@@ -30,7 +30,7 @@ target_metadata = SQLModel.metadata
 
 current_dir = Path(__file__).parent
 
-load_dotenv(str(current_dir / ".." / "src" / ".env"))
+load_dotenv(str(current_dir / ".." / ".env"))
 
 
 def get_url():

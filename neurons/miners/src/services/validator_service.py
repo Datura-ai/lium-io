@@ -2,7 +2,7 @@ from typing import Annotated
 
 from fastapi import Depends
 
-from dtos.validator import ValidatorDao
+from daos.validator import ValidatorDao
 
 
 class ValidatorService:

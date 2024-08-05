@@ -18,6 +18,8 @@ dependencies = [
     "databases[postgresql]>=0.9.0",
     "sqlmodel>=0.0.19",
     "psycopg2-binary~=2.9.7",
+    "paramiko>=3.4.0",
+    "asgiref>=3.8.1",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"

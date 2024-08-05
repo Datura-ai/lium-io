@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import Annotated
+import time
 
 import bittensor
 from clients.miner_client import MinerClient
@@ -16,6 +17,7 @@ from requests.api_requests import MinerRequestPayload
 
 from core.config import settings
 from services.ssh_service import SSHService
+from services.task_service import TaskService
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +29,10 @@ class MinerService:
     def __init__(
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
-        task_dao: Annotated[TaskDao, Depends(TaskDao)],
+        task_service: Annotated[TaskService, Depends(TaskService)],
     ):
         self.ssh_service = ssh_service
-        self.task_dao = task_dao
+        self.task_service = task_service
 
     async def request_resource_to_miner(self, payload: MinerRequestPayload):
         loop = asyncio.get_event_loop()
@@ -76,19 +78,12 @@ class MinerService:
 
             if isinstance(msg, AcceptSSHKeyRequest):
                 logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+
+                await self.task_service.create_task(miner_client.miner_address, msg.ssh_username, my_key, private_key.decode('utf-8'), public_key.decode())
             elif isinstance(msg, FailedRequest):
                 logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
                 return
             else:
                 raise ValueError(f"Unexpected msg: {msg}")
-
-            self.task_dao.save(
-                Task(
-                    task_status=TaskStatus.SSHConnected,
-                    miner_hotkey=payload.miner_hotkey,
-                    ssh_private_key=private_key.decode(),
-                )
-            )
-
-
+    
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]
