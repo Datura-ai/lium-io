@@ -1,7 +1,6 @@
 import asyncio
 import logging
 from typing import Annotated
-import time
 
 import bittensor
 from clients.miner_client import MinerClient
@@ -9,8 +8,9 @@ from daos.task import TaskDao
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     FailedRequest,
+    DeclineJobRequest,
 )
-from datura.requests.validator_requests import SSHPubKeySubmitRequest
+from datura.requests.validator_requests import SSHPubKeySubmitRequest, SSHPubKeyRemoveRequest
 from fastapi import Depends
 from models.task import Task, TaskStatus
 from requests.api_requests import MinerRequestPayload
@@ -79,9 +79,14 @@ class MinerService:
             if isinstance(msg, AcceptSSHKeyRequest):
                 logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
 
-                await self.task_service.create_task(miner_client.miner_address, msg.ssh_username, my_key, private_key.decode('utf-8'), public_key.decode())
+                await self.task_service.create_task(miner_client.miner_address, msg, my_key, private_key.decode('utf-8'))
+                
+                await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
                 logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
+                return
+            elif isinstance(msg, DeclineJobRequest):
+                logger.info(f"Miner {miner_client.miner_name} job declined: {msg}")
                 return
             else:
                 raise ValueError(f"Unexpected msg: {msg}")

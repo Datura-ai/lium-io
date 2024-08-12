@@ -15,5 +15,4 @@ services:
       - 6432:5432
 
 volumes:
-  redis_data:
   db_data:

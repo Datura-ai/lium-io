@@ -8,6 +8,7 @@ from datura.requests.base import BaseRequest
 class RequestType(enum.Enum):
     AuthenticateRequest = "AuthenticateRequest"
     SSHPubKeySubmitRequest = "SSHPubKeySubmitRequest"
+    SSHPubKeyRemoveRequest = "SSHPubKeyRemoveRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -35,4 +36,8 @@ class AuthenticateRequest(BaseValidatorRequest):
 
 class SSHPubKeySubmitRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeySubmitRequest
+    public_key: bytes
+
+class SSHPubKeyRemoveRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.SSHPubKeyRemoveRequest
     public_key: bytes

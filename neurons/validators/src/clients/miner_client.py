@@ -16,6 +16,7 @@ from datura.requests.miner_requests import (
     FailedRequest,
     GenericError,
     UnAuthorizedRequest,
+    SSHKeyRemoved,
 )
 from datura.requests.validator_requests import AuthenticateRequest, AuthenticationPayload
 
@@ -28,6 +29,7 @@ class JobState:
         self.miner_ready_or_declining_timestamp: int = 0
         self.miner_accepted_ssh_key_or_failed_future = asyncio.Future()
         self.miner_accepted_ssh_key_or_failed_timestamp: int = 0
+        self.miner_removed_ssh_key_future = asyncio.Future()
 
 
 class MinerClient(abc.ABC):
@@ -66,12 +68,14 @@ class MinerClient(abc.ABC):
         """
         Handle the message based on its type or raise UnsupportedMessageReceived
         """
-        if isinstance(msg, AcceptJobRequest | DeclineJobRequest):
+        if isinstance(msg, AcceptJobRequest):
             self.job_state.miner_ready_or_declining_timestamp = time.time()
             self.job_state.miner_ready_or_declining_future.set_result(msg)
-        elif isinstance(msg, AcceptSSHKeyRequest | FailedRequest | UnAuthorizedRequest):
+        elif isinstance(msg, AcceptSSHKeyRequest | FailedRequest | UnAuthorizedRequest | DeclineJobRequest):
             self.job_state.miner_accepted_ssh_key_or_failed_timestamp = time.time()
             self.job_state.miner_accepted_ssh_key_or_failed_future.set_result(msg)
+        elif isinstance(msg, SSHKeyRemoved):
+            self.job_state.miner_removed_ssh_key_future.set_result(msg)
 
     async def __aenter__(self):
         await self.await_connect()

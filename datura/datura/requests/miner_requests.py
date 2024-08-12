@@ -10,6 +10,7 @@ class RequestType(enum.Enum):
     AcceptSSHKeyRequest = "AcceptSSHKeyRequest"
     FailedRequest = "FailedRequest"
     UnAuthorizedRequest = "UnAuthorizedRequest"
+    SSHKeyRemoved = "SSHKeyRemoved"
 
 
 class BaseMinerRequest(BaseRequest):
@@ -32,6 +33,12 @@ class DeclineJobRequest(BaseMinerRequest):
 class AcceptSSHKeyRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.AcceptSSHKeyRequest
     ssh_username: str
+    python_path: str
+    root_dir: str
+
+
+class SSHKeyRemoved(BaseMinerRequest):
+    message_type: RequestType = RequestType.SSHKeyRemoved
 
 
 class FailedRequest(BaseMinerRequest):

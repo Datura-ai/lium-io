@@ -1,6 +1,9 @@
 import logging
 import time
+import sys
+import asyncio
 from typing import Annotated
+from pathlib import Path
 
 import bittensor
 from datura.consumers.base import BaseConsumer
@@ -8,11 +11,14 @@ from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     FailedRequest,
     UnAuthorizedRequest,
+    SSHKeyRemoved,
+    DeclineJobRequest,
 )
 from datura.requests.validator_requests import (
     AuthenticateRequest,
     BaseValidatorRequest,
     SSHPubKeySubmitRequest,
+    SSHPubKeyRemoveRequest,
 )
 from fastapi import Depends, WebSocket
 
@@ -99,10 +105,63 @@ class ValidatorConsumer(BaseConsumer):
             try:
                 self.ssh_service.add_pubkey_to_host(msg.public_key)
                 await self.send_message(
-                    AcceptSSHKeyRequest(ssh_username=self.ssh_service.get_current_os_user())
+                    AcceptSSHKeyRequest(
+                        ssh_username=self.ssh_service.get_current_os_user(),
+                        python_path=sys.executable,
+                        root_dir=str(Path(__file__).resolve().parents[2])
+                    )
                 )
                 logger.info("Sent AcceptSSHKeyRequest to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e))
+                self.ssh_service.remove_pubkey_from_host(msg.public_key)
                 await self.send_message(FailedRequest(details=str(e)))
             return
+        
+        if isinstance(msg, SSHPubKeyRemoveRequest):
+            logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
+            try:
+                self.ssh_service.remove_pubkey_from_host(msg.public_key)
+                await self.send_message(SSHKeyRemoved())
+                logger.info("Sent SSHPubKeyRemoveRequest to validator %s", self.validator_key)
+            except Exception as e:
+                logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e))
+                await self.send_message(FailedRequest(details=str(e)))
+            return
+
+class ValidatorConsumerManger:
+    def __init__(
+        self,
+    ):
+        self.active_consumer: ValidatorConsumer | None = None
+        self.lock = asyncio.Lock()
+        
+    async def addConsumer(
+        self,
+        websocket: WebSocket,
+        validator_key: str,
+        ssh_service: Annotated[MinerSSHService, Depends(MinerSSHService)],
+        validator_service: Annotated[ValidatorService, Depends(ValidatorService)],
+    ):
+        consumer = ValidatorConsumer(
+            websocket=websocket,
+            validator_key=validator_key,
+            ssh_service=ssh_service,
+            validator_service=validator_service
+        )
+        await consumer.connect()
+
+        if self.active_consumer is not None:
+            await consumer.send_message(DeclineJobRequest())
+            await consumer.disconnect()
+            return
+
+        async with self.lock:
+            self.active_consumer = consumer
+            
+            await self.active_consumer.handle()
+
+            self.active_consumer = None
+        
+        
+validatorConsumerManager = ValidatorConsumerManger()

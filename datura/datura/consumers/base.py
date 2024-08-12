@@ -37,7 +37,7 @@ class BaseConsumer(abc.ABC):
         raise NotImplementedError
 
     async def handle(self):
-        await self.connect()
+        # await self.connect()
         try:
             while True:
                 data: BaseRequest = await self.receive_message()
