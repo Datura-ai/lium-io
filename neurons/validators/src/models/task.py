@@ -21,6 +21,6 @@ class Task(SQLModel, table=True):
     task_status: TaskStatus = Field(sa_column=Column(Enum(TaskStatus)))
     miner_hotkey: str
     ssh_private_key: str
-    created_at: datetime = Field(default_factory=datetime.now(UTC))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
     proceed_time: Optional[int] = Field(default=None)
     score: Optional[float] = None

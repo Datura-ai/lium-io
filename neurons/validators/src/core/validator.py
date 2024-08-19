@@ -1,10 +1,14 @@
 import logging
-import threading
+import asyncio
 import traceback
-import time
 
 import bittensor
 from core.config import settings
+from core.db import get_db
+from services.ssh_service import SSHService
+from services.task_service import TaskService
+from services.miner_service import MinerService, MinerRequestPayload
+from daos.task import TaskDao
 
 logger = logging.getLogger(__name__)
 
@@ -25,19 +29,15 @@ class Validator():
         self.should_exit = False
         self.is_running = False
         
-    def __enter__(self):
-        self.run_in_background_thread()
+        # set miner service
+        session = next(get_db())
+        self.task_dao = TaskDao(session=session)
+
+        ssh_service = SSHService()
+        task_service = TaskService(task_dao=self.task_dao, ssh_service=ssh_service)
+        self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service)
         
-    def __exit__(self):
-        if self.is_running:
-            logger.debug("Stopping miner in background thread.")
-            self.should_exit = True
-            if self.thread is not None:
-                self.thread.join(5)
-            self.is_running = False
-            logger.debug("Stopped")
-        
-    def check_registered(self):
+    async def check_registered(self):
         if not self.subtensor.is_hotkey_registered(
             netuid=self.netuid,
             hotkey_ss58=self.wallet.get_hotkey().ss58_address,
@@ -48,37 +48,38 @@ class Validator():
             )
             exit()
             
-    def fetch_minors(self):
+    async def fetch_minors(self):
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
         miners = [neuron for neuron in metagraph.neurons if neuron.axon_info.is_serving]
         
         return miners
     
-    def set_scores(self):
+    async def set_weights(self):
         pass
     
-    def set_weights(self):
-        pass
-    
-    def sync(self):
+    async def sync(self):
+        bittensor.logging.debug('sync validator')
+        # check registered
+        await self.check_registered()
+
         # fetch miners
-        miners = self.fetch_minors()
+        miners = await self.fetch_minors()
         
         # run jobs
+        for miner in miners:
+            print(miner.hotkey)
+            print(miner.axon_info.ip)
+            print(miner.axon_info.port)
         
-        # set scores
         
-        # set rates
-        
-        pass
-        
-    def run(self):
+    async def start(self):
+        bittensor.logging.debug('Start validator in background')
         try:
             while not self.should_exit:
-                self.sync()
+                await self.sync()
                 
                 # sync every 10 mins
-                time.sleep(10 * 60)
+                await asyncio.sleep(2 * 60)
                 
         except KeyboardInterrupt:
             logger.debug('Miner killed by keyboard interrupt.')
@@ -86,11 +87,6 @@ class Validator():
         except Exception as e:
             logger.error(traceback.format_exc())
             
-    def run_in_background_thread(self):
-        if not self.is_running:
-            bittensor.logging.debug("Starting validator in background thread.")
-            self.should_exit = False
-            self.thread = threading.Thread(target=self.run, daemon=True)
-            self.thread.start()
-            self.is_running = True
-            bittensor.logging.debug("Started")
+    async def stop(self):
+        bittensor.logging.debug('Stop validator in background')
+        self.should_exit = True
