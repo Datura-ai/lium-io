@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Response
-from requests.api_requests import MinerRequestPayload
+from services.miner_service import MinerRequestPayload
 
 from services.miner_service import MinerServiceDep
 from services.task_service import TaskServiceDep

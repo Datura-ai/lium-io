@@ -5,6 +5,7 @@ import uvicorn
 
 from core.config import settings
 from routes.validator_interface import validator_router
+from core.miner import Miner
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -16,4 +17,5 @@ app = FastAPI(
 app.include_router(validator_router)
 
 if __name__ == "__main__":
-    uvicorn.run("miner:app", host="0.0.0.0", port=8000, reload=True)
+    with Miner():
+        uvicorn.run("miner:app", host="0.0.0.0", port=settings.PORT, reload=True)

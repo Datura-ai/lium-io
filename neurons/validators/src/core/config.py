@@ -1,6 +1,8 @@
 import pathlib
+from typing import Optional
 
 import bittensor
+import argparse
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,8 +17,13 @@ class Settings(BaseSettings):
     )
     BITTENSOR_WALLET_NAME: str = Field(env="BITTENSOR_WALLET_NAME")
     BITTENSOR_WALLET_HOTKEY_NAME: str = Field(env="BITTENSOR_WALLET_HOTKEY_NAME")
+    BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID")
+    BITTENSOR_CHAIN_ENDPOINT: str = Field(env="BITTENSOR_CHAIN_ENDPOINT")
+    BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK")
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
+    
+    PORT: int = Field(env="PORT", default=8000)
 
     class Config:
         env_file = ".env"
@@ -32,5 +39,35 @@ class Settings(BaseSettings):
         wallet.hotkey_file.get_keypair()  # this raises errors if the keys are inaccessible
         return wallet
 
+    def get_bittensor_config(self) -> bittensor.config:
+        parser = argparse.ArgumentParser()
+        # bittensor.wallet.add_args(parser)
+        # bittensor.subtensor.add_args(parser)
+        # bittensor.logging.add_args(parser)
+        # bittensor.axon.add_args(parser)
+        
+        if self.BITTENSOR_NETWORK:
+            if '--subtensor.network' in parser._option_string_actions:
+                parser._handle_conflict_resolve(None, [('--subtensor.network', parser._option_string_actions['--subtensor.network'])])
+
+            parser.add_argument(
+                "--subtensor.network",
+                type=str,
+                help="network",
+                default=self.BITTENSOR_NETWORK,
+            )
+            
+        if self.BITTENSOR_CHAIN_ENDPOINT:
+            if '--subtensor.chain_endpoint' in parser._option_string_actions:
+                parser._handle_conflict_resolve(None, [('--subtensor.chain_endpoint', parser._option_string_actions['--subtensor.chain_endpoint'])])
+
+            parser.add_argument(
+                "--subtensor.chain_endpoint",
+                type=str,
+                help="chain endpoint",
+                default=self.BITTENSOR_CHAIN_ENDPOINT,
+            )
+            
+        return bittensor.config(parser)
 
 settings = Settings()

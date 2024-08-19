@@ -2,9 +2,10 @@ import asyncio
 import logging
 from typing import Annotated
 
+from pydantic import BaseModel
+
 import bittensor
 from clients.miner_client import MinerClient
-from daos.task import TaskDao
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     FailedRequest,
@@ -12,8 +13,6 @@ from datura.requests.miner_requests import (
 )
 from datura.requests.validator_requests import SSHPubKeySubmitRequest, SSHPubKeyRemoveRequest
 from fastapi import Depends
-from models.task import Task, TaskStatus
-from requests.api_requests import MinerRequestPayload
 
 from core.config import settings
 from services.ssh_service import SSHService
@@ -24,6 +23,10 @@ logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
 
+class MinerRequestPayload(BaseModel):
+    miner_hotkey: str
+    miner_address: str
+    miner_port: int
 
 class MinerService:
     def __init__(
