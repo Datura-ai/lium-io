@@ -5,8 +5,9 @@ import time
 
 import bittensor
 from core.config import settings
+from core.db import get_db
 
-from daos.validator import ValidatorDao
+from daos.validator import ValidatorDao, Validator
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,6 @@ class Miner():
         self.subtensor = bittensor.subtensor(config=config)
         self.netuid = settings.BITTENSOR_NETUID
 
-        # self.validator_dao = validator_dao
         self.axon = bittensor.axon(
 			wallet=self.wallet,
 			external_port=settings.PORT,
@@ -39,6 +39,9 @@ class Miner():
         
         self.should_exit = False
         self.is_running = False
+        
+        session = next(get_db())
+        self.validator_dao = ValidatorDao(session=session)
         
     def __enter__(self):
         self.run_in_background_thread()
@@ -75,14 +78,23 @@ class Miner():
         return neurons[:VALIDATORS_LIMIT]
     
     def save_validators(self):
-        pass
+        validators = self.fetch_validators()
+        for v in validators:
+            existing = self.validator_dao.get_validator_by_hotkey(v.hotkey)
+            if not existing:
+                self.validator_dao.save(
+                    Validator(
+                        validator_hotkey=v.hotkey,
+                        active=True
+                    )
+                )
     
     def sync(self):
         # announce
         self.announce()
         
         # get validators and store it in database
-        validators = self.fetch_validators()
+        self.save_validators()
 
             
     def run(self):
@@ -100,10 +112,8 @@ class Miner():
         
     def run_in_background_thread(self):
         if not self.is_running:
-            logger.debug("Starting validator in background thread.")
+            logger.debug("Starting miner in background thread.")
             self.should_exit = False
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
             self.is_running = True
-            logger.debug("Started")
-    
