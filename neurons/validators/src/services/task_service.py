@@ -3,10 +3,12 @@ from pathlib import Path
 import io
 import logging
 import time
+import asyncio
 from asgiref.sync import sync_to_async
 
 import bittensor
 from daos.task import TaskDao
+from models.task import Task, TaskStatus
 from fastapi import Depends
 
 from core.config import settings
@@ -31,17 +33,21 @@ class TaskService:
     async def create_task(
         self,
         miner_address: str,
+        miner_hotkey: str,
         msg: AcceptSSHKeyRequest,
         keypair: bittensor.Keypair,
         private_key: str
     ):
-        # self.task_dao.save(
-        #     Task(
-        #         task_status=TaskStatus.SSHConnected,
-        #         miner_hotkey=payload.miner_hotkey,
-        #         ssh_private_key=private_key.decode(),
-        #     )
-        # )
+        logger.info(f"Create Task -> miner_address: {miner_address}, miner_hotkey: {miner_hotkey}")
+        task = self.task_dao.save(
+            Task(
+                task_status=TaskStatus.SSHConnected,
+                miner_hotkey=miner_hotkey,
+                ssh_private_key=private_key,
+            )
+        )
+        
+        logger.info("Connect ssh")
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = Ed25519Key.from_private_key(io.StringIO(private_key))
 
@@ -59,15 +65,24 @@ class TaskService:
         ftp_client.close()
         
         start_time = time.time()
-        restuls, err = await sync_to_async(self._run_task)(ssh_client, msg, remote_file_path)
+        # results, err = await sync_to_async(self._run_task)(ssh_client, msg, remote_file_path)
+        results, err = await asyncio.to_thread(self._run_task, ssh_client, msg, remote_file_path)
         end_time = time.time()
+        logger.info(f"results: {results}")
         
         if err is not None:
+            logger.error(f"error: {err}")
+
             # mark task is failed
+            self.task_dao.update(
+                uuid=task.uuid,
+                task_status=TaskStatus.Failed,
+                score=0,
+            )
             
             return
 
-        job_taken_time = restuls[-1]
+        job_taken_time = results[-1]
         try:
             job_taken_time = int(job_taken_time)
         except:
@@ -77,13 +92,12 @@ class TaskService:
         ssh_client.close()
         
         # update task with results
-        # self.task_dao.save(
-        #     Task(
-        #         task_status=TaskStatus.SSHConnected,
-        #         miner_hotkey=payload.miner_hotkey,
-        #         ssh_private_key=private_key.decode(),
-        #     )
-        # )
+        self.task_dao.update(
+            uuid=task.uuid,
+            task_status=TaskStatus.Finished,
+            proceed_time=job_taken_time,
+            score= 1 / job_taken_time if job_taken_time > 0 else 0,
+        )
         
     def _run_task(
         self,

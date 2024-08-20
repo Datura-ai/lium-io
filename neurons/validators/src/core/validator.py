@@ -12,6 +12,9 @@ from daos.task import TaskDao
 
 logger = logging.getLogger(__name__)
 
+SYNC_CYCLE = 3 * 60
+WEIGHT_STEP = 24
+
 class Validator():
     wallet: bittensor.wallet
     subtensor: bittensor.subtensor
@@ -23,8 +26,6 @@ class Validator():
         self.wallet = settings.get_bittensor_wallet()
         self.subtensor = bittensor.subtensor(config=config)
         self.netuid = settings.BITTENSOR_NETUID
-        
-        self.check_registered()
         
         self.should_exit = False
         self.is_running = False
@@ -47,6 +48,7 @@ class Validator():
                 f" Please register the hotkey using `btcli subnets register` before trying again"
             )
             exit()
+        bittensor.logging.debug('Validator is registered')
             
     async def fetch_minors(self):
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
@@ -58,19 +60,28 @@ class Validator():
         pass
     
     async def sync(self):
-        bittensor.logging.debug('sync validator')
         # check registered
         await self.check_registered()
 
         # fetch miners
         miners = await self.fetch_minors()
         
-        # run jobs
-        for miner in miners:
-            print(miner.hotkey)
-            print(miner.axon_info.ip)
-            print(miner.axon_info.port)
+        # request jobs
+        jobs = [
+            asyncio.create_task(
+                asyncio.wait_for(
+                self.miner_service.request_resource_to_miner(payload=MinerRequestPayload(
+                    miner_hotkey=miner.hotkey,
+                    miner_address=miner.axon_info.ip,
+                    miner_port=miner.axon_info.port
+                )),
+                timeout=SYNC_CYCLE - 5
+            )
+            )
+            for miner in miners
+        ]
         
+        await asyncio.gather(*jobs, return_exceptions=True)
         
     async def start(self):
         bittensor.logging.debug('Start validator in background')
@@ -79,7 +90,7 @@ class Validator():
                 await self.sync()
                 
                 # sync every 10 mins
-                await asyncio.sleep(2 * 60)
+                await asyncio.sleep(SYNC_CYCLE)
                 
         except KeyboardInterrupt:
             logger.debug('Miner killed by keyboard interrupt.')
