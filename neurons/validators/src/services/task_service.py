@@ -84,11 +84,11 @@ class TaskService:
 
         job_taken_time = results[-1]
         try:
-            job_taken_time = int(job_taken_time)
+            job_taken_time = float(job_taken_time.strip())
         except:
             job_taken_time = end_time - start_time
         
-        
+        logger.info(f"job_taken_time: {job_taken_time}")
         ssh_client.close()
         
         # update task with results
@@ -109,8 +109,14 @@ class TaskService:
             _, stdout, stderr = ssh_client.exec_command(f"export PYTHONPATH={msg.root_dir} && {msg.python_path} {remote_file_path}", timeout=JOB_LENGTH)
             results = stdout.readlines()
             errors = stderr.readlines()
-            if (len(errors) > 0):
-                print(errors)
+            
+            actual_errors = [
+                error for error in errors
+                if not 'warnning' in error.lower()
+            ]
+
+            if (len(results) == 0 and len(actual_errors) > 0):
+                logger.error(f"{actual_errors}")
                 raise Exception("Failed to execute command!")
 
             #  remove remote_file

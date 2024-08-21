@@ -29,7 +29,7 @@ dataloader = DataLoader(tokenized_dataset, batch_size=4, shuffle=True)
 
 # Training loop
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("device", device)
+# print("device", device)
 model.to(device)
 
 
@@ -47,8 +47,8 @@ def evaluate(model, dataloader):
 
 # Initial evaluation
 initial_loss = evaluate(model, dataloader)
-print(f"Initial Loss: {initial_loss:.4f}")
-print(f"Initial Perplexity: {torch.exp(torch.tensor(initial_loss)):.4f}")
+# print(f"Initial Loss: {initial_loss:.4f}")
+# print(f"Initial Perplexity: {torch.exp(torch.tensor(initial_loss)):.4f}")
 optimizer = AdamW(model.parameters(), lr=5e-5, no_deprecation_warning=True)
 
 num_epochs = 1
@@ -61,17 +61,17 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
-    print(f"Epoch {epoch+1}/{num_epochs} completed")
+    # print(f"Epoch {epoch+1}/{num_epochs} completed")
 
 # Final evaluation
 final_loss = evaluate(model, dataloader)
-print(f"Final Loss: {final_loss:.4f}")
-print(f"Final Perplexity: {torch.exp(torch.tensor(final_loss)):.4f}")
+# print(f"Final Loss: {final_loss:.4f}")
+# print(f"Final Perplexity: {torch.exp(torch.tensor(final_loss)):.4f}")
 
-print(f"Loss decreased by: {initial_loss - final_loss:.4f}")
-print(
-    f"Perplexity decreased by: {torch.exp(torch.tensor(initial_loss)) - torch.exp(torch.tensor(final_loss)):.4f}"
-)
+# print(f"Loss decreased by: {initial_loss - final_loss:.4f}")
+# print(
+#     f"Perplexity decreased by: {torch.exp(torch.tensor(initial_loss)) - torch.exp(torch.tensor(final_loss)):.4f}"
+# )
 
-print("Job finished")
+# print("Job finished")
 print(time.time() - start_time)
