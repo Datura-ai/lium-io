@@ -3,17 +3,20 @@ import asyncio
 import traceback
 
 import bittensor
+from bittensor.utils.weight_utils import process_weights_for_netuid, convert_weights_and_uids_for_emit
 from core.config import settings
 from core.db import get_db
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.miner_service import MinerService, MinerRequestPayload
 from daos.task import TaskDao
+import numpy as np
+
 
 logger = logging.getLogger(__name__)
 
 SYNC_CYCLE = 2 * 60
-WEIGHT_MAX_COUNTER = 24
+WEIGHT_MAX_COUNTER = 5
 
 class Validator():
     wallet: bittensor.wallet
@@ -63,25 +66,48 @@ class Validator():
     def set_weights(self, miners, subtensor: bittensor.subtensor):
         avg_scores = self.task_dao.get_avg_scores_in_hours(24)
         
-        hotkey_to_uid = {miner.hotkey: miner.uid for miner in miners}
-        uids = [hotkey_to_uid[score.miner_hotkey] for score in avg_scores if score.miner_hotkey in hotkey_to_uid]
+        hotkey_to_score = {score.miner_hotkey: score.avg_score for score in avg_scores}
 
-        scores = [score.avg_score for score in avg_scores]
-        bittensor.logging.ino(f"uids: {uids}")
-        bittensor.logging.ino(f"scores: {scores}")
+        uids = np.zeros(len(miners), dtype=np.int64)
+        weights = np.zeros(len(miners), dtype=np.float32)
+        for ind, miner in enumerate(miners):
+            uids[ind] = miner.uid
+            weights[ind] = hotkey_to_score.get(miner.hotkey, 0.0)
+            
+        bittensor.logging.info(f"uids: {uids}")
+        bittensor.logging.info(f"weights: {weights}")
         
-        # result, msg = subtensor.set_weights(
-        #     wallet=self.wallet,
-        #     netuid=self.netuid,
-        #     uids=uint_uids,
-        #     weights=uint_weights,
-        #     wait_for_finalization=False,
-        #     wait_for_inclusion=False,
-        # )
-        # if result is True:
-        #     bittensor.logging.info("set_weights on chain successfully!")
-        # else:
-        #     bittensor.logging.error("set_weights failed", msg)
+        metagraph = subtensor.metagraph(netuid=self.netuid)
+        processed_uids, processed_weights = process_weights_for_netuid(
+            uids=uids,
+            weights=weights,
+            netuid=self.netuid,
+            subtensor=subtensor,
+            metagraph=metagraph,
+        )
+        
+        bittensor.logging.info(f"processed_uids: {processed_uids}")
+        bittensor.logging.info(f"processed_weights: {processed_weights}")
+        
+        uint_uids, uint_weights = convert_weights_and_uids_for_emit(
+            uids=processed_uids, weights=processed_weights
+        )
+        
+        bittensor.logging.info(f"uint_uids: {uint_uids}")
+        bittensor.logging.info(f"uint_weights: {uint_weights}")
+        
+        result, msg = subtensor.set_weights(
+            wallet=self.wallet,
+            netuid=self.netuid,
+            uids=uint_uids,
+            weights=uint_weights,
+            wait_for_finalization=False,
+            wait_for_inclusion=False,
+        )
+        if result is True:
+            bittensor.logging.info("set_weights on chain successfully!")
+        else:
+            bittensor.logging.error("set_weights failed", msg)
     
     async def sync(self):
         self.weight_counter += 1
@@ -92,6 +118,8 @@ class Validator():
 
         # fetch miners
         miners = await self.fetch_minors(subtensor)
+        for miner in miners:
+            bittensor.logging.info(f"miner {miner.hotkey}")
         
         if self.weight_counter >= WEIGHT_MAX_COUNTER:
             self.weight_counter = 0
