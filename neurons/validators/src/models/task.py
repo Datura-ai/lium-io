@@ -2,7 +2,7 @@ from typing import Optional
 import enum
 import uuid
 from uuid import UUID
-from datetime import datetime, UTC
+from datetime import datetime
 
 from sqlmodel import Column, Enum, Field, SQLModel
 
