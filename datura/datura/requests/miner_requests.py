@@ -33,6 +33,7 @@ class DeclineJobRequest(BaseMinerRequest):
 class AcceptSSHKeyRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.AcceptSSHKeyRequest
     ssh_username: str
+    ssh_port: int
     python_path: str
     root_dir: str
 
