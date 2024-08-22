@@ -53,7 +53,7 @@ class TaskService:
 
         ssh_client = SSHClient()
         ssh_client.set_missing_host_key_policy(AutoAddPolicy())
-        ssh_client.connect(hostname=miner_address, username=msg.ssh_username, look_for_keys=False, pkey=pkey)
+        ssh_client.connect(hostname=miner_address, username=msg.ssh_username, look_for_keys=False, pkey=pkey, port=msg.ssh_port)
         ssh_client.exec_command(f"mkdir -p {msg.root_dir}/temp")
 
         timestamp = int(time.time())

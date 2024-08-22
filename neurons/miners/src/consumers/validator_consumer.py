@@ -107,6 +107,7 @@ class ValidatorConsumer(BaseConsumer):
                 await self.send_message(
                     AcceptSSHKeyRequest(
                         ssh_username=self.ssh_service.get_current_os_user(),
+                        ssh_port=settings.SSH_PORT,
                         python_path=sys.executable,
                         root_dir=str(Path(__file__).resolve().parents[2])
                     )
@@ -122,10 +123,10 @@ class ValidatorConsumer(BaseConsumer):
             logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
             try:
                 self.ssh_service.remove_pubkey_from_host(msg.public_key)
-                await self.send_message(SSHKeyRemoved())
-                logger.info("Sent SSHPubKeyRemoveRequest to validator %s", self.validator_key)
+                # await self.send_message(SSHKeyRemoved())
+                logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
-                logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e))
+                logger.error("Failed SSHKeyRemoved request: %s", str(e))
                 await self.send_message(FailedRequest(details=str(e)))
             return
 
