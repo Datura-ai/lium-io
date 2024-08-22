@@ -1,3 +1,4 @@
+from typing import Optional
 import pathlib
 from typing import Optional
 
@@ -18,7 +19,7 @@ class Settings(BaseSettings):
     BITTENSOR_WALLET_NAME: str = Field(env="BITTENSOR_WALLET_NAME")
     BITTENSOR_WALLET_HOTKEY_NAME: str = Field(env="BITTENSOR_WALLET_HOTKEY_NAME")
     BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID")
-    BITTENSOR_CHAIN_ENDPOINT: str = Field(env="BITTENSOR_CHAIN_ENDPOINT")
+    BITTENSOR_CHAIN_ENDPOINT: Optional[str] = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK")
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")

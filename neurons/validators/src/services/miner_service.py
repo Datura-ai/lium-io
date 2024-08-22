@@ -36,6 +36,9 @@ class MinerService:
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
+        
+    # async def request_resource_to_miner(self, payload: MinerRequestPayload):
+    #     await asyncio.to_thread(self._request_resource_to_miner, payload)
 
     async def request_resource_to_miner(self, payload: MinerRequestPayload):
         loop = asyncio.get_event_loop()
@@ -82,7 +85,13 @@ class MinerService:
             if isinstance(msg, AcceptSSHKeyRequest):
                 logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
 
-                await self.task_service.create_task(miner_client.miner_address, msg, my_key, private_key.decode('utf-8'))
+                await self.task_service.create_task(
+                    miner_address=payload.miner_address,
+                    miner_hotkey=payload.miner_hotkey,
+                    msg=msg,
+                    keypair=my_key,
+                    private_key=private_key.decode('utf-8')
+                )
                 
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):

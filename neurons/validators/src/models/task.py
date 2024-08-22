@@ -1,6 +1,8 @@
+from typing import Optional
 import enum
 import uuid
 from uuid import UUID
+from datetime import datetime
 
 from sqlmodel import Column, Enum, Field, SQLModel
 
@@ -19,3 +21,6 @@ class Task(SQLModel, table=True):
     task_status: TaskStatus = Field(sa_column=Column(Enum(TaskStatus)))
     miner_hotkey: str
     ssh_private_key: str
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    proceed_time: Optional[int] = Field(default=None)
+    score: Optional[float] = None
