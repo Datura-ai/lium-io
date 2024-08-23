@@ -89,8 +89,8 @@ install_python() {
             
             # Install necessary packages
             python -m pip install --upgrade pip
-            python -m pip install cffi
-            python -m pip install cryptography
+            pip install cffi
+            pip install cryptography
 
             # Install bittensor
             python -m pip install bittensor
@@ -109,11 +109,11 @@ install_python() {
         
         # Install necessary packages
         python -m pip install --upgrade pip
-        python -m pip install cffi
-        python -m pip install cryptography
+        pip install cffi
+        pip install cryptography
 
         # Install bittensor
-        python -m pip install bittensor
+        pip install bittensor
     fi
 
     # check if PDM is installed
