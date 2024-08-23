@@ -56,7 +56,7 @@ ohai() {
 wait_for_user() {
   local c
   echo
-  echo "Press RETURN to continue or any other key to abort"
+  echo "Press Enter to continue or any other key to abort"
   getc c
   # we test for \r and \n because some stuff does \r instead
   if ! [[ "$c" == $'\r' || "$c" == $'\n' ]]; then
@@ -126,42 +126,33 @@ install_python() {
 install_postgresql() {
     if command -v psql &> /dev/null
     then
-        ohai "PostgreSQL is already installed."
+        echo "PostgreSQL is already installed."
         echo "Checking PostgreSQL version..."
         psql --version
 
-        su - postgres
-
         # Check if the database exists
-        DB_EXISTS=$(psql -tAc "SELECT 1 FROM pg_database WHERE datname='compute_subnet_db'")
+        DB_EXISTS=$(runuser -l postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='compute_subnet_db'\"")
         if [ "$DB_EXISTS" == "1" ]; then
             echo "Database compute_subnet_db already exists."
         else
             echo "Creating database compute_subnet_db..."
-            createdb compute_subnet_db
+            runuser -l postgres -c "createdb compute_subnet_db"
         fi
-
-        exit
     else
-        ohai "Installing PostgreSQL..."
-
         echo "Installing PostgreSQL..."
+
         apt install -y postgresql postgresql-contrib
 
         echo "Starting PostgreSQL server..."
         service postgresql start
 
-        su - postgres
-
         read -p "Enter Postgres password: " pg_password
 
-        echo "Setting password for postgres user..."
-        psql -c "ALTER USER postgres PASSWORD '$pg_password';"
+        # Set the password for the postgres user
+        runuser -l postgres -c "psql -c \"ALTER USER postgres PASSWORD '$pg_password';\""
 
-        echo "Creating database compute_subnet_db..."
-        createdb compute_subnet_db;
-
-        exit
+        # Create the database as the postgres user
+        runuser -l postgres -c "createdb compute_subnet_db"
     fi
 }
 
