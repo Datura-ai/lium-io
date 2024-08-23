@@ -67,6 +67,7 @@ wait_for_user() {
 #install pre
 install_pre() {
     apt update
+    apt upgrade
     apt install --no-install-recommends --no-install-suggests -y apt-utils curl git cmake build-essential
     exit_on_error $?
 }
@@ -96,7 +97,7 @@ install_python() {
             python -m pip install bittensor
         fi
     else
-        echo "Installing Python 3.11"
+        ohai "Installing Python 3.11..."
         add-apt-repository ppa:deadsnakes/ppa
         apt update
         apt install -y python3.11 python3.11-venv python3.11-dev
@@ -160,7 +161,7 @@ install_postgresql() {
             runuser -l postgres -c "createdb compute_subnet_db"
         fi
     else
-        echo "Installing PostgreSQL..."
+        ohai "Installing PostgreSQL..."
 
         apt install -y postgresql postgresql-contrib
 
@@ -179,6 +180,8 @@ install_postgresql() {
 
 # install miner dependencies
 install_miner_dependencies() {
+  ohai "Installing miner..."
+
   # Get the directory of the current script
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   
@@ -196,6 +199,7 @@ echo "python3.11 and pdm"
 echo "python3-pip"
 echo "postgresql"
 echo "bittensor"
+echo "install miner dependencies"
 
 wait_for_user
 install_pre
