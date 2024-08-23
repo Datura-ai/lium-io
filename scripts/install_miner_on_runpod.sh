@@ -182,11 +182,11 @@ install_miner_dependencies() {
   # Get the directory of the current script
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   
-  # Specify the PDM root path
-  PDM_ROOT_PATH="$SCRIPT_DIR/../neurons/miners"
+  # Navigate to the PDM root path relative to the script directory
+  cd "$SCRIPT_DIR/../neurons/miners" || exit
   
-  # Install PDM dependencies in the specified path where pyproject.toml exists
-  pdm install --cwd "$PDM_ROOT_PATH"
+  # Install PDM dependencies
+  pdm install
 }
 
 ohai "This script will install:"
