@@ -79,20 +79,41 @@ install_python() {
         # Check the version
         PYTHON_VERSION=$(python3.11 --version 2>&1)
         if [[ $PYTHON_VERSION == *"Python 3.11"* ]]; then
-            ohai "Python 3.11 is already installed."
+            echo "Python 3.11 is already installed."
         else
-            ohai "Linking python to python 3.11"
+            echo "Linking python to python 3.11"
             update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+            
+            # Ensure pip is installed
+            python3.11 -m ensurepip --upgrade
+            
+            # Install necessary packages
+            python -m pip install --upgrade pip
             python -m pip install cffi
             python -m pip install cryptography
+
+            # Install bittensor
+            python -m pip install bittensor
         fi
     else
-        ohai "Installing Python 3.11"
+        echo "Installing Python 3.11"
         add-apt-repository ppa:deadsnakes/ppa
-        apt install python3.11
+        apt update
+        apt install -y python3.11 python3.11-venv python3.11-dev
+        
+        echo "Linking python to python 3.11"
         update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
+        
+        # Ensure pip is installed
+        python3.11 -m ensurepip --upgrade
+        
+        # Install necessary packages
+        python -m pip install --upgrade pip
         python -m pip install cffi
         python -m pip install cryptography
+
+        # Install bittensor
+        python -m pip install bittensor
     fi
 
     # check if PDM is installed
@@ -156,22 +177,16 @@ install_postgresql() {
     fi
 }
 
-# install btcli
-install_btcli() {
-    if command -v btcli &> /dev/null
-    then
-        ohai "BtCLI is already installed."
-    else
-        ohai "Installing BtCLI..."
-
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/opentensor/bittensor/master/scripts/install.sh)"
-    fi
-}
-
 # install miner dependencies
 install_miner_dependencies() {
-  cd neurons/miners
-  pdm install
+  # Get the directory of the current script
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  
+  # Specify the PDM root path
+  PDM_ROOT_PATH="$SCRIPT_DIR/../neurons/miners"
+  
+  # Install PDM dependencies in the specified path where pyproject.toml exists
+  pdm install --cwd "$PDM_ROOT_PATH"
 }
 
 ohai "This script will install:"
@@ -186,5 +201,4 @@ wait_for_user
 install_pre
 install_python
 install_postgresql
-install_btcli
 install_miner_dependencies
