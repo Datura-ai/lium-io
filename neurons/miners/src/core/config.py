@@ -23,8 +23,8 @@ class Settings(BaseSettings):
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     
-    IP_ADDRESS: str = Field(env="IP_ADDRESS")
-    PORT: int = Field(env="PORT", default=8000)
+    IP_ADDRESS: str = Field(env="EXTERNAL_IP_ADDRESS")
+    PORT: int = Field(env="INTERNAL_PORT", default=8000)
     EXTERNAL_PORT: int = Field(env="EXTERNAL_PORT", default=8000)
     
     SSH_PORT: int = Field(env="SSH_PORT", default=22)

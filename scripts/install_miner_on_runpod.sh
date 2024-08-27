@@ -68,7 +68,7 @@ wait_for_user() {
 install_pre() {
     apt update
     apt upgrade
-    apt install --no-install-recommends --no-install-suggests -y apt-utils curl git cmake build-essential
+    apt install --no-install-recommends --no-install-suggests -y apt-utils curl git cmake build-essential nano
     exit_on_error $?
 }
 
@@ -94,7 +94,8 @@ install_python() {
             pip install cryptography
 
             # Install bittensor
-            python -m pip install bittensor
+            pip install bittensor
+            pip install bittensor[torch]
         fi
     else
         ohai "Installing Python 3.11..."
@@ -115,6 +116,7 @@ install_python() {
 
         # Install bittensor
         pip install bittensor
+        pip install bittensor[torch]
     fi
 
     # check if PDM is installed
