@@ -25,7 +25,7 @@ class Miner:
 
         self.axon = bittensor.axon(
             wallet=self.wallet,
-            external_port=settings.PORT,
+            external_port=settings.EXTERNAL_PORT,
             external_ip=settings.IP_ADDRESS,
             port=settings.PORT,
             ip=settings.IP_ADDRESS,
