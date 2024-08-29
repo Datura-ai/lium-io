@@ -23,10 +23,16 @@ logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
 
-class MinerRequestPayload(BaseModel):
+class MinerJobRequestPayload(BaseModel):
     miner_hotkey: str
     miner_address: str
     miner_port: int
+    
+class MinerResourceRequestPayload(BaseModel):
+    miner_hotkey: str
+    miner_address: str
+    miner_port: int
+    docker_image: str
 
 class MinerService:
     def __init__(
@@ -37,10 +43,7 @@ class MinerService:
         self.ssh_service = ssh_service
         self.task_service = task_service
         
-    # async def request_resource_to_miner(self, payload: MinerRequestPayload):
-    #     await asyncio.to_thread(self._request_resource_to_miner, payload)
-
-    async def request_resource_to_miner(self, payload: MinerRequestPayload):
+    async def request_job_to_miner(self, payload: MinerJobRequestPayload):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
 
@@ -51,24 +54,10 @@ class MinerService:
             miner_hotkey=payload.miner_hotkey,
             my_hotkey=my_key.ss58_address,
             keypair=my_key,
+            miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/jobs/{my_key.ss58_address}"
         )
 
         async with miner_client:
-            # try:
-            #     msg = await asyncio.wait_for(
-            #         miner_client.job_state.miner_ready_or_declining_future, JOB_LENGTH
-            #     )
-            # except TimeoutError:
-            #     msg = None
-            #
-            # if isinstance(msg, DeclineJobRequest) or msg is None:
-            #     logger.info(f"Miner {miner_client.miner_name} won't do job: {msg}")
-            #     return
-            # elif isinstance(msg, AcceptJobRequest):
-            #     logger.info(f"Miner {miner_client.miner_name} will do job: {msg}")
-            # else:
-            #     raise ValueError(f"Unexpected msg: {msg}")
-
             # generate ssh key and send it to miner
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
             await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
@@ -99,6 +88,45 @@ class MinerService:
                 return
             elif isinstance(msg, DeclineJobRequest):
                 logger.info(f"Miner {miner_client.miner_name} job declined: {msg}")
+                return
+            else:
+                raise ValueError(f"Unexpected msg: {msg}")
+            
+    async def request_resource_to_miner(self, payload: MinerResourceRequestPayload):
+        loop = asyncio.get_event_loop()
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+
+        miner_client = MinerClient(
+            loop=loop,
+            miner_address=payload.miner_address,
+            miner_port=payload.miner_port,
+            miner_hotkey=payload.miner_hotkey,
+            my_hotkey=my_key.ss58_address,
+            keypair=my_key,
+            miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/resources/{my_key.ss58_address}"
+        )
+
+        async with miner_client:
+            # generate ssh key and send it to miner
+            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
+
+            logger.info("Sent SSH key to miner %s", miner_client.miner_name)
+
+            try:
+                msg = await asyncio.wait_for(
+                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future, JOB_LENGTH
+                )
+            except TimeoutError:
+                msg = None
+
+            if isinstance(msg, AcceptSSHKeyRequest):
+                logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+
+                
+                await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
+            elif isinstance(msg, FailedRequest):
+                logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
                 return
             else:
                 raise ValueError(f"Unexpected msg: {msg}")

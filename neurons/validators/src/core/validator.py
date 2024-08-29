@@ -8,7 +8,7 @@ from core.config import settings
 from core.db import get_db
 from services.ssh_service import SSHService
 from services.task_service import TaskService
-from services.miner_service import MinerService, MinerRequestPayload
+from services.miner_service import MinerService, MinerJobRequestPayload
 from daos.task import TaskDao
 import numpy as np
 
@@ -129,7 +129,7 @@ class Validator():
         jobs = [
             asyncio.create_task(
                 asyncio.wait_for(
-                self.miner_service.request_resource_to_miner(payload=MinerRequestPayload(
+                self.miner_service.request_job_to_miner(payload=MinerJobRequestPayload(
                     miner_hotkey=miner.hotkey,
                     miner_address=miner.axon_info.ip,
                     miner_port=miner.axon_info.port

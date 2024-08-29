@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Response
-from services.miner_service import MinerRequestPayload
+from services.miner_service import MinerJobRequestPayload
 
 from services.miner_service import MinerServiceDep
 from services.task_service import TaskServiceDep
@@ -7,12 +7,12 @@ from services.task_service import TaskServiceDep
 apis_router = APIRouter()
 
 
-@apis_router.post("/miner_request")
-async def request_resource_to_miner(
-    miner_payload: MinerRequestPayload, miner_service: MinerServiceDep
+@apis_router.post("/miner_job_request")
+async def request_job_to_miner(
+    miner_payload: MinerJobRequestPayload, miner_service: MinerServiceDep
 ):
     """Requesting resource to miner."""
-    await miner_service.request_resource_to_miner(miner_payload)
+    await miner_service.request_job_to_miner(miner_payload)
 
 
 @apis_router.get("/tasks/{uuid}/download")

@@ -33,4 +33,4 @@ app = FastAPI(
 app.include_router(validator_router)
 
 if __name__ == "__main__":
-    uvicorn.run("miner:app", host="0.0.0.0", port=settings.PORT, reload=True)
+    uvicorn.run("miner:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=True)

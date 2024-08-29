@@ -4,7 +4,6 @@ import io
 import logging
 import time
 import asyncio
-from asgiref.sync import sync_to_async
 
 import bittensor
 from daos.task import TaskDao
