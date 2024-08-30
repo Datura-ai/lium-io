@@ -15,8 +15,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-SYNC_CYCLE = 2 * 60
-WEIGHT_MAX_COUNTER = 5
+SYNC_CYCLE = 10 * 60
+WEIGHT_MAX_COUNTER = 6
 
 class Validator():
     wallet: bittensor.wallet

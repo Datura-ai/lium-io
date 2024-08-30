@@ -25,4 +25,5 @@ async def validator_interface(
 
 @validator_router.websocket("/resources/{validator_key}")
 async def validator_interface(consumer: Annotated[ValidatorConsumer, Depends(ValidatorConsumer)]):
+    await consumer.connect()
     await consumer.handle()

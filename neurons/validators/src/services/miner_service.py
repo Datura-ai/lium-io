@@ -17,6 +17,7 @@ from fastapi import Depends
 from core.config import settings
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.docker_service import DockerService, ResourceType
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +28,14 @@ class MinerJobRequestPayload(BaseModel):
     miner_hotkey: str
     miner_address: str
     miner_port: int
-    
+
 class MinerResourceRequestPayload(BaseModel):
     miner_hotkey: str
     miner_address: str
     miner_port: int
     docker_image: str
+    public_key: str
+    resources: ResourceType
 
 class MinerService:
     def __init__(
@@ -42,6 +45,9 @@ class MinerService:
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
+        self.docker_service = DockerService(
+            ssh_service=ssh_service
+        )
         
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
         loop = asyncio.get_event_loop()
@@ -123,7 +129,16 @@ class MinerService:
             if isinstance(msg, AcceptSSHKeyRequest):
                 logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
 
-                
+                await self.docker_service.create_docker(
+                    miner_address=payload.miner_address,
+                    miner_hotkey=payload.miner_hotkey,
+                    msg=msg,
+                    keypair=my_key,
+                    private_key=private_key.decode('utf-8'),
+                    docker_image=payload.docker_image,
+                    public_key=payload.public_key,
+                    resources=payload.resources,
+                )
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
                 logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")

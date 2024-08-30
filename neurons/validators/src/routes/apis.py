@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Response
-from services.miner_service import MinerJobRequestPayload
+from services.miner_service import MinerJobRequestPayload, MinerResourceRequestPayload
 
 from services.miner_service import MinerServiceDep
 from services.task_service import TaskServiceDep
@@ -15,6 +15,13 @@ async def request_job_to_miner(
     await miner_service.request_job_to_miner(miner_payload)
 
 
+@apis_router.post("/miner_resource_request")
+async def request_resource_to_miner(
+    miner_payload: MinerResourceRequestPayload, miner_service: MinerServiceDep
+):
+    """Requesting resource to miner."""
+    await miner_service.request_resource_to_miner(miner_payload)
+    
 @apis_router.get("/tasks/{uuid}/download")
 async def download_private_key_for_task(uuid: str, task_service: TaskServiceDep):
     """Download private key for given task."""
