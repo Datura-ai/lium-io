@@ -45,7 +45,7 @@ class Validator():
     def get_subtensor(self):
         return bittensor.subtensor(config=self.config)
         
-    async def check_registered(self, subtensor: bittensor.subtensor):
+    def check_registered(self, subtensor: bittensor.subtensor):
         if not subtensor.is_hotkey_registered(
             netuid=self.netuid,
             hotkey_ss58=self.wallet.get_hotkey().ss58_address,
@@ -57,11 +57,20 @@ class Validator():
             exit()
         bittensor.logging.info('Validator is registered')
             
-    async def fetch_minors(self, subtensor: bittensor.subtensor):
+    def fetch_minors(self, subtensor: bittensor.subtensor):
         metagraph = subtensor.metagraph(netuid=self.netuid)
         miners = [neuron for neuron in metagraph.neurons if neuron.axon_info.is_serving]
         
         return miners
+    
+    def get_my_uid(self, subtensor: bittensor.subtensor):
+        return subtensor.get_uid_for_hotkey_on_subnet(hotkey_ss58=self.wallet.get_hotkey().ss58_address, netuid=self.netuid)
+    
+    def get_me(self, subtensor: bittensor.subtensor):
+        metagraph = subtensor.metagraph(netuid=self.netuid)
+        neurons = [neuron for neuron in metagraph.neurons if neuron.hotkey == self.wallet.get_hotkey().ss58_address]
+        
+        return neurons[0]
     
     def set_weights(self, miners, subtensor: bittensor.subtensor):
         avg_scores = self.task_dao.get_avg_scores_in_hours(24)
@@ -96,31 +105,45 @@ class Validator():
         bittensor.logging.info(f"uint_uids: {uint_uids}")
         bittensor.logging.info(f"uint_weights: {uint_weights}")
         
-        result, msg = subtensor.set_weights(
-            wallet=self.wallet,
-            netuid=self.netuid,
-            uids=uint_uids,
-            weights=uint_weights,
-            wait_for_finalization=False,
-            wait_for_inclusion=False,
-        )
-        if result is True:
-            bittensor.logging.info("set_weights on chain successfully!")
-        else:
-            bittensor.logging.error("set_weights failed", msg)
+        uid = self.get_my_uid(subtensor)
+        
+        # current_block = subtensor.get_current_block()
+        # last_block = metagraph.last_update[uid]
+        # bittensor.logging.info(f"current block: {current_block}, last block: {last_block}")
+        
+        blocks_since_last_update = subtensor.blocks_since_last_update(netuid=self.netuid, uid=uid)
+        tempo = subtensor.tempo(netuid=self.netuid)
+        bittensor.logging.info(f"blocks_since_last_update: {blocks_since_last_update}, tempo: {tempo}")
+
+        # current_weights = [list for id, list in subtensor.weights(netuid=self.netuid) if id ==  uid][0]
+        # bittensor.logging.info(f"current_weights block: {current_weights}")
+        
+        if blocks_since_last_update > tempo:
+            result, msg = subtensor.set_weights(
+                wallet=self.wallet,
+                netuid=self.netuid,
+                uids=uint_uids,
+                weights=uint_weights,
+                wait_for_finalization=False,
+                wait_for_inclusion=False,
+            )
+            if result is True:
+                bittensor.logging.info("set_weights on chain successfully!")
+            else:
+                bittensor.logging.error("set_weights failed", msg)
     
     async def sync(self):
         self.weight_counter += 1
 
         subtensor = self.get_subtensor()
         # check registered
-        await self.check_registered(subtensor)
+        self.check_registered(subtensor)
 
         # fetch miners
-        miners = await self.fetch_minors(subtensor)
-        for miner in miners:
-            bittensor.logging.info(f"miner {miner.hotkey}")
-        
+        miners = self.fetch_minors(subtensor)
+        # for miner in miners:
+        #     bittensor.logging.info(f"miner {miner.hotkey}")
+
         if self.weight_counter >= WEIGHT_MAX_COUNTER:
             self.weight_counter = 0
             self.set_weights(miners, subtensor)
