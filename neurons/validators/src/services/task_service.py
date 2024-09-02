@@ -109,7 +109,7 @@ class TaskService:
         ftp_client.close()
         ssh_client.close()
         
-        return json.loads(results)
+        return json.loads(results[0].strip())
         
         
     def _run_task(
