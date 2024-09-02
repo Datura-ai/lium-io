@@ -80,13 +80,14 @@ class MinerService:
             if isinstance(msg, AcceptSSHKeyRequest):
                 logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
 
-                await self.task_service.create_task(
+                machine_specs = await self.task_service.create_task(
                     miner_address=payload.miner_address,
                     miner_hotkey=payload.miner_hotkey,
                     msg=msg,
                     keypair=my_key,
                     private_key=private_key.decode('utf-8')
                 )
+                logger.info(f"miner {payload.miner_hotkey} machine specs => {machine_specs}")
                 
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
