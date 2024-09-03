@@ -8,9 +8,10 @@ from core.config import settings
 from core.db import get_db
 from services.ssh_service import SSHService
 from services.task_service import TaskService
-from services.miner_service import MinerService, MinerJobRequestPayload
+from services.miner_service import MinerService
 from daos.task import TaskDao
 import numpy as np
+from payload_models.payloads import MinerJobRequestPayload
 
 
 logger = logging.getLogger(__name__)
