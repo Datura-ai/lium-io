@@ -41,6 +41,7 @@ class MinerClient(abc.ABC):
         miner_hotkey: str,
         miner_port: int,
         keypair: bittensor.Keypair,
+        miner_url: str,
     ):
         self.debounce_counter = 0
         self.max_debounce_count: int | None = 5  # set to None for unlimited debounce
@@ -55,11 +56,10 @@ class MinerClient(abc.ABC):
         self.miner_address = miner_address
         self.miner_port = miner_port
         self.keypair = keypair
+        
+        self.miner_url = miner_url
 
         self.job_state = JobState()
-
-    def miner_url(self) -> str:
-        return f"ws://{self.miner_address}:{self.miner_port}/validator/{self.my_hotkey}"
 
     def accepted_request_type(self) -> type[BaseRequest]:
         return BaseMinerRequest
@@ -105,7 +105,7 @@ class MinerClient(abc.ABC):
         )
 
     async def _connect(self):
-        ws = await websockets.connect(self.miner_url(), max_size=50 * (2**20))  # 50MB
+        ws = await websockets.connect(self.miner_url, max_size=50 * (2**20))  # 50MB
         await ws.send(self.generate_authentication_message().json())
         return ws
 

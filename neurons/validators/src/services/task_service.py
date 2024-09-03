@@ -4,7 +4,7 @@ import io
 import logging
 import time
 import asyncio
-from asgiref.sync import sync_to_async
+import json
 
 import bittensor
 from daos.task import TaskDao
@@ -56,13 +56,14 @@ class TaskService:
         ssh_client.connect(hostname=miner_address, username=msg.ssh_username, look_for_keys=False, pkey=pkey, port=msg.ssh_port)
         ssh_client.exec_command(f"mkdir -p {msg.root_dir}/temp")
 
+        # run synthetic job
+        ftp_client=ssh_client.open_sftp()
+        
         timestamp = int(time.time())
-        local_file_path = str(Path(__file__).parent / ".." / "job.py")
+        local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
         remote_file_path = f"{msg.root_dir}/temp/job_{timestamp}.py"
 
-        ftp_client=ssh_client.open_sftp()
         ftp_client.put(local_file_path, remote_file_path)
-        ftp_client.close()
         
         start_time = time.time()
         # results, err = await sync_to_async(self._run_task)(ssh_client, msg, remote_file_path)
@@ -79,25 +80,37 @@ class TaskService:
                 task_status=TaskStatus.Failed,
                 score=0,
             )
+        else:
+            job_taken_time = results[-1]
+            try:
+                job_taken_time = float(job_taken_time.strip())
+            except:
+                job_taken_time = end_time - start_time
             
-            return
-
-        job_taken_time = results[-1]
-        try:
-            job_taken_time = float(job_taken_time.strip())
-        except:
-            job_taken_time = end_time - start_time
+            logger.info(f"job_taken_time: {job_taken_time}")
+            
+            # update task with results
+            self.task_dao.update(
+                uuid=task.uuid,
+                task_status=TaskStatus.Finished,
+                proceed_time=job_taken_time,
+                score= 1 / job_taken_time if job_taken_time > 0 else 0,
+            )
+            
+        # get machine specs
+        timestamp = int(time.time())
+        local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py")
+        remote_file_path = f"{msg.root_dir}/temp/job_{timestamp}.py"
         
-        logger.info(f"job_taken_time: {job_taken_time}")
+        ftp_client.put(local_file_path, remote_file_path)
+        
+        results, _ = await asyncio.to_thread(self._run_task, ssh_client, msg, remote_file_path)
+        
+        ftp_client.close()
         ssh_client.close()
         
-        # update task with results
-        self.task_dao.update(
-            uuid=task.uuid,
-            task_status=TaskStatus.Finished,
-            proceed_time=job_taken_time,
-            score= 1 / job_taken_time if job_taken_time > 0 else 0,
-        )
+        return json.loads(results[0].strip())
+        
         
     def _run_task(
         self,
