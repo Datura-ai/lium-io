@@ -75,7 +75,7 @@ class DockerService:
         )
         
         # logger.info('Pulling docker image')
-        # ssh_client.exec_command(f"sudo docker pull {payload.docker_image}")
+        # ssh_client.exec_command(f"docker pull {payload.docker_image}")
         
         # generate port maps
         port_maps = self.generate_portMappings()
@@ -85,12 +85,12 @@ class DockerService:
         uuid = uuid4()
         logger.info('Create docker volume')
         volume_name = f'volume_{uuid}'
-        ssh_client.exec_command(f"sudo docker volume create {volume_name}")
+        ssh_client.exec_command(f"docker volume create {volume_name}")
         
         # creat docker container with the port map & resource
         logger.info('Create docker container')
         container_name = f'container_{uuid}'
-        ssh_client.exec_command(f'sudo docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}')
+        ssh_client.exec_command(f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}')
         
         ssh_client.close()
         
@@ -118,7 +118,7 @@ class DockerService:
         )
 
         logger.info("stop container")
-        ssh_client.exec_command(f"sudo docker stop {payload.container_name}")
+        ssh_client.exec_command(f"docker stop {payload.container_name}")
         
         ssh_client.close()
             
@@ -140,7 +140,7 @@ class DockerService:
         )
 
         logger.info("stop container")
-        ssh_client.exec_command(f"sudo docker start {payload.container_name}")
+        ssh_client.exec_command(f"docker start {payload.container_name}")
         
         ssh_client.close()
             
@@ -162,10 +162,10 @@ class DockerService:
         )
         
         logger.info("delete container")
-        ssh_client.exec_command(f"sudo docker stop {payload.container_name}")
-        ssh_client.exec_command(f"sudo docker rm {payload.container_name} -f")
+        ssh_client.exec_command(f"docker stop {payload.container_name}")
+        ssh_client.exec_command(f"docker rm {payload.container_name} -f")
         
         logger.info("delete volume")
-        ssh_client.exec_command(f"sudo docker volume rm {payload.volume_name}")
+        ssh_client.exec_command(f"docker volume rm {payload.volume_name}")
         
         ssh_client.close()
