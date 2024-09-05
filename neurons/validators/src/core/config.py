@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     
     PORT: int = Field(env="PORT", default=8000)
+    
+    APP_WS_URI: Optional[str] = Field(env="APP_WS_URI", default=None)
 
     class Config:
         env_file = ".env"
