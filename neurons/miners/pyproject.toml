@@ -21,6 +21,7 @@ dependencies = [
     "numpy<2.0.0",
     "datasets>=2.20.0",
     "transformers>=4.43.4",
+    "click>=8.1.7",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"

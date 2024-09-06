@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
 
+from models.executor import *  # noqa
 from models.validator import *  # noqa
 
 # this is the Alembic Config object, which provides
@@ -33,6 +34,7 @@ target_metadata = SQLModel.metadata
 current_dir = Path(__file__).parent
 
 load_dotenv(str(current_dir / ".." / ".env"))
+
 
 def get_url():
     url = os.getenv("SQLALCHEMY_DATABASE_URI")
