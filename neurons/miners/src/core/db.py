@@ -10,8 +10,7 @@ engine = create_engine(str(settings.SQLALCHEMY_DATABASE_URI))
 
 
 def get_db() -> Generator[Session, None, None]:
-    with Session(engine) as session:
-        yield session
+    return Session(engine)
 
 
 SessionDep = Annotated[Session, Depends(get_db)]

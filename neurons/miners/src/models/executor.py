@@ -13,3 +13,6 @@ class Executor(SQLModel, table=True):
     address: str
     port: int
     validator: str
+
+    def __str__(self):
+        return f"{self.address}:{self.port}"

@@ -1,5 +1,6 @@
 import enum
 
+import pydantic
 from datura.requests.base import BaseRequest
 
 
@@ -13,6 +14,12 @@ class RequestType(enum.Enum):
     SSHKeyRemoved = "SSHKeyRemoved"
 
 
+class Executor:
+    uuid: str
+    address: str
+    port: int
+
+
 class BaseMinerRequest(BaseRequest):
     message_type: RequestType
 
@@ -24,18 +31,23 @@ class GenericError(BaseMinerRequest):
 
 class AcceptJobRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.AcceptJobRequest
+    executors: list[Executor]
 
 
 class DeclineJobRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.DeclineJobRequest
 
 
-class AcceptSSHKeyRequest(BaseMinerRequest):
-    message_type: RequestType = RequestType.AcceptSSHKeyRequest
+class ExecutorSSHInfo(pydantic.BaseModel):
     ssh_username: str
     ssh_port: int
     python_path: str
     root_dir: str
+
+
+class AcceptSSHKeyRequest(BaseMinerRequest):
+    message_type: RequestType = RequestType.AcceptSSHKeyRequest
+    executors: list[ExecutorSSHInfo]
 
 
 class SSHKeyRemoved(BaseMinerRequest):
