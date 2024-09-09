@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 async def async_add_executor(address: str, port: int, validator: str):
     """Add executor machine to the database"""
     logger.info("Add an new executor (%s:%d) that opens to validator(%s)", address, port, validator)
-    executor_dao = ExecutorDao(session=get_db())
+    executor_dao = ExecutorDao(session=next(get_db()))
     try:
         executor = executor_dao.save(
             Executor(uuid=uuid.uuid4(), address=address, port=port, validator=validator)
