@@ -1,28 +1,29 @@
+import asyncio
 import logging
 import time
-import sys
-import asyncio
 from typing import Annotated
-from pathlib import Path
 
 import bittensor
 from datura.consumers.base import BaseConsumer
 from datura.requests.miner_requests import (
+    AcceptJobRequest,
     AcceptSSHKeyRequest,
+    DeclineJobRequest,
+    Executor,
+    ExecutorSSHInfo,
     FailedRequest,
     UnAuthorizedRequest,
-    SSHKeyRemoved,
-    DeclineJobRequest,
 )
 from datura.requests.validator_requests import (
     AuthenticateRequest,
     BaseValidatorRequest,
-    SSHPubKeySubmitRequest,
     SSHPubKeyRemoveRequest,
+    SSHPubKeySubmitRequest,
 )
 from fastapi import Depends, WebSocket
 
 from core.config import settings
+from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
 from services.validator_service import ValidatorService
 
@@ -39,10 +40,12 @@ class ValidatorConsumer(BaseConsumer):
         validator_key: str,
         ssh_service: Annotated[MinerSSHService, Depends(MinerSSHService)],
         validator_service: Annotated[ValidatorService, Depends(ValidatorService)],
+        executor_service: Annotated[ExecutorService, Depends(ExecutorService)],
     ):
         super().__init__(websocket)
         self.ssh_service = ssh_service
         self.validator_service = validator_service
+        self.executor_service = executor_service
         self.validator_key = validator_key
         self.my_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
         self.validator_authenticated = False
@@ -85,9 +88,35 @@ class ValidatorConsumer(BaseConsumer):
         for msg in self.msg_queue:
             await self.handle_message(msg)
 
+    async def check_validator_allowance(self):
+        """Check if there's any executors opened for current validator.
+
+        If there are any executors, send accept job request to validator w/ executors list
+        available for that validator.
+
+        If no executors, decline job request
+        """
+        executors = self.executor_service.get_executors_for_validator(self.validator_key)
+        if len(executors):
+            logger.info("Found %d executors for validator(%s)", len(executors), self.validator_key)
+            await self.send_message(
+                AcceptJobRequest(
+                    executors=[
+                        Executor(uuid=executor.uuid, address=executor.address, port=executor.port)
+                        for executor in executors
+                    ]
+                )
+            )
+        else:
+            logger.info("Not found any executors for validator(%s)", self.validator_key)
+            await self.send_message(DeclineJobRequest())
+            await self.disconnect()
+
     async def handle_message(self, msg: BaseValidatorRequest):
         if isinstance(msg, AuthenticateRequest):
             await self.handle_authentication(msg)
+            if self.validator_authenticated:
+                await self.check_validator_allowance()
             return
 
         # TODO: update logic here, fow now, it sends AcceptJobRequest regardless
@@ -103,32 +132,28 @@ class ValidatorConsumer(BaseConsumer):
             logger.info("Validator %s sent SSH Pubkey.", self.validator_key)
 
             try:
-                self.ssh_service.add_pubkey_to_host(msg.public_key)
-                await self.send_message(
-                    AcceptSSHKeyRequest(
-                        ssh_username=self.ssh_service.get_current_os_user(),
-                        ssh_port=settings.SSH_PORT,
-                        python_path=sys.executable,
-                        root_dir=str(Path(__file__).resolve().parents[2])
-                    )
+                msg: SSHPubKeySubmitRequest
+                executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
+                    self.validator_key, msg.public_key
                 )
+                await self.send_message(AcceptSSHKeyRequest(executors=executors))
                 logger.info("Sent AcceptSSHKeyRequest to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e))
                 self.ssh_service.remove_pubkey_from_host(msg.public_key)
                 await self.send_message(FailedRequest(details=str(e)))
             return
-        
+
         if isinstance(msg, SSHPubKeyRemoveRequest):
             logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
             try:
-                self.ssh_service.remove_pubkey_from_host(msg.public_key)
-                # await self.send_message(SSHKeyRemoved())
+                await self.executor_service.deregister_pubkey(self.validator_key)
                 logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Failed SSHKeyRemoved request: %s", str(e))
                 await self.send_message(FailedRequest(details=str(e)))
             return
+
 
 class ValidatorConsumerManger:
     def __init__(
@@ -136,7 +161,7 @@ class ValidatorConsumerManger:
     ):
         self.active_consumer: ValidatorConsumer | None = None
         self.lock = asyncio.Lock()
-        
+
     async def addConsumer(
         self,
         websocket: WebSocket,
@@ -148,7 +173,7 @@ class ValidatorConsumerManger:
             websocket=websocket,
             validator_key=validator_key,
             ssh_service=ssh_service,
-            validator_service=validator_service
+            validator_service=validator_service,
         )
         await consumer.connect()
 
@@ -159,10 +184,10 @@ class ValidatorConsumerManger:
 
         async with self.lock:
             self.active_consumer = consumer
-            
+
             await self.active_consumer.handle()
 
             self.active_consumer = None
-        
-        
+
+
 validatorConsumerManager = ValidatorConsumerManger()

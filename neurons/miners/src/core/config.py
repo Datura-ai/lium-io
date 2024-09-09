@@ -1,8 +1,7 @@
-from typing import Optional
+import argparse
 import pathlib
 
 import bittensor
-import argparse
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,15 +17,16 @@ class Settings(BaseSettings):
     BITTENSOR_WALLET_NAME: str = Field(env="BITTENSOR_WALLET_NAME")
     BITTENSOR_WALLET_HOTKEY_NAME: str = Field(env="BITTENSOR_WALLET_HOTKEY_NAME")
     BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID")
-    BITTENSOR_CHAIN_ENDPOINT: Optional[str] = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
+    BITTENSOR_CHAIN_ENDPOINT: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK")
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
-    
+
     EXTERNAL_IP_ADDRESS: str = Field(env="EXTERNAL_IP_ADDRESS")
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     EXTERNAL_PORT: int = Field(env="EXTERNAL_PORT", default=8000)
-    
+    DEBUG: bool = Field(env="DEBUG", default=False)
+
     SSH_PORT: int = Field(env="SSH_PORT", default=22)
 
     class Config:
@@ -42,17 +42,20 @@ class Settings(BaseSettings):
         )
         wallet.hotkey_file.get_keypair()  # this raises errors if the keys are inaccessible
         return wallet
-    
+
     def get_bittensor_config(self) -> bittensor.config:
         parser = argparse.ArgumentParser()
         # bittensor.wallet.add_args(parser)
         # bittensor.subtensor.add_args(parser)
         # bittensor.logging.add_args(parser)
         # bittensor.axon.add_args(parser)
-        
+
         if self.BITTENSOR_NETWORK:
-            if '--subtensor.network' in parser._option_string_actions:
-                parser._handle_conflict_resolve(None, [('--subtensor.network', parser._option_string_actions['--subtensor.network'])])
+            if "--subtensor.network" in parser._option_string_actions:
+                parser._handle_conflict_resolve(
+                    None,
+                    [("--subtensor.network", parser._option_string_actions["--subtensor.network"])],
+                )
 
             parser.add_argument(
                 "--subtensor.network",
@@ -60,10 +63,18 @@ class Settings(BaseSettings):
                 help="network",
                 default=self.BITTENSOR_NETWORK,
             )
-            
+
         if self.BITTENSOR_CHAIN_ENDPOINT:
-            if '--subtensor.chain_endpoint' in parser._option_string_actions:
-                parser._handle_conflict_resolve(None, [('--subtensor.chain_endpoint', parser._option_string_actions['--subtensor.chain_endpoint'])])
+            if "--subtensor.chain_endpoint" in parser._option_string_actions:
+                parser._handle_conflict_resolve(
+                    None,
+                    [
+                        (
+                            "--subtensor.chain_endpoint",
+                            parser._option_string_actions["--subtensor.chain_endpoint"],
+                        )
+                    ],
+                )
 
             parser.add_argument(
                 "--subtensor.chain_endpoint",
@@ -71,8 +82,8 @@ class Settings(BaseSettings):
                 help="chain endpoint",
                 default=self.BITTENSOR_CHAIN_ENDPOINT,
             )
-            
+
         return bittensor.config(parser)
-        
+
 
 settings = Settings()
