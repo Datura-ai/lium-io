@@ -9,7 +9,7 @@ from fastapi import Depends
 from core.config import settings
 from services.ssh_service import SSHService
 
-from payloads.miner import SSHkeyPayload
+from payloads.miner import MinerAuthPayload
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class MinerService:
     ):
         self.ssh_service = ssh_service
 
-    async def upload_ssh_key(self, paylod: SSHkeyPayload):
+    async def upload_ssh_key(self, paylod: MinerAuthPayload):
         self.ssh_service.add_pubkey_to_host(paylod.public_key)
 
         return {
@@ -31,5 +31,5 @@ class MinerService:
             "root_dir": str(Path(__file__).resolve().parents[2])
         }
 
-    async def remove_ssh_key(self, paylod: SSHkeyPayload):
+    async def remove_ssh_key(self, paylod: MinerAuthPayload):
         return self.ssh_service.remove_pubkey_from_host(paylod.public_key)

@@ -5,7 +5,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import ValidationError
 
 from core.config import settings
-from payloads.miner import SSHkeyPayload
+from payloads.miner import MinerAuthPayload
 
 from fastapi.responses import JSONResponse
 
@@ -22,7 +22,7 @@ class MinerMiddleware(BaseHTTPMiddleware):
             miner_ip = request.client.host
 
             # Parse it into the Pydantic model
-            payload = SSHkeyPayload.model_validate_json(body_bytes)
+            payload = MinerAuthPayload.model_validate_json(body_bytes)
             logger.info(f"miner ip: {miner_ip}")
 
             if miner_ip != settings.MINER_IP_ADDRESS:
