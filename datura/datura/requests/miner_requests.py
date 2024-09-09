@@ -14,7 +14,7 @@ class RequestType(enum.Enum):
     SSHKeyRemoved = "SSHKeyRemoved"
 
 
-class Executor:
+class Executor(pydantic.BaseModel):
     uuid: str
     address: str
     port: int
