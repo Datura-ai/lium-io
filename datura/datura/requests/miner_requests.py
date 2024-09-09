@@ -39,6 +39,7 @@ class DeclineJobRequest(BaseMinerRequest):
 
 
 class ExecutorSSHInfo(pydantic.BaseModel):
+    uuid: str
     ssh_username: str
     ssh_port: int
     python_path: str

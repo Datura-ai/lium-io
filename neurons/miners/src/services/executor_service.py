@@ -52,6 +52,7 @@ class ExecutorService:
                         executor.port,
                         json.dumps(response_obj),
                     )
+                    response_obj["uuid"] = str(executor.uuid)
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(
