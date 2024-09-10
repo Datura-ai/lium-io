@@ -1,51 +1,59 @@
-import logging
 import asyncio
+import logging
 import traceback
 
 import bittensor
-from bittensor.utils.weight_utils import process_weights_for_netuid, convert_weights_and_uids_for_emit
+import numpy as np
+from bittensor.utils.weight_utils import (
+    convert_weights_and_uids_for_emit,
+    process_weights_for_netuid,
+)
+from payload_models.payloads import MinerJobRequestPayload
+from substrateinterface import SubstrateInterface
+
 from core.config import settings
 from core.db import get_db
+from daos.task import TaskDao
+from services.miner_service import MinerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
-from services.miner_service import MinerService
-from daos.task import TaskDao
-import numpy as np
-from payload_models.payloads import MinerJobRequestPayload
-
 
 logger = logging.getLogger(__name__)
 
-SYNC_CYCLE = 10 * 60
+SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
 
-class Validator():
+
+class Validator:
     wallet: bittensor.wallet
     subtensor: bittensor.subtensor
     netuid: int
-    
+
     def __init__(self):
         self.config = settings.get_bittensor_config()
 
         self.wallet = settings.get_bittensor_wallet()
         self.netuid = settings.BITTENSOR_NETUID
-        
+        self.subtensor = bittensor.subtensor(config=self.config)
+        self.metagraph = self.subtensor.metagraph(netuid=self.netuid)
+        self.my_uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+        self.node = SubstrateInterface(url=self.config.subtensor.chain_endpoint)
+
         self.should_exit = False
         self.is_running = False
-        
+
         # set miner service
         session = next(get_db())
         self.task_dao = TaskDao(session=session)
 
+        # Get network tempo
+        self.tempo = self.subtensor.tempo(self.netuid)
+        self.weights_rate_limit = self.get_weights_rate_limit()
+
         ssh_service = SSHService()
         task_service = TaskService(task_dao=self.task_dao, ssh_service=ssh_service)
         self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service)
-        
-        self.weight_counter = 0
-        
-    def get_subtensor(self):
-        return bittensor.subtensor(config=self.config)
-        
+
     def check_registered(self, subtensor: bittensor.subtensor):
         if not subtensor.is_hotkey_registered(
             netuid=self.netuid,
@@ -56,26 +64,30 @@ class Validator():
                 f" Please register the hotkey using `btcli subnets register` before trying again"
             )
             exit()
-        bittensor.logging.info('Validator is registered')
-            
-    def fetch_minors(self, subtensor: bittensor.subtensor):
+        bittensor.logging.info("Validator is registered")
+
+    def fetch_miners(self, subtensor: bittensor.subtensor):
         metagraph = subtensor.metagraph(netuid=self.netuid)
-        miners = [neuron for neuron in metagraph.neurons if neuron.axon_info.is_serving]
-        
+        miners = [
+            neuron
+            for neuron in metagraph.neurons
+            if neuron.axon_info.is_serving
+            and (
+                not settings.DEBUG
+                or not settings.DEBUG_MINER_HOTKEY
+                or settings.DEBUG_MINER_HOTKEY == neuron.axon_info.hotkey
+            )
+        ]
         return miners
-    
+
     def get_my_uid(self, subtensor: bittensor.subtensor):
-        return subtensor.get_uid_for_hotkey_on_subnet(hotkey_ss58=self.wallet.get_hotkey().ss58_address, netuid=self.netuid)
-    
-    def get_me(self, subtensor: bittensor.subtensor):
-        metagraph = subtensor.metagraph(netuid=self.netuid)
-        neurons = [neuron for neuron in metagraph.neurons if neuron.hotkey == self.wallet.get_hotkey().ss58_address]
-        
-        return neurons[0]
-    
+        return subtensor.get_uid_for_hotkey_on_subnet(
+            hotkey_ss58=self.wallet.get_hotkey().ss58_address, netuid=self.netuid
+        )
+
     def set_weights(self, miners, subtensor: bittensor.subtensor):
         avg_scores = self.task_dao.get_avg_scores_in_hours(24)
-        
+
         hotkey_to_score = {score.miner_hotkey: score.avg_score for score in avg_scores}
 
         uids = np.zeros(len(miners), dtype=np.int64)
@@ -83,10 +95,10 @@ class Validator():
         for ind, miner in enumerate(miners):
             uids[ind] = miner.uid
             weights[ind] = hotkey_to_score.get(miner.hotkey, 0.0)
-            
+
         bittensor.logging.info(f"uids: {uids}")
         bittensor.logging.info(f"weights: {weights}")
-        
+
         metagraph = subtensor.metagraph(netuid=self.netuid)
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
@@ -95,92 +107,123 @@ class Validator():
             subtensor=subtensor,
             metagraph=metagraph,
         )
-        
+
         bittensor.logging.info(f"processed_uids: {processed_uids}")
         bittensor.logging.info(f"processed_weights: {processed_weights}")
-        
+
         uint_uids, uint_weights = convert_weights_and_uids_for_emit(
             uids=processed_uids, weights=processed_weights
         )
-        
+
         bittensor.logging.info(f"uint_uids: {uint_uids}")
         bittensor.logging.info(f"uint_weights: {uint_weights}")
-        
-        uid = self.get_my_uid(subtensor)
-        
-        # current_block = subtensor.get_current_block()
-        # last_block = metagraph.last_update[uid]
-        # bittensor.logging.info(f"current block: {current_block}, last block: {last_block}")
-        
-        blocks_since_last_update = subtensor.blocks_since_last_update(netuid=self.netuid, uid=uid)
-        tempo = subtensor.tempo(netuid=self.netuid)
-        bittensor.logging.info(f"blocks_since_last_update: {blocks_since_last_update}, tempo: {tempo}")
 
-        # current_weights = [list for id, list in subtensor.weights(netuid=self.netuid) if id ==  uid][0]
-        # bittensor.logging.info(f"current_weights block: {current_weights}")
-        
-        if blocks_since_last_update > tempo:
-            result, msg = subtensor.set_weights(
-                wallet=self.wallet,
-                netuid=self.netuid,
-                uids=uint_uids,
-                weights=uint_weights,
-                wait_for_finalization=False,
-                wait_for_inclusion=False,
+        result, msg = subtensor.set_weights(
+            wallet=self.wallet,
+            netuid=self.netuid,
+            uids=uint_uids,
+            weights=uint_weights,
+            wait_for_finalization=False,
+            wait_for_inclusion=False,
+        )
+        if result is True:
+            bittensor.logging.info("set_weights on chain successfully!")
+        else:
+            bittensor.logging.error("set_weights failed", msg)
+
+    def get_last_update(self, block):
+        try:
+            last_update_blocks = (
+                block
+                - self.node.query("SubtensorModule", "LastUpdate", [self.netuid]).value[self.my_uid]
             )
-            if result is True:
-                bittensor.logging.info("set_weights on chain successfully!")
-            else:
-                bittensor.logging.error("set_weights failed", msg)
-    
-    async def sync(self):
-        self.weight_counter += 1
+        except Exception:
+            bittensor.logging.error(f"Error getting last update: {traceback.format_exc()}")
+            # means that the validator is not registered yet. The validator should break if this is the case anyways
+            last_update_blocks = 1000
 
-        subtensor = self.get_subtensor()
+        bittensor.logging.info(f"last set weights successfully {last_update_blocks} blocks ago")
+        return last_update_blocks
+
+    def get_current_block(self):
+        return self.node.query("System", "Number", []).value
+
+    def get_weights_rate_limit(self):
+        return self.node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
+
+    async def should_set_weights(self) -> bool:
+        """Check if current block is for setting weights."""
+        try:
+            current_block = self.get_current_block()
+            last_update = self.get_last_update(current_block)
+            blocks_till_epoch = self.tempo - (current_block + self.netuid + 1) % (self.tempo + 1)
+            bittensor.logging.info(
+                "Checking should set weights(weights_rate_limit=%d, tempo=%d): current_block=%d, last_update=%d, blocks_till_epoch=%d",
+                "should_set_weights",
+                "should_set_weights",
+                self.weights_rate_limit,
+                self.tempo,
+                current_block,
+                last_update,
+                blocks_till_epoch,
+            )
+            return last_update >= self.tempo * 2 or (
+                blocks_till_epoch < 20 and last_update >= self.weights_rate_limit
+            )
+        except Exception as e:
+            bittensor.logging.error(
+                "Checking set weights failed: error=%s",
+                "should_set_weights",
+                "should_set_weights",
+                str(e),
+            )
+            return False
+
+    async def sync(self):
+        subtensor = self.subtensor
         # check registered
         self.check_registered(subtensor)
 
         # fetch miners
-        miners = self.fetch_minors(subtensor)
-        # for miner in miners:
-        #     bittensor.logging.info(f"miner {miner.hotkey}")
+        miners = self.fetch_miners(subtensor)
 
-        if self.weight_counter >= WEIGHT_MAX_COUNTER:
-            self.weight_counter = 0
+        if await self.should_set_weights():
             self.set_weights(miners, subtensor)
-        
+
         # request jobs
         jobs = [
             asyncio.create_task(
                 asyncio.wait_for(
-                self.miner_service.request_job_to_miner(payload=MinerJobRequestPayload(
-                    miner_hotkey=miner.hotkey,
-                    miner_address=miner.axon_info.ip,
-                    miner_port=miner.axon_info.port
-                )),
-                timeout=SYNC_CYCLE - 5
-            )
+                    self.miner_service.request_job_to_miner(
+                        payload=MinerJobRequestPayload(
+                            miner_hotkey=miner.hotkey,
+                            miner_address=miner.axon_info.ip,
+                            miner_port=miner.axon_info.port,
+                        )
+                    ),
+                    timeout=SYNC_CYCLE - 5,
+                )
             )
             for miner in miners
         ]
-        
+
         await asyncio.gather(*jobs, return_exceptions=True)
-        
+
     async def start(self):
-        bittensor.logging.info('Start Validator in background')
+        bittensor.logging.info("Start Validator in background")
         try:
             while not self.should_exit:
                 await self.sync()
-                
+
                 # sync every 10 mins
                 await asyncio.sleep(SYNC_CYCLE)
-                
+
         except KeyboardInterrupt:
-            logger.error('Miner killed by keyboard interrupt.')
+            logger.error("Miner killed by keyboard interrupt.")
             exit()
-        except Exception as e:
+        except Exception:
             logger.error(traceback.format_exc())
-            
+
     async def stop(self):
-        bittensor.logging.info('Stop Validator process')
+        bittensor.logging.info("Stop Validator process")
         self.should_exit = True
