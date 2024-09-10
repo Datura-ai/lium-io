@@ -10,6 +10,7 @@ from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.miner_service import MinerService
 from daos.task import TaskDao
+from daos.executor import ExecutorDao
 import numpy as np
 from payload_models.payloads import MinerJobRequestPayload
 
@@ -36,9 +37,10 @@ class Validator():
         # set miner service
         session = next(get_db())
         self.task_dao = TaskDao(session=session)
+        executor_dao = ExecutorDao(session=session)
 
         ssh_service = SSHService()
-        task_service = TaskService(task_dao=self.task_dao, ssh_service=ssh_service)
+        task_service = TaskService(task_dao=self.task_dao, ssh_service=ssh_service, executor_dao=executor_dao)
         self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service)
         
         self.weight_counter = 0

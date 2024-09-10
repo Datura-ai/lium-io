@@ -102,7 +102,7 @@ class ValidatorConsumer(BaseConsumer):
             await self.send_message(
                 AcceptJobRequest(
                     executors=[
-                        Executor(uuid=executor.uuid, address=executor.address, port=executor.port)
+                        Executor(uuid=str(executor.uuid), address=executor.address, port=executor.port)
                         for executor in executors
                     ]
                 )
@@ -147,7 +147,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, SSHPubKeyRemoveRequest):
             logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
             try:
-                await self.executor_service.deregister_pubkey(self.validator_key)
+                await self.executor_service.deregister_pubkey(self.validator_key, msg.public_key)
                 logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Failed SSHKeyRemoved request: %s", str(e))
@@ -168,12 +168,14 @@ class ValidatorConsumerManger:
         validator_key: str,
         ssh_service: Annotated[MinerSSHService, Depends(MinerSSHService)],
         validator_service: Annotated[ValidatorService, Depends(ValidatorService)],
+        executor_service: Annotated[ExecutorService, Depends(ExecutorService)],
     ):
         consumer = ValidatorConsumer(
             websocket=websocket,
             validator_key=validator_key,
             ssh_service=ssh_service,
             validator_service=validator_service,
+            executor_service=executor_service,
         )
         await consumer.connect()
 

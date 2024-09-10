@@ -35,7 +35,7 @@ class MinerService:
         self.docker_service = DockerService(
             ssh_service=ssh_service
         )
-        
+
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -52,7 +52,8 @@ class MinerService:
 
         async with miner_client:
             # generate ssh key and send it to miner
-            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            private_key, public_key = self.ssh_service.generate_ssh_key(
+                my_key.ss58_address)
             await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
             logger.info("Sent SSH key to miner %s", miner_client.miner_name)
@@ -65,27 +66,38 @@ class MinerService:
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
-                logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+                logger.info(
+                    f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
 
-                machine_specs = await self.task_service.create_task(
-                    miner_address=payload.miner_address,
-                    miner_hotkey=payload.miner_hotkey,
-                    msg=msg,
-                    keypair=my_key,
-                    private_key=private_key.decode('utf-8')
-                )
-                logger.info(f"miner {payload.miner_hotkey} machine specs => {machine_specs}")
-                
+                tasks = [
+                    asyncio.create_task(
+                        self.task_service.create_task(
+                            miner_info=payload,
+                            executor_info=executor_info,
+                            keypair=my_key,
+                            private_key=private_key.decode('utf-8')
+                        )
+                    )
+                    for executor_info in msg.executors
+                ]
+
+                results = [
+                    result for result in await asyncio.gather(*tasks, return_exceptions=True) if result
+                ]
+                logger.info(
+                    f"Miner {miner_client.miner_name} machine specs: {results}")
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
-                logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
+                logger.info(
+                    f"Miner {miner_client.miner_name} failed job: {msg}")
                 return
             elif isinstance(msg, DeclineJobRequest):
-                logger.info(f"Miner {miner_client.miner_name} job declined: {msg}")
+                logger.info(
+                    f"Miner {miner_client.miner_name} job declined: {msg}")
                 return
             else:
                 raise ValueError(f"Unexpected msg: {msg}")
-            
+
     async def create_container_to_miner(self, payload: ContainerCreateRequestPayload):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -102,7 +114,8 @@ class MinerService:
 
         async with miner_client:
             # generate ssh key and send it to miner
-            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            private_key, public_key = self.ssh_service.generate_ssh_key(
+                my_key.ss58_address)
             await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
             logger.info("Sent SSH key to miner %s", miner_client.miner_name)
@@ -115,20 +128,23 @@ class MinerService:
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
-                logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
-                
+                logger.info(
+                    f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+
                 try:
-                    result = await asyncio.to_thread(self.docker_service.create_container, payload, msg, my_key, private_key.decode('utf-8'))
+                    pass
+                    # result = await asyncio.to_thread(self.docker_service.create_container, payload, msg, my_key, private_key.decode('utf-8'))
                 except Exception as e:
                     logger.error('create container error: %s', str(e))
 
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
-                logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
+                logger.info(
+                    f"Miner {miner_client.miner_name} failed job: {msg}")
                 return
             else:
                 raise ValueError(f"Unexpected msg: {msg}")
-            
+
     async def start_container_to_miner(self, payload: ContainerStartStopRequestPayload):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -145,7 +161,8 @@ class MinerService:
 
         async with miner_client:
             # generate ssh key and send it to miner
-            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            private_key, public_key = self.ssh_service.generate_ssh_key(
+                my_key.ss58_address)
             await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
             logger.info("Sent SSH key to miner %s", miner_client.miner_name)
@@ -158,20 +175,23 @@ class MinerService:
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
-                logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
-                
+                logger.info(
+                    f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+
                 try:
-                    await asyncio.to_thread(self.docker_service.start_container, payload, msg, my_key, private_key.decode('utf-8'))
+                    pass
+                    # await asyncio.to_thread(self.docker_service.start_container, payload, msg, my_key, private_key.decode('utf-8'))
                 except Exception as e:
                     logger.error('start container error: %s', str(e))
 
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
-                logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
+                logger.info(
+                    f"Miner {miner_client.miner_name} failed job: {msg}")
                 return
             else:
                 raise ValueError(f"Unexpected msg: {msg}")
-            
+
     async def stop_container_to_miner(self, payload: ContainerStartStopRequestPayload):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -188,7 +208,8 @@ class MinerService:
 
         async with miner_client:
             # generate ssh key and send it to miner
-            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            private_key, public_key = self.ssh_service.generate_ssh_key(
+                my_key.ss58_address)
             await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
             logger.info("Sent SSH key to miner %s", miner_client.miner_name)
@@ -201,20 +222,23 @@ class MinerService:
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
-                logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
-                
+                logger.info(
+                    f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+
                 try:
-                    await asyncio.to_thread(self.docker_service.stop_container, payload, msg, my_key, private_key.decode('utf-8'))
+                    pass
+                    # await asyncio.to_thread(self.docker_service.stop_container, payload, msg, my_key, private_key.decode('utf-8'))
                 except Exception as e:
                     logger.error('start container error: %s', str(e))
 
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
-                logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
+                logger.info(
+                    f"Miner {miner_client.miner_name} failed job: {msg}")
                 return
             else:
                 raise ValueError(f"Unexpected msg: {msg}")
-            
+
     async def delete_container_to_miner(self, payload: ContainerDeleteRequestPayload):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -231,7 +255,8 @@ class MinerService:
 
         async with miner_client:
             # generate ssh key and send it to miner
-            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            private_key, public_key = self.ssh_service.generate_ssh_key(
+                my_key.ss58_address)
             await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
             logger.info("Sent SSH key to miner %s", miner_client.miner_name)
@@ -244,18 +269,22 @@ class MinerService:
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
-                logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
-                
+                logger.info(
+                    f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+
                 try:
-                    await asyncio.to_thread(self.docker_service.delete_container, payload, msg, my_key, private_key.decode('utf-8'))
+                    pass
+                    # await asyncio.to_thread(self.docker_service.delete_container, payload, msg, my_key, private_key.decode('utf-8'))
                 except Exception as e:
                     logger.error('start container error: %s', str(e))
 
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
-                logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
+                logger.info(
+                    f"Miner {miner_client.miner_name} failed job: {msg}")
                 return
             else:
                 raise ValueError(f"Unexpected msg: {msg}")
-    
+
+
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]
