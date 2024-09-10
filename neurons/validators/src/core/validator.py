@@ -13,6 +13,7 @@ from substrateinterface import SubstrateInterface
 
 from core.config import settings
 from core.db import get_db
+from daos.executor import ExecutorDao
 from daos.task import TaskDao
 from services.miner_service import MinerService
 from services.ssh_service import SSHService
@@ -45,13 +46,16 @@ class Validator:
         # set miner service
         session = next(get_db())
         self.task_dao = TaskDao(session=session)
+        executor_dao = ExecutorDao(session=session)
 
         # Get network tempo
         self.tempo = self.subtensor.tempo(self.netuid)
         self.weights_rate_limit = self.get_weights_rate_limit()
 
         ssh_service = SSHService()
-        task_service = TaskService(task_dao=self.task_dao, ssh_service=ssh_service)
+        task_service = TaskService(
+            task_dao=self.task_dao, ssh_service=ssh_service, executor_dao=executor_dao
+        )
         self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service)
 
     def check_registered(self, subtensor: bittensor.subtensor):
