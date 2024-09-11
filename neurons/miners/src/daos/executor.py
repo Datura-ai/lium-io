@@ -1,3 +1,4 @@
+from typing import Optional
 from daos.base import BaseDao
 from models.executor import Executor
 
@@ -9,7 +10,7 @@ class ExecutorDao(BaseDao):
         self.session.refresh(executor)
         return executor
 
-    def get_executors_for_validator(self, validator_key: str) -> list[Executor]:
+    def get_executors_for_validator(self, validator_key: str, executor_id: Optional[str] = None) -> list[Executor]:
         """Get executors that opened to valdiator
 
         Args:
@@ -18,4 +19,7 @@ class ExecutorDao(BaseDao):
         Return:
             List[Executor]: list of Executors
         """
+        if executor_id:
+            return list(self.session.query(Executor).filter_by(validator=validator_key, uuid=executor_id))
+
         return list(self.session.query(Executor).filter_by(validator=validator_key))

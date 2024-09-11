@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, List, Tuple
 import io
 import logging
 import random
@@ -10,8 +10,9 @@ from fastapi import Depends
 from services.ssh_service import SSHService
 from paramiko import SSHClient, AutoAddPolicy, Ed25519Key
 
-from payload_models.payloads import ContainerCreateRequestPayload, ContainerStartStopRequestPayload, ContainerDeleteRequestPayload
+from payload_models.payloads import ContainerCreateRequest, ContainerStartRequest, ContainerStopRequest, ContainerDeleteRequest, ContainerCreatedResult
 from datura.requests.miner_requests import ExecutorSSHInfo
+from daos.executor import ExecutorDao
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +21,12 @@ class DockerService:
     def __init__(
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
+        executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)],
     ):
         self.ssh_service = ssh_service
+        self.executor_dao = executor_dao
 
-    def generate_portMappings(self, start_external_port=40000):
+    def generate_portMappings(self, start_external_port=40000) -> List[Tuple[int, int]]:
         internal_ports = [22, 22140, 22141, 22142, 22143]
 
         mappings = []
@@ -63,7 +66,7 @@ class DockerService:
 
     def create_container(
         self,
-        payload: ContainerCreateRequestPayload,
+        payload: ContainerCreateRequest,
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
@@ -101,15 +104,17 @@ class DockerService:
 
         ssh_client.close()
 
-        return {
-            container_name,
-            volume_name,
-            port_maps,
-        }
+        self.executor_dao.rent(payload.executor_id, payload.miner_hotkey)
+
+        return ContainerCreatedResult(
+            container_name=container_name,
+            volume_name=volume_name,
+            port_maps=port_maps,
+        )
 
     def stop_container(
         self,
-        payload: ContainerStartStopRequestPayload,
+        payload: ContainerStopRequest,
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
@@ -130,9 +135,11 @@ class DockerService:
 
         ssh_client.close()
 
+        return
+
     def start_container(
         self,
-        payload: ContainerStartStopRequestPayload,
+        payload: ContainerStartRequest,
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
@@ -153,9 +160,11 @@ class DockerService:
 
         ssh_client.close()
 
+        return
+
     def delete_container(
         self,
-        payload: ContainerDeleteRequestPayload,
+        payload: ContainerDeleteRequest,
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
@@ -179,3 +188,7 @@ class DockerService:
         ssh_client.exec_command(f"docker volume rm {payload.volume_name}")
 
         ssh_client.close()
+
+        self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
+
+        return

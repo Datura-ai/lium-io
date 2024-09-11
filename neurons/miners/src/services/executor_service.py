@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from typing import Annotated
+from typing import Annotated, Optional
 
 import aiohttp
 import bittensor
@@ -20,8 +20,8 @@ class ExecutorService:
     def __init__(self, executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)]):
         self.executor_dao = executor_dao
 
-    def get_executors_for_validator(self, validator_hotkey: str):
-        return self.executor_dao.get_executors_for_validator(validator_hotkey)
+    def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None):
+        return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
 
     async def send_pubkey_to_executor(
         self, executor: Executor, pubkey: str
@@ -82,7 +82,7 @@ class ExecutorService:
                     "API request failed to register SSH key. url=%s, error=%s", url, str(e)
                 )
 
-    async def register_pubkey(self, validator_hotkey: str, pubkey: bytes):
+    async def register_pubkey(self, validator_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
         """Register pubkeys to executors for given validator.
 
         Args:
@@ -97,7 +97,7 @@ class ExecutorService:
                 self.send_pubkey_to_executor(executor, pubkey.decode("utf-8")),
                 name=f"{executor}.send_pubkey_to_executor",
             )
-            for executor in self.get_executors_for_validator(validator_hotkey)
+            for executor in self.get_executors_for_validator(validator_hotkey, executor_id)
         ]
 
         total_executors = len(tasks)
@@ -111,7 +111,7 @@ class ExecutorService:
         )
         return results
 
-    async def deregister_pubkey(self, validator_hotkey: str, pubkey: bytes):
+    async def deregister_pubkey(self, validator_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
         """Deregister pubkey from executors.
 
         Args:
@@ -123,6 +123,6 @@ class ExecutorService:
                 self.remove_pubkey_from_executor(executor, pubkey.decode("utf-8")),
                 name=f"{executor}.remove_pubkey_from_executor",
             )
-            for executor in self.get_executors_for_validator(validator_hotkey)
+            for executor in self.get_executors_for_validator(validator_hotkey, executor_id)
         ]
         await asyncio.gather(*tasks, return_exceptions=True)

@@ -9,6 +9,7 @@ from core.db import get_db
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.miner_service import MinerService
+from services.docker_service import DockerService
 from daos.task import TaskDao
 from daos.executor import ExecutorDao
 import numpy as np
@@ -41,7 +42,8 @@ class Validator():
 
         ssh_service = SSHService()
         task_service = TaskService(task_dao=self.task_dao, ssh_service=ssh_service, executor_dao=executor_dao)
-        self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service)
+        docker_service = DockerService(ssh_service=ssh_service, executor_dao=executor_dao)
+        self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service, docker_service=docker_service)
         
         self.weight_counter = 0
         

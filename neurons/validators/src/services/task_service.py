@@ -59,6 +59,10 @@ class TaskService:
             )
         )
 
+        executor = self.executor_dao.get_executor(executor_info.uuid, miner_info.miner_hotkey)
+        if executor.rented:
+            return None
+            
         logger.info(
             f"Create Task -> miner_address: {miner_info.miner_address}, miner_hotkey: {miner_info.miner_hotkey}")
         task = self.task_dao.save(
