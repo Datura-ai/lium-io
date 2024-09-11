@@ -43,5 +43,20 @@ def add_executor(address: str, port: int, validator: str):
     asyncio.run(async_add_executor(address, port, validator))
 
 
+@cli.command()
+@click.option("--address", prompt="IP Address", help="IP address of executor")
+@click.option("--port", type=int, prompt="Port", help="Port of executor")
+def remove_executor(address: str, port: int):
+    """Add executor machine to the database"""
+    logger.info("Removing executor (%s:%d)", address, port)
+    executor_dao = ExecutorDao(session=next(get_db()))
+    try:
+        executor_dao.delete_by_address_port(address, port)
+    except sqlalchemy.exc.IntegrityError as e:
+        logger.error("Failed in removing an executor: %s", str(e))
+    else:
+        logger.info("Removed an executor(%s:%d)", address, port)
+
+
 if __name__ == "__main__":
     cli()
