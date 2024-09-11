@@ -1,15 +1,16 @@
 from datetime import datetime, timedelta
-from sqlalchemy import func
-from pydantic import BaseModel
-from typing import List
 
-from models.task import Task, TaskStatus
+from pydantic import BaseModel
+from sqlalchemy import func
 
 from daos.base import BaseDao
+from models.task import Task, TaskStatus
 
-class MinerAvgScore(BaseModel):
+
+class MinerScore(BaseModel):
     miner_hotkey: str
-    avg_score: float
+    total_score: float
+
 
 class TaskDao(BaseDao):
     def save(self, task: Task) -> Task:
@@ -30,26 +31,27 @@ class TaskDao(BaseDao):
         self.session.commit()
         self.session.refresh(task)
         return task
-    
-    def get_avg_scores_in_hours(self, hours: int) -> List[MinerAvgScore]:
-        hours_ago = datetime.now() - timedelta(hours=hours)
-        
-        results = self.session.query(
-            Task.miner_hotkey,
-            func.avg(Task.score).label('avg_score')
-        ).filter(
-            Task.task_status.in_([TaskStatus.Finished, TaskStatus.Failed]),
-            Task.created_at >= hours_ago
-        ).group_by(Task.miner_hotkey).all()
-        
+
+    def get_scores_for_last_epoch(self, tempo: int) -> list[MinerScore]:
+        last_epoch = datetime.now() - timedelta(seconds=tempo * 12)
+
+        results = (
+            self.session.query(Task.miner_hotkey, func.sum(Task.score).label("total_score"))
+            .filter(
+                Task.task_status.in_([TaskStatus.Finished, TaskStatus.Failed]),
+                Task.created_at >= last_epoch,
+            )
+            .group_by(Task.miner_hotkey)
+            .all()
+        )
+
         return [
-            MinerAvgScore(
+            MinerScore(
                 miner_hotkey=result[0],
-                avg_score=result[1],
+                total_score=result[1],
             )
             for result in results
         ]
-        
-        
+
     def get_task_by_uuid(self, uuid: str) -> Task:
         return self.session.query(Task).filter_by(uuid=uuid).first()

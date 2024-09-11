@@ -10,6 +10,13 @@ class ExecutorDao(BaseDao):
         self.session.refresh(executor)
         return executor
 
+    def delete_by_address_port(self, address: str, port: int) -> None:
+        executor = self.session.query(Executor).filter_by(
+            address=address, port=port).first()
+        if executor:
+            self.session.delete(executor)
+            self.session.commit()
+
     def get_executors_for_validator(self, validator_key: str, executor_id: Optional[str] = None) -> list[Executor]:
         """Get executors that opened to valdiator
 
