@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     DEBUG_MINER_HOTKEY: str = Field(env="DEBUG_MINER_HOTKEY", default="")
 
     PORT: int = Field(env="PORT", default=8000)
+    BLOCKS_FOR_JOB: int = 50
 
     class Config:
         env_file = ".env"

@@ -59,16 +59,19 @@ class Validator:
         self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service)
 
     def check_registered(self, subtensor: bittensor.subtensor):
-        if not subtensor.is_hotkey_registered(
-            netuid=self.netuid,
-            hotkey_ss58=self.wallet.get_hotkey().ss58_address,
-        ):
-            bittensor.logging.error(
-                f"Wallet: {self.wallet} is not registered on netuid {self.netuid}."
-                f" Please register the hotkey using `btcli subnets register` before trying again"
-            )
-            exit()
-        bittensor.logging.info("Validator is registered")
+        try:
+            if not subtensor.is_hotkey_registered(
+                netuid=self.netuid,
+                hotkey_ss58=self.wallet.get_hotkey().ss58_address,
+            ):
+                bittensor.logging.error(
+                    f"Wallet: {self.wallet} is not registered on netuid {self.netuid}."
+                    f" Please register the hotkey using `btcli subnets register` before trying again"
+                )
+                exit()
+            bittensor.logging.info("Validator is registered")
+        except Exception as e:
+            bittensor.logging.error("Checking validator registered failed: %s", str(e))
 
     def fetch_miners(self, subtensor: bittensor.subtensor):
         metagraph = subtensor.metagraph(netuid=self.netuid)
@@ -82,6 +85,7 @@ class Validator:
                 or settings.DEBUG_MINER_HOTKEY == neuron.axon_info.hotkey
             )
         ]
+        bittensor.logging.info("Found %d miners", "fetch_miners", "fetch_miners", len(miners))
         return miners
 
     def get_my_uid(self, subtensor: bittensor.subtensor):
@@ -90,9 +94,9 @@ class Validator:
         )
 
     def set_weights(self, miners, subtensor: bittensor.subtensor):
-        avg_scores = self.task_dao.get_avg_scores_in_hours(24)
+        scores = self.task_dao.get_scores_for_last_epoch(self.tempo)
 
-        hotkey_to_score = {score.miner_hotkey: score.avg_score for score in avg_scores}
+        hotkey_to_score = {score.miner_hotkey: score.total_score for score in scores}
 
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
@@ -189,29 +193,45 @@ class Validator:
         self.check_registered(subtensor)
 
         # fetch miners
-        miners = self.fetch_miners(subtensor)
+        try:
+            miners = self.fetch_miners(subtensor)
+        except Exception:
+            miners = []
 
         if await self.should_set_weights():
             self.set_weights(miners, subtensor)
 
-        # request jobs
-        jobs = [
-            asyncio.create_task(
-                asyncio.wait_for(
-                    self.miner_service.request_job_to_miner(
-                        payload=MinerJobRequestPayload(
-                            miner_hotkey=miner.hotkey,
-                            miner_address=miner.axon_info.ip,
-                            miner_port=miner.axon_info.port,
-                        )
-                    ),
-                    timeout=SYNC_CYCLE - 5,
-                )
+        current_block = self.get_current_block()
+        if current_block % settings.BLOCKS_FOR_JOB == 0:
+            bittensor.logging.info(
+                "Send jobs to %d miners at block(%d)", "sync", "sync", len(miners), current_block
             )
-            for miner in miners
-        ]
 
-        await asyncio.gather(*jobs, return_exceptions=True)
+            # request jobs
+            jobs = [
+                asyncio.create_task(
+                    asyncio.wait_for(
+                        self.miner_service.request_job_to_miner(
+                            payload=MinerJobRequestPayload(
+                                miner_hotkey=miner.hotkey,
+                                miner_address=miner.axon_info.ip,
+                                miner_port=miner.axon_info.port,
+                            )
+                        ),
+                        timeout=60 * 5,
+                    )
+                )
+                for miner in miners
+            ]
+
+            await asyncio.gather(*jobs, return_exceptions=True)
+        else:
+            remaining_blocks = (
+                current_block // settings.BLOCKS_FOR_JOB + 1
+            ) * settings.BLOCKS_FOR_JOB - current_block
+            bittensor.logging.info(
+                "Remaining blocks %d for next job", "sync", "sync", remaining_blocks
+            )
 
     async def start(self):
         bittensor.logging.info("Start Validator in background")
