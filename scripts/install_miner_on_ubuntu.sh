@@ -66,8 +66,8 @@ wait_for_user() {
 
 #install pre
 install_pre() {
-    apt update
-    apt install --no-install-recommends --no-install-suggests -y sudo apt-utils curl git cmake build-essential
+    sudo apt update
+    sudo apt install --no-install-recommends --no-install-suggests -y sudo apt-utils curl git cmake build-essential
     exit_on_error $?
 }
 
@@ -89,7 +89,7 @@ install_python() {
     else
         ohai "Installing Python 3.11"
         add-apt-repository ppa:deadsnakes/ppa
-        apt install python3.11
+        sudo apt install python3.11
         sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
         python -m pip install cffi
         python -m pip install cryptography
@@ -103,6 +103,7 @@ install_python() {
         pdm --version
     else
         ohai "Installing PDM..."
+        sudo apt install -y python3.12-venv
         curl -sSL https://pdm-project.org/install-pdm.py | python3 -
 
         local bashrc_file="/root/.bashrc"
@@ -132,13 +133,13 @@ install_redis() {
     else
         ohai "Installing Redis..."
 
-        apt install -y redis-server
+        sudo apt install -y redis-server
 
         echo "Starting Redis server..."
-        service redis-server start
+        sudo systemctl start redis-server.service
 
         echo "Checking Redis server status..."
-        service redis-server status
+        sudo systemctl status redis-server.service
     fi
 }
 
@@ -151,27 +152,25 @@ install_postgresql() {
         psql --version
 
         # Check if the database exists
-        DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='compute_horde_miner'")
+        DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='compute_subnet_db'")
         if [ "$DB_EXISTS" == "1" ]; then
-            echo "Database compute_horde_miner already exists."
+            echo "Database compute_subnet_db already exists."
         else
-            echo "Creating database compute_horde_miner..."
-            sudo -u postgres createdb compute_horde_miner
+            echo "Creating database compute_subnet_db..."
+            sudo -u postgres createdb compute_subnet_db
         fi
     else
-        ohai "Installing PostgreSQL..."
-
         echo "Installing PostgreSQL..."
         sudo apt install -y postgresql postgresql-contrib
 
         echo "Starting PostgreSQL server..."
-        sudo service postgresql start
+        sudo systemctl start postgresql.service
 
         echo "Setting password for postgres user..."
-        sudo -u postgres psql -c "ALTER USER postgres PASSWORD '12345';"
+        sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'password';"
 
-        echo "Creating database compute_horde_miner..."
-        sudo -u postgres createdb compute_horde_miner
+        echo "Creating database compute_subnet_db..."
+        sudo -u postgres createdb compute_subnet_db
     fi
 }
 
@@ -183,93 +182,10 @@ install_btcli() {
     else
         ohai "Installing BtCLI..."
 
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/opentensor/bittensor/master/scripts/install.sh)"
+        sudo apt install -y pipx 
+        pipx install bittensor
     fi
 }
-
-# install hashcat
-install_single_hashcat() {
-    instance_dir=$1
-    # URL to download Hashcat
-    hashcat_url="https://hashcat.net/files/hashcat-6.2.6.7z"
-
-    # Directory to store downloaded files
-    download_dir="/tmp/hashcat_download"
-
-    # Create the directory if it does not exist
-    mkdir -p $instance_dir
-    mkdir -p $download_dir
-
-    # Download Hashcat
-    wget -O $download_dir/hashcat.7z $hashcat_url
-
-    # Install p7zip if not already installed
-    if ! command -v 7z &> /dev/null; then
-        sudo apt-get update
-        sudo apt-get install -y p7zip-full
-    fi
-
-    # Extract the downloaded file
-    7z x $download_dir/hashcat.7z -o$instance_dir
-
-    # Make the hashcat executable
-    chmod +x $instance_dir/hashcat-6.2.6/hashcat.bin
-}
-
-install_hashcat() {
-    ohai "Installing Hashcat..."
-
-    read -p "Enter Hashcat Instances: " HASHCAT_INSTANCES
-    # Loop through the instances
-    for i in $(seq 1 $HASHCAT_INSTANCES); do
-        instance_dir="/opt/hashcat$i"
-        if [ -f $instance_dir/hashcat-6.2.6/hashcat.bin ]; then
-            echo "Hashcat already installed in $instance_dir"
-        else
-            echo "Hashcat not found in $instance_dir. Installing..."
-            install_single_hashcat $instance_dir
-        fi
-    done
-}
-
-# generate .env file
-generate_env() {
-    PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-    PROJECT_DIR=${PROJECT_DIR}/miner
-    ENV_DIR="./envs/dev"
-    cd "${PROJECT_DIR}"
-
-    ohai "Generating env and Setting up dev..."
-
-    read -p "Enter PORT_FOR_EXECUTORS: " PORT_FOR_EXECUTORS
-    read -p "Enter BITTENSOR_MINER_ADDRESS: " BITTENSOR_MINER_ADDRESS
-    read -p "Enter BITTENSOR_MINER_PORT: " BITTENSOR_MINER_PORT
-
-    sed -e "s|{{PORT_FOR_EXECUTORS}}|$PORT_FOR_EXECUTORS|g" \
-        -e "s|{{BITTENSOR_MINER_ADDRESS}}|$BITTENSOR_MINER_ADDRESS|g" \
-        -e "s|{{BITTENSOR_MINER_PORT}}|$BITTENSOR_MINER_PORT|g" ${ENV_DIR}/.env.template > ${ENV_DIR}/.env
-
-    sudo chmod +x ./setup-dev.sh
-    /usr/bin/bash ./setup-dev.sh
-
-    ohai "Running migrations..."
-    cd "${PROJECT_DIR}/app/src"
-    pdm run manage.py migrate
-
-    mkdir -p /tmp/logs
-
-    ohai "Creating services..."
-    cd "${PROJECT_DIR}"
-    sudo chmod +x ./app/envs/dev/*.*
-    sudo cp ./app/envs/dev/celeryapp /etc/init.d/celeryapp
-    sudo cp ./app/envs/dev/minerapp /etc/init.d/minerapp
-    sudo cp ./app/envs/dev/minerbeat /etc/init.d/minerbeat
-
-    sudo chmod +x /etc/init.d/celeryapp
-    sudo chmod +x /etc/init.d/minerapp
-    sudo chmod +x /etc/init.d/minerbeat
-}
-
 ohai "This script will install:"
 echo "git"
 echo "curl"
@@ -278,7 +194,6 @@ echo "python3-pip"
 echo "redis"
 echo "postgresql"
 echo "bittensor"
-echo "hashcat"
 
 wait_for_user
 install_pre
@@ -286,5 +201,3 @@ install_python
 install_redis
 install_postgresql
 install_btcli
-# install_hashcat
-generate_env
