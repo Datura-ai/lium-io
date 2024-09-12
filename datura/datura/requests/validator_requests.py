@@ -1,5 +1,6 @@
 import enum
 import json
+from typing import Optional
 
 import pydantic
 from datura.requests.base import BaseRequest
@@ -37,7 +38,10 @@ class AuthenticateRequest(BaseValidatorRequest):
 class SSHPubKeySubmitRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeySubmitRequest
     public_key: bytes
+    executor_id: Optional[str] = None
+
 
 class SSHPubKeyRemoveRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeyRemoveRequest
     public_key: bytes
+    executor_id: Optional[str] = None

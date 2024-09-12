@@ -1,4 +1,7 @@
+from typing import List, Tuple
 from pydantic import BaseModel, field_validator
+import enum
+from datura.requests.base import BaseRequest
 
 
 class MinerJobRequestPayload(BaseModel):
@@ -27,18 +30,84 @@ class ResourceType(BaseModel):
         return v
 
 
-class ContainerCreateRequestPayload(MinerJobRequestPayload):
+class ContainerRequestType(enum.Enum):
+    ContainerCreateRequest = "ContainerCreateRequest"
+    ContainerStartRequest = "ContainerStartRequest"
+    ContainerStopRequest = "ContainerStopRequest"
+    ContainerDeleteRequest = "ContainerDeleteRequest"
+
+
+class ContainerBaseRequest(BaseRequest):
+    message_type: ContainerRequestType
+    miner_hotkey: str
+    miner_address: str
+    miner_port: int
     executor_id: str
+
+
+class ContainerCreateRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_key: str
     resources: ResourceType
 
 
-class ContainerStartStopRequestPayload(MinerJobRequestPayload):
-    executor_id: str
+class ContainerStartRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.ContainerStartRequest
     container_name: str
 
 
-class ContainerDeleteRequestPayload(ContainerStartStopRequestPayload):
-    executor_id: str
+class ContainerStopRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
+    container_name: str
+
+
+class ContainerDeleteRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteRequest
+    container_name: str
     volume_name: str
+
+
+class ContainerResponseType(enum.Enum):
+    ContainerCreated = "ContainerCreated"
+    ContainerStarted = "ContainerStarted",
+    ContainerStopped = "ContainerStopped"
+    ContainerDeleted = "ContainerDeleted"
+    FaildRequest = "FailedRequest"
+
+
+class ContainerBaseResponse(BaseRequest):
+    message_type: ContainerResponseType
+    miner_hotkey: str
+    executor_id: str
+
+
+class ContainerCreatedResult(BaseModel):
+    container_name: str
+    volume_name: str
+    port_maps: List[Tuple[int, int]]
+
+
+class ContainerCreated(ContainerBaseResponse, ContainerCreatedResult):
+    message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
+
+
+class ContainerStarted(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.ContainerStarted
+    container_name: str
+
+
+class ContainerStopped(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.ContainerStopped
+    container_name: str
+
+
+class ContainerDeleted(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
+    container_name: str
+    volume_name: str
+
+
+class FaildContainerRequest(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.FaildRequest
+    msg: str

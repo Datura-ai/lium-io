@@ -1,3 +1,4 @@
+from typing import Optional
 from daos.base import BaseDao
 from models.executor import Executor
 
@@ -10,12 +11,13 @@ class ExecutorDao(BaseDao):
         return executor
 
     def delete_by_address_port(self, address: str, port: int) -> None:
-        executor = self.session.query(Executor).filter_by(address=address, port=port).first()
+        executor = self.session.query(Executor).filter_by(
+            address=address, port=port).first()
         if executor:
             self.session.delete(executor)
             self.session.commit()
 
-    def get_executors_for_validator(self, validator_key: str) -> list[Executor]:
+    def get_executors_for_validator(self, validator_key: str, executor_id: Optional[str] = None) -> list[Executor]:
         """Get executors that opened to valdiator
 
         Args:
@@ -24,4 +26,7 @@ class ExecutorDao(BaseDao):
         Return:
             List[Executor]: list of Executors
         """
+        if executor_id:
+            return list(self.session.query(Executor).filter_by(validator=validator_key, uuid=executor_id))
+
         return list(self.session.query(Executor).filter_by(validator=validator_key))

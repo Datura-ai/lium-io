@@ -134,7 +134,7 @@ class ValidatorConsumer(BaseConsumer):
             try:
                 msg: SSHPubKeySubmitRequest
                 executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
-                    self.validator_key, msg.public_key
+                    self.validator_key, msg.public_key, msg.executor_id
                 )
                 await self.send_message(AcceptSSHKeyRequest(executors=executors))
                 logger.info("Sent AcceptSSHKeyRequest to validator %s", self.validator_key)
@@ -147,7 +147,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, SSHPubKeyRemoveRequest):
             logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
             try:
-                await self.executor_service.deregister_pubkey(self.validator_key, msg.public_key)
+                await self.executor_service.deregister_pubkey(self.validator_key, msg.public_key, msg.executor_id)
                 logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Failed SSHKeyRemoved request: %s", str(e))
