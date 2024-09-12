@@ -24,7 +24,6 @@ from daos.executor import ExecutorDao
 import numpy as np
 from payload_models.payloads import MinerJobRequestPayload
 
-
 logger = logging.getLogger(__name__)
 
 SYNC_CYCLE = 12
@@ -33,7 +32,6 @@ WEIGHT_MAX_COUNTER = 6
 
 class Validator:
     wallet: bittensor.wallet
-    subtensor: bittensor.subtensor
     netuid: int
 
     def __init__(self):
@@ -41,10 +39,6 @@ class Validator:
 
         self.wallet = settings.get_bittensor_wallet()
         self.netuid = settings.BITTENSOR_NETUID
-        self.subtensor = bittensor.subtensor(config=self.config)
-        self.metagraph = self.subtensor.metagraph(netuid=self.netuid)
-        self.my_uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
-        self.node = SubstrateInterface(url=self.config.subtensor.chain_endpoint)
 
         self.should_exit = False
         self.is_running = False
@@ -54,24 +48,35 @@ class Validator:
         self.task_dao = TaskDao(session=session)
         executor_dao = ExecutorDao(session=session)
 
-        # Get network tempo
-        self.tempo = self.subtensor.tempo(self.netuid)
-        self.weights_rate_limit = self.get_weights_rate_limit()
-
         ssh_service = SSHService()
         task_service = TaskService(task_dao=self.task_dao, ssh_service=ssh_service, executor_dao=executor_dao)
         docker_service = DockerService(ssh_service=ssh_service, executor_dao=executor_dao)
         self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service, docker_service=docker_service)
         
-        self.weight_counter = 0
-        
     def get_subtensor(self):
         return bittensor.subtensor(config=self.config)
-        
-        task_service = TaskService(
-            task_dao=self.task_dao, ssh_service=ssh_service, executor_dao=executor_dao
-        )
-        self.miner_service = MinerService(ssh_service=ssh_service, task_service=task_service)
+    
+    def get_metagraph(self, subtensor: bittensor.subtensor):
+        return subtensor.metagraph(netuid=self.netuid)
+    
+    def get_node(self, subtensor: bittensor.subtensor):
+        # return SubstrateInterface(url=self.config.subtensor.chain_endpoint)
+        return subtensor.substrate
+    
+    def get_current_block(self, subtensor: bittensor.subtensor):
+        node = self.get_node(subtensor)
+        return node.query("System", "Number", []).value
+
+    def get_weights_rate_limit(self, subtensor: bittensor.subtensor):
+        node = self.get_node(subtensor)
+        return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
+    
+    def get_my_uid(self, subtensor: bittensor.subtensor):
+        metagraph = self.get_metagraph(subtensor)
+        return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+    
+    def get_tempo(self, subtensor: bittensor.subtensor):
+        return subtensor.tempo(self.netuid)
 
     def check_registered(self, subtensor: bittensor.subtensor):
         try:
@@ -89,7 +94,7 @@ class Validator:
             bittensor.logging.error("Checking validator registered failed: %s", str(e))
 
     def fetch_miners(self, subtensor: bittensor.subtensor):
-        metagraph = subtensor.metagraph(netuid=self.netuid)
+        metagraph = self.get_metagraph(subtensor)
         miners = [
             neuron
             for neuron in metagraph.neurons
@@ -103,13 +108,8 @@ class Validator:
         bittensor.logging.info("Found %d miners", "fetch_miners", "fetch_miners", len(miners))
         return miners
 
-    def get_my_uid(self, subtensor: bittensor.subtensor):
-        return subtensor.get_uid_for_hotkey_on_subnet(
-            hotkey_ss58=self.wallet.get_hotkey().ss58_address, netuid=self.netuid
-        )
-
     def set_weights(self, miners, subtensor: bittensor.subtensor):
-        scores = self.task_dao.get_scores_for_last_epoch(self.tempo)
+        scores = self.task_dao.get_scores_for_last_epoch(self.get_tempo(subtensor))
 
         hotkey_to_score = {score.miner_hotkey: score.total_score for score in scores}
 
@@ -122,7 +122,7 @@ class Validator:
         bittensor.logging.info(f"uids: {uids}")
         bittensor.logging.info(f"weights: {weights}")
 
-        metagraph = subtensor.metagraph(netuid=self.netuid)
+        metagraph = self.get_metagraph(subtensor)
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
             weights=weights,
@@ -154,11 +154,12 @@ class Validator:
         else:
             bittensor.logging.error("set_weights failed", msg)
 
-    def get_last_update(self, block):
+    def get_last_update(self, subtensor: bittensor.subtensor, block):
         try:
+            node = self.get_node(subtensor)
             last_update_blocks = (
                 block
-                - self.node.query("SubtensorModule", "LastUpdate", [self.netuid]).value[self.my_uid]
+                - node.query("SubtensorModule", "LastUpdate", [self.netuid]).value[self.get_my_uid(subtensor)]
             )
         except Exception:
             bittensor.logging.error(f"Error getting last update: {traceback.format_exc()}")
@@ -168,30 +169,27 @@ class Validator:
         bittensor.logging.info(f"last set weights successfully {last_update_blocks} blocks ago")
         return last_update_blocks
 
-    def get_current_block(self):
-        return self.node.query("System", "Number", []).value
-
-    def get_weights_rate_limit(self):
-        return self.node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
-
-    async def should_set_weights(self) -> bool:
+    async def should_set_weights(self, subtensor: bittensor.subtensor) -> bool:
         """Check if current block is for setting weights."""
         try:
-            current_block = self.get_current_block()
-            last_update = self.get_last_update(current_block)
-            blocks_till_epoch = self.tempo - (current_block + self.netuid + 1) % (self.tempo + 1)
+            current_block = self.get_current_block(subtensor)
+            last_update = self.get_last_update(subtensor, current_block)
+            tempo = self.get_tempo(subtensor)
+            weights_rate_limit = self.get_weights_rate_limit(subtensor)
+            
+            blocks_till_epoch = tempo - (current_block + self.netuid + 1) % (tempo + 1)
             bittensor.logging.info(
                 "Checking should set weights(weights_rate_limit=%d, tempo=%d): current_block=%d, last_update=%d, blocks_till_epoch=%d",
                 "should_set_weights",
                 "should_set_weights",
-                self.weights_rate_limit,
-                self.tempo,
+                weights_rate_limit,
+                tempo,
                 current_block,
                 last_update,
                 blocks_till_epoch,
             )
-            return last_update >= self.tempo * 2 or (
-                blocks_till_epoch < 20 and last_update >= self.weights_rate_limit
+            return last_update >= tempo * 2 or (
+                blocks_till_epoch < 20 and last_update >= weights_rate_limit
             )
         except Exception as e:
             bittensor.logging.error(
@@ -203,50 +201,50 @@ class Validator:
             return False
 
     async def sync(self):
-        subtensor = self.subtensor
-        # check registered
-        self.check_registered(subtensor)
-
-        # fetch miners
         try:
+            subtensor = self.get_subtensor()
+            # check registered
+            self.check_registered(subtensor)
+
+            # fetch miners
             miners = self.fetch_miners(subtensor)
-        except Exception:
-            miners = []
 
-        if await self.should_set_weights():
-            self.set_weights(miners, subtensor)
+            if await self.should_set_weights(subtensor):
+                self.set_weights(miners, subtensor)
 
-        current_block = self.get_current_block()
-        if current_block % settings.BLOCKS_FOR_JOB == 0:
-            bittensor.logging.info(
-                "Send jobs to %d miners at block(%d)", "sync", "sync", len(miners), current_block
-            )
-
-            # request jobs
-            jobs = [
-                asyncio.create_task(
-                    asyncio.wait_for(
-                        self.miner_service.request_job_to_miner(
-                            payload=MinerJobRequestPayload(
-                                miner_hotkey=miner.hotkey,
-                                miner_address=miner.axon_info.ip,
-                                miner_port=miner.axon_info.port,
-                            )
-                        ),
-                        timeout=60 * 5,
-                    )
+            current_block = self.get_current_block(subtensor)
+            if current_block % settings.BLOCKS_FOR_JOB == 0:
+                bittensor.logging.info(
+                    "Send jobs to %d miners at block(%d)", "sync", "sync", len(miners), current_block
                 )
-                for miner in miners
-            ]
 
-            await asyncio.gather(*jobs, return_exceptions=True)
-        else:
-            remaining_blocks = (
-                current_block // settings.BLOCKS_FOR_JOB + 1
-            ) * settings.BLOCKS_FOR_JOB - current_block
-            bittensor.logging.info(
-                "Remaining blocks %d for next job", "sync", "sync", remaining_blocks
-            )
+                # request jobs
+                jobs = [
+                    asyncio.create_task(
+                        asyncio.wait_for(
+                            self.miner_service.request_job_to_miner(
+                                payload=MinerJobRequestPayload(
+                                    miner_hotkey=miner.hotkey,
+                                    miner_address=miner.axon_info.ip,
+                                    miner_port=miner.axon_info.port,
+                                )
+                            ),
+                            timeout=60 * 5,
+                        )
+                    )
+                    for miner in miners
+                ]
+
+                await asyncio.gather(*jobs, return_exceptions=True)
+            else:
+                remaining_blocks = (
+                    current_block // settings.BLOCKS_FOR_JOB + 1
+                ) * settings.BLOCKS_FOR_JOB - current_block
+                bittensor.logging.info(
+                    "Remaining blocks %d for next job", "sync", "sync", remaining_blocks
+                )
+        except Exception:
+            logger.error(traceback.format_exc())
 
     async def start(self):
         bittensor.logging.info("Start Validator in background")

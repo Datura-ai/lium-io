@@ -89,6 +89,7 @@ class DockerService:
         port_maps = self.generate_portMappings()
         port_flags = ' '.join(
             [f'-p {external}:{internal}' for internal, external in port_maps])
+        logger.info(f"Port mappings: {port_maps}")
 
         # creat docker volume
         uuid = uuid4()
