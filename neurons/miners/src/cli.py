@@ -58,5 +58,16 @@ def remove_executor(address: str, port: int):
         logger.info("Removed an executor(%s:%d)", address, port)
 
 
+@cli.command()
+def show_executors():
+    """Add executor machine to the database"""
+    executor_dao = ExecutorDao(session=next(get_db()))
+    try:
+        for executor in executor_dao.get_all_executors():
+            logger.info("%s:%d -> %s", executor.address, executor.port, executor.validator)
+    except sqlalchemy.exc.IntegrityError as e:
+        logger.error("Failed in removing an executor: %s", str(e))
+
+
 if __name__ == "__main__":
     cli()

@@ -30,3 +30,6 @@ class ExecutorDao(BaseDao):
             return list(self.session.query(Executor).filter_by(validator=validator_key, uuid=executor_id))
 
         return list(self.session.query(Executor).filter_by(validator=validator_key))
+
+    def get_all_executors(self) -> list[Executor]:
+        return list(self.session.query(Executor).all())
