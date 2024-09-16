@@ -10,7 +10,7 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
-MACHINE_SPEC_CHANNEL_NAME = "channel:1"
+MACHINE_SPEC_CHANNEL_NAME = "channel:machine-specs"
 
 
 class ComputeClient:
@@ -110,10 +110,7 @@ class ComputeClient:
         while True:
             # validator_hotkey = settings.BITTENSOR_WALLET().hotkey.ss58_address
             try:
-                msg = await asyncio.wait_for(
-                    channel.get_message(ignore_subscribe_messages=True), timeout=20 * 60
-                )
-
+                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=20 * 60)
                 logger.info("Received machine specs from validator app.")
                 print(msg)
 
