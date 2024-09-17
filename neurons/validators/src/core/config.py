@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
-    COMPUTE_APP_URI: str = "ws://127.0.0.1:8001"
+    COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="ws://127.0.0.1:8100")
 
     class Config:
         env_file = ".env"

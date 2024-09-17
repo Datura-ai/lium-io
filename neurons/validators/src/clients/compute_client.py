@@ -1,16 +1,28 @@
 import asyncio
+import json
 import logging
 from typing import NoReturn
 
 import bittensor
+import pydantic
 import redis.asyncio as aioredis
+import tenacity
 import websockets
+from protocol.vc_protocol.compute_requests import Error, Response
+from protocol.vc_protocol.validator_requests import AuthenticateRequest, ExecutorSpecRequest
+from pydantic import BaseModel
 
 from core.config import settings
 
 logger = logging.getLogger(__name__)
 
-MACHINE_SPEC_CHANNEL_NAME = "channel:machine-specs"
+MACHINE_SPEC_CHANNEL_NAME = "channel:1"
+
+
+class AuthenticationError(Exception):
+    def __init__(self, reason: str, errors: list[Error]):
+        self.reason = reason
+        self.errors = errors
 
 
 class ComputeClient:
@@ -28,6 +40,7 @@ class ComputeClient:
 
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
+        logger.info("Connecting to %s", self.compute_app_uri)
         return websockets.connect(self.compute_app_uri)
 
     # async def miner_driver_awaiter(self):
@@ -63,23 +76,23 @@ class ComputeClient:
         self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
         try:
             while True:
-                await asyncio.sleep(10)
-            # async for ws in self.connect():
-            #     try:
-            #         await self.handle_connection(ws)
-            #     except websockets.ConnectionClosed as exc:
-            #         self.ws = None
-            #         logger.warning(
-            #             "validator connection closed with code %r and reason %r, reconnecting...",
-            #             exc.code,
-            #             exc.reason,
-            #         )
-            #     except asyncio.exceptions.CancelledError:
-            #         self.ws = None
-            #         logger.warning("Facilitator client received cancel, stopping")
-            #     except Exception as exc:
-            #         self.ws = None
-            #         logger.error(str(exc), exc_info=exc)
+                async for ws in self.connect():
+                    try:
+                        logger.info("Connected to %s", self.compute_app_uri)
+                        await self.handle_connection(ws)
+                    except websockets.ConnectionClosed as exc:
+                        self.ws = None
+                        logger.warning(
+                            "validator connection closed with code %r and reason %r, reconnecting...",
+                            exc.code,
+                            exc.reason,
+                        )
+                    except asyncio.exceptions.CancelledError:
+                        self.ws = None
+                        logger.warning("Facilitator client received cancel, stopping")
+                    except Exception as exc:
+                        self.ws = None
+                        logger.error(str(exc), exc_info=exc)
 
         except asyncio.exceptions.CancelledError:
             self.ws = None
@@ -87,60 +100,65 @@ class ComputeClient:
 
     async def handle_connection(self, ws: websockets.WebSocketClientProtocol):
         """handle a single websocket connection"""
-        return
-        # await ws.send(AuthenticationRequest.from_keypair(self.keypair).model_dump_json())
+        await ws.send(AuthenticateRequest.from_keypair(self.keypair).model_dump_json())
 
-        # raw_msg = await ws.recv()
-        # try:
-        #     response = Response.model_validate_json(raw_msg)
-        # except pydantic.ValidationError as exc:
-        #     raise AuthenticationError(
-        #         "did not receive Response for AuthenticationRequest", []
-        #     ) from exc
-        # if response.status != "success":
-        #     raise AuthenticationError("auth request received failed response", response.errors)
+        raw_msg = await ws.recv()
+        try:
+            response = Response.model_validate_json(raw_msg)
+        except pydantic.ValidationError as exc:
+            raise AuthenticationError(
+                "did not receive Response for AuthenticationRequest", []
+            ) from exc
+        if response.status != "success":
+            raise AuthenticationError("auth request received failed response", response.errors)
 
-        # self.ws = ws
+        self.ws = ws
 
-        # async for raw_msg in ws:
-        #     await self.handle_message(raw_msg)
+        async for raw_msg in ws:
+            await self.handle_message(raw_msg)
 
     async def wait_for_specs(self, channel: aioredis.client.PubSub):
-        # specs_queue = []
+        specs_queue = []
         while True:
-            # validator_hotkey = settings.BITTENSOR_WALLET().hotkey.ss58_address
+            validator_hotkey = settings.get_bittensor_wallet().hotkey.ss58_address
+            logger.info(f"Waiting for machine specs from validator app: {validator_hotkey}")
             try:
                 msg = await channel.get_message(ignore_subscribe_messages=True, timeout=20 * 60)
                 logger.info("Received machine specs from validator app.")
-                print(msg)
 
-                # specs = MachineSpecsUpdate(
-                #     specs=msg["specs"],
-                #     miner_hotkey=msg["miner_hotkey"],
-                #     batch_id=msg["batch_id"],
-                #     validator_hotkey=validator_hotkey,
-                # )
-                # logger.debug(f"sending machine specs update to facilitator: {specs}")
+                if msg is None:
+                    logger.warning("No message received from validator app.")
+                    continue
 
-                # specs_queue.append(specs)
-                # if self.ws is not None:
-                #     while len(specs_queue) > 0:
-                #         spec_to_send = specs_queue.pop(0)
-                #         try:
-                #             await self.send_model(spec_to_send)
-                #         except Exception as exc:
-                #             specs_queue.insert(0, spec_to_send)
-                #             msg = f"Error occurred while sending specs: {exc}"
-                #             await save_facilitator_event(
-                #                 subtype=SystemEvent.EventSubType.SPECS_SEND_ERROR,
-                #                 long_description=msg,
-                #                 data={
-                #                     "miner_hotkey": spec_to_send.miner_hotkey,
-                #                     "batch_id": spec_to_send.batch_id,
-                #                 },
-                #             )
-                #             logger.warning(msg)
-                #             break
+                msg = json.loads(msg["data"])
+                specs = None
+                try:
+                    specs = ExecutorSpecRequest(
+                        specs=msg["specs"],
+                        miner_hotkey=msg["miner_hotkey"],
+                        validator_hotkey=validator_hotkey,
+                        executor_uuid=msg["executor_uuid"],
+                        executor_ip=msg["executor_ip"],
+                        executor_port=msg["executor_port"],
+                    )
+                except Exception as exc:
+                    msg = f"Error occurred while parsing msg: {exc}"
+                    logger.warning(msg)
+                    continue
+
+                logger.info(f"sending machine specs update to compute app: {specs}")
+
+                specs_queue.append(specs)
+                if self.ws is not None:
+                    while len(specs_queue) > 0:
+                        spec_to_send = specs_queue.pop(0)
+                        try:
+                            await self.send_model(spec_to_send)
+                        except Exception as exc:
+                            specs_queue.insert(0, spec_to_send)
+                            msg = f"Error occurred while sending specs: {exc}"
+                            logger.warning(msg)
+                            break
             except TimeoutError:
                 logger.debug("wait_for_specs still running")
 
@@ -158,40 +176,40 @@ class ComputeClient:
     # def create_metagraph_refresh_task(self, period=None):
     #     return create_metagraph_refresh_task(period=period)
 
-    # @tenacity.retry(
-    #     stop=tenacity.stop_after_attempt(7),
-    #     wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
-    #     retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
-    # )
-    # async def send_model(self, msg: BaseModel):
-    #     if self.ws is None:
-    #         raise websockets.ConnectionClosed(rcvd=None, sent=None)
-    #     await self.ws.send(msg.model_dump_json())
-    #     # Summary: https://github.com/python-websockets/websockets/issues/867
-    #     # Longer discussion: https://github.com/python-websockets/websockets/issues/865
-    #     await asyncio.sleep(0)
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(7),
+        wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
+        retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
+    )
+    async def send_model(self, msg: BaseModel):
+        if self.ws is None:
+            raise websockets.ConnectionClosed(rcvd=None, sent=None)
+        await self.ws.send(msg.model_dump_json())
+        # Summary: https://github.com/python-websockets/websockets/issues/867
+        # Longer discussion: https://github.com/python-websockets/websockets/issues/865
+        await asyncio.sleep(0)
 
-    # async def handle_message(self, raw_msg: str | bytes):
-    #     """handle message received from facilitator"""
-    #     try:
-    #         response = Response.model_validate_json(raw_msg)
-    #     except pydantic.ValidationError:
-    #         logger.debug("could not parse raw message as Response")
-    #     else:
-    #         if response.status != "success":
-    #             logger.error("received error response from facilitator: %r", response)
-    #         return
+    async def handle_message(self, raw_msg: str | bytes):
+        """handle message received from facilitator"""
+        try:
+            response = Response.model_validate_json(raw_msg)
+        except pydantic.ValidationError:
+            logger.info("could not parse raw message as Response")
+        else:
+            if response.status != "success":
+                logger.error("received error response from facilitator: %r", response)
+            return
 
-    #     try:
-    #         job_request = pydantic.TypeAdapter(JobRequest).validate_json(raw_msg)
-    #     except pydantic.ValidationError as exc:
-    #         logger.debug("could not parse raw message as JobRequest: %s", exc)
-    #     else:
-    #         task = asyncio.create_task(self.miner_driver(job_request))
-    #         await self.miner_drivers.put(task)
-    #         return
+        # try:
+        #     job_request = pydantic.TypeAdapter(JobRequest).validate_json(raw_msg)
+        # except pydantic.ValidationError as exc:
+        #     logger.error("could not parse raw message as JobRequest: %s", exc)
+        # else:
+        #     task = asyncio.create_task(self.miner_driver(job_request))
+        #     await self.miner_drivers.put(task)
+        #     return
 
-    #     logger.error("unsupported message received from facilitator: %s", raw_msg)
+        # logger.error("unsupported message received from facilitator: %s", raw_msg)
 
     # async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
     #     return await get_miner_axon_info(hotkey)

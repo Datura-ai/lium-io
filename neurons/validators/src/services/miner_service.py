@@ -9,6 +9,7 @@ from clients.miner_client import MinerClient
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     DeclineJobRequest,
+    ExecutorSSHInfo,
     FailedRequest,
 )
 from datura.requests.validator_requests import SSHPubKeyRemoveRequest, SSHPubKeySubmitRequest
@@ -110,7 +111,7 @@ class MinerService:
                     if result
                 ]
                 logger.info(f"Miner {miner_client.miner_name} machine specs: {results}")
-                await self.publish_machine_specs(results)
+                await self.publish_machine_specs(results, miner_client.miner_hotkey)
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
             elif isinstance(msg, FailedRequest):
                 logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
@@ -121,9 +122,24 @@ class MinerService:
             else:
                 raise ValueError(f"Unexpected msg: {msg}")
 
-    async def publish_machine_specs(self, results):
+    async def publish_machine_specs(
+        self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str
+    ):
         """Publish machine specs to compute app connector process"""
-        await self.redis.publish("channel:machine-specs", json.dumps(results))
+        logger.info(f"Publishing machine specs to compute app connector process: {results}")
+        for specs, ssh_info in results:
+            await self.redis.publish(
+                "channel:1",
+                json.dumps(
+                    {
+                        "specs": specs,
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": ssh_info.uuid,
+                        "executor_ip": ssh_info.address,
+                        "executor_port": ssh_info.port,
+                    }
+                ),
+            )
 
     async def handle_container(self, payload: ContainerBaseRequest):
         loop = asyncio.get_event_loop()
