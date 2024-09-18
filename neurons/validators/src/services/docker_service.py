@@ -1,18 +1,23 @@
-from typing import Annotated, List, Tuple
 import io
 import logging
 import random
+from typing import Annotated
 from uuid import uuid4
 
 import bittensor
-from fastapi import Depends
-
-from services.ssh_service import SSHService
-from paramiko import SSHClient, AutoAddPolicy, Ed25519Key
-
-from payload_models.payloads import ContainerCreateRequest, ContainerStartRequest, ContainerStopRequest, ContainerDeleteRequest, ContainerCreatedResult
 from datura.requests.miner_requests import ExecutorSSHInfo
+from fastapi import Depends
+from paramiko import AutoAddPolicy, Ed25519Key, SSHClient
+from payload_models.payloads import (
+    ContainerCreatedResult,
+    ContainerCreateRequest,
+    ContainerDeleteRequest,
+    ContainerStartRequest,
+    ContainerStopRequest,
+)
+
 from daos.executor import ExecutorDao
+from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +31,7 @@ class DockerService:
         self.ssh_service = ssh_service
         self.executor_dao = executor_dao
 
-    def generate_portMappings(self, start_external_port=40000) -> List[Tuple[int, int]]:
+    def generate_portMappings(self, start_external_port=40000) -> list[tuple[int, int]]:
         internal_ports = [22, 22140, 22141, 22142, 22143]
 
         mappings = []
@@ -34,8 +39,7 @@ class DockerService:
 
         for i in range(len(internal_ports)):
             while True:
-                external_port = random.randint(
-                    start_external_port, start_external_port + 10000)
+                external_port = random.randint(start_external_port, start_external_port + 10000)
                 if external_port not in used_external_ports:
                     used_external_ports.add(external_port)
                     break
@@ -53,14 +57,18 @@ class DockerService:
         private_key: str,
     ):
         logger.info("Connect ssh")
-        private_key = self.ssh_service.decrypt_payload(
-            keypair.ss58_address, private_key)
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = Ed25519Key.from_private_key(io.StringIO(private_key))
 
         ssh_client = SSHClient()
         ssh_client.set_missing_host_key_policy(AutoAddPolicy())
-        ssh_client.connect(hostname=ip_address, username=ssh_username,
-                           look_for_keys=False, pkey=pkey, port=ssh_port)
+        ssh_client.connect(
+            hostname=ip_address,
+            username=ssh_username,
+            look_for_keys=False,
+            pkey=pkey,
+            port=ssh_port,
+        )
 
         return ssh_client
 
@@ -72,7 +80,8 @@ class DockerService:
         private_key: str,
     ):
         logger.info(
-            f"Create Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, escecutor: {executor_info}")
+            f"Create Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, escecutor: {executor_info}"
+        )
 
         ssh_client = self.get_ssh_client(
             ip_address=executor_info.address,
@@ -82,26 +91,49 @@ class DockerService:
             private_key=private_key,
         )
 
-        # logger.info('Pulling docker image')
-        # ssh_client.exec_command(f"docker pull {payload.docker_image}")
+        # check docker image exists
+        logger.info("Checking if docker image exists: %s", payload.docker_image)
+        stdin, stdout, stderr = ssh_client.exec_command(
+            f"docker inspect --type=image {payload.docker_image}"
+        )
+
+        # Read the output and error streams
+        output = stdout.read().decode("utf-8")
+        error = stderr.read().decode("utf-8")
+
+        if not output:
+            logger.info("Pulling docker image: %s", payload.docker_image)
+            stdin, stdout, stderr = ssh_client.exec_command(f"docker pull {payload.docker_image}")
+
+            # Read the output and error streams
+            output = stdout.read().decode("utf-8")
+            error = stderr.read().decode("utf-8")
+
+            # Log the output and error
+            if output:
+                logger.info(f"Docker pull output: {output}")
+            if error:
+                logger.error(f"Docker pull error: {error}")
+        else:
+            logger.info(f"Docker image {payload.docker_image} already exists locally.")
 
         # generate port maps
         port_maps = self.generate_portMappings()
-        port_flags = ' '.join(
-            [f'-p {external}:{internal}' for internal, external in port_maps])
+        port_flags = " ".join([f"-p {external}:{internal}" for internal, external in port_maps])
         logger.info(f"Port mappings: {port_maps}")
 
         # creat docker volume
         uuid = uuid4()
-        logger.info('Create docker volume')
-        volume_name = f'volume_{uuid}'
+        logger.info("Create docker volume")
+        volume_name = f"volume_{uuid}"
         ssh_client.exec_command(f"docker volume create {volume_name}")
 
         # creat docker container with the port map & resource
-        logger.info('Create docker container')
-        container_name = f'container_{uuid}'
+        logger.info("Create docker container")
+        container_name = f"container_{uuid}"
         ssh_client.exec_command(
-            f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}')
+            f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
+        )
 
         ssh_client.close()
 
@@ -121,7 +153,8 @@ class DockerService:
         private_key: str,
     ):
         logger.info(
-            f"Stop Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, escecutor: {executor_info}, contaienr_name: {payload.container_name}")
+            f"Stop Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, executor: {executor_info}, container_name: {payload.container_name}"
+        )
 
         ssh_client = self.get_ssh_client(
             ip_address=executor_info.address,
@@ -146,7 +179,8 @@ class DockerService:
         private_key: str,
     ):
         logger.info(
-            f"Restart Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, contaienr_name: {payload.container_name}")
+            f"Restart Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, contaienr_name: {payload.container_name}"
+        )
 
         ssh_client = self.get_ssh_client(
             ip_address=executor_info.address,
@@ -171,7 +205,8 @@ class DockerService:
         private_key: str,
     ):
         logger.info(
-            f"Restart Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, contaienr_name: {payload.container_name}")
+            f"Restart Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, contaienr_name: {payload.container_name}"
+        )
 
         ssh_client = self.get_ssh_client(
             ip_address=executor_info.address,

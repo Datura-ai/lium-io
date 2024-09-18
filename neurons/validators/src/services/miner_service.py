@@ -24,7 +24,7 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopped,
     ContainerStopRequest,
-    FaildContainerRequest,
+    FailedContainerRequest,
     MinerJobRequestPayload,
 )
 
@@ -183,7 +183,7 @@ class MinerService:
                         )
                     )
 
-                    return FaildContainerRequest(
+                    return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
                         msg=f"Invalid executor id {payload.executor_id}",
@@ -271,7 +271,7 @@ class MinerService:
                         )
                     else:
                         logger.info(f"Unexpected request: {payload}")
-                        return FaildContainerRequest(
+                        return FailedContainerRequest(
                             miner_hotkey=payload.miner_hotkey,
                             executor_id=payload.executor_id,
                             msg=f"Unexpected request: {payload}",
@@ -285,7 +285,7 @@ class MinerService:
                         )
                     )
 
-                    return FaildContainerRequest(
+                    return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
                         msg=f"create container error: {str(e)}",
@@ -293,14 +293,14 @@ class MinerService:
 
             elif isinstance(msg, FailedRequest):
                 logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
-                return FaildContainerRequest(
+                return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     msg=f"create container error: {str(msg)}",
                 )
             else:
                 logger.info(f"Unexpected msg: {msg}")
-                return FaildContainerRequest(
+                return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     msg=f"Unexpected msg: {msg}",

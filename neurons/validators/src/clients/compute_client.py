@@ -8,11 +8,14 @@ import pydantic
 import redis.asyncio as aioredis
 import tenacity
 import websockets
+from payload_models.payloads import ContainerCreated, ContainerCreateRequest, ContainerDeleteRequest
 from protocol.vc_protocol.compute_requests import Error, Response
 from protocol.vc_protocol.validator_requests import AuthenticateRequest, ExecutorSpecRequest
 from pydantic import BaseModel
 
+from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.config import settings
+from services.miner_service import MinerService
 
 logger = logging.getLogger(__name__)
 
@@ -28,40 +31,42 @@ class AuthenticationError(Exception):
 class ComputeClient:
     HEARTBEAT_PERIOD = 60
 
-    def __init__(self, keypair: bittensor.Keypair, compute_app_uri: str):
+    def __init__(
+        self, keypair: bittensor.Keypair, compute_app_uri: str, miner_service: MinerService
+    ):
         self.keypair = keypair
         self.ws: websockets.WebSocketClientProtocol | None = None
         self.compute_app_uri = compute_app_uri
         self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
-        # self.miner_drivers = asyncio.Queue()
-        # self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
+        self.miner_drivers = asyncio.Queue()
+        self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
-        # self.refresh_metagraph_task = self.create_metagraph_refresh_task()
+        self.refresh_metagraph_task = self.create_metagraph_refresh_task()
+        self.miner_service = miner_service
 
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
         logger.info("Connecting to %s", self.compute_app_uri)
         return websockets.connect(self.compute_app_uri)
 
-    # async def miner_driver_awaiter(self):
-    #     """avoid memory leak by awaiting miner driver tasks"""
-    #     while True:
-    #         task = await self.miner_drivers.get()
-    #         if task is None:
-    #             return
+    async def miner_driver_awaiter(self):
+        """avoid memory leak by awaiting miner driver tasks"""
+        while True:
+            task = await self.miner_drivers.get()
+            if task is None:
+                return
 
-    #         try:
-    #             await task
-    #         except Exception:
-    #             logger.error("Error occurred during driving a miner client", exc_info=True)
+            try:
+                await task
+            except Exception:
+                logger.error("Error occurred during driving a miner client", exc_info=True)
 
     async def __aenter__(self):
         pass
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
-        # await self.miner_drivers.put(None)
-        # await self.miner_driver_awaiter_task
+        await self.miner_drivers.put(None)
+        await self.miner_driver_awaiter_task
 
     def my_hotkey(self) -> str:
         return self.keypair.ss58_address
@@ -162,6 +167,9 @@ class ComputeClient:
             except TimeoutError:
                 logger.debug("wait_for_specs still running")
 
+    def create_metagraph_refresh_task(self, period=None):
+        return create_metagraph_refresh_task(period=period)
+
     async def heartbeat(self):
         pass
         # while True:
@@ -172,9 +180,6 @@ class ComputeClient:
         #             msg = f"Error occurred while sending heartbeat: {exc}"
         #             logger.warning(msg)
         #     await asyncio.sleep(self.HEARTBEAT_PERIOD)
-
-    # def create_metagraph_refresh_task(self, period=None):
-    #     return create_metagraph_refresh_task(period=period)
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(7),
@@ -200,48 +205,58 @@ class ComputeClient:
                 logger.error("received error response from facilitator: %r", response)
             return
 
-        # try:
-        #     job_request = pydantic.TypeAdapter(JobRequest).validate_json(raw_msg)
-        # except pydantic.ValidationError as exc:
-        #     logger.error("could not parse raw message as JobRequest: %s", exc)
-        # else:
-        #     task = asyncio.create_task(self.miner_driver(job_request))
-        #     await self.miner_drivers.put(task)
-        #     return
+        try:
+            job_request = pydantic.TypeAdapter(ContainerCreateRequest).validate_json(raw_msg)
+        except pydantic.ValidationError as exc:
+            logger.error("could not parse raw message as ContainerCreateRequest: %s", exc)
+        else:
+            task = asyncio.create_task(self.miner_driver(job_request))
+            await self.miner_drivers.put(task)
+            return
+
+        try:
+            job_request = pydantic.TypeAdapter(ContainerDeleteRequest).validate_json(raw_msg)
+        except pydantic.ValidationError as exc:
+            logger.error("could not parse raw message as ContainerCreateRequest: %s", exc)
+        else:
+            task = asyncio.create_task(self.miner_driver(job_request))
+            await self.miner_drivers.put(task)
+            return
 
         # logger.error("unsupported message received from facilitator: %s", raw_msg)
 
-    # async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
-    #     return await get_miner_axon_info(hotkey)
+    async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
+        return await get_miner_axon_info(hotkey)
 
-    # async def miner_driver(self, job_request: JobRequest):
-    #     """drive a miner client from job start to completion, then close miner connection"""
-    #     miner, _ = await Miner.objects.aget_or_create(hotkey=job_request.miner_hotkey)
-    #     miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
-    #     job = await OrganicJob.objects.acreate(
-    #         job_uuid=job_request.uuid,
-    #         miner=miner,
-    #         miner_address=miner_axon_info.ip,
-    #         miner_address_ip_version=miner_axon_info.ip_type,
-    #         miner_port=miner_axon_info.port,
-    #         executor_class=job_request.executor_class,
-    #         job_description="User job from facilitator",
-    #     )
+    async def miner_driver(self, job_request: ContainerCreateRequest | ContainerDeleteRequest):
+        """drive a miner client from job start to completion, then close miner connection"""
+        miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
+        logger.info(
+            "Miner driver to miner(%s, %s:%d)",
+            job_request.miner_hotkey,
+            miner_axon_info.ip,
+            miner_axon_info.port,
+        )
 
-    #     miner_client = self.MINER_CLIENT_CLASS(
-    #         miner_address=miner_axon_info.ip,
-    #         miner_port=miner_axon_info.port,
-    #         miner_hotkey=job_request.miner_hotkey,
-    #         my_hotkey=self.my_hotkey(),
-    #         job_uuid=job_request.uuid,
-    #         batch_id=None,
-    #         keypair=self.keypair,
-    #     )
-    #     await execute_organic_job(
-    #         miner_client,
-    #         job,
-    #         job_request,
-    #         total_job_timeout=TOTAL_JOB_TIMEOUT,
-    #         wait_timeout=PREPARE_WAIT_TIMEOUT,
-    #         notify_callback=self.send_model,
-    #     )
+        if isinstance(job_request, ContainerCreateRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            container_created: ContainerCreated = await self.miner_service.handle_container(
+                job_request
+            )
+
+            logger.info(
+                "Sending back created container info to compute app: %s", str(container_created)
+            )
+            await self.send_model(container_created)
+        elif isinstance(job_request, ContainerDeleteRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            container_created: ContainerDeleteRequest = await self.miner_service.handle_container(
+                job_request
+            )
+
+            logger.info(
+                "Sending back deleted container info to compute app: %s", str(container_created)
+            )
+            await self.send_model(container_created)
