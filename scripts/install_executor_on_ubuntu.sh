@@ -103,11 +103,11 @@ install_python() {
         pdm --version
     else
         ohai "Installing PDM..."
-        sudo apt install -y python3.12-venv
+        sudo apt install -y python3.10-venv
         curl -sSL https://pdm-project.org/install-pdm.py | python3 -
 
-        local bashrc_file="/root/.bashrc"
-        local path_string="export PATH=/root/.local/bin:\$PATH"
+        local bashrc_file="/home/shadeform/.bashrc"
+        local path_string="export PATH=/home/shadeform/.local/bin:\$PATH"
 
         if ! grep -Fxq "$path_string" $bashrc_file; then
             echo "$path_string" >> $bashrc_file
@@ -116,7 +116,7 @@ install_python() {
             echo "$path_string already present in $bashrc_file"
         fi
 
-        export PATH=/root/.local/bin:$PATH
+        export PATH=/home/shadeform/.local/bin:$PATH
 
         echo "Checking PDM version..."
         pdm --version
