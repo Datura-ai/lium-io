@@ -23,6 +23,9 @@ dependencies = [
     "pytest>=8.3.2",
     "httpx>=0.27.0",
     "numpy>=2.1.0",
+    "redis>=5.0.8",
+    "click>=8.1.7",
+    "tenacity>=9.0.0",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"

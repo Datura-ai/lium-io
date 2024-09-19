@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     PORT: int = Field(env="PORT", default=8000)
     BLOCKS_FOR_JOB: int = 50
 
+    REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
+    REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
+    COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="ws://127.0.0.1:8100")
+
     class Config:
         env_file = ".env"
 

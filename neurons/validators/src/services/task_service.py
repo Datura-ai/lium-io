@@ -1,26 +1,23 @@
-from typing import Annotated, Tuple, List, Optional
-from pathlib import Path
+import asyncio
 import io
+import json
 import logging
 import time
-import asyncio
-import json
+from pathlib import Path
+from typing import Annotated
 
 import bittensor
-
-from models.task import Task, TaskStatus
-from models.executor import Executor
-from daos.task import TaskDao
-from daos.executor import ExecutorDao
-
+from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
+from paramiko import AutoAddPolicy, Ed25519Key, SSHClient
+from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
+from daos.executor import ExecutorDao
+from daos.task import TaskDao
+from models.executor import Executor
+from models.task import Task, TaskStatus
 from services.ssh_service import SSHService
-from paramiko import SSHClient, AutoAddPolicy, Ed25519Key
-
-from datura.requests.miner_requests import ExecutorSSHInfo
-from payload_models.payloads import MinerJobRequestPayload
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +40,11 @@ class TaskService:
         miner_info: MinerJobRequestPayload,
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
-        private_key: str
+        private_key: str,
     ):
         logger.info(
-            f"Upsert executor -> miner_address: {miner_info.miner_address}, executor uuid: {executor_info.uuid}")
+            f"Upsert executor -> miner_address: {miner_info.miner_address}, executor uuid: {executor_info.uuid}"
+        )
         self.executor_dao.upsert(
             Executor(
                 miner_address=miner_info.miner_address,
@@ -62,9 +60,10 @@ class TaskService:
         executor = self.executor_dao.get_executor(executor_info.uuid, miner_info.miner_hotkey)
         if executor.rented:
             return None
-            
+
         logger.info(
-            f"Create Task -> miner_address: {miner_info.miner_address}, miner_hotkey: {miner_info.miner_hotkey}")
+            f"Create Task -> miner_address: {miner_info.miner_address}, miner_hotkey: {miner_info.miner_hotkey}"
+        )
         task = self.task_dao.save(
             Task(
                 task_status=TaskStatus.SSHConnected,
@@ -74,29 +73,34 @@ class TaskService:
         )
 
         logger.info("Connect ssh")
-        private_key = self.ssh_service.decrypt_payload(
-            keypair.ss58_address, private_key)
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = Ed25519Key.from_private_key(io.StringIO(private_key))
 
         ssh_client = SSHClient()
         ssh_client.set_missing_host_key_policy(AutoAddPolicy())
-        ssh_client.connect(hostname=executor_info.address, username=executor_info.ssh_username,
-                           look_for_keys=False, pkey=pkey, port=executor_info.ssh_port)
+        ssh_client.connect(
+            hostname=executor_info.address,
+            username=executor_info.ssh_username,
+            look_for_keys=False,
+            pkey=pkey,
+            port=executor_info.ssh_port,
+        )
         ssh_client.exec_command(f"mkdir -p {executor_info.root_dir}/temp")
 
         # run synthetic job
         ftp_client = ssh_client.open_sftp()
 
         timestamp = int(time.time())
-        local_file_path = str(Path(__file__).parent /
-                              ".." / "miner_jobs/score.py")
+        local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
         remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
 
         ftp_client.put(local_file_path, remote_file_path)
 
         start_time = time.time()
         # results, err = await sync_to_async(self._run_task)(ssh_client, msg, remote_file_path)
-        results, err = await asyncio.to_thread(self._run_task, ssh_client, executor_info, remote_file_path)
+        results, err = await asyncio.to_thread(
+            self._run_task, ssh_client, executor_info, remote_file_path
+        )
         end_time = time.time()
         logger.info(f"results: {results}")
 
@@ -113,7 +117,7 @@ class TaskService:
             job_taken_time = results[-1]
             try:
                 job_taken_time = float(job_taken_time.strip())
-            except:
+            except Exception:
                 job_taken_time = end_time - start_time
 
             logger.info(f"job_taken_time: {job_taken_time}")
@@ -128,37 +132,34 @@ class TaskService:
 
         # get machine specs
         timestamp = int(time.time())
-        local_file_path = str(Path(__file__).parent /
-                              ".." / "miner_jobs/machine_scrape.py")
+        local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py")
         remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
 
         ftp_client.put(local_file_path, remote_file_path)
 
-        results, _ = await asyncio.to_thread(self._run_task, ssh_client, executor_info, remote_file_path)
+        results, _ = await asyncio.to_thread(
+            self._run_task, ssh_client, executor_info, remote_file_path
+        )
 
         ftp_client.close()
         ssh_client.close()
 
-        return json.loads(results[0].strip())
+        return json.loads(results[0].strip()), executor_info
 
     def _run_task(
-        self,
-        ssh_client: SSHClient,
-        executor_info: ExecutorSSHInfo,
-        remote_file_path: str
-    ) -> Tuple[Optional[List[str]], Optional[str]]:
+        self, ssh_client: SSHClient, executor_info: ExecutorSSHInfo, remote_file_path: str
+    ) -> tuple[list[str] | None, str | None]:
         try:
             _, stdout, stderr = ssh_client.exec_command(
-                f"export PYTHONPATH={executor_info.root_dir} && {executor_info.python_path} {remote_file_path}", timeout=JOB_LENGTH)
+                f"export PYTHONPATH={executor_info.root_dir} && {executor_info.python_path} {remote_file_path}",
+                timeout=JOB_LENGTH,
+            )
             results = stdout.readlines()
             errors = stderr.readlines()
 
-            actual_errors = [
-                error for error in errors
-                if not 'warnning' in error.lower()
-            ]
+            actual_errors = [error for error in errors if "warnning" not in error.lower()]
 
-            if (len(results) == 0 and len(actual_errors) > 0):
+            if len(results) == 0 and len(actual_errors) > 0:
                 logger.error(f"{actual_errors}")
                 raise Exception("Failed to execute command!")
 
@@ -167,7 +168,7 @@ class TaskService:
 
             return results, None
         except Exception as e:
-            logger.error('ssh connection error: %s', str(e))
+            logger.error("ssh connection error: %s", str(e))
 
             #  remove remote_file
             ssh_client.exec_command(f"rm {remote_file_path}")

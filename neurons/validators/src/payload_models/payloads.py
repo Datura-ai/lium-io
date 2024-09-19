@@ -1,7 +1,7 @@
-from typing import List, Tuple
-from pydantic import BaseModel, field_validator
 import enum
+
 from datura.requests.base import BaseRequest
+from pydantic import BaseModel, field_validator
 
 
 class MinerJobRequestPayload(BaseModel):
@@ -16,17 +16,16 @@ class ResourceType(BaseModel):
     memory: str
     volume: str
 
-    @field_validator('cpu', 'gpu')
+    @field_validator("cpu", "gpu")
     def validate_positive_int(cls, v: int) -> int:
         if v < 0:
-            raise ValueError(
-                f'{v} should be a valid non-negative integer string.')
+            raise ValueError(f"{v} should be a valid non-negative integer string.")
         return v
 
-    @field_validator('memory', 'volume')
+    @field_validator("memory", "volume")
     def validate_memory_format(cls, v: str) -> str:
-        if not v[:-2].isdigit() or v[-2:].upper() not in ['MB', 'GB']:
-            raise ValueError(f'{v} is not a valid format.')
+        if not v[:-2].isdigit() or v[-2:].upper() not in ["MB", "GB"]:
+            raise ValueError(f"{v} is not a valid format.")
         return v
 
 
@@ -40,8 +39,8 @@ class ContainerRequestType(enum.Enum):
 class ContainerBaseRequest(BaseRequest):
     message_type: ContainerRequestType
     miner_hotkey: str
-    miner_address: str
-    miner_port: int
+    miner_address: str | None = None
+    miner_port: int | None = None
     executor_id: str
 
 
@@ -49,7 +48,6 @@ class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_key: str
-    resources: ResourceType
 
 
 class ContainerStartRequest(ContainerBaseRequest):
@@ -70,10 +68,10 @@ class ContainerDeleteRequest(ContainerBaseRequest):
 
 class ContainerResponseType(enum.Enum):
     ContainerCreated = "ContainerCreated"
-    ContainerStarted = "ContainerStarted",
+    ContainerStarted = ("ContainerStarted",)
     ContainerStopped = "ContainerStopped"
     ContainerDeleted = "ContainerDeleted"
-    FaildRequest = "FailedRequest"
+    FailedRequest = "FailedRequest"
 
 
 class ContainerBaseResponse(BaseRequest):
@@ -85,7 +83,7 @@ class ContainerBaseResponse(BaseRequest):
 class ContainerCreatedResult(BaseModel):
     container_name: str
     volume_name: str
-    port_maps: List[Tuple[int, int]]
+    port_maps: list[tuple[int, int]]
 
 
 class ContainerCreated(ContainerBaseResponse, ContainerCreatedResult):
@@ -108,6 +106,6 @@ class ContainerDeleted(ContainerBaseResponse):
     volume_name: str
 
 
-class FaildContainerRequest(ContainerBaseResponse):
-    message_type: ContainerResponseType = ContainerResponseType.FaildRequest
+class FailedContainerRequest(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.FailedRequest
     msg: str
