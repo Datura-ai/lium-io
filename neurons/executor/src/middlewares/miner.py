@@ -1,13 +1,12 @@
 import logging
-import bittensor
 
-from starlette.middleware.base import BaseHTTPMiddleware
+import bittensor
+from fastapi.responses import JSONResponse
+from payloads.miner import MinerAuthPayload
 from pydantic import ValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from core.config import settings
-from payloads.miner import MinerAuthPayload
-
-from fastapi.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
@@ -25,21 +24,10 @@ class MinerMiddleware(BaseHTTPMiddleware):
             payload = MinerAuthPayload.model_validate_json(body_bytes)
             logger.info(f"miner ip: {miner_ip}")
 
-            if miner_ip != settings.MINER_IP_ADDRESS:
-                logger.error(f"Incorrect ip address {miner_ip}")
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "IP address is not correct"}
-                )
-
-            keypair = bittensor.Keypair(
-                ss58_address=settings.MINER_HOTKEY_SS58_ADDRESS)
+            keypair = bittensor.Keypair(ss58_address=settings.MINER_HOTKEY_SS58_ADDRESS)
             if not keypair.verify(payload.public_key, payload.signature):
-                logger.error(f"Auth failed. incorrect signature")
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Auth failed"}
-                )
+                logger.error("Auth failed. incorrect signature")
+                return JSONResponse(status_code=401, content={"detail": "Auth failed"})
 
             response = await call_next(request)
 
@@ -48,7 +36,4 @@ class MinerMiddleware(BaseHTTPMiddleware):
             # Handle validation error if needed
             logger.error(f"Validation Error: {e}")
 
-            return JSONResponse(
-                status_code=422,
-                content={"detail": e.errors()}
-            )
+            return JSONResponse(status_code=422, content={"detail": e.errors()})
