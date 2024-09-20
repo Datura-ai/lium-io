@@ -101,7 +101,7 @@ class DockerService:
         output = stdout.read().decode("utf-8")
         error = stderr.read().decode("utf-8")
 
-        if not output:
+        if error:
             logger.info("Pulling docker image: %s", payload.docker_image)
             stdin, stdout, stderr = ssh_client.exec_command(f"docker pull {payload.docker_image}")
 
