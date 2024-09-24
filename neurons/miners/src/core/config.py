@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict()
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     PROJECT_NAME: str = "compute-subnet-miner"
 
     BITTENSOR_WALLET_DIRECTORY: pathlib.Path = Field(
@@ -26,11 +26,6 @@ class Settings(BaseSettings):
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     EXTERNAL_PORT: int = Field(env="EXTERNAL_PORT", default=8000)
     DEBUG: bool = Field(env="DEBUG", default=False)
-
-    SSH_PORT: int = Field(env="SSH_PORT", default=22)
-
-    class Config:
-        env_file = ".env"
 
     def get_bittensor_wallet(self) -> bittensor.wallet:
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

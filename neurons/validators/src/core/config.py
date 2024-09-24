@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict()
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     PROJECT_NAME: str = "compute-subnet-validator"
 
     BITTENSOR_WALLET_DIRECTORY: pathlib.Path = Field(
@@ -24,15 +24,12 @@ class Settings(BaseSettings):
     DEBUG: bool = Field(env="DEBUG", default=False)
     DEBUG_MINER_HOTKEY: str = Field(env="DEBUG_MINER_HOTKEY", default="")
 
-    PORT: int = Field(env="PORT", default=8000)
+    INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     BLOCKS_FOR_JOB: int = 50
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="ws://127.0.0.1:8100")
-
-    class Config:
-        env_file = ".env"
 
     def get_bittensor_wallet(self) -> bittensor.wallet:
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

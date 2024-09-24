@@ -6,13 +6,14 @@ services:
     healthcheck:
       test: pg_isready -U postgres || exit 1
     environment:
-      - POSTGRES_DB=compute-subnet-db
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    env_file: ./.env
     volumes:
       - db_data:/var/lib/postgresql/data
     ports:
-      - 6432:5432
+      - ${POSTGRES_PORT}:5432
 
   redis:
     image: redis:6-alpine
@@ -22,7 +23,24 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - 6379:6379
+      - ${REDIS_PORT}:6379
+
+  validator:
+    image: daturaai/compute-subnet-validator:latest
+    env_file: ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    ports:
+      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+    expose:
+      - ${INTERNAL_PORT}
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    depends_on:
+      - db
+      - redis
 
 volumes:
   db_data:
