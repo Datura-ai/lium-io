@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import multiprocessing
 
 from clients.compute_client import ComputeClient
 
@@ -20,5 +21,13 @@ async def run_forever():
         await compute_app_client.run_forever()
 
 
-if __name__ == "__main__":
-    asyncio.run(run_forever())
+def start_process():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_forever())
+
+
+def start_connector_process():
+    p = multiprocessing.Process(target=start_process)
+    p.start()
+    return p
