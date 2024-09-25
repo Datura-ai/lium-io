@@ -1,40 +1,18 @@
 GPU_MAX_SCORES = {
-    # NVIDIA GeForce RTX Series
-    "NVIDIA GeForce RTX 3060 Ti": 0.35,
-    "NVIDIA GeForce RTX 3070": 0.40,
-    "NVIDIA GeForce RTX 3080": 0.50,
-    "NVIDIA GeForce RTX 3090": 0.70,
-    "NVIDIA GeForce RTX 4090": 1.00,
+    # Latest Gen NVIDIA GPUs (Averaged if applicable)
+    "NVIDIA H100": (3.49 + 3.29 + 2.89) / 3,  # Average of H100 SXM, H100 NVL, and H100 PCIe
+    "NVIDIA RTX 4090": 0.69,
+    "NVIDIA RTX 4000 Ada": 0.38,
+    "NVIDIA RTX 6000 Ada": 1.03,
+    "NVIDIA L4": 0.43,
+    "NVIDIA L40": (0.99 + 1.03) / 2,  # Average of L40 and L40S
+    "NVIDIA RTX 2000 Ada": 0.28,
 
-    # NVIDIA Titan Series
-    "NVIDIA Titan RTX": 1.50,
-
-    # NVIDIA Quadro RTX Series
-    "NVIDIA Quadro RTX 4000": 1.00,
-    "NVIDIA Quadro RTX 5000": 1.50,
-    "NVIDIA Quadro RTX 6000": 2.20,
-    "NVIDIA Quadro RTX 8000": 2.50,
-    "NVIDIA Quadro RTX A4000": 1.20,
-    "NVIDIA Quadro RTX A5000": 1.80,
-    "NVIDIA Quadro RTX A6000": 3.00,
-
-    # NVIDIA A Series (Ampere Architecture)
-    "NVIDIA A100 Tensor Core (40 GB)": 3.00,
-    "NVIDIA A100 Tensor Core (80 GB)": 3.50,
-    "NVIDIA A4000": 0.80,
-    "NVIDIA RTX A4000": 0.80,
-    "NVIDIA A5000": 1.20,
-    "NVIDIA RTX A5000": 1.20,
-
-    # NVIDIA H Series (Hopper Architecture)
-    "NVIDIA H100 Tensor Core (80 GB)": 5.00,
-    "NVIDIA H200 Tensor Core (140 GB)": 7.00,
-
-    # NVIDIA T Series
-    "NVIDIA T4 Tensor Core": 0.30,
-
-    # Older NVIDIA Models
-    "NVIDIA GTX 1080 Ti": 0.25,
-    "NVIDIA RTX 6000 Ada": 2.00,
-    "NVIDIA RTX 8000 Ada": 2.50,
+    # Previous Gen NVIDIA GPUs (Averaged if applicable)
+    "NVIDIA A100": (1.64 + 1.89) / 2,  # Average of A100 PCIe and A100 SXM
+    "NVIDIA RTX A6000": 0.76,
+    "NVIDIA RTX A5000": 0.43,
+    "NVIDIA RTX A4000": 0.32,
+    "NVIDIA A40": 0.39,
+    "NVIDIA RTX 3090": 0.43,
 }
