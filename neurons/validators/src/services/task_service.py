@@ -87,6 +87,8 @@ class TaskService:
             self._run_task, ssh_client, executor_info, remote_file_path
         )
         machine_spec = json.loads(machine_specs[0].strip())
+        logger.info(f'machine spec: {machine_spec}')
+        
         gpu_model = None
         if machine_spec.get("gpu", {}).get("count", 0) > 0:
             details = machine_spec["gpu"].get("details", [])
@@ -96,7 +98,8 @@ class TaskService:
         max_score = 0
         if gpu_model:
             max_score = GPU_MAX_SCORES.get(gpu_model, 0)
-            logger.info(f'gpu model: {gpu_model}, max score: {max_score}')
+            
+        logger.info(f'gpu model: {gpu_model}, max score: {max_score}')
 
         executor = self.executor_dao.get_executor(executor_info.uuid, miner_info.miner_hotkey)
         if executor.rented:
