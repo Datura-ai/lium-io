@@ -39,7 +39,7 @@ Replace with your information for `BITTENSOR_WALLET_NAME`, `BITTENSOR_WALLET_HOT
 #### Step 4: Docker Compose Up
 
 ```
-docker compose up -d
+cd neurons/miners && docker compose up -d
 ```
 
 #### Step 5: Register Executors
