@@ -18,6 +18,7 @@ from daos.task import TaskDao
 from models.executor import Executor
 from models.task import Task, TaskStatus
 from services.ssh_service import SSHService
+from services.const import GPU_MAX_SCORES, MIN_JOB_TAKEN_TIME
 
 logger = logging.getLogger(__name__)
 
@@ -57,21 +58,6 @@ class TaskService:
             )
         )
 
-        executor = self.executor_dao.get_executor(executor_info.uuid, miner_info.miner_hotkey)
-        if executor.rented:
-            return None
-
-        logger.info(
-            f"Create Task -> miner_address: {miner_info.miner_address}, miner_hotkey: {miner_info.miner_hotkey}"
-        )
-        task = self.task_dao.save(
-            Task(
-                task_status=TaskStatus.SSHConnected,
-                miner_hotkey=miner_info.miner_hotkey,
-                executor_id=executor_info.uuid,
-            )
-        )
-
         logger.info("Connect ssh")
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = Ed25519Key.from_private_key(io.StringIO(private_key))
@@ -89,6 +75,55 @@ class TaskService:
 
         # run synthetic job
         ftp_client = ssh_client.open_sftp()
+
+        # get machine specs
+        timestamp = int(time.time())
+        local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py")
+        remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
+
+        ftp_client.put(local_file_path, remote_file_path)
+
+        machine_specs, _ = await asyncio.to_thread(
+            self._run_task, ssh_client, executor_info, remote_file_path
+        )
+        machine_spec = json.loads(machine_specs[0].strip())
+        logger.info(f'machine spec: {machine_spec}')
+        
+        gpu_model = None
+        if machine_spec.get("gpu", {}).get("count", 0) > 0:
+            details = machine_spec["gpu"].get("details", [])
+            if len(details) > 0:
+                gpu_model = details[0].get("name", None)
+                
+        max_score = 0
+        if gpu_model:
+            max_score = GPU_MAX_SCORES.get(gpu_model, 0)
+            
+        logger.info(f'gpu model: {gpu_model}, max score: {max_score}')
+
+        executor = self.executor_dao.get_executor(executor_info.uuid, miner_info.miner_hotkey)
+        if executor.rented:
+            self.task_dao.save(
+                Task(
+                    task_status=TaskStatus.Finished,
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_id=executor_info.uuid,
+                    proceed_time=0,
+                    score=max_score
+                )
+            )
+            return machine_spec, executor_info
+
+        logger.info(
+            f"Create Task -> miner_address: {miner_info.miner_address}, miner_hotkey: {miner_info.miner_hotkey}"
+        )
+        task = self.task_dao.save(
+            Task(
+                task_status=TaskStatus.SSHConnected,
+                miner_hotkey=miner_info.miner_hotkey,
+                executor_id=executor_info.uuid,
+            )
+        )
 
         timestamp = int(time.time())
         local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
@@ -127,24 +162,13 @@ class TaskService:
                 uuid=task.uuid,
                 task_status=TaskStatus.Finished,
                 proceed_time=job_taken_time,
-                score=1 / job_taken_time if job_taken_time > 0 else 0,
+                score=max_score * min(MIN_JOB_TAKEN_TIME/job_taken_time, 1) if job_taken_time > 0 else 0,
             )
-
-        # get machine specs
-        timestamp = int(time.time())
-        local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py")
-        remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
-
-        ftp_client.put(local_file_path, remote_file_path)
-
-        results, _ = await asyncio.to_thread(
-            self._run_task, ssh_client, executor_info, remote_file_path
-        )
 
         ftp_client.close()
         ssh_client.close()
 
-        return json.loads(results[0].strip()), executor_info
+        return machine_spec, executor_info
 
     def _run_task(
         self, ssh_client: SSHClient, executor_info: ExecutorSSHInfo, remote_file_path: str
