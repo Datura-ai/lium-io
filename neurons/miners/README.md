@@ -7,7 +7,7 @@
 #### Step 1: Clone Git repo
 
 ```
-git clone git@github.com:Datura-ai/compute-subnet.git
+git clone https://github.com/Datura-ai/compute-subnet.git
 ```
 
 #### Step 2: Install Required Tools
