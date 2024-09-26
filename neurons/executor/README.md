@@ -10,6 +10,11 @@
 sudo apt-get install openssh-client openssh-server
 ```
 
+Run following command to install required tools: 
+```shell
+chmod +x scripts/install_executor_on_ubuntu.sh && scripts/install_executor_on_ubuntu.sh
+```
+
 ### Install and Run
 
 * Install Python dependencies
