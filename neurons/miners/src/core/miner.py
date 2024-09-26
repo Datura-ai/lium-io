@@ -9,7 +9,7 @@ from daos.validator import ValidatorDao, Validator
 
 logger = logging.getLogger(__name__)
 
-MIN_STAKE = 1000
+MIN_STAKE = 10
 VALIDATORS_LIMIT = 24
 SYNC_CYCLE = 2 * 60
 
