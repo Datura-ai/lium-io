@@ -18,7 +18,7 @@ from daos.task import TaskDao
 from models.executor import Executor
 from models.task import Task, TaskStatus
 from services.ssh_service import SSHService
-from services.const import GPU_MAX_SCORES
+from services.const import GPU_MAX_SCORES, MIN_JOB_TAKEN_TIME
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ class TaskService:
                 uuid=task.uuid,
                 task_status=TaskStatus.Finished,
                 proceed_time=job_taken_time,
-                score=max_score / job_taken_time if job_taken_time > 0 else 0,
+                score=max_score * min(MIN_JOB_TAKEN_TIME/job_taken_time, 1) if job_taken_time > 0 else 0,
             )
 
         ftp_client.close()

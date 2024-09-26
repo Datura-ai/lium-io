@@ -1,3 +1,5 @@
+MIN_JOB_TAKEN_TIME=20
+
 GPU_MAX_SCORES = {
     # Latest Gen NVIDIA GPUs (Averaged if applicable)
     "NVIDIA H100": (3.49 + 3.29 + 2.89) / 3,  # Average of H100 SXM, H100 NVL, and H100 PCIe
