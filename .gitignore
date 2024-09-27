@@ -165,3 +165,7 @@ testing/
 .vscode/settings.json
 
 .pdm-python
+.env.local
+.env.test
+.env.main
+.env

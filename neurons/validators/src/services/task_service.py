@@ -175,7 +175,7 @@ class TaskService:
     ) -> tuple[list[str] | None, str | None]:
         try:
             _, stdout, stderr = ssh_client.exec_command(
-                f"export PYTHONPATH={executor_info.root_dir} && {executor_info.python_path} {remote_file_path}",
+                f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_file_path}",
                 timeout=JOB_LENGTH,
             )
             results = stdout.readlines()

@@ -17,6 +17,7 @@ app = FastAPI(
 app.add_middleware(MinerMiddleware)
 app.include_router(apis_router)
 
+reload = True if settings.ENV == "dev" else False
+
 if __name__ == "__main__":
-    uvicorn.run("executor:app", host="0.0.0.0",
-                port=settings.PORT, reload=True)
+    uvicorn.run("executor:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=reload)

@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     EXTERNAL_IP_ADDRESS: str = Field(env="EXTERNAL_IP_ADDRESS")
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     EXTERNAL_PORT: int = Field(env="EXTERNAL_PORT", default=8000)
+    ENV: str = Field(env="ENV", default="dev")
     DEBUG: bool = Field(env="DEBUG", default=False)
 
     def get_bittensor_wallet(self) -> bittensor.wallet:
