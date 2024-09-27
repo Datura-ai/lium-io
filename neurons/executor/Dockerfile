@@ -44,6 +44,10 @@ ENV PYTHONUNBUFFERED=1
 ENV PATH=/opt/pypackages/bin:$PATH
 ENV PYTHONPATH=/opt/pypackages/lib:/root/app
 
+RUN echo "export PYTHONPATH=$PYTHONPATH" >> /etc/profile
+RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bashrc
+RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bash_profile
+
 COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 
