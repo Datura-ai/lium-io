@@ -31,10 +31,13 @@ FROM $BASE_IMAGE AS secondary-image
 LABEL builder=false
 
 RUN apt-get update \
-  && apt-get install -y wget docker.io docker-compose \
+  && apt-get install -y wget docker.io docker-compose openssh-server \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
+
+# Remove existing SSH host keys
+RUN rm -f /etc/ssh/ssh_host_*
 
 ENV ENV=prod
 ENV PYTHONUNBUFFERED=1

@@ -21,8 +21,9 @@ RUN --mount=type=cache,target=/tmp/pdm_cache \
   # hence we pass PDM_BUILD_SCM_VERSION=0 manually
   PDM_BUILD_SCM_VERSION=0 pdm sync --prod --group :all
 RUN mkdir -p /opt/ && mv __pypackages__/3.11/ /opt/pypackages/
+
 ENV PATH=/opt/pypackages/bin:$PATH
-ENV PYTHONPATH=/opt/pypackages/lib:$PYTHONPATH
+ENV PYTHONPATH=/opt/pypackages/lib:/root/app
 
 COPY . .
 
@@ -34,9 +35,15 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
+
+ENV ENV=prod
 ENV PYTHONUNBUFFERED=1
 ENV PATH=/opt/pypackages/bin:$PATH
-ENV PYTHONPATH=/opt/pypackages/lib:$PYTHONPATH
+ENV PYTHONPATH=/opt/pypackages/lib:/root/app
+
+RUN echo "export PYTHONPATH=$PYTHONPATH" >> /etc/profile
+RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bashrc
+RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bash_profile
 
 COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/

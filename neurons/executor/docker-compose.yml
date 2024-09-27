@@ -1,0 +1,18 @@
+services:
+  executor:
+    image: daturaai/compute-subnet-executor:latest
+    env_file: ./.env
+    ports:
+      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+      - ${SSH_PORT}:22
+    expose:
+      - ${INTERNAL_PORT}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
