@@ -1,6 +1,7 @@
 .pdm.toml
 .pdm-python
 .pdm-build/
+__pycache__/
 .venv
 docker_build.sh
 docker_publish.sh
