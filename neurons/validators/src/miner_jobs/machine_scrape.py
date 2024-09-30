@@ -14,6 +14,19 @@ def run_cmd(cmd):
     return proc.stdout
 
 
+def get_network_speed():
+    """Get upload and download speed of the machine."""
+    data = {"upload_speed": None, "download_speed": None}
+    try:
+        speedtest_cmd = run_cmd("speedtest-cli --json")
+        speedtest_data = json.loads(speedtest_cmd)
+        data["upload_speed"] = speedtest_data["upload"] / 1_000_000  # Convert to Mbps
+        data["download_speed"] = speedtest_data["download"] / 1_000_000  # Convert to Mbps
+    except Exception as exc:
+        data["network_speed_error"] = repr(exc)
+    return data
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -89,6 +102,8 @@ def get_machine_specs():
     except Exception as exc:
         # print(f'Error getting os specs: {exc}', flush=True)
         data["os_scrape_error"] = repr(exc)
+
+    data["network"] = get_network_speed()
     return data
 
 
