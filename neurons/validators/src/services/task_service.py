@@ -17,8 +17,16 @@ from daos.executor import ExecutorDao
 from daos.task import TaskDao
 from models.executor import Executor
 from models.task import Task, TaskStatus
+from services.const import (
+    DOWNLOAD_SPEED_WEIGHT,
+    GPU_MAX_SCORES,
+    JOB_TAKEN_TIME_WEIGHT,
+    MAX_DOWNLOAD_SPEED,
+    MAX_UPLOAD_SPEED,
+    MIN_JOB_TAKEN_TIME,
+    UPLOAD_SPEED_WEIGHT,
+)
 from services.ssh_service import SSHService
-from services.const import GPU_MAX_SCORES, MIN_JOB_TAKEN_TIME
 
 logger = logging.getLogger(__name__)
 
@@ -87,19 +95,19 @@ class TaskService:
             self._run_task, ssh_client, executor_info, remote_file_path
         )
         machine_spec = json.loads(machine_specs[0].strip())
-        logger.info(f'machine spec: {machine_spec}')
-        
+        logger.info(f"machine spec: {machine_spec}")
+
         gpu_model = None
         if machine_spec.get("gpu", {}).get("count", 0) > 0:
             details = machine_spec["gpu"].get("details", [])
             if len(details) > 0:
                 gpu_model = details[0].get("name", None)
-                
+
         max_score = 0
         if gpu_model:
             max_score = GPU_MAX_SCORES.get(gpu_model, 0)
-            
-        logger.info(f'gpu model: {gpu_model}, max score: {max_score}')
+
+        logger.info(f"gpu model: {gpu_model}, max score: {max_score}")
 
         executor = self.executor_dao.get_executor(executor_info.uuid, miner_info.miner_hotkey)
         if executor.rented:
@@ -109,7 +117,7 @@ class TaskService:
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_id=executor_info.uuid,
                     proceed_time=0,
-                    score=max_score
+                    score=max_score,
                 )
             )
             return machine_spec, executor_info
@@ -157,12 +165,34 @@ class TaskService:
 
             logger.info(f"job_taken_time: {job_taken_time}")
 
+            upload_speed = machine_spec.get("network", {}).get("upload_speed", 0)
+            download_speed = machine_spec.get("network", {}).get("download_speed", 0)
+
+            job_taken_score = (
+                min(MIN_JOB_TAKEN_TIME / job_taken_time, 1) if job_taken_time > 0 else 0
+            )
+            upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
+            download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
+
+            score = max_score * (
+                job_taken_score * JOB_TAKEN_TIME_WEIGHT
+                + upload_speed_score * UPLOAD_SPEED_WEIGHT
+                + download_speed_score * DOWNLOAD_SPEED_WEIGHT
+            )
+
+            logger.info(
+                "Give score(%f) to miner(%s) for the task(%s).",
+                score,
+                miner_info.miner_hotkey,
+                str(task.uuid),
+            )
+
             # update task with results
             self.task_dao.update(
                 uuid=task.uuid,
                 task_status=TaskStatus.Finished,
                 proceed_time=job_taken_time,
-                score=max_score * min(MIN_JOB_TAKEN_TIME/job_taken_time, 1) if job_taken_time > 0 else 0,
+                score=score,
             )
 
         ftp_client.close()

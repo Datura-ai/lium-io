@@ -1,4 +1,4 @@
-MIN_JOB_TAKEN_TIME=20
+MIN_JOB_TAKEN_TIME = 20
 
 GPU_MAX_SCORES = {
     # Latest Gen NVIDIA GPUs (Averaged if applicable)
@@ -9,7 +9,6 @@ GPU_MAX_SCORES = {
     "NVIDIA L4": 0.43,
     "NVIDIA L40": (0.99 + 1.03) / 2,  # Average of L40 and L40S
     "NVIDIA RTX 2000 Ada": 0.28,
-
     # Previous Gen NVIDIA GPUs (Averaged if applicable)
     "NVIDIA A100": (1.64 + 1.89) / 2,  # Average of A100 PCIe and A100 SXM
     "NVIDIA RTX A6000": 0.76,
@@ -18,3 +17,10 @@ GPU_MAX_SCORES = {
     "NVIDIA A40": 0.39,
     "NVIDIA RTX 3090": 0.43,
 }
+
+MAX_UPLOAD_SPEED = 1000
+MAX_DOWNLOAD_SPEED = 1000
+
+JOB_TAKEN_TIME_WEIGHT = 0.9
+UPLOAD_SPEED_WEIGHT = 0.05
+DOWNLOAD_SPEED_WEIGHT = 0.05
