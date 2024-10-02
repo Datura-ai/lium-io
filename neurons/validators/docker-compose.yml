@@ -1,47 +1,19 @@
 version: '3.7'
 
 services:
-  db:
-    image: postgres:14.0-alpine
-    healthcheck:
-      test: pg_isready -U postgres || exit 1
-    environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    env_file: ./.env
+  validator-runner:
+    image: daturaai/compute-subnet-validator-runner:latest
+    restart: unless-stopped
     volumes:
-      - db_data:/var/lib/postgresql/data
-    ports:
-      - ${POSTGRES_PORT}:5432
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
+      - ./.env:/root/validator/.env
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
 
-  redis:
-    image: redis:6-alpine
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: redis-cli ping
+  watchtower:
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
     volumes:
-      - redis_data:/data
-    ports:
-      - ${REDIS_PORT}:6379
-
-  validator:
-    image: daturaai/compute-subnet-validator:latest
-    env_file: ./.env
-    environment:
-      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    ports:
-      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
-    expose:
-      - ${INTERNAL_PORT}
-    volumes:
-      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
-    depends_on:
-      - db
-      - redis
-
-volumes:
-  db_data:
-  redis_data:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 60 --cleanup --label-enable

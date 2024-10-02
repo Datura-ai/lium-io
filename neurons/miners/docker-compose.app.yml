@@ -1,0 +1,33 @@
+version: '3.7'
+
+services:
+  db:
+    image: postgres:14.0-alpine
+    healthcheck:
+      test: pg_isready -U postgres || exit 1
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    env_file: ./.env
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - ${POSTGRES_PORT}:5432
+  
+  miner:
+    image: daturaai/compute-subnet-miner:latest
+    env_file: ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    ports:
+      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+    expose:
+      - ${INTERNAL_PORT}
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    depends_on:
+      - db
+
+volumes:
+  db_data:
