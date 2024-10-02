@@ -25,22 +25,22 @@ services:
     ports:
       - ${REDIS_PORT}:6379
 
-  validator:
-    image: daturaai/compute-subnet-validator:latest
-    env_file: ./.env
-    environment:
-      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-    ports:
-      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
-    expose:
-      - ${INTERNAL_PORT}
-    volumes:
-      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
-    depends_on:
-      - db
-      - redis
+  # validator:
+  #   image: daturaai/compute-subnet-validator:latest
+  #   env_file: ./.env
+  #   environment:
+  #     - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+  #     - REDIS_HOST=redis
+  #     - REDIS_PORT=6379
+  #   ports:
+  #     - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+  #   expose:
+  #     - ${INTERNAL_PORT}
+  #   volumes:
+  #     - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+  #   depends_on:
+  #     - db
+  #     - redis
 
 volumes:
   db_data:

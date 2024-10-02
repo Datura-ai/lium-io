@@ -15,19 +15,19 @@ services:
     ports:
       - ${POSTGRES_PORT}:5432
   
-  miner:
-    image: daturaai/compute-subnet-miner:latest
-    env_file: ./.env
-    environment:
-      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-    ports:
-      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
-    expose:
-      - ${INTERNAL_PORT}
-    volumes:
-      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
-    depends_on:
-      - db
+  # miner:
+  #   image: daturaai/compute-subnet-miner:latest
+  #   env_file: ./.env
+  #   environment:
+  #     - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+  #   ports:
+  #     - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+  #   expose:
+  #     - ${INTERNAL_PORT}
+  #   volumes:
+  #     - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+  #   depends_on:
+  #     - db
 
 volumes:
   db_data:
