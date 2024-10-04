@@ -103,11 +103,11 @@ install_python() {
         pdm --version
     else
         ohai "Installing PDM..."
-        sudo apt install -y python3.10-venv
+        sudo apt install -y python3.12-venv
         curl -sSL https://pdm-project.org/install-pdm.py | python3 -
 
-        local bashrc_file="/home/shadeform/.bashrc"
-        local path_string="export PATH=/home/shadeform/.local/bin:\$PATH"
+        local bashrc_file="/root/.bashrc"
+        local path_string="export PATH=/root/.local/bin:\$PATH"
 
         if ! grep -Fxq "$path_string" $bashrc_file; then
             echo "$path_string" >> $bashrc_file
@@ -116,19 +116,108 @@ install_python() {
             echo "$path_string already present in $bashrc_file"
         fi
 
-        export PATH=/home/shadeform/.local/bin:$PATH
+        export PATH=/root/.local/bin:$PATH
 
         echo "Checking PDM version..."
         pdm --version
     fi
 }
 
+# install redis
+install_redis() {
+    if command -v redis-server &> /dev/null
+    then
+        ohai "Redis is already installed."
+        echo "Checking Redis version..."
+        redis-server --version
+    else
+        ohai "Installing Redis..."
+
+        sudo apt install -y redis-server
+
+        echo "Starting Redis server..."
+        sudo systemctl start redis-server.service
+
+        echo "Checking Redis server status..."
+        sudo systemctl status redis-server.service
+    fi
+}
+
+# install postgresql
+install_postgresql() {
+    if command -v psql &> /dev/null
+    then
+        ohai "PostgreSQL is already installed."
+        echo "Checking PostgreSQL version..."
+        psql --version
+
+        # Check if the database exists
+        DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='compute_subnet_db'")
+        if [ "$DB_EXISTS" == "1" ]; then
+            echo "Database compute_subnet_db already exists."
+        else
+            echo "Creating database compute_subnet_db..."
+            sudo -u postgres createdb compute_subnet_db
+        fi
+    else
+        echo "Installing PostgreSQL..."
+        sudo apt install -y postgresql postgresql-contrib
+
+        echo "Starting PostgreSQL server..."
+        sudo systemctl start postgresql.service
+
+        echo "Setting password for postgres user..."
+        sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'password';"
+
+        echo "Creating database compute_subnet_db..."
+        sudo -u postgres createdb compute_subnet_db
+    fi
+}
+
+# install btcli
+install_btcli() {
+    if command -v btcli &> /dev/null
+    then
+        ohai "BtCLI is already installed."
+    else
+        ohai "Installing BtCLI..."
+
+        sudo apt install -y pipx 
+        pipx install bittensor
+        source ~/.bashrc
+    fi
+}
+
+# install docker
+install_docker() {
+  if command -v docker &> /dev/null; then
+    ohai "Docker is already installed."
+    return 0
+  else
+    ohai "Installing Docker..."
+    sudo apt-get update -y
+    sudo apt-get install -y ca-certificates curl
+    sudo install -m 0755 -d /etc/apt/keyrings
+    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    sudo chmod a+r /etc/apt/keyrings/docker.asc
+    
+    # Add the repository to Apt sources:
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    sudo apt-get update -y
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    sudo groupadd docker
+    sudo usermod -aG docker $USER
+    newgrp docker
+  fi
+}
+
 ohai "This script will install:"
-echo "git"
-echo "curl"
-echo "python3.11 and pdm"
-echo "python3-pip"
+echo "docker"
+
 
 wait_for_user
 install_pre
-install_python
+install_docker

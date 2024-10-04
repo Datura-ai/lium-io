@@ -1,4 +1,4 @@
-# Miners
+# Miner
 
 ## Installation
 
@@ -34,7 +34,8 @@ For docker, use [This Link](https://docs.docker.com/engine/install/)
 cp neurons/miners/.env.template neurons/miners/.env
 ```
 
-Replace with your information for `BITTENSOR_WALLET_NAME`, `BITTENSOR_WALLET_HOTKEY_NAME`, `BITTENSOR_NETUID`, `BITTENSOR_NETWORK`, `EXTERNAL_IP_ADDRESS`. 
+Replace with your information for `BITTENSOR_WALLET_NAME`, `BITTENSOR_WALLET_HOTKEY_NAME`, `EXTERNAL_IP_ADDRESS`, `HOST_WALLET_DIR`.
+If you want you can use different port for `INTERNAL_PORT`, `EXTERNAL_PORT`.
 
 #### Step 4: Docker Compose Up
 
