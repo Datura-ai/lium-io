@@ -33,12 +33,12 @@ The Compute Subnet on Bittensor is a decentralized network that allows miners to
 
 If you are looking to rent computational resources, you can easily do so through the Compute Subnet. Renters can:
 
-1. Visit [ComputeNet.ai](https://computenet.ai) and sign up.
+1. Visit [computenet.ai](https://computenet.ai) and sign up.
 2. **Browse** available GPU resources.
 3. **Select** machines based on GPU type, performance, and price.
 4. **Deploy** and monitor your computational tasks using the platform's tools.
 
-To start renting machines, visit [ComputeNet.ai](https://computenet.ai) and access the resources you need.
+To start renting machines, visit [computenet.ai](https://computenet.ai) and access the resources you need.
 
 ### For Miners
 
