@@ -19,6 +19,12 @@ Run following command to install required tools:
 cd compute-subnet && chmod +x scripts/install_executor_on_ubuntu.sh && scripts/install_executor_on_ubuntu.sh
 ```
 
+if you don't have sudo on your machine, run
+```shell
+sed -i 's/sudo //g' scripts/install_executor_on_ubuntu.sh
+```
+to remove sudo from the setup script commands
+
 ### Step 3: Install and Run
 
 * Go to executor root
