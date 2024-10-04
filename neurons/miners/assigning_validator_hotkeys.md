@@ -70,5 +70,5 @@ By following this strategy, you’ll ensure that your executors are assigned to 
 ## Additional Resources
 
 - [TaoMarketCap Subnet 51 Validators](https://taomarketcap.com/subnets/51/validators)
-- [Compute Subnet Documentation](https://computenet.ai/docs)
+- [Compute Subnet Miner README](README.md)
 
