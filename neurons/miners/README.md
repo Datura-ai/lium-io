@@ -17,6 +17,8 @@ To run the central miner, you only need a CPU server with the following specific
 
 Executors are GPU-equipped machines that perform the computational tasks. The central miner manages these executors, which can be easily added or removed from the network.
 
+To see the compatible GPUs to mine with and their relative scores, see this dict [here](https://github.com/Datura-ai/compute-subnet/blob/4f963dc81824afdc8bf926bb70aa0860bd7b6936/neurons/validators/src/services/const.py#L3).
+
 ## Installation
 
 ### Using Docker
