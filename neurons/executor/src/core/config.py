@@ -6,7 +6,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     PROJECT_NAME: str = "compute-subnet-executor"
 
-    IP_ADDRESS: str = Field(env="IP_ADDRESS")
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8001)
     SSH_PORT: int = Field(env="SSH_PORT", default=22)
 
