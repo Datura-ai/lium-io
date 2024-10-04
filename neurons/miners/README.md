@@ -86,7 +86,7 @@ Executors are machines running on GPUs that you can add to your central miner. T
     ```
 
     - `<executor-ip-address>`: The IP address of the executor machine.
-    - `<executor-port>`: The port number used for the executor (default: `80001`).
+    - `<executor-port>`: The port number used for the executor (default: `8001`).
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. Which validator hotkey should you pick? Follow [this guide](assigning_validator_hotkeys.md)
 
 ### What is a Validator Hotkey?
