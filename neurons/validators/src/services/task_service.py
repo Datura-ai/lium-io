@@ -106,6 +106,8 @@ class TaskService:
         max_score = 0
         if gpu_model:
             max_score = GPU_MAX_SCORES.get(gpu_model, 0)
+            
+        gpu_count = machine_spec.get("gpu", {}).get("count", 0)
 
         logger.info(f"gpu model: {gpu_model}, max score: {max_score}")
 
@@ -175,7 +177,7 @@ class TaskService:
             download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
 
             score = max_score * (
-                job_taken_score * JOB_TAKEN_TIME_WEIGHT
+                job_taken_score * gpu_count * JOB_TAKEN_TIME_WEIGHT
                 + upload_speed_score * UPLOAD_SPEED_WEIGHT
                 + download_speed_score * DOWNLOAD_SPEED_WEIGHT
             )
