@@ -46,7 +46,7 @@ To start renting machines, visit [ComputeNet.ai](https://computenet.ai) and acce
 
 Miners can contribute their GPU-equipped machines to the network. The machines are scored and validated based on factors like GPU type, number of GPUs, bandwidth, and overall GPU performance. Higher performance results in better compensation for miners.
 
-If you are a miner and want to contribute GPU resources to the subnet, please refer to the [Miner Setup Guide](/neurons/miner/README.md) for instructions on how to:
+If you are a miner and want to contribute GPU resources to the subnet, please refer to the [Miner Setup Guide](neurons/miners/README.md) for instructions on how to:
 
 - Set up your environment.
 - Install the miner software.
@@ -57,7 +57,7 @@ If you are a miner and want to contribute GPU resources to the subnet, please re
 
 Validators play a crucial role in maintaining the integrity of the Compute Subnet by verifying the hardware specifications and performance of miners’ machines. Validators ensure that miners are fairly compensated based on their GPU contributions and prevent fraudulent activities.
 
-For more details, visit the [Validator Setup Guide](/neurons/validator/README.md).
+For more details, visit the [Validator Setup Guide](neurons/validators/README.md).
 
 
 ## Contact and Support
