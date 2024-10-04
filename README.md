@@ -9,9 +9,9 @@ Welcome to the **Compute Subnet on Bittensor**! This project enables a decentral
 - [Introduction](#introduction)
 - [High-Level Architecture](#high-level-architecture)
 - [Getting Started](#getting-started)
-  - For Renters
-  - For Miners
-  - For Validators
+  - [For Renters](#for-renters)
+  - [For Miners](#for-miners)
+  - [For Validators](#for-validators)
 - [Contact and Support](#contact-and-support)
 
 ## Introduction
