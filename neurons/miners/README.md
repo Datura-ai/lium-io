@@ -54,10 +54,15 @@ cp neurons/miners/.env.template neurons/miners/.env
 Fill in your information for:
 
 `BITTENSOR_WALLET_NAME`: Your wallet name for Bittensor. You can check this with `btcli wallet list`
+
 `BITTENSOR_WALLET_HOTKEY_NAME`: The hotkey name of your wallet's registered hotkey. If it is not registered, run `btcli subnet register --netuid 51`. 
+
 `EXTERNAL_IP_ADDRESS`: The external IP address of your central miner server. Make sure it is open to external connections on the `EXTERNAL PORT`
-`HOST_WALLET_DIR`: The directory path of your wallet on the host machine.
+
+`HOST_WALLET_DIR`: The directory path of your wallet on the machine.
+
 `INTERNAL_PORT` and `EXTERNAL_PORT`: Optionally customize these ports. Make sure the `EXTERNAL PORT` is open for external connections to connect to the validators.
+
 
 #### Step 4: Start the Miner
 
