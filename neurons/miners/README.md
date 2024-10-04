@@ -91,7 +91,7 @@ Executors are machines running on GPUs that you can add to your central miner. T
 
 The **validator hotkey** is a unique identifier tied to a validator that authenticates and verifies the performance of your executor machines. When you specify a validator hotkey during executor registration, it ensures that your executor is validated by this specific validator.
 
-To switch to a different validator, you can update the hotkey when adding or reconfiguring executors.
+To switch to a different validator first follow the instructions for removing an executor. After removing the executor, you need to re-register executors by running the add-executor command again (Step 2 of Adding an Executor).
 
 ### Removing an Executor
 
@@ -102,10 +102,6 @@ To remove an executor from the central miner, follow these steps:
     ```bash
     docker exec <docker instance> python /root/app/src/cli.py remove-executor --address <executor public ip> --port <executor external port>
     ```
-
-### Changing the Validator Hotkey
-
-To change the validator hotkey that has access to your executor, first follow the instructions above to remove the executor. After removing the executor, you need to re-register executors by running the add-executor command again (Step 2 of Adding an Executor).
 
 
 ### Monitoring earnings
