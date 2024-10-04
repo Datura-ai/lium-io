@@ -3,30 +3,45 @@
 ## Setup project
 ### Requirements
 * Ubuntu machine
-* install [pdm](https://pdm-project.org/latest/)
-* python version v3.11.*
-* For ssh connection test on local machine, need to install openssh-client and openssh-server
+* install [docker](https://docs.docker.com/engine/install/ubuntu/)
+
+
+### Step 1: Clone project
+
 ```
-sudo apt-get install openssh-client openssh-server
+git clone https://github.com/Datura-ai/compute-subnet.git
 ```
+
+### Step 2: Install Required Tools
 
 Run following command to install required tools: 
 ```shell
-chmod +x scripts/install_executor_on_ubuntu.sh && scripts/install_executor_on_ubuntu.sh
+cd compute-subnet && chmod +x scripts/install_executor_on_ubuntu.sh && scripts/install_executor_on_ubuntu.sh
 ```
 
-### Install and Run
+### Step 3: Install and Run
 
-* Install Python dependencies
-```
-pdm install
+* Go to executor root
+```shell
+cd neurons/executor
 ```
 
 * Add .env in the project
+```shell
+cp .env.template .env
+```
 
-See the required enviroment variables in the example.env
+Add the correct miner wallet hotkey for `MINER_HOTKEY_SS58_ADDRESS`.
+You can change the ports for `INTERNAL_PORT`, `EXTERNAL_PORT`, `SSH_PORT` based on your need.
+
+```
+INTERNAL_PORT: internal port of your executor docker container
+EXTERNAL_PORT: external expose port of your executor docker container
+SSH_PORT: ssh access port of your executor docker container
+MINER_HOTKEY_SS58_ADDRESS: the miner hotkey address
+```
 
 * Run project
-```
-python src/executor.py
+```shell
+docker compose up -d
 ```
