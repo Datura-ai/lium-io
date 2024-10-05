@@ -1,5 +1,16 @@
 # Validator
 
+## System Requirements
+
+For validation, a validator machine will need:
+
+- **CPU**: 4 cores
+- **RAM**: 8 GB
+
+Ensure that your machine meets these requirements before proceeding with the setup.
+
+---
+
 First, register and regen your bittensor wallet and validator hotkey onto the machine. 
 
 For installation of btcli, check [this guide](https://github.com/opentensor/bittensor/blob/master/README.md#install-bittensor-sdk)
