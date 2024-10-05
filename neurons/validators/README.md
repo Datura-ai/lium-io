@@ -1,5 +1,18 @@
 # Validator
 
+First, register and regen your bittensor wallet and validator hotkey onto the machine. 
+
+For installation of btcli, check [this guide](https://github.com/opentensor/bittensor/blob/master/README.md#install-bittensor-sdk)
+```
+btcli s register --netuid 51
+```
+```
+btcli w regen_coldkeypub
+```
+```
+btcli w regen_hotkey
+```
+
 ## Installation
 
 ### Using Docker
@@ -16,18 +29,12 @@ git clone https://github.com/Datura-ai/compute-subnet.git
 cd compute-subnet && chmod +x scripts/install_validator_on_ubuntu.sh && ./scripts/install_validator_on_ubuntu.sh
 ```
 
-Verify if bittensor and docker installed: 
-```
-btcli --version
-```
+Verify docker installation
 
 ```
 docker --version
 ```
-
-If one of them isn't installed properly, install using following link:     
-For bittensor, use [This Link](https://github.com/opentensor/bittensor/blob/master/README.md#install-bittensor-sdk)
-For docker, use [This Link](https://docs.docker.com/engine/install/)
+If did not correctly install, follow [this link](https://docs.docker.com/engine/install/)
 
 #### Step 3: Setup ENV
 ```
