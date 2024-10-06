@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-docker compose up --detach --wait --force-recreate
+docker compose up --pull always --detach --wait --force-recreate
 
 while true
 do
