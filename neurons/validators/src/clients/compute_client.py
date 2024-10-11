@@ -8,7 +8,12 @@ import pydantic
 import redis.asyncio as aioredis
 import tenacity
 import websockets
-from payload_models.payloads import ContainerCreated, ContainerCreateRequest, ContainerDeleteRequest
+from payload_models.payloads import (
+    ContainerCreated,
+    ContainerCreateRequest,
+    ContainerDeleteRequest,
+    FailedContainerRequest,
+)
 from protocol.vc_protocol.compute_requests import Error, Response
 from protocol.vc_protocol.validator_requests import AuthenticateRequest, ExecutorSpecRequest
 from pydantic import BaseModel
@@ -252,11 +257,9 @@ class ComputeClient:
         elif isinstance(job_request, ContainerDeleteRequest):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
-            container_created: ContainerDeleteRequest = await self.miner_service.handle_container(
-                job_request
-            )
+            response: (
+                ContainerDeleteRequest | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
 
-            logger.info(
-                "Sending back deleted container info to compute app: %s", str(container_created)
-            )
-            await self.send_model(container_created)
+            logger.info("Sending back deleted container info to compute app: %s", str(response))
+            await self.send_model(response)

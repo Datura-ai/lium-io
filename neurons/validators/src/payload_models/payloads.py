@@ -68,7 +68,7 @@ class ContainerDeleteRequest(ContainerBaseRequest):
 
 class ContainerResponseType(enum.Enum):
     ContainerCreated = "ContainerCreated"
-    ContainerStarted = ("ContainerStarted",)
+    ContainerStarted = "ContainerStarted"
     ContainerStopped = "ContainerStopped"
     ContainerDeleted = "ContainerDeleted"
     FailedRequest = "FailedRequest"
