@@ -26,6 +26,7 @@ def initiate_services():
         ssh_service=ioc["SSHService"],
         task_service=ioc["TaskService"],
         docker_service=ioc["DockerService"],
+        executor_dao=ioc["ExecutorDao"],
     )
 
 

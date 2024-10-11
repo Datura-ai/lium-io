@@ -29,6 +29,7 @@ from payload_models.payloads import (
 )
 
 from core.config import settings
+from daos.executor import ExecutorDao
 from services.docker_service import DockerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
@@ -46,10 +47,12 @@ class MinerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
         docker_service: Annotated[DockerService, Depends(DockerService)],
+        executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.docker_service = docker_service
+        self.executor_dao = executor_dao
         self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
 
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
@@ -174,7 +177,12 @@ class MinerService:
             if isinstance(msg, AcceptSSHKeyRequest):
                 logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
 
-                executor = msg.executors[0]
+                try:
+                    executor = msg.executors[0]
+                except Exception as e:
+                    logger.error(f"Miner didn't return executor info: {e}")
+                    executor = None
+
                 if executor is None or executor.uuid != payload.executor_id:
                     logger.error(f"Invalid executor id {payload.executor_id}")
                     await miner_client.send_model(
@@ -182,6 +190,8 @@ class MinerService:
                             public_key=public_key, executor_id=payload.executor_id
                         )
                     )
+
+                    self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,

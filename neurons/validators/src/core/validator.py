@@ -50,7 +50,10 @@ class Validator:
         )
         docker_service = DockerService(ssh_service=ssh_service, executor_dao=executor_dao)
         self.miner_service = MinerService(
-            ssh_service=ssh_service, task_service=task_service, docker_service=docker_service
+            ssh_service=ssh_service,
+            task_service=task_service,
+            docker_service=docker_service,
+            executor_dao=executor_dao,
         )
 
     def get_subtensor(self):
