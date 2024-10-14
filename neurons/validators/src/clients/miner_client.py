@@ -15,8 +15,8 @@ from datura.requests.miner_requests import (
     DeclineJobRequest,
     FailedRequest,
     GenericError,
-    UnAuthorizedRequest,
     SSHKeyRemoved,
+    UnAuthorizedRequest,
 )
 from datura.requests.validator_requests import AuthenticateRequest, AuthenticationPayload
 
@@ -56,7 +56,7 @@ class MinerClient(abc.ABC):
         self.miner_address = miner_address
         self.miner_port = miner_port
         self.keypair = keypair
-        
+
         self.miner_url = miner_url
 
         self.job_state = JobState()
@@ -69,13 +69,18 @@ class MinerClient(abc.ABC):
         Handle the message based on its type or raise UnsupportedMessageReceived
         """
         if isinstance(msg, AcceptJobRequest):
-            self.job_state.miner_ready_or_declining_timestamp = time.time()
-            self.job_state.miner_ready_or_declining_future.set_result(msg)
-        elif isinstance(msg, AcceptSSHKeyRequest | FailedRequest | UnAuthorizedRequest | DeclineJobRequest):
-            self.job_state.miner_accepted_ssh_key_or_failed_timestamp = time.time()
-            self.job_state.miner_accepted_ssh_key_or_failed_future.set_result(msg)
+            if not self.job_state.miner_ready_or_declining_future.done():
+                self.job_state.miner_ready_or_declining_timestamp = time.time()
+                self.job_state.miner_ready_or_declining_future.set_result(msg)
+        elif isinstance(
+            msg, AcceptSSHKeyRequest | FailedRequest | UnAuthorizedRequest | DeclineJobRequest
+        ):
+            if not self.job_state.miner_accepted_ssh_key_or_failed_future.done():
+                self.job_state.miner_accepted_ssh_key_or_failed_timestamp = time.time()
+                self.job_state.miner_accepted_ssh_key_or_failed_future.set_result(msg)
         elif isinstance(msg, SSHKeyRemoved):
-            self.job_state.miner_removed_ssh_key_future.set_result(msg)
+            if not self.job_state.miner_removed_ssh_key_future.done():
+                self.job_state.miner_removed_ssh_key_future.set_result(msg)
 
     async def __aenter__(self):
         await self.await_connect()
