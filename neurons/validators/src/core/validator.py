@@ -221,7 +221,6 @@ class Validator:
             if (
                 current_block % settings.BLOCKS_FOR_JOB == 0
                 or current_block - self.last_job_run_blocks > int(settings.BLOCKS_FOR_JOB * 1.5)
-                or current_block % settings.BLOCKS_FOR_JOB < 5
             ):
                 bittensor.logging.info(
                     "Send jobs to %d miners at block(%d)",
