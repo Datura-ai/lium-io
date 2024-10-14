@@ -66,7 +66,9 @@ class TaskService:
             )
         )
 
-        logger.info("Connect ssh")
+        logger.info(
+            f"Connect ssh -> executor info: {executor_info.address}:{executor_info.ssh_port}"
+        )
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = Ed25519Key.from_private_key(io.StringIO(private_key))
 
@@ -95,7 +97,10 @@ class TaskService:
             self._run_task, ssh_client, executor_info, remote_file_path
         )
         machine_spec = json.loads(machine_specs[0].strip())
-        logger.info(f"machine spec: {machine_spec}")
+
+        logger.info(
+            f"Machine spec -> executor: {executor_info.address}, spec: {machine_spec}"
+        )
 
         gpu_model = None
         if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -106,10 +111,10 @@ class TaskService:
         max_score = 0
         if gpu_model:
             max_score = GPU_MAX_SCORES.get(gpu_model, 0)
-            
+
         gpu_count = machine_spec.get("gpu", {}).get("count", 0)
 
-        logger.info(f"gpu model: {gpu_model}, max score: {max_score}")
+        logger.info(f"Max Score -> executor: {executor_info.address}, gpu model: {gpu_model}, max score: {max_score}")
 
         executor = self.executor_dao.get_executor(executor_info.uuid, miner_info.miner_hotkey)
         if executor.rented:
@@ -125,7 +130,7 @@ class TaskService:
             return machine_spec, executor_info
 
         logger.info(
-            f"Create Task -> miner_address: {miner_info.miner_address}, miner_hotkey: {miner_info.miner_hotkey}"
+            f"Create Task -> executor: {executor_info.address}, executor uuid:{executor_info.uuid}, miner_hotkey: {miner_info.miner_hotkey}"
         )
         task = self.task_dao.save(
             Task(
@@ -147,7 +152,7 @@ class TaskService:
             self._run_task, ssh_client, executor_info, remote_file_path
         )
         end_time = time.time()
-        logger.info(f"results: {results}")
+        logger.info(f"Task results -> executor: {executor_info.address}, result: {results}")
 
         if err is not None:
             logger.error(f"error: {err}")
