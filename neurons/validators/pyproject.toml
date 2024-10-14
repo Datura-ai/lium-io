@@ -26,6 +26,7 @@ dependencies = [
     "redis>=5.0.8",
     "click>=8.1.7",
     "tenacity>=9.0.0",
+    "uvicorn>=0.30.2",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"
