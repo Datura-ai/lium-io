@@ -67,7 +67,7 @@ class TaskService:
         )
 
         logger.info(
-            f"Connect ssh -> executor info: {executor_info}"
+            f"Connect ssh -> executor info: {executor_info.address}:{executor_info.ssh_port}"
         )
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = Ed25519Key.from_private_key(io.StringIO(private_key))
