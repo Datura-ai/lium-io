@@ -218,9 +218,9 @@ class Validator:
                 self.set_weights(miners, subtensor)
 
             current_block = self.get_current_block(subtensor)
-            if current_block % settings.BLOCKS_FOR_JOB == 0 or (
-                current_block - self.last_job_run_blocks > settings.BLOCKS_FOR_JOB
-                and current_block % settings.BLOCKS_FOR_JOB < 5
+            if (
+                current_block % settings.BLOCKS_FOR_JOB == 0
+                or current_block - self.last_job_run_blocks > int(settings.BLOCKS_FOR_JOB * 1.5)
             ):
                 bittensor.logging.info(
                     "Send jobs to %d miners at block(%d)",
@@ -255,7 +255,12 @@ class Validator:
                     current_block // settings.BLOCKS_FOR_JOB + 1
                 ) * settings.BLOCKS_FOR_JOB - current_block
                 bittensor.logging.info(
-                    "Remaining blocks %d for next job", "sync", "sync", remaining_blocks
+                    "Remaining blocks %d for next job. Last job run at block %d, current block %d",
+                    "sync",
+                    "sync",
+                    remaining_blocks,
+                    self.last_job_run_blocks,
+                    current_block,
                 )
         except Exception:
             logger.error(traceback.format_exc())
