@@ -133,8 +133,8 @@ class ComputeClient:
             validator_hotkey = settings.get_bittensor_wallet().hotkey.ss58_address
             logger.info(f"Waiting for machine specs from validator app: {validator_hotkey}")
             try:
-                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=20 * 60)
-                logger.info("Received machine specs from validator app.")
+                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=100 * 60)
+                logger.info(f"Received machine specs from validator app. msg={msg}")
 
                 if msg is None:
                     logger.warning("No message received from validator app.")
