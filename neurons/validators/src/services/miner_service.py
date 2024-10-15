@@ -169,7 +169,7 @@ class MinerService:
                 SSHPubKeySubmitRequest(public_key=public_key, executor_id=payload.executor_id)
             )
 
-            logger.info("Sent SSH key to miner %s", miner_client.miner_name)
+            logger.info("[handle_container] Sent SSH key to miner %s", miner_client.miner_name)
 
             try:
                 msg = await asyncio.wait_for(
@@ -179,16 +179,16 @@ class MinerService:
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
-                logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+                logger.info(f"[handle_container] Miner {miner_client.miner_name} accepted SSH key: {msg}")
 
                 try:
                     executor = msg.executors[0]
                 except Exception as e:
-                    logger.error(f"Miner didn't return executor info: {e}")
+                    logger.error(f"[handle_container] Error: Miner didn't return executor info: {e}")
                     executor = None
 
                 if executor is None or executor.uuid != payload.executor_id:
-                    logger.error(f"Invalid executor id {payload.executor_id}")
+                    logger.error(f"[handle_container] Error: Invalid executor id {payload.executor_id}")
                     await miner_client.send_model(
                         SSHPubKeyRemoveRequest(
                             public_key=public_key, executor_id=payload.executor_id
@@ -291,7 +291,7 @@ class MinerService:
                         )
 
                 except Exception as e:
-                    logger.error("create container error: %s", str(e))
+                    logger.error("[handle_container] Error: create container error: %s", str(e))
                     await miner_client.send_model(
                         SSHPubKeyRemoveRequest(
                             public_key=public_key, executor_id=payload.executor_id
@@ -305,14 +305,14 @@ class MinerService:
                     )
 
             elif isinstance(msg, FailedRequest):
-                logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
+                logger.info(f"[handle_container] Error: Miner {miner_client.miner_name} failed job: {msg}")
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     msg=f"create container error: {str(msg)}",
                 )
             else:
-                logger.info(f"Unexpected msg: {msg}")
+                logger.info(f"[handle_container] Error: Unexpected msg: {msg}")
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,

@@ -102,12 +102,10 @@ class DockerService:
 
             # creat docker volume
             uuid = uuid4()
-            logger.info("Create docker volume")
             volume_name = f"volume_{uuid}"
             await ssh_client.run(f"docker volume create {volume_name}")
 
             # creat docker container with the port map & resource
-            logger.info("Create docker container")
             container_name = f"container_{uuid}"
             await ssh_client.run(
                 f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
@@ -142,7 +140,6 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            logger.info("stop container")
             await ssh_client.run(f"docker stop {payload.container_name}")
 
             return
@@ -168,7 +165,6 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            logger.info("stop container")
             await ssh_client.run(f"docker start {payload.container_name}")
 
             return
@@ -194,11 +190,8 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            logger.info("delete container")
             await ssh_client.run(f"docker stop {payload.container_name}")
             await ssh_client.run(f"docker rm {payload.container_name} -f")
-
-            logger.info("delete volume")
             await ssh_client.run(f"docker volume rm {payload.volume_name}")
 
             self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
