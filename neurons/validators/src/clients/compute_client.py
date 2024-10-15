@@ -23,6 +23,10 @@ from core.config import settings
 from services.miner_service import MinerService
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(log_color)s %(levelname)-8s %(asctime)s --- %(lineno)-8s [%(name)s] %(funcName)-24s : %(message)s",
+)
 
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 

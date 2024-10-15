@@ -131,18 +131,23 @@ class MinerService:
         """Publish machine specs to compute app connector process"""
         logger.info(f"Publishing machine specs to compute app connector process: {results}")
         for specs, ssh_info in results:
-            await self.redis.publish(
-                "channel:1",
-                json.dumps(
-                    {
-                        "specs": specs,
-                        "miner_hotkey": miner_hotkey,
-                        "executor_uuid": ssh_info.uuid,
-                        "executor_ip": ssh_info.address,
-                        "executor_port": ssh_info.port,
-                    }
-                ),
-            )
+            try:
+                await self.redis.publish(
+                    "channel:1",
+                    json.dumps(
+                        {
+                            "specs": specs,
+                            "miner_hotkey": miner_hotkey,
+                            "executor_uuid": ssh_info.uuid,
+                            "executor_ip": ssh_info.address,
+                            "executor_port": ssh_info.port,
+                        }
+                    ),
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error publishing machine specs of {miner_hotkey} to compute app connector process: {e}"
+                )
 
     async def handle_container(self, payload: ContainerBaseRequest):
         loop = asyncio.get_event_loop()

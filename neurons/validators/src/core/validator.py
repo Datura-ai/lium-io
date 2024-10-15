@@ -56,7 +56,13 @@ class Validator:
             executor_dao=executor_dao,
         )
 
+        subtensor = self.get_subtensor()
+
+        # check registered
+        self.check_registered(subtensor)
+
     def get_subtensor(self):
+        bittensor.logging.debug("Getting subtensor", "get_subtensor", "get_subtensor")
         return bittensor.subtensor(config=self.config)
 
     def get_metagraph(self, subtensor: bittensor.subtensor):
@@ -97,6 +103,7 @@ class Validator:
             bittensor.logging.error("Checking validator registered failed: %s", str(e))
 
     def fetch_miners(self, subtensor: bittensor.subtensor):
+        bittensor.logging.debug("Fetching miners started", "fetch_miners", "fetch_miners")
         metagraph = self.get_metagraph(subtensor)
         miners = [
             neuron
@@ -208,8 +215,7 @@ class Validator:
     async def sync(self):
         try:
             subtensor = self.get_subtensor()
-            # check registered
-            self.check_registered(subtensor)
+            bittensor.logging.info("Syncing at subtensor %s", "sync", "sync", subtensor)
 
             # fetch miners
             miners = self.fetch_miners(subtensor)
@@ -218,6 +224,8 @@ class Validator:
                 self.set_weights(miners, subtensor)
 
             current_block = self.get_current_block(subtensor)
+            bittensor.logging.info(f"Current block: {current_block}", "sync", "sync")
+
             if (
                 current_block % settings.BLOCKS_FOR_JOB == 0
                 or current_block - self.last_job_run_blocks > int(settings.BLOCKS_FOR_JOB * 1.5)
@@ -249,7 +257,23 @@ class Validator:
                     for miner in miners
                 ]
 
-                await asyncio.gather(*jobs, return_exceptions=True)
+                results = await asyncio.gather(*jobs, return_exceptions=True)
+                for index, result in enumerate(results):
+                    miner = miners[index]
+                    if isinstance(result, Exception):
+                        bittensor.logging.error(
+                            f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) resulted in an exception: {result}",
+                            "sync",
+                            "sync",
+                        )
+                    else:
+                        bittensor.logging.info(
+                            f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) completed successfully",
+                            "sync",
+                            "sync",
+                        )
+
+                bittensor.logging.info("All Jobs finished", "sync", "sync")
             else:
                 remaining_blocks = (
                     current_block // settings.BLOCKS_FOR_JOB + 1
@@ -263,10 +287,12 @@ class Validator:
                     current_block,
                 )
         except Exception:
-            logger.error(traceback.format_exc())
+            bittensor.logging.error(
+                f"Error in running task: {traceback.format_exc()}", "sync", "sync"
+            )
 
     async def start(self):
-        bittensor.logging.info("Start Validator in background")
+        bittensor.logging.info("Start Validator in background", "start", "start")
         try:
             while not self.should_exit:
                 await self.sync()
@@ -275,10 +301,12 @@ class Validator:
                 await asyncio.sleep(SYNC_CYCLE)
 
         except KeyboardInterrupt:
-            logger.error("Miner killed by keyboard interrupt.")
+            bittensor.logging.error("Miner killed by keyboard interrupt.", "start", "start")
             exit()
         except Exception:
-            logger.error(traceback.format_exc())
+            bittensor.logging.error(
+                f"Error in running task: {traceback.format_exc()}", "start", "start"
+            )
 
     async def stop(self):
         bittensor.logging.info("Stop Validator process")
