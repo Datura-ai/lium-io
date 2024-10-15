@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:cb4230158eb7f940cc4724b0893d00217fa443a8b1da21fa157e965713c236ec"
+content_hash = "sha256:8ba9635794c83e851adaa1c00d320ad1c55c7218c69811a913c004a0158d623a"
 
 [[metadata.targets]]
 requires_python = "==3.11.*"
@@ -210,6 +210,21 @@ files = [
     {file = "asyncpg-0.29.0-cp311-cp311-win32.whl", hash = "sha256:1e186427c88225ef730555f5fdda6c1812daa884064bfe6bc462fd3a71c4b675"},
     {file = "asyncpg-0.29.0-cp311-cp311-win_amd64.whl", hash = "sha256:cfe73ffae35f518cfd6e4e5f5abb2618ceb5ef02a2365ce64f132601000587d3"},
     {file = "asyncpg-0.29.0.tar.gz", hash = "sha256:d1c49e1f44fffafd9a55e1a9b101590859d881d639ea2922516f5d9c512d354e"},
+]
+
+[[package]]
+name = "asyncssh"
+version = "2.17.0"
+requires_python = ">=3.6"
+summary = "AsyncSSH: Asynchronous SSHv2 client and server library"
+groups = ["default"]
+dependencies = [
+    "cryptography>=39.0",
+    "typing-extensions>=4.0.0",
+]
+files = [
+    {file = "asyncssh-2.17.0-py3-none-any.whl", hash = "sha256:70bfe4081793255b0115f7a72efd92d5bad8562639302531223bb00188db9747"},
+    {file = "asyncssh-2.17.0.tar.gz", hash = "sha256:3b159c105aa388c1e2245c4faf483f540ada8cad99402281119100166e5edb3c"},
 ]
 
 [[package]]
@@ -1160,22 +1175,6 @@ groups = ["default"]
 files = [
     {file = "packaging-24.1-py3-none-any.whl", hash = "sha256:5b8f2217dbdbd2f7f384c41c628544e6d52f2d0f53c6d0c3ea61aa5d1d7ff124"},
     {file = "packaging-24.1.tar.gz", hash = "sha256:026ed72c8ed3fcce5bf8950572258698927fd1dbda10a5e981cdf0ac37f4f002"},
-]
-
-[[package]]
-name = "paramiko"
-version = "3.4.1"
-requires_python = ">=3.6"
-summary = "SSH2 protocol library"
-groups = ["default"]
-dependencies = [
-    "bcrypt>=3.2",
-    "cryptography>=3.3",
-    "pynacl>=1.5",
-]
-files = [
-    {file = "paramiko-3.4.1-py3-none-any.whl", hash = "sha256:8e49fd2f82f84acf7ffd57c64311aa2b30e575370dc23bdb375b10262f7eac32"},
-    {file = "paramiko-3.4.1.tar.gz", hash = "sha256:8b15302870af7f6652f2e038975c1d2973f06046cb5d7d65355668b3ecbece0c"},
 ]
 
 [[package]]

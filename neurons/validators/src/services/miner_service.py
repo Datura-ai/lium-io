@@ -205,8 +205,7 @@ class MinerService:
 
                 try:
                     if isinstance(payload, ContainerCreateRequest):
-                        result = await asyncio.to_thread(
-                            self.docker_service.create_container,
+                        result = await self.docker_service.create_container(
                             payload,
                             executor,
                             my_key,

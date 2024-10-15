@@ -7,7 +7,7 @@ from uuid import uuid4
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
-from paramiko import AutoAddPolicy, Ed25519Key, SSHClient
+import asyncssh
 from payload_models.payloads import (
     ContainerCreatedResult,
     ContainerCreateRequest,
@@ -48,31 +48,7 @@ class DockerService:
 
         return mappings
 
-    def get_ssh_client(
-        self,
-        ip_address: str,
-        ssh_username: str,
-        ssh_port: str,
-        keypair: bittensor.Keypair,
-        private_key: str,
-    ):
-        logger.info("Connect ssh")
-        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = Ed25519Key.from_private_key(io.StringIO(private_key))
-
-        ssh_client = SSHClient()
-        ssh_client.set_missing_host_key_policy(AutoAddPolicy())
-        ssh_client.connect(
-            hostname=ip_address,
-            username=ssh_username,
-            look_for_keys=False,
-            pkey=pkey,
-            port=ssh_port,
-        )
-
-        return ssh_client
-
-    def create_container(
+    async def create_container(
         self,
         payload: ContainerCreateRequest,
         executor_info: ExecutorSSHInfo,
@@ -83,69 +59,69 @@ class DockerService:
             f"Create Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, escecutor: {executor_info}"
         )
 
-        ssh_client = self.get_ssh_client(
-            ip_address=executor_info.address,
-            ssh_username=executor_info.ssh_username,
-            ssh_port=executor_info.ssh_port,
-            keypair=keypair,
-            private_key=private_key,
-        )
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
 
-        # check docker image exists
-        logger.info("Checking if docker image exists: %s", payload.docker_image)
-        stdin, stdout, stderr = ssh_client.exec_command(
-            f"docker inspect --type=image {payload.docker_image}"
-        )
-
-        # Read the output and error streams
-        output = stdout.read().decode("utf-8")
-        error = stderr.read().decode("utf-8")
-
-        if error:
-            logger.info("Pulling docker image: %s", payload.docker_image)
-            stdin, stdout, stderr = ssh_client.exec_command(f"docker pull {payload.docker_image}")
+        async with asyncssh.connect(
+            host=executor_info.address,
+            port=executor_info.ssh_port,
+            username=executor_info.ssh_username,
+            client_keys=[pkey],
+            known_hosts=None,
+        ) as ssh_client:
+            # check docker image exists
+            logger.info("Checking if docker image exists: %s", payload.docker_image)
+            result = await ssh_client.run(
+                f"docker inspect --type=image {payload.docker_image}"
+            )
 
             # Read the output and error streams
-            output = stdout.read().decode("utf-8")
-            error = stderr.read().decode("utf-8")
+            output = result.stdout
+            error = result.stderr
 
-            # Log the output and error
-            if output:
-                logger.info(f"Docker pull output: {output}")
             if error:
-                logger.error(f"Docker pull error: {error}")
-        else:
-            logger.info(f"Docker image {payload.docker_image} already exists locally.")
+                logger.info("Pulling docker image: %s", payload.docker_image)
+                result = await ssh_client.run(f"docker pull {payload.docker_image}")
 
-        # generate port maps
-        port_maps = self.generate_portMappings()
-        port_flags = " ".join([f"-p {external}:{internal}" for internal, external in port_maps])
-        logger.info(f"Port mappings: {port_maps}")
+                # Read the output and error streams
+                output = result.stdout
+                error = result.stderr
 
-        # creat docker volume
-        uuid = uuid4()
-        logger.info("Create docker volume")
-        volume_name = f"volume_{uuid}"
-        ssh_client.exec_command(f"docker volume create {volume_name}")
+                # Log the output and error
+                if output:
+                    logger.info(f"Docker pull output: {output}")
+                if error:
+                    logger.error(f"Docker pull error: {error}")
+            else:
+                logger.info(f"Docker image {payload.docker_image} already exists locally.")
 
-        # creat docker container with the port map & resource
-        logger.info("Create docker container")
-        container_name = f"container_{uuid}"
-        ssh_client.exec_command(
-            f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
-        )
+            # generate port maps
+            port_maps = self.generate_portMappings()
+            port_flags = " ".join([f"-p {external}:{internal}" for internal, external in port_maps])
+            logger.info(f"Port mappings: {port_maps}")
 
-        ssh_client.close()
+            # creat docker volume
+            uuid = uuid4()
+            logger.info("Create docker volume")
+            volume_name = f"volume_{uuid}"
+            await ssh_client.run(f"docker volume create {volume_name}")
 
-        self.executor_dao.rent(payload.executor_id, payload.miner_hotkey)
+            # creat docker container with the port map & resource
+            logger.info("Create docker container")
+            container_name = f"container_{uuid}"
+            await ssh_client.run(
+                f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
+            )
 
-        return ContainerCreatedResult(
-            container_name=container_name,
-            volume_name=volume_name,
-            port_maps=port_maps,
-        )
+            self.executor_dao.rent(payload.executor_id, payload.miner_hotkey)
 
-    def stop_container(
+            return ContainerCreatedResult(
+                container_name=container_name,
+                volume_name=volume_name,
+                port_maps=port_maps,
+            )
+
+    async def stop_container(
         self,
         payload: ContainerStopRequest,
         executor_info: ExecutorSSHInfo,
@@ -156,22 +132,22 @@ class DockerService:
             f"Stop Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, executor: {executor_info}, container_name: {payload.container_name}"
         )
 
-        ssh_client = self.get_ssh_client(
-            ip_address=executor_info.address,
-            ssh_username=executor_info.ssh_username,
-            ssh_port=executor_info.ssh_port,
-            keypair=keypair,
-            private_key=private_key,
-        )
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
 
-        logger.info("stop container")
-        ssh_client.exec_command(f"docker stop {payload.container_name}")
+        async with asyncssh.connect(
+            host=executor_info.address,
+            port=executor_info.ssh_port,
+            username=executor_info.ssh_username,
+            client_keys=[pkey],
+            known_hosts=None,
+        ) as ssh_client:
+            logger.info("stop container")
+            await ssh_client.run(f"docker stop {payload.container_name}")
 
-        ssh_client.close()
+            return
 
-        return
-
-    def start_container(
+    async def start_container(
         self,
         payload: ContainerStartRequest,
         executor_info: ExecutorSSHInfo,
@@ -182,22 +158,22 @@ class DockerService:
             f"Restart Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, contaienr_name: {payload.container_name}"
         )
 
-        ssh_client = self.get_ssh_client(
-            ip_address=executor_info.address,
-            ssh_username=executor_info.ssh_username,
-            ssh_port=executor_info.ssh_port,
-            keypair=keypair,
-            private_key=private_key,
-        )
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
 
-        logger.info("stop container")
-        ssh_client.exec_command(f"docker start {payload.container_name}")
+        async with asyncssh.connect(
+            host=executor_info.address,
+            port=executor_info.ssh_port,
+            username=executor_info.ssh_username,
+            client_keys=[pkey],
+            known_hosts=None,
+        ) as ssh_client:
+            logger.info("stop container")
+            await ssh_client.run(f"docker start {payload.container_name}")
 
-        ssh_client.close()
+            return
 
-        return
-
-    def delete_container(
+    async def delete_container(
         self,
         payload: ContainerDeleteRequest,
         executor_info: ExecutorSSHInfo,
@@ -208,23 +184,23 @@ class DockerService:
             f"Restart Docker Container -> miner_address: {payload.miner_address}, miner_hotkey: {payload.miner_hotkey}, contaienr_name: {payload.container_name}"
         )
 
-        ssh_client = self.get_ssh_client(
-            ip_address=executor_info.address,
-            ssh_username=executor_info.ssh_username,
-            ssh_port=executor_info.ssh_port,
-            keypair=keypair,
-            private_key=private_key,
-        )
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
 
-        logger.info("delete container")
-        ssh_client.exec_command(f"docker stop {payload.container_name}")
-        ssh_client.exec_command(f"docker rm {payload.container_name} -f")
+        async with asyncssh.connect(
+            host=executor_info.address,
+            port=executor_info.ssh_port,
+            username=executor_info.ssh_username,
+            client_keys=[pkey],
+            known_hosts=None,
+        ) as ssh_client:
+            logger.info("delete container")
+            await ssh_client.run(f"docker stop {payload.container_name}")
+            await ssh_client.run(f"docker rm {payload.container_name} -f")
 
-        logger.info("delete volume")
-        ssh_client.exec_command(f"docker volume rm {payload.volume_name}")
+            logger.info("delete volume")
+            await ssh_client.run(f"docker volume rm {payload.volume_name}")
 
-        ssh_client.close()
+            self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
 
-        self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
-
-        return
+            return
