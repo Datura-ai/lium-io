@@ -48,6 +48,6 @@ RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bash_profile
 COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 
-LABEL version="2.0.1"
+LABEL version="2.0.10"
 
 CMD ["bash", "run.sh"]
