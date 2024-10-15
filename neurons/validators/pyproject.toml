@@ -79,7 +79,6 @@ dependencies = [
     "nvidia-nvjitlink-cu12==12.6.20",
     "nvidia-nvtx-cu12==12.1.105",
     "packaging==24.1",
-    "paramiko==3.4.1",
     "password-strength==0.0.3.post2",
     "pluggy==1.5.0",
     "psycopg2-binary==2.9.9",
@@ -130,6 +129,7 @@ dependencies = [
     "wheel==0.44.0",
     "xxhash==3.4.1",
     "yarl==1.9.4",
+    "asyncssh>=2.17.0",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"
