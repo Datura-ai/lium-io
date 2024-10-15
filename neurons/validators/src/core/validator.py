@@ -122,6 +122,14 @@ class Validator:
         scores = self.task_dao.get_scores_for_last_epoch(self.get_tempo(subtensor))
 
         hotkey_to_score = {score.miner_hotkey: score.total_score for score in scores}
+        for miner_hotkey in hotkey_to_score.keys():
+            bittensor.logging.info(
+                "Total score for miner(%s) is %f",
+                "set_weights",
+                "set_weights",
+                miner_hotkey,
+                hotkey_to_score.get(miner_hotkey, 0.0),
+            )
 
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)

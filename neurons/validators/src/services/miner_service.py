@@ -58,13 +58,9 @@ class MinerService:
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        miner_name = f"{payload.miner_hotkey}_{payload.miner_address}_{payload.miner_port}"
 
-        logger.info(
-            "Requesting job to miner(%s-%s:%d)",
-            payload.miner_hotkey,
-            payload.miner_address,
-            payload.miner_port,
-        )
+        logger.info("Requesting job to miner(%s)", miner_name)
 
         miner_client = MinerClient(
             loop=loop,
@@ -94,7 +90,9 @@ class MinerService:
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
-                logger.info(f"Miner {miner_client.miner_name} accepted SSH key: {msg}")
+                logger.info(
+                    f"Requesting job to miner({miner_name}): Received AcceptSSHKeyRequest: {msg}"
+                )
 
                 tasks = [
                     asyncio.create_task(
@@ -113,17 +111,18 @@ class MinerService:
                     for result in await asyncio.gather(*tasks, return_exceptions=True)
                     if result
                 ]
-                logger.info(f"Miner {miner_client.miner_name} machine specs: {results}")
+                logger.info(f"Miner({miner_name}) machine specs: {results}")
                 await self.publish_machine_specs(results, miner_client.miner_hotkey)
                 await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
+                logger.info(f"Requesting job success for miner({miner_name})")
             elif isinstance(msg, FailedRequest):
-                logger.info(f"Miner {miner_client.miner_name} failed job: {msg}")
+                logger.warning(f"Requesting job failed for miner({miner_name}): {msg}")
                 return
             elif isinstance(msg, DeclineJobRequest):
-                logger.info(f"Miner {miner_client.miner_name} job declined: {msg}")
+                logger.warning(f"Requesting job declined for miner({miner_name}): {msg}")
                 return
             else:
-                raise ValueError(f"Unexpected msg: {msg}")
+                raise ValueError(f"Requesting job to miner({miner_name}): Unexpected msg: {msg}")
 
     async def publish_machine_specs(
         self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str

@@ -146,6 +146,7 @@ class ComputeClient:
 
                 msg = json.loads(msg["data"])
                 specs = None
+                executor_name = ""
                 try:
                     specs = ExecutorSpecRequest(
                         specs=msg["specs"],
@@ -155,12 +156,18 @@ class ComputeClient:
                         executor_ip=msg["executor_ip"],
                         executor_port=msg["executor_port"],
                     )
+                    executor_name = (
+                        f"{msg['executor_uuid']}_{msg['executor_ip']}_{msg['executor_port']}"
+                    )
                 except Exception as exc:
                     msg = f"Error occurred while parsing msg: {exc}"
                     logger.warning(msg)
                     continue
 
-                logger.info(f"sending machine specs update to compute app: {specs}")
+                logger.info(
+                    f"sending machine specs update of executor(%s) to compute app: {specs}",
+                    executor_name,
+                )
 
                 specs_queue.append(specs)
                 if self.ws is not None:
@@ -170,11 +177,11 @@ class ComputeClient:
                             await self.send_model(spec_to_send)
                         except Exception as exc:
                             specs_queue.insert(0, spec_to_send)
-                            msg = f"Error occurred while sending specs: {exc}"
-                            logger.warning(msg)
+                            msg = f"Error occurred while sending specs of executor({executor_name}): {exc}"
+                            logger.error(msg)
                             break
             except TimeoutError:
-                logger.debug("wait_for_specs still running")
+                logger.error("wait_for_specs still running")
 
     def create_metagraph_refresh_task(self, period=None):
         return create_metagraph_refresh_task(period=period)
