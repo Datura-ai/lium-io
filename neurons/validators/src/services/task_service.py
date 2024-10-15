@@ -1,15 +1,13 @@
-import asyncio
-import io
 import json
 import logging
 import time
 from pathlib import Path
 from typing import Annotated
 
+import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
-import asyncssh
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
@@ -83,9 +81,13 @@ class TaskService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                logger.info(f"[create_task] SSH connection established with executor({executor_name})")
+                logger.info(
+                    f"[create_task] SSH connection established with executor({executor_name})"
+                )
                 await ssh_client.run(f"mkdir -p {executor_info.root_dir}/temp")
-                logger.debug(f"[create_task] Created temporary directory on executor({executor_name})")
+                logger.debug(
+                    f"[create_task] Created temporary directory on executor({executor_name})"
+                )
 
                 async with ssh_client.start_sftp_client() as sftp_client:
                     # run synthetic job
@@ -93,7 +95,9 @@ class TaskService:
 
                     # get machine specs
                     timestamp = int(time.time())
-                    local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py")
+                    local_file_path = str(
+                        Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
+                    )
                     remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
 
                     await sftp_client.put(local_file_path, remote_file_path)
@@ -101,13 +105,15 @@ class TaskService:
                         f"[create_task] Uploaded machine scrape script to executor({executor_name})"
                     )
 
-                    machine_specs, _ = await self._run_task(ssh_client, executor_info, remote_file_path)
+                    machine_specs, _ = await self._run_task(
+                        ssh_client, executor_info, remote_file_path
+                    )
                     if not machine_specs:
                         return None
 
                     machine_spec = json.loads(machine_specs[0].strip())
                     logger.info(
-                        f"[create_task] Machine spec -> executor: {executor_info.address}, spec: {machine_spec}"
+                        f"[create_task] Machine spec -> executor: {executor_name}, spec: {machine_spec}"
                     )
 
                     gpu_model = None
@@ -123,10 +129,12 @@ class TaskService:
                     gpu_count = machine_spec.get("gpu", {}).get("count", 0)
 
                     logger.info(
-                        f"[create_task] Max Score -> executor: {executor_info.address}, gpu model: {gpu_model}, max score: {max_score}"
+                        f"[create_task] Max Score -> executor: {executor_name}, gpu model: {gpu_model}, max score: {max_score}"
                     )
 
-                    executor = self.executor_dao.get_executor(executor_info.uuid, miner_info.miner_hotkey)
+                    executor = self.executor_dao.get_executor(
+                        executor_info.uuid, miner_info.miner_hotkey
+                    )
                     if executor.rented:
                         score = max_score * gpu_count
                         logger.info(
@@ -144,7 +152,7 @@ class TaskService:
                         return machine_spec, executor_info
 
                     logger.info(
-                        f"[create_task] Create Task -> executor: {executor_info.address}, executor uuid:{executor_info.uuid}, miner_hotkey: {miner_info.miner_hotkey}"
+                        f"[create_task] Create Task -> executor: {executor_name}, executor uuid:{executor_info.uuid}, miner_hotkey: {miner_info.miner_hotkey}"
                     )
                     task = self.task_dao.save(
                         Task(
@@ -172,7 +180,7 @@ class TaskService:
 
                     end_time = time.time()
                     logger.info(
-                        f"[create_task] Task results -> executor: {executor_info.address}, result: {results}"
+                        f"[create_task] Task results -> executor: {executor_name}, result: {results}"
                     )
 
                     if err is not None:
@@ -186,7 +194,9 @@ class TaskService:
                             task_status=TaskStatus.Failed,
                             score=0,
                         )
-                        logger.debug(f"[create_task] Task marked as failed for executor({executor_name})")
+                        logger.debug(
+                            f"[create_task] Task marked as failed for executor({executor_name})"
+                        )
                     else:
                         job_taken_time = results[-1]
                         try:
@@ -214,9 +224,9 @@ class TaskService:
                         )
 
                         logger.info(
-                            "[create_task] Give score(%f) to miner(%s) for the task(%s).",
+                            "[create_task] Give score(%f) for executor(%s) for the task(%s).",
                             score,
-                            miner_info.miner_hotkey,
+                            executor_name,
                             str(task.uuid),
                         )
 
@@ -232,7 +242,9 @@ class TaskService:
                         )
 
                     logger.debug(f"[create_task] SFTP client closed for executor({executor_name})")
-                    logger.info(f"[create_task] SSH connection closed for executor({executor_name})")
+                    logger.info(
+                        f"[create_task] SSH connection closed for executor({executor_name})"
+                    )
 
                     return machine_spec, executor_info
         except Exception as e:
@@ -240,7 +252,10 @@ class TaskService:
             return None
 
     async def _run_task(
-        self, ssh_client: asyncssh.SSHClientConnection, executor_info: ExecutorSSHInfo, remote_file_path: str
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        remote_file_path: str,
     ) -> tuple[list[str] | None, str | None]:
         try:
             logger.info(
@@ -253,7 +268,7 @@ class TaskService:
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
             print("results ================>", results)
-            print('errors ===>', errors)
+            print("errors ===>", errors)
 
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
 

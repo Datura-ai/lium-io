@@ -248,13 +248,16 @@ class ComputeClient:
         """drive a miner client from job start to completion, then close miner connection"""
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logger.info(
-            "Miner driver to miner(%s, %s:%d)",
+            "Miner driver to miner(%s, %s:%d), {job_request}",
             job_request.miner_hotkey,
             miner_axon_info.ip,
             miner_axon_info.port,
         )
 
         if isinstance(job_request, ContainerCreateRequest):
+            logger.info(
+                f"Creating container for executor({job_request.executor_id}): {job_request}"
+            )
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             container_created: ContainerCreated = await self.miner_service.handle_container(
