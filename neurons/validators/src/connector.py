@@ -1,14 +1,17 @@
 import asyncio
 import logging
-import multiprocessing
 
 from clients.compute_client import ComputeClient
 
 from core.config import settings
+from core.utils import wait_for_services_sync
 from services.ioc import ioc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
+
+
+wait_for_services_sync()
 
 
 async def run_forever():
@@ -27,7 +30,10 @@ def start_process():
     loop.run_until_complete(run_forever())
 
 
-def start_connector_process():
-    p = multiprocessing.Process(target=start_process)
-    p.start()
-    return p
+if __name__ == "__main__":
+    start_process()
+
+# def start_connector_process():
+#     p = multiprocessing.Process(target=start_process)
+#     p.start()
+#     return p
