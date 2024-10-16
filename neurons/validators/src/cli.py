@@ -1,13 +1,14 @@
 import asyncio
 import logging
-import time
 import random
+import time
 import uuid
 
 import click
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 
+from core.validator import Validator
 from services.ioc import ioc
 from services.miner_service import MinerService
 
@@ -35,15 +36,17 @@ def debug_send_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: i
         )
     )
 
+
 def generate_random_ip():
     return ".".join(str(random.randint(0, 255)) for _ in range(4))
+
 
 @cli.command()
 def debug_send_machine_specs_to_connector():
     """Debug sending machine specs to connector"""
     miner_service: MinerService = ioc["MinerService"]
     counter = 0
-    
+
     while counter < 10:
         counter += 1
         debug_specs = {
@@ -63,7 +66,12 @@ def debug_send_machine_specs_to_connector():
                 ],
             },
             "cpu": {"count": 128, "model": "AMD EPYC 7452 32-Core Processor", "clocks": []},
-            "ram": {"available": 491930408, "free": 131653212, "total": 528012784, "used": 396359572},
+            "ram": {
+                "available": 491930408,
+                "free": 131653212,
+                "total": 528012784,
+                "used": 396359572,
+            },
             "hard_disk": {"total": 20971520, "used": 13962880, "free": 7008640},
             "os": "Ubuntu 22.04.4 LTS",
         }
@@ -86,7 +94,7 @@ def debug_send_machine_specs_to_connector():
                 miner_hotkey="5Cco1xUS8kXuaCzAHAXZ36nr6mLzmY5B9ufxrfb8Q3HB6ZdN",
             )
         )
-        
+
         asyncio.run(
             miner_service.publish_machine_specs(
                 results=[
@@ -106,8 +114,18 @@ def debug_send_machine_specs_to_connector():
                 miner_hotkey="5Cco1xUS8kXuaCzAHAXZ36nr6mLzmY5B9ufxrfb8Q3HB6ZdN",
             )
         )
-        
+
         time.sleep(2)
+
+
+@cli.command()
+def debug_set_weights():
+    """Debug setting weights"""
+    validator = Validator()
+    subtensor = validator.get_subtensor()
+    # fetch miners
+    miners = validator.fetch_miners(subtensor)
+    asyncio.run(validator.set_weights(miners=miners, subtensor=subtensor))
 
 
 if __name__ == "__main__":

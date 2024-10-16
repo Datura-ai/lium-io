@@ -56,12 +56,12 @@ class TaskService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
-        executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+        executor_name = f"{miner_info.miner_hotkey}_{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
         try:
             logger.info(
                 f"[create_task] Creating task for executor({executor_name}): Upsert executor uuid: {executor_info.uuid}"
             )
-            self.executor_dao.upsert(
+            await self.executor_dao.upsert(
                 Executor(
                     miner_address=miner_info.miner_address,
                     miner_port=miner_info.miner_port,
@@ -142,15 +142,15 @@ class TaskService:
                         f"[create_task] Max Score -> executor: {executor_name}, gpu model: {gpu_model}, max score: {max_score}"
                     )
 
-                    executor = self.executor_dao.get_executor(
-                        executor_info.uuid, miner_info.miner_hotkey
+                    executor = await self.executor_dao.get_executor(
+                        executor_id=executor_info.uuid, miner_hotkey=miner_info.miner_hotkey
                     )
                     if executor.rented:
                         score = max_score * gpu_count
                         logger.info(
                             f"[create_task] Executor({executor_name}) is already rented. Give score: {score}"
                         )
-                        self.task_dao.save(
+                        await self.task_dao.save(
                             Task(
                                 task_status=TaskStatus.Finished,
                                 miner_hotkey=miner_info.miner_hotkey,
@@ -159,19 +159,22 @@ class TaskService:
                                 score=score,
                             )
                         )
+                        logger.info(
+                            f"[create_task] Task saved with status Finished for executor({executor_name})"
+                        )
                         return machine_spec, executor_info
 
                     logger.info(
                         f"[create_task] Create Task -> executor: {executor_name}, executor uuid:{executor_info.uuid}, miner_hotkey: {miner_info.miner_hotkey}"
                     )
-                    task = self.task_dao.save(
+                    task = await self.task_dao.save(
                         Task(
                             task_status=TaskStatus.SSHConnected,
                             miner_hotkey=miner_info.miner_hotkey,
                             executor_id=executor_info.uuid,
                         )
                     )
-                    logger.debug(
+                    logger.info(
                         f"[create_task] Task saved with status SSHConnected for executor({executor_name})"
                     )
 
@@ -200,7 +203,7 @@ class TaskService:
                         )
 
                         # mark task is failed
-                        self.task_dao.update(
+                        await self.task_dao.update(
                             uuid=task.uuid,
                             task_status=TaskStatus.Failed,
                             score=0,
@@ -242,7 +245,7 @@ class TaskService:
                         )
 
                         # update task with results
-                        self.task_dao.update(
+                        await self.task_dao.update(
                             uuid=task.uuid,
                             task_status=TaskStatus.Finished,
                             proceed_time=job_taken_time,
@@ -314,8 +317,8 @@ class TaskService:
 
             return None, str(e)
 
-    def get_decrypted_private_key_for_task(self, uuid: str) -> str | None:
-        task = self.task_dao.get_task_by_uuid(uuid)
+    async def get_decrypted_private_key_for_task(self, uuid: str) -> str | None:
+        task = await self.task_dao.get_task_by_uuid(uuid)
         if task is None:
             return None
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
