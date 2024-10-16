@@ -281,15 +281,6 @@ class Validator:
                             )
 
                     bittensor.logging.info("All Jobs finished", "sync", "sync")
-
-                    # Get all tasks in the current event loop
-                    tasks = asyncio.all_tasks()
-                    pending_tasks = [task for task in tasks if not task.done()]
-
-                    bittensor.logging.info(f"Total tasks: {len(tasks)}")
-                    bittensor.logging.info(f"Pending tasks: {len(pending_tasks)}")
-                    for task in pending_tasks:
-                        bittensor.logging.info(f"Pending task: {task}")
                 except TimeoutError:
                     bittensor.logging.info("Tasks timed out!", "sync", "sync")
                     # Cancel all tasks
