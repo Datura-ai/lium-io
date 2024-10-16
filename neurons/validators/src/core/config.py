@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK")
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
+    ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
     DEBUG: bool = Field(env="DEBUG", default=False)
     DEBUG_MINER_HOTKEY: str = Field(env="DEBUG_MINER_HOTKEY", default="")
 
@@ -30,7 +31,7 @@ class Settings(BaseSettings):
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="ws://127.0.0.1:8100")
-    
+
     ENV: str = Field(env="ENV", default="dev")
 
     def get_bittensor_wallet(self) -> bittensor.wallet:

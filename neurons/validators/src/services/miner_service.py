@@ -92,10 +92,20 @@ class MinerService:
                         miner_client.job_state.miner_accepted_ssh_key_or_failed_future, JOB_LENGTH
                     )
                 except TimeoutError:
+                    logger.error(
+                        f"[_request_job_to_miner] Waiting accepted ssh key or failed request from miner({miner_name}) resulted in an exception"
+                    )
+                    msg = None
+                except Exception as e:
+                    logger.error(
+                        f"[_request_job_to_miner] Waiting accepted ssh key or failed request from miner({miner_name}) resulted in an exception: {e}"
+                    )
                     msg = None
 
                 if isinstance(msg, AcceptSSHKeyRequest):
-                    logger.info(f"[_request_job_to_miner] Received AcceptSSHKeyRequest: {msg}")
+                    logger.info(
+                        f"[_request_job_to_miner] Received AcceptSSHKeyRequest for miner({miner_name}): {msg}"
+                    )
 
                     tasks = [
                         asyncio.create_task(
@@ -133,9 +143,10 @@ class MinerService:
                     )
                     return
                 else:
-                    raise ValueError(
-                        f"Requesting job to miner({miner_name}): Unexpected msg: {msg}"
+                    logger.error(
+                        f"[_request_job_to_miner] Requesting job to miner({miner_name}): Unexpected msg: {msg}"
                     )
+                    return
         except asyncio.CancelledError:
             logger.error(
                 f"[_request_job_to_miner][finished] Requesting job to miner({miner_name}) was cancelled"
@@ -199,9 +210,17 @@ class MinerService:
 
             try:
                 msg = await asyncio.wait_for(
-                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future, JOB_LENGTH
+                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future, timeout=1
                 )
             except TimeoutError:
+                logger.error(
+                    f"[_request_job_to_miner] Waiting accepted ssh key or failed request from miner({miner_client.miner_name}) resulted in an timeout error"
+                )
+                msg = None
+            except Exception as e:
+                logger.error(
+                    f"[_request_job_to_miner] Waiting accepted ssh key or failed request from miner({miner_client.miner_name}) resulted in an exception: {e}"
+                )
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
@@ -227,7 +246,7 @@ class MinerService:
                         )
                     )
 
-                    self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
+                    await self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,

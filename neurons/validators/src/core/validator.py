@@ -40,27 +40,31 @@ class Validator:
         self.is_running = False
         self.last_job_run_blocks = 0
 
-        # set miner service
-        session = next(get_db())
-        self.task_dao = TaskDao(session=session)
-        executor_dao = ExecutorDao(session=session)
-
-        ssh_service = SSHService()
-        task_service = TaskService(
-            task_dao=self.task_dao, ssh_service=ssh_service, executor_dao=executor_dao
-        )
-        docker_service = DockerService(ssh_service=ssh_service, executor_dao=executor_dao)
-        self.miner_service = MinerService(
-            ssh_service=ssh_service,
-            task_service=task_service,
-            docker_service=docker_service,
-            executor_dao=executor_dao,
-        )
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.initiate_services())
 
         subtensor = self.get_subtensor()
 
         # check registered
         self.check_registered(subtensor)
+
+    async def initiate_services(self):
+        gen = get_db()
+        session = await gen.__anext__()
+        self.task_dao = TaskDao(session=session)
+        self.executor_dao = ExecutorDao(session=session)
+
+        ssh_service = SSHService()
+        task_service = TaskService(
+            task_dao=self.task_dao, ssh_service=ssh_service, executor_dao=self.executor_dao
+        )
+        docker_service = DockerService(ssh_service=ssh_service, executor_dao=self.executor_dao)
+        self.miner_service = MinerService(
+            ssh_service=ssh_service,
+            task_service=task_service,
+            docker_service=docker_service,
+            executor_dao=self.executor_dao,
+        )
 
     def get_subtensor(self):
         bittensor.logging.debug("Getting subtensor", "get_subtensor", "get_subtensor")
@@ -119,8 +123,8 @@ class Validator:
         bittensor.logging.info("Found %d miners", "fetch_miners", "fetch_miners", len(miners))
         return miners
 
-    def set_weights(self, miners, subtensor: bittensor.subtensor):
-        scores = self.task_dao.get_scores_for_last_epoch(self.get_tempo(subtensor))
+    async def set_weights(self, miners, subtensor: bittensor.subtensor):
+        scores = await self.task_dao.get_scores_for_last_epoch(tempo=self.get_tempo(subtensor))
 
         hotkey_to_score = {score.miner_hotkey: score.total_score for score in scores}
         for miner_hotkey in hotkey_to_score.keys():
@@ -230,7 +234,7 @@ class Validator:
             miners = self.fetch_miners(subtensor)
 
             if await self.should_set_weights(subtensor):
-                self.set_weights(miners, subtensor)
+                await self.set_weights(miners=miners, subtensor=subtensor)
 
             current_block = self.get_current_block(subtensor)
             bittensor.logging.info(f"Current block: {current_block}", "sync", "sync")

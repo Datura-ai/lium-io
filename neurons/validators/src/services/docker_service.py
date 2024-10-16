@@ -118,7 +118,7 @@ class DockerService:
                 f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
             )
 
-            self.executor_dao.rent(payload.executor_id, payload.miner_hotkey)
+            await self.executor_dao.rent(payload.executor_id, payload.miner_hotkey)
 
             return ContainerCreatedResult(
                 container_name=container_name,
@@ -201,6 +201,6 @@ class DockerService:
             await ssh_client.run(f"docker rm {payload.container_name} -f")
             await ssh_client.run(f"docker volume rm {payload.volume_name}")
 
-            self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
+            await self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
 
             return

@@ -1,14 +1,18 @@
 import logging
+
+from sqlalchemy import select
+
 from daos.base import BaseDao
 from models.executor import Executor
 
 logger = logging.getLogger(__name__)
 
+
 class ExecutorDao(BaseDao):
-    def upsert(self, executor: Executor) -> Executor:
+    async def upsert(self, executor: Executor) -> Executor:
         try:
-            existing_executor = self.get_executor(
-                miner_hotkey=executor.miner_hotkey, executor_id=executor.executor_id
+            existing_executor = await self.get_executor(
+                executor_id=executor.executor_id, miner_hotkey=executor.miner_hotkey
             )
 
             if existing_executor:
@@ -18,58 +22,58 @@ class ExecutorDao(BaseDao):
                 existing_executor.executor_ip_address = executor.executor_ip_address
                 existing_executor.executor_ssh_username = executor.executor_ssh_username
                 existing_executor.executor_ssh_port = executor.executor_ssh_port
-                
-                self.session.commit()
-                self.session.refresh(existing_executor)
+
+                await self.session.commit()
+                await self.session.refresh(existing_executor)
                 return existing_executor
             else:
                 # Insert the new executor
                 self.session.add(executor)
-                self.session.commit()
-                self.session.refresh(executor)
+                await self.session.commit()
+                await self.session.refresh(executor)
 
                 return executor
         except Exception as e:
-            self.session.rollback()
-            print(e)
+            await self.session.rollback()
             logger.error("Error upsert executor: %s", e)
             raise
 
-    def rent(self, executor_id: str, miner_hotkey: str) -> Executor:
+    async def rent(self, executor_id: str, miner_hotkey: str) -> Executor:
         try:
-            executor = self.get_executor(executor_id, miner_hotkey)
+            executor = await self.get_executor(executor_id=executor_id, miner_hotkey=miner_hotkey)
             if executor:
                 executor.rented = True
-                self.session.commit()
-                self.session.refresh(executor)
+                await self.session.commit()
+                await self.session.refresh(executor)
 
             return executor
         except Exception as e:
-            self.session.rollback()
-            print(e)
+            await self.session.rollback()
             logger.error("Error rent executor: %s", e)
             raise
 
-    def unrent(self, executor_id: str, miner_hotkey: str) -> Executor:
+    async def unrent(self, executor_id: str, miner_hotkey: str) -> Executor:
         try:
-            executor = self.get_executor(executor_id, miner_hotkey)
+            executor = await self.get_executor(executor_id=executor_id, miner_hotkey=miner_hotkey)
             if executor:
                 executor.rented = False
-                self.session.commit()
-                self.session.refresh(executor)
+                await self.session.commit()
+                await self.session.refresh(executor)
 
             return executor
         except Exception as e:
-            self.session.rollback()
-            print(e)
+            await self.session.rollback()
             logger.error("Error unrent executor: %s", e)
             raise
 
-    def get_executor(self, executor_id: str, miner_hotkey: str) -> Executor:
+    async def get_executor(self, executor_id: str, miner_hotkey: str) -> Executor:
         try:
-            return self.session.query(Executor).filter_by(miner_hotkey=miner_hotkey, executor_id=executor_id).first()
+            statement = select(Executor).where(
+                Executor.miner_hotkey == miner_hotkey, Executor.executor_id == executor_id
+            )
+            result = await self.session.exec(statement)
+            return result.scalar_one_or_none()
         except Exception as e:
-            self.session.rollback()
-            print(e)
+            await self.session.rollback()
             logger.error("Error get executor: %s", e)
             raise
