@@ -282,11 +282,11 @@ class Validator:
 
                     bittensor.logging.info("All Jobs finished", "sync", "sync")
                 except TimeoutError:
-                    bittensor.logging.info("Tasks timed out!", "sync", "sync")
+                    bittensor.logging.error("Tasks timed out!", "sync", "sync")
                     # Cancel all tasks
                     for index, job in enumerate(jobs):
                         if not job.done():
-                            bittensor.logging.info(
+                            bittensor.logging.error(
                                 f"Cancelling job for miner({miners[index].hotkey}-{miners[index].axon_info.ip}:{miners[index].axon_info.port})",
                                 "sync",
                                 "sync",

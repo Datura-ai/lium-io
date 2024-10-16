@@ -137,7 +137,7 @@ class MinerService:
                         f"Requesting job to miner({miner_name}): Unexpected msg: {msg}"
                     )
         except asyncio.CancelledError:
-            logger.info(
+            logger.error(
                 f"[_request_job_to_miner][finished] Requesting job to miner({miner_name}) was cancelled"
             )
             return
