@@ -60,69 +60,92 @@ class MinerService:
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         miner_name = f"{payload.miner_hotkey}_{payload.miner_address}_{payload.miner_port}"
 
-        logger.info("Requesting job to miner(%s)", miner_name)
+        try:
+            logger.info("[_request_job_to_miner] Requesting job to miner(%s)", miner_name)
 
-        miner_client = MinerClient(
-            loop=loop,
-            miner_address=payload.miner_address,
-            miner_port=payload.miner_port,
-            miner_hotkey=payload.miner_hotkey,
-            my_hotkey=my_key.ss58_address,
-            keypair=my_key,
-            miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/jobs/{my_key.ss58_address}",
-        )
+            miner_client = MinerClient(
+                loop=loop,
+                miner_address=payload.miner_address,
+                miner_port=payload.miner_port,
+                miner_hotkey=payload.miner_hotkey,
+                my_hotkey=my_key.ss58_address,
+                keypair=my_key,
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/jobs/{my_key.ss58_address}",
+            )
 
-        async with miner_client:
-            # generate ssh key and send it to miner
-            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            async with miner_client:
+                # generate ssh key and send it to miner
+                private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
-            logger.info(f"sending SSHPubKeySubmitRequest {miner_client.miner_name}")
-
-            await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
-
-            logger.info("Sent SSH key to miner %s", miner_client.miner_name)
-
-            try:
-                msg = await asyncio.wait_for(
-                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future, JOB_LENGTH
-                )
-            except TimeoutError:
-                msg = None
-
-            if isinstance(msg, AcceptSSHKeyRequest):
                 logger.info(
-                    f"Requesting job to miner({miner_name}): Received AcceptSSHKeyRequest: {msg}"
+                    f"[_request_job_to_miner] Sending SSHPubKeySubmitRequest to miner({miner_client.miner_name})"
                 )
 
-                tasks = [
-                    asyncio.create_task(
-                        self.task_service.create_task(
-                            miner_info=payload,
-                            executor_info=executor_info,
-                            keypair=my_key,
-                            private_key=private_key.decode("utf-8"),
-                        )
-                    )
-                    for executor_info in msg.executors
-                ]
+                await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
-                results = [
-                    result
-                    for result in await asyncio.gather(*tasks, return_exceptions=True)
-                    if result
-                ]
-                logger.info(f"Miner({miner_name}) machine specs: {results}")
-                await self.publish_machine_specs(results, miner_client.miner_hotkey)
-                await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
-                logger.info(f"Requesting job success for miner({miner_name})")
-            elif isinstance(msg, FailedRequest):
-                logger.warning(f"Requesting job failed for miner({miner_name}): {msg}")
-                return
-            elif isinstance(msg, DeclineJobRequest):
-                logger.warning(f"Requesting job declined for miner({miner_name}): {msg}")
-                return
-            else:
-                raise ValueError(f"Requesting job to miner({miner_name}): Unexpected msg: {msg}")
+                logger.info(
+                    "[_request_job_to_miner] Sent SSH key to miner %s", miner_client.miner_name
+                )
+
+                try:
+                    msg = await asyncio.wait_for(
+                        miner_client.job_state.miner_accepted_ssh_key_or_failed_future, JOB_LENGTH
+                    )
+                except TimeoutError:
+                    msg = None
+
+                if isinstance(msg, AcceptSSHKeyRequest):
+                    logger.info(f"[_request_job_to_miner] Received AcceptSSHKeyRequest: {msg}")
+
+                    tasks = [
+                        asyncio.create_task(
+                            self.task_service.create_task(
+                                miner_info=payload,
+                                executor_info=executor_info,
+                                keypair=my_key,
+                                private_key=private_key.decode("utf-8"),
+                            )
+                        )
+                        for executor_info in msg.executors
+                    ]
+
+                    results = [
+                        result
+                        for result in await asyncio.gather(*tasks, return_exceptions=True)
+                        if result
+                    ]
+                    logger.info(
+                        f"[_request_job_to_miner] Miner({miner_name}) machine specs: {results}"
+                    )
+                    await self.publish_machine_specs(results, miner_client.miner_hotkey)
+                    await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
+                    logger.info(
+                        f"[_request_job_to_miner][finished] Requesting job success for miner({miner_name})"
+                    )
+                elif isinstance(msg, FailedRequest):
+                    logger.warning(
+                        f"[_request_job_to_miner][finished] Requesting job failed for miner({miner_name}): {msg}"
+                    )
+                    return
+                elif isinstance(msg, DeclineJobRequest):
+                    logger.warning(
+                        f"[_request_job_to_miner][finished] Requesting job declined for miner({miner_name}): {msg}"
+                    )
+                    return
+                else:
+                    raise ValueError(
+                        f"Requesting job to miner({miner_name}): Unexpected msg: {msg}"
+                    )
+        except asyncio.CancelledError:
+            logger.info(
+                f"[_request_job_to_miner][finished] Requesting job to miner({miner_name}) was cancelled"
+            )
+            return
+        except Exception as e:
+            logger.error(
+                f"[_request_job_to_miner][finished] Requesting job to miner({miner_name}) resulted in an exception: {e}"
+            )
+            return
 
     async def publish_machine_specs(
         self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str

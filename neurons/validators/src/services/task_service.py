@@ -26,7 +26,14 @@ from services.const import (
 )
 from services.ssh_service import SSHService
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Get the logger for the 'asyncssh' module
+asyncssh_logger = logging.getLogger("asyncssh")
+
+# Set the logging level to WARNING
+asyncssh_logger.setLevel(logging.WARNING)
 
 JOB_LENGTH = 300
 

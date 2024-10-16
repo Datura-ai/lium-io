@@ -19,6 +19,7 @@ from services.miner_service import MinerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SYNC_CYCLE = 12
@@ -251,37 +252,55 @@ class Validator:
                 # request jobs
                 jobs = [
                     asyncio.create_task(
-                        asyncio.wait_for(
-                            self.miner_service.request_job_to_miner(
-                                payload=MinerJobRequestPayload(
-                                    miner_hotkey=miner.hotkey,
-                                    miner_address=miner.axon_info.ip,
-                                    miner_port=miner.axon_info.port,
-                                )
-                            ),
-                            timeout=60 * 5,
+                        self.miner_service.request_job_to_miner(
+                            payload=MinerJobRequestPayload(
+                                miner_hotkey=miner.hotkey,
+                                miner_address=miner.axon_info.ip,
+                                miner_port=miner.axon_info.port,
+                            )
                         )
                     )
                     for miner in miners
                 ]
 
-                results = await asyncio.gather(*jobs, return_exceptions=True)
-                for index, result in enumerate(results):
-                    miner = miners[index]
-                    if isinstance(result, Exception):
-                        bittensor.logging.error(
-                            f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) resulted in an exception: {result}",
-                            "sync",
-                            "sync",
-                        )
-                    else:
-                        bittensor.logging.info(
-                            f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) completed successfully",
-                            "sync",
-                            "sync",
-                        )
+                try:
+                    results = await asyncio.wait_for(asyncio.gather(*jobs), timeout=60 * 10)
+                    for index, result in enumerate(results):
+                        miner = miners[index]
+                        if isinstance(result, Exception):
+                            bittensor.logging.error(
+                                f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) resulted in an exception: {result}",
+                                "sync",
+                                "sync",
+                            )
+                        else:
+                            bittensor.logging.info(
+                                f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) completed successfully",
+                                "sync",
+                                "sync",
+                            )
 
-                bittensor.logging.info("All Jobs finished", "sync", "sync")
+                    bittensor.logging.info("All Jobs finished", "sync", "sync")
+
+                    # Get all tasks in the current event loop
+                    tasks = asyncio.all_tasks()
+                    pending_tasks = [task for task in tasks if not task.done()]
+
+                    bittensor.logging.info(f"Total tasks: {len(tasks)}")
+                    bittensor.logging.info(f"Pending tasks: {len(pending_tasks)}")
+                    for task in pending_tasks:
+                        bittensor.logging.info(f"Pending task: {task}")
+                except TimeoutError:
+                    bittensor.logging.info("Tasks timed out!", "sync", "sync")
+                    # Cancel all tasks
+                    for index, job in enumerate(jobs):
+                        if not job.done():
+                            bittensor.logging.info(
+                                f"Cancelling job for miner({miners[index].hotkey}-{miners[index].axon_info.ip}:{miners[index].axon_info.port})",
+                                "sync",
+                                "sync",
+                            )
+                            job.cancel()
             else:
                 remaining_blocks = (
                     current_block // settings.BLOCKS_FOR_JOB + 1
