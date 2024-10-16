@@ -109,6 +109,9 @@ class TaskService:
                         ssh_client, executor_info, remote_file_path
                     )
                     if not machine_specs:
+                        logger.warning(
+                            f"[create_task][{executor_name}] No result from machine scrape task."
+                        )
                         return None
 
                     machine_spec = json.loads(machine_specs[0].strip())
@@ -176,6 +179,7 @@ class TaskService:
 
                     results, err = await self._run_task(ssh_client, executor_info, remote_file_path)
                     if not results:
+                        logger.warning(f"[create_task][{executor_name}] No result from task.")
                         return None
 
                     end_time = time.time()
@@ -258,8 +262,11 @@ class TaskService:
         remote_file_path: str,
     ) -> tuple[list[str] | None, str | None]:
         try:
+            executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
             logger.info(
-                "run task -> executor(%s:%d)", executor_info.address, executor_info.ssh_port
+                f"[_run_task][{executor_name}] Run task -> executor(%s:%d)",
+                executor_info.address,
+                executor_info.ssh_port,
             )
             result = await ssh_client.run(
                 f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_file_path}",
@@ -267,25 +274,29 @@ class TaskService:
             )
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
-            print("results ================>", results)
-            print("errors ===>", errors)
+            logger.info(f"[_run_task][{executor_name}] results ================> {results}")
+            logger.warning(f"[_run_task][{executor_name}] errors ===> {errors}")
 
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
 
             if len(results) == 0 and len(actual_errors) > 0:
-                logger.error(f"{actual_errors}")
+                logger.error(
+                    f"[_run_task][{executor_name}] Failed to execute command! {actual_errors}"
+                )
                 raise Exception("Failed to execute command!")
 
             #  remove remote_file
             await ssh_client.run(f"rm {remote_file_path}")
 
             logger.info(
-                "run task success -> executor(%s:%d)", executor_info.address, executor_info.ssh_port
+                f"[_run_task][{executor_name}] Run task success -> executor(%s:%d)",
+                executor_info.address,
+                executor_info.ssh_port,
             )
             return results, None
         except Exception as e:
             logger.error(
-                "run task error to executor(%s:%d): %s",
+                f"[_run_task][{executor_name}] Run task error to executor(%s:%d): %s",
                 executor_info.address,
                 executor_info.ssh_port,
                 str(e),
