@@ -296,7 +296,7 @@ class TaskService:
                 raise Exception("Failed to execute command!")
 
             #  remove remote_file
-            await ssh_client.run(f"rm {remote_file_path}")
+            await ssh_client.run(f"rm {remote_file_path}", timeout=30)
 
             logger.info(
                 f"[_run_task][{executor_name}] Run task success -> executor(%s:%d)",
@@ -313,7 +313,10 @@ class TaskService:
             )
 
             #  remove remote_file
-            await ssh_client.run(f"rm {remote_file_path}")
+            try:
+                await ssh_client.run(f"rm {remote_file_path}", timeout=30)
+            except Exception as e:
+                logger.error(f"[_run_task][{executor_name}] Failed to remove remote file: {e}")
 
             return None, str(e)
 
