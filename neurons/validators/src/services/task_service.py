@@ -11,10 +11,6 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
-from daos.executor import ExecutorDao
-from daos.task import TaskDao
-from models.executor import Executor
-from models.task import Task, TaskStatus
 from services.const import (
     DOWNLOAD_SPEED_WEIGHT,
     GPU_MAX_SCORES,
@@ -41,12 +37,8 @@ JOB_LENGTH = 300
 class TaskService:
     def __init__(
         self,
-        task_dao: Annotated[TaskDao, Depends(TaskDao)],
-        executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)],
         ssh_service: Annotated[SSHService, Depends(SSHService)],
     ):
-        self.task_dao = task_dao
-        self.executor_dao = executor_dao
         self.ssh_service = ssh_service
 
     async def create_task(
@@ -59,26 +51,9 @@ class TaskService:
         executor_name = f"{miner_info.miner_hotkey}_{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
         try:
             logger.info(
-                f"[create_task] Creating task for executor({executor_name}): Upsert executor uuid: {executor_info.uuid}"
-            )
-            await self.executor_dao.upsert(
-                Executor(
-                    miner_address=miner_info.miner_address,
-                    miner_port=miner_info.miner_port,
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_id=executor_info.uuid,
-                    executor_ip_address=executor_info.address,
-                    executor_ssh_username=executor_info.ssh_username,
-                    executor_ssh_port=executor_info.ssh_port,
-                )
-            )
-
-            logger.info(
-                f"[create_task] Creating task for executor({executor_name}): Connecting ssh with info: {executor_info.address}:{executor_info.ssh_port}"
+                f"[create_task] ({executor_name}): Connecting ssh with info: {executor_info.address}:{executor_info.ssh_port}"
             )
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-            logger.debug(f"[create_task] Decrypted private key for executor({executor_name})")
-
             pkey = asyncssh.import_private_key(private_key)
 
             async with asyncssh.connect(
@@ -89,16 +64,16 @@ class TaskService:
                 known_hosts=None,
             ) as ssh_client:
                 logger.info(
-                    f"[create_task] SSH connection established with executor({executor_name})"
+                    f"[create_task][{executor_name}] SSH connection established"
                 )
                 await ssh_client.run(f"mkdir -p {executor_info.root_dir}/temp")
                 logger.debug(
-                    f"[create_task] Created temporary directory on executor({executor_name})"
+                    f"[create_task][{executor_name}] Created temporary directory"
                 )
 
                 async with ssh_client.start_sftp_client() as sftp_client:
                     # run synthetic job
-                    logger.debug(f"[create_task] Opened SFTP client for executor({executor_name})")
+                    logger.debug(f"[create_task][{executor_name}] Opened SFTP client")
 
                     # get machine specs
                     timestamp = int(time.time())
@@ -109,7 +84,7 @@ class TaskService:
 
                     await sftp_client.put(local_file_path, remote_file_path)
                     logger.info(
-                        f"[create_task] Uploaded machine scrape script to executor({executor_name})"
+                        f"[create_task][{executor_name}] Uploaded machine scrape script"
                     )
 
                     machine_specs, _ = await self._run_task(
@@ -123,7 +98,7 @@ class TaskService:
 
                     machine_spec = json.loads(machine_specs[0].strip())
                     logger.info(
-                        f"[create_task] Machine spec -> executor: {executor_name}, spec: {machine_spec}"
+                        f"[create_task][{executor_name}] Machine spec: {machine_spec}"
                     )
 
                     gpu_model = None
@@ -139,77 +114,47 @@ class TaskService:
                     gpu_count = machine_spec.get("gpu", {}).get("count", 0)
 
                     logger.info(
-                        f"[create_task] Max Score -> executor: {executor_name}, gpu model: {gpu_model}, max score: {max_score}"
+                        f"[create_task][{executor_name}] gpu model: {gpu_model}, max score: {max_score}"
                     )
 
-                    executor = await self.executor_dao.get_executor(
-                        executor_id=executor_info.uuid, miner_hotkey=miner_info.miner_hotkey
-                    )
-                    if executor.rented:
-                        score = max_score * gpu_count
+                    if max_score == 0:
                         logger.info(
-                            f"[create_task] Executor({executor_name}) is already rented. Give score: {score}"
+                            f"[create_task][{executor_name}] return with 0 score"
                         )
-                        await self.task_dao.save(
-                            Task(
-                                task_status=TaskStatus.Finished,
-                                miner_hotkey=miner_info.miner_hotkey,
-                                executor_id=executor_info.uuid,
-                                proceed_time=0,
-                                score=score,
-                            )
-                        )
-                        logger.info(
-                            f"[create_task] Task saved with status Finished for executor({executor_name})"
-                        )
-                        return machine_spec, executor_info
+                        return machine_spec, executor_info, 0
 
-                    logger.info(
-                        f"[create_task] Create Task -> executor: {executor_name}, executor uuid:{executor_info.uuid}, miner_hotkey: {miner_info.miner_hotkey}"
-                    )
-                    task = await self.task_dao.save(
-                        Task(
-                            task_status=TaskStatus.SSHConnected,
-                            miner_hotkey=miner_info.miner_hotkey,
-                            executor_id=executor_info.uuid,
-                        )
-                    )
-                    logger.info(
-                        f"[create_task] Task saved with status SSHConnected for executor({executor_name})"
-                    )
+                    # if executor.rented:
+                    #     score = max_score * gpu_count
+                    #     logger.info(
+                    #         f"[create_task] Executor({executor_name}) is already rented. Give score: {score}"
+                    #     )
+
+                    #     logger.info(
+                    #         f"[create_task] Task saved with status Finished for executor({executor_name})"
+                    #     )
+                    #     return machine_spec, executor_info
 
                     timestamp = int(time.time())
                     local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
                     remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
 
                     await sftp_client.put(local_file_path, remote_file_path)
-                    logger.info(f"[create_task] Uploaded score script to executor({executor_name})")
+                    logger.info(f"[create_task][{executor_name}] Uploaded score script")
 
                     start_time = time.time()
 
                     results, err = await self._run_task(ssh_client, executor_info, remote_file_path)
                     if not results:
                         logger.warning(f"[create_task][{executor_name}] No result from task.")
-                        return None
+                        return machine_spec, executor_info, 0
 
                     end_time = time.time()
-                    logger.info(
-                        f"[create_task] Task results -> executor: {executor_name}, result: {results}"
-                    )
+
+                    score = 0
 
                     if err is not None:
                         logger.error(
-                            f"[create_task] Error executing task on executor({executor_name}): {err}"
-                        )
-
-                        # mark task is failed
-                        await self.task_dao.update(
-                            uuid=task.uuid,
-                            task_status=TaskStatus.Failed,
-                            score=0,
-                        )
-                        logger.debug(
-                            f"[create_task] Task marked as failed for executor({executor_name})"
+                            f"[create_task][{executor_name}] Error executing task: {err}"
                         )
                     else:
                         job_taken_time = results[-1]
@@ -219,17 +164,19 @@ class TaskService:
                             job_taken_time = end_time - start_time
 
                         logger.info(
-                            f"[create_task] Job taken time for executor({executor_name}): {job_taken_time}"
+                            f"[create_task][{executor_name}] Job taken time: {job_taken_time}"
                         )
 
                         upload_speed = machine_spec.get("network", {}).get("upload_speed", 0)
                         download_speed = machine_spec.get("network", {}).get("download_speed", 0)
-
+                        print('upload/download ===>', upload_speed, download_speed)
                         job_taken_score = (
                             min(MIN_JOB_TAKEN_TIME / job_taken_time, 1) if job_taken_time > 0 else 0
                         )
+                        print('job_taken_score ===>', job_taken_score)
                         upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
                         download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
+                        print(upload_speed_score, download_speed_score)
 
                         score = max_score * (
                             job_taken_score * gpu_count * JOB_TAKEN_TIME_WEIGHT
@@ -238,31 +185,17 @@ class TaskService:
                         )
 
                         logger.info(
-                            "[create_task] Give score(%f) for executor(%s) for the task(%s).",
-                            score,
-                            executor_name,
-                            str(task.uuid),
+                            f"[create_task][{executor_name}] Give score {score}",
                         )
 
-                        # update task with results
-                        await self.task_dao.update(
-                            uuid=task.uuid,
-                            task_status=TaskStatus.Finished,
-                            proceed_time=job_taken_time,
-                            score=score,
-                        )
-                        logger.debug(
-                            f"[create_task] Task updated with final score for executor({executor_name})"
-                        )
-
-                    logger.debug(f"[create_task] SFTP client closed for executor({executor_name})")
+                    logger.debug(f"[create_task][{executor_name}] SFTP client closed")
                     logger.info(
-                        f"[create_task] SSH connection closed for executor({executor_name})"
+                        f"[create_task][{executor_name}] SSH connection closed"
                     )
 
-                    return machine_spec, executor_info
+                    return machine_spec, executor_info, score
         except Exception as e:
-            logger.error(f"[create_task] Error creating task for executor({executor_name}): {e}")
+            logger.error(f"[create_task][{executor_name}] Error creating task: {e}")
             return None
 
     async def _run_task(

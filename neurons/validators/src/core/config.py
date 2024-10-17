@@ -20,8 +20,6 @@ class Settings(BaseSettings):
     BITTENSOR_CHAIN_ENDPOINT: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK")
 
-    SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
-    ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
     DEBUG: bool = Field(env="DEBUG", default=False)
     DEBUG_MINER_HOTKEY: str = Field(env="DEBUG_MINER_HOTKEY", default="")
 

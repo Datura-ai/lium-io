@@ -1,20 +1,4 @@
-version: '3.7'
-
 services:
-  db:
-    image: postgres:14.0-alpine
-    healthcheck:
-      test: pg_isready -U postgres || exit 1
-    environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    env_file: ./.env
-    volumes:
-      - db_data:/var/lib/postgresql/data
-    ports:
-      - ${POSTGRES_PORT}:5432
-
   redis:
     image: redis:6-alpine
     command: redis-server --appendonly yes
@@ -29,8 +13,6 @@ services:
     image: daturaai/compute-subnet-validator:latest
     env_file: ./.env
     environment:
-      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     ports:
@@ -47,8 +29,6 @@ services:
     image: daturaai/compute-subnet-validator:latest
     env_file: ./.env
     environment:
-      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     command: python src/connector.py

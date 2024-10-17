@@ -29,7 +29,6 @@ from payload_models.payloads import (
 )
 
 from core.config import settings
-from daos.executor import ExecutorDao
 from services.docker_service import DockerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
@@ -47,12 +46,10 @@ class MinerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
         docker_service: Annotated[DockerService, Depends(DockerService)],
-        executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.docker_service = docker_service
-        self.executor_dao = executor_dao
         self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
 
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
@@ -132,38 +129,51 @@ class MinerService:
                     logger.info(
                         f"[_request_job_to_miner][finished] Requesting job success for miner({miner_name})"
                     )
+
+                    total_score = 0
+                    for _, _, score in results:
+                        total_score += score
+                        
+                    logger.info(
+                        f"[_request_job_to_miner][{miner_name}] total score: {total_score}"
+                    )
+
+                    return {
+                        "miner_hotkey": payload.miner_hotkey,
+                        "score": total_score,
+                    }
                 elif isinstance(msg, FailedRequest):
                     logger.warning(
                         f"[_request_job_to_miner][finished] Requesting job failed for miner({miner_name}): {msg}"
                     )
-                    return
+                    return None
                 elif isinstance(msg, DeclineJobRequest):
                     logger.warning(
                         f"[_request_job_to_miner][finished] Requesting job declined for miner({miner_name}): {msg}"
                     )
-                    return
+                    return None
                 else:
                     logger.error(
                         f"[_request_job_to_miner] Requesting job to miner({miner_name}): Unexpected msg: {msg}"
                     )
-                    return
+                    return None
         except asyncio.CancelledError:
             logger.error(
                 f"[_request_job_to_miner][finished] Requesting job to miner({miner_name}) was cancelled"
             )
-            return
+            return None
         except Exception as e:
             logger.error(
                 f"[_request_job_to_miner][finished] Requesting job to miner({miner_name}) resulted in an exception: {e}"
             )
-            return
+            return None
 
     async def publish_machine_specs(
         self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str
     ):
         """Publish machine specs to compute app connector process"""
         logger.info(f"Publishing machine specs to compute app connector process: {results}")
-        for specs, ssh_info in results:
+        for specs, ssh_info, _ in results:
             try:
                 await self.redis.publish(
                     "channel:1",
@@ -246,7 +256,7 @@ class MinerService:
                         )
                     )
 
-                    await self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
+                    # await self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
