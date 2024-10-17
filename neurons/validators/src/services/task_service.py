@@ -1,3 +1,5 @@
+import asyncio
+import contextvars
 import json
 import logging
 import time
@@ -33,7 +35,44 @@ logger = logging.getLogger(__name__)
 asyncssh_logger = logging.getLogger("asyncssh")
 
 # Set the logging level to WARNING
-asyncssh_logger.setLevel(logging.WARNING)
+asyncssh_logger.setLevel(logging.INFO)
+
+# Create a ContextVar to hold the context information
+context = contextvars.ContextVar("context", default="custom")
+
+context.set("custom")
+
+
+class ContextFilter(logging.Filter):
+    """
+    This is a filter which injects contextual information into the log.
+    """
+
+    def filter(self, record):
+        record.context = context.get() or "Default"
+        return True
+
+
+# Create a custom formatter that adds the context to the log messages
+class CustomFormatter(logging.Formatter):
+    def format(self, record):
+        try:
+            return f"{getattr(record, 'context', 'Default')} {super().format(record)}"
+        except Exception:
+            return ""
+
+
+# Add the filter to the logger
+asyncssh_logger.addFilter(ContextFilter())
+
+# Create a handler for the logger
+handler = logging.StreamHandler()
+
+# Add the handler to the logger
+asyncssh_logger.addHandler(handler)
+
+# Set the formatter for the handler
+handler.setFormatter(CustomFormatter())
 
 JOB_LENGTH = 300
 
@@ -137,6 +176,12 @@ class TaskService:
                         max_score = GPU_MAX_SCORES.get(gpu_model, 0)
 
                     gpu_count = machine_spec.get("gpu", {}).get("count", 0)
+
+                    if max_score == 0 or gpu_count == 0:
+                        logger.warning(
+                            f"[create_task] Max Score({max_score}) or GPU count({gpu_count}) is 0 for executor({executor_name}). No need to run job."
+                        )
+                        return machine_spec, executor_info
 
                     logger.info(
                         f"[create_task] Max Score -> executor: {executor_name}, gpu model: {gpu_model}, max score: {max_score}"
@@ -273,6 +318,7 @@ class TaskService:
     ) -> tuple[list[str] | None, str | None]:
         try:
             executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+            context.set(f"[_run_task][{executor_name}]")
             logger.info(
                 f"[_run_task][{executor_name}] Run task -> executor(%s:%d)",
                 executor_info.address,
@@ -317,7 +363,7 @@ class TaskService:
                 logger.info(
                     f"[_run_task][{executor_name}] Removing remote file - {remote_file_path}"
                 )
-                await ssh_client.run(f"rm {remote_file_path}", timeout=30)
+                await asyncio.wait_for(ssh_client.run(f"rm {remote_file_path}"), timeout=10)
                 logger.info(
                     f"[_run_task][{executor_name}] Removed remote file - {remote_file_path}"
                 )
