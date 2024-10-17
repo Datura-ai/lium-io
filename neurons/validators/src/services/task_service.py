@@ -315,8 +315,9 @@ class TaskService:
             #  remove remote_file
             try:
                 await ssh_client.run(f"rm {remote_file_path}", timeout=30)
+                logger.error(f"[_run_task][{executor_name}] Removed remote file")
             except Exception as e:
-                logger.error(f"[_run_task][{executor_name}] Failed to remove remote file: {e}")
+                logger.error(f"[_run_task][{executor_name}] Failed to remove remote file")
 
             return None, str(e)
 

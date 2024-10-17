@@ -8,7 +8,6 @@ from fastapi import FastAPI
 from core.config import settings
 from core.utils import wait_for_services_sync
 from core.validator import Validator
-from routes.apis import apis_router
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -36,7 +35,7 @@ app = FastAPI(
     lifespan=app_lifespan,
 )
 
-app.include_router(apis_router)
+# app.include_router(apis_router)
 
 reload = True if settings.ENV == "dev" else False
 
