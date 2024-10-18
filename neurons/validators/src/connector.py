@@ -1,21 +1,19 @@
 import asyncio
-import logging
 
 from clients.compute_client import ComputeClient
 
 from core.config import settings
-from core.utils import wait_for_services_sync
+from core.utils import get_logger, wait_for_services_sync
 from services.ioc import ioc
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 wait_for_services_sync()
 
 
 async def run_forever():
-    logger.info("Compute app connector started.")
+    logger.info("Compute app connector started")
     keypair = settings.get_bittensor_wallet().get_hotkey()
     compute_app_client = ComputeClient(
         keypair, f"{settings.COMPUTE_APP_URI}/validator/{keypair.ss58_address}", ioc["MinerService"]
