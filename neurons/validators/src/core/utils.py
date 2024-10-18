@@ -1,8 +1,7 @@
 import asyncio
 import contextvars
+import json
 import logging
-
-from pythonjsonlogger import jsonlogger
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +55,6 @@ def wait_for_services_sync(timeout=30):
             time.sleep(1)
 
 
-def get_logger(name):
-    logger = logging.getLogger(name)
-    stdout = logging.StreamHandler()
-    fmt = jsonlogger.JsonFormatter(
-        "%(name)s %(asctime)s %(levelname)s %(filename)s %(funcName)s %(lineno)s %(process)d %(message)s"
-    )
-    stdout.setFormatter(fmt)
-    logger.setLevel(logging.INFO)
-    logger.addHandler(stdout)
-    return logger
-
-
 def get_extra_info(extra: dict) -> dict:
     task = asyncio.current_task()
     coro_name = task.get_coro().__name__ if task else "NoTask"
@@ -81,6 +68,11 @@ def get_extra_info(extra: dict) -> dict:
 
 
 def configure_logs_of_other_modules():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="Name: %(name)s | Time: %(asctime)s | Level: %(levelname)s | File: %(filename)s | Function: %(funcName)s | Line: %(lineno)s | Process: %(process)d | Message: %(message)s",
+    )
+
     sqlalchemy_logger = logging.getLogger("sqlalchemy.engine.Engine")
     sqlalchemy_logger.setLevel(logging.WARNING)
 
@@ -105,7 +97,7 @@ def configure_logs_of_other_modules():
                 return ""
 
     asyncssh_logger = logging.getLogger("asyncssh")
-    asyncssh_logger.setLevel(logging.INFO)
+    asyncssh_logger.setLevel(logging.WARNING)
 
     # Add the filter to the logger
     asyncssh_logger.addFilter(ContextFilter())
@@ -121,3 +113,15 @@ def configure_logs_of_other_modules():
     handler.setFormatter(
         CustomFormatter("%(name)s %(asctime)s %(levelname)s %(filename)s %(process)d %(message)s")
     )
+
+
+class StructuredMessage:
+    def __init__(self, message, extra: dict):
+        self.message = message
+        self.extra = extra
+
+    def __str__(self):
+        return "%s >>> %s" % (self.message, json.dumps(self.extra))  # noqa
+
+
+_m = StructuredMessage

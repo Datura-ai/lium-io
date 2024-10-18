@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from typing import Annotated
 
 import bittensor
@@ -28,13 +29,13 @@ from payload_models.payloads import (
 )
 
 from core.config import settings
-from core.utils import get_extra_info, get_logger
+from core.utils import _m, get_extra_info
 from daos.executor import ExecutorDao
 from services.docker_service import DockerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 JOB_LENGTH = 300
@@ -64,7 +65,7 @@ class MinerService:
         }
 
         try:
-            logger.info("Requesting job to miner", extra=get_extra_info(default_extra))
+            logger.info(_m("Requesting job to miner", extra=get_extra_info(default_extra)))
             miner_client = MinerClient(
                 loop=loop,
                 miner_address=payload.miner_address,
@@ -80,7 +81,10 @@ class MinerService:
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
                 logger.info(
-                    "Sending SSHPubKeySubmitRequest to miner", extra=get_extra_info(default_extra)
+                    _m(
+                        "Sending SSHPubKeySubmitRequest to miner",
+                        extra=get_extra_info(default_extra),
+                    )
                 )
                 await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
@@ -90,21 +94,29 @@ class MinerService:
                     )
                 except TimeoutError:
                     logger.error(
-                        "Waiting accepted ssh key or failed request from miner resulted in TimeoutError",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "Waiting accepted ssh key or failed request from miner resulted in TimeoutError",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
                     msg = None
                 except Exception:
                     logger.error(
-                        "Waiting accepted ssh key or failed request from miner resulted in an exception",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "Waiting accepted ssh key or failed request from miner resulted in an exception",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
                     msg = None
 
                 if isinstance(msg, AcceptSSHKeyRequest):
                     logger.info(
-                        "Received AcceptSSHKeyRequest for miner. Running tasks for executors",
-                        extra=get_extra_info({**default_extra, "executors": len(msg.executors)}),
+                        _m(
+                            "Received AcceptSSHKeyRequest for miner. Running tasks for executors",
+                            extra=get_extra_info(
+                                {**default_extra, "executors": len(msg.executors)}
+                            ),
+                        ),
                     )
 
                     tasks = [
@@ -125,42 +137,48 @@ class MinerService:
                         if result
                     ]
                     logger.info(
-                        "Finished running tasks for executors",
-                        extra=get_extra_info({**default_extra, "executors": len(results)}),
+                        _m(
+                            "Finished running tasks for executors",
+                            extra=get_extra_info({**default_extra, "executors": len(results)}),
+                        ),
                     )
                     await self.publish_machine_specs(results, miner_client.miner_hotkey)
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
                     logger.info(
-                        "Requesting job success for miner", extra=get_extra_info(default_extra)
+                        _m("Requesting job success for miner", extra=get_extra_info(default_extra))
                     )
                 elif isinstance(msg, FailedRequest):
                     logger.warning(
-                        "Requesting job failed for miner",
-                        extra=get_extra_info({**default_extra, "msg": msg}),
+                        _m(
+                            "Requesting job failed for miner",
+                            extra=get_extra_info({**default_extra, "msg": msg}),
+                        ),
                     )
                     return
                 elif isinstance(msg, DeclineJobRequest):
                     logger.warning(
-                        "Requesting job declined for miner",
-                        extra=get_extra_info({**default_extra, "msg": msg}),
+                        _m(
+                            "Requesting job declined for miner",
+                            extra=get_extra_info({**default_extra, "msg": msg}),
+                        ),
                     )
                     return
                 else:
                     logger.error(
-                        "Unexpected msg",
-                        extra=get_extra_info({**default_extra, "msg": msg}),
+                        _m("Unexpected msg", extra=get_extra_info({**default_extra, "msg": msg})),
                     )
                     return
         except asyncio.CancelledError:
             logger.error(
-                "Requesting job to miner was cancelled",
-                extra=get_extra_info(default_extra),
+                _m("Requesting job to miner was cancelled", extra=get_extra_info(default_extra)),
             )
             return
         except Exception:
             logger.error(
-                "Requesting job to miner resulted in an exception",
-                extra=get_extra_info(default_extra),
+                _m(
+                    "Requesting job to miner resulted in an exception",
+                    extra=get_extra_info(default_extra),
+                ),
             )
             return
 
@@ -173,8 +191,10 @@ class MinerService:
         }
 
         logger.info(
-            "Publishing machine specs to compute app connector process",
-            extra=get_extra_info({**default_extra, "results": len(results)}),
+            _m(
+                "Publishing machine specs to compute app connector process",
+                extra=get_extra_info({**default_extra, "results": len(results)}),
+            ),
         )
         for specs, ssh_info in results:
             try:
@@ -192,8 +212,10 @@ class MinerService:
                 )
             except Exception:
                 logger.error(
-                    "Error publishing machine specs of {miner_hotkey} to compute app connector process",
-                    extra=get_extra_info(default_extra),
+                    _m(
+                        "Error publishing machine specs of {miner_hotkey} to compute app connector process",
+                        extra=get_extra_info(default_extra),
+                    ),
                 )
 
     async def handle_container(self, payload: ContainerBaseRequest):
@@ -225,8 +247,7 @@ class MinerService:
             )
 
             logger.info(
-                "Sent SSH key to miner.",
-                extra=get_extra_info(default_extra),
+                _m("Sent SSH key to miner.", extra=get_extra_info(default_extra)),
             )
 
             try:
@@ -235,36 +256,43 @@ class MinerService:
                 )
             except TimeoutError:
                 logger.error(
-                    "Waiting accepted ssh key or failed request from miner resulted in an timeout error",
-                    extra=get_extra_info(default_extra),
+                    _m(
+                        "Waiting accepted ssh key or failed request from miner resulted in an timeout error",
+                        extra=get_extra_info(default_extra),
+                    ),
                 )
                 msg = None
             except Exception:
                 logger.error(
-                    "Waiting accepted ssh key or failed request from miner resulted in an exception",
-                    extra=get_extra_info(default_extra),
+                    _m(
+                        "Waiting accepted ssh key or failed request from miner resulted in an exception",
+                        extra=get_extra_info(default_extra),
+                    ),
                 )
                 msg = None
 
             if isinstance(msg, AcceptSSHKeyRequest):
                 logger.info(
-                    "Received AcceptSSHKeyRequest",
-                    extra=get_extra_info({**default_extra, "msg": msg}),
+                    _m(
+                        "Received AcceptSSHKeyRequest",
+                        extra=get_extra_info({**default_extra, "msg": msg}),
+                    ),
                 )
 
                 try:
                     executor = msg.executors[0]
                 except Exception as e:
                     logger.error(
-                        "Error: Miner didn't return executor info",
-                        extra=get_extra_info({**default_extra, "error": str(e)}),
+                        _m(
+                            "Error: Miner didn't return executor info",
+                            extra=get_extra_info({**default_extra, "error": str(e)}),
+                        ),
                     )
                     executor = None
 
                 if executor is None or executor.uuid != payload.executor_id:
                     logger.error(
-                        "Error: Invalid executor id",
-                        extra=get_extra_info(default_extra),
+                        _m("Error: Invalid executor id", extra=get_extra_info(default_extra)),
                     )
                     await miner_client.send_model(
                         SSHPubKeyRemoveRequest(
@@ -283,8 +311,10 @@ class MinerService:
                 try:
                     if isinstance(payload, ContainerCreateRequest):
                         logger.info(
-                            "Creating container",
-                            extra=get_extra_info({**default_extra, "payload": payload}),
+                            _m(
+                                "Creating container",
+                                extra=get_extra_info({**default_extra, "payload": payload}),
+                            ),
                         )
                         result = await self.docker_service.create_container(
                             payload,
@@ -294,8 +324,10 @@ class MinerService:
                         )
 
                         logger.info(
-                            "Created Container",
-                            extra=get_extra_info({**default_extra, "result": result}),
+                            _m(
+                                "Created Container",
+                                extra=get_extra_info({**default_extra, "result": result}),
+                            ),
                         )
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
@@ -312,8 +344,10 @@ class MinerService:
                         )
                     elif isinstance(payload, ContainerStartRequest):
                         logger.info(
-                            "Starting container",
-                            extra=get_extra_info({**default_extra, "payload": payload}),
+                            _m(
+                                "Starting container",
+                                extra=get_extra_info({**default_extra, "payload": payload}),
+                            ),
                         )
                         await self.docker_service.start_container(
                             payload,
@@ -323,8 +357,10 @@ class MinerService:
                         )
 
                         logger.info(
-                            "Started Container",
-                            extra=get_extra_info({**default_extra, "payload": payload}),
+                            _m(
+                                "Started Container",
+                                extra=get_extra_info({**default_extra, "payload": payload}),
+                            ),
                         )
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
@@ -358,8 +394,10 @@ class MinerService:
                         )
                     elif isinstance(payload, ContainerDeleteRequest):
                         logger.info(
-                            "Deleting container",
-                            extra=get_extra_info({**default_extra, "payload": payload}),
+                            _m(
+                                "Deleting container",
+                                extra=get_extra_info({**default_extra, "payload": payload}),
+                            ),
                         )
                         await self.docker_service.delete_container(
                             payload,
@@ -369,8 +407,10 @@ class MinerService:
                         )
 
                         logger.info(
-                            "Deleted Container",
-                            extra=get_extra_info({**default_extra, "payload": payload}),
+                            _m(
+                                "Deleted Container",
+                                extra=get_extra_info({**default_extra, "payload": payload}),
+                            ),
                         )
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
@@ -386,8 +426,10 @@ class MinerService:
                         )
                     else:
                         logger.error(
-                            "Unexpected request",
-                            extra=get_extra_info({**default_extra, "payload": payload}),
+                            _m(
+                                "Unexpected request",
+                                extra=get_extra_info({**default_extra, "payload": payload}),
+                            ),
                         )
                         return FailedContainerRequest(
                             miner_hotkey=payload.miner_hotkey,
@@ -397,8 +439,10 @@ class MinerService:
 
                 except Exception as e:
                     logger.error(
-                        "Error: create container error",
-                        extra=get_extra_info({**default_extra, "error": str(e)}),
+                        _m(
+                            "Error: create container error",
+                            extra=get_extra_info({**default_extra, "error": str(e)}),
+                        ),
                     )
                     await miner_client.send_model(
                         SSHPubKeyRemoveRequest(
@@ -414,8 +458,10 @@ class MinerService:
 
             elif isinstance(msg, FailedRequest):
                 logger.info(
-                    "Error: Miner failed job",
-                    extra=get_extra_info({**default_extra, "msg": msg}),
+                    _m(
+                        "Error: Miner failed job",
+                        extra=get_extra_info({**default_extra, "msg": msg}),
+                    ),
                 )
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -424,8 +470,9 @@ class MinerService:
                 )
             else:
                 logger.error(
-                    "Error: Unexpected msg",
-                    extra=get_extra_info({**default_extra, "msg": msg}),
+                    _m(
+                        "Error: Unexpected msg", extra=get_extra_info({**default_extra, "msg": msg})
+                    ),
                 )
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,

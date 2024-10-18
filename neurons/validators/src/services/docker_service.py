@@ -1,3 +1,4 @@
+import logging
 import random
 from typing import Annotated
 from uuid import uuid4
@@ -14,11 +15,11 @@ from payload_models.payloads import (
     ContainerStopRequest,
 )
 
-from core.utils import get_extra_info, get_logger
+from core.utils import _m, get_extra_info
 from daos.executor import ExecutorDao
 from services.ssh_service import SSHService
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class DockerService:
@@ -64,8 +65,10 @@ class DockerService:
         }
 
         logger.info(
-            "Create Docker Container",
-            extra=get_extra_info({**default_extra, "payload": payload}),
+            _m(
+                "Create Docker Container",
+                extra=get_extra_info({**default_extra, "payload": payload}),
+            ),
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
@@ -80,8 +83,10 @@ class DockerService:
         ) as ssh_client:
             # check docker image exists
             logger.info(
-                "Checking if docker image exists",
-                extra=get_extra_info({**default_extra, "docker_image": payload.docker_image}),
+                _m(
+                    "Checking if docker image exists",
+                    extra=get_extra_info({**default_extra, "docker_image": payload.docker_image}),
+                ),
             )
             result = await ssh_client.run(f"docker inspect --type=image {payload.docker_image}")
 
@@ -91,8 +96,12 @@ class DockerService:
 
             if error:
                 logger.info(
-                    "Pulling docker image",
-                    extra=get_extra_info({**default_extra, "docker_image": payload.docker_image}),
+                    _m(
+                        "Pulling docker image",
+                        extra=get_extra_info(
+                            {**default_extra, "docker_image": payload.docker_image}
+                        ),
+                    ),
                 )
                 result = await ssh_client.run(f"docker pull {payload.docker_image}")
 
@@ -103,18 +112,26 @@ class DockerService:
                 # Log the output and error
                 if output:
                     logger.info(
-                        "Docker pull output",
-                        extra=get_extra_info({**default_extra, "output": output}),
+                        _m(
+                            "Docker pull output",
+                            extra=get_extra_info({**default_extra, "output": output}),
+                        ),
                     )
                 if error:
                     logger.error(
-                        "Docker pull error",
-                        extra=get_extra_info({**default_extra, "error": error}),
+                        _m(
+                            "Docker pull error",
+                            extra=get_extra_info({**default_extra, "error": error}),
+                        ),
                     )
             else:
                 logger.info(
-                    "Docker image already exists locally",
-                    extra=get_extra_info({**default_extra, "docker_image": payload.docker_image}),
+                    _m(
+                        "Docker image already exists locally",
+                        extra=get_extra_info(
+                            {**default_extra, "docker_image": payload.docker_image}
+                        ),
+                    ),
                 )
 
             # generate port maps
@@ -127,8 +144,10 @@ class DockerService:
             await ssh_client.run(f"docker volume create {volume_name}")
 
             logger.info(
-                "Created Docker Volume",
-                extra=get_extra_info({**default_extra, "volume_name": volume_name}),
+                _m(
+                    "Created Docker Volume",
+                    extra=get_extra_info({**default_extra, "volume_name": volume_name}),
+                ),
             )
 
             # create docker container with the port map & resource
@@ -138,8 +157,10 @@ class DockerService:
             )
 
             logger.info(
-                "Created Docker Container",
-                extra=get_extra_info({**default_extra, "container_name": container_name}),
+                _m(
+                    "Created Docker Container",
+                    extra=get_extra_info({**default_extra, "container_name": container_name}),
+                ),
             )
 
             await self.executor_dao.rent(payload.executor_id, payload.miner_hotkey)
@@ -167,8 +188,9 @@ class DockerService:
         }
 
         logger.info(
-            "Stop Docker Container",
-            extra=get_extra_info({**default_extra, "payload": payload}),
+            _m(
+                "Stop Docker Container", extra=get_extra_info({**default_extra, "payload": payload})
+            ),
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
@@ -184,8 +206,12 @@ class DockerService:
             await ssh_client.run(f"docker stop {payload.container_name}")
 
             logger.info(
-                "Stopped Docker Container",
-                extra=get_extra_info({**default_extra, "container_name": payload.container_name}),
+                _m(
+                    "Stopped Docker Container",
+                    extra=get_extra_info(
+                        {**default_extra, "container_name": payload.container_name}
+                    ),
+                ),
             )
 
     async def start_container(
@@ -205,8 +231,10 @@ class DockerService:
         }
 
         logger.info(
-            "Restart Docker Container",
-            extra=get_extra_info({**default_extra, "payload": payload}),
+            _m(
+                "Restart Docker Container",
+                extra=get_extra_info({**default_extra, "payload": payload}),
+            ),
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
@@ -221,8 +249,12 @@ class DockerService:
         ) as ssh_client:
             await ssh_client.run(f"docker start {payload.container_name}")
             logger.info(
-                "Started Docker Container",
-                extra=get_extra_info({**default_extra, "container_name": payload.container_name}),
+                _m(
+                    "Started Docker Container",
+                    extra=get_extra_info(
+                        {**default_extra, "container_name": payload.container_name}
+                    ),
+                ),
             )
 
     async def delete_container(
@@ -242,8 +274,10 @@ class DockerService:
         }
 
         logger.info(
-            "Delete Docker Container",
-            extra=get_extra_info({**default_extra, "payload": payload}),
+            _m(
+                "Delete Docker Container",
+                extra=get_extra_info({**default_extra, "payload": payload}),
+            ),
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
@@ -261,13 +295,15 @@ class DockerService:
             await ssh_client.run(f"docker volume rm {payload.volume_name}")
 
             logger.info(
-                "Deleted Docker Container",
-                extra=get_extra_info(
-                    {
-                        **default_extra,
-                        "container_name": payload.container_name,
-                        "volume_name": payload.volume_name,
-                    }
+                _m(
+                    "Deleted Docker Container",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "container_name": payload.container_name,
+                            "volume_name": payload.volume_name,
+                        }
+                    ),
                 ),
             )
 

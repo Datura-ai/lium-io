@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from typing import NoReturn
 
 import bittensor
@@ -19,10 +20,10 @@ from pydantic import BaseModel
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.config import settings
-from core.utils import get_extra_info, get_logger
+from core.utils import get_extra_info
 from services.miner_service import MinerService
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 
