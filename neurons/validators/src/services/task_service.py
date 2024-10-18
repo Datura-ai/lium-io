@@ -23,7 +23,7 @@ from services.const import (
     UPLOAD_SPEED_WEIGHT,
 )
 from services.ssh_service import SSHService
-from services.redis_service import RedisService
+from services.redis_service import RedisService, RENTED_MACHINE_SET
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -165,16 +165,21 @@ class TaskService:
                         f"[create_task][{executor_name}] gpu model: {gpu_model}, max score: {max_score}"
                     )
 
-                    # if executor.rented:
-                    #     score = max_score * gpu_count
-                    #     logger.info(
-                    #         f"[create_task] Executor({executor_name}) is already rented. Give score: {score}"
-                    #     )
+                    is_rented = await self.redis_service.is_elem_exists_in_set(
+                        RENTED_MACHINE_SET,
+                        f"{miner_info.miner_hotkey}:{executor_info.uuid}"
+                    )
 
-                    #     logger.info(
-                    #         f"[create_task] Task saved with status Finished for executor({executor_name})"
-                    #     )
-                    #     return machine_spec, executor_info
+                    if is_rented:
+                        score = max_score * gpu_count
+                        logger.info(
+                            f"[create_task] Executor({executor_name}) is already rented. Give score: {score}"
+                        )
+
+                        logger.info(
+                            f"[create_task] Task saved with status Finished for executor({executor_name})"
+                        )
+                        return machine_spec, executor_info, score
 
                     timestamp = int(time.time())
                     local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")

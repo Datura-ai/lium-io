@@ -3,6 +3,7 @@ import redis.asyncio as aioredis
 from core.config import settings
 
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
+RENTED_MACHINE_SET = "rented_machines"
 
 
 class RedisService:
@@ -26,3 +27,15 @@ class RedisService:
     async def get(self, key: str):
         """Get a value by key from Redis."""
         return await self.redis.get(key)
+
+    async def sadd(self, key: str, elem: str):
+        """Add a machine ID to the set of rented machines."""
+        await self.redis.sadd(key, elem)
+
+    async def srem(self, key: str, elem: str):
+        """Remove a machine ID from the set of rented machines."""
+        await self.redis.srem(key, elem)
+
+    async def is_elem_exists_in_set(self, key: str, elem: str) -> bool:
+        """Check if a machine ID is in the set of rented machines."""
+        return await self.redis.sismember(key, elem)

@@ -16,7 +16,7 @@ from payload_models.payloads import (
 )
 
 from services.ssh_service import SSHService
-from services.redis_service import RedisService
+from services.redis_service import RedisService, RENTED_MACHINE_SET
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ class DockerService:
                 f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
             )
 
-            # await self.executor_dao.rent(payload.executor_id, payload.miner_hotkey)
+            await self.redis_service.sadd(RENTED_MACHINE_SET, f"{payload.miner_hotkey}:{payload.executor_id}")
 
             return ContainerCreatedResult(
                 container_name=container_name,
@@ -201,6 +201,6 @@ class DockerService:
             await ssh_client.run(f"docker rm {payload.container_name} -f")
             await ssh_client.run(f"docker volume rm {payload.volume_name}")
 
-            # await self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
+            await self.redis_service.srem(RENTED_MACHINE_SET, f"{payload.miner_hotkey}:{payload.executor_id}")
 
             return
