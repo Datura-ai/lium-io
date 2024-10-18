@@ -130,6 +130,7 @@ dependencies = [
     "xxhash==3.4.1",
     "yarl==1.9.4",
     "asyncssh>=2.17.0",
+    "python-json-logger>=2.0.7",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"

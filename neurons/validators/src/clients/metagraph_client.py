@@ -1,13 +1,13 @@
 import asyncio
 import datetime as dt
-import logging
 
 import bittensor
 from asgiref.sync import sync_to_async
 
 from core.config import settings
+from core.utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class AsyncMetagraphClient:
