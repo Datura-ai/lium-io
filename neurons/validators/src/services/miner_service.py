@@ -32,6 +32,7 @@ from core.config import settings
 from services.docker_service import DockerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.redis_service import RedisService, MACHINE_SPEC_CHANNEL_NAME
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,11 +47,12 @@ class MinerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
         docker_service: Annotated[DockerService, Depends(DockerService)],
+        redis_service: Annotated[RedisService, Depends(RedisService)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.docker_service = docker_service
-        self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
+        self.redis_service = redis_service
 
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
         loop = asyncio.get_event_loop()
@@ -133,7 +135,7 @@ class MinerService:
                     total_score = 0
                     for _, _, score in results:
                         total_score += score
-                        
+
                     logger.info(
                         f"[_request_job_to_miner][{miner_name}] total score: {total_score}"
                     )
@@ -175,17 +177,15 @@ class MinerService:
         logger.info(f"Publishing machine specs to compute app connector process: {results}")
         for specs, ssh_info, _ in results:
             try:
-                await self.redis.publish(
-                    "channel:1",
-                    json.dumps(
-                        {
-                            "specs": specs,
-                            "miner_hotkey": miner_hotkey,
-                            "executor_uuid": ssh_info.uuid,
-                            "executor_ip": ssh_info.address,
-                            "executor_port": ssh_info.port,
-                        }
-                    ),
+                await self.redis_service.publish(
+                    MACHINE_SPEC_CHANNEL_NAME,
+                    {
+                        "specs": specs,
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": ssh_info.uuid,
+                        "executor_ip": ssh_info.address,
+                        "executor_port": ssh_info.port,
+                    },
                 )
             except Exception as e:
                 logger.error(

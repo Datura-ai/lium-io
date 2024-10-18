@@ -16,6 +16,7 @@ from payload_models.payloads import (
 )
 
 from services.ssh_service import SSHService
+from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,10 @@ class DockerService:
     def __init__(
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
+        redis_service: Annotated[RedisService, Depends(RedisService)],
     ):
         self.ssh_service = ssh_service
+        self.redis_service = redis_service
 
     def generate_portMappings(self, start_external_port=40000) -> list[tuple[int, int]]:
         internal_ports = [22, 22140, 22141, 22142, 22143]

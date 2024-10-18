@@ -23,6 +23,7 @@ from services.const import (
     UPLOAD_SPEED_WEIGHT,
 )
 from services.ssh_service import SSHService
+from services.redis_service import RedisService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -77,8 +78,10 @@ class TaskService:
     def __init__(
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
+        redis_service: Annotated[RedisService, Depends(RedisService)],
     ):
         self.ssh_service = ssh_service
+        self.redis_service = redis_service
 
     async def create_task(
         self,

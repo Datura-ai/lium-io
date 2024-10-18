@@ -15,6 +15,7 @@ from services.docker_service import DockerService
 from services.miner_service import MinerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.redis_service import RedisService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -50,12 +51,20 @@ class Validator:
 
     async def initiate_services(self):
         ssh_service = SSHService()
-        task_service = TaskService(ssh_service=ssh_service)
-        docker_service = DockerService(ssh_service=ssh_service)
+        redis_service = RedisService()
+        task_service = TaskService(
+            ssh_service=ssh_service,
+            redis_service=redis_service,
+        )
+        docker_service = DockerService(
+            ssh_service=ssh_service,
+            redis_service=redis_service,
+        )
         self.miner_service = MinerService(
             ssh_service=ssh_service,
             task_service=task_service,
             docker_service=docker_service,
+            redis_service=redis_service,
         )
 
     def get_subtensor(self):

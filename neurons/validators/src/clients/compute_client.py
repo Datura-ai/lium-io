@@ -21,14 +21,13 @@ from pydantic import BaseModel
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.config import settings
 from services.miner_service import MinerService
+from services.redis_service import MACHINE_SPEC_CHANNEL_NAME
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(log_color)s %(levelname)-8s %(asctime)s --- %(lineno)-8s [%(name)s] %(funcName)-24s : %(message)s",
 )
-
-MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 
 
 class AuthenticationError(Exception):
@@ -46,7 +45,6 @@ class ComputeClient:
         self.keypair = keypair
         self.ws: websockets.WebSocketClientProtocol | None = None
         self.compute_app_uri = compute_app_uri
-        self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
@@ -82,12 +80,16 @@ class ComputeClient:
 
     async def run_forever(self) -> NoReturn:
         """connect (and re-connect) to facilitator and keep reading messages ... forever"""
-        # subscribe to channel to get machine specs
-        pubsub = self.redis.pubsub()
-        await pubsub.subscribe(MACHINE_SPEC_CHANNEL_NAME)
+        try:
+            # subscribe to channel to get machine specs
+            pubsub = await self.miner_service.redis_service.subscribe(MACHINE_SPEC_CHANNEL_NAME)
 
-        # send machine specs to facilitator
-        self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
+            # send machine specs to facilitator
+            self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
+        except Exception as exc:
+            msg = f"[Connector][Error] redis connection msg: {exc}"
+            logger.error(msg)
+
         try:
             while True:
                 async for ws in self.connect():
