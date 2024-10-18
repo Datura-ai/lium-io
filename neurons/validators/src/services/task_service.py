@@ -156,17 +156,11 @@ class TaskService:
                         logger.warning(
                             f"[create_task] Max Score({max_score}) or GPU count({gpu_count}) is 0 for executor({executor_name}). No need to run job."
                         )
-                        return machine_spec, executor_info
+                        return machine_spec, executor_info, 0
 
                     logger.info(
                         f"[create_task][{executor_name}] gpu model: {gpu_model}, max score: {max_score}"
                     )
-
-                    if max_score == 0:
-                        logger.info(
-                            f"[create_task][{executor_name}] return with 0 score"
-                        )
-                        return machine_spec, executor_info, 0
 
                     # if executor.rented:
                     #     score = max_score * gpu_count
@@ -214,14 +208,12 @@ class TaskService:
 
                         upload_speed = machine_spec.get("network", {}).get("upload_speed", 0)
                         download_speed = machine_spec.get("network", {}).get("download_speed", 0)
-                        print('upload/download ===>', upload_speed, download_speed)
+
                         job_taken_score = (
                             min(MIN_JOB_TAKEN_TIME / job_taken_time, 1) if job_taken_time > 0 else 0
                         )
-                        print('job_taken_score ===>', job_taken_score)
                         upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
                         download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
-                        print(upload_speed_score, download_speed_score)
 
                         score = max_score * (
                             job_taken_score * gpu_count * JOB_TAKEN_TIME_WEIGHT
