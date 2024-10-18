@@ -1,5 +1,6 @@
 import abc
 import asyncio
+import logging
 import random
 import time
 
@@ -19,9 +20,9 @@ from datura.requests.miner_requests import (
 )
 from datura.requests.validator_requests import AuthenticateRequest, AuthenticationPayload
 
-from core.utils import get_extra_info, get_logger
+from core.utils import get_extra_info
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class JobState:

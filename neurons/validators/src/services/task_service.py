@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Annotated
@@ -11,7 +12,7 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
-from core.utils import configure_logs_of_other_modules, context, get_extra_info, get_logger
+from core.utils import _m, context, get_extra_info
 from daos.executor import ExecutorDao
 from daos.task import TaskDao
 from models.executor import Executor
@@ -27,8 +28,7 @@ from services.const import (
 )
 from services.ssh_service import SSHService
 
-logger = get_logger(__name__)
-configure_logs_of_other_modules()
+logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
 
@@ -51,7 +51,6 @@ class TaskService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
-        executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
         default_extra = {
             "miner_hotkey": miner_info.miner_hotkey,
             "executor_uuid": executor_info.uuid,
@@ -61,10 +60,7 @@ class TaskService:
             "executor_ssh_port": executor_info.ssh_port,
         }
         try:
-            # logger.info(
-            #     f"[create_task] Creating task for executor({executor_name}): Upsert executor uuid: {executor_info.uuid}"
-            # )
-            logger.info("Update or create an executor", extra=get_extra_info(default_extra))
+            logger.info(_m("Update or create an executor", extra=get_extra_info(default_extra)))
             await self.executor_dao.upsert(
                 Executor(
                     miner_address=miner_info.miner_address,
@@ -81,8 +77,10 @@ class TaskService:
             pkey = asyncssh.import_private_key(private_key)
 
             logger.info(
-                f"Connecting with SSH INFO(ssh -p {executor_info.ssh_port} {executor_info.ssh_username}:{executor_info.address})",
-                extra=get_extra_info(default_extra),
+                _m(
+                    "Connecting with SSH INFO(ssh -p {executor_info.ssh_port} {executor_info.ssh_username}:{executor_info.address})",
+                    extra=get_extra_info(default_extra),
+                ),
             )
 
             async with asyncssh.connect(
@@ -93,8 +91,10 @@ class TaskService:
                 known_hosts=None,
             ) as ssh_client:
                 logger.info(
-                    f"SSH Connection Established. Creating temp directory at {executor_info.root_dir}/temp",
-                    extra=get_extra_info(default_extra),
+                    _m(
+                        "SSH Connection Established. Creating temp directory at {executor_info.root_dir}/temp",
+                        extra=get_extra_info(default_extra),
+                    ),
                 )
 
                 await ssh_client.run(f"mkdir -p {executor_info.root_dir}/temp")
@@ -108,8 +108,10 @@ class TaskService:
                     await sftp_client.put(local_file_path, remote_file_path)
 
                     logger.info(
-                        f"Uploaded machine scrape script to {remote_file_path}",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "Uploaded machine scrape script to {remote_file_path}",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
 
                     machine_specs, _ = await self._run_task(
@@ -117,15 +119,16 @@ class TaskService:
                     )
                     if not machine_specs:
                         logger.warning(
-                            "No machine specs found",
-                            extra=get_extra_info(default_extra),
+                            _m("No machine specs found", extra=get_extra_info(default_extra)),
                         )
                         return None
 
                     machine_spec = json.loads(machine_specs[0].strip())
                     logger.info(
-                        f"Machine spec scraped: {machine_spec}",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "Machine spec scraped: {machine_spec}",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
 
                     gpu_model = None
@@ -142,14 +145,18 @@ class TaskService:
 
                     if max_score == 0 or gpu_count == 0:
                         logger.warning(
-                            f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
-                            extra=get_extra_info(default_extra),
+                            _m(
+                                "Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
+                                extra=get_extra_info(default_extra),
+                            ),
                         )
                         return machine_spec, executor_info
 
                     logger.info(
-                        f"Got GPU specs: {gpu_model} with max score: {max_score}",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "Got GPU specs: {gpu_model} with max score: {max_score}",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
 
                     executor = await self.executor_dao.get_executor(
@@ -158,8 +165,10 @@ class TaskService:
                     if executor.rented:
                         score = max_score * gpu_count
                         logger.info(
-                            "Executor is already rented.",
-                            extra=get_extra_info({**default_extra, "score": score}),
+                            _m(
+                                "Executor is already rented.",
+                                extra=get_extra_info({**default_extra, "score": score}),
+                            ),
                         )
                         await self.task_dao.save(
                             Task(
@@ -171,14 +180,15 @@ class TaskService:
                             )
                         )
                         logger.info(
-                            f"Task saved with status Finished for executor({executor_name})",
-                            extra=get_extra_info(default_extra),
+                            _m(
+                                "Task saved with status Finished for executor({executor_name})",
+                                extra=get_extra_info(default_extra),
+                            ),
                         )
                         return machine_spec, executor_info
 
                     logger.info(
-                        "Creating task for executor",
-                        extra=get_extra_info(default_extra),
+                        _m("Creating task for executor", extra=get_extra_info(default_extra)),
                     )
                     task = await self.task_dao.save(
                         Task(
@@ -188,8 +198,10 @@ class TaskService:
                         )
                     )
                     logger.info(
-                        "Task saved with status SSHConnected for executor",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "Task saved with status SSHConnected for executor",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
 
                     timestamp = int(time.time())
@@ -198,8 +210,10 @@ class TaskService:
 
                     await sftp_client.put(local_file_path, remote_file_path)
                     logger.info(
-                        f"Uploaded score script to {remote_file_path}",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "Uploaded score script to {remote_file_path}",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
 
                     start_time = time.time()
@@ -207,20 +221,27 @@ class TaskService:
                     results, err = await self._run_task(ssh_client, executor_info, remote_file_path)
                     if not results:
                         logger.warning(
-                            "No result from training job task.", extra=get_extra_info(default_extra)
+                            _m(
+                                "No result from training job task.",
+                                extra=get_extra_info(default_extra),
+                            ),
                         )
                         return None
 
                     end_time = time.time()
                     logger.info(
-                        f"Results from training job task: {results}",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            f"Results from training job task: {results}",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
 
                     if err is not None:
                         logger.error(
-                            f"Error executing task on executor: {err}",
-                            extra=get_extra_info(default_extra),
+                            _m(
+                                f"Error executing task on executor: {err}",
+                                extra=get_extra_info(default_extra),
+                            ),
                         )
 
                         # mark task is failed
@@ -230,8 +251,10 @@ class TaskService:
                             score=0,
                         )
                         logger.debug(
-                            "Task marked as failed for executor",
-                            extra=get_extra_info(default_extra),
+                            _m(
+                                "Task marked as failed for executor",
+                                extra=get_extra_info(default_extra),
+                            ),
                         )
                     else:
                         job_taken_time = results[-1]
@@ -241,9 +264,11 @@ class TaskService:
                             job_taken_time = end_time - start_time
 
                         logger.info(
-                            "Job taken time for executor",
-                            extra=get_extra_info(
-                                {**default_extra, "job_taken_time": job_taken_time}
+                            _m(
+                                "Job taken time for executor",
+                                extra=get_extra_info(
+                                    {**default_extra, "job_taken_time": job_taken_time}
+                                ),
                             ),
                         )
 
@@ -263,15 +288,17 @@ class TaskService:
                         )
 
                         logger.info(
-                            "Train task finished",
-                            extra=get_extra_info(
-                                {
-                                    **default_extra,
-                                    "score": score,
-                                    "job_taken_time": job_taken_time,
-                                    "upload_speed": upload_speed,
-                                    "download_speed": download_speed,
-                                }
+                            _m(
+                                "Train task finished",
+                                extra=get_extra_info(
+                                    {
+                                        **default_extra,
+                                        "score": score,
+                                        "job_taken_time": job_taken_time,
+                                        "upload_speed": upload_speed,
+                                        "download_speed": download_speed,
+                                    }
+                                ),
                             ),
                         )
 
@@ -283,15 +310,19 @@ class TaskService:
                             score=score,
                         )
                     logger.info(
-                        "SSH connection closed for executor",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "SSH connection closed for executor",
+                            extra=get_extra_info(default_extra),
+                        ),
                     )
 
                     return machine_spec, executor_info
         except Exception as e:
             logger.error(
-                "Error creating task for executor",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                _m(
+                    "Error creating task for executor",
+                    extra=get_extra_info({**default_extra, "error": str(e)}),
+                ),
                 exc_info=True,
             )
             return None
@@ -312,8 +343,10 @@ class TaskService:
             }
             context.set(f"[_run_task][{executor_name}]")
             logger.info(
-                "Running task for executor",
-                extra=get_extra_info({**default_extra, "remote_file_path": remote_file_path}),
+                _m(
+                    "Running task for executor",
+                    extra=get_extra_info({**default_extra, "remote_file_path": remote_file_path}),
+                ),
             )
             result = await ssh_client.run(
                 f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_file_path}",
@@ -322,45 +355,41 @@ class TaskService:
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
             logger.info(
-                "Run task results", extra=get_extra_info({**default_extra, "results": results})
+                _m("Run task results", extra=get_extra_info({**default_extra, "results": results})),
             )
             logger.warning(
-                "Run task errors", extra=get_extra_info({**default_extra, "errors": errors})
+                _m("Run task errors", extra=get_extra_info({**default_extra, "errors": errors})),
             )
 
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
 
             if len(results) == 0 and len(actual_errors) > 0:
-                logger.error("Failed to execute command!", extra=get_extra_info(default_extra))
+                logger.error(_m("Failed to execute command!", extra=get_extra_info(default_extra)))
                 raise Exception("Failed to execute command!")
 
             #  remove remote_file
             await ssh_client.run(f"rm {remote_file_path}", timeout=30)
 
-            logger.info("Run task success", extra=get_extra_info(default_extra))
+            logger.info(_m("Run task success", extra=get_extra_info(default_extra)))
             return results, None
         except Exception as e:
             logger.error(
-                "Run task error to executor",
-                extra=get_extra_info(default_extra),
+                _m("Run task error to executor", extra=get_extra_info(default_extra)),
                 exc_info=True,
             )
 
             #  remove remote_file
             try:
                 logger.info(
-                    "Removing remote file",
-                    extra=get_extra_info(default_extra),
+                    _m("Removing remote file", extra=get_extra_info(default_extra)),
                 )
                 await asyncio.wait_for(ssh_client.run(f"rm {remote_file_path}"), timeout=10)
                 logger.info(
-                    "Removed remote file",
-                    extra=get_extra_info(default_extra),
+                    _m("Removed remote file", extra=get_extra_info(default_extra)),
                 )
             except Exception:
                 logger.error(
-                    "Failed to remove remote file",
-                    extra=get_extra_info(default_extra),
+                    _m("Failed to remove remote file", extra=get_extra_info(default_extra)),
                     exc_info=True,
                 )
 

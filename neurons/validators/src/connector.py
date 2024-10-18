@@ -1,12 +1,13 @@
 import asyncio
+import logging
 
 from clients.compute_client import ComputeClient
 
 from core.config import settings
-from core.utils import get_logger, wait_for_services_sync
+from core.utils import wait_for_services_sync
 from services.ioc import ioc
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 wait_for_services_sync()

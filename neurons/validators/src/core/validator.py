@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import traceback
 
 import bittensor
@@ -11,7 +12,6 @@ from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
 from core.db import get_db
-from core.utils import get_logger
 from daos.executor import ExecutorDao
 from daos.task import TaskDao
 from services.docker_service import DockerService
@@ -19,7 +19,7 @@ from services.miner_service import MinerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
