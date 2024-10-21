@@ -229,7 +229,7 @@ class MinerService:
             "executor_id": payload.executor_id,
             "executor_ip": payload.miner_address,
             "executor_port": payload.miner_port,
-            "container_request_type": payload.message_type,
+            "container_request_type": str(payload.message_type),
         }
 
         miner_client = MinerClient(

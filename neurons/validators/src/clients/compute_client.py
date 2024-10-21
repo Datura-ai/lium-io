@@ -346,8 +346,8 @@ class ComputeClient:
             "miner_hotkey": job_request.miner_hotkey,
             "miner_ip": miner_axon_info.ip,
             "miner_port": miner_axon_info.port,
-            "job_request": job_request,
-            "executor_id": job_request.executor_id,
+            "job_request": str(job_request),
+            "executor_id": str(job_request.executor_id),
         }
         logger.info(
             _m(
