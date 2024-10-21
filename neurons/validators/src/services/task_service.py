@@ -146,7 +146,7 @@ class TaskService:
                     if max_score == 0 or gpu_count == 0:
                         logger.warning(
                             _m(
-                                "Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
+                                f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
                                 extra=get_extra_info(default_extra),
                             ),
                         )
@@ -154,7 +154,7 @@ class TaskService:
 
                     logger.info(
                         _m(
-                            "Got GPU specs: {gpu_model} with max score: {max_score}",
+                            f"Got GPU specs: {gpu_model} with max score: {max_score}",
                             extra=get_extra_info(default_extra),
                         ),
                     )
@@ -181,7 +181,7 @@ class TaskService:
                         )
                         logger.info(
                             _m(
-                                "Task saved with status Finished for executor({executor_name})",
+                                "Task saved with status Finished for executor",
                                 extra=get_extra_info(default_extra),
                             ),
                         )
@@ -211,7 +211,7 @@ class TaskService:
                     await sftp_client.put(local_file_path, remote_file_path)
                     logger.info(
                         _m(
-                            "Uploaded score script to {remote_file_path}",
+                            f"Uploaded score script to {remote_file_path}",
                             extra=get_extra_info(default_extra),
                         ),
                     )
