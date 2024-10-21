@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.config import settings
-from core.utils import get_extra_info
+from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
 
 logger = logging.getLogger(__name__)
@@ -50,14 +50,19 @@ class ComputeClient:
         self.refresh_metagraph_task = self.create_metagraph_refresh_task()
         self.miner_service = miner_service
 
-        self.logging_extra = {
-            "compute_app_uri": compute_app_uri,
-        }
+        self.logging_extra = get_extra_info(
+            {
+                "compute_app_uri": compute_app_uri,
+            }
+        )
 
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
         logger.info(
-            f"Connecting to {self.compute_app_uri}", extra=get_extra_info(self.logging_extra)
+            _m(
+                "Connecting to backend app",
+                extra=self.logging_extra,
+            )
         )
         return websockets.connect(self.compute_app_uri)
 
@@ -72,8 +77,10 @@ class ComputeClient:
                 await task
             except Exception as exc:
                 logger.error(
-                    "Error occurred during driving a miner client",
-                    extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
+                    _m(
+                        "Error occurred during driving a miner client",
+                        extra={**self.logging_extra, "error": str(exc)},
+                    )
                 )
 
     async def __aenter__(self):
@@ -99,34 +106,44 @@ class ComputeClient:
                 async for ws in self.connect():
                     try:
                         logger.info(
-                            f"Connected to {self.compute_app_uri}",
-                            extra=get_extra_info(self.logging_extra),
+                            _m(
+                                "Connected to backend app",
+                                extra=self.logging_extra,
+                            )
                         )
                         await self.handle_connection(ws)
                     except websockets.ConnectionClosed as exc:
                         self.ws = None
                         logger.warning(
-                            f"validator connection closed with code {exc.code} and reason {exc.reason}, reconnecting...",
-                            extra=get_extra_info(self.logging_extra),
+                            _m(
+                                f"validator connection to backend app closed with code {exc.code} and reason {exc.reason}, reconnecting...",
+                                extra=self.logging_extra,
+                            )
                         )
                     except asyncio.exceptions.CancelledError:
                         self.ws = None
                         logger.warning(
-                            "Facilitator client received cancel, stopping",
-                            extra=get_extra_info(self.logging_extra),
+                            _m(
+                                "Facilitator client received cancel, stopping",
+                                extra=self.logging_extra,
+                            )
                         )
                     except Exception:
                         self.ws = None
                         logger.error(
-                            "Error in connecting to compute app",
-                            extra=get_extra_info(self.logging_extra),
+                            _m(
+                                "Error in connecting to compute app",
+                                extra=self.logging_extra,
+                            )
                         )
 
         except asyncio.exceptions.CancelledError:
             self.ws = None
             logger.error(
-                "Facilitator client received cancel, stopping",
-                extra=get_extra_info(self.logging_extra),
+                _m(
+                    "Facilitator client received cancel, stopping",
+                    extra=self.logging_extra,
+                )
             )
 
     async def handle_connection(self, ws: websockets.WebSocketClientProtocol):
@@ -157,20 +174,26 @@ class ComputeClient:
                 "validator_hotkey": validator_hotkey,
             }
             logger.info(
-                f"Waiting for machine specs from validator app: {validator_hotkey}",
-                extra=get_extra_info(default_extra),
+                _m(
+                    f"Waiting for machine specs from validator app: {validator_hotkey}",
+                    extra=default_extra,
+                )
             )
             try:
                 msg = await channel.get_message(ignore_subscribe_messages=True, timeout=100 * 60)
                 logger.info(
-                    "Received machine specs from validator app.",
-                    extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                    _m(
+                        "Received machine specs from validator app.",
+                        extra={**default_extra, "msg": str(msg)},
+                    )
                 )
 
                 if msg is None:
                     logger.warning(
-                        "No message received from validator app.",
-                        extra=get_extra_info(default_extra),
+                        _m(
+                            "No message received from validator app.",
+                            extra=default_extra,
+                        )
                     )
                     continue
 
@@ -194,18 +217,16 @@ class ComputeClient:
                 except Exception as exc:
                     msg = "Error occurred while parsing msg"
                     logger.error(
-                        msg,
-                        extra=get_extra_info(
-                            {**default_extra, **executor_logging_extra, "error": str(exc)}
-                        ),
+                        _m(
+                            msg,
+                            extra={**default_extra, **executor_logging_extra, "error": str(exc)},
+                        )
                     )
                     continue
 
                 logger.info(
                     "Sending machine specs update of executor to compute app",
-                    extra=get_extra_info(
-                        {**default_extra, **executor_logging_extra, "specs": str(specs)}
-                    ),
+                    extra={**default_extra, **executor_logging_extra, "specs": str(specs)},
                 )
 
                 specs_queue.append(specs)
@@ -218,14 +239,23 @@ class ComputeClient:
                             specs_queue.insert(0, spec_to_send)
                             msg = "Error occurred while sending specs of executor"
                             logger.error(
-                                msg,
-                                extra=get_extra_info(
-                                    {**default_extra, **executor_logging_extra, "error": str(exc)}
-                                ),
+                                _m(
+                                    msg,
+                                    extra={
+                                        **default_extra,
+                                        **executor_logging_extra,
+                                        "error": str(exc),
+                                    },
+                                )
                             )
                             break
             except TimeoutError:
-                logger.error("wait_for_specs still running", extra=get_extra_info(default_extra))
+                logger.error(
+                    _m(
+                        "wait_for_specs still running",
+                        extra=default_extra,
+                    )
+                )
 
     def create_metagraph_refresh_task(self, period=None):
         return create_metagraph_refresh_task(period=period)
@@ -260,14 +290,18 @@ class ComputeClient:
             response = Response.model_validate_json(raw_msg)
         except pydantic.ValidationError:
             logger.info(
-                "could not parse raw message as Response",
-                extra=get_extra_info({**self.logging_extra, "raw_msg": raw_msg}),
+                _m(
+                    "could not parse raw message as Response",
+                    extra={**self.logging_extra, "raw_msg": raw_msg},
+                )
             )
         else:
             if response.status != "success":
                 logger.error(
-                    "received error response from facilitator",
-                    extra=get_extra_info({**self.logging_extra, "response": str(response)}),
+                    _m(
+                        "received error response from facilitator",
+                        extra={**self.logging_extra, "response": str(response)},
+                    )
                 )
             return
 
@@ -275,8 +309,10 @@ class ComputeClient:
             job_request = pydantic.TypeAdapter(ContainerCreateRequest).validate_json(raw_msg)
         except pydantic.ValidationError as exc:
             logger.error(
-                "could not parse raw message as ContainerCreateRequest",
-                extra=get_extra_info({**self.logging_extra, "error": str(exc), "raw_msg": raw_msg}),
+                _m(
+                    "could not parse raw message as ContainerCreateRequest",
+                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                )
             )
         else:
             task = asyncio.create_task(self.miner_driver(job_request))
@@ -287,8 +323,10 @@ class ComputeClient:
             job_request = pydantic.TypeAdapter(ContainerDeleteRequest).validate_json(raw_msg)
         except pydantic.ValidationError as exc:
             logger.error(
-                "could not parse raw message as ContainerDeleteRequest",
-                extra=get_extra_info({**self.logging_extra, "error": str(exc), "raw_msg": raw_msg}),
+                _m(
+                    "could not parse raw message as ContainerDeleteRequest",
+                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                )
             )
         else:
             task = asyncio.create_task(self.miner_driver(job_request))
@@ -304,18 +342,26 @@ class ComputeClient:
         """drive a miner client from job start to completion, then close miner connection"""
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logging_extra = {
+            **self.logging_extra,
             "miner_hotkey": job_request.miner_hotkey,
             "miner_ip": miner_axon_info.ip,
             "miner_port": miner_axon_info.port,
             "job_request": job_request,
             "executor_id": job_request.executor_id,
         }
-        logger.info("Miner driver to miner", extra=get_extra_info(logging_extra))
+        logger.info(
+            _m(
+                "Miner driver to miner",
+                extra=logging_extra,
+            )
+        )
 
         if isinstance(job_request, ContainerCreateRequest):
             logger.info(
-                "Creating container for executor.",
-                extra=get_extra_info({**logging_extra, "job_request": str(job_request)}),
+                _m(
+                    "Creating container for executor.",
+                    extra={**logging_extra, "job_request": str(job_request)},
+                )
             )
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
@@ -324,10 +370,10 @@ class ComputeClient:
             )
 
             logger.info(
-                "Sending back created container info to compute app",
-                extra=get_extra_info(
-                    {**logging_extra, "container_created": str(container_created)}
-                ),
+                _m(
+                    "Sending back created container info to compute app",
+                    extra={**logging_extra, "container_created": str(container_created)},
+                )
             )
             await self.send_model(container_created)
         elif isinstance(job_request, ContainerDeleteRequest):
@@ -338,7 +384,9 @@ class ComputeClient:
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
-                "Sending back deleted container info to compute app",
-                extra=get_extra_info({**logging_extra, "response": str(response)}),
+                _m(
+                    "Sending back deleted container info to compute app",
+                    extra={**logging_extra, "response": str(response)},
+                )
             )
             await self.send_model(response)
