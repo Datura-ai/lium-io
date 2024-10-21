@@ -151,7 +151,7 @@ class MinerService:
                     logger.warning(
                         _m(
                             "Requesting job failed for miner",
-                            extra=get_extra_info({**default_extra, "msg": msg}),
+                            extra=get_extra_info({**default_extra, "msg": str(msg)}),
                         ),
                     )
                     return
@@ -159,13 +159,16 @@ class MinerService:
                     logger.warning(
                         _m(
                             "Requesting job declined for miner",
-                            extra=get_extra_info({**default_extra, "msg": msg}),
+                            extra=get_extra_info({**default_extra, "msg": str(msg)}),
                         ),
                     )
                     return
                 else:
                     logger.error(
-                        _m("Unexpected msg", extra=get_extra_info({**default_extra, "msg": msg})),
+                        _m(
+                            "Unexpected msg",
+                            extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                        ),
                     )
                     return
         except asyncio.CancelledError:
@@ -275,7 +278,7 @@ class MinerService:
                 logger.info(
                     _m(
                         "Received AcceptSSHKeyRequest",
-                        extra=get_extra_info({**default_extra, "msg": msg}),
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     ),
                 )
 
@@ -460,7 +463,7 @@ class MinerService:
                 logger.info(
                     _m(
                         "Error: Miner failed job",
-                        extra=get_extra_info({**default_extra, "msg": msg}),
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     ),
                 )
                 return FailedContainerRequest(
@@ -471,7 +474,8 @@ class MinerService:
             else:
                 logger.error(
                     _m(
-                        "Error: Unexpected msg", extra=get_extra_info({**default_extra, "msg": msg})
+                        "Error: Unexpected msg",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     ),
                 )
                 return FailedContainerRequest(
