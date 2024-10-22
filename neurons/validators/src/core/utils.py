@@ -3,6 +3,8 @@ import contextvars
 import json
 import logging
 
+from core.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Create a ContextVar to hold the context information
@@ -68,9 +70,11 @@ def get_extra_info(extra: dict) -> dict:
 
 
 def configure_logs_of_other_modules():
+    validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
+
     logging.basicConfig(
         level=logging.INFO,
-        format="Name: %(name)s | Time: %(asctime)s | Level: %(levelname)s | File: %(filename)s | Function: %(funcName)s | Line: %(lineno)s | Process: %(process)d | Message: %(message)s",
+        format=f"Validator: {validator_hotkey} | Name: %(name)s | Time: %(asctime)s | Level: %(levelname)s | File: %(filename)s | Function: %(funcName)s | Line: %(lineno)s | Process: %(process)d | Message: %(message)s",
     )
 
     sqlalchemy_logger = logging.getLogger("sqlalchemy.engine.Engine")

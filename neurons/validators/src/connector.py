@@ -4,10 +4,11 @@ import logging
 from clients.compute_client import ComputeClient
 
 from core.config import settings
-from core.utils import wait_for_services_sync
+from core.utils import configure_logs_of_other_modules, wait_for_services_sync
 from services.ioc import ioc
 
 logger = logging.getLogger(__name__)
+configure_logs_of_other_modules()
 
 
 wait_for_services_sync()

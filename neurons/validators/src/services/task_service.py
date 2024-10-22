@@ -100,7 +100,7 @@ class TaskService:
                     )
 
                     machine_specs, _ = await self._run_task(
-                        ssh_client, executor_info, remote_file_path
+                        ssh_client, executor_info, remote_file_path, miner_info.miner_hotkey
                     )
                     if not machine_specs:
                         logger.warning(
@@ -111,8 +111,8 @@ class TaskService:
                     machine_spec = json.loads(machine_specs[0].strip())
                     logger.info(
                         _m(
-                            "Machine spec scraped: {machine_spec}",
-                            extra=get_extra_info(default_extra),
+                            "Machine spec scraped",
+                            extra=get_extra_info({**default_extra, "machine_spec": machine_spec}),
                         ),
                     )
 
@@ -178,7 +178,9 @@ class TaskService:
 
                     start_time = time.time()
 
-                    results, err = await self._run_task(ssh_client, executor_info, remote_file_path)
+                    results, err = await self._run_task(
+                        ssh_client, executor_info, remote_file_path, miner_info.miner_hotkey
+                    )
                     if not results:
                         logger.warning(
                             _m(
@@ -274,6 +276,7 @@ class TaskService:
         ssh_client: asyncssh.SSHClientConnection,
         executor_info: ExecutorSSHInfo,
         remote_file_path: str,
+        miner_hotkey: str,
     ) -> tuple[list[str] | None, str | None]:
         try:
             executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
@@ -282,6 +285,7 @@ class TaskService:
                 "executor_ip_address": executor_info.address,
                 "executor_port": executor_info.port,
                 "remote_file_path": remote_file_path,
+                "miner_hotkey": miner_hotkey,
             }
             context.set(f"[_run_task][{executor_name}]")
             logger.info(
@@ -297,10 +301,16 @@ class TaskService:
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
             logger.info(
-                _m("Run task results", extra=get_extra_info({**default_extra, "results": results})),
+                _m(
+                    "Run training task results",
+                    extra=get_extra_info({**default_extra, "results": results}),
+                ),
             )
             logger.warning(
-                _m("Run task errors", extra=get_extra_info({**default_extra, "errors": errors})),
+                _m(
+                    "Run training task errors",
+                    extra=get_extra_info({**default_extra, "errors": errors}),
+                ),
             )
 
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
