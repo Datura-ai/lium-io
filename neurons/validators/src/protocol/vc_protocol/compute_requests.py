@@ -14,3 +14,14 @@ class Response(BaseModel, extra="forbid"):
 
     status: Literal["error", "success"]
     errors: list[Error] = []
+
+
+class RentedMachine(BaseModel):
+    miner_hotkey: str
+    executor_id: str
+    executor_ip_address: str
+    executor_ip_port: str
+
+
+class RentedMachineResponse(BaseModel):
+    machines: list[RentedMachine]

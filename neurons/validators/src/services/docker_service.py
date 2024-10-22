@@ -14,10 +14,11 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopRequest,
 )
+from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
-from services.redis_service import RedisService, RENTED_MACHINE_SET
+from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +164,14 @@ class DockerService:
                 ),
             )
 
-            await self.redis_service.sadd(RENTED_MACHINE_SET, f"{payload.miner_hotkey}:{payload.executor_id}")
+            await self.redis_service.add_rented_machine(
+                RentedMachine(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    executor_ip_address=executor_info.address,
+                    executor_ip_port=str(executor_info.port),
+                )
+            )
 
             return ContainerCreatedResult(
                 container_name=container_name,
@@ -307,4 +315,11 @@ class DockerService:
                 ),
             )
 
-            await self.redis_service.srem(RENTED_MACHINE_SET, f"{payload.miner_hotkey}:{payload.executor_id}")
+            await self.redis_service.remove_rented_machine(
+                RentedMachine(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    executor_ip_address=executor_info.address,
+                    executor_ip_port=str(executor_info.port,)
+                )
+            )

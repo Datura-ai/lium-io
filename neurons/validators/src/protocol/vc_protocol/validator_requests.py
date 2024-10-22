@@ -11,6 +11,7 @@ class RequestType(enum.Enum):
     AuthenticateRequest = "AuthenticateRequest"
     MachineSpecRequest = "MachineSpecRequest"
     ExecutorSpecRequest = "ExecutorSpecRequest"
+    RentedMachineRequest = "RentedMachineRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -51,3 +52,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     executor_ip: str
     executor_port: int
     specs: dict
+
+
+class RentedMachineRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.RentedMachineRequest

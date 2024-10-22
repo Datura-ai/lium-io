@@ -14,15 +14,15 @@ from payload_models.payloads import (
     ContainerDeleteRequest,
     FailedContainerRequest,
 )
-from protocol.vc_protocol.compute_requests import Error, Response
-from protocol.vc_protocol.validator_requests import AuthenticateRequest, ExecutorSpecRequest
+from protocol.vc_protocol.compute_requests import Error, Response, RentedMachineResponse
+from protocol.vc_protocol.validator_requests import AuthenticateRequest, ExecutorSpecRequest, RentedMachineRequest
 from pydantic import BaseModel
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
-from services.redis_service import MACHINE_SPEC_CHANNEL_NAME
+from services.redis_service import MACHINE_SPEC_CHANNEL_NAME, RENTED_MACHINE_SET
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,8 @@ class ComputeClient:
         except Exception as exc:
             msg = f"[Connector][Error] redis connection msg: {exc}"
             logger.error(msg)
+
+        asyncio.create_task(self.poll_rented_machines())
 
         try:
             while True:
@@ -286,6 +288,20 @@ class ComputeClient:
         # Longer discussion: https://github.com/python-websockets/websockets/issues/865
         await asyncio.sleep(0)
 
+    async def poll_rented_machines(self):
+        while True:
+            if self.ws is not None:
+                logger.info(
+                    _m(
+                        "Request rented machines",
+                        extra={**self.logging_extra},
+                    )
+                )
+                await self.send_model(RentedMachineRequest())
+                await asyncio.sleep(10 * 60)
+            else:
+                await asyncio.sleep(10)
+
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
         try:
@@ -305,6 +321,31 @@ class ComputeClient:
                         extra={**self.logging_extra, "response": str(response)},
                     )
                 )
+            return
+
+        try:
+            response = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
+        except pydantic.ValidationError as exc:
+            logger.error(
+                _m(
+                    "could not parse raw message as RentedMachineResponse",
+                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                )
+            )
+        else:
+            logger.info(
+                _m(
+                    "Rented machines",
+                    extra={**self.logging_extra, "machines": raw_msg},
+                )
+            )
+
+            redis_service = self.miner_service.redis_service
+            await redis_service.clear_set(RENTED_MACHINE_SET)
+
+            for machine in response.machines:
+                await redis_service.add_rented_machine(machine)
+
             return
 
         try:

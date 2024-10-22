@@ -31,7 +31,8 @@ from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
-from services.redis_service import RedisService, MACHINE_SPEC_CHANNEL_NAME, RENTED_MACHINE_SET
+from services.redis_service import RedisService, MACHINE_SPEC_CHANNEL_NAME
+from protocol.vc_protocol.compute_requests import RentedMachine
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +315,14 @@ class MinerService:
                         )
                     )
 
-                    await self.redis_service.srem(RENTED_MACHINE_SET, f"{payload.miner_hotkey}:{payload.executor_id}")
+                    await self.redis_service.remove_rented_machine(
+                        RentedMachine(
+                            miner_hotkey=payload.miner_hotkey,
+                            executor_id=payload.executor_id,
+                            executor_ip_address=executor.address,
+                            executor_ip_port=str(executor.port,)
+                        )
+                    )
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
