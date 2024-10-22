@@ -77,7 +77,7 @@ def configure_logs_of_other_modules():
         format=f"Validator: {validator_hotkey} | Name: %(name)s | Time: %(asctime)s | Level: %(levelname)s | File: %(filename)s | Function: %(funcName)s | Line: %(lineno)s | Process: %(process)d | Message: %(message)s",
     )
 
-    sqlalchemy_logger = logging.getLogger("sqlalchemy.engine.Engine")
+    sqlalchemy_logger = logging.getLogger("sqlalchemy")
     sqlalchemy_logger.setLevel(logging.WARNING)
 
     class ContextFilter(logging.Filter):
