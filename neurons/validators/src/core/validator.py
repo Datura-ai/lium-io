@@ -17,7 +17,6 @@ from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.redis_service import RedisService
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SYNC_CYCLE = 12

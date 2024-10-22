@@ -1,22 +1,17 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
 
 from core.config import settings
-from core.utils import wait_for_services_sync
+from core.utils import configure_logs_of_other_modules, wait_for_services_sync
 from core.validator import Validator
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-
-
+configure_logs_of_other_modules()
 wait_for_services_sync()
 
 
-@asynccontextmanager
 async def app_lifespan(app: FastAPI):
     validator = Validator()
     # Run the miner in the background

@@ -8,11 +8,12 @@ import click
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
 
+from core.utils import configure_logs_of_other_modules
 from core.validator import Validator
 from services.ioc import ioc
 from services.miner_service import MinerService
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+configure_logs_of_other_modules()
 logger = logging.getLogger(__name__)
 
 
