@@ -14,18 +14,17 @@ from payload_models.payloads import (
     ContainerDeleteRequest,
     FailedContainerRequest,
 )
-from protocol.vc_protocol.compute_requests import Error, Response
-from protocol.vc_protocol.validator_requests import AuthenticateRequest, ExecutorSpecRequest
+from protocol.vc_protocol.compute_requests import Error, Response, RentedMachineResponse
+from protocol.vc_protocol.validator_requests import AuthenticateRequest, ExecutorSpecRequest, RentedMachineRequest
 from pydantic import BaseModel
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
+from services.redis_service import MACHINE_SPEC_CHANNEL_NAME, RENTED_MACHINE_SET
 
 logger = logging.getLogger(__name__)
-
-MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 
 
 class AuthenticationError(Exception):
@@ -43,7 +42,6 @@ class ComputeClient:
         self.keypair = keypair
         self.ws: websockets.WebSocketClientProtocol | None = None
         self.compute_app_uri = compute_app_uri
-        self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
@@ -52,6 +50,7 @@ class ComputeClient:
 
         self.logging_extra = get_extra_info(
             {
+                "validator_hotkey": self.my_hotkey(),
                 "compute_app_uri": compute_app_uri,
             }
         )
@@ -95,12 +94,22 @@ class ComputeClient:
 
     async def run_forever(self) -> NoReturn:
         """connect (and re-connect) to facilitator and keep reading messages ... forever"""
-        # subscribe to channel to get machine specs
-        pubsub = self.redis.pubsub()
-        await pubsub.subscribe(MACHINE_SPEC_CHANNEL_NAME)
+        try:
+            # subscribe to channel to get machine specs
+            pubsub = await self.miner_service.redis_service.subscribe(MACHINE_SPEC_CHANNEL_NAME)
 
-        # send machine specs to facilitator
-        self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
+            # send machine specs to facilitator
+            self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "redis connection error",
+                    extra={**self.logging_extra,  "error": str(exc)}
+                )
+            )
+
+        asyncio.create_task(self.poll_rented_machines())
+
         try:
             while True:
                 async for ws in self.connect():
@@ -168,15 +177,12 @@ class ComputeClient:
     async def wait_for_specs(self, channel: aioredis.client.PubSub):
         specs_queue = []
         while True:
-            validator_hotkey = settings.get_bittensor_wallet().hotkey.ss58_address
-            default_extra = {
-                **self.logging_extra,
-                "validator_hotkey": validator_hotkey,
-            }
+            validator_hotkey = self.my_hotkey()
+
             logger.info(
                 _m(
                     f"Waiting for machine specs from validator app: {validator_hotkey}",
-                    extra=default_extra,
+                    extra=self.logging_extra,
                 )
             )
             try:
@@ -184,7 +190,7 @@ class ComputeClient:
                 logger.info(
                     _m(
                         "Received machine specs from validator app.",
-                        extra={**default_extra, "msg": str(msg)},
+                        extra={**self.logging_extra, "msg": str(msg)},
                     )
                 )
 
@@ -192,7 +198,7 @@ class ComputeClient:
                     logger.warning(
                         _m(
                             "No message received from validator app.",
-                            extra=default_extra,
+                            extra=self.logging_extra,
                         )
                     )
                     continue
@@ -219,14 +225,14 @@ class ComputeClient:
                     logger.error(
                         _m(
                             msg,
-                            extra={**default_extra, **executor_logging_extra, "error": str(exc)},
+                            extra={**self.logging_extra, **executor_logging_extra, "error": str(exc)},
                         )
                     )
                     continue
 
                 logger.info(
                     "Sending machine specs update of executor to compute app",
-                    extra={**default_extra, **executor_logging_extra, "specs": str(specs)},
+                    extra={**self.logging_extra, **executor_logging_extra, "specs": str(specs)},
                 )
 
                 specs_queue.append(specs)
@@ -242,7 +248,7 @@ class ComputeClient:
                                 _m(
                                     msg,
                                     extra={
-                                        **default_extra,
+                                        **self.logging_extra,
                                         **executor_logging_extra,
                                         "error": str(exc),
                                     },
@@ -253,7 +259,7 @@ class ComputeClient:
                 logger.error(
                     _m(
                         "wait_for_specs still running",
-                        extra=default_extra,
+                        extra=self.logging_extra,
                     )
                 )
 
@@ -284,6 +290,20 @@ class ComputeClient:
         # Longer discussion: https://github.com/python-websockets/websockets/issues/865
         await asyncio.sleep(0)
 
+    async def poll_rented_machines(self):
+        while True:
+            if self.ws is not None:
+                logger.info(
+                    _m(
+                        "Request rented machines",
+                        extra=self.logging_extra,
+                    )
+                )
+                await self.send_model(RentedMachineRequest())
+                await asyncio.sleep(10 * 60)
+            else:
+                await asyncio.sleep(10)
+
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
         try:
@@ -303,6 +323,31 @@ class ComputeClient:
                         extra={**self.logging_extra, "response": str(response)},
                     )
                 )
+            return
+
+        try:
+            response = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
+        except pydantic.ValidationError as exc:
+            logger.error(
+                _m(
+                    "could not parse raw message as RentedMachineResponse",
+                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                )
+            )
+        else:
+            logger.info(
+                _m(
+                    "Rented machines",
+                    extra={**self.logging_extra, "machines": raw_msg},
+                )
+            )
+
+            redis_service = self.miner_service.redis_service
+            await redis_service.clear_set(RENTED_MACHINE_SET)
+
+            for machine in response.machines:
+                await redis_service.add_rented_machine(machine)
+
             return
 
         try:

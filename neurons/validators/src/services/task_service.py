@@ -13,10 +13,6 @@ from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
 from core.utils import _m, context, get_extra_info
-from daos.executor import ExecutorDao
-from daos.task import TaskDao
-from models.executor import Executor
-from models.task import Task, TaskStatus
 from services.const import (
     DOWNLOAD_SPEED_WEIGHT,
     GPU_MAX_SCORES,
@@ -27,6 +23,7 @@ from services.const import (
     UPLOAD_SPEED_WEIGHT,
 )
 from services.ssh_service import SSHService
+from services.redis_service import RedisService, RENTED_MACHINE_SET
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +33,11 @@ JOB_LENGTH = 300
 class TaskService:
     def __init__(
         self,
-        task_dao: Annotated[TaskDao, Depends(TaskDao)],
-        executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)],
         ssh_service: Annotated[SSHService, Depends(SSHService)],
+        redis_service: Annotated[RedisService, Depends(RedisService)],
     ):
-        self.task_dao = task_dao
-        self.executor_dao = executor_dao
         self.ssh_service = ssh_service
+        self.redis_service = redis_service
 
     async def create_task(
         self,
@@ -61,17 +56,6 @@ class TaskService:
         }
         try:
             logger.info(_m("Update or create an executor", extra=get_extra_info(default_extra)))
-            await self.executor_dao.upsert(
-                Executor(
-                    miner_address=miner_info.miner_address,
-                    miner_port=miner_info.miner_port,
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_id=executor_info.uuid,
-                    executor_ip_address=executor_info.address,
-                    executor_ssh_username=executor_info.ssh_username,
-                    executor_ssh_port=executor_info.ssh_port,
-                )
-            )
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
@@ -98,6 +82,7 @@ class TaskService:
                 )
 
                 await ssh_client.run(f"mkdir -p {executor_info.root_dir}/temp")
+
                 async with ssh_client.start_sftp_client() as sftp_client:
                     # get machine specs
                     timestamp = int(time.time())
@@ -150,7 +135,7 @@ class TaskService:
                                 extra=get_extra_info(default_extra),
                             ),
                         )
-                        return machine_spec, executor_info
+                        return machine_spec, executor_info, 0
 
                     logger.info(
                         _m(
@@ -159,10 +144,12 @@ class TaskService:
                         ),
                     )
 
-                    executor = await self.executor_dao.get_executor(
-                        executor_id=executor_info.uuid, miner_hotkey=miner_info.miner_hotkey
+                    is_rented = await self.redis_service.is_elem_exists_in_set(
+                        RENTED_MACHINE_SET,
+                        f"{miner_info.miner_hotkey}:{executor_info.uuid}"
                     )
-                    if executor.rented:
+
+                    if is_rented:
                         score = max_score * gpu_count
                         logger.info(
                             _m(
@@ -170,38 +157,11 @@ class TaskService:
                                 extra=get_extra_info({**default_extra, "score": score}),
                             ),
                         )
-                        await self.task_dao.save(
-                            Task(
-                                task_status=TaskStatus.Finished,
-                                miner_hotkey=miner_info.miner_hotkey,
-                                executor_id=executor_info.uuid,
-                                proceed_time=0,
-                                score=score,
-                            )
-                        )
-                        logger.info(
-                            _m(
-                                "Task saved with status Finished for executor",
-                                extra=get_extra_info(default_extra),
-                            ),
-                        )
-                        return machine_spec, executor_info
+
+                        return machine_spec, executor_info, score
 
                     logger.info(
                         _m("Creating task for executor", extra=get_extra_info(default_extra)),
-                    )
-                    task = await self.task_dao.save(
-                        Task(
-                            task_status=TaskStatus.SSHConnected,
-                            miner_hotkey=miner_info.miner_hotkey,
-                            executor_id=executor_info.uuid,
-                        )
-                    )
-                    logger.info(
-                        _m(
-                            "Task saved with status SSHConnected for executor",
-                            extra=get_extra_info(default_extra),
-                        ),
                     )
 
                     timestamp = int(time.time())
@@ -228,9 +188,12 @@ class TaskService:
                                 extra=get_extra_info(default_extra),
                             ),
                         )
-                        return None
+                        return machine_spec, executor_info, 0
 
                     end_time = time.time()
+
+                    score = 0
+
                     logger.info(
                         _m(
                             f"Results from training job task: {results}",
@@ -242,19 +205,6 @@ class TaskService:
                         logger.error(
                             _m(
                                 f"Error executing task on executor: {err}",
-                                extra=get_extra_info(default_extra),
-                            ),
-                        )
-
-                        # mark task is failed
-                        await self.task_dao.update(
-                            uuid=task.uuid,
-                            task_status=TaskStatus.Failed,
-                            score=0,
-                        )
-                        logger.debug(
-                            _m(
-                                "Task marked as failed for executor",
                                 extra=get_extra_info(default_extra),
                             ),
                         )
@@ -276,6 +226,10 @@ class TaskService:
 
                         upload_speed = machine_spec.get("network", {}).get("upload_speed", 0)
                         download_speed = machine_spec.get("network", {}).get("download_speed", 0)
+                        
+                        # Ensure upload_speed and download_speed are not None
+                        upload_speed = upload_speed if upload_speed is not None else 0
+                        download_speed = download_speed if download_speed is not None else 0
 
                         job_taken_score = (
                             min(MIN_JOB_TAKEN_TIME / job_taken_time, 1) if job_taken_time > 0 else 0
@@ -303,14 +257,6 @@ class TaskService:
                                 ),
                             ),
                         )
-
-                        # update task with results
-                        await self.task_dao.update(
-                            uuid=task.uuid,
-                            task_status=TaskStatus.Finished,
-                            proceed_time=job_taken_time,
-                            score=score,
-                        )
                     logger.info(
                         _m(
                             "SSH connection closed for executor",
@@ -318,7 +264,7 @@ class TaskService:
                         ),
                     )
 
-                    return machine_spec, executor_info
+                    return machine_spec, executor_info, score
         except Exception as e:
             logger.error(
                 _m(

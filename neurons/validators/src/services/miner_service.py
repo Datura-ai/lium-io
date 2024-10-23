@@ -1,10 +1,8 @@
 import asyncio
-import json
 import logging
 from typing import Annotated
 
 import bittensor
-import redis.asyncio as aioredis
 from clients.miner_client import MinerClient
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
@@ -30,10 +28,11 @@ from payload_models.payloads import (
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from daos.executor import ExecutorDao
 from services.docker_service import DockerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.redis_service import RedisService, MACHINE_SPEC_CHANNEL_NAME
+from protocol.vc_protocol.compute_requests import RentedMachine
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +46,12 @@ class MinerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
         docker_service: Annotated[DockerService, Depends(DockerService)],
-        executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)],
+        redis_service: Annotated[RedisService, Depends(RedisService)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.docker_service = docker_service
-        self.executor_dao = executor_dao
-        self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
+        self.redis_service = redis_service
 
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
         loop = asyncio.get_event_loop()
@@ -147,6 +145,22 @@ class MinerService:
                     logger.info(
                         _m("Requesting job success for miner", extra=get_extra_info(default_extra))
                     )
+
+                    total_score = 0
+                    for _, _, score in results:
+                        total_score += score
+
+                    logger.info(
+                        _m(
+                            f"total score: {total_score}",
+                            extra=get_extra_info(default_extra),
+                        )
+                    )
+
+                    return {
+                        "miner_hotkey": payload.miner_hotkey,
+                        "score": total_score,
+                    }
                 elif isinstance(msg, FailedRequest):
                     logger.warning(
                         _m(
@@ -154,7 +168,7 @@ class MinerService:
                             extra=get_extra_info({**default_extra, "msg": str(msg)}),
                         ),
                     )
-                    return
+                    return None
                 elif isinstance(msg, DeclineJobRequest):
                     logger.warning(
                         _m(
@@ -162,7 +176,7 @@ class MinerService:
                             extra=get_extra_info({**default_extra, "msg": str(msg)}),
                         ),
                     )
-                    return
+                    return None
                 else:
                     logger.error(
                         _m(
@@ -170,12 +184,12 @@ class MinerService:
                             extra=get_extra_info({**default_extra, "msg": str(msg)}),
                         ),
                     )
-                    return
+                    return None
         except asyncio.CancelledError:
             logger.error(
                 _m("Requesting job to miner was cancelled", extra=get_extra_info(default_extra)),
             )
-            return
+            return None
         except Exception:
             logger.error(
                 _m(
@@ -183,7 +197,7 @@ class MinerService:
                     extra=get_extra_info(default_extra),
                 ),
             )
-            return
+            return None
 
     async def publish_machine_specs(
         self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str
@@ -199,19 +213,17 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "results": len(results)}),
             ),
         )
-        for specs, ssh_info in results:
+        for specs, ssh_info, _ in results:
             try:
-                await self.redis.publish(
-                    "channel:1",
-                    json.dumps(
-                        {
-                            "specs": specs,
-                            "miner_hotkey": miner_hotkey,
-                            "executor_uuid": ssh_info.uuid,
-                            "executor_ip": ssh_info.address,
-                            "executor_port": ssh_info.port,
-                        }
-                    ),
+                await self.redis_service.publish(
+                    MACHINE_SPEC_CHANNEL_NAME,
+                    {
+                        "specs": specs,
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": ssh_info.uuid,
+                        "executor_ip": ssh_info.address,
+                        "executor_port": ssh_info.port,
+                    },
                 )
             except Exception:
                 logger.error(
@@ -303,7 +315,14 @@ class MinerService:
                         )
                     )
 
-                    await self.executor_dao.unrent(payload.executor_id, payload.miner_hotkey)
+                    await self.redis_service.remove_rented_machine(
+                        RentedMachine(
+                            miner_hotkey=payload.miner_hotkey,
+                            executor_id=payload.executor_id,
+                            executor_ip_address=executor.address,
+                            executor_ip_port=str(executor.port,)
+                        )
+                    )
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -377,8 +396,7 @@ class MinerService:
                             container_name=payload.container_name,
                         )
                     elif isinstance(payload, ContainerStopRequest):
-                        await asyncio.to_thread(
-                            self.docker_service.stop_container,
+                        await self.docker_service.stop_container(
                             payload,
                             executor,
                             my_key,
