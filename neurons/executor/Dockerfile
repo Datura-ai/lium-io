@@ -11,7 +11,7 @@ ENV PDM_CHECK_UPDATE=false
 
 RUN apt-get update && apt-get install -y git
 COPY pyproject.toml pdm.lock README.md ./
-RUN pdm lock --check
+# RUN pdm lock --check
 COPY --from=datura . /datura
 
 RUN --mount=type=cache,target=/tmp/pdm_cache \

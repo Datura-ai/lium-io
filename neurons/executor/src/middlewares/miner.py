@@ -38,11 +38,12 @@ class MinerMiddleware(BaseHTTPMiddleware):
                         },
                     )
                 )
-                return JSONResponse(status_code=401)
+                return JSONResponse(status_code=401, content="Unauthorized")
 
             response = await call_next(request)
             return response
         except ValidationError as e:
             # Handle validation error if needed
-            logger.error(_m("Validation Error", extra={"errors": str(e.errors())}))
-            return JSONResponse(status_code=422)
+            error_message = str(_m("Validation Error", extra={"errors": str(e.errors())}))
+            logger.error(error_message)
+            return JSONResponse(status_code=422, content=error_message)
