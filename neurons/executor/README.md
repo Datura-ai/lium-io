@@ -25,7 +25,12 @@ sed -i 's/sudo //g' scripts/install_executor_on_ubuntu.sh
 ```
 to remove sudo from the setup script commands
 
-### Step 3: Install and Run
+### Step 3: Configure Docker for Nvidia
+
+Please follow [this](https://stackoverflow.com/questions/72932940/failed-to-initialize-nvml-unknown-error-in-docker-after-few-hours) to setup docker for nvidia properly 
+
+
+### Step 4: Install and Run
 
 * Go to executor root
 ```shell
