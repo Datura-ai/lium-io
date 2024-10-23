@@ -10,8 +10,6 @@ services:
     env_file: ./.env
     volumes:
       - db_data:/var/lib/postgresql/data
-    ports:
-      - ${POSTGRES_PORT}:5432
 
   redis:
     image: redis:6-alpine
@@ -20,8 +18,6 @@ services:
       test: redis-cli ping
     volumes:
       - redis_data:/data
-    ports:
-      - ${REDIS_PORT}:6379
 
   validator:
     image: daturaai/compute-subnet-validator:latest

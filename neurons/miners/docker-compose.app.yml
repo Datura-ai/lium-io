@@ -12,8 +12,6 @@ services:
     env_file: ./.env
     volumes:
       - db_data:/var/lib/postgresql/data
-    ports:
-      - ${POSTGRES_PORT}:5432
   
   miner:
     image: daturaai/compute-subnet-miner:latest
