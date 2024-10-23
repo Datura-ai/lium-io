@@ -50,6 +50,7 @@ class ComputeClient:
 
         self.logging_extra = get_extra_info(
             {
+                "validator_hotkey": self.my_hotkey(),
                 "compute_app_uri": compute_app_uri,
             }
         )
@@ -100,8 +101,12 @@ class ComputeClient:
             # send machine specs to facilitator
             self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
         except Exception as exc:
-            msg = f"[Connector][Error] redis connection msg: {exc}"
-            logger.error(msg)
+            logger.error(
+                _m(
+                    "redis connection error",
+                    extra={**self.logging_extra,  "error": str(exc)}
+                )
+            )
 
         asyncio.create_task(self.poll_rented_machines())
 
@@ -172,15 +177,12 @@ class ComputeClient:
     async def wait_for_specs(self, channel: aioredis.client.PubSub):
         specs_queue = []
         while True:
-            validator_hotkey = settings.get_bittensor_wallet().hotkey.ss58_address
-            default_extra = {
-                **self.logging_extra,
-                "validator_hotkey": validator_hotkey,
-            }
+            validator_hotkey = self.my_hotkey()
+
             logger.info(
                 _m(
                     f"Waiting for machine specs from validator app: {validator_hotkey}",
-                    extra=default_extra,
+                    extra=self.logging_extra,
                 )
             )
             try:
@@ -188,7 +190,7 @@ class ComputeClient:
                 logger.info(
                     _m(
                         "Received machine specs from validator app.",
-                        extra={**default_extra, "msg": str(msg)},
+                        extra={**self.logging_extra, "msg": str(msg)},
                     )
                 )
 
@@ -196,7 +198,7 @@ class ComputeClient:
                     logger.warning(
                         _m(
                             "No message received from validator app.",
-                            extra=default_extra,
+                            extra=self.logging_extra,
                         )
                     )
                     continue
@@ -223,14 +225,14 @@ class ComputeClient:
                     logger.error(
                         _m(
                             msg,
-                            extra={**default_extra, **executor_logging_extra, "error": str(exc)},
+                            extra={**self.logging_extra, **executor_logging_extra, "error": str(exc)},
                         )
                     )
                     continue
 
                 logger.info(
                     "Sending machine specs update of executor to compute app",
-                    extra={**default_extra, **executor_logging_extra, "specs": str(specs)},
+                    extra={**self.logging_extra, **executor_logging_extra, "specs": str(specs)},
                 )
 
                 specs_queue.append(specs)
@@ -246,7 +248,7 @@ class ComputeClient:
                                 _m(
                                     msg,
                                     extra={
-                                        **default_extra,
+                                        **self.logging_extra,
                                         **executor_logging_extra,
                                         "error": str(exc),
                                     },
@@ -257,7 +259,7 @@ class ComputeClient:
                 logger.error(
                     _m(
                         "wait_for_specs still running",
-                        extra=default_extra,
+                        extra=self.logging_extra,
                     )
                 )
 
@@ -294,7 +296,7 @@ class ComputeClient:
                 logger.info(
                     _m(
                         "Request rented machines",
-                        extra={**self.logging_extra},
+                        extra=self.logging_extra,
                     )
                 )
                 await self.send_model(RentedMachineRequest())
