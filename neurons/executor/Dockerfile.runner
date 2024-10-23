@@ -1,10 +1,11 @@
 FROM docker:26-cli
 WORKDIR /root/executor
 
-LABEL version="2.0.5"
-
 COPY docker-compose.app.yml docker-compose.yml
 COPY entrypoint.sh /entrypoint.sh
 
 RUN chmod u+x /entrypoint.sh
+
+LABEL version="3.0.0"
+
 ENTRYPOINT ["/entrypoint.sh"]
