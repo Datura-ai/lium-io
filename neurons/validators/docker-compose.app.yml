@@ -22,8 +22,6 @@ services:
       test: redis-cli ping
     volumes:
       - redis_data:/data
-    ports:
-      - ${REDIS_PORT}:6379
 
   validator:
     image: daturaai/compute-subnet-validator:latest
