@@ -7,3 +7,4 @@ docker_build.sh
 docker_publish.sh
 docker-compose.yml
 .env*
+logs

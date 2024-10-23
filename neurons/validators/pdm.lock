@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:8ba9635794c83e851adaa1c00d320ad1c55c7218c69811a913c004a0158d623a"
+content_hash = "sha256:24c738a95556211398381fc637548b13d3fb20f9ab2233fa1cbe2dbc5330585a"
 
 [[metadata.targets]]
 requires_python = "==3.11.*"
@@ -1437,6 +1437,17 @@ groups = ["default"]
 files = [
     {file = "python-dotenv-1.0.1.tar.gz", hash = "sha256:e324ee90a023d808f1959c46bcbc04446a10ced277783dc6ee09987c37ec10ca"},
     {file = "python_dotenv-1.0.1-py3-none-any.whl", hash = "sha256:f7b63ef50f1b690dddf550d03497b66d609393b40b564ed0d674909a68ebf16a"},
+]
+
+[[package]]
+name = "python-json-logger"
+version = "2.0.7"
+requires_python = ">=3.6"
+summary = "A python library adding a json log formatter"
+groups = ["default"]
+files = [
+    {file = "python-json-logger-2.0.7.tar.gz", hash = "sha256:23e7ec02d34237c5aa1e29a070193a4ea87583bb4e7f8fd06d3de8264c4b2e1c"},
+    {file = "python_json_logger-2.0.7-py3-none-any.whl", hash = "sha256:f380b826a991ebbe3de4d897aeec42760035ac760345e57b812938dc8b35e2bd"},
 ]
 
 [[package]]
