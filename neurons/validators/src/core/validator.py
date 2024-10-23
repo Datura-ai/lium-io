@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import traceback
+import json
 
 import bittensor
 import numpy as np
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
+MINER_SCORES_KEY = "miner_scores"
 
 
 class Validator:
@@ -37,34 +39,48 @@ class Validator:
         self.is_running = False
         self.last_job_run_blocks = 0
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.initiate_services())
-
         subtensor = self.get_subtensor()
 
         # check registered
         self.check_registered(subtensor)
 
-        # init miner_scores
-        self.miner_scores = {}
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.initiate_services(subtensor))
 
-    async def initiate_services(self):
+    async def initiate_services(self, subtensor: bittensor.subtensor):
         ssh_service = SSHService()
-        redis_service = RedisService()
+        self.redis_service = RedisService()
         task_service = TaskService(
             ssh_service=ssh_service,
-            redis_service=redis_service,
+            redis_service=self.redis_service,
         )
         docker_service = DockerService(
             ssh_service=ssh_service,
-            redis_service=redis_service,
+            redis_service=self.redis_service,
         )
         self.miner_service = MinerService(
             ssh_service=ssh_service,
             task_service=task_service,
             docker_service=docker_service,
-            redis_service=redis_service,
+            redis_service=self.redis_service,
         )
+
+        # init miner_scores
+        try:
+            if await self.should_set_weights(subtensor):
+                self.miner_scores = {}
+            else:
+                miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
+                if miner_scores_json is None:
+                    bittensor.logging.info("No data found in Redis for MINER_SCORES_KEY, initializing empty miner_scores.")
+                    self.miner_scores = {}
+                else:
+                    self.miner_scores = json.loads(miner_scores_json)
+        except Exception as e:
+            bittensor.logging.error(f"Failed to initialize miner_scores: {str(e)}")
+            self.miner_scores = {}
+
+        bittensor.logging.info(f"miner scores: {self.miner_scores}", "init", "init")
 
     def get_subtensor(self):
         bittensor.logging.debug("Getting subtensor", "get_subtensor", "get_subtensor")
@@ -125,6 +141,10 @@ class Validator:
 
     async def set_weights(self, miners, subtensor: bittensor.subtensor):
         bittensor.logging.info(f"[set_weights] scores: {self.miner_scores}")
+
+        if not self.miner_scores:
+            bittensor.logging.info("No miner scores available, skipping set_weights.")
+            return
 
         for miner_hotkey in self.miner_scores.keys():
             bittensor.logging.info(
@@ -281,6 +301,8 @@ class Validator:
                             else:
                                 self.miner_scores[miner_hotkey] = job_score
 
+                    bittensor.logging.info(f"miner scores: {self.miner_scores}", "sync", "sync")
+
                     for index, result in enumerate(results):
                         miner = miners[index]
                         if isinstance(result, Exception):
@@ -345,4 +367,10 @@ class Validator:
 
     async def stop(self):
         bittensor.logging.info("Stop Validator process")
+
+        try:
+            await self.redis_service.set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
+        except Exception as e:
+            bittensor.logging.error(f"Failed to save miner_scores: {str(e)}")
+
         self.should_exit = True

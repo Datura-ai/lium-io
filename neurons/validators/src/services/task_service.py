@@ -226,6 +226,10 @@ class TaskService:
 
                         upload_speed = machine_spec.get("network", {}).get("upload_speed", 0)
                         download_speed = machine_spec.get("network", {}).get("download_speed", 0)
+                        
+                        # Ensure upload_speed and download_speed are not None
+                        upload_speed = upload_speed if upload_speed is not None else 0
+                        download_speed = download_speed if download_speed is not None else 0
 
                         job_taken_score = (
                             min(MIN_JOB_TAKEN_TIME / job_taken_time, 1) if job_taken_time > 0 else 0
