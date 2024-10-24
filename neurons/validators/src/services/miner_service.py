@@ -25,14 +25,14 @@ from payload_models.payloads import (
     FailedContainerRequest,
     MinerJobRequestPayload,
 )
+from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
+from services.redis_service import MACHINE_SPEC_CHANNEL_NAME, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
-from services.redis_service import RedisService, MACHINE_SPEC_CHANNEL_NAME
-from protocol.vc_protocol.compute_requests import RentedMachine
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +320,9 @@ class MinerService:
                             miner_hotkey=payload.miner_hotkey,
                             executor_id=payload.executor_id,
                             executor_ip_address=executor.address,
-                            executor_ip_port=str(executor.port,)
+                            executor_ip_port=str(
+                                executor.port,
+                            ),
                         )
                     )
 
@@ -335,7 +337,7 @@ class MinerService:
                         logger.info(
                             _m(
                                 "Creating container",
-                                extra=get_extra_info({**default_extra, "payload": payload}),
+                                extra=get_extra_info({**default_extra, "payload": str(payload)}),
                             ),
                         )
                         result = await self.docker_service.create_container(
@@ -348,7 +350,7 @@ class MinerService:
                         logger.info(
                             _m(
                                 "Created Container",
-                                extra=get_extra_info({**default_extra, "result": result}),
+                                extra=get_extra_info({**default_extra, "result": str(result)}),
                             ),
                         )
                         await miner_client.send_model(
@@ -368,7 +370,7 @@ class MinerService:
                         logger.info(
                             _m(
                                 "Starting container",
-                                extra=get_extra_info({**default_extra, "payload": payload}),
+                                extra=get_extra_info({**default_extra, "payload": str(payload)}),
                             ),
                         )
                         await self.docker_service.start_container(
@@ -381,7 +383,7 @@ class MinerService:
                         logger.info(
                             _m(
                                 "Started Container",
-                                extra=get_extra_info({**default_extra, "payload": payload}),
+                                extra=get_extra_info({**default_extra, "payload": str(payload)}),
                             ),
                         )
                         await miner_client.send_model(
@@ -417,7 +419,7 @@ class MinerService:
                         logger.info(
                             _m(
                                 "Deleting container",
-                                extra=get_extra_info({**default_extra, "payload": payload}),
+                                extra=get_extra_info({**default_extra, "payload": str(payload)}),
                             ),
                         )
                         await self.docker_service.delete_container(
@@ -430,7 +432,7 @@ class MinerService:
                         logger.info(
                             _m(
                                 "Deleted Container",
-                                extra=get_extra_info({**default_extra, "payload": payload}),
+                                extra=get_extra_info({**default_extra, "payload": str(payload)}),
                             ),
                         )
                         await miner_client.send_model(
@@ -449,7 +451,7 @@ class MinerService:
                         logger.error(
                             _m(
                                 "Unexpected request",
-                                extra=get_extra_info({**default_extra, "payload": payload}),
+                                extra=get_extra_info({**default_extra, "payload": str(payload)}),
                             ),
                         )
                         return FailedContainerRequest(
