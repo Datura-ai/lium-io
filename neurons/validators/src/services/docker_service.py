@@ -17,8 +17,8 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info
-from services.ssh_service import SSHService
 from services.redis_service import RedisService
+from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class DockerService:
         logger.info(
             _m(
                 "Create Docker Container",
-                extra=get_extra_info({**default_extra, "payload": payload}),
+                extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
 
@@ -320,6 +320,8 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     executor_ip_address=executor_info.address,
-                    executor_ip_port=str(executor_info.port,)
+                    executor_ip_port=str(
+                        executor_info.port,
+                    ),
                 )
             )
