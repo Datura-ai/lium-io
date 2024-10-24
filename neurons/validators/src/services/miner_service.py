@@ -319,10 +319,8 @@ class MinerService:
                         RentedMachine(
                             miner_hotkey=payload.miner_hotkey,
                             executor_id=payload.executor_id,
-                            executor_ip_address=executor.address,
-                            executor_ip_port=str(
-                                executor.port,
-                            ),
+                            executor_ip_address=executor.address if executor else "",
+                            executor_ip_port=str(executor.port if executor else ""),
                         )
                     )
 

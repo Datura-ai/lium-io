@@ -14,12 +14,15 @@ from payload_models.payloads import (
     ContainerDeleteRequest,
     FailedContainerRequest,
 )
-from protocol.vc_protocol.compute_requests import Error, Response, RentedMachineResponse
-from protocol.vc_protocol.validator_requests import AuthenticateRequest, ExecutorSpecRequest, RentedMachineRequest
+from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
+from protocol.vc_protocol.validator_requests import (
+    AuthenticateRequest,
+    ExecutorSpecRequest,
+    RentedMachineRequest,
+)
 from pydantic import BaseModel
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
-from core.config import settings
 from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
 from services.redis_service import MACHINE_SPEC_CHANNEL_NAME, RENTED_MACHINE_SET
@@ -102,10 +105,7 @@ class ComputeClient:
             self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
         except Exception as exc:
             logger.error(
-                _m(
-                    "redis connection error",
-                    extra={**self.logging_extra,  "error": str(exc)}
-                )
+                _m("redis connection error", extra={**self.logging_extra, "error": str(exc)})
             )
 
         asyncio.create_task(self.poll_rented_machines())
@@ -225,7 +225,11 @@ class ComputeClient:
                     logger.error(
                         _m(
                             msg,
-                            extra={**self.logging_extra, **executor_logging_extra, "error": str(exc)},
+                            extra={
+                                **self.logging_extra,
+                                **executor_logging_extra,
+                                "error": str(exc),
+                            },
                         )
                     )
                     continue
@@ -410,9 +414,9 @@ class ComputeClient:
             )
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
-            container_created: ContainerCreated = await self.miner_service.handle_container(
-                job_request
-            )
+            container_created: (
+                ContainerCreated | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
                 _m(
