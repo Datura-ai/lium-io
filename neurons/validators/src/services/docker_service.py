@@ -320,8 +320,6 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     executor_ip_address=executor_info.address,
-                    executor_ip_port=str(
-                        executor_info.port,
-                    ),
+                    executor_ip_port=str(executor_info.port),
                 )
             )
