@@ -60,12 +60,6 @@ class TaskService:
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
 
-            logger.info(
-                _m(
-                    "Connecting with SSH INFO(ssh -p {executor_info.ssh_port} {executor_info.ssh_username}:{executor_info.address})",
-                    extra=get_extra_info(default_extra),
-                ),
-            )
 
             async with asyncssh.connect(
                 host=executor_info.address,
@@ -160,9 +154,6 @@ class TaskService:
 
                         return machine_spec, executor_info, score
 
-                    logger.info(
-                        _m("Creating task for executor", extra=get_extra_info(default_extra)),
-                    )
 
                     timestamp = int(time.time())
                     local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
@@ -292,12 +283,6 @@ class TaskService:
                 "miner_hotkey": miner_hotkey,
             }
             context.set(f"[_run_task][{executor_name}]")
-            logger.info(
-                _m(
-                    "Running task for executor",
-                    extra=get_extra_info({**default_extra, "remote_file_path": remote_file_path}),
-                ),
-            )
             result = await ssh_client.run(
                 f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_file_path}",
                 timeout=JOB_LENGTH,

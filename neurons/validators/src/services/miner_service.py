@@ -63,7 +63,6 @@ class MinerService:
         }
 
         try:
-            logger.info(_m("Requesting job to miner", extra=get_extra_info(default_extra)))
             miner_client = MinerClient(
                 loop=loop,
                 miner_address=payload.miner_address,
@@ -78,12 +77,6 @@ class MinerService:
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
-                logger.info(
-                    _m(
-                        "Sending SSHPubKeySubmitRequest to miner",
-                        extra=get_extra_info(default_extra),
-                    )
-                )
                 await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
                 try:
@@ -108,14 +101,6 @@ class MinerService:
                     msg = None
 
                 if isinstance(msg, AcceptSSHKeyRequest):
-                    logger.info(
-                        _m(
-                            "Received AcceptSSHKeyRequest for miner. Running tasks for executors",
-                            extra=get_extra_info(
-                                {**default_extra, "executors": len(msg.executors)}
-                            ),
-                        ),
-                    )
 
                     tasks = [
                         asyncio.create_task(
@@ -142,9 +127,6 @@ class MinerService:
                     )
                     await self.publish_machine_specs(results, miner_client.miner_hotkey)
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
-                    logger.info(
-                        _m("Requesting job success for miner", extra=get_extra_info(default_extra))
-                    )
 
                     total_score = 0
                     for _, _, score in results:
