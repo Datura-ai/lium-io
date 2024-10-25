@@ -131,6 +131,7 @@ dependencies = [
     "yarl==1.9.4",
     "asyncssh>=2.17.0",
     "python-json-logger>=2.0.7",
+    "psutil>=6.1.0",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"
