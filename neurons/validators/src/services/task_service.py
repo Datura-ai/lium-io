@@ -68,12 +68,6 @@ class TaskService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                logger.info(
-                    _m(
-                        "SSH Connection Established. Creating temp directory at {executor_info.root_dir}/temp",
-                        extra=get_extra_info(default_extra),
-                    ),
-                )
 
                 await ssh_client.run(f"mkdir -p {executor_info.root_dir}/temp")
 
@@ -131,13 +125,6 @@ class TaskService:
                         )
                         return machine_spec, executor_info, 0
 
-                    logger.info(
-                        _m(
-                            f"Got GPU specs: {gpu_model} with max score: {max_score}",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
-
                     is_rented = await self.redis_service.is_elem_exists_in_set(
                         RENTED_MACHINE_SET,
                         f"{miner_info.miner_hotkey}:{executor_info.uuid}"
@@ -160,12 +147,7 @@ class TaskService:
                     remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
 
                     await sftp_client.put(local_file_path, remote_file_path)
-                    logger.info(
-                        _m(
-                            f"Uploaded score script to {remote_file_path}",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
+
 
                     start_time = time.time()
 
@@ -248,12 +230,6 @@ class TaskService:
                                 ),
                             ),
                         )
-                    logger.info(
-                        _m(
-                            "SSH connection closed for executor",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
 
                     return machine_spec, executor_info, score
         except Exception as e:
@@ -311,7 +287,6 @@ class TaskService:
             #  remove remote_file
             await ssh_client.run(f"rm {remote_file_path}", timeout=30)
 
-            logger.info(_m("Run task success", extra=get_extra_info(default_extra)))
             return results, None
         except Exception as e:
             logger.error(
@@ -321,13 +296,7 @@ class TaskService:
 
             #  remove remote_file
             try:
-                logger.info(
-                    _m("Removing remote file", extra=get_extra_info(default_extra)),
-                )
                 await asyncio.wait_for(ssh_client.run(f"rm {remote_file_path}"), timeout=10)
-                logger.info(
-                    _m("Removed remote file", extra=get_extra_info(default_extra)),
-                )
             except Exception:
                 logger.error(
                     _m("Failed to remove remote file", extra=get_extra_info(default_extra)),
