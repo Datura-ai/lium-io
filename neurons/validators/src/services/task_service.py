@@ -259,6 +259,12 @@ class TaskService:
                 "miner_hotkey": miner_hotkey,
             }
             context.set(f"[_run_task][{executor_name}]")
+            logger.info(
+                _m(
+                    "Running task for executor",
+                    extra=get_extra_info({**default_extra, "remote_file_path": remote_file_path}),
+                ),
+            )
             result = await ssh_client.run(
                 f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_file_path}",
                 timeout=JOB_LENGTH,

@@ -137,6 +137,10 @@ class MinerClient(abc.ABC):
                     )
                 if self.debounce_counter:
                     sleep_time = self.sleep_time()
+                    logger.info(
+                        f"Retrying connection to miner in {sleep_time:0.2f}",
+                        extra=get_extra_info(self.logging_extra),
+                    )
                     await asyncio.sleep(sleep_time)
                 self.ws = await self._connect()
                 self.read_messages_task = self.loop.create_task(self.read_messages())

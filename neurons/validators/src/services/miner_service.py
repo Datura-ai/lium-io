@@ -63,6 +63,7 @@ class MinerService:
         }
 
         try:
+            logger.info(_m("Requesting job to miner", extra=get_extra_info(default_extra)))
             miner_client = MinerClient(
                 loop=loop,
                 miner_address=payload.miner_address,
@@ -101,7 +102,15 @@ class MinerService:
                     msg = None
 
                 if isinstance(msg, AcceptSSHKeyRequest):
-
+                    logger.info(
+                        _m(
+                            "Received AcceptSSHKeyRequest for miner. Running tasks for executors",
+                            extra=get_extra_info(
+                                {**default_extra, "executors": len(msg.executors)}
+                            ),
+                        ),
+                    )
+                    
                     tasks = [
                         asyncio.create_task(
                             self.task_service.create_task(
