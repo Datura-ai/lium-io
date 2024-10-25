@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+import psutil
 from functools import wraps
 
 
@@ -158,9 +159,16 @@ class c_nvmlMemory_v2_t(_PrintableStructure):
 
 nvmlMemory_v2 = 0x02000028
 
+
+class c_nvmlUtilization_t(_PrintableStructure):
+    _fields_ = [
+        ('gpu', c_uint),
+        ('memory', c_uint),
+    ]
+    _fmt_ = {'<default>': "%d %%"}
+
+
 ## Error Checking ##
-
-
 class NVMLError(Exception):
     _valClassMapping = dict()
     # List of currently known error codes
@@ -476,6 +484,14 @@ def nvmlDeviceGetSupportedMemoryClocks(handle):
         raise NVMLError(ret)
 
 
+def nvmlDeviceGetUtilizationRates(handle):
+    c_util = c_nvmlUtilization_t()
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetUtilizationRates")
+    ret = fn(handle, byref(c_util))
+    _nvmlCheckReturn(ret)
+    return c_util
+
+
 def run_cmd(cmd):
     proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True)
     if proc.returncode != 0:
@@ -527,6 +543,9 @@ def get_machine_specs():
             cuda_compute_capability = nvmlDeviceGetCudaComputeCapability(handle)
             major = cuda_compute_capability[0]
             minor = cuda_compute_capability[1]
+            
+            # Get GPU utilization rates
+            utilization = nvmlDeviceGetUtilizationRates(handle)
 
             data["gpu"]["details"].append(
                 {
@@ -538,6 +557,8 @@ def get_machine_specs():
                     "memory_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM),
                     "pcie": nvmlDeviceGetCurrPcieLinkWidth(handle),
                     "pcie_speed": nvmlDeviceGetPcieSpeed(handle),
+                    "gpu_utilization": utilization.gpu,
+                    "memory_utilization": utilization.memory,
                 }
             )
 
@@ -551,23 +572,33 @@ def get_machine_specs():
         lscpu_output = run_cmd("lscpu")
         data["cpu"]["model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
         data["cpu"]["count"] = int(re.search(r"CPU\(s\):\s*(.*)", lscpu_output).group(1))
-
+        data["cpu"]["utilization"] = psutil.cpu_percent(interval=1) 
     except Exception as exc:
         # print(f'Error getting cpu specs: {exc}', flush=True)
         data["cpu_scrape_error"] = repr(exc)
 
     data["ram"] = {}
     try:
-        with open("/proc/meminfo") as f:
-            meminfo = f.read()
+        # with open("/proc/meminfo") as f:
+        #     meminfo = f.read()
 
-        for name, key in [
-            ("MemAvailable", "available"),
-            ("MemFree", "free"),
-            ("MemTotal", "total"),
-        ]:
-            data["ram"][key] = int(re.search(rf"^{name}:\s*(\d+)\s+kB$", meminfo, re.M).group(1))
-        data["ram"]["used"] = data["ram"]["total"] - data["ram"]["free"]
+        # for name, key in [
+        #     ("MemAvailable", "available"),
+        #     ("MemFree", "free"),
+        #     ("MemTotal", "total"),
+        # ]:
+        #     data["ram"][key] = int(re.search(rf"^{name}:\s*(\d+)\s+kB$", meminfo, re.M).group(1))
+        # data["ram"]["used"] = data["ram"]["total"] - data["ram"]["available"]
+        # data['ram']['utilization'] = (data["ram"]["used"] / data["ram"]["total"]) * 100
+        
+        mem = psutil.virtual_memory()
+        data["ram"] = {
+            "total": mem.total / 1024,
+            "free": mem.free / 1024,
+            "used": mem.free /1024,
+            "available": mem.available / 1024,
+            "utilization": mem.percent
+        }
     except Exception as exc:
         # print(f"Error reading /proc/meminfo; Exc: {exc}", file=sys.stderr)
         data["ram_scrape_error"] = repr(exc)
@@ -579,6 +610,7 @@ def get_machine_specs():
             "total": disk_usage.total // 1024,  # in kiB
             "used": disk_usage.used // 1024,
             "free": disk_usage.free // 1024,
+            "utilization": (disk_usage.used / disk_usage.total) * 100
         }
     except Exception as exc:
         # print(f"Error getting disk_usage from shutil: {exc}", file=sys.stderr)
