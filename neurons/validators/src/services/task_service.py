@@ -135,8 +135,8 @@ class TaskService:
                                 extra=get_extra_info(default_extra),
                             ),
                         )
-                        return machine_spec, executor_info, 0
-
+                        log_text = f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job."
+                        return machine_spec, executor_info, 0, log_text
                     logger.info(
                         _m(
                             f"Got GPU specs: {gpu_model} with max score: {max_score}",
@@ -157,8 +157,11 @@ class TaskService:
                                 extra=get_extra_info({**default_extra, "score": score}),
                             ),
                         )
-
-                        return machine_spec, executor_info, score
+                        log_text = _m(
+                                "Executor is already rented.",
+                                extra=get_extra_info({**default_extra, "score": score}),
+                                    )
+                        return machine_spec, executor_info, score, log_text,
 
                     logger.info(
                         _m("Creating task for executor", extra=get_extra_info(default_extra)),
@@ -188,7 +191,11 @@ class TaskService:
                                 extra=get_extra_info(default_extra),
                             ),
                         )
-                        return machine_spec, executor_info, 0
+                        log_text = _m(
+                                "No result from training job task.",
+                                extra=get_extra_info(default_extra),
+                                )
+                        return machine_spec, executor_info, 0, log_text
 
                     end_time = time.time()
 
@@ -200,6 +207,7 @@ class TaskService:
                             extra=get_extra_info(default_extra),
                         ),
                     )
+                    log_text = ""
 
                     if err is not None:
                         logger.error(
@@ -208,6 +216,11 @@ class TaskService:
                                 extra=get_extra_info(default_extra),
                             ),
                         )
+                        log_text = _m(
+                                f"Error executing task on executor: {err}",
+                                extra=get_extra_info(default_extra),
+                            )
+
                     else:
                         job_taken_time = results[-1]
                         try:
@@ -257,6 +270,19 @@ class TaskService:
                                 ),
                             ),
                         )
+                        log_text = _m(
+                                "Train task finished",
+                                extra=get_extra_info(
+                                    {
+                                        **default_extra,
+                                        "score": score,
+                                        "job_taken_time": job_taken_time,
+                                        "upload_speed": upload_speed,
+                                        "download_speed": download_speed,
+                                    }
+                                ),
+                            )
+
                     logger.info(
                         _m(
                             "SSH connection closed for executor",
@@ -264,7 +290,7 @@ class TaskService:
                         ),
                     )
 
-                    return machine_spec, executor_info, score
+                    return machine_spec, executor_info, score, log_text
         except Exception as e:
             logger.error(
                 _m(

@@ -209,6 +209,8 @@ class ComputeClient:
                 try:
                     specs = ExecutorSpecRequest(
                         specs=msg["specs"],
+                        score=msg["score"],
+                        log_text=msg["log_text"],
                         miner_hotkey=msg["miner_hotkey"],
                         validator_hotkey=validator_hotkey,
                         executor_uuid=msg["executor_uuid"],

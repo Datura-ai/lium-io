@@ -52,6 +52,8 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     executor_ip: str
     executor_port: int
     specs: dict
+    score: float
+    log_text: str
 
 
 class RentedMachineRequest(BaseValidatorRequest):

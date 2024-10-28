@@ -213,7 +213,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "results": len(results)}),
             ),
         )
-        for specs, ssh_info, _ in results:
+        for specs, ssh_info, score, log_text in results:
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL_NAME,
@@ -223,6 +223,8 @@ class MinerService:
                         "executor_uuid": ssh_info.uuid,
                         "executor_ip": ssh_info.address,
                         "executor_port": ssh_info.port,
+                        "score": score,
+                        "log_text": log_text,
                     },
                 )
             except Exception:
