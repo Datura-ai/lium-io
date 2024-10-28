@@ -265,6 +265,10 @@ class Validator:
                 current_block % settings.BLOCKS_FOR_JOB == 0
                 or current_block - self.last_job_run_blocks > int(settings.BLOCKS_FOR_JOB * 1.5)
             ):
+                
+                job_batch_id = current_block // settings.BLOCKS_FOR_JOB
+
+
                 bittensor.logging.info(
                     "Send jobs to %d miners at block(%d)",
                     "sync",
@@ -280,6 +284,7 @@ class Validator:
                     asyncio.create_task(
                         self.miner_service.request_job_to_miner(
                             payload=MinerJobRequestPayload(
+                                job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
                                 miner_address=miner.axon_info.ip,
                                 miner_port=miner.axon_info.port,

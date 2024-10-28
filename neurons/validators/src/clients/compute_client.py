@@ -210,6 +210,8 @@ class ComputeClient:
                     specs = ExecutorSpecRequest(
                         specs=msg["specs"],
                         score=msg["score"],
+                        log_status=msg["log_status"],
+                        job_batch_id=msg["job_batch_id"],
                         log_text=msg["log_text"],
                         miner_hotkey=msg["miner_hotkey"],
                         validator_hotkey=validator_hotkey,

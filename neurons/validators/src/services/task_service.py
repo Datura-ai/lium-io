@@ -47,6 +47,7 @@ class TaskService:
         private_key: str,
     ):
         default_extra = {
+            "job_batch_id": miner_info.job_batch_id,
             "miner_hotkey": miner_info.miner_hotkey,
             "executor_uuid": executor_info.uuid,
             "executor_ip_address": executor_info.address,
@@ -106,7 +107,10 @@ class TaskService:
                         logger.warning(
                             _m("No machine specs found", extra=get_extra_info(default_extra)),
                         )
-                        return None
+                        log_status = "warning"
+                        log_text = _m("No machine specs found", extra=get_extra_info(default_extra))
+                        job_batch_id = default_extra.job_batch_id
+                        return {}, executor_info, 0, job_batch_id, log_status, log_text
 
                     machine_spec = json.loads(machine_specs[0].strip())
                     logger.info(
@@ -136,7 +140,9 @@ class TaskService:
                             ),
                         )
                         log_text = f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job."
-                        return machine_spec, executor_info, 0, log_text
+                        log_status = "warning"
+                        job_batch_id = default_extra.job_batch_id
+                        return machine_spec, executor_info, 0, job_batch_id, log_status, log_text
                     logger.info(
                         _m(
                             f"Got GPU specs: {gpu_model} with max score: {max_score}",
@@ -161,7 +167,9 @@ class TaskService:
                                 "Executor is already rented.",
                                 extra=get_extra_info({**default_extra, "score": score}),
                                     )
-                        return machine_spec, executor_info, score, log_text,
+                        log_status = "info"
+                        job_batch_id = default_extra.job_batch_id
+                        return machine_spec, executor_info, score, job_batch_id, log_status, log_text
 
                     logger.info(
                         _m("Creating task for executor", extra=get_extra_info(default_extra)),
@@ -195,7 +203,9 @@ class TaskService:
                                 "No result from training job task.",
                                 extra=get_extra_info(default_extra),
                                 )
-                        return machine_spec, executor_info, 0, log_text
+                        log_status = "warning"
+                        job_batch_id = default_extra.job_batch_id
+                        return machine_spec, executor_info, 0, job_batch_id, log_status, log_text
 
                     end_time = time.time()
 
@@ -208,6 +218,8 @@ class TaskService:
                         ),
                     )
                     log_text = ""
+                    log_status = ""
+                    job_batch_id = default_extra.job_batch_id
 
                     if err is not None:
                         logger.error(
@@ -216,6 +228,7 @@ class TaskService:
                                 extra=get_extra_info(default_extra),
                             ),
                         )
+                        log_status = "error"
                         log_text = _m(
                                 f"Error executing task on executor: {err}",
                                 extra=get_extra_info(default_extra),
@@ -270,6 +283,7 @@ class TaskService:
                                 ),
                             ),
                         )
+                        log_status = "info"
                         log_text = _m(
                                 "Train task finished",
                                 extra=get_extra_info(
@@ -281,7 +295,7 @@ class TaskService:
                                         "download_speed": download_speed,
                                     }
                                 ),
-                            )
+                            )                        
 
                     logger.info(
                         _m(
@@ -290,7 +304,7 @@ class TaskService:
                         ),
                     )
 
-                    return machine_spec, executor_info, score, log_text
+                    return machine_spec, executor_info, score, job_batch_id, log_status, log_text
         except Exception as e:
             logger.error(
                 _m(
@@ -299,7 +313,13 @@ class TaskService:
                 ),
                 exc_info=True,
             )
-            return None
+            log_status = "error"
+            log_text = _m(
+                    "Error creating task for executor",
+                    extra=get_extra_info({**default_extra, "error": str(e)}),
+                )
+            job_batch_id = default_extra.job_batch_id
+            return {}, executor_info, 0, job_batch_id, log_status, log_text
 
     async def _run_task(
         self,

@@ -5,6 +5,7 @@ from pydantic import BaseModel, field_validator
 
 
 class MinerJobRequestPayload(BaseModel):
+    job_batch_id: int
     miner_hotkey: str
     miner_address: str
     miner_port: int

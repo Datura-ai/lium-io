@@ -57,6 +57,7 @@ class MinerService:
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
+            "job_batch_id": payload.job_batch_id,
             "miner_hotkey": payload.miner_hotkey,
             "miner_address": payload.miner_address,
             "miner_port": payload.miner_port,
@@ -213,7 +214,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "results": len(results)}),
             ),
         )
-        for specs, ssh_info, score, log_text in results:
+        for specs, ssh_info, score, job_batch_id, log_status, log_text in results:
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL_NAME,
@@ -224,6 +225,8 @@ class MinerService:
                         "executor_ip": ssh_info.address,
                         "executor_port": ssh_info.port,
                         "score": score,
+                        "job_batch_id": job_batch_id,
+                        "log_status": log_status,
                         "log_text": log_text,
                     },
                 )
