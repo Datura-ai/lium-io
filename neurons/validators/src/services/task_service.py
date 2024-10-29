@@ -93,7 +93,7 @@ class TaskService:
                         log_status = "warning"
                         log_text = _m("No machine specs found", extra=get_extra_info(default_extra))
                         logger.warning(log_text)
-                        return {}, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+                        return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                     machine_spec = json.loads(machine_specs[0].strip())
                     logger.info(
@@ -301,7 +301,7 @@ class TaskService:
                 "Error creating task for executor",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
-            return {}, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+            return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
     async def _run_task(
         self,

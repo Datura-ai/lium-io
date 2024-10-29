@@ -219,15 +219,16 @@ class MinerService:
                         "score": score,
                         "job_batch_id": job_batch_id,
                         "log_status": log_status,
-                        "log_text": log_text,
+                        "log_text": str(log_text),
                     },
                 )
-            except Exception:
+            except Exception as e:
                 logger.error(
                     _m(
-                        "Error publishing machine specs of {miner_hotkey} to compute app connector process",
-                        extra=get_extra_info(default_extra),
+                        f"Error publishing machine specs of {miner_hotkey} to compute app connector process",
+                        extra=get_extra_info({**default_extra, "error": str(e)}),
                     ),
+                    exc_info=True,
                 )
 
     async def handle_container(self, payload: ContainerBaseRequest):
