@@ -79,12 +79,6 @@ class MinerService:
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
-                logger.info(
-                    _m(
-                        "Sending SSHPubKeySubmitRequest to miner",
-                        extra=get_extra_info(default_extra),
-                    )
-                )
                 await miner_client.send_model(SSHPubKeySubmitRequest(public_key=public_key))
 
                 try:
@@ -143,9 +137,6 @@ class MinerService:
                     )
                     await self.publish_machine_specs(results, miner_client.miner_hotkey)
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
-                    logger.info(
-                        _m("Requesting job success for miner", extra=get_extra_info(default_extra))
-                    )
 
                     total_score = 0
                     for _, _, score, _, _, _ in results:
