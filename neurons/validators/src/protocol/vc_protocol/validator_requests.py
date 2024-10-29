@@ -52,8 +52,9 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     executor_ip: str
     executor_port: int
     specs: dict
-    score: float
-    log_text: str
+    score: float | None
+    log_text: str | None
+    job_batch_id: str
 
 
 class RentedMachineRequest(BaseValidatorRequest):

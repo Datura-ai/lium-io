@@ -223,6 +223,7 @@ class ComputeClient:
                         "executor_uuid": msg["executor_uuid"],
                         "executor_ip": msg["executor_ip"],
                         "executor_port": msg["executor_port"],
+                        "job_batch_id": msg["job_batch_id"],
                     }
                 except Exception as exc:
                     msg = "Error occurred while parsing msg"

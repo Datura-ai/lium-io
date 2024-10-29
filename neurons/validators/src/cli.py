@@ -6,7 +6,6 @@ import uuid
 
 import click
 from datura.requests.miner_requests import ExecutorSSHInfo
-from payload_models.payloads import MinerJobRequestPayload
 
 from core.utils import configure_logs_of_other_modules
 from core.validator import Validator
@@ -28,14 +27,13 @@ def cli():
 @click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
 def debug_send_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
     """Debug sending job to miner"""
-    miner_service = ioc["MinerService"]
-    asyncio.run(
-        miner_service.request_job_to_miner(
-            MinerJobRequestPayload(
-                miner_hotkey=miner_hotkey, miner_address=miner_address, miner_port=miner_port
-            )
-        )
-    )
+    miner = type("Miner", (object,), {})()
+    miner.hotkey = miner_hotkey
+    miner.axon_info = type("AxonInfo", (object,), {})()
+    miner.axon_info.ip = miner_address
+    miner.axon_info.port = miner_port
+    validator = Validator(debug_miner=miner)
+    asyncio.run(validator.sync())
 
 
 def generate_random_ip():

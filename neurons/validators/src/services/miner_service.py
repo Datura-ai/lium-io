@@ -148,7 +148,7 @@ class MinerService:
                     )
 
                     total_score = 0
-                    for _, _, score in results:
+                    for _, _, score, _, _, _ in results:
                         total_score += score
 
                     logger.info(
@@ -191,12 +191,13 @@ class MinerService:
                 _m("Requesting job to miner was cancelled", extra=get_extra_info(default_extra)),
             )
             return None
-        except Exception:
+        except Exception as e:
             logger.error(
                 _m(
                     "Requesting job to miner resulted in an exception",
-                    extra=get_extra_info(default_extra),
+                    extra=get_extra_info({**default_extra, "error": str(e)}),
                 ),
+                exc_info=True,
             )
             return None
 
