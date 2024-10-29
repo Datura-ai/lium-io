@@ -60,12 +60,6 @@ class TaskService:
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
 
-            logger.info(
-                _m(
-                    "Connecting with SSH INFO(ssh -p {executor_info.ssh_port} {executor_info.ssh_username}:{executor_info.address})",
-                    extra=get_extra_info(default_extra),
-                ),
-            )
 
             async with asyncssh.connect(
                 host=executor_info.address,
@@ -74,12 +68,6 @@ class TaskService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                logger.info(
-                    _m(
-                        "SSH Connection Established. Creating temp directory at {executor_info.root_dir}/temp",
-                        extra=get_extra_info(default_extra),
-                    ),
-                )
 
                 await ssh_client.run(f"mkdir -p {executor_info.root_dir}/temp")
 
@@ -160,21 +148,13 @@ class TaskService:
 
                         return machine_spec, executor_info, score
 
-                    logger.info(
-                        _m("Creating task for executor", extra=get_extra_info(default_extra)),
-                    )
 
                     timestamp = int(time.time())
                     local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
                     remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
 
                     await sftp_client.put(local_file_path, remote_file_path)
-                    logger.info(
-                        _m(
-                            f"Uploaded score script to {remote_file_path}",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
+
 
                     start_time = time.time()
 
@@ -257,12 +237,6 @@ class TaskService:
                                 ),
                             ),
                         )
-                    logger.info(
-                        _m(
-                            "SSH connection closed for executor",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
 
                     return machine_spec, executor_info, score
         except Exception as e:
@@ -304,18 +278,6 @@ class TaskService:
             )
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
-            logger.info(
-                _m(
-                    "Run training task results",
-                    extra=get_extra_info({**default_extra, "results": results}),
-                ),
-            )
-            logger.warning(
-                _m(
-                    "Run training task errors",
-                    extra=get_extra_info({**default_extra, "errors": errors}),
-                ),
-            )
 
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
 
@@ -326,7 +288,6 @@ class TaskService:
             #  remove remote_file
             await ssh_client.run(f"rm {remote_file_path}", timeout=30)
 
-            logger.info(_m("Run task success", extra=get_extra_info(default_extra)))
             return results, None
         except Exception as e:
             logger.error(
@@ -336,13 +297,7 @@ class TaskService:
 
             #  remove remote_file
             try:
-                logger.info(
-                    _m("Removing remote file", extra=get_extra_info(default_extra)),
-                )
                 await asyncio.wait_for(ssh_client.run(f"rm {remote_file_path}"), timeout=10)
-                logger.info(
-                    _m("Removed remote file", extra=get_extra_info(default_extra)),
-                )
             except Exception:
                 logger.error(
                     _m("Failed to remove remote file", extra=get_extra_info(default_extra)),
