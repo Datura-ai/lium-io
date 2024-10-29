@@ -125,6 +125,13 @@ class TaskService:
                         )
                         return machine_spec, executor_info, 0
 
+                    logger.info(
+                        _m(
+                            f"Got GPU specs: {gpu_model} with max score: {max_score}",
+                            extra=get_extra_info(default_extra),
+                        ),
+                    )
+
                     is_rented = await self.redis_service.is_elem_exists_in_set(
                         RENTED_MACHINE_SET,
                         f"{miner_info.miner_hotkey}:{executor_info.uuid}"
@@ -271,18 +278,6 @@ class TaskService:
             )
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
-            logger.info(
-                _m(
-                    "Run training task results",
-                    extra=get_extra_info({**default_extra, "results": results}),
-                ),
-            )
-            logger.warning(
-                _m(
-                    "Run training task errors",
-                    extra=get_extra_info({**default_extra, "errors": errors}),
-                ),
-            )
 
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
 
