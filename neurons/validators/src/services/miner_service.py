@@ -57,6 +57,7 @@ class MinerService:
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
+            "job_batch_id": payload.job_batch_id,
             "miner_hotkey": payload.miner_hotkey,
             "miner_address": payload.miner_address,
             "miner_port": payload.miner_port,
@@ -110,7 +111,7 @@ class MinerService:
                             ),
                         ),
                     )
-                    
+
                     tasks = [
                         asyncio.create_task(
                             self.task_service.create_task(
@@ -138,7 +139,7 @@ class MinerService:
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
                     total_score = 0
-                    for _, _, score in results:
+                    for _, _, score, _, _, _ in results:
                         total_score += score
 
                     logger.info(
@@ -181,12 +182,13 @@ class MinerService:
                 _m("Requesting job to miner was cancelled", extra=get_extra_info(default_extra)),
             )
             return None
-        except Exception:
+        except Exception as e:
             logger.error(
                 _m(
                     "Requesting job to miner resulted in an exception",
-                    extra=get_extra_info(default_extra),
+                    extra=get_extra_info({**default_extra, "error": str(e)}),
                 ),
+                exc_info=True,
             )
             return None
 
@@ -204,7 +206,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "results": len(results)}),
             ),
         )
-        for specs, ssh_info, _ in results:
+        for specs, ssh_info, score, job_batch_id, log_status, log_text in results:
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL_NAME,
@@ -214,14 +216,19 @@ class MinerService:
                         "executor_uuid": ssh_info.uuid,
                         "executor_ip": ssh_info.address,
                         "executor_port": ssh_info.port,
+                        "score": score,
+                        "job_batch_id": job_batch_id,
+                        "log_status": log_status,
+                        "log_text": str(log_text),
                     },
                 )
-            except Exception:
+            except Exception as e:
                 logger.error(
                     _m(
-                        "Error publishing machine specs of {miner_hotkey} to compute app connector process",
-                        extra=get_extra_info(default_extra),
+                        f"Error publishing machine specs of {miner_hotkey} to compute app connector process",
+                        extra=get_extra_info({**default_extra, "error": str(e)}),
                     ),
+                    exc_info=True,
                 )
 
     async def handle_container(self, payload: ContainerBaseRequest):

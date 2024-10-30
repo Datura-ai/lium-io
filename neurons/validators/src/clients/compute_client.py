@@ -209,6 +209,10 @@ class ComputeClient:
                 try:
                     specs = ExecutorSpecRequest(
                         specs=msg["specs"],
+                        score=msg["score"],
+                        log_status=msg["log_status"],
+                        job_batch_id=msg["job_batch_id"],
+                        log_text=msg["log_text"],
                         miner_hotkey=msg["miner_hotkey"],
                         validator_hotkey=validator_hotkey,
                         executor_uuid=msg["executor_uuid"],
@@ -219,6 +223,7 @@ class ComputeClient:
                         "executor_uuid": msg["executor_uuid"],
                         "executor_ip": msg["executor_ip"],
                         "executor_port": msg["executor_port"],
+                        "job_batch_id": msg["job_batch_id"],
                     }
                 except Exception as exc:
                     msg = "Error occurred while parsing msg"
