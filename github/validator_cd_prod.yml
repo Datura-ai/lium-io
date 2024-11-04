@@ -1,0 +1,30 @@
+name: "CD: validator (prod)"
+
+on:
+  push:
+    branches:
+      - 'feat/DAH-585-nvidia-smi'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Make scripts executable
+        run: |
+          chmod +x neurons/validators/docker_publish.sh
+          chmod +x neurons/validators/docker_runner_publish.sh
+          
+      - name: Run docker_publish.sh
+        run: |
+          cd neurons/validators
+          ./docker_publish.sh
+
+      - name: Run docker_runner_publish.sh
+        run: |
+          cd neurons/validators
+          ./docker_runner_publish.sh
