@@ -5,8 +5,7 @@ on:
     branches:
       - 'feat/DAH-585-nvidia-smi'
 
-env:
-  TAG: "latest"
+
 
 jobs:
   deploy:
@@ -18,11 +17,15 @@ jobs:
           fetch-depth: 0
 
       - name: Make scripts executable
+        env:
+          TAG: "latest"
         run: |
           chmod +x neurons/validators/docker_publish.sh
           chmod +x neurons/validators/docker_runner_publish.sh
           
       - name: Run docker_publish.sh
+        env:
+          TAG: "latest"
         run: |
           cd neurons/validators
           ./docker_publish.sh
