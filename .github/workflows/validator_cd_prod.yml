@@ -3,7 +3,7 @@ name: "CD: validator (prod)"
 on:
   push:
     branches:
-      - 'feat/DAH-585-nvidia-smi'
+      - 'prod_validator'
 
 jobs:
   deploy:
