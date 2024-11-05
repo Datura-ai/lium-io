@@ -96,12 +96,6 @@ class TaskService:
                         return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                     machine_spec = json.loads(machine_specs[0].strip())
-                    logger.info(
-                        _m(
-                            "Machine spec scraped",
-                            extra=get_extra_info({**default_extra, "machine_spec": machine_spec}),
-                        ),
-                    )
 
                     gpu_model = None
                     if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -114,6 +108,15 @@ class TaskService:
                         max_score = GPU_MAX_SCORES.get(gpu_model, 0)
 
                     gpu_count = machine_spec.get("gpu", {}).get("count", 0)
+
+                    logger.info(
+                        _m(
+                            "Machine spec scraped",
+                            extra=get_extra_info(
+                                {**default_extra, "gpu_model": gpu_model, "gpu_count": gpu_count}
+                            ),
+                        ),
+                    )
 
                     if max_score == 0 or gpu_count == 0:
                         log_text = _m(

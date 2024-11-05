@@ -284,7 +284,7 @@ class DockerService:
         logger.info(
             _m(
                 "Delete Docker Container",
-                extra=get_extra_info({**default_extra, "payload": payload}),
+                extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
 
