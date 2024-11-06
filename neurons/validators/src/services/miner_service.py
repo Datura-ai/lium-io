@@ -277,27 +277,6 @@ class MinerService:
                 exc_info=True,
             )
 
-        # # test - get all executor_counts
-        # try:
-        #     executor_counts = await self.redis_service.hgetall(key)
-        #     parsed_counts = [
-        #         {
-        #             "job_batch_id": job_batch_id.decode('utf-8'),
-        #             **json.loads(data.decode('utf-8')),
-        #         }
-        #         for job_batch_id, data in executor_counts.items()
-        #     ]
-
-        #     print('parsed_counts ========>', parsed_counts)
-        # except Exception as e:
-        #     logger.error(
-        #         _m(
-        #             "Failed get all executor counts",
-        #             extra=get_extra_info({**default_extra, "error": str(e)}),
-        #         ),
-        #         exc_info=True,
-        #     )
-
     async def handle_container(self, payload: ContainerBaseRequest):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
