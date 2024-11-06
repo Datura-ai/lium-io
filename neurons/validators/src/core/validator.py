@@ -72,6 +72,13 @@ class Validator:
         try:
             if await self.should_set_weights(subtensor):
                 self.miner_scores = {}
+
+                # clear executor_counts
+                try:
+                    await self.redis_service.clear_all_executor_counts()
+                    bittensor.logging.info(f"Cleared executor_counts")
+                except Exception as e:
+                    bittensor.logging.error(f"Failed to clear executor_counts: {str(e)}")
             else:
                 miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
                 if miner_scores_json is None:
@@ -207,6 +214,13 @@ class Validator:
 
         bittensor.logging.info("Reset miner scores")
         self.miner_scores = {}
+
+        # clear executor_counts
+        try:
+            await self.redis_service.clear_all_executor_counts()
+            bittensor.logging.info(f"Cleared executor_counts")
+        except Exception as e:
+            bittensor.logging.error(f"Failed to clear executor_counts: {str(e)}")
 
     def get_last_update(self, subtensor: bittensor.subtensor, block):
         try:
