@@ -121,7 +121,7 @@ class TaskService:
                     if max_score == 0 or gpu_count == 0:
                         log_text = _m(
                             f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
-                            extra=get_extra_info(default_extra),
+                            extra=get_extra_info({**default_extra, "os_version": machine_spec.get('os', ''), "nvidia_cfg": machine_spec.get('nvidia_cfg', ''), "docker_cfg": machine_spec.get('docker_cfg', '')}),
                         )
                         log_status = "warning"
                         logger.warning(log_text)
