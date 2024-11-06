@@ -567,6 +567,20 @@ def get_machine_specs():
         # print(f'Error getting os specs: {exc}', flush=True)
         data["gpu_scrape_error"] = repr(exc)
 
+        # Scrape the NVIDIA Container Runtime config
+        nvidia_cfg_cmd = 'cat /etc/nvidia-container-runtime/config.toml'
+        try:
+            data["nvidia_cfg"] = run_cmd(nvidia_cfg_cmd)
+        except Exception as exc:
+            data["nvidia_cfg_scrape_error"] = repr(exc)
+
+        # Scrape the Docker Daemon config
+        docker_cfg_cmd = 'cat /etc/docker/daemon.json'
+        try:
+            data["docker_cfg"] = run_cmd(docker_cfg_cmd)
+        except Exception as exc:
+            data["docker_cfg_scrape_error"] = repr(exc)
+
     data["cpu"] = {"count": 0, "model": "", "clocks": []}
     try:
         lscpu_output = run_cmd("lscpu")

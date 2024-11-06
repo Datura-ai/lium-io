@@ -51,7 +51,11 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     executor_uuid: str
     executor_ip: str
     executor_port: int
-    specs: dict
+    specs: dict | None
+    score: float | None
+    log_text: str | None
+    log_status: str | None
+    job_batch_id: str
 
 
 class RentedMachineRequest(BaseValidatorRequest):

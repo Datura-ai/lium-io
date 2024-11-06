@@ -22,8 +22,8 @@ from services.const import (
     MIN_JOB_TAKEN_TIME,
     UPLOAD_SPEED_WEIGHT,
 )
+from services.redis_service import RENTED_MACHINE_SET, RedisService
 from services.ssh_service import SSHService
-from services.redis_service import RedisService, RENTED_MACHINE_SET
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,7 @@ class TaskService:
         private_key: str,
     ):
         default_extra = {
+            "job_batch_id": miner_info.job_batch_id,
             "miner_hotkey": miner_info.miner_hotkey,
             "executor_uuid": executor_info.uuid,
             "executor_ip_address": executor_info.address,
@@ -60,13 +61,6 @@ class TaskService:
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
 
-            logger.info(
-                _m(
-                    "Connecting with SSH INFO(ssh -p {executor_info.ssh_port} {executor_info.ssh_username}:{executor_info.address})",
-                    extra=get_extra_info(default_extra),
-                ),
-            )
-
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
@@ -74,13 +68,6 @@ class TaskService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                logger.info(
-                    _m(
-                        "SSH Connection Established. Creating temp directory at {executor_info.root_dir}/temp",
-                        extra=get_extra_info(default_extra),
-                    ),
-                )
-
                 await ssh_client.run(f"mkdir -p {executor_info.root_dir}/temp")
 
                 async with ssh_client.start_sftp_client() as sftp_client:
@@ -103,18 +90,12 @@ class TaskService:
                         ssh_client, executor_info, remote_file_path, miner_info.miner_hotkey
                     )
                     if not machine_specs:
-                        logger.warning(
-                            _m("No machine specs found", extra=get_extra_info(default_extra)),
-                        )
-                        return None
+                        log_status = "warning"
+                        log_text = _m("No machine specs found", extra=get_extra_info(default_extra))
+                        logger.warning(log_text)
+                        return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                     machine_spec = json.loads(machine_specs[0].strip())
-                    logger.info(
-                        _m(
-                            "Machine spec scraped",
-                            extra=get_extra_info({**default_extra, "machine_spec": machine_spec}),
-                        ),
-                    )
 
                     gpu_model = None
                     if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -128,14 +109,30 @@ class TaskService:
 
                     gpu_count = machine_spec.get("gpu", {}).get("count", 0)
 
-                    if max_score == 0 or gpu_count == 0:
-                        logger.warning(
-                            _m(
-                                f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
-                                extra=get_extra_info(default_extra),
+                    logger.info(
+                        _m(
+                            "Machine spec scraped",
+                            extra=get_extra_info(
+                                {**default_extra, "gpu_model": gpu_model, "gpu_count": gpu_count}
                             ),
+                        ),
+                    )
+
+                    if max_score == 0 or gpu_count == 0:
+                        log_text = _m(
+                            f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
+                            extra=get_extra_info({**default_extra, "os_version": machine_spec.get('os', ''), "nvidia_cfg": machine_spec.get('nvidia_cfg', ''), "docker_cfg": machine_spec.get('docker_cfg', '')}),
                         )
-                        return machine_spec, executor_info, 0
+                        log_status = "warning"
+                        logger.warning(log_text)
+                        return (
+                            machine_spec,
+                            executor_info,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
 
                     logger.info(
                         _m(
@@ -145,36 +142,31 @@ class TaskService:
                     )
 
                     is_rented = await self.redis_service.is_elem_exists_in_set(
-                        RENTED_MACHINE_SET,
-                        f"{miner_info.miner_hotkey}:{executor_info.uuid}"
+                        RENTED_MACHINE_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
                     )
 
                     if is_rented:
                         score = max_score * gpu_count
-                        logger.info(
-                            _m(
-                                "Executor is already rented.",
-                                extra=get_extra_info({**default_extra, "score": score}),
-                            ),
+                        log_text = _m(
+                            "Executor is already rented.",
+                            extra=get_extra_info({**default_extra, "score": score}),
                         )
-
-                        return machine_spec, executor_info, score
-
-                    logger.info(
-                        _m("Creating task for executor", extra=get_extra_info(default_extra)),
-                    )
+                        log_status = "info"
+                        logger.info(log_text)
+                        return (
+                            machine_spec,
+                            executor_info,
+                            score,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
 
                     timestamp = int(time.time())
                     local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
                     remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
 
                     await sftp_client.put(local_file_path, remote_file_path)
-                    logger.info(
-                        _m(
-                            f"Uploaded score script to {remote_file_path}",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
 
                     start_time = time.time()
 
@@ -182,13 +174,20 @@ class TaskService:
                         ssh_client, executor_info, remote_file_path, miner_info.miner_hotkey
                     )
                     if not results:
-                        logger.warning(
-                            _m(
-                                "No result from training job task.",
-                                extra=get_extra_info(default_extra),
-                            ),
+                        log_text = _m(
+                            "No result from training job task.",
+                            extra=get_extra_info(default_extra),
                         )
-                        return machine_spec, executor_info, 0
+                        log_status = "warning"
+                        logger.warning(log_text)
+                        return (
+                            machine_spec,
+                            executor_info,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
 
                     end_time = time.time()
 
@@ -200,14 +199,17 @@ class TaskService:
                             extra=get_extra_info(default_extra),
                         ),
                     )
+                    log_text = ""
+                    log_status = ""
 
                     if err is not None:
-                        logger.error(
-                            _m(
-                                f"Error executing task on executor: {err}",
-                                extra=get_extra_info(default_extra),
-                            ),
+                        log_status = "error"
+                        log_text = _m(
+                            f"Error executing task on executor: {err}",
+                            extra=get_extra_info(default_extra),
                         )
+                        logger.error(log_text)
+
                     else:
                         job_taken_time = results[-1]
                         try:
@@ -226,7 +228,7 @@ class TaskService:
 
                         upload_speed = machine_spec.get("network", {}).get("upload_speed", 0)
                         download_speed = machine_spec.get("network", {}).get("download_speed", 0)
-                        
+
                         # Ensure upload_speed and download_speed are not None
                         upload_speed = upload_speed if upload_speed is not None else 0
                         download_speed = download_speed if download_speed is not None else 0
@@ -257,6 +259,23 @@ class TaskService:
                                 ),
                             ),
                         )
+
+                        log_status = "info"
+                        log_text = _m(
+                            "Train task finished",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "score": score,
+                                    "job_taken_time": job_taken_time,
+                                    "upload_speed": upload_speed,
+                                    "download_speed": download_speed,
+                                }
+                            ),
+                        )
+
+                        logger.info(log_text)
+
                     logger.info(
                         _m(
                             "SSH connection closed for executor",
@@ -264,7 +283,14 @@ class TaskService:
                         ),
                     )
 
-                    return machine_spec, executor_info, score
+                    return (
+                        machine_spec,
+                        executor_info,
+                        score,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
         except Exception as e:
             logger.error(
                 _m(
@@ -273,7 +299,12 @@ class TaskService:
                 ),
                 exc_info=True,
             )
-            return None
+            log_status = "error"
+            log_text = _m(
+                "Error creating task for executor",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
     async def _run_task(
         self,
@@ -304,18 +335,6 @@ class TaskService:
             )
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
-            logger.info(
-                _m(
-                    "Run training task results",
-                    extra=get_extra_info({**default_extra, "results": results}),
-                ),
-            )
-            logger.warning(
-                _m(
-                    "Run training task errors",
-                    extra=get_extra_info({**default_extra, "errors": errors}),
-                ),
-            )
 
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
 
@@ -326,7 +345,6 @@ class TaskService:
             #  remove remote_file
             await ssh_client.run(f"rm {remote_file_path}", timeout=30)
 
-            logger.info(_m("Run task success", extra=get_extra_info(default_extra)))
             return results, None
         except Exception as e:
             logger.error(
@@ -336,13 +354,7 @@ class TaskService:
 
             #  remove remote_file
             try:
-                logger.info(
-                    _m("Removing remote file", extra=get_extra_info(default_extra)),
-                )
                 await asyncio.wait_for(ssh_client.run(f"rm {remote_file_path}"), timeout=10)
-                logger.info(
-                    _m("Removed remote file", extra=get_extra_info(default_extra)),
-                )
             except Exception:
                 logger.error(
                     _m("Failed to remove remote file", extra=get_extra_info(default_extra)),
