@@ -1,9 +1,9 @@
-name: "CD: validator (prod)"
+name: "CD: executor (prod)"
 
 on:
   push:
     branches:
-      - 'prod_validator'
+      - 'prod_executor'
 
 jobs:
   deploy:
@@ -18,15 +18,15 @@ jobs:
 
       - name: Make scripts executable
         run: |
-          chmod +x neurons/validators/docker_publish.sh
-          chmod +x neurons/validators/docker_runner_publish.sh
+          chmod +x neurons/executor/docker_publish.sh
+          chmod +x neurons/executor/docker_runner_publish.sh
           
       - name: Run docker_publish.sh
         run: |
-          cd neurons/validators
+          cd neurons/executor
           ./docker_publish.sh
           
       - name: Run docker_runner_publish.sh
         run: |
-          cd neurons/validators
+          cd neurons/executor
           ./docker_runner_publish.sh

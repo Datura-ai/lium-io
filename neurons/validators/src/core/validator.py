@@ -15,7 +15,7 @@ from payload_models.payloads import MinerJobRequestPayload
 from core.config import settings
 from services.docker_service import DockerService
 from services.miner_service import MinerService
-from services.redis_service import RedisService
+from services.redis_service import RedisService, EXECUTOR_COUNT_PREFIX
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
@@ -72,6 +72,13 @@ class Validator:
         try:
             if await self.should_set_weights(subtensor):
                 self.miner_scores = {}
+
+                # clear executor_counts
+                try:
+                    await self.redis_service.clear_all_executor_counts()
+                    bittensor.logging.info(f"Cleared executor_counts")
+                except Exception as e:
+                    bittensor.logging.error(f"Failed to clear executor_counts: {str(e)}")
             else:
                 miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
                 if miner_scores_json is None:
@@ -208,6 +215,13 @@ class Validator:
         bittensor.logging.info("Reset miner scores")
         self.miner_scores = {}
 
+        # clear executor_counts
+        try:
+            await self.redis_service.clear_all_executor_counts()
+            bittensor.logging.info(f"Cleared executor_counts")
+        except Exception as e:
+            bittensor.logging.error(f"Failed to clear executor_counts: {str(e)}")
+
     def get_last_update(self, subtensor: bittensor.subtensor, block):
         try:
             node = self.get_node(subtensor)
@@ -329,27 +343,34 @@ class Validator:
                             bittensor.logging.info(f"Job score: {result}", "sync", "sync")
                             miner_hotkey = result.get("miner_hotkey")
                             job_score = result.get("score")
+
+                            key = f"{EXECUTOR_COUNT_PREFIX}:{miner_hotkey}"
+
+                            try:
+                                executor_counts = await self.redis_service.hgetall(key)
+                                parsed_counts = [
+                                    {
+                                        "job_batch_id": job_id.decode('utf-8'),
+                                        **json.loads(data.decode('utf-8')),
+                                    }
+                                    for job_id, data in executor_counts.items()
+                                ]
+
+                                if parsed_counts:
+                                    bittensor.logging.info(f"[executor_counts_list] miner_hotkey: {miner_hotkey}, list: {parsed_counts}")
+                                    
+                                    max_executors = max(parsed_counts, key=lambda x: x['total'])['total']
+                                    min_executors = min(parsed_counts, key=lambda x: x['total'])['total']
+
+                                    bittensor.logging.info(f"[executor_counts] miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}, Max: {max_executors}, Min: {min_executors}")
+
+                            except Exception as e:
+                                bittensor.logging.error(f"[Get executor_counts] miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}", "sync", "sync")
+
                             if miner_hotkey in self.miner_scores:
                                 self.miner_scores[miner_hotkey] += job_score
                             else:
                                 self.miner_scores[miner_hotkey] = job_score
-
-                    bittensor.logging.info(f"miner scores: {self.miner_scores}", "sync", "sync")
-
-                    for index, result in enumerate(results):
-                        miner = miners[index]
-                        if isinstance(result, Exception):
-                            bittensor.logging.error(
-                                f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) resulted in an exception: {result}",
-                                "sync",
-                                "sync",
-                            )
-                        else:
-                            bittensor.logging.info(
-                                f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) completed successfully: {result}",
-                                "sync",
-                                "sync",
-                            )
 
                     bittensor.logging.info("All Jobs finished", "sync", "sync")
                     bittensor.logging.info(f"miner_scores: {self.miner_scores}", "sync", "sync")
