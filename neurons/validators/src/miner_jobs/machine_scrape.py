@@ -638,6 +638,7 @@ def get_machine_specs():
         data["os_scrape_error"] = repr(exc)
 
     data["network"] = get_network_speed()
+    data['signature'] = 'signature_value'
     return data
 
 
