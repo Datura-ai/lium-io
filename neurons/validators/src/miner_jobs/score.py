@@ -1,5 +1,6 @@
 import time
 import torch
+import json
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AdamW, GPT2LMHeadModel, GPT2Tokenizer
@@ -74,4 +75,10 @@ final_loss = evaluate(model, dataloader)
 # )
 
 # print("Job finished")
-print(time.time() - start_time)
+
+result = {
+    "time": time.time() - start_time,
+    "signature": "signature_value",
+}
+
+print(json.dumps(result))

@@ -20,6 +20,7 @@ GPU_MAX_SCORES = {
     "NVIDIA RTX A4500": 0.35,
     "NVIDIA RTX A4000": 0.32,
     "NVIDIA A40": 0.39,
+    "NVIDIA A30": 0.35,
     "NVIDIA GeForce RTX 3090": 0.43,
 }
 

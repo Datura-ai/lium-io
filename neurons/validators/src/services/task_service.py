@@ -4,6 +4,8 @@ import logging
 import time
 from pathlib import Path
 from typing import Annotated
+import random
+import string
 
 import asyncssh
 import bittensor
@@ -38,6 +40,22 @@ class TaskService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+
+    def generate_random_string(self, length=30):
+        characters = string.ascii_letters + string.digits
+        random_string = ''.join(random.choices(characters, k=length))
+        return random_string
+
+    def generate_signature(self):
+        random_string = self.generate_random_string()
+        return random_string, f"0x{self.my_key.sign(random_string).hex()}"
+
+    def verify_signature(self, s: str, signature: str):
+        try:
+            return self.my_key.verify(s, signature)
+        except:
+            return False
 
     async def create_task(
         self,
@@ -72,12 +90,19 @@ class TaskService:
 
                 async with ssh_client.start_sftp_client() as sftp_client:
                     # get machine specs
+                    random_string, signature_value = self.generate_signature()
+
                     timestamp = int(time.time())
-                    local_file_path = str(
+                    machine_scrape_file_path = str(
                         Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
                     )
-                    remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
-                    await sftp_client.put(local_file_path, remote_file_path)
+                    with open(machine_scrape_file_path, 'r') as file:
+                        content = file.read()
+                    modified_content = content.replace('signature_value', signature_value)
+
+                    remote_file_path = f"{executor_info.root_dir}/temp/{timestamp}.py"
+                    async with sftp_client.open(remote_file_path, 'w') as remote_file:
+                        await remote_file.write(modified_content)
 
                     logger.info(
                         _m(
@@ -97,6 +122,8 @@ class TaskService:
 
                     machine_spec = json.loads(machine_specs[0].strip())
 
+                    signature = machine_spec.get("signature", "")
+
                     gpu_model = None
                     if machine_spec.get("gpu", {}).get("count", 0) > 0:
                         details = machine_spec["gpu"].get("details", [])
@@ -109,6 +136,20 @@ class TaskService:
 
                     gpu_count = machine_spec.get("gpu", {}).get("count", 0)
 
+                    if not self.verify_signature(random_string, signature):
+                        log_text = _m(
+                            "Unverified machine spec",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "gpu_model": gpu_model,
+                                "gpu_count": gpu_count,
+                            }),
+                        )
+                        log_status = "error"
+                        logger.error(log_text)
+
+                        return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+
                     logger.info(
                         _m(
                             "Machine spec scraped",
@@ -119,24 +160,31 @@ class TaskService:
                     )
 
                     if max_score == 0 or gpu_count == 0:
+                        extra_info = {
+                            **default_extra,
+                            "os_version": machine_spec.get('os', ''),
+                            "nvidia_cfg": machine_spec.get('nvidia_cfg', ''),
+                            "docker_cfg": machine_spec.get('docker_cfg', ''),
+                            "gpu_scrape_error": machine_spec.get('gpu_scrape_error', ''),
+                            "nvidia_cfg_scrape_error": machine_spec.get('nvidia_cfg_scrape_error', ''),
+                            "docker_cfg_scrape_error": machine_spec.get('docker_cfg_scrape_error', '')
+                        }
+                        if gpu_model:
+                            extra_info["gpu_model"] = gpu_model
+                            extra_info["help_text"] = (
+                                "If you have the gpu machine and encountering this issue consistantly, "
+                                "then please pull the latest version of github repository and follow the installation guide here: "
+                                "https://github.com/Datura-ai/compute-subnet/tree/main/neurons/executor. "
+                                "Also, please configure the nvidia-container-runtime correctly. Check out here: "
+                                "https://stackoverflow.com/questions/72932940/failed-to-initialize-nvml-unknown-error-in-docker-after-few-hours "
+                                "https://bobcares.com/blog/docker-failed-to-initialize-nvml-unknown-error/"
+                            )
+
                         log_text = _m(
                             f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
                             extra=get_extra_info({
                                 **default_extra,
-                                "os_version": machine_spec.get('os', ''),
-                                "nvidia_cfg": machine_spec.get('nvidia_cfg', ''),
-                                "docker_cfg": machine_spec.get('docker_cfg', ''),
-                                "gpu_scrape_error": machine_spec.get('gpu_scrape_error', ''),
-                                "nvidia_cfg_scrape_error": machine_spec.get('nvidia_cfg_scrape_error', ''),
-                                "docker_cfg_scrape_error": machine_spec.get('docker_cfg_scrape_error', ''),
-                                "help_text": (
-                                    "If you have the gpu machine and encountering this issue consistantly, "
-                                    "then please pull the latest version of github repository and follow the installation guide here: "
-                                    "https://github.com/Datura-ai/compute-subnet/tree/main/neurons/executor. "
-                                    "Also, please configure the nvidia-container-runtime correctly. Check out here: "
-                                    "https://stackoverflow.com/questions/72932940/failed-to-initialize-nvml-unknown-error-in-docker-after-few-hours "
-                                    "https://bobcares.com/blog/docker-failed-to-initialize-nvml-unknown-error/"
-                                ),
+                                **extra_info,
                             }),
                         )
                         log_status = "warning"
@@ -178,11 +226,17 @@ class TaskService:
                             log_text,
                         )
 
-                    timestamp = int(time.time())
-                    local_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
-                    remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
+                    random_string, signature_value = self.generate_signature()
 
-                    await sftp_client.put(local_file_path, remote_file_path)
+                    timestamp = int(time.time())
+                    score_script_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
+                    with open(score_script_path, 'r') as file:
+                        content = file.read()
+                    modified_content = content.replace('signature_value', signature_value)
+
+                    remote_file_path = f"{executor_info.root_dir}/temp/{timestamp}.py"
+                    async with sftp_client.open(remote_file_path, 'w') as remote_file:
+                        await remote_file.write(modified_content)
 
                     start_time = time.time()
 
@@ -207,11 +261,27 @@ class TaskService:
 
                     end_time = time.time()
 
+                    result = json.loads(results[0])
+                    signature = result.get("signature", "")
+
+                    if not self.verify_signature(random_string, signature):
+                        log_text = _m(
+                            "Unverified score result",
+                            extra=get_extra_info({
+                                **default_extra,
+                                **result,
+                            }),
+                        )
+                        log_status = "error"
+                        logger.error(log_text)
+
+                        return machine_spec, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+
                     score = 0
 
                     logger.info(
                         _m(
-                            f"Results from training job task: {results}",
+                            f"Results from training job task: {str(result)}",
                             extra=get_extra_info(default_extra),
                         ),
                     )
@@ -227,9 +297,9 @@ class TaskService:
                         logger.error(log_text)
 
                     else:
-                        job_taken_time = results[-1]
+                        job_taken_time = result["time"]
                         try:
-                            job_taken_time = float(job_taken_time.strip())
+                            job_taken_time = float(job_taken_time)
                         except Exception:
                             job_taken_time = end_time - start_time
 
