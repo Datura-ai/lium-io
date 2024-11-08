@@ -144,11 +144,11 @@ class MinerClient(abc.ABC):
                     await asyncio.sleep(sleep_time)
                 self.ws = await self._connect()
                 self.read_messages_task = self.loop.create_task(self.read_messages())
-                if self.debounce_counter:
-                    logger.info(
-                        f"Connected to miner after {self.debounce_counter + 1} attempts",
-                        extra=get_extra_info(self.logging_extra),
-                    )
+
+                logger.info(
+                    f"Connected to miner after {self.debounce_counter + 1} attempts",
+                    extra=get_extra_info(self.logging_extra),
+                )
                 return
             except (websockets.WebSocketException, OSError) as ex:
                 self.debounce_counter += 1
