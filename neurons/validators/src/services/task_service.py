@@ -120,14 +120,23 @@ class TaskService:
 
                     if max_score == 0 or gpu_count == 0:
                         log_text = _m(
-                            f"Max Score or GPU count is 0. No need to run job.",
+                            f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
                             extra=get_extra_info({
                                 **default_extra,
                                 "os_version": machine_spec.get('os', ''),
                                 "nvidia_cfg": machine_spec.get('nvidia_cfg', ''),
                                 "docker_cfg": machine_spec.get('docker_cfg', ''),
-                                "gpu_model": gpu_model,
-                                "gpu_count": gpu_count,
+                                "gpu_scrape_error": machine_spec.get('gpu_scrape_error', ''),
+                                "nvidia_cfg_scrape_error": machine_spec.get('nvidia_cfg_scrape_error', ''),
+                                "docker_cfg_scrape_error": machine_spec.get('docker_cfg_scrape_error', ''),
+                                "help_text": (
+                                    "If you have the gpu machine and encountering this issue consistantly, "
+                                    "then please pull the latest version of github repository and follow the installation guide here: "
+                                    "https://github.com/Datura-ai/compute-subnet/tree/main/neurons/executor. "
+                                    "Also, please configure the nvidia-container-runtime correctly. Check out here: "
+                                    "https://stackoverflow.com/questions/72932940/failed-to-initialize-nvml-unknown-error-in-docker-after-few-hours "
+                                    "https://bobcares.com/blog/docker-failed-to-initialize-nvml-unknown-error/"
+                                ),
                             }),
                         )
                         log_status = "warning"
