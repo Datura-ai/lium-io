@@ -100,7 +100,7 @@ class TaskService:
                         content = file.read()
                     modified_content = content.replace('signature_value', signature_value)
 
-                    remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
+                    remote_file_path = f"{executor_info.root_dir}/temp/{timestamp}.py"
                     async with sftp_client.open(remote_file_path, 'w') as remote_file:
                         await remote_file.write(modified_content)
 
@@ -234,7 +234,7 @@ class TaskService:
                         content = file.read()
                     modified_content = content.replace('signature_value', signature_value)
 
-                    remote_file_path = f"{executor_info.root_dir}/temp/job_{timestamp}.py"
+                    remote_file_path = f"{executor_info.root_dir}/temp/{timestamp}.py"
                     async with sftp_client.open(remote_file_path, 'w') as remote_file:
                         await remote_file.write(modified_content)
 
