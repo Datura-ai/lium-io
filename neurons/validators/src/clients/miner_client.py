@@ -20,7 +20,7 @@ from datura.requests.miner_requests import (
 )
 from datura.requests.validator_requests import AuthenticateRequest, AuthenticationPayload
 
-from core.utils import get_extra_info
+from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
 
@@ -138,25 +138,31 @@ class MinerClient(abc.ABC):
                 if self.debounce_counter:
                     sleep_time = self.sleep_time()
                     logger.info(
-                        f"Retrying connection to miner in {sleep_time:0.2f}",
-                        extra=get_extra_info(self.logging_extra),
+                        _m(
+                            f"Retrying connection to miner in {sleep_time:0.2f}",
+                            extra=get_extra_info(self.logging_extra)
+                        )
                     )
                     await asyncio.sleep(sleep_time)
                 self.ws = await self._connect()
                 self.read_messages_task = self.loop.create_task(self.read_messages())
 
                 logger.info(
-                    f"Connected to miner after {self.debounce_counter + 1} attempts",
-                    extra=get_extra_info(self.logging_extra),
+                    _m(
+                        f"Connected to miner after {self.debounce_counter + 1} attempts",
+                        extra=get_extra_info(self.logging_extra),
+                    )
                 )
                 return
             except (websockets.WebSocketException, OSError) as ex:
                 self.debounce_counter += 1
                 logger.error(
-                    f"Could not connect to miner: {str(ex)}",
-                    extra=get_extra_info(
-                        {**self.logging_extra, "debounce_counter": self.debounce_counter}
-                    ),
+                    _m(
+                        f"Could not connect to miner: {str(ex)}",
+                        extra=get_extra_info(
+                            {**self.logging_extra, "debounce_counter": self.debounce_counter}
+                        ),
+                    )
                 )
 
     def sleep_time(self):
@@ -175,8 +181,10 @@ class MinerClient(abc.ABC):
                 await self.ws.send(model.json())
             except websockets.WebSocketException:
                 logger.error(
-                    "Could not send to miner. Retrying 1+ seconds later...",
-                    extra=get_extra_info({**self.logging_extra, "model": str(model)}),
+                    _m(
+                        "Could not send to miner. Retrying 1+ seconds later...",
+                        extra=get_extra_info({**self.logging_extra, "model": str(model)}),
+                    )
                 )
                 await asyncio.sleep(1 + random.random())
                 continue
@@ -193,14 +201,16 @@ class MinerClient(abc.ABC):
             except websockets.WebSocketException as ex:
                 self.debounce_counter += 1
                 logger.error(
-                    "Connection to miner lost",
-                    extra=get_extra_info(
-                        {
-                            **self.logging_extra,
-                            "debounce_counter": self.debounce_counter,
-                            "error": str(ex),
-                        }
-                    ),
+                    _m(
+                        "Connection to miner lost",
+                        extra=get_extra_info(
+                            {
+                                **self.logging_extra,
+                                "debounce_counter": self.debounce_counter,
+                                "error": str(ex),
+                            }
+                        ),
+                    )
                 )
                 self.loop.create_task(self.await_connect())
                 return
@@ -210,8 +220,10 @@ class MinerClient(abc.ABC):
             except Exception as ex:
                 error_msg = f"Malformed message from miner: {str(ex)}"
                 logger.error(
-                    error_msg,
-                    extra=get_extra_info({**self.logging_extra, "error": str(ex)}),
+                    _m(
+                        error_msg,
+                        extra=get_extra_info({**self.logging_extra, "error": str(ex)}),
+                    )
                 )
                 continue
 
@@ -221,8 +233,10 @@ class MinerClient(abc.ABC):
                     raise RuntimeError(f"Received error message from miner: {msg.json()}")
                 except Exception:
                     logger.error(
-                        "Error closing websocket connection",
-                        extra=get_extra_info(self.logging_extra),
+                        _m(
+                            "Error closing websocket connection",
+                            extra=get_extra_info(self.logging_extra),
+                        )
                     )
                 continue
 
@@ -230,11 +244,14 @@ class MinerClient(abc.ABC):
                 await self.handle_message(msg)
             except UnsupportedMessageReceived:
                 error_msg = "Unsupported message from miner"
-                logger.error(error_msg, extra=get_extra_info(self.logging_extra))
+                logger.error(_m(error_msg, extra=get_extra_info(self.logging_extra)))
             else:
                 if self.debounce_counter:
                     logger.info(
-                        f"Receviced valid message from miner after {self.debounce_counter + 1} connection attempts",
-                        extra=get_extra_info(self.logging_extra),
+                        _m(
+                            f"Receviced valid message from miner after {self.debounce_counter + 1} connection attempts",
+                            extra=get_extra_info(self.logging_extra),
+                        )
+
                     )
                     self.debounce_counter = 0
