@@ -1,7 +1,12 @@
+import os
 import asyncio
 import logging
 from typing import Annotated
 import json
+from pathlib import Path
+import tempfile
+import shutil
+import subprocess
 
 import bittensor
 from clients.miner_client import MinerClient
@@ -112,6 +117,37 @@ class MinerService:
                             ),
                         ),
                     )
+                    if len(msg.executors) == 0:
+                        return None
+
+                    tmp_directory = Path(__file__).parent / "temp" / payload.miner_hotkey
+
+                    # generate pyarmor script
+                    encrypt_key = self.ssh_service.generate_random_string()
+
+                    # generate machine_scrape file
+                    machine_scrape_file_path = str(
+                        Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
+                    )
+                    with open(machine_scrape_file_path, 'r') as file:
+                        content = file.read()
+                    modified_content = content.replace('encrypt_key', encrypt_key)
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.py') as machine_scrape_file:
+                        machine_scrape_file.write(modified_content.encode('utf-8'))
+
+                    # generate scroe_script file
+                    score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
+                    with open(score_script_file_path, 'r') as file:
+                        content = file.read()
+                    modified_content = content.replace('encrypt_key', encrypt_key)
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.py') as score_file:
+                        score_file.write(modified_content.encode('utf-8'))
+
+                    # args = ['gen', '-O', str(tmp_directory), machine_scrape_file.name, score_file.name]
+                    # main_entry(args)
+                    subprocess.run(['pyarmor', 'gen', '-O', str(tmp_directory), machine_scrape_file.name, score_file.name])
 
                     tasks = [
                         asyncio.create_task(
@@ -120,6 +156,10 @@ class MinerService:
                                 executor_info=executor_info,
                                 keypair=my_key,
                                 private_key=private_key.decode("utf-8"),
+                                encrypt_key=encrypt_key,
+                                tmp_directory=str(tmp_directory),
+                                machine_scrape_file_name=os.path.basename(machine_scrape_file.name),
+                                score_file_name=os.path.basename(score_file.name),
                             )
                         )
                         for executor_info in msg.executors
@@ -130,6 +170,10 @@ class MinerService:
                         for result in await asyncio.gather(*tasks, return_exceptions=True)
                         if result
                     ]
+
+                    if tmp_directory.exists() and tmp_directory.is_dir():
+                        shutil.rmtree(tmp_directory)
+
                     logger.info(
                         _m(
                             "Finished running tasks for executors",
