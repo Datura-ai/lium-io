@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:ce8dc0a8ef8f04408a42f151c6ff6b10dd3c9cc664fcd7d3132a701ed50b074a"
+content_hash = "sha256:bf28cd49864db8cdbdaea5a1d9c300ad937143e78f6122cb07a37fd104c2f9e5"
 
 [[metadata.targets]]
 requires_python = "==3.11.*"
@@ -1303,6 +1303,39 @@ files = [
     {file = "py_sr25519_bindings-0.2.0-cp311-cp311-musllinux_1_1_x86_64.whl", hash = "sha256:8f06ea3237e06666e3a4ff4719b4fba415472943831b229428753c37d5ecd1b4"},
     {file = "py_sr25519_bindings-0.2.0-cp311-none-win_amd64.whl", hash = "sha256:d62af30b2022f5fa787e46c06823c35a21abe791bf55012f498f9ba8e4baabc8"},
     {file = "py_sr25519_bindings-0.2.0.tar.gz", hash = "sha256:0c2fe92b7cdcebf6c5611a90054f8ba6ea90b68b8832896d2dc565537bc40b0c"},
+]
+
+[[package]]
+name = "pyarmor"
+version = "9.0.5"
+summary = "A tool used to obfuscate python scripts, bind obfuscated scripts to fixed machine or expire obfuscated scripts."
+groups = ["default"]
+dependencies = [
+    "pyarmor-cli-core~=7.6.2",
+]
+files = [
+    {file = "pyarmor-9.0.5-py3-none-any.whl", hash = "sha256:71a0519e19efbcffca93ebb0a221497ffb11725d941a250c1a7b0cb69c5fabd7"},
+    {file = "pyarmor-9.0.5.zip", hash = "sha256:48d69e5bdda2715f60081afb0e3c7f15cceb4bf956dde05c555f3327dcdf4ad8"},
+]
+
+[[package]]
+name = "pyarmor-cli-core"
+version = "7.6.2"
+summary = "Provide extension module pytransform3 for Pyarmor"
+groups = ["default"]
+files = [
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-macosx_10_14_x86_64.whl", hash = "sha256:ae85e83e4dd6e8fa2d79cb1090af573cd823b3f77b0ab786250b273b8d91df0f"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-macosx_11_0_arm64.whl", hash = "sha256:5962d07223668198b0678aff67844c448dfb4b4406941ec0a11747ce21cc1262"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-manylinux1_i686.whl", hash = "sha256:cee32ccb42252e490fc6b82e37325201e7ffa767d185ab326bfe409a49191b88"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-manylinux1_x86_64.whl", hash = "sha256:17f2c8fa2a073ab565b57b0efba9633fad02ff58d70f41c5bc25560b99f74190"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-manylinux2014_aarch64.whl", hash = "sha256:504115d1a4e9ba93b78d3ec29b7aadda982a59e6b2698e2d8d847be81cd8727d"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-manylinux2014_armv7l.whl", hash = "sha256:a0097d4e7fbbb103d22ea67b3bea7c6f3e31a20464d8082df716bf4b62ad9140"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-musllinux_1_1_aarch64.whl", hash = "sha256:dba0bfdc3bf78d0dad64b8556c22573b2aaf73501d748dcb6c068ea3a7087180"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-musllinux_1_1_x86_64.whl", hash = "sha256:a95bd88545aaac6478f46ca8a5f8458b35383194c520067c5c9d216491c48110"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-win32.whl", hash = "sha256:17437c1830145542b708e376e17966834c2d34353094068cd52023f71650ba47"},
+    {file = "pyarmor.cli.core-7.6.2-cp311-none-win_amd64.whl", hash = "sha256:574dc563749e897fa8fd8527c504ad9f5ed50aaf21bb523a1e5c92f586e04bb3"},
+    {file = "pyarmor.cli.core-7.6.2-py3-none-any.whl", hash = "sha256:26fc0d98ffb60e2ee45af853947cbaea3a8727d8f20ebba133c1877b1637da72"},
+    {file = "pyarmor.cli.core-7.6.2.zip", hash = "sha256:7ca18969df1a75d9a313434aa53b93d3f5efca339d87c2a276d924870f30e02f"},
 ]
 
 [[package]]
