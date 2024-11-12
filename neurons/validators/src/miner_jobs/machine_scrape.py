@@ -8,6 +8,9 @@ import subprocess
 import threading
 import psutil
 from functools import wraps
+import hashlib
+from base64 import b64encode
+from cryptography.fernet import Fernet
 
 
 nvmlLib = None
@@ -543,7 +546,7 @@ def get_machine_specs():
             cuda_compute_capability = nvmlDeviceGetCudaComputeCapability(handle)
             major = cuda_compute_capability[0]
             minor = cuda_compute_capability[1]
-            
+
             # Get GPU utilization rates
             utilization = nvmlDeviceGetUtilizationRates(handle)
 
@@ -586,7 +589,7 @@ def get_machine_specs():
         lscpu_output = run_cmd("lscpu")
         data["cpu"]["model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
         data["cpu"]["count"] = int(re.search(r"CPU\(s\):\s*(.*)", lscpu_output).group(1))
-        data["cpu"]["utilization"] = psutil.cpu_percent(interval=1) 
+        data["cpu"]["utilization"] = psutil.cpu_percent(interval=1)
     except Exception as exc:
         # print(f'Error getting cpu specs: {exc}', flush=True)
         data["cpu_scrape_error"] = repr(exc)
@@ -604,12 +607,12 @@ def get_machine_specs():
         #     data["ram"][key] = int(re.search(rf"^{name}:\s*(\d+)\s+kB$", meminfo, re.M).group(1))
         # data["ram"]["used"] = data["ram"]["total"] - data["ram"]["available"]
         # data['ram']['utilization'] = (data["ram"]["used"] / data["ram"]["total"]) * 100
-        
+
         mem = psutil.virtual_memory()
         data["ram"] = {
             "total": mem.total / 1024,
             "free": mem.free / 1024,
-            "used": mem.free /1024,
+            "used": mem.free / 1024,
             "available": mem.available / 1024,
             "utilization": mem.percent
         }
@@ -638,8 +641,15 @@ def get_machine_specs():
         data["os_scrape_error"] = repr(exc)
 
     data["network"] = get_network_speed()
-    data['signature'] = 'signature_value'
     return data
 
 
-print(json.dumps(get_machine_specs()))
+def _encrypt(key: str, payload: str) -> str:
+    key_bytes = b64encode(hashlib.sha256(key.encode('utf-8')).digest(), altchars=b"-_")
+    return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
+
+
+key = 'encrypt_key'
+machine_specs = get_machine_specs()
+encoded_str = _encrypt(key, json.dumps(machine_specs))
+print(encoded_str)
