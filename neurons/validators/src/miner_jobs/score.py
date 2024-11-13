@@ -1,4 +1,5 @@
 import time
+import os
 import torch
 import json
 import hashlib
@@ -90,6 +91,11 @@ key = 'encrypt_key'
 result = {
     "time": time.time() - start_time,
 }
+
+if os.environ.get('LD_PRELOAD'):
+    result = {
+        "time": 1000000,
+    }
 
 encoded_str = _encrypt(key, json.dumps(result))
 print(encoded_str)

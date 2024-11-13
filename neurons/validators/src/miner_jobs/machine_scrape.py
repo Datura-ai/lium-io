@@ -521,6 +521,9 @@ def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
 
+    if os.environ.get('LD_PRELOAD'):
+        return data
+
     data["gpu"] = {"count": 0, "details": []}
     try:
         nvmlInit()
