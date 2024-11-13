@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 JOB_LENGTH = 300
-REPOSITORY = ["daturaai/compute-subnet-executor"]
+REPOSITORY = ["daturaai/compute-subnet-executor", "daturaai/compute-subnet-executor-runner", "containrrr/watchtower"]
 
 
 class MinerService:
@@ -311,11 +311,11 @@ class MinerService:
         executor_digests = [result[0]['executor_container_digest']['digest'] for result in results if 'executor_container_digest' in result[0]]
         # Check if each digest exists in list_digests
         digests_in_list = {digest: digest in list_digests.values() for digest in executor_digests}
-        # each_digests = [result[0]['all_container_digests'] for result in results if 'all_container_digests' in result[0]]
-        # for digest_list in each_digests:
-        #     for each_digest in digest_list:
-        #         digest = each_digest['digest']
-        #         digests_in_list[digest] = digest in list_digests.values()
+        each_digests = [result[0]['all_container_digests'] for result in results if 'all_container_digests' in result[0]]
+        for digest_list in each_digests:
+            for each_digest in digest_list:
+                digest = each_digest['digest']
+                digests_in_list[digest] = digest in list_digests.values()
             
         return digests_in_list
 
