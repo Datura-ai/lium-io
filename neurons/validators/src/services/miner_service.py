@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import shutil
 import subprocess
+import requests
 
 import bittensor
 from clients.miner_client import MinerClient
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 JOB_LENGTH = 300
+REPOSITORY = ["daturaai/compute-subnet-executor"]
 
 
 class MinerService:
@@ -58,6 +60,7 @@ class MinerService:
         self.task_service = task_service
         self.docker_service = docker_service
         self.redis_service = redis_service
+        self.is_valid = True
 
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
         loop = asyncio.get_event_loop()
@@ -183,6 +186,14 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
+
+                    list_digests = self.get_docker_hub_digests(REPOSITORY)
+
+                    digests_in_list = self.check_digests(results, list_digests)
+                    duplicates = self.check_duplidate_digests(results)
+                    # Validate digests
+                    self.is_valid = self.validate_digests(digests_in_list, duplicates)
+                        
                     await self.publish_machine_specs(results, miner_client.miner_hotkey)
 
                     await self.store_executor_counts(payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results)
@@ -240,6 +251,88 @@ class MinerService:
                 exc_info=True,
             )
             return None
+        
+    def validate_digests(self, digests_in_list, duplicates):
+        # Check if any digest in digests_in_list is False
+        if any(not is_in_list for is_in_list in digests_in_list.values()):
+            return False
+
+        if duplicates:
+            return False
+
+        return True
+    
+    def get_docker_hub_digests(self, repositories):
+        """Retrieve all tags and their corresponding digests from Docker Hub."""
+        all_digests = {}  # Initialize a dictionary to store all tag-digest pairs
+
+        for repository in repositories:
+            try:
+                # Get authorization token
+                token_response = requests.get(
+                    f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repository}:pull"
+                )
+                token_response.raise_for_status()  # Raise an error for bad responses
+                token = token_response.json().get("token")
+
+                # Find all tags
+                tags_response = requests.get(
+                    f"https://index.docker.io/v2/{repository}/tags/list",
+                    headers={"Authorization": f"Bearer {token}"}
+                )
+                tags_response.raise_for_status()
+                all_tags = tags_response.json().get("tags", [])
+
+                # Dictionary to store tag-digest pairs for the current repository
+                tag_digests = {}
+                for tag in all_tags:
+                    # Get image digest
+                    manifest_response = requests.head(
+                        f"https://index.docker.io/v2/{repository}/manifests/{tag}",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/vnd.docker.distribution.manifest.v2+json"
+                        }
+                    )
+                    manifest_response.raise_for_status()
+                    digest = manifest_response.headers.get("Docker-Content-Digest")
+                    tag_digests[f"{repository}:{tag}"] = digest
+
+                # Update the all_digests dictionary with the current repository's tag-digest pairs
+                all_digests.update(tag_digests)
+
+            except requests.exceptions.RequestException as e:
+                print(f"Error retrieving data for {repository}: {e}")
+
+        return all_digests 
+
+    def check_digests(self, results, list_digests):
+
+        executor_digests = [result[0]['executor_container_digest']['digest'] for result in results if 'executor_container_digest' in result[0]]
+        # Check if each digest exists in list_digests
+        digests_in_list = {digest: digest in list_digests.values() for digest in executor_digests}
+        # each_digests = [result[0]['all_container_digests'] for result in results if 'all_container_digests' in result[0]]
+        # for digest_list in each_digests:
+        #     for each_digest in digest_list:
+        #         digest = each_digest['digest']
+        #         digests_in_list[digest] = digest in list_digests.values()
+            
+        return digests_in_list
+
+    def check_duplidate_digests(self, results):
+        # Find duplicate digests in results
+        digest_count = {}
+        for result in results:
+            all_container_digests = result[0].get('all_container_digests', [])
+            for container_digest in all_container_digests:
+                digest = container_digest['digest']
+                if digest in digest_count:
+                    digest_count[digest] += 1
+                else:
+                    digest_count[digest] = 1
+
+        duplicates = {digest: count for digest, count in digest_count.items() if count > 1}
+        return duplicates
 
     async def publish_machine_specs(
         self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str
@@ -256,6 +349,8 @@ class MinerService:
             ),
         )
         for specs, ssh_info, score, job_batch_id, log_status, log_text in results:
+            if not self.is_valid:
+                score = 0
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL_NAME,

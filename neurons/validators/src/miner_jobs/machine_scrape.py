@@ -9,6 +9,7 @@ import threading
 import psutil
 from functools import wraps
 import hashlib
+import docker
 from base64 import b64encode
 from cryptography.fernet import Fernet
 
@@ -516,6 +517,53 @@ def get_network_speed():
         data["network_speed_error"] = repr(exc)
     return data
 
+def get_container_id():
+    """Retrieve the Docker container ID if running inside a container."""
+    try:
+        with open('/proc/self/cgroup', 'r') as f:
+            for line in f:
+                if 'docker' in line:
+                    return line.strip().split('/')[-1]
+    except FileNotFoundError:
+        return None
+    
+def get_container_digest(container_id):
+    """Retrieve the digest of a specific container using its ID."""
+    client = docker.from_env()
+    try:
+        container = client.containers.get(container_id)
+        image_id = container.image.id
+        image = client.images.get(image_id)
+        digest = None
+        if image.tags:
+            for repo_digest in image.attrs['RepoDigests']:
+                if repo_digest.startswith(image.tags[0].split(':')[0]):
+                    digest = repo_digest.split('@')[1]
+                    break
+        return digest
+    except docker.errors.NotFound:
+        return None
+    
+def get_all_container_digests():
+    """Verify and return the digests of all running containers."""
+    client = docker.from_env()
+    containers = client.containers.list()
+
+    digests = []  # Initialize an empty list to store digests
+
+    for container in containers:
+        image_id = container.image.id
+        image = client.images.get(image_id)
+        digest = None
+        if image.tags:
+            for repo_digest in image.attrs['RepoDigests']:
+                if repo_digest.startswith(image.tags[0].split(':')[0]):
+                    digest = repo_digest.split('@')[1]
+                    break
+        if digest:
+           digests.append({'id': container.id, 'digest': digest})   # Add the digest to the list
+
+    return digests  # Return the list of digests
 
 def get_machine_specs():
     """Get Specs of miner machine."""
@@ -644,6 +692,9 @@ def get_machine_specs():
         data["os_scrape_error"] = repr(exc)
 
     data["network"] = get_network_speed()
+    container_id = get_container_id()
+    data["executor_container_digest"] = {"id": container_id, "digest": get_container_digest(container_id)} if container_id else {}
+    data["all_container_digests"] = get_all_container_digests()
     return data
 
 
