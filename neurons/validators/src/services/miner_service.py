@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 JOB_LENGTH = 300
-REPOSITORYS = ["daturaai/compute-subnet-executor", "daturaai/compute-subnet-executor-runner", "containrrr/watchtower", "daturaai/pytorch:1.13.0-py3.10-cuda11.7.1-devel-ubuntu22.04", "daturaai/pytorch:1.9.1-py3.9-cuda11.1.1-devel-ubuntu20.04"]
+REPOSITORYS = ["daturaai/compute-subnet-executor", "daturaai/compute-subnet-executor-runner", "containrrr/watchtower", "daturaai/pytorch"]
 
 
 class MinerService:
@@ -60,7 +60,6 @@ class MinerService:
         self.task_service = task_service
         self.docker_service = docker_service
         self.redis_service = redis_service
-        self.is_valid = True
         self.docker_hub_digests = self.get_docker_hub_digests(REPOSITORYS)
 
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
@@ -164,6 +163,7 @@ class MinerService:
                                 tmp_directory=str(tmp_directory),
                                 machine_scrape_file_name=os.path.basename(machine_scrape_file.name),
                                 score_file_name=os.path.basename(score_file.name),
+                                docker_hub_digests=self.docker_hub_digests
                             )
                         )
                         for executor_info in msg.executors
@@ -187,10 +187,6 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
-                    digests_in_list = self.task_service.check_digests(results, self.docker_hub_digests)
-                    duplicates = self.task_service.check_duplidate_digests(results)
-                    # Validate digests
-                    self.is_valid = self.task_service.validate_digests(digests_in_list, duplicates)
                     await self.publish_machine_specs(results, miner_client.miner_hotkey)
                     await self.store_executor_counts(payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results)
 
@@ -198,8 +194,6 @@ class MinerService:
                     for _, _, score, _, _, _ in results:
                         total_score += score
 
-                    if not self.is_valid:
-                        total_score = 0
 
                     logger.info(
                         _m(
