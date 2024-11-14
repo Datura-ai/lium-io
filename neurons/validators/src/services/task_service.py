@@ -65,6 +65,44 @@ class TaskService:
                 # Await all upload tasks for the current directory
                 await asyncio.gather(*upload_tasks)
 
+    def check_digests(self, results, list_digests):
+
+        # Check if each digest exists in list_digests
+        digests_in_list = {}
+        each_digests = [result[0]['all_container_digests'] for result in results if 'all_container_digests' in result[0]]
+        for digest_list in each_digests:
+            for each_digest in digest_list:
+                digest = each_digest['digest']
+                digests_in_list[digest] = digest in list_digests.values()
+            
+        return digests_in_list
+    
+    def check_duplidate_digests(self, results):
+        # Find duplicate digests in results
+        digest_count = {}
+        for result in results:
+            all_container_digests = result[0].get('all_container_digests', [])
+            for container_digest in all_container_digests:
+                digest = container_digest['digest']
+                if digest in digest_count:
+                    digest_count[digest] += 1
+                else:
+                    digest_count[digest] = 1
+
+        duplicates = {digest: count for digest, count in digest_count.items() if count > 1}
+        return duplicates
+    
+    def validate_digests(self, digests_in_list, duplicates):
+        # Check if any digest in digests_in_list is False
+        if any(not is_in_list for is_in_list in digests_in_list.values()):
+            return False
+
+        if duplicates:
+            return False
+
+        return True
+    
+    
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,

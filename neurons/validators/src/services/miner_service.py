@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 JOB_LENGTH = 300
-REPOSITORY = ["daturaai/compute-subnet-executor", "daturaai/compute-subnet-executor-runner", "containrrr/watchtower"]
+REPOSITORYS = ["daturaai/compute-subnet-executor", "daturaai/compute-subnet-executor-runner", "containrrr/watchtower", "daturaai/pytorch:1.13.0-py3.10-cuda11.7.1-devel-ubuntu22.04", "daturaai/pytorch:1.9.1-py3.9-cuda11.1.1-devel-ubuntu20.04"]
 
 
 class MinerService:
@@ -61,6 +61,7 @@ class MinerService:
         self.docker_service = docker_service
         self.redis_service = redis_service
         self.is_valid = True
+        self.docker_hub_digests = self.get_docker_hub_digests(REPOSITORYS)
 
     async def request_job_to_miner(self, payload: MinerJobRequestPayload):
         loop = asyncio.get_event_loop()
@@ -186,21 +187,19 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
-
-                    list_digests = self.get_docker_hub_digests(REPOSITORY)
-
-                    digests_in_list = self.check_digests(results, list_digests)
-                    duplicates = self.check_duplidate_digests(results)
+                    digests_in_list = self.task_service.check_digests(results, self.docker_hub_digests)
+                    duplicates = self.task_service.check_duplidate_digests(results)
                     # Validate digests
-                    self.is_valid = self.validate_digests(digests_in_list, duplicates)
-                        
+                    self.is_valid = self.task_service.validate_digests(digests_in_list, duplicates)
                     await self.publish_machine_specs(results, miner_client.miner_hotkey)
-
                     await self.store_executor_counts(payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results)
 
                     total_score = 0
                     for _, _, score, _, _, _ in results:
                         total_score += score
+
+                    if not self.is_valid:
+                        total_score = 0
 
                     logger.info(
                         _m(
@@ -252,16 +251,6 @@ class MinerService:
             )
             return None
         
-    def validate_digests(self, digests_in_list, duplicates):
-        # Check if any digest in digests_in_list is False
-        if any(not is_in_list for is_in_list in digests_in_list.values()):
-            return False
-
-        if duplicates:
-            return False
-
-        return True
-    
     def get_docker_hub_digests(self, repositories):
         """Retrieve all tags and their corresponding digests from Docker Hub."""
         all_digests = {}  # Initialize a dictionary to store all tag-digest pairs
@@ -306,33 +295,6 @@ class MinerService:
 
         return all_digests 
 
-    def check_digests(self, results, list_digests):
-
-        executor_digests = [result[0]['executor_container_digest']['digest'] for result in results if 'executor_container_digest' in result[0]]
-        # Check if each digest exists in list_digests
-        digests_in_list = {digest: digest in list_digests.values() for digest in executor_digests}
-        each_digests = [result[0]['all_container_digests'] for result in results if 'all_container_digests' in result[0]]
-        for digest_list in each_digests:
-            for each_digest in digest_list:
-                digest = each_digest['digest']
-                digests_in_list[digest] = digest in list_digests.values()
-            
-        return digests_in_list
-
-    def check_duplidate_digests(self, results):
-        # Find duplicate digests in results
-        digest_count = {}
-        for result in results:
-            all_container_digests = result[0].get('all_container_digests', [])
-            for container_digest in all_container_digests:
-                digest = container_digest['digest']
-                if digest in digest_count:
-                    digest_count[digest] += 1
-                else:
-                    digest_count[digest] = 1
-
-        duplicates = {digest: count for digest, count in digest_count.items() if count > 1}
-        return duplicates
 
     async def publish_machine_specs(
         self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str
@@ -349,8 +311,6 @@ class MinerService:
             ),
         )
         for specs, ssh_info, score, job_batch_id, log_status, log_text in results:
-            if not self.is_valid:
-                score = 0
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL_NAME,
