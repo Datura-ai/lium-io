@@ -38,6 +38,7 @@ class TaskService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.is_valid = True
+
     async def upload_directory(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -66,16 +67,15 @@ class TaskService:
                 await asyncio.gather(*upload_tasks)
 
     def check_digests(self, result, list_digests):
-
         # Check if each digest exists in list_digests
         digests_in_list = {}
         each_digests = result['all_container_digests']
         for each_digest in each_digests:
             digest = each_digest['digest']
             digests_in_list[digest] = digest in list_digests.values()
-            
+
         return digests_in_list
-    
+
     def check_duplidate_digests(self, result):
         # Find duplicate digests in results
         digest_count = {}
@@ -89,7 +89,7 @@ class TaskService:
 
         duplicates = {digest: count for digest, count in digest_count.items() if count > 1}
         return duplicates
-    
+
     def validate_digests(self, digests_in_list, duplicates):
         # Check if any digest in digests_in_list is False
         if any(not is_in_list for is_in_list in digests_in_list.values()):
@@ -99,8 +99,7 @@ class TaskService:
             return False
 
         return True
-    
-    
+
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -111,7 +110,7 @@ class TaskService:
         tmp_directory: str,
         machine_scrape_file_name: str,
         score_file_name: str,
-        docker_hub_digests: dict[str, str],
+        docker_hub_digests: dict[str, str]
     ):
         default_extra = {
             "job_batch_id": miner_info.job_batch_id,
@@ -165,6 +164,7 @@ class TaskService:
 
                 digests_in_list = self.check_digests(machine_spec, docker_hub_digests)
                 duplicates = self.check_duplidate_digests(machine_spec)
+
                 # Validate digests
                 self.is_valid = self.validate_digests(digests_in_list, duplicates)
 
