@@ -167,6 +167,15 @@ class TaskService:
                 duplicates = self.check_duplidate_digests(machine_spec)
                 # Validate digests
                 self.is_valid = self.validate_digests(digests_in_list, duplicates)
+
+                if not self.is_valid:
+                    log_text = _m(
+                        "Docker digests are not valid",
+                        extra=get_extra_info(default_extra),
+                    )
+                    log_status = "warning"
+                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+
                 gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
                     details = machine_spec["gpu"].get("details", [])
@@ -219,7 +228,7 @@ class TaskService:
                     log_status = "warning"
                     logger.warning(log_text)
                     return (
-                        machine_spec if self.is_valid else None,
+                        machine_spec,
                         executor_info,
                         0,
                         miner_info.job_batch_id,
@@ -247,9 +256,9 @@ class TaskService:
                     log_status = "info"
                     logger.info(log_text)
                     return (
-                        machine_spec if self.is_valid else None,
+                        machine_spec,
                         executor_info,
-                        score if self.is_valid else 0,
+                        score,
                         miner_info.job_batch_id,
                         log_status,
                         log_text,
@@ -269,7 +278,7 @@ class TaskService:
                     log_status = "warning"
                     logger.warning(log_text)
                     return (
-                        machine_spec if self.is_valid else None,
+                        machine_spec,
                         executor_info,
                         0,
                         miner_info.job_batch_id,
@@ -341,7 +350,7 @@ class TaskService:
                         extra=get_extra_info(
                             {
                                 **default_extra,
-                                "score": score if self.is_valid else 0,
+                                "score": score,
                                 "job_taken_time": job_taken_time,
                                 "upload_speed": upload_speed,
                                 "download_speed": download_speed,
@@ -361,9 +370,9 @@ class TaskService:
                 await ssh_client.run(f"rm -rf {remote_dir}")
 
                 return (
-                    machine_spec if self.is_valid else None,
+                    machine_spec,
                     executor_info,
-                    score if self.is_valid else 0,
+                    score,
                     miner_info.job_batch_id,
                     log_status,
                     log_text,
