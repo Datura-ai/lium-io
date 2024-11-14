@@ -18,6 +18,7 @@ dependencies = [
     "datasets>=2.20.0",
     "transformers>=4.43.4",
     "psutil>=6.1.0",
+    "docker>=7.1.0",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"

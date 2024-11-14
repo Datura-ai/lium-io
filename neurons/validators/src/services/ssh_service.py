@@ -1,5 +1,7 @@
 import hashlib
 from base64 import b64encode
+import random
+import string
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import serialization
@@ -7,6 +9,11 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 
 class SSHService:
+    def generate_random_string(self, length=30):
+        characters = string.ascii_letters + string.digits
+        random_string = ''.join(random.choices(characters, k=length))
+        return random_string
+
     def _hash(self, s: bytes) -> bytes:
         return b64encode(hashlib.sha256(s).digest(), altchars=b"-_")
 
