@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import shutil
 import subprocess
+import requests
 
 import bittensor
 from clients.miner_client import MinerClient
@@ -59,7 +60,7 @@ class MinerService:
         self.docker_service = docker_service
         self.redis_service = redis_service
 
-    async def request_job_to_miner(self, payload: MinerJobRequestPayload):
+    async def request_job_to_miner(self, payload: MinerJobRequestPayload, docker_hub_digests: dict[str, str]):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
@@ -160,6 +161,7 @@ class MinerService:
                                 tmp_directory=str(tmp_directory),
                                 machine_scrape_file_name=os.path.basename(machine_scrape_file.name),
                                 score_file_name=os.path.basename(score_file.name),
+                                docker_hub_digests=docker_hub_digests,
                             )
                         )
                         for executor_info in msg.executors
@@ -184,7 +186,6 @@ class MinerService:
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
                     await self.publish_machine_specs(results, miner_client.miner_hotkey)
-
                     await self.store_executor_counts(payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results)
 
                     total_score = 0

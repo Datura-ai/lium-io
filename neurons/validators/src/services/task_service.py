@@ -37,6 +37,7 @@ class TaskService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.is_valid = True
 
     async def upload_directory(
         self,
@@ -65,6 +66,40 @@ class TaskService:
                 # Await all upload tasks for the current directory
                 await asyncio.gather(*upload_tasks)
 
+    def check_digests(self, result, list_digests):
+        # Check if each digest exists in list_digests
+        digests_in_list = {}
+        each_digests = result['all_container_digests']
+        for each_digest in each_digests:
+            digest = each_digest['digest']
+            digests_in_list[digest] = digest in list_digests.values()
+
+        return digests_in_list
+
+    def check_duplidate_digests(self, result):
+        # Find duplicate digests in results
+        digest_count = {}
+        all_container_digests = result.get('all_container_digests', [])
+        for container_digest in all_container_digests:
+            digest = container_digest['digest']
+            if digest in digest_count:
+                digest_count[digest] += 1
+            else:
+                digest_count[digest] = 1
+
+        duplicates = {digest: count for digest, count in digest_count.items() if count > 1}
+        return duplicates
+
+    def validate_digests(self, digests_in_list, duplicates):
+        # Check if any digest in digests_in_list is False
+        if any(not is_in_list for is_in_list in digests_in_list.values()):
+            return False
+
+        if duplicates:
+            return False
+
+        return True
+
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -75,6 +110,7 @@ class TaskService:
         tmp_directory: str,
         machine_scrape_file_name: str,
         score_file_name: str,
+        docker_hub_digests: dict[str, str]
     ):
         default_extra = {
             "job_batch_id": miner_info.job_batch_id,
@@ -125,6 +161,20 @@ class TaskService:
                     return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                 machine_spec = json.loads(self.ssh_service.decrypt_payload(encrypt_key, machine_specs[0].strip()))
+
+                digests_in_list = self.check_digests(machine_spec, docker_hub_digests)
+                duplicates = self.check_duplidate_digests(machine_spec)
+
+                # Validate digests
+                self.is_valid = self.validate_digests(digests_in_list, duplicates)
+
+                if not self.is_valid:
+                    log_text = _m(
+                        "Docker digests are not valid",
+                        extra=get_extra_info(default_extra),
+                    )
+                    log_status = "warning"
+                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                 gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -292,21 +342,6 @@ class TaskService:
                         job_taken_score * gpu_count * JOB_TAKEN_TIME_WEIGHT
                         + upload_speed_score * UPLOAD_SPEED_WEIGHT
                         + download_speed_score * DOWNLOAD_SPEED_WEIGHT
-                    )
-
-                    logger.info(
-                        _m(
-                            "Train task finished",
-                            extra=get_extra_info(
-                                {
-                                    **default_extra,
-                                    "score": score,
-                                    "job_taken_time": job_taken_time,
-                                    "upload_speed": upload_speed,
-                                    "download_speed": download_speed,
-                                }
-                            ),
-                        ),
                     )
 
                     log_status = "info"

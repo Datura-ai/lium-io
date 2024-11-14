@@ -13,7 +13,8 @@ from bittensor.utils.weight_utils import (
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
-from services.docker_service import DockerService
+from core.utils import _m, get_extra_info
+from services.docker_service import DockerService, REPOSITORYS
 from services.miner_service import MinerService
 from services.redis_service import RedisService, EXECUTOR_COUNT_PREFIX
 from services.ssh_service import SSHService
@@ -57,14 +58,14 @@ class Validator:
             ssh_service=ssh_service,
             redis_service=self.redis_service,
         )
-        docker_service = DockerService(
+        self.docker_service = DockerService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
         )
         self.miner_service = MinerService(
             ssh_service=ssh_service,
             task_service=task_service,
-            docker_service=docker_service,
+            docker_service=self.docker_service,
             redis_service=self.redis_service,
         )
 
@@ -321,6 +322,19 @@ class Validator:
 
                 self.last_job_run_blocks = current_block
 
+                docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORYS)
+                logger.info(
+                    _m(
+                        "Docker Hub Digests",
+                        extra=get_extra_info(
+                            {
+                                "job_batch_id": job_batch_id,
+                                "docker_hub_digests": docker_hub_digests
+                            }
+                        ),
+                    ),
+                )
+
                 # request jobs
                 jobs = [
                     asyncio.create_task(
@@ -330,7 +344,8 @@ class Validator:
                                 miner_hotkey=miner.hotkey,
                                 miner_address=miner.axon_info.ip,
                                 miner_port=miner.axon_info.port,
-                            )
+                            ),
+                            docker_hub_digests=docker_hub_digests,
                         )
                     )
                     for miner in miners
@@ -358,7 +373,7 @@ class Validator:
 
                                 if parsed_counts:
                                     bittensor.logging.info(f"[executor_counts_list] miner_hotkey: {miner_hotkey}, list: {parsed_counts}")
-                                    
+
                                     max_executors = max(parsed_counts, key=lambda x: x['total'])['total']
                                     min_executors = min(parsed_counts, key=lambda x: x['total'])['total']
 
