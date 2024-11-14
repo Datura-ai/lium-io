@@ -11,6 +11,7 @@ from core.utils import configure_logs_of_other_modules
 from core.validator import Validator
 from services.ioc import ioc
 from services.miner_service import MinerService
+from services.docker_service import DockerService, REPOSITORYS
 from payload_models.payloads import (
     MinerJobRequestPayload,
 )
@@ -140,6 +141,9 @@ def request_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int)
 
 async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
     miner_service: MinerService = ioc["MinerService"]
+    docker_service: DockerService = ioc["DockerService"]
+
+    docker_hub_digests = await docker_service.get_docker_hub_digests(REPOSITORYS)
 
     await miner_service.request_job_to_miner(
         MinerJobRequestPayload(
@@ -147,7 +151,8 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
             miner_hotkey=miner_hotkey,
             miner_address=miner_address,
             miner_port=miner_port,
-        )
+        ),
+        docker_hub_digests=docker_hub_digests,
     )
 
 if __name__ == "__main__":

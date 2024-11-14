@@ -45,7 +45,6 @@ logger = logging.getLogger(__name__)
 
 
 JOB_LENGTH = 300
-REPOSITORYS = ["daturaai/compute-subnet-executor", "daturaai/compute-subnet-executor-runner", "containrrr/watchtower", "daturaai/pytorch"]
 
 
 class MinerService:
@@ -60,9 +59,8 @@ class MinerService:
         self.task_service = task_service
         self.docker_service = docker_service
         self.redis_service = redis_service
-        self.docker_hub_digests = self.get_docker_hub_digests(REPOSITORYS)
 
-    async def request_job_to_miner(self, payload: MinerJobRequestPayload):
+    async def request_job_to_miner(self, payload: MinerJobRequestPayload, docker_hub_digests: dict[str, str]):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
@@ -163,7 +161,7 @@ class MinerService:
                                 tmp_directory=str(tmp_directory),
                                 machine_scrape_file_name=os.path.basename(machine_scrape_file.name),
                                 score_file_name=os.path.basename(score_file.name),
-                                docker_hub_digests=self.docker_hub_digests
+                                docker_hub_digests=docker_hub_digests,
                             )
                         )
                         for executor_info in msg.executors
@@ -193,7 +191,6 @@ class MinerService:
                     total_score = 0
                     for _, _, score, _, _, _ in results:
                         total_score += score
-
 
                     logger.info(
                         _m(
@@ -244,51 +241,6 @@ class MinerService:
                 exc_info=True,
             )
             return None
-        
-    def get_docker_hub_digests(self, repositories):
-        """Retrieve all tags and their corresponding digests from Docker Hub."""
-        all_digests = {}  # Initialize a dictionary to store all tag-digest pairs
-
-        for repository in repositories:
-            try:
-                # Get authorization token
-                token_response = requests.get(
-                    f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repository}:pull"
-                )
-                token_response.raise_for_status()  # Raise an error for bad responses
-                token = token_response.json().get("token")
-
-                # Find all tags
-                tags_response = requests.get(
-                    f"https://index.docker.io/v2/{repository}/tags/list",
-                    headers={"Authorization": f"Bearer {token}"}
-                )
-                tags_response.raise_for_status()
-                all_tags = tags_response.json().get("tags", [])
-
-                # Dictionary to store tag-digest pairs for the current repository
-                tag_digests = {}
-                for tag in all_tags:
-                    # Get image digest
-                    manifest_response = requests.head(
-                        f"https://index.docker.io/v2/{repository}/manifests/{tag}",
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "Accept": "application/vnd.docker.distribution.manifest.v2+json"
-                        }
-                    )
-                    manifest_response.raise_for_status()
-                    digest = manifest_response.headers.get("Docker-Content-Digest")
-                    tag_digests[f"{repository}:{tag}"] = digest
-
-                # Update the all_digests dictionary with the current repository's tag-digest pairs
-                all_digests.update(tag_digests)
-
-            except requests.exceptions.RequestException as e:
-                print(f"Error retrieving data for {repository}: {e}")
-
-        return all_digests 
-
 
     async def publish_machine_specs(
         self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str
