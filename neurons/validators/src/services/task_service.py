@@ -181,16 +181,16 @@ class TaskService:
                 # Validate digests
                 self.is_valid = self.validate_digests(digests_in_list, duplicates)
 
-                # if not self.is_valid:
-                #     log_text = _m(
-                #         "Docker digests are not valid",
-                #         extra=get_extra_info(default_extra),
-                #     )
-                #     log_status = "warning"
+                if not self.is_valid:
+                    log_text = _m(
+                        "Docker digests are not valid",
+                        extra=get_extra_info(default_extra),
+                    )
+                    log_status = "warning"
 
-                #     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_remote_directory(ssh_client, remote_dir)
 
-                #     return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                 gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -293,7 +293,7 @@ class TaskService:
                     ssh_client=ssh_client,
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
-                    command=f"export PYTHONPATH={executor_info.root_dir} && {executor_info.python_path} {remote_score_file_path}",
+                    command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path}",
                 )
                 if not results:
                     log_text = _m(
@@ -317,7 +317,6 @@ class TaskService:
                 end_time = time.time()
 
                 result = json.loads(self.ssh_service.decrypt_payload(encypted_files.encrypt_key, results[0]))
-                print('result ===>', result)
 
                 score = 0
 
@@ -435,6 +434,7 @@ class TaskService:
                 "executor_ip_address": executor_info.address,
                 "executor_port": executor_info.port,
                 "miner_hotkey": miner_hotkey,
+                "command": command,
             }
             context.set(f"[_run_task][{executor_name}]")
             logger.info(

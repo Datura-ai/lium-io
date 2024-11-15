@@ -20,7 +20,11 @@ class FileEncryptService:
         self.ssh_service = ssh_service
 
     def make_obfuscated_file(self, tmp_directory: str, file_path: str):
-        subprocess.run(['pyarmor', 'gen', '-O', tmp_directory, file_path])
+        subprocess.run(
+            ['pyarmor', 'gen', '-O', tmp_directory, file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE ,
+        )
         return os.path.basename(file_path)
 
     def make_binary_file(self, tmp_directory: str, file_path: str):
@@ -55,6 +59,8 @@ class FileEncryptService:
 
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:
             machine_scrape_file.write(modified_content.encode('utf-8'))
+            machine_scrape_file.flush()
+            os.fsync(machine_scrape_file.fileno())
             machine_scrape_file_name = self.make_binary_file(str(tmp_directory), machine_scrape_file.name)
 
         # generate score_script file
@@ -65,6 +71,8 @@ class FileEncryptService:
 
         with tempfile.NamedTemporaryFile(delete=True, suffix='.py') as score_file:
             score_file.write(modified_content.encode('utf-8'))
+            score_file.flush()
+            os.fsync(score_file.fileno())
             score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
         return MinerJobEnryptedFiles(
