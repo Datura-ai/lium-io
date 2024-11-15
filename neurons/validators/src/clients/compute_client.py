@@ -19,13 +19,14 @@ from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     ExecutorSpecRequest,
     RentedMachineRequest,
+    LogValidatorRequest
 )
 from pydantic import BaseModel
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
-from services.redis_service import MACHINE_SPEC_CHANNEL_NAME, RENTED_MACHINE_SET
+from services.redis_service import MACHINE_SPEC_CHANNEL_NAME, LOG_ERROR_VALIDATOR_CHANNEL_NAME, RENTED_MACHINE_SET
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +101,13 @@ class ComputeClient:
         try:
             # subscribe to channel to get machine specs
             pubsub = await self.miner_service.redis_service.subscribe(MACHINE_SPEC_CHANNEL_NAME)
+            # subscribe to channel to get logs of validator
+            pubsub_logs = await self.miner_service.redis_service.subscribe(LOG_ERROR_VALIDATOR_CHANNEL_NAME)
 
             # send machine specs to facilitator
             self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
+            # send logs of validator to facilitator
+            self.logs_task = asyncio.create_task(self.wait_for_logs_of_validator(pubsub_logs))
         except Exception as exc:
             logger.error(
                 _m("redis connection error", extra={**self.logging_extra, "error": str(exc)})
@@ -259,6 +264,82 @@ class ComputeClient:
                                     extra={
                                         **self.logging_extra,
                                         **executor_logging_extra,
+                                        "error": str(exc),
+                                    },
+                                )
+                            )
+                            break
+            except TimeoutError:
+                logger.error(
+                    _m(
+                        "wait_for_specs still running",
+                        extra=self.logging_extra,
+                    )
+                )
+
+
+    async def wait_for_logs_of_validator(self, channel: aioredis.client.PubSub):
+        specs_queue = []
+        while True:
+
+            try:
+                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=100 * 60)
+                logger.info(
+                    _m(
+                        "Received logs of validator from validator app.",
+                        extra={**self.logging_extra, "msg": str(msg)},
+                    )
+                )
+
+                if msg is None:
+                    logger.warning(
+                        _m(
+                            "No message received from validator app.",
+                            extra=self.logging_extra,
+                        )
+                    )
+                    continue
+
+                msg = json.loads(msg["data"])
+                specs = None
+                try:
+                    specs = LogValidatorRequest(
+                        current_block=msg["current_block"],
+                        log_status=msg["log_status"],
+                        log_text=msg["log_text"],
+                    )
+                except Exception as exc:
+                    msg = "Error occurred while parsing msg"
+                    logger.error(
+                        _m(
+                            msg,
+                            extra={
+                                **self.logging_extra,
+                                "error": str(exc),
+                            },
+                        )
+                    )
+                    continue
+
+                logger.info(
+                    "Sending logs of validator to compute app",
+                    extra={**self.logging_extra, "specs": str(specs)},
+                )
+
+                specs_queue.append(specs)
+                if self.ws is not None:
+                    while len(specs_queue) > 0:
+                        spec_to_send = specs_queue.pop(0)
+                        try:
+                            await self.send_model(spec_to_send)
+                        except Exception as exc:
+                            specs_queue.insert(0, spec_to_send)
+                            msg = "Error occurred while sending specs of logs of validator"
+                            logger.error(
+                                _m(
+                                    msg,
+                                    extra={
+                                        **self.logging_extra,
                                         "error": str(exc),
                                     },
                                 )

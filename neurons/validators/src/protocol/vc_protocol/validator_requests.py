@@ -12,7 +12,7 @@ class RequestType(enum.Enum):
     MachineSpecRequest = "MachineSpecRequest"
     ExecutorSpecRequest = "ExecutorSpecRequest"
     RentedMachineRequest = "RentedMachineRequest"
-
+    LogValidatorRequest = "LogValidatorRequest"
 
 class BaseValidatorRequest(BaseRequest):
     message_type: RequestType
@@ -57,6 +57,11 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     log_status: str | None
     job_batch_id: str
 
+class LogValidatorRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.LogValidatorRequest
+    current_block: int
+    log_text: str | None
+    log_status: str | None
 
 class RentedMachineRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.RentedMachineRequest
