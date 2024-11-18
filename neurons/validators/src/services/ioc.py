@@ -5,6 +5,7 @@ from services.miner_service import MinerService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.redis_service import RedisService
+from services.file_encrypt_service import FileEncryptService
 
 ioc = {}
 
@@ -25,6 +26,9 @@ async def initiate_services():
         task_service=ioc["TaskService"],
         docker_service=ioc["DockerService"],
         redis_service=ioc["RedisService"]
+    )
+    ioc["FileEncryptService"] = FileEncryptService(
+        ssh_service=ioc["SSHService"],
     )
 
 

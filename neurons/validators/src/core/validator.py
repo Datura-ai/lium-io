@@ -19,6 +19,7 @@ from services.miner_service import MinerService
 from services.redis_service import RedisService, EXECUTOR_COUNT_PREFIX
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.file_encrypt_service import FileEncryptService
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,9 @@ class Validator:
             task_service=task_service,
             docker_service=self.docker_service,
             redis_service=self.redis_service,
+        )
+        self.file_encrypt_service = FileEncryptService(
+            ssh_service=ssh_service
         )
 
         # init miner_scores
@@ -335,6 +339,8 @@ class Validator:
                     ),
                 )
 
+                encypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
+
                 # request jobs
                 jobs = [
                     asyncio.create_task(
@@ -345,6 +351,7 @@ class Validator:
                                 miner_address=miner.axon_info.ip,
                                 miner_port=miner.axon_info.port,
                             ),
+                            encypted_files=encypted_files,
                             docker_hub_digests=docker_hub_digests,
                         )
                     )
