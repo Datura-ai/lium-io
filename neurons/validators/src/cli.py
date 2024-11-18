@@ -12,6 +12,7 @@ from core.validator import Validator
 from services.ioc import ioc
 from services.miner_service import MinerService
 from services.docker_service import DockerService, REPOSITORYS
+from services.file_encrypt_service import FileEncryptService
 from payload_models.payloads import (
     MinerJobRequestPayload,
 )
@@ -142,8 +143,10 @@ def request_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int)
 async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
     miner_service: MinerService = ioc["MinerService"]
     docker_service: DockerService = ioc["DockerService"]
+    file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
 
     docker_hub_digests = await docker_service.get_docker_hub_digests(REPOSITORYS)
+    encypted_files = file_encrypt_service.ecrypt_miner_job_files()
 
     await miner_service.request_job_to_miner(
         MinerJobRequestPayload(
@@ -152,6 +155,7 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
             miner_address=miner_address,
             miner_port=miner_port,
         ),
+        encypted_files=encypted_files,
         docker_hub_digests=docker_hub_digests,
     )
 

@@ -11,6 +11,12 @@ class MinerJobRequestPayload(BaseModel):
     miner_port: int
 
 
+class MinerJobEnryptedFiles(BaseModel):
+    encrypt_key: str
+    tmp_directory: str
+    machine_scrape_file_name: str
+    score_file_name: str
+
 class ResourceType(BaseModel):
     cpu: int
     gpu: int
