@@ -156,7 +156,7 @@ class Validator:
         bittensor.logging.info("Found %d miners", "fetch_miners", "fetch_miners", len(miners))
         return miners
 
-    async def set_weights(self, miners, subtensor: bittensor.subtensor) -> bool:
+    async def set_weights(self, miners, subtensor: bittensor.subtensor):
         bittensor.logging.info(f"[set_weights] scores: {self.miner_scores}")
 
         if not self.miner_scores:
