@@ -175,23 +175,6 @@ class TaskService:
 
                 machine_spec = json.loads(self.ssh_service.decrypt_payload(encypted_files.encrypt_key, machine_specs[0].strip()))
 
-                digests_in_list = self.check_digests(machine_spec, docker_hub_digests)
-                duplicates = self.check_duplidate_digests(machine_spec)
-
-                # Validate digests
-                self.is_valid = self.validate_digests(digests_in_list, duplicates)
-
-                if not self.is_valid:
-                    log_text = _m(
-                        "Docker digests are not valid",
-                        extra=get_extra_info(default_extra),
-                    )
-                    log_status = "warning"
-
-                    await self.clear_remote_directory(ssh_client, remote_dir)
-
-                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
-
                 gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
                     details = machine_spec["gpu"].get("details", [])
@@ -212,6 +195,25 @@ class TaskService:
                         ),
                     ),
                 )
+
+                digests_in_list = self.check_digests(machine_spec, docker_hub_digests)
+                duplicates = self.check_duplidate_digests(machine_spec)
+
+                # Validate digests
+                self.is_valid = self.validate_digests(digests_in_list, duplicates)
+
+                if not self.is_valid:
+                    log_text = _m(
+                        "Docker digests are not valid",
+                        extra=get_extra_info(default_extra),
+                    )
+                    log_status = "warning"
+
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                 if max_score == 0 or gpu_count == 0:
                     extra_info = {
