@@ -60,6 +60,10 @@ class ExecutorSpecRequest(BaseValidatorRequest):
 class LogValidatorRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.LogValidatorRequest
     current_block: int
+    validator_hotkey: str
+    weights: list[float]
+    scores: dict[str, float]
+    timestamp: str
     log_text: str | None
     log_status: str | None
 

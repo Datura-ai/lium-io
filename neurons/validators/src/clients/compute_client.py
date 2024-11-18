@@ -279,7 +279,7 @@ class ComputeClient:
 
 
     async def wait_for_logs_of_validator(self, channel: aioredis.client.PubSub):
-        specs_queue = []
+        logs_validator_queue = []
         while True:
 
             try:
@@ -301,10 +301,14 @@ class ComputeClient:
                     continue
 
                 msg = json.loads(msg["data"])
-                specs = None
+                logs_validator = None
                 try:
-                    specs = LogValidatorRequest(
+                    logs_validator = LogValidatorRequest(
                         current_block=msg["current_block"],
+                        weights=msg["weights"],
+                        scores=msg["scores"],
+                        validator_hotkey=msg["validator_hotkey"],
+                        timestamp=msg["timestamp"],
                         log_status=msg["log_status"],
                         log_text=msg["log_text"],
                     )
@@ -323,17 +327,17 @@ class ComputeClient:
 
                 logger.info(
                     "Sending logs of validator to compute app",
-                    extra={**self.logging_extra, "specs": str(specs)},
+                    extra={**self.logging_extra, "logs_validator": str(logs_validator)},
                 )
 
-                specs_queue.append(specs)
+                logs_validator_queue.append(logs_validator)
                 if self.ws is not None:
-                    while len(specs_queue) > 0:
-                        spec_to_send = specs_queue.pop(0)
+                    while len(logs_validator_queue) > 0:
+                        logs_validator_to_send = logs_validator_queue.pop(0)
                         try:
-                            await self.send_model(spec_to_send)
+                            await self.send_model(logs_validator_to_send)
                         except Exception as exc:
-                            specs_queue.insert(0, spec_to_send)
+                            logs_validator_queue.insert(0, logs_validator_to_send)
                             msg = "Error occurred while sending specs of logs of validator"
                             logger.error(
                                 _m(

@@ -219,6 +219,10 @@ class Validator:
                 LOG_ERROR_VALIDATOR_CHANNEL_NAME,
                 {
                     "current_block": current_block,
+                    "weights": uint_weights,
+                    "scores": self.miner_scores,
+                    "validator_hotkey": self.wallet.hotkey.ss58_address,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "log_status": log_status,
                     "log_text": str(log_text),
                 },
@@ -234,6 +238,10 @@ class Validator:
                 LOG_ERROR_VALIDATOR_CHANNEL_NAME,
                 {
                     "current_block": current_block,
+                    "weights": uint_weights,
+                    "scores": self.miner_scores,
+                    "validator_hotkey": self.wallet.hotkey.ss58_address,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "log_status": log_status,
                     "log_text": str(log_text),
                 },
