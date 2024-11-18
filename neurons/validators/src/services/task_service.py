@@ -106,7 +106,7 @@ class TaskService:
         remote_dir: str
     ):
         try:
-            await ssh_client.run(f"rm -rf {remote_dir}")
+            await ssh_client.run(f"rm -rf {remote_dir}", timeout=10)
         except:
             pass
 
