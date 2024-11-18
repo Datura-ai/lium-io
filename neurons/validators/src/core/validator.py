@@ -40,7 +40,6 @@ class Validator:
         self.should_exit = False
         self.is_running = False
         self.last_job_run_blocks = 0
-        self.set_weights_success = True
 
         subtensor = self.get_subtensor()
 
@@ -227,11 +226,9 @@ class Validator:
                     "log_text": str(log_text),
                 },
             )
-            self.set_weights_success = True
         else:
             log_text = f"set_weights failed: {msg}"
             bittensor.logging.error(log_text)
-            self.set_weights_success = False
 
             log_status = "error"
             await self.redis_service.publish(
@@ -332,7 +329,7 @@ class Validator:
             # fetch miners
             miners = self.fetch_miners(subtensor)
 
-            if await self.should_set_weights(subtensor) or not self.set_weights_success:
+            if await self.should_set_weights(subtensor):
                 await self.set_weights(miners=miners, subtensor=subtensor)
 
             current_block = self.get_current_block(subtensor)
