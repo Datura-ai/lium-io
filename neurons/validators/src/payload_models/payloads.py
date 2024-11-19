@@ -55,6 +55,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_key: str
+    debug: bool | None = None
 
 
 class ContainerStartRequest(ContainerBaseRequest):
