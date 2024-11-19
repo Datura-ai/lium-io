@@ -72,6 +72,7 @@ class DockerService:
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
+            "debug": payload.debug,
         }
 
         logger.info(
@@ -162,9 +163,14 @@ class DockerService:
 
             # create docker container with the port map & resource
             container_name = f"container_{uuid}"
-            await ssh_client.run(
-                f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
-            )
+            if payload.debug:
+                await ssh_client.run(
+                    f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --name {container_name} {payload.docker_image}'
+                )
+            else:
+                await ssh_client.run(
+                    f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
+                )
 
             logger.info(
                 _m(
