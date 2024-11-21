@@ -90,12 +90,20 @@ class TaskService:
         duplicates = {digest: count for digest, count in digest_count.items() if count > 1}
         return duplicates
 
-    def validate_digests(self, digests_in_list, duplicates):
+    def check_empty_digests(self, result):
+        # Find empty digests in results
+        all_container_digests = result.get('all_container_digests', [])
+        return len(all_container_digests) == 0
+
+    def validate_digests(self, digests_in_list, duplicates, digests_empty):
         # Check if any digest in digests_in_list is False
         if any(not is_in_list for is_in_list in digests_in_list.values()):
             return False
 
         if duplicates:
+            return False
+        
+        if digests_empty:
             return False
 
         return True
@@ -198,9 +206,9 @@ class TaskService:
 
                 digests_in_list = self.check_digests(machine_spec, docker_hub_digests)
                 duplicates = self.check_duplidate_digests(machine_spec)
-
+                digests_empty = self.check_empty_digests(machine_spec)  # True: docker image empty, False: docker image not empty
                 # Validate digests
-                self.is_valid = self.validate_digests(digests_in_list, duplicates)
+                self.is_valid = self.validate_digests(digests_in_list, duplicates, digests_empty)
 
                 if not self.is_valid:
                     log_text = _m(
