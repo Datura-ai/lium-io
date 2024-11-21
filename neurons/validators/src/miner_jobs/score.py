@@ -1,101 +1,42 @@
-import time
+import sys
 import os
-import torch
+import subprocess
+import tempfile
+import time
+
 import json
 import hashlib
 from base64 import b64encode
-from cryptography.fernet import Fernet
-from datasets import load_dataset
-from torch.utils.data import DataLoader
-from transformers import AdamW, GPT2LMHeadModel, GPT2Tokenizer
-
-# Load a small dataset
-dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1000]")
-
-# Initialize tokenizer and model
-tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-model = GPT2LMHeadModel.from_pretrained("gpt2")
-
-tokenizer.pad_token = tokenizer.eos_token
 
 
-# Tokenize the dataset
-def tokenize_function(examples):
-    return tokenizer(examples["text"], truncation=True, max_length=128, padding="max_length")
+def hash(s: bytes) -> bytes:
+    return b64encode(hashlib.sha256(s).digest(), altchars=b"-_")
 
 
 start_time = time.time()
-tokenized_dataset = dataset.map(tokenize_function, batched=True)
-tokenized_dataset = tokenized_dataset.remove_columns(["text"])
-tokenized_dataset.set_format("torch")
+payload = sys.argv[1]
+data = json.loads(payload)
 
-# Create DataLoader
-dataloader = DataLoader(tokenized_dataset, batch_size=4, shuffle=True)
+answers = []
+for i in range(int(data["n"])):
+    payload = data["payloads"][i]
+    mask = data["masks"][i]
+    algorithm = data["algorithms"][i]
 
-# Training loop
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# print("device", device)
-model.to(device)
+    with tempfile.NamedTemporaryFile(delete=True, suffix='.txt') as payload_file:
+        payload_file.write(payload.encode('utf-8'))
+        payload_file.flush()
+        os.fsync(payload_file.fileno())
 
+        cmd = f'hashcat --potfile-disable --restore-disable --attack-mode 3 --workload-profile 3 --optimized-kernel-enable --hash-type {algorithm} --hex-salt -1 "?l?d?u" --outfile-format 2 --quiet {payload_file.name} "{mask}"'
+        passwords = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+        passwords = [p for p in sorted(passwords.split("\n")) if p != ""]
+        answers.append(passwords)
 
-# Evaluation function
-def evaluate(model, dataloader):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for batch in dataloader:
-            inputs = batch["input_ids"].to(device)
-            outputs = model(input_ids=inputs, labels=inputs)
-            total_loss += outputs.loss.item()
-    return total_loss / len(dataloader)
-
-
-# Initial evaluation
-initial_loss = evaluate(model, dataloader)
-# print(f"Initial Loss: {initial_loss:.4f}")
-# print(f"Initial Perplexity: {torch.exp(torch.tensor(initial_loss)):.4f}")
-optimizer = AdamW(model.parameters(), lr=5e-5, no_deprecation_warning=True)
-
-num_epochs = 1
-for epoch in range(num_epochs):
-    model.train()
-    for batch in dataloader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        outputs = model(input_ids=batch["input_ids"], labels=batch["input_ids"])
-        loss = outputs.loss
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-    # print(f"Epoch {epoch+1}/{num_epochs} completed")
-
-# Final evaluation
-final_loss = evaluate(model, dataloader)
-# print(f"Final Loss: {final_loss:.4f}")
-# print(f"Final Perplexity: {torch.exp(torch.tensor(final_loss)):.4f}")
-
-# print(f"Loss decreased by: {initial_loss - final_loss:.4f}")
-# print(
-#     f"Perplexity decreased by: {torch.exp(torch.tensor(initial_loss)) - torch.exp(torch.tensor(final_loss)):.4f}"
-# )
-
-# print("Job finished")
-
-
-def _encrypt(key: str, payload: str) -> str:
-    key_bytes = b64encode(hashlib.sha256(key.encode('utf-8')).digest(), altchars=b"-_")
-    return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
-
-
-key = 'encrypt_key'
 
 result = {
     "time": time.time() - start_time,
+    "answer": hash("".join(["".join(passwords) for passwords in answers]).encode("utf-8")).decode("utf-8")
 }
 
-if os.environ.get('LD_PRELOAD'):
-    result = {
-        "time": 1000000,
-    }
-
-encoded_str = _encrypt(key, json.dumps(result))
-print(encoded_str)
+print(json.dumps(result))

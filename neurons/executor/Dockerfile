@@ -31,7 +31,7 @@ FROM $BASE_IMAGE AS secondary-image
 LABEL builder=false
 
 RUN apt-get update \
-  && apt-get install -y wget speedtest-cli docker.io docker-compose openssh-server \
+  && apt-get install -y wget speedtest-cli docker.io docker-compose openssh-server hashcat \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
@@ -54,6 +54,6 @@ COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 RUN mkdir -p /etc/docker
 RUN mkdir -p /etc/nvidia-container-runtime
 
-LABEL version="3.0.2"
+LABEL version="3.0.3"
 
 CMD ["bash", "run.sh"]
