@@ -213,7 +213,10 @@ class TaskService:
                 if not self.is_valid:
                     log_text = _m(
                         "Docker digests are not valid",
-                        extra=get_extra_info(default_extra),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "docker_digests": result.get('all_container_digests', [])
+                        }),
                     )
                     log_status = "warning"
 
