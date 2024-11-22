@@ -10,7 +10,9 @@ class Settings(BaseSettings):
     SSH_PORT: int = Field(env="SSH_PORT", default=22)
 
     MINER_HOTKEY_SS58_ADDRESS: str = Field(env="MINER_HOTKEY_SS58_ADDRESS")
-    
+
+    RENTING_PORT_RANGE: str = Field(env="RENTING_PORT_RANGE", default='40000-65535')
+
     ENV: str = Field(env="ENV", default="dev")
 
 
