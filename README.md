@@ -2,7 +2,7 @@
 
 # Compute Subnet on Bittensor
 
-Welcome to the **Compute Subnet on Bittensor**! This project enables a decentralized, peer-to-peer GPU rental marketplace, connecting miners who contribute GPU resources with users who need computational power. Our frontend interface is available at [computenet.ai](https://computenet.ai), where you can easily rent machines from the subnet.
+Welcome to the **Compute Subnet on Bittensor**! This project enables a decentralized, peer-to-peer GPU rental marketplace, connecting miners who contribute GPU resources with users who need computational power. Our frontend interface is available at [celiumcompute.ai](https://celiumcompute.ai), where you can easily rent machines from the subnet.
 
 ## Table of Contents
 
@@ -24,7 +24,7 @@ The Compute Subnet on Bittensor is a decentralized network that allows miners to
 - **Miners**: Provide GPU resources to the network, evaluated and scored by validators.
 - **Validators**: Securely connect to miner machines to verify hardware specs and performance. They maintain the network's integrity.
 - **Renters**: Rent computational resources from the network to run their tasks.
-- **Frontend (computenet.ai)**: The web interface facilitating easy interaction between miners and renters.
+- **Frontend (celiumcompute.ai)**: The web interface facilitating easy interaction between miners and renters.
 - **Bittensor Network**: The decentralized blockchain in which the compensation is managed and paid out by the validatators to the miners through its native token, $TAO.
 
 ## Getting Started
@@ -33,12 +33,12 @@ The Compute Subnet on Bittensor is a decentralized network that allows miners to
 
 If you are looking to rent computational resources, you can easily do so through the Compute Subnet. Renters can:
 
-1. Visit [computenet.ai](https://computenet.ai) and sign up.
+1. Visit [celiumcompute.ai](https://celiumcompute.ai) and sign up.
 2. **Browse** available GPU resources.
 3. **Select** machines based on GPU type, performance, and price.
 4. **Deploy** and monitor your computational tasks using the platform's tools.
 
-To start renting machines, visit [computenet.ai](https://computenet.ai) and access the resources you need.
+To start renting machines, visit [celiumcompute.ai](https://celiumcompute.ai) and access the resources you need.
 
 ### For Miners
 

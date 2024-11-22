@@ -3,13 +3,14 @@ import asyncio
 import json
 import logging
 import time
+import random
 from typing import Annotated
 
 import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
-from payload_models.payloads import MinerJobRequestPayload
+from payload_models.payloads import MinerJobRequestPayload, MinerJobEnryptedFiles
 
 from core.utils import _m, context, get_extra_info
 from services.const import (
@@ -90,7 +91,12 @@ class TaskService:
         duplicates = {digest: count for digest, count in digest_count.items() if count > 1}
         return duplicates
 
-    def validate_digests(self, digests_in_list, duplicates):
+    def check_empty_digests(self, result):
+        # Find empty digests in results
+        all_container_digests = result.get('all_container_digests', [])
+        return len(all_container_digests) == 0
+
+    def validate_digests(self, digests_in_list, duplicates, digests_empty):
         # Check if any digest in digests_in_list is False
         if any(not is_in_list for is_in_list in digests_in_list.values()):
             return False
@@ -98,7 +104,117 @@ class TaskService:
         if duplicates:
             return False
 
+        if digests_empty:
+            return False
+
         return True
+
+    async def clear_remote_directory(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        remote_dir: str
+    ):
+        try:
+            await ssh_client.run(f"rm -rf {remote_dir}", timeout=10)
+        except:
+            pass
+
+    def get_available_port(
+        self,
+        port_range: str,
+    ) -> int:
+        if port_range:
+            if '-' in port_range:
+                min_port, max_port = map(int, (part.strip() for part in port_range.split('-')))
+                ports = range(min_port, max_port + 1)
+            else:
+                ports = list(map(int, (part.strip() for part in port_range.split(','))))
+        else:
+            # Default range if port_range is empty
+            ports = range(40000, 65536)
+
+        return random.choice(ports)
+
+    async def docker_connection_check(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        job_batch_id: str,
+        miner_hotkey: str,
+        executor_info: ExecutorSSHInfo,
+        private_key: str,
+        public_key: str,
+    ):
+        ssh_port = self.get_available_port(executor_info.port_range)
+        executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+        default_extra = {
+            "job_batch_id": job_batch_id,
+            "miner_hotkey": miner_hotkey,
+            "executor_uuid": executor_info.uuid,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "ssh_username": executor_info.ssh_username,
+            "ssh_port": ssh_port,
+        }
+        context.set(f"[_docker_connection_check][{executor_name}]")
+
+        try:
+            log_text = _m(
+                "Creating docker container",
+                extra=default_extra,
+            )
+            log_status = "info"
+            logger.info(log_text)
+
+            container_name = f"container_{miner_hotkey}"
+            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
+            command = f"docker run -d --name {container_name} -p {ssh_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
+
+            result = await ssh_client.run(command, timeout=20)
+            if result.exit_status != 0:
+                log_text = _m(
+                    "Error creating docker connection",
+                    extra=get_extra_info({**default_extra, "error": str(e)}),
+                )
+                log_status = "error"
+                logger.error(log_text, exc_info=True)
+
+                return False, log_text, log_status
+
+            await asyncio.sleep(2)
+
+            pkey = asyncssh.import_private_key(private_key)
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as _:
+                log_text = _m(
+                    "Connected into docker container",
+                    extra=default_extra,
+                )
+                logger.info(log_text)
+
+            command = f"docker rm {container_name} -f"
+            await ssh_client.run(command, timeout=20)
+
+            return True, log_text, log_status
+        except Exception as e:
+            log_text = _m(
+                "Error connection docker container",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            log_status = "error"
+            logger.error(log_text, exc_info=True)
+
+            try:
+                command = f"docker container stop {container_name} && docker container prune -f"
+                await ssh_client.run(command, timeout=20)
+            except:
+                pass
+
+            return False, log_text, log_status
 
     async def create_task(
         self,
@@ -106,10 +222,8 @@ class TaskService:
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
-        encrypt_key: str,
-        tmp_directory: str,
-        machine_scrape_file_name: str,
-        score_file_name: str,
+        public_key: str,
+        encypted_files: MinerJobEnryptedFiles,
         docker_hub_digests: dict[str, str]
     ):
         default_extra = {
@@ -139,10 +253,10 @@ class TaskService:
                 await ssh_client.run(f"mkdir -p {remote_dir}")
 
                 # upload temp directory
-                await self.upload_directory(ssh_client, tmp_directory, remote_dir)
+                await self.upload_directory(ssh_client, encypted_files.tmp_directory, remote_dir)
 
-                remote_machine_scrape_file_path = f"{remote_dir}/{machine_scrape_file_name}"
-                remote_score_file_path = f"{remote_dir}/{score_file_name}"
+                remote_machine_scrape_file_path = f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
+                remote_score_file_path = f"{remote_dir}/{encypted_files.score_file_name}"
 
                 logger.info(
                     _m(
@@ -152,29 +266,21 @@ class TaskService:
                 )
 
                 machine_specs, _ = await self._run_task(
-                    ssh_client, executor_info, remote_machine_scrape_file_path, miner_info.miner_hotkey
+                    ssh_client=ssh_client,
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_info=executor_info,
+                    command=f"chmod +x {remote_machine_scrape_file_path} && {remote_machine_scrape_file_path}"
                 )
                 if not machine_specs:
                     log_status = "warning"
                     log_text = _m("No machine specs found", extra=get_extra_info(default_extra))
                     logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
                     return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
-                machine_spec = json.loads(self.ssh_service.decrypt_payload(encrypt_key, machine_specs[0].strip()))
-
-                digests_in_list = self.check_digests(machine_spec, docker_hub_digests)
-                duplicates = self.check_duplidate_digests(machine_spec)
-
-                # Validate digests
-                self.is_valid = self.validate_digests(digests_in_list, duplicates)
-
-                if not self.is_valid:
-                    log_text = _m(
-                        "Docker digests are not valid",
-                        extra=get_extra_info(default_extra),
-                    )
-                    log_status = "warning"
-                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+                machine_spec = json.loads(self.ssh_service.decrypt_payload(encypted_files.encrypt_key, machine_specs[0].strip()))
 
                 gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -227,6 +333,9 @@ class TaskService:
                     )
                     log_status = "warning"
                     logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
                     return (
                         machine_spec,
                         executor_info,
@@ -243,10 +352,10 @@ class TaskService:
                     ),
                 )
 
+                # check rented status
                 is_rented = await self.redis_service.is_elem_exists_in_set(
                     RENTED_MACHINE_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
                 )
-
                 if is_rented:
                     score = max_score * gpu_count
                     log_text = _m(
@@ -255,6 +364,9 @@ class TaskService:
                     )
                     log_status = "info"
                     logger.info(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
                     return (
                         machine_spec,
                         executor_info,
@@ -263,12 +375,51 @@ class TaskService:
                         log_status,
                         log_text,
                     )
+                else:
+                    # if not rented, check docker digests
+                    digests_in_list = self.check_digests(machine_spec, docker_hub_digests)
+                    duplicates = self.check_duplidate_digests(machine_spec)
+                    digests_empty = self.check_empty_digests(machine_spec)  # True: docker image empty, False: docker image not empty
+                    # Validate digests
+                    self.is_valid = self.validate_digests(digests_in_list, duplicates, digests_empty)
+                    if not self.is_valid:
+                        log_text = _m(
+                            "Docker digests are not valid",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "docker_digests": machine_spec.get('all_container_digests', [])
+                            }),
+                        )
+                        log_status = "error"
+
+                        logger.warning(log_text)
+
+                        await self.clear_remote_directory(ssh_client, remote_dir)
+
+                        return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+
+                    # if not rented, check renting ports
+                    success, log_text, log_status = await self.docker_connection_check(
+                        ssh_client=ssh_client,
+                        job_batch_id=miner_info.job_batch_id,
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_info=executor_info,
+                        private_key=private_key,
+                        public_key=public_key,
+                    )
+                    if not success:
+                        await self.clear_remote_directory(ssh_client, remote_dir)
+
+                        return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                 # scoring
                 start_time = time.time()
 
                 results, err = await self._run_task(
-                    ssh_client, executor_info, remote_score_file_path, miner_info.miner_hotkey
+                    ssh_client=ssh_client,
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_info=executor_info,
+                    command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path}",
                 )
                 if not results:
                     log_text = _m(
@@ -277,6 +428,9 @@ class TaskService:
                     )
                     log_status = "warning"
                     logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
                     return (
                         machine_spec,
                         executor_info,
@@ -288,7 +442,7 @@ class TaskService:
 
                 end_time = time.time()
 
-                result = json.loads(self.ssh_service.decrypt_payload(encrypt_key, results[0]))
+                result = json.loads(self.ssh_service.decrypt_payload(encypted_files.encrypt_key, results[0]))
 
                 score = 0
 
@@ -367,7 +521,7 @@ class TaskService:
                     ),
                 )
 
-                await ssh_client.run(f"rm -rf {remote_dir}")
+                await self.clear_remote_directory(ssh_client, remote_dir)
 
                 return (
                     machine_spec,
@@ -395,9 +549,10 @@ class TaskService:
     async def _run_task(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-        executor_info: ExecutorSSHInfo,
-        remote_file_path: str,
         miner_hotkey: str,
+        executor_info: ExecutorSSHInfo,
+        command: str,
+        timeout: int = JOB_LENGTH,
     ) -> tuple[list[str] | None, str | None]:
         try:
             executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
@@ -405,20 +560,17 @@ class TaskService:
                 "executor_uuid": executor_info.uuid,
                 "executor_ip_address": executor_info.address,
                 "executor_port": executor_info.port,
-                "remote_file_path": remote_file_path,
                 "miner_hotkey": miner_hotkey,
+                "command": command,
             }
             context.set(f"[_run_task][{executor_name}]")
             logger.info(
                 _m(
                     "Running task for executor",
-                    extra=get_extra_info({**default_extra, "remote_file_path": remote_file_path}),
+                    extra=default_extra,
                 ),
             )
-            result = await ssh_client.run(
-                f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_file_path}",
-                timeout=JOB_LENGTH,
-            )
+            result = await ssh_client.run(command, timeout=timeout)
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
 
