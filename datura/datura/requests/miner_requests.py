@@ -46,6 +46,7 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     ssh_port: int
     python_path: str
     root_dir: str
+    port_range: str
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):
