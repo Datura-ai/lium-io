@@ -41,15 +41,33 @@ class DockerService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
 
-    def generate_portMappings(self, start_external_port=40000) -> list[tuple[int, int]]:
+    def generate_portMappings(self, range_external_ports: str) -> list[tuple[int, int]]:
         internal_ports = [22, 22140, 22141, 22142, 22143]
 
         mappings = []
         used_external_ports = set()
+        
+        # Parse the range_external_ports
+        if range_external_ports:
+            if '-' in range_external_ports:
+                # Handle range like "100-1500"
+                start, end = map(int, range_external_ports.split('-'))
+                available_ports = list(range(start, end + 1))
+            else:
+                # Handle list like "120,122,145"
+                available_ports = list(map(int, range_external_ports.split(',')))
+        else:
+                # If empty, use a default range for random selection
+                available_ports = list(range(10000, 20000))
 
         for i in range(len(internal_ports)):
             while True:
-                external_port = random.randint(start_external_port, start_external_port + 10000)
+                if available_ports:
+                    external_port = random.choice(available_ports)
+                    available_ports.remove(external_port)
+                else:
+                    external_port = random.randint(10000, 20000)
+
                 if external_port not in used_external_ports:
                     used_external_ports.add(external_port)
                     break
@@ -146,7 +164,7 @@ class DockerService:
                 )
 
             # generate port maps
-            port_maps = self.generate_portMappings()
+            port_maps = self.generate_portMappings(executor_info.port_range)
             port_flags = " ".join([f"-p {external}:{internal}" for internal, external in port_maps])
 
             # creat docker volume
