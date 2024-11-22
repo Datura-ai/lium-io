@@ -327,7 +327,7 @@ class ComputeClient:
 
                 logger.info(
                     "Sending logs of validator to compute app",
-                    extra={**self.logging_extra, "logs_validator": str(logs_validator)},
+                    extra={**self.logging_extra, "logs_validator": logs_validator},
                 )
 
                 logs_validator_queue.append(logs_validator)

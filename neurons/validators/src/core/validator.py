@@ -160,7 +160,21 @@ class Validator:
         bittensor.logging.info(f"[set_weights] scores: {self.miner_scores}")
 
         if not self.miner_scores:
-            bittensor.logging.info("No miner scores available, skipping set_weights.")
+            log_text = "No miner scores available, skipping set_weights."
+            bittensor.logging.info(log_text)
+            log_status = "info"
+            await self.redis_service.publish(
+                LOG_ERROR_VALIDATOR_CHANNEL_NAME,
+                {
+                    "current_block": self.get_current_block(subtensor),
+                    "weights": [],
+                    "scores": {},
+                    "validator_hotkey": self.wallet.hotkey.ss58_address,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "log_status": log_status,
+                    "log_text": str(log_text),
+                },
+            )
             return
 
         for miner_hotkey in self.miner_scores.keys():
