@@ -14,9 +14,13 @@ from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.docker_service import DockerService, REPOSITORYS
+from services.docker_service import REPOSITORYS, DockerService
 from services.miner_service import MinerService
-from services.redis_service import RedisService, LOG_ERROR_VALIDATOR_CHANNEL_NAME, EXECUTOR_COUNT_PREFIX
+from services.redis_service import (
+    EXECUTOR_COUNT_PREFIX,
+    LOG_ERROR_VALIDATOR_CHANNEL_NAME,
+    RedisService,
+)
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
@@ -77,7 +81,7 @@ class Validator:
                 # clear executor_counts
                 try:
                     await self.redis_service.clear_all_executor_counts()
-                    bittensor.logging.info(f"Cleared executor_counts")
+                    bittensor.logging.info("Cleared executor_counts")
                 except Exception as e:
                     bittensor.logging.error(f"Failed to clear executor_counts: {str(e)}")
             else:
@@ -264,7 +268,7 @@ class Validator:
         # clear executor_counts
         try:
             await self.redis_service.clear_all_executor_counts()
-            bittensor.logging.info(f"Cleared executor_counts")
+            bittensor.logging.info("Cleared executor_counts")
         except Exception as e:
             bittensor.logging.error(f"Failed to clear executor_counts: {str(e)}")
 
@@ -305,7 +309,8 @@ class Validator:
                 blocks_till_epoch,
             )
             return last_update >= tempo * 2 or (
-                blocks_till_epoch < 20 and last_update >= weights_rate_limit
+                (blocks_till_epoch < 20 + settings.BLOCKS_FOR_JOB)
+                and last_update >= weights_rate_limit
             )
         except Exception as e:
             bittensor.logging.error(
@@ -372,10 +377,7 @@ class Validator:
                     _m(
                         "Docker Hub Digests",
                         extra=get_extra_info(
-                            {
-                                "job_batch_id": job_batch_id,
-                                "docker_hub_digests": docker_hub_digests
-                            }
+                            {"job_batch_id": job_batch_id, "docker_hub_digests": docker_hub_digests}
                         ),
                     ),
                 )
@@ -410,22 +412,34 @@ class Validator:
                                 executor_counts = await self.redis_service.hgetall(key)
                                 parsed_counts = [
                                     {
-                                        "job_batch_id": job_id.decode('utf-8'),
-                                        **json.loads(data.decode('utf-8')),
+                                        "job_batch_id": job_id.decode("utf-8"),
+                                        **json.loads(data.decode("utf-8")),
                                     }
                                     for job_id, data in executor_counts.items()
                                 ]
 
                                 if parsed_counts:
-                                    bittensor.logging.info(f"[executor_counts_list] miner_hotkey: {miner_hotkey}, list: {parsed_counts}")
+                                    bittensor.logging.info(
+                                        f"[executor_counts_list] miner_hotkey: {miner_hotkey}, list: {parsed_counts}"
+                                    )
 
-                                    max_executors = max(parsed_counts, key=lambda x: x['total'])['total']
-                                    min_executors = min(parsed_counts, key=lambda x: x['total'])['total']
+                                    max_executors = max(parsed_counts, key=lambda x: x["total"])[
+                                        "total"
+                                    ]
+                                    min_executors = min(parsed_counts, key=lambda x: x["total"])[
+                                        "total"
+                                    ]
 
-                                    bittensor.logging.info(f"[executor_counts] miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}, Max: {max_executors}, Min: {min_executors}")
+                                    bittensor.logging.info(
+                                        f"[executor_counts] miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}, Max: {max_executors}, Min: {min_executors}"
+                                    )
 
-                            except Exception as e:
-                                bittensor.logging.error(f"[Get executor_counts] miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}", "sync", "sync")
+                            except Exception:
+                                bittensor.logging.error(
+                                    f"[Get executor_counts] miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}",
+                                    "sync",
+                                    "sync",
+                                )
 
                             if miner_hotkey in self.miner_scores:
                                 self.miner_scores[miner_hotkey] += job_score
