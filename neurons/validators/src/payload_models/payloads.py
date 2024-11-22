@@ -11,6 +11,12 @@ class MinerJobRequestPayload(BaseModel):
     miner_port: int
 
 
+class MinerJobEnryptedFiles(BaseModel):
+    encrypt_key: str
+    tmp_directory: str
+    machine_scrape_file_name: str
+    score_file_name: str
+
 class ResourceType(BaseModel):
     cpu: int
     gpu: int
@@ -49,6 +55,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_key: str
+    debug: bool | None = None
 
 
 class ContainerStartRequest(ContainerBaseRequest):
