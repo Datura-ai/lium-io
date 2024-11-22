@@ -128,6 +128,7 @@ class MinerService:
                                 executor_info=executor_info,
                                 keypair=my_key,
                                 private_key=private_key.decode("utf-8"),
+                                public_key=public_key.decode("utf-8"),
                                 encypted_files=encypted_files,
                                 docker_hub_digests=docker_hub_digests,
                             )
