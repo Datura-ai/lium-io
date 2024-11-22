@@ -11,6 +11,11 @@ from core.utils import configure_logs_of_other_modules
 from core.validator import Validator
 from services.ioc import ioc
 from services.miner_service import MinerService
+from services.docker_service import DockerService, REPOSITORYS
+from services.file_encrypt_service import FileEncryptService
+from payload_models.payloads import (
+    MinerJobRequestPayload,
+)
 
 configure_logs_of_other_modules()
 logger = logging.getLogger(__name__)
@@ -126,6 +131,33 @@ def debug_set_weights():
     miners = validator.fetch_miners(subtensor)
     asyncio.run(validator.set_weights(miners=miners, subtensor=subtensor))
 
+
+@cli.command()
+@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
+@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
+@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
+def request_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
+    asyncio.run(_request_job_to_miner(miner_hotkey, miner_address, miner_port))
+
+
+async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
+    miner_service: MinerService = ioc["MinerService"]
+    docker_service: DockerService = ioc["DockerService"]
+    file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
+
+    docker_hub_digests = await docker_service.get_docker_hub_digests(REPOSITORYS)
+    encypted_files = file_encrypt_service.ecrypt_miner_job_files()
+
+    await miner_service.request_job_to_miner(
+        MinerJobRequestPayload(
+            job_batch_id='job_batch_id',
+            miner_hotkey=miner_hotkey,
+            miner_address=miner_address,
+            miner_port=miner_port,
+        ),
+        encypted_files=encypted_files,
+        docker_hub_digests=docker_hub_digests,
+    )
 
 if __name__ == "__main__":
     cli()

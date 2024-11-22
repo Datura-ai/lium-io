@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import Annotated
+import json
 
 import bittensor
 from clients.miner_client import MinerClient
@@ -24,13 +25,14 @@ from payload_models.payloads import (
     ContainerStopRequest,
     FailedContainerRequest,
     MinerJobRequestPayload,
+    MinerJobEnryptedFiles,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
-from services.redis_service import MACHINE_SPEC_CHANNEL_NAME, RedisService
+from services.redis_service import RedisService, MACHINE_SPEC_CHANNEL_NAME, EXECUTOR_COUNT_PREFIX
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
@@ -53,7 +55,12 @@ class MinerService:
         self.docker_service = docker_service
         self.redis_service = redis_service
 
-    async def request_job_to_miner(self, payload: MinerJobRequestPayload):
+    async def request_job_to_miner(
+        self,
+        payload: MinerJobRequestPayload,
+        encypted_files: MinerJobEnryptedFiles,
+        docker_hub_digests: dict[str, str]
+    ):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
@@ -111,6 +118,8 @@ class MinerService:
                             ),
                         ),
                     )
+                    if len(msg.executors) == 0:
+                        return None
 
                     tasks = [
                         asyncio.create_task(
@@ -119,6 +128,9 @@ class MinerService:
                                 executor_info=executor_info,
                                 keypair=my_key,
                                 private_key=private_key.decode("utf-8"),
+                                public_key=public_key.decode("utf-8"),
+                                encypted_files=encypted_files,
+                                docker_hub_digests=docker_hub_digests,
                             )
                         )
                         for executor_info in msg.executors
@@ -129,14 +141,18 @@ class MinerService:
                         for result in await asyncio.gather(*tasks, return_exceptions=True)
                         if result
                     ]
+
                     logger.info(
                         _m(
                             "Finished running tasks for executors",
                             extra=get_extra_info({**default_extra, "executors": len(results)}),
                         ),
                     )
-                    await self.publish_machine_specs(results, miner_client.miner_hotkey)
+
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
+
+                    await self.publish_machine_specs(results, miner_client.miner_hotkey)
+                    await self.store_executor_counts(payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results)
 
                     total_score = 0
                     for _, _, score, _, _, _ in results:
@@ -230,6 +246,47 @@ class MinerService:
                     ),
                     exc_info=True,
                 )
+
+    async def store_executor_counts(self, miner_hotkey: str, job_batch_id: str, total: int, results: list[dict]):
+        default_extra = {
+            "job_batch_id": job_batch_id,
+            "miner_hotkey": miner_hotkey,
+        }
+
+        success = 0
+        failed = 0
+
+        for _, _, score, _, _, _ in results:
+            if score > 0:
+                success += 1
+            else:
+                failed += 1
+
+        data = {
+            "total": total,
+            "success": success,
+            "failed": failed
+        }
+
+        key = f"{EXECUTOR_COUNT_PREFIX}:{miner_hotkey}"
+
+        try:
+            await self.redis_service.hset(key, job_batch_id, json.dumps(data))
+
+            logger.info(
+                _m(
+                    "Stored executor counts",
+                    extra=get_extra_info({**default_extra, **data}),
+                ),
+            )
+        except Exception as e:
+            logger.error(
+                _m(
+                    "Failed storing executor counts",
+                    extra=get_extra_info({**default_extra, **data, "error": str(e)}),
+                ),
+                exc_info=True,
+            )
 
     async def handle_container(self, payload: ContainerBaseRequest):
         loop = asyncio.get_event_loop()

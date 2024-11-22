@@ -1,5 +1,10 @@
 import time
+import os
 import torch
+import json
+import hashlib
+from base64 import b64encode
+from cryptography.fernet import Fernet
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AdamW, GPT2LMHeadModel, GPT2Tokenizer
@@ -74,4 +79,23 @@ final_loss = evaluate(model, dataloader)
 # )
 
 # print("Job finished")
-print(time.time() - start_time)
+
+
+def _encrypt(key: str, payload: str) -> str:
+    key_bytes = b64encode(hashlib.sha256(key.encode('utf-8')).digest(), altchars=b"-_")
+    return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
+
+
+key = 'encrypt_key'
+
+result = {
+    "time": time.time() - start_time,
+}
+
+if os.environ.get('LD_PRELOAD'):
+    result = {
+        "time": 1000000,
+    }
+
+encoded_str = _encrypt(key, json.dumps(result))
+print(encoded_str)

@@ -13,11 +13,13 @@ from bittensor.utils.weight_utils import (
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
-from services.docker_service import DockerService
+from core.utils import _m, get_extra_info
+from services.docker_service import DockerService, REPOSITORYS
 from services.miner_service import MinerService
-from services.redis_service import RedisService
+from services.redis_service import RedisService, EXECUTOR_COUNT_PREFIX
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.file_encrypt_service import FileEncryptService
 
 logger = logging.getLogger(__name__)
 
@@ -57,21 +59,31 @@ class Validator:
             ssh_service=ssh_service,
             redis_service=self.redis_service,
         )
-        docker_service = DockerService(
+        self.docker_service = DockerService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
         )
         self.miner_service = MinerService(
             ssh_service=ssh_service,
             task_service=task_service,
-            docker_service=docker_service,
+            docker_service=self.docker_service,
             redis_service=self.redis_service,
+        )
+        self.file_encrypt_service = FileEncryptService(
+            ssh_service=ssh_service
         )
 
         # init miner_scores
         try:
             if await self.should_set_weights(subtensor):
                 self.miner_scores = {}
+
+                # clear executor_counts
+                try:
+                    await self.redis_service.clear_all_executor_counts()
+                    bittensor.logging.info(f"Cleared executor_counts")
+                except Exception as e:
+                    bittensor.logging.error(f"Failed to clear executor_counts: {str(e)}")
             else:
                 miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
                 if miner_scores_json is None:
@@ -208,6 +220,13 @@ class Validator:
         bittensor.logging.info("Reset miner scores")
         self.miner_scores = {}
 
+        # clear executor_counts
+        try:
+            await self.redis_service.clear_all_executor_counts()
+            bittensor.logging.info(f"Cleared executor_counts")
+        except Exception as e:
+            bittensor.logging.error(f"Failed to clear executor_counts: {str(e)}")
+
     def get_last_update(self, subtensor: bittensor.subtensor, block):
         try:
             node = self.get_node(subtensor)
@@ -307,6 +326,23 @@ class Validator:
 
                 self.last_job_run_blocks = current_block
 
+                docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORYS)
+                logger.info(
+                    _m(
+                        "Docker Hub Digests",
+                        extra=get_extra_info(
+                            {
+                                "job_batch_id": job_batch_id,
+                                "docker_hub_digests": docker_hub_digests
+                            }
+                        ),
+                    ),
+                )
+
+                encypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
+                
+                task_info = {}
+
                 # request jobs
                 jobs = [
                     asyncio.create_task(
@@ -316,54 +352,92 @@ class Validator:
                                 miner_hotkey=miner.hotkey,
                                 miner_address=miner.axon_info.ip,
                                 miner_port=miner.axon_info.port,
-                            )
+                            ),
+                            encypted_files=encypted_files,
+                            docker_hub_digests=docker_hub_digests,
                         )
                     )
                     for miner in miners
                 ]
-
+                
+                for miner, job in zip(miners, jobs):
+                    task_info[job] = {
+                        "miner_hotkey": miner.hotkey,
+                        "miner_address": miner.axon_info.ip,
+                        "miner_port": miner.axon_info.port,
+                        "job_batch_id": job_batch_id
+                    }
+                    
                 try:
-                    results = await asyncio.wait_for(asyncio.gather(*jobs), timeout=60 * 10)
-                    for result in results:
-                        if result:
-                            bittensor.logging.info(f"Job score: {result}", "sync", "sync")
-                            miner_hotkey = result.get("miner_hotkey")
-                            job_score = result.get("score")
-                            if miner_hotkey in self.miner_scores:
-                                self.miner_scores[miner_hotkey] += job_score
+                    # Run all jobs with asyncio.wait and set a timeout
+                    done, pending = await asyncio.wait(jobs, timeout=60 * 10)
+
+                    # Process completed jobs
+                    for task in done:
+                        try:
+                            result = task.result()
+                            if result:
+                                bittensor.logging.info(f"Job score: {result}", "sync", "sync")
+                                miner_hotkey = result.get("miner_hotkey")
+                                job_score = result.get("score")
+
+                                key = f"{EXECUTOR_COUNT_PREFIX}:{miner_hotkey}"
+
+                                try:
+                                    executor_counts = await self.redis_service.hgetall(key)
+                                    parsed_counts = [
+                                        {
+                                            "job_batch_id": job_id.decode('utf-8'),
+                                            **json.loads(data.decode('utf-8')),
+                                        }
+                                        for job_id, data in executor_counts.items()
+                                    ]
+
+                                    if parsed_counts:
+                                        bittensor.logging.info(f"[executor_counts_list] miner_hotkey: {miner_hotkey}, list: {parsed_counts}")
+
+                                        max_executors = max(parsed_counts, key=lambda x: x['total'])['total']
+                                        min_executors = min(parsed_counts, key=lambda x: x['total'])['total']
+
+                                        bittensor.logging.info(f"[executor_counts] miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}, Max: {max_executors}, Min: {min_executors}")
+
+                                except Exception as e:
+                                    bittensor.logging.error(f"[Get executor_counts] miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}", "sync", "sync")
+
+                                if miner_hotkey in self.miner_scores:
+                                    self.miner_scores[miner_hotkey] += job_score
+                                else:
+                                    self.miner_scores[miner_hotkey] = job_score
                             else:
-                                self.miner_scores[miner_hotkey] = job_score
+                                info = task_info.get(task, {})
+                                miner_hotkey = info.get("miner_hotkey", "unknown")
+                                job_batch_id = info.get("job_batch_id", "unknown")
+                                bittensor.logging.error(
+                                    f"[Job_No_Result]: Task - for miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}.",
+                                    "sync", "sync"
+                                )
 
-                    bittensor.logging.info(f"miner scores: {self.miner_scores}", "sync", "sync")
+                        except Exception as e:
+                            bittensor.logging.error(f"Error processing job result: {e}", "sync", "sync")
 
-                    for index, result in enumerate(results):
-                        miner = miners[index]
-                        if isinstance(result, Exception):
+                    # Handle pending jobs (those that did not complete within the timeout)
+                    if pending:
+                        bittensor.logging.error("Some tasks timed out!", "sync", "sync")
+                        for task in pending:
+                            info = task_info.get(task, {})
+                            miner_hotkey = info.get("miner_hotkey", "unknown")
+                            job_batch_id = info.get("job_batch_id", "unknown")
                             bittensor.logging.error(
-                                f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) resulted in an exception: {result}",
-                                "sync",
-                                "sync",
+                                f"[Job_Timeout]: Task for miner_hotkey: {miner_hotkey}, job_batch_id: {job_batch_id}.",
+                                "sync", "sync"
                             )
-                        else:
-                            bittensor.logging.info(
-                                f"Job for miner({miner.hotkey}-{miner.axon_info.ip}:{miner.axon_info.port}) completed successfully: {result}",
-                                "sync",
-                                "sync",
-                            )
+                            task.cancel()
 
                     bittensor.logging.info("All Jobs finished", "sync", "sync")
                     bittensor.logging.info(f"miner_scores: {self.miner_scores}", "sync", "sync")
-                except TimeoutError:
-                    bittensor.logging.error("Tasks timed out!", "sync", "sync")
-                    # Cancel all tasks
-                    for index, job in enumerate(jobs):
-                        if not job.done():
-                            bittensor.logging.error(
-                                f"Cancelling job for miner({miners[index].hotkey}-{miners[index].axon_info.ip}:{miners[index].axon_info.port})",
-                                "sync",
-                                "sync",
-                            )
-                            job.cancel()
+
+                except Exception as e:
+                    bittensor.logging.error(f"Unexpected error: {e}", "sync", "sync")
             else:
                 remaining_blocks = (
                     current_block // settings.BLOCKS_FOR_JOB + 1
