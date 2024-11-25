@@ -393,64 +393,26 @@ class MinerService:
                                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
                             ),
                         )
-                        success, result = await self.docker_service.create_container(
+                        result = await self.docker_service.create_container(
                             payload,
                             executor,
                             my_key,
                             private_key.decode("utf-8"),
                         )
-                        if success:
-                            logger.info(
-                                _m(
-                                    "Created Container",
-                                    extra=get_extra_info({**default_extra, "result": str(result)}),
-                                ),
-                            )
-                            await miner_client.send_model(
-                                SSHPubKeyRemoveRequest(
-                                    public_key=public_key, executor_id=payload.executor_id
-                                )
-                            )
 
-                            return ContainerCreated(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                container_name=result.container_name,
-                                volume_name=result.volume_name,
-                                port_maps=result.port_maps,
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
                             )
-                        else:
-                            logger.info(
-                                _m(
-                                    "Deleting container",
-                                    extra=get_extra_info({**default_extra, "payload": str(payload)}),
-                                ),
-                            )
-                            await self.docker_service.delete_container(
-                                payload,
-                                executor,
-                                my_key,
-                                private_key.decode("utf-8"),
-                            )
+                        )
 
-                            logger.info(
-                                _m(
-                                    "Deleted Container",
-                                    extra=get_extra_info({**default_extra, "payload": str(payload)}),
-                                ),
-                            )
-                            await miner_client.send_model(
-                                SSHPubKeyRemoveRequest(
-                                    public_key=public_key, executor_id=payload.executor_id
-                                )
-                            )
-
-                            return ContainerDeleted(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                container_name=payload.container_name,
-                                volume_name=payload.volume_name,
-                            )
+                        return ContainerCreated(
+                            miner_hotkey=payload.miner_hotkey,
+                            executor_id=payload.executor_id,
+                            container_name=result.container_name,
+                            volume_name=result.volume_name,
+                            port_maps=result.port_maps,
+                        )
 
                     elif isinstance(payload, ContainerStartRequest):
                         logger.info(
