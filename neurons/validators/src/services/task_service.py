@@ -21,6 +21,7 @@ from services.const import (
     MAX_UPLOAD_SPEED,
     MIN_JOB_TAKEN_TIME,
     UPLOAD_SPEED_WEIGHT,
+    GPU_COUNT,
 )
 from services.redis_service import RENTED_MACHINE_SET, RedisService
 from services.ssh_service import SSHService
@@ -366,6 +367,8 @@ class TaskService:
                     logger.info(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    if gpu_count > GPU_COUNT:
+                        score = 0
 
                     return (
                         machine_spec,
@@ -522,7 +525,9 @@ class TaskService:
                 )
 
                 await self.clear_remote_directory(ssh_client, remote_dir)
-
+                if gpu_count > GPU_COUNT:
+                    score = 0
+                        
                 return (
                     machine_spec,
                     executor_info,
