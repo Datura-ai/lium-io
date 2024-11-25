@@ -3,6 +3,7 @@ import random
 import aiohttp
 from typing import Annotated
 from uuid import uuid4
+import asyncio
 
 import asyncssh
 import bittensor
@@ -17,7 +18,7 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
-from core.utils import _m, get_extra_info
+from core.utils import _m, context, get_extra_info
 from services.redis_service import RedisService
 from services.ssh_service import SSHService
 
@@ -58,7 +59,7 @@ class DockerService:
                 available_ports = list(map(int, range_external_ports.split(',')))
         else:
                 # If empty, use a default range for random selection
-                available_ports = list(range(10000, 20000))
+                available_ports = list(range(40000, 65536))
 
         for i in range(len(internal_ports)):
             while True:
@@ -66,7 +67,7 @@ class DockerService:
                     external_port = random.choice(available_ports)
                     available_ports.remove(external_port)
                 else:
-                    external_port = random.randint(10000, 20000)
+                    external_port = random.randint(40000, 65536)
 
                 if external_port not in used_external_ports:
                     used_external_ports.add(external_port)
@@ -196,7 +197,13 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "container_name": container_name}),
                 ),
             )
-
+            success, _, _ = await self.docker_connection_check(
+                ssh_client, 
+                payload.miner_hotkey, 
+                executor_info, 
+                private_key, 
+                payload.user_public_key
+            )
             await self.redis_service.add_rented_machine(
                 RentedMachine(
                     miner_hotkey=payload.miner_hotkey,
@@ -206,7 +213,7 @@ class DockerService:
                 )
             )
 
-            return ContainerCreatedResult(
+            return success, ContainerCreatedResult(
                 container_name=container_name,
                 volume_name=volume_name,
                 port_maps=port_maps,
@@ -412,3 +419,98 @@ class DockerService:
                     print(f"Error retrieving data for {repo}: {e}")
 
         return all_digests
+
+    def get_available_port(
+        self,
+        port_range: str,
+    ) -> int:
+        if port_range:
+            if '-' in port_range:
+                min_port, max_port = map(int, (part.strip() for part in port_range.split('-')))
+                ports = range(min_port, max_port + 1)
+            else:
+                ports = list(map(int, (part.strip() for part in port_range.split(','))))
+        else:
+            # Default range if port_range is empty
+            ports = range(40000, 65536)
+
+        return random.choice(ports)
+    
+    async def docker_connection_check(
+            self,
+            ssh_client: asyncssh.SSHClientConnection,
+            miner_hotkey: str,
+            executor_info: ExecutorSSHInfo,
+            private_key: str,
+            public_key: str,
+        ):
+            ssh_port = self.get_available_port(executor_info.port_range)
+            executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+            default_extra = {
+                "miner_hotkey": miner_hotkey,
+                "executor_uuid": executor_info.uuid,
+                "executor_ip_address": executor_info.address,
+                "executor_port": executor_info.port,
+                "ssh_username": executor_info.ssh_username,
+                "ssh_port": ssh_port,
+            }
+            context.set(f"[_docker_connection_check][{executor_name}]")
+
+            try:
+                log_text = _m(
+                    "Creating docker container",
+                    extra=default_extra,
+                )
+                log_status = "info"
+                logger.info(log_text)
+
+                container_name = f"container_{miner_hotkey}"
+                docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
+                command = f"docker run -d --name {container_name} -p {ssh_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
+
+                result = await ssh_client.run(command, timeout=20)
+                if result.exit_status != 0:
+                    log_text = _m(
+                        "Error creating docker connection",
+                        extra=get_extra_info({**default_extra, "error": str(e)}),
+                    )
+                    log_status = "error"
+                    logger.error(log_text, exc_info=True)
+
+                    return False, log_text, log_status
+
+                await asyncio.sleep(2)
+
+                pkey = asyncssh.import_private_key(private_key)
+                async with asyncssh.connect(
+                    host=executor_info.address,
+                    port=ssh_port,
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=None,
+                ) as _:
+                    log_text = _m(
+                        "Connected into docker container",
+                        extra=default_extra,
+                    )
+                    logger.info(log_text)
+
+                command = f"docker rm {container_name} -f"
+                await ssh_client.run(command, timeout=20)
+
+                return True, log_text, log_status
+            except Exception as e:
+                log_text = _m(
+                    "Error connection docker container",
+                    extra=get_extra_info({**default_extra, "error": str(e)}),
+                )
+                log_status = "error"
+                logger.error(log_text, exc_info=True)
+
+                try:
+                    command = f"docker container stop {container_name} && docker container prune -f"
+                    await ssh_client.run(command, timeout=20)
+                except:
+                    pass
+
+                return False, log_text, log_status
