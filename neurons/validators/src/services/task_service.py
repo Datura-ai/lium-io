@@ -294,6 +294,21 @@ class TaskService:
                     max_score = GPU_MAX_SCORES.get(gpu_model, 0)
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
+                if gpu_count > GPU_COUNT:
+                    score = 0
+                    log_status = "warning"
+                    log_text = _m(
+                        f"GPU count({gpu_count}) is greater than the maximum allowed ({GPU_COUNT}).",
+                        extra=get_extra_info(default_extra),
+                    )
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 logger.info(
                     _m(
@@ -367,8 +382,6 @@ class TaskService:
                     logger.info(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    if gpu_count > GPU_COUNT:
-                        score = 0
 
                     return (
                         machine_spec,
@@ -525,9 +538,6 @@ class TaskService:
                 )
 
                 await self.clear_remote_directory(ssh_client, remote_dir)
-                if gpu_count > GPU_COUNT:
-                    score = 0
-                        
                 return (
                     machine_spec,
                     executor_info,
