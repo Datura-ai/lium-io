@@ -41,40 +41,28 @@ class DockerService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-
-    def generate_portMappings(self, range_external_ports: str) -> list[tuple[int, int]]:
-        internal_ports = [22, 22140, 22141, 22142, 22143]
-
-        mappings = []
-        used_external_ports = set()
         
-        # Parse the range_external_ports
+    def generate_portMappings(range_external_ports):
+        internal_ports = [22, 20000, 20001, 20002, 20003]
         if range_external_ports:
             if '-' in range_external_ports:
-                # Handle range like "100-1500"
                 start, end = map(int, range_external_ports.split('-'))
                 available_ports = list(range(start, end + 1))
             else:
-                # Handle list like "120,122,145"
                 available_ports = list(map(int, range_external_ports.split(',')))
         else:
-                # If empty, use a default range for random selection
-                available_ports = list(range(40000, 65535))
+            available_ports = list(range(40000, 65535))
 
-        for i in range(len(internal_ports)):
-            while True:
-                if available_ports:
-                    external_port = random.choice(available_ports)
-                    available_ports.remove(external_port)
-                else:
-                    external_port = random.randint(40000, 65535)
+        if 0 in available_ports:
+            available_ports.remove(0)
+            max_port = max(available_ports)
+            fill_ports = [p for p in range(max_port - (len(available_ports) - 1), max_port) if p not in available_ports]
+            available_ports = fill_ports + available_ports
 
-                if external_port not in used_external_ports:
-                    used_external_ports.add(external_port)
-                    break
-
-            mappings.append((internal_ports[i], external_port))
-
+        available_ports = available_ports[:len(available_ports)]
+        mappings = []
+        for i, internal_port in enumerate(internal_ports[:len(available_ports)]):
+            mappings.append((internal_port, available_ports[i]))
         return mappings
 
     async def create_container(
