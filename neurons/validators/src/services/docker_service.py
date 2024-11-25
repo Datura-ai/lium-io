@@ -84,6 +84,12 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        ssh_service = SSHService()
+        task_service = TaskService(
+            ssh_service=ssh_service,
+            redis_service=self.redis_service,
+        )
+        
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
@@ -93,6 +99,7 @@ class DockerService:
             "executor_ssh_port": executor_info.ssh_port,
             "debug": payload.debug,
         }
+
 
         logger.info(
             _m(
@@ -197,7 +204,7 @@ class DockerService:
                     extra=get_extra_info({**default_extra, "container_name": container_name}),
                 ),
             )
-            success, _, _ = await TaskService.docker_connection_check(
+            success, _, _ = await task_service.docker_connection_check(
                 ssh_client, 
                 "",
                 payload.miner_hotkey, 
