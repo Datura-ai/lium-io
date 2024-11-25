@@ -52,17 +52,23 @@ class DockerService:
                 available_ports = list(map(int, range_external_ports.split(',')))
         else:
             available_ports = list(range(40000, 65535))
-
+        
         if 0 in available_ports:
             available_ports.remove(0)
             max_port = max(available_ports)
-            fill_ports = [p for p in range(max_port - (len(available_ports) - 1), max_port) if p not in available_ports]
+            fill_ports = []
+            for i in  range(len(internal_ports)):
+                if max_port - i not in available_ports:
+                    fill_ports.append(max_port - i)
+                    break
             available_ports = fill_ports + available_ports
-
-        available_ports = available_ports[:len(available_ports)]
+        
         mappings = []
-        for i, internal_port in enumerate(internal_ports[:len(available_ports)]):
-            mappings.append((internal_port, available_ports[i]))
+        for i, internal_port in enumerate(internal_ports):
+            if i < len(available_ports):
+                mappings.append((internal_port, available_ports[i]))
+            else:
+                break
         return mappings
 
     async def create_container(
