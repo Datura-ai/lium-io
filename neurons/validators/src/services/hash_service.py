@@ -88,10 +88,10 @@ class HashService:
 
     @classmethod
     def generate(
-        cls, job_params_count: int = 3, salt_length_bytes: int = 8
+        cls, job_params_count: int = 3, num_hashes: int = 100, salt_length_bytes: int = 8
     ) -> Self:
         # generate distinct passwords for each algorithm
-        job_params = [JobParam.generate() for _ in range(job_params_count)]
+        job_params = [JobParam.generate(num_hashes=num_hashes) for _ in range(job_params_count)]
 
         passwords = []
         for _params in job_params:
@@ -157,13 +157,19 @@ class HashService:
 
 
 if __name__ == "__main__":
-    hash_service = HashService.generate()
-    # print(hash_service.payload)
+    import time
+
+    hash_service = HashService.generate(num_hashes=1)
+    print(hash_service.payload)
     print(hash_service.answer)
-    
-    cmd=f"python src/miner_jobs/score.py '{hash_service.payload}'"
+
+    start_time = time.time()
+
+    cmd = f"python dist/score.py '{hash_service.payload}'"
     result = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+    end_time = time.time()
     print('result ===>', result)
+    print(end_time - start_time)
     # # print(job.algorithms, job.passwords, job.salts, job.params)
     # print(job.payload)
     # # print(job.raw_script())

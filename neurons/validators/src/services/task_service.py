@@ -24,6 +24,7 @@ from services.const import (
 )
 from services.redis_service import RENTED_MACHINE_SET, RedisService
 from services.ssh_service import SSHService
+from services.hash_service import HashService
 
 logger = logging.getLogger(__name__)
 
@@ -413,13 +414,14 @@ class TaskService:
                         return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                 # scoring
+                hash_service = HashService.generate(num_hashes=1)
                 start_time = time.time()
 
                 results, err = await self._run_task(
                     ssh_client=ssh_client,
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
-                    command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path}",
+                    command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path} '{hash_service.payload}'",
                 )
                 if not results:
                     log_text = _m(
@@ -443,6 +445,7 @@ class TaskService:
                 end_time = time.time()
 
                 result = json.loads(self.ssh_service.decrypt_payload(encypted_files.encrypt_key, results[0]))
+                answer = result["answer"]
 
                 score = 0
 
@@ -463,12 +466,16 @@ class TaskService:
                     )
                     logger.error(log_text)
 
+                elif answer != hash_service.answer:
+                    log_status = "error"
+                    log_text = _m(
+                        f"Incorrect Answer",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.error(log_text)
+
                 else:
-                    job_taken_time = result["time"]
-                    try:
-                        job_taken_time = float(job_taken_time)
-                    except Exception:
-                        job_taken_time = end_time - start_time
+                    job_taken_time = end_time - start_time
 
                     logger.info(
                         _m(

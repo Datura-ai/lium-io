@@ -54,6 +54,6 @@ COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 RUN mkdir -p /etc/docker
 RUN mkdir -p /etc/nvidia-container-runtime
 
-LABEL version="3.1.0"
+LABEL version="3.2.0"
 
 CMD ["bash", "run.sh"]

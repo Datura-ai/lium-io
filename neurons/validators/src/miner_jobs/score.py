@@ -2,8 +2,6 @@ import sys
 import os
 import subprocess
 import tempfile
-import time
-
 import json
 import hashlib
 from base64 import b64encode
@@ -13,7 +11,6 @@ def hash(s: bytes) -> bytes:
     return b64encode(hashlib.sha256(s).digest(), altchars=b"-_")
 
 
-start_time = time.time()
 payload = sys.argv[1]
 data = json.loads(payload)
 
@@ -35,7 +32,6 @@ for i in range(int(data["n"])):
 
 
 result = {
-    "time": time.time() - start_time,
     "answer": hash("".join(["".join(passwords) for passwords in answers]).encode("utf-8")).decode("utf-8")
 }
 
