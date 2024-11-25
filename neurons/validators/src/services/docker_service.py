@@ -59,7 +59,7 @@ class DockerService:
                 available_ports = list(map(int, range_external_ports.split(',')))
         else:
                 # If empty, use a default range for random selection
-                available_ports = list(range(40000, 65536))
+                available_ports = list(range(40000, 65535))
 
         for i in range(len(internal_ports)):
             while True:
@@ -67,7 +67,7 @@ class DockerService:
                     external_port = random.choice(available_ports)
                     available_ports.remove(external_port)
                 else:
-                    external_port = random.randint(40000, 65536)
+                    external_port = random.randint(40000, 65535)
 
                 if external_port not in used_external_ports:
                     used_external_ports.add(external_port)
