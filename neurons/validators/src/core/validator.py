@@ -166,7 +166,7 @@ class Validator:
         if not self.miner_scores:
             log_text = "No miner scores available, skipping set_weights."
             bittensor.logging.info(log_text)
-            log_status = "info"
+            log_status = "warning"
             await self.redis_service.publish(
                 LOG_ERROR_VALIDATOR_CHANNEL_NAME,
                 {
