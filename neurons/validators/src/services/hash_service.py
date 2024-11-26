@@ -50,14 +50,16 @@ class JobParam:
     @classmethod
     def generate(
         cls,
-        num_hashes: int = 100
+        num_letters: int,
+        num_digits: int,
+        num_hashes: int,
     ) -> Self:
         algorithm = random.choice(list(Algorithm))
 
         return cls(
             algorithm=algorithm,
-            num_letters=random.randint(5, 6),
-            num_digits=random.randint(1, 2),
+            num_letters=num_letters,
+            num_digits=num_digits,
             num_hashes=num_hashes,
         )
 
@@ -76,11 +78,18 @@ class JobParam:
 
 
 @dataclass
-class HashService:
-    job_params_count: int
+class HashcatJob:
     passwords: list[list[str]]
     salts: list[bytes]
     job_params: list[JobParam]
+
+
+@dataclass
+class HashService:
+    gpu_count: int
+    num_job_params: int
+    jobs: list[HashcatJob]
+    timeout: int
 
     @classmethod
     def random_string(self, num_letters: int, num_digits: int) -> str:
@@ -88,48 +97,77 @@ class HashService:
 
     @classmethod
     def generate(
-        cls, job_params_count: int = 3, num_hashes: int = 100, salt_length_bytes: int = 8
+        cls,
+        gpu_count: int = 1,
+        timeout: int = 60,
+        num_job_params: int = 1,
+        num_letters: int = 0,
+        num_digits: int = 11,
+        num_hashes: int = 10,
+        salt_length_bytes: int = 8
     ) -> Self:
-        # generate distinct passwords for each algorithm
-        job_params = [JobParam.generate(num_hashes=num_hashes) for _ in range(job_params_count)]
-
-        passwords = []
-        for _params in job_params:
-            _passwords = set()
-            while len(_passwords) < _params.num_hashes:
-                _passwords.add(
-                    cls.random_string(
-                        num_letters=_params.num_letters, num_digits=_params.num_digits
-                    )
+        jobs = []
+        for _ in range(gpu_count):
+            job_params = [
+                JobParam.generate(
+                    num_letters=num_letters,
+                    num_digits=num_digits,
+                    num_hashes=num_hashes,
                 )
-            passwords.append(sorted(list(_passwords)))
+                for _ in range(num_job_params)
+            ]
+
+            passwords = [
+                sorted(
+                    {
+                        cls.random_string(
+                            num_letters=_params.num_letters, num_digits=_params.num_digits
+                        )
+                        for _ in range(_params.num_hashes)
+                    }
+                )
+                for _params in job_params
+            ]
+
+            salts = [secrets.token_bytes(salt_length_bytes) for _ in range(num_job_params)]
+
+            jobs.append(HashcatJob(
+                job_params=job_params,
+                passwords=passwords,
+                salts=salts,
+            ))
 
         return cls(
-            job_params_count=job_params_count,
-            job_params=job_params,
-            passwords=passwords,
-            salts=[secrets.token_bytes(salt_length_bytes) for _ in range(job_params_count)],
+            gpu_count=gpu_count,
+            num_job_params=num_job_params,
+            jobs=jobs,
+            timeout=timeout,
         )
 
-    def hash_masks(self) -> list[str]:
-        return ["?1" * param.num_letters + "?d" * param.num_digits for param in self.job_params]
+    def hash_masks(self, job: HashcatJob) -> list[str]:
+        return ["?1" * param.num_letters + "?d" * param.num_digits for param in job.job_params]
 
-    def hash_hexes(self, i) -> list[str]:
+    def hash_hexes(self, algorithm: Algorithm, passwords: list[str], salt: str) -> list[str]:
         return [
-            self.job_params[i].algorithm.hash(password.encode("ascii") + self.salts[i]).hexdigest()
-            for password in self.passwords[i]
+            algorithm.hash(password.encode("ascii") + salt).hexdigest()
+            for password in passwords
         ]
 
     def _hash(self, s: bytes) -> bytes:
         return b64encode(hashlib.sha256(s).digest(), altchars=b"-_")
 
-    def _payload(self, i) -> str:
-        return "\n".join([f"{hash_hex}:{self.salts[i].hex()}" for hash_hex in self.hash_hexes(i)])
+    # def _payload(self, i) -> str:
+    #     return "\n".join([f"{hash_hex}:{self.salts[i].hex()}" for hash_hex in self.hash_hexes(i)])
 
-    def _payloads(self) -> list[str]:
-        payloads = []
-        for i in range(self.job_params_count):
-            payloads.append(self._payload(i))
+    def _payloads(self, job: HashcatJob) -> list[str]:
+        payloads = [
+            "\n".join([
+                f"{hash_hex}:{job.salts[i].hex()}"
+                for hash_hex
+                in self.hash_hexes(job.job_params[i].algorithm, job.passwords[i], job.salts[i])
+            ])
+            for i in range(self.num_job_params)
+        ]
         return payloads
 
     @property
@@ -137,41 +175,40 @@ class HashService:
         """Convert this instance to a hashcat argument format."""
 
         data = {
-            "n": self.job_params_count,
-            "payloads": self._payloads(),
-            "masks": self.hash_masks(),
-            "algorithms": [param.algorithm.type for param in self.job_params],
-            "num_letters": [param.num_letters for param in self.job_params],
-            "num_digits": [param.num_digits for param in self.job_params],
+            "gpu_count": self.gpu_count,
+            "num_job_params": self.num_job_params,
+            "jobs": [
+                {
+                    "payloads": self._payloads(job),
+                    "masks": self.hash_masks(job),
+                    "algorithms": [param.algorithm.type for param in job.job_params],
+                }
+                for job in self.jobs
+            ],
+            "timeout": self.timeout,
         }
         return json.dumps(data)
 
     @property
     def answer(self) -> str:
         return self._hash(
-            "".join(["".join(passwords) for passwords in self.passwords]).encode("utf-8")
+            "".join(["".join(["".join(passwords) for passwords in job.passwords]) for job in self.jobs]).encode("utf-8")
         ).decode("utf-8")
 
     def __str__(self) -> str:
-        return f"JobService {self.job_params}"
+        return f"JobService {self.jobs}"
 
 
 if __name__ == "__main__":
     import time
 
-    hash_service = HashService.generate(num_hashes=1)
-    print(hash_service.payload)
-    print(hash_service.answer)
+    hash_service = HashService.generate(gpu_count=1, timeout=50)
+    print('answer ====>', hash_service.answer)
 
     start_time = time.time()
 
-    cmd = f"python dist/score.py '{hash_service.payload}'"
+    cmd = f"python src/miner_jobs/score.py '{hash_service.payload}'"
     result = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
     end_time = time.time()
     print('result ===>', result)
     print(end_time - start_time)
-    # # print(job.algorithms, job.passwords, job.salts, job.params)
-    # print(job.payload)
-    # # print(job.raw_script())
-    # # print(f"Payload: {job.payload}")
-    # print(f"Answer: {job.answer}") fSCQBEvrW6wTYMbh1vO66l1K_Jqx5efRU8ofjAcA2pQ=
