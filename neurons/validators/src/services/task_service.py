@@ -543,7 +543,7 @@ class TaskService:
                     upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
                     download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
 
-                    score = max_score * gpu_count * (
+                    score = max_score * gpu_count * 0.1 (
                         job_taken_score * JOB_TAKEN_TIME_WEIGHT
                         + upload_speed_score * UPLOAD_SPEED_WEIGHT
                         + download_speed_score * DOWNLOAD_SPEED_WEIGHT
