@@ -203,6 +203,7 @@ if __name__ == "__main__":
     import time
 
     hash_service = HashService.generate(gpu_count=1, timeout=50)
+    # print(hash_service.payload)
     print('answer ====>', hash_service.answer)
 
     start_time = time.time()

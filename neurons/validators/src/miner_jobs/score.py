@@ -33,9 +33,11 @@ def run_hashcat(device_id: int, job: dict) -> list[str]:
             payload_file.flush()
             os.fsync(payload_file.fileno())
 
-            cmd = f'hashcat --potfile-disable --restore-disable --attack-mode 3 -d {device_id} --workload-profile 3 --optimized-kernel-enable --hash-type {algorithm} --hex-salt -1 "?l?d?u" --outfile-format 2 --quiet {payload_file.name} "{mask}"'
-            passwords = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
-            passwords = [p for p in sorted(passwords.split("\n")) if p != ""]
+            subprocess.check_output(f"cp /usr/bin/hashcat /usr/bin/hashcat{device_id}", shell=True)
+
+            cmd = f'hashcat{device_id} --potfile-disable --restore-disable --attack-mode 3 -d {device_id} --workload-profile 3 --optimized-kernel-enable --hash-type {algorithm} --hex-salt -1 "?l?d?u" --outfile-format 2 --quiet {payload_file.name} "{mask}"'
+            stdout = subprocess.check_output(cmd, shell=True, text=True)
+            passwords = [p for p in sorted(stdout.split("\n")) if p != ""]
             answers.append(passwords)
 
     return answers
@@ -44,13 +46,14 @@ def run_hashcat(device_id: int, job: dict) -> list[str]:
 async def run_jobs():
     tasks = [
         asyncio.to_thread(
-            run_hashcat, i+1, jobs[i]
+            run_hashcat,
+            i+1,
+            jobs[i]
         )
         for i in range(gpu_count)
     ]
 
     results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-
     result = {
         "answer": gen_hash("".join([
             "".join([
