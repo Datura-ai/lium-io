@@ -19,12 +19,13 @@ from services.const import (
     JOB_TAKEN_TIME_WEIGHT,
     MAX_DOWNLOAD_SPEED,
     MAX_UPLOAD_SPEED,
-    MIN_JOB_TAKEN_TIME,
     UPLOAD_SPEED_WEIGHT,
     GPU_COUNT,
+    HASHCAT_CONFIGS,
 )
 from services.redis_service import RENTED_MACHINE_SET, RedisService
 from services.ssh_service import SSHService
+from services.hash_service import HashService
 
 logger = logging.getLogger(__name__)
 
@@ -429,13 +430,34 @@ class TaskService:
                         return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
 
                 # scoring
+                hashcat_config = HASHCAT_CONFIGS[gpu_model]
+                if not hashcat_config:
+                    log_text = _m(
+                        "No config for hashcat",
+                        extra=get_extra_info(default_extra),
+                    )
+                    log_status = "error"
+
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+
+                num_digits = hashcat_config.get('digits', 11)
+                avg_job_time = hashcat_config.get("average_time")[gpu_count - 1] if hashcat_config.get("average_time") else 60
+                hash_service = HashService.generate(
+                    gpu_count=gpu_count,
+                    num_digits=num_digits,
+                    timeout=int(avg_job_time * 2.5)
+                )
                 start_time = time.time()
 
                 results, err = await self._run_task(
                     ssh_client=ssh_client,
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
-                    command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path}",
+                    command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path} '{hash_service.payload}'",
                 )
                 if not results:
                     log_text = _m(
@@ -457,8 +479,10 @@ class TaskService:
                     )
 
                 end_time = time.time()
+                job_taken_time = end_time - start_time
 
-                result = json.loads(self.ssh_service.decrypt_payload(encypted_files.encrypt_key, results[0]))
+                result = json.loads(results[0])
+                answer = result["answer"]
 
                 score = 0
 
@@ -479,13 +503,23 @@ class TaskService:
                     )
                     logger.error(log_text)
 
-                else:
-                    job_taken_time = result["time"]
-                    try:
-                        job_taken_time = float(job_taken_time)
-                    except Exception:
-                        job_taken_time = end_time - start_time
+                elif answer != hash_service.answer:
+                    log_status = "error"
+                    log_text = _m(
+                        f"Hashcat incorrect Answer",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.error(log_text)
+                    
+                # elif job_taken_time > avg_job_time * 2:
+                #     log_status = "error"
+                #     log_text = _m(
+                #         f"Incorrect Answer",
+                #         extra=get_extra_info(default_extra),
+                #     )
+                #     logger.error(log_text)
 
+                else:
                     logger.info(
                         _m(
                             "Job taken time for executor",
@@ -503,13 +537,13 @@ class TaskService:
                     download_speed = download_speed if download_speed is not None else 0
 
                     job_taken_score = (
-                        min(MIN_JOB_TAKEN_TIME / job_taken_time, 1) if job_taken_time > 0 else 0
+                        min(avg_job_time * 0.7 / job_taken_time, 1) if job_taken_time > 0 else 0
                     )
                     upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
                     download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
 
-                    score = max_score * (
-                        job_taken_score * gpu_count * JOB_TAKEN_TIME_WEIGHT
+                    score = max_score * gpu_count * (
+                        job_taken_score * JOB_TAKEN_TIME_WEIGHT
                         + upload_speed_score * UPLOAD_SPEED_WEIGHT
                         + download_speed_score * DOWNLOAD_SPEED_WEIGHT
                     )
