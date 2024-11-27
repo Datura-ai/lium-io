@@ -21,6 +21,7 @@ from services.const import (
     MAX_UPLOAD_SPEED,
     UPLOAD_SPEED_WEIGHT,
     MAX_GPU_COUNT,
+    UNRENTED_MULTIPLIER,
     HASHCAT_CONFIGS,
 )
 from services.redis_service import RENTED_MACHINE_SET, RedisService
@@ -511,7 +512,7 @@ class TaskService:
                         extra=get_extra_info(default_extra),
                     )
                     logger.error(log_text)
-                    
+
                 # elif job_taken_time > avg_job_time * 2:
                 #     log_status = "error"
                 #     log_text = _m(
@@ -543,7 +544,7 @@ class TaskService:
                     upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
                     download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
 
-                    score = max_score * gpu_count * 0.1 (
+                    score = max_score * gpu_count * UNRENTED_MULTIPLIER * (
                         job_taken_score * JOB_TAKEN_TIME_WEIGHT
                         + upload_speed_score * UPLOAD_SPEED_WEIGHT
                         + download_speed_score * DOWNLOAD_SPEED_WEIGHT
