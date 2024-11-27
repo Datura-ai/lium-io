@@ -41,8 +41,8 @@ class DockerService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-        
-    def generate_portMappings(range_external_ports):
+
+    def generate_portMappings(self, range_external_ports):
         internal_ports = [22, 20000, 20001, 20002, 20003]
         if range_external_ports:
             if '-' in range_external_ports:
@@ -52,17 +52,10 @@ class DockerService:
                 available_ports = list(map(int, range_external_ports.split(',')))
         else:
             available_ports = list(range(40000, 65535))
-        
+
         if 0 in available_ports:
             available_ports.remove(0)
-            max_port = max(available_ports)
-            fill_ports = []
-            for i in  range(len(internal_ports)):
-                if max_port - i not in available_ports:
-                    fill_ports.append(max_port - i)
-                    break
-            available_ports = fill_ports + available_ports
-        
+
         mappings = []
         for i, internal_port in enumerate(internal_ports):
             if i < len(available_ports):
@@ -88,13 +81,17 @@ class DockerService:
             "debug": payload.debug,
         }
 
-
         logger.info(
             _m(
                 "Create Docker Container",
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
+
+        # generate port maps
+        port_maps = self.generate_portMappings(executor_info.port_range)
+        if not port_maps:
+            return None
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
@@ -159,8 +156,6 @@ class DockerService:
                     ),
                 )
 
-            # generate port maps
-            port_maps = self.generate_portMappings(executor_info.port_range)
             port_flags = " ".join([f"-p {external}:{internal}" for internal, external in port_maps])
 
             # creat docker volume

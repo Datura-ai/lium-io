@@ -405,6 +405,13 @@ class MinerService:
                                 public_key=public_key, executor_id=payload.executor_id
                             )
                         )
+                        
+                        if result is None:
+                            return FailedContainerRequest(
+                                miner_hotkey=payload.miner_hotkey,
+                                executor_id=payload.executor_id,
+                                msg=f"create container error: No ports available",
+                            )
 
                         return ContainerCreated(
                             miner_hotkey=payload.miner_hotkey,
