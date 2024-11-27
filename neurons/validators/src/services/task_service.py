@@ -302,6 +302,7 @@ class TaskService:
                         f"GPU count({gpu_count}) is greater than the maximum allowed ({GPU_COUNT}).",
                         extra=get_extra_info(default_extra),
                     )
+                    await self.clear_remote_directory(ssh_client, remote_dir)
                     return (
                         machine_spec,
                         executor_info,
