@@ -280,4 +280,4 @@ HASHCAT_CONFIGS = {
         ]
     }
 }
-GPU_COUNT = 8
+MAX_GPU_COUNT = 8
