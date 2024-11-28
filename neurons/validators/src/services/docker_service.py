@@ -439,15 +439,13 @@ class DockerService:
 
             return False, log_text, log_status
 
-        # Run the docker inspect command to get container details
-        result = await ssh_client.run(f'docker inspect {container_name}', check=True)
 
-        external_port = int(port_flags.split()[1].split(':')[0])
+        port = int(port_flags.split()[1].split(':')[0])
         # Check SSH connection
         try:
             async with asyncssh.connect(
                 host=ip_address,
-                port=external_port,
+                port=port,
                 username=username,
                 client_keys=[pkey],
                 known_hosts=None,
