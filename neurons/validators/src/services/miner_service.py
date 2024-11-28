@@ -399,6 +399,12 @@ class MinerService:
                             my_key,
                             private_key.decode("utf-8"),
                         )
+                        if isinstance(result, FailedContainerRequest):
+                            return FailedContainerRequest(
+                                miner_hotkey=payload.miner_hotkey,
+                                executor_id=payload.executor_id,
+                                msg=f"Unexpected request: {payload}",
+                            )
 
                         logger.info(
                             _m(

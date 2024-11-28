@@ -14,6 +14,7 @@ from payload_models.payloads import (
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
+    FailedContainerRequest,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -179,6 +180,19 @@ class DockerService:
                 ),
             )
 
+            result, log_text, log_status = await self.setup_ssh_access(
+                ssh_client, 
+                container_name,
+                executor_info.address,
+                executor_info.ssh_username, 
+                port_flags
+            )
+            if not result:
+                return FailedContainerRequest(
+                            miner_hotkey=payload.miner_hotkey,
+                            executor_id=payload.executor_id,
+                            msg=log_text
+                        )
             await self.redis_service.add_rented_machine(
                 RentedMachine(
                     miner_hotkey=payload.miner_hotkey,
@@ -394,3 +408,74 @@ class DockerService:
                     print(f"Error retrieving data for {repo}: {e}")
 
         return all_digests
+    
+    async def setup_ssh_access(
+            self,
+            ssh_client: asyncssh.SSHClientConnection,
+            container_name: str,
+            ip_address: str,
+            username: str = "root", 
+            port_flags: str = ""
+    ) -> tuple[bool, str, str]:
+        """Generate an SSH key pair, add the public key to the Docker container, and check SSH connection."""
+
+        my_key="my_key"
+        private_key, public_key = self.ssh_service.generate_ssh_key(my_key)
+
+        public_key = public_key.decode("utf-8")
+        private_key = private_key.decode("utf-8")
+
+        private_key = self.ssh_service.decrypt_payload(my_key, private_key)
+        pkey = asyncssh.import_private_key(private_key)
+
+
+        command = f"docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
+
+        result = await ssh_client.run(command)
+        if result.exit_status != 0:
+            log_text = "Error creating docker connection"
+            log_status = "error"
+            logger.error(log_text, exc_info=True)
+
+            return False, log_text, log_status
+
+        # Run the docker inspect command to get container details
+        result = await ssh_client.run(f'docker inspect {container_name}', check=True)
+
+        external_port = int(port_flags.split()[1].split(':')[0])
+        # Check SSH connection
+        try:
+            async with asyncssh.connect(
+                host=ip_address,
+                port=external_port,
+                username=username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client_1:
+                log_status = "info"
+                log_text = "SSH connection successful!"
+                logger.info(
+                    _m(
+                        log_text,
+                        extra={
+                            "container_name": container_name,
+                            "ip_address": ip_address,
+                            "external_port": external_port,
+                        },
+                    )
+                )
+                return True, log_text, log_status
+        except Exception:
+            log_text = "SSH connection failed"
+            log_status = "error"
+            logger.error(
+                _m(
+                    log_text,
+                    extra={
+                        "container_name": container_name,
+                        "ip_address": ip_address,
+                        "external_port": external_port,
+                    },
+                )
+            )
+            return False, log_text, log_status
