@@ -15,6 +15,7 @@ from services.docker_service import DockerService, REPOSITORYS
 from services.file_encrypt_service import FileEncryptService
 from payload_models.payloads import (
     MinerJobRequestPayload,
+    ContainerCreateRequest,
 )
 
 configure_logs_of_other_modules()
@@ -158,6 +159,30 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
         encypted_files=encypted_files,
         docker_hub_digests=docker_hub_digests,
     )
+
+@cli.command()
+@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
+@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
+@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
+@click.option("--executor_id", prompt="Executor Id", help="Executor Id")
+@click.option("--docker_image", prompt="Docker Image", help="Docker Image")
+def create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
+    asyncio.run(_create_container_to_miner(miner_hotkey, miner_address, miner_port, executor_id, docker_image))
+
+
+async def _create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
+    miner_service: MinerService = ioc["MinerService"]
+
+    payload = ContainerCreateRequest(
+        docker_image=docker_image,
+        user_public_key="user_public_key",
+        executor_id=executor_id,
+        miner_hotkey=miner_hotkey,
+        miner_address=miner_address,
+        miner_port=miner_port,
+    )
+    await miner_service.handle_container(payload)
+
 
 if __name__ == "__main__":
     cli()
