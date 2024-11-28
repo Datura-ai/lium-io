@@ -194,7 +194,7 @@ class DockerService:
                 container_name,
                 executor_info.address,
                 executor_info.ssh_username, 
-                port_flags
+                port_maps
             )
             if not result:
                 return FailedContainerRequest(
@@ -424,7 +424,7 @@ class DockerService:
             container_name: str,
             ip_address: str,
             username: str = "root", 
-            port_flags: str = ""
+            port_maps: str = ""
     ) -> tuple[bool, str, str]:
         """Generate an SSH key pair, add the public key to the Docker container, and check SSH connection."""
 
@@ -449,13 +449,9 @@ class DockerService:
             return False, log_text, log_status
         
         port=0
-        mappings = port_flags.split()
-        # Iterate over each mapping
-        for mapping in mappings:
-            # Check if the mapping contains the internal port
-            if ":22" in mapping:
-                # Extract and return the external port
-                port = int(mapping.split(':')[0])
+        for internal, external in port_maps:
+            if internal == 22:
+                port = external
         # Check SSH connection
         try:
             async with asyncssh.connect(
@@ -473,7 +469,7 @@ class DockerService:
                         extra={
                             "container_name": container_name,
                             "ip_address": ip_address,
-                            "port_mappings": port_flags,
+                            "port_maps": port_maps,
                         },
                     )
                 )
@@ -487,7 +483,7 @@ class DockerService:
                     extra={
                         "container_name": container_name,
                         "ip_address": ip_address,
-                        "port_mappings": port_flags,
+                        "port_maps": port_maps,
                     },
                 )
             )
