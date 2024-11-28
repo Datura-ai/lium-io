@@ -210,6 +210,7 @@ class ComputeClient:
                     specs = ExecutorSpecRequest(
                         specs=msg["specs"],
                         score=msg["score"],
+                        synthetic_job_score=msg["synthetic_job_score"],
                         log_status=msg["log_status"],
                         job_batch_id=msg["job_batch_id"],
                         log_text=msg["log_text"],
