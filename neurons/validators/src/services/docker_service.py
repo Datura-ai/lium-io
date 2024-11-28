@@ -447,9 +447,15 @@ class DockerService:
             logger.error(log_text, exc_info=True)
 
             return False, log_text, log_status
-
-
-        port = int(port_flags.split()[1].split(':')[0])
+        
+        port=0
+        mappings = port_flags.split()
+        # Iterate over each mapping
+        for mapping in mappings:
+            # Check if the mapping contains the internal port
+            if ":22" in mapping:
+                # Extract and return the external port
+                port = int(mapping.split(':')[0])
         # Check SSH connection
         try:
             async with asyncssh.connect(
