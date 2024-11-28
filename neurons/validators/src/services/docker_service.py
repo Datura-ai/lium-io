@@ -18,8 +18,8 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
-from core.utils import _m, context, get_extra_info
-from services.redis_service import RedisService
+from core.utils import _m, get_extra_info
+from services.redis_service import RedisService, AVAILABLE_PORTS_PREFIX
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -42,27 +42,29 @@ class DockerService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
 
-    def generate_portMappings(self, range_external_ports):
-        internal_ports = [22, 20000, 20001, 20002, 20003]
-        if range_external_ports:
-            if '-' in range_external_ports:
-                start, end = map(int, range_external_ports.split('-'))
-                available_ports = list(range(start, end + 1))
-            else:
-                available_ports = list(map(int, range_external_ports.split(',')))
-        else:
-            available_ports = list(range(40000, 65535))
+    async def generate_portMappings(self, miner_hotkey, executor_id):
+        try:
+            internal_ports = [22, 20000, 20001, 20002, 20003]
 
-        if 0 in available_ports:
-            available_ports.remove(0)
-
-        mappings = []
-        for i, internal_port in enumerate(internal_ports):
-            if i < len(available_ports):
-                mappings.append((internal_port, available_ports[i]))
+            key = f"{AVAILABLE_PORTS_PREFIX}:{miner_hotkey}:{executor_id}"
+            available_ports_str = await self.redis_service.get(key)
+            if available_ports_str:
+                available_ports = list(map(int, available_ports_str.decode().split(',')))
             else:
-                break
-        return mappings
+                available_ports = []
+
+            if 0 in available_ports:
+                available_ports.remove(0)
+
+            mappings = []
+            for i, internal_port in enumerate(internal_ports):
+                if i < len(available_ports):
+                    mappings.append((internal_port, available_ports[i]))
+                else:
+                    break
+            return mappings
+        except:
+            return []
 
     async def create_container(
         self,
@@ -89,7 +91,7 @@ class DockerService:
         )
 
         # generate port maps
-        port_maps = self.generate_portMappings(executor_info.port_range)
+        port_maps = await self.generate_portMappings(payload.miner_hotkey, payload.executor_id)
         if not port_maps:
             return None
 
