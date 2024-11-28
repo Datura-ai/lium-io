@@ -424,7 +424,7 @@ class DockerService:
             container_name: str,
             ip_address: str,
             username: str = "root", 
-            port_maps: str = ""
+            port_maps: list[tuple[int, int]] = None
     ) -> tuple[bool, str, str]:
         """Generate an SSH key pair, add the public key to the Docker container, and check SSH connection."""
 
