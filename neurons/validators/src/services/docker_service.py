@@ -92,7 +92,13 @@ class DockerService:
         # generate port maps
         port_maps = self.generate_portMappings(executor_info.port_range)
         if not port_maps:
-            return None
+            log_text = "No port mappings found"
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=log_text
+            )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
@@ -444,7 +450,7 @@ class DockerService:
         if result.exit_status != 0:
             log_text = "Error creating docker connection"
             log_status = "error"
-            logger.error(log_text, exc_info=True)
+            logger.error(log_text)
 
             return False, log_text, log_status
         
