@@ -53,6 +53,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     executor_port: int
     specs: dict | None
     score: float | None
+    synthetic_job_score: float | None
     log_text: str | None
     log_status: str | None
     job_batch_id: str
