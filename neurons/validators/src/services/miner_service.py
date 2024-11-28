@@ -406,17 +406,18 @@ class MinerService:
                                 msg=f"Unexpected request: {payload}",
                             )
 
-                        logger.info(
-                            _m(
-                                "Created Container",
-                                extra=get_extra_info({**default_extra, "result": str(result)}),
-                            ),
-                        )
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key, executor_id=payload.executor_id
                             )
                         )
+                        
+                        if result is None:
+                            return FailedContainerRequest(
+                                miner_hotkey=payload.miner_hotkey,
+                                executor_id=payload.executor_id,
+                                msg=f"create container error: No ports available",
+                            )
 
                         return ContainerCreated(
                             miner_hotkey=payload.miner_hotkey,
@@ -425,6 +426,7 @@ class MinerService:
                             volume_name=result.volume_name,
                             port_maps=result.port_maps,
                         )
+
                     elif isinstance(payload, ContainerStartRequest):
                         logger.info(
                             _m(

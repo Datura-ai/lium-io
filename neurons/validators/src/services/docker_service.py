@@ -3,6 +3,7 @@ import random
 import aiohttp
 from typing import Annotated
 from uuid import uuid4
+import asyncio
 
 import asyncssh
 import bittensor
@@ -18,7 +19,7 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
-from core.utils import _m, get_extra_info
+from core.utils import _m, context, get_extra_info
 from services.redis_service import RedisService
 from services.ssh_service import SSHService
 
@@ -42,21 +43,26 @@ class DockerService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
 
-    def generate_portMappings(self, start_external_port=40000) -> list[tuple[int, int]]:
-        internal_ports = [22, 22140, 22141, 22142, 22143]
+    def generate_portMappings(self, range_external_ports):
+        internal_ports = [22, 20000, 20001, 20002, 20003]
+        if range_external_ports:
+            if '-' in range_external_ports:
+                start, end = map(int, range_external_ports.split('-'))
+                available_ports = list(range(start, end + 1))
+            else:
+                available_ports = list(map(int, range_external_ports.split(',')))
+        else:
+            available_ports = list(range(40000, 65535))
+
+        if 0 in available_ports:
+            available_ports.remove(0)
 
         mappings = []
-        used_external_ports = set()
-
-        for i in range(len(internal_ports)):
-            while True:
-                external_port = random.randint(start_external_port, start_external_port + 10000)
-                if external_port not in used_external_ports:
-                    used_external_ports.add(external_port)
-                    break
-
-            mappings.append((internal_ports[i], external_port))
-
+        for i, internal_port in enumerate(internal_ports):
+            if i < len(available_ports):
+                mappings.append((internal_port, available_ports[i]))
+            else:
+                break
         return mappings
 
     async def create_container(
@@ -82,6 +88,11 @@ class DockerService:
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
+
+        # generate port maps
+        port_maps = self.generate_portMappings(executor_info.port_range)
+        if not port_maps:
+            return None
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
@@ -146,8 +157,6 @@ class DockerService:
                     ),
                 )
 
-            # generate port maps
-            port_maps = self.generate_portMappings()
             port_flags = " ".join([f"-p {external}:{internal}" for internal, external in port_maps])
 
             # creat docker volume
