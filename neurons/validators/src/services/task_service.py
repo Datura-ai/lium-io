@@ -412,29 +412,29 @@ class TaskService:
                     digests_empty = self.check_empty_digests(machine_spec)  # True: docker image empty, False: docker image not empty
                     # Validate digests
                     self.is_valid = self.validate_digests(digests_in_list, duplicates, digests_empty)
-                    # if not self.is_valid:
-                    #     log_text = _m(
-                    #         "Docker digests are not valid",
-                    #         extra=get_extra_info({
-                    #             **default_extra,
-                    #             "docker_digests": machine_spec.get('all_container_digests', [])
-                    #         }),
-                    #     )
-                    #     log_status = "error"
+                    if not self.is_valid:
+                        log_text = _m(
+                            "Docker digests are not valid",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "docker_digests": machine_spec.get('all_container_digests', [])
+                            }),
+                        )
+                        log_status = "error"
 
-                    #     logger.warning(log_text)
+                        logger.warning(log_text)
 
-                    #     await self.clear_remote_directory(ssh_client, remote_dir)
+                        await self.clear_remote_directory(ssh_client, remote_dir)
 
-                    #     return (
-                    #         None,
-                    #         executor_info,
-                    #         0,
-                    #         0,
-                    #         miner_info.job_batch_id,
-                    #         log_status,
-                    #         log_text,
-                    #     )
+                        return (
+                            None,
+                            executor_info,
+                            0,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
 
                     # if not rented, check renting ports
                     success, log_text, log_status = await self.docker_connection_check(
