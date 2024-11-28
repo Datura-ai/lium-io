@@ -467,7 +467,7 @@ class DockerService:
                         extra={
                             "container_name": container_name,
                             "ip_address": ip_address,
-                            "external_port": external_port,
+                            "port_mappings": port_flags,
                         },
                     )
                 )
@@ -481,7 +481,7 @@ class DockerService:
                     extra={
                         "container_name": container_name,
                         "ip_address": ip_address,
-                        "external_port": external_port,
+                        "port_mappings": port_flags,
                     },
                 )
             )
