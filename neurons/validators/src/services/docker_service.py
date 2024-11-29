@@ -197,19 +197,20 @@ class DockerService:
                 ),
             )
 
-            result, log_text, log_status = await self.setup_ssh_access(
-                ssh_client, 
-                container_name,
-                executor_info.address,
-                executor_info.ssh_username, 
-                port_maps
-            )
-            if not result:
-                return FailedContainerRequest(
-                            miner_hotkey=payload.miner_hotkey,
-                            executor_id=payload.executor_id,
-                            msg=log_text
-                        )
+            # result, log_text, log_status = await self.setup_ssh_access(
+            #     ssh_client,
+            #     container_name,
+            #     executor_info.address,
+            #     executor_info.ssh_username,
+            #     port_maps,
+            # )
+            # if not result:
+            #     return FailedContainerRequest(
+            #         miner_hotkey=payload.miner_hotkey,
+            #         executor_id=payload.executor_id,
+            #         msg=log_text,
+            #     )
+
             await self.redis_service.add_rented_machine(
                 RentedMachine(
                     miner_hotkey=payload.miner_hotkey,
@@ -425,18 +426,18 @@ class DockerService:
                     print(f"Error retrieving data for {repo}: {e}")
 
         return all_digests
-    
+
     async def setup_ssh_access(
             self,
             ssh_client: asyncssh.SSHClientConnection,
             container_name: str,
             ip_address: str,
-            username: str = "root", 
+            username: str = "root",
             port_maps: list[tuple[int, int]] = None
     ) -> tuple[bool, str, str]:
         """Generate an SSH key pair, add the public key to the Docker container, and check SSH connection."""
 
-        my_key="my_key"
+        my_key = "my_key"
         private_key, public_key = self.ssh_service.generate_ssh_key(my_key)
 
         public_key = public_key.decode("utf-8")
@@ -445,6 +446,7 @@ class DockerService:
         private_key = self.ssh_service.decrypt_payload(my_key, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
+        await asyncio.sleep(5)
 
         command = f"docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
 
@@ -455,8 +457,8 @@ class DockerService:
             logger.error(log_text)
 
             return False, log_text, log_status
-        
-        port=0
+
+        port = 0
         for internal, external in port_maps:
             if internal == 22:
                 port = external
@@ -482,7 +484,7 @@ class DockerService:
                     )
                 )
                 return True, log_text, log_status
-        except Exception:
+        except Exception as e:
             log_text = "SSH connection failed"
             log_status = "error"
             logger.error(
@@ -492,6 +494,7 @@ class DockerService:
                         "container_name": container_name,
                         "ip_address": ip_address,
                         "port_maps": port_maps,
+                        "error": str(e),
                     },
                 )
             )
