@@ -197,20 +197,6 @@ class DockerService:
                 ),
             )
 
-            # result, log_text, log_status = await self.setup_ssh_access(
-            #     ssh_client,
-            #     container_name,
-            #     executor_info.address,
-            #     executor_info.ssh_username,
-            #     port_maps,
-            # )
-            # if not result:
-            #     return FailedContainerRequest(
-            #         miner_hotkey=payload.miner_hotkey,
-            #         executor_id=payload.executor_id,
-            #         msg=log_text,
-            #     )
-
             await self.redis_service.add_rented_machine(
                 RentedMachine(
                     miner_hotkey=payload.miner_hotkey,
