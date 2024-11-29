@@ -323,7 +323,7 @@ class MinerService:
 
             try:
                 msg = await asyncio.wait_for(
-                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future, timeout=1
+                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future, timeout=JOB_LENGTH
                 )
             except TimeoutError:
                 logger.error(
@@ -406,7 +406,7 @@ class MinerService:
                                 public_key=public_key, executor_id=payload.executor_id
                             )
                         )
-                        
+
                         if isinstance(result, FailedContainerRequest):
                             return result
 
