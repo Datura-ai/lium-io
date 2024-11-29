@@ -631,13 +631,6 @@ class TaskService:
                     log_text,
                 )
         except Exception as e:
-            logger.error(
-                _m(
-                    "Error creating task for executor",
-                    extra=get_extra_info({**default_extra, "error": str(e)}),
-                ),
-                exc_info=True,
-            )
             log_status = "error"
             log_text = _m(
                 "Error creating task for executor",
@@ -647,8 +640,20 @@ class TaskService:
             try:
                 key = f"{AVAILABLE_PORTS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
                 await self.redis_service.set(key, '')
-            except:
-                pass
+            except Exception as redis_error:
+                log_text = _m(
+                    "Error creating task for executor",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error": str(e),
+                        "redis_reset_error": str(redis_error),
+                    }),
+                )
+
+            logger.error(
+                log_text,
+                exc_info=True,
+            )
 
             return (
                 None,
