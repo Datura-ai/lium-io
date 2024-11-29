@@ -7,6 +7,7 @@ from core.config import settings
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 RENTED_MACHINE_SET = "rented_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
+AVAILABLE_PORTS_PREFIX = "available_ports"
 
 
 class RedisService:
@@ -33,6 +34,11 @@ class RedisService:
         """Get a value by key from Redis."""
         async with self.lock:
             return await self.redis.get(key)
+
+    async def delete(self, key: str):
+        """Remove a key from Redis."""
+        async with self.lock:
+            await self.redis.delete(key)
 
     async def sadd(self, key: str, elem: str):
         """Add a machine ID to the set of rented machines."""
