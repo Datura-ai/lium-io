@@ -539,6 +539,21 @@ def get_all_container_digests():
 
     return digests  # Return the list of digests
 
+# Define the get_md5_checksums function
+def get_md5_checksums():
+    checksums = {"nvidia_smi": None, "libnvidia_ml": None}
+    try:
+        nvidia_smi_path = run_cmd("which nvidia-smi").strip()
+        if nvidia_smi_path:
+            checksums["nvidia_smi"] = run_cmd(f"md5sum {nvidia_smi_path}").split()[0]
+
+        lib_path = run_cmd("find /usr -name 'libnvidia-ml.so.1'").strip()
+        if lib_path:
+            checksums["libnvidia_ml"] = run_cmd(f"md5sum {lib_path}").split()[0]
+    except Exception as exc:
+        checksums["error"] = repr(exc)
+    return checksums
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -667,6 +682,7 @@ def get_machine_specs():
 
     data["network"] = get_network_speed()
     data["all_container_digests"] = get_all_container_digests()
+    data["md5_checksums"] = get_md5_checksums()
     return data
 
 
