@@ -176,7 +176,7 @@ class TaskService:
             if result.exit_status != 0:
                 log_text = _m(
                     "Error creating docker connection",
-                    extra=get_extra_info({**default_extra, "error": str(e)}),
+                    extra=get_extra_info(default_extra),
                 )
                 log_status = "error"
                 logger.error(log_text, exc_info=True)
@@ -290,7 +290,15 @@ class TaskService:
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
 
-                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+                    return (
+                        None,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 machine_spec = json.loads(self.ssh_service.decrypt_payload(encypted_files.encrypt_key, machine_specs[0].strip()))
 
@@ -316,6 +324,7 @@ class TaskService:
                     return (
                         machine_spec,
                         executor_info,
+                        0,
                         0,
                         miner_info.job_batch_id,
                         log_status,
@@ -368,6 +377,7 @@ class TaskService:
                         machine_spec,
                         executor_info,
                         0,
+                        0,
                         miner_info.job_batch_id,
                         log_status,
                         log_text,
@@ -399,6 +409,7 @@ class TaskService:
                         machine_spec,
                         executor_info,
                         score,
+                        0,
                         miner_info.job_batch_id,
                         log_status,
                         log_text,
@@ -424,7 +435,15 @@ class TaskService:
 
                         await self.clear_remote_directory(ssh_client, remote_dir)
 
-                        return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+                        return (
+                            None,
+                            executor_info,
+                            0,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
 
                     # if not rented, check renting ports
                     success, log_text, log_status = await self.docker_connection_check(
@@ -438,7 +457,15 @@ class TaskService:
                     if not success:
                         await self.clear_remote_directory(ssh_client, remote_dir)
 
-                        return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+                        return (
+                            None,
+                            executor_info,
+                            0,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
 
                 # scoring
                 hashcat_config = HASHCAT_CONFIGS[gpu_model]
@@ -453,7 +480,15 @@ class TaskService:
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
 
-                    return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+                    return (
+                        None,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 num_digits = hashcat_config.get('digits', 11)
                 avg_job_time = hashcat_config.get("average_time")[gpu_count - 1] if hashcat_config.get("average_time") else 60
@@ -483,6 +518,7 @@ class TaskService:
                     return (
                         machine_spec,
                         executor_info,
+                        0,
                         0,
                         miner_info.job_batch_id,
                         log_status,
@@ -569,6 +605,8 @@ class TaskService:
                                 "job_taken_time": job_taken_time,
                                 "upload_speed": upload_speed,
                                 "download_speed": download_speed,
+                                "gpu_model": gpu_model,
+                                "gpu_count": gpu_count,
                             }
                         ),
                     )
@@ -586,6 +624,7 @@ class TaskService:
                 return (
                     machine_spec,
                     executor_info,
+                    score,
                     score,
                     miner_info.job_batch_id,
                     log_status,
@@ -611,7 +650,15 @@ class TaskService:
             except:
                 pass
 
-            return None, executor_info, 0, miner_info.job_batch_id, log_status, log_text
+            return (
+                None,
+                executor_info,
+                0,
+                0,
+                miner_info.job_batch_id,
+                log_status,
+                log_text,
+            )
 
     async def _run_task(
         self,

@@ -155,7 +155,7 @@ class MinerService:
                     await self.store_executor_counts(payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results)
 
                     total_score = 0
-                    for _, _, score, _, _, _ in results:
+                    for _, _, score, _, _, _, _ in results:
                         total_score += score
 
                     logger.info(
@@ -222,7 +222,7 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "results": len(results)}),
             ),
         )
-        for specs, ssh_info, score, job_batch_id, log_status, log_text in results:
+        for specs, ssh_info, score, synthetic_job_score, job_batch_id, log_status, log_text in results:
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL_NAME,
@@ -233,6 +233,7 @@ class MinerService:
                         "executor_ip": ssh_info.address,
                         "executor_port": ssh_info.port,
                         "score": score,
+                        "synthetic_job_score": synthetic_job_score,
                         "job_batch_id": job_batch_id,
                         "log_status": log_status,
                         "log_text": str(log_text),
@@ -256,7 +257,7 @@ class MinerService:
         success = 0
         failed = 0
 
-        for _, _, score, _, _, _ in results:
+        for _, _, score, _, _, _, _ in results:
             if score > 0:
                 success += 1
             else:
@@ -406,12 +407,8 @@ class MinerService:
                             )
                         )
                         
-                        if result is None:
-                            return FailedContainerRequest(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                msg=f"create container error: No ports available",
-                            )
+                        if isinstance(result, FailedContainerRequest):
+                            return result
 
                         return ContainerCreated(
                             miner_hotkey=payload.miner_hotkey,
