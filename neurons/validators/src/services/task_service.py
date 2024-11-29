@@ -24,7 +24,7 @@ from services.const import (
     UNRENTED_MULTIPLIER,
     HASHCAT_CONFIGS,
 )
-from services.redis_service import RENTED_MACHINE_SET, RedisService
+from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORTS_PREFIX
 from services.ssh_service import SSHService
 from services.hash_service import HashService
 
@@ -198,6 +198,15 @@ class TaskService:
                     extra=default_extra,
                 )
                 logger.info(log_text)
+
+                # set port on redis
+                key = f"{AVAILABLE_PORTS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
+                existing_ports = await self.redis_service.get(key)
+                if existing_ports:
+                    ports = f'{existing_ports.decode()},{ssh_port}'
+                else:
+                    ports = f'{ssh_port}'
+                await self.redis_service.set(key, ports)
 
             command = f"docker rm {container_name} -f"
             await ssh_client.run(command, timeout=20)
@@ -622,18 +631,30 @@ class TaskService:
                     log_text,
                 )
         except Exception as e:
-            logger.error(
-                _m(
-                    "Error creating task for executor",
-                    extra=get_extra_info({**default_extra, "error": str(e)}),
-                ),
-                exc_info=True,
-            )
             log_status = "error"
             log_text = _m(
                 "Error creating task for executor",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
+
+            try:
+                key = f"{AVAILABLE_PORTS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
+                await self.redis_service.set(key, '')
+            except Exception as redis_error:
+                log_text = _m(
+                    "Error creating task for executor",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error": str(e),
+                        "redis_reset_error": str(redis_error),
+                    }),
+                )
+
+            logger.error(
+                log_text,
+                exc_info=True,
+            )
+
             return (
                 None,
                 executor_info,
