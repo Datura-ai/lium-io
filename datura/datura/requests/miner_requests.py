@@ -48,6 +48,12 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     root_dir: str
     port_range: str
 
+class CustomOptions(pydantic.BaseModel):
+    docker_image: str
+    volumes: list[str]
+    environment: dict[str, str]
+    entrypoint: str
+    internal_ports: list[int]
 
 class AcceptSSHKeyRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.AcceptSSHKeyRequest

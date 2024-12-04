@@ -7,7 +7,7 @@ import asyncio
 
 import asyncssh
 import bittensor
-from datura.requests.miner_requests import ExecutorSSHInfo
+from datura.requests.miner_requests import ExecutorSSHInfo, CustomOptions
 from fastapi import Depends
 from payload_models.payloads import (
     ContainerCreatedResult,
@@ -43,9 +43,11 @@ class DockerService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
 
-    async def generate_portMappings(self, miner_hotkey, executor_id):
+    async def generate_portMappings(self, miner_hotkey, executor_id, internal_ports = None):
         try:
             internal_ports = [22, 20000, 20001, 20002, 20003]
+            if internal_ports:
+                internal_ports = internal_ports
 
             key = f"{AVAILABLE_PORTS_PREFIX}:{miner_hotkey}:{executor_id}"
             available_ports_str = await self.redis_service.get(key)
@@ -73,6 +75,7 @@ class DockerService:
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
+        custom_options: CustomOptions,
     ):
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
@@ -92,7 +95,11 @@ class DockerService:
         )
 
         # generate port maps
-        port_maps = await self.generate_portMappings(payload.miner_hotkey, payload.executor_id)
+        if custom_options and custom_options.internal_ports:
+            port_maps = await self.generate_portMappings(payload.miner_hotkey, payload.executor_id, custom_options.internal_ports)
+        else:
+            port_maps = await self.generate_portMappings(payload.miner_hotkey, payload.executor_id)
+
         if not port_maps:
             log_text = "No port mappings found"
             logger.error(log_text)
@@ -181,13 +188,20 @@ class DockerService:
 
             # create docker container with the port map & resource
             container_name = f"container_{uuid}"
+
+            # Prepare extra options
+            volume_flags = " ".join([f"-v {volume}" for volume in custom_options.volumes]) if custom_options else ""
+            entrypoint_flag = f"--entrypoint {custom_options.entrypoint}" if custom_options and custom_options.entrypoint and custom_options.entrypoint.strip() else ""
+            env_flags = " ".join([f"-e {key}={value}" for key, value in custom_options.environment.items()]) if custom_options else ""
+            docker_image = custom_options.docker_image if custom_options else payload.docker_image
+            
             if payload.debug:
                 await ssh_client.run(
-                    f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --name {container_name} {payload.docker_image}'
+                    f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {docker_image} {entrypoint_flag}'
                 )
             else:
                 await ssh_client.run(
-                    f'docker run -d {port_flags} -e PUBLIC_KEY="{payload.user_public_key}" --mount source={volume_name},target=/root --gpus all --name {container_name} {payload.docker_image}'
+                    f'docker run -d {port_flags} {volume_flags} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {docker_image}  {entrypoint_flag}'
                 )
 
             logger.info(

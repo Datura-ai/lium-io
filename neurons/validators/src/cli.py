@@ -5,7 +5,7 @@ import time
 import uuid
 
 import click
-from datura.requests.miner_requests import ExecutorSSHInfo
+from datura.requests.miner_requests import ExecutorSSHInfo, CustomOptions
 
 from core.utils import configure_logs_of_other_modules
 from core.validator import Validator
@@ -183,6 +183,35 @@ async def _create_container_to_miner(miner_hotkey: str, miner_address: str, mine
     )
     await miner_service.handle_container(payload)
 
+@cli.command()
+@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
+@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
+@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
+@click.option("--executor_id", prompt="Executor Id", help="Executor Id")
+@click.option("--docker_image", prompt="Docker Image", help="Docker Image")
+def create_custom_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
+    asyncio.run(_create_custom_container_to_miner(miner_hotkey, miner_address, miner_port, executor_id, docker_image))
+
+
+async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
+    miner_service: MinerService = ioc["MinerService"]
+    # mock custom options
+    custom_options = CustomOptions(
+        docker_image="daturaai/pytorch:1.9.1-py3.9-cuda11.1.1-devel-ubuntu20.04",
+        volumes=["/var/runer/docker.sock:/var/runer/docker.sock"],
+        environment={"UPDATED_PUBLIC_KEY":"user_public_key"},
+        entrypoint="",
+        internal_ports=[22, 8002]
+    )
+    payload = ContainerCreateRequest(
+        docker_image=docker_image,
+        user_public_key="user_public_key",
+        executor_id=executor_id,
+        miner_hotkey=miner_hotkey,
+        miner_address=miner_address,
+        miner_port=miner_port,
+    )
+    await miner_service.handle_container(payload, custom_options)
 
 if __name__ == "__main__":
     cli()
