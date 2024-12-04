@@ -92,6 +92,11 @@ class RedisService:
         async with self.lock:
             await self.redis.delete(redis_key)
 
+    async def clear_by_pattern(self, pattern: str):
+        async with self.lock:
+            async for key in self.redis.scan_iter(match=pattern):
+                await self.redis.delete(key.decode())
+
     async def clear_all_executor_counts(self):
         pattern = f"{EXECUTOR_COUNT_PREFIX}:*"
         cursor = 0
@@ -103,3 +108,7 @@ class RedisService:
                     await self.redis.delete(*keys)
                 if cursor == 0:
                     break
+
+    async def clear_all_ssh_ports(self):
+        pattern = f"{AVAILABLE_PORTS_PREFIX}:*"
+        await self.clear_by_pattern(pattern)

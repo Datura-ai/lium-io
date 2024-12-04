@@ -284,3 +284,24 @@ HASHCAT_CONFIGS = {
         ]
     }
 }
+
+LIB_NVIDIA_ML_DIGESTS = [
+    "58fc46eefa8ebb265293556951a75a39",
+    "03ed7fa2134095b32f9d0d24a774c6ba",
+    "96479a06139fc5261d06f432970d6a7b",
+    "5ad33588e91af67139efb54fe9fefc68",
+    "85ad949d7553ab96cce5c811e229c7c7",
+    "48be49d0e792b5ee76f73857c0bef35a",
+    "bfa2733eee442016792bcbf130156e3d",
+    "9625642dcf8765f52e332c8e38fbef73",
+    "1f335d1f068931fe7f2ce13117d1602b",
+    "c95828f8a8ab7f17743b40561b812c96",
+    "d7702d394ab213a725abeb345185a072",
+    "0262f396e80847dccefc8ccf52cff1ae",
+    "69774adffa76471490e6d8fac9067725",
+    "6d6e0122cff1ac777a9e37ba09b886cb",
+    "93a3f8ef77af86b79314c00b0788aeed",
+    "1eec299b50e33a6cfa5155ded53495ab",
+    "c801dd3fc4660f3a8ddf977cfdffe113",
+    "189634bf960b9a2efe1af8011d27ccf7",
+]
