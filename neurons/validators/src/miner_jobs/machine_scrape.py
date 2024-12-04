@@ -12,6 +12,8 @@ import hashlib
 import docker
 from base64 import b64encode
 from cryptography.fernet import Fernet
+import random
+import string
 
 
 nvmlLib = None
@@ -288,8 +290,8 @@ def _nvmlGetFunctionPointer(name):
         libLoadLock.release()
 
 
-def nvmlInitWithFlags(flags):
-    _LoadNvmlLibrary()
+def nvmlInitWithFlags(flags, libpath: str):
+    _LoadNvmlLibrary(libpath)
 
     #
     # Initialize the library
@@ -306,12 +308,12 @@ def nvmlInitWithFlags(flags):
     return None
 
 
-def nvmlInit():
-    nvmlInitWithFlags(0)
+def nvmlInit(libpath: str):
+    nvmlInitWithFlags(0, libpath)
     return None
 
 
-def _LoadNvmlLibrary():
+def _LoadNvmlLibrary(libpath: str):
     '''
     Load the library if it isn't loaded already
     '''
@@ -336,7 +338,7 @@ def _LoadNvmlLibrary():
                             nvmlLib = CDLL(os.path.join(os.getenv("ProgramFiles", "C:/Program Files"), "NVIDIA Corporation/NVSMI/nvml.dll"))
                     else:
                         # assume linux
-                        nvmlLib = CDLL("libnvidia-ml.so.1")
+                        nvmlLib = CDLL(libpath)
                 except OSError as ose:
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
                 if (nvmlLib == None):
@@ -547,22 +549,35 @@ def get_all_container_digests():
 
     return digests  # Return the list of digests
 
-# Define the get_md5_checksums function
+
+def get_md5_checksum(file_path):
+    # Create an MD5 hash object
+    md5_hash = hashlib.md5()
+
+    # Open the file in binary mode
+    with open(file_path, "rb") as f:
+        # Read the file in chunks to avoid memory issues with large files
+        for chunk in iter(lambda: f.read(4096), b""):
+            md5_hash.update(chunk)
+
+    # Return the hexadecimal MD5 checksum
+    return md5_hash.hexdigest()
 
 
-def get_md5_checksums():
-    checksums = {"nvidia_smi": None, "libnvidia_ml": None}
+def random_string(length: int = 30) -> str:
+    characters = string.ascii_letters + string.digits
+    random_string = ''.join(random.choices(characters, k=length))
+    return random_string
+
+
+def get_libnvidia_ml_path():
     try:
-        nvidia_smi_path = run_cmd("which nvidia-smi").strip()
-        if nvidia_smi_path:
-            checksums["nvidia_smi"] = run_cmd(f"md5sum {nvidia_smi_path}").split()[0]
-
-        lib_path = run_cmd("find /usr -name 'libnvidia-ml.so.1'").strip()
-        if lib_path:
-            checksums["libnvidia_ml"] = run_cmd(f"md5sum {lib_path}").split()[0]
-    except Exception as exc:
-        checksums["error"] = repr(exc)
-    return checksums
+        original_path = run_cmd("find /usr -name 'libnvidia-ml.so.1'").strip()
+        lib_path = f"/usr/bin/{random_string(random.randint(10, 20))}"
+        run_cmd(f"cp {original_path} {lib_path}")
+        return lib_path
+    except:
+        return ''
 
 
 def get_machine_specs():
@@ -572,9 +587,13 @@ def get_machine_specs():
     if os.environ.get('LD_PRELOAD'):
         return data
 
+    libnvidia_path = get_libnvidia_ml_path()
+    if not libnvidia_path:
+        return data
+
     data["gpu"] = {"count": 0, "details": []}
     try:
-        nvmlInit()
+        nvmlInit(libnvidia_path)
 
         device_count = nvmlDeviceGetCount()
 
@@ -693,7 +712,17 @@ def get_machine_specs():
 
     data["network"] = get_network_speed()
     data["all_container_digests"] = get_all_container_digests()
-    data["md5_checksums"] = get_md5_checksums()
+    data["md5_checksums"] = {
+        "nvidia_smi": get_md5_checksum(run_cmd("which nvidia-smi").strip()),
+        "libnvidia_ml": get_md5_checksum(libnvidia_path),
+    }
+
+    # clear
+    try:
+        run_cmd(f"rm -rf {libnvidia_path}")
+    except:
+        pass
+
     return data
 
 
