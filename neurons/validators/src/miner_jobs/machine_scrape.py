@@ -250,6 +250,14 @@ def convertStrBytes(func):
     return func
 
 
+@convertStrBytes
+def nvmlErrorString(result):
+    fn = _nvmlGetFunctionPointer("nvmlErrorString")
+    fn.restype = c_char_p  # otherwise return is an int
+    ret = fn(result)
+    return ret
+
+
 def _nvmlCheckReturn(ret):
     if (ret != NVML_SUCCESS):
         raise NVMLError(ret)
@@ -517,7 +525,7 @@ def get_network_speed():
         data["network_speed_error"] = repr(exc)
     return data
 
-    
+
 def get_all_container_digests():
     """Verify and return the digests of all running containers."""
     client = docker.from_env()
@@ -535,11 +543,13 @@ def get_all_container_digests():
                     digest = repo_digest.split('@')[1]
                     break
         if digest:
-           digests.append({'id': container.id, 'digest': digest})   # Add the digest to the list
+            digests.append({'id': container.id, 'digest': digest})   # Add the digest to the list
 
     return digests  # Return the list of digests
 
 # Define the get_md5_checksums function
+
+
 def get_md5_checksums():
     checksums = {"nvidia_smi": None, "libnvidia_ml": None}
     try:
@@ -553,6 +563,7 @@ def get_md5_checksums():
     except Exception as exc:
         checksums["error"] = repr(exc)
     return checksums
+
 
 def get_machine_specs():
     """Get Specs of miner machine."""

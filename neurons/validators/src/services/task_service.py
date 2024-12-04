@@ -125,16 +125,23 @@ class TaskService:
     def get_available_port(
         self,
         port_range: str,
+        host_ssh_port: int,
     ) -> int:
         if port_range:
             if '-' in port_range:
                 min_port, max_port = map(int, (part.strip() for part in port_range.split('-')))
-                ports = range(min_port, max_port + 1)
+                ports = list(range(min_port, max_port + 1))
             else:
                 ports = list(map(int, (part.strip() for part in port_range.split(','))))
         else:
             # Default range if port_range is empty
-            ports = range(40000, 65536)
+            ports = list(range(40000, 65536))
+
+        if host_ssh_port in ports:
+            ports.remove(host_ssh_port)
+
+        if not ports:
+            return 0
 
         return random.choice(ports)
 
@@ -147,7 +154,7 @@ class TaskService:
         private_key: str,
         public_key: str,
     ):
-        ssh_port = self.get_available_port(executor_info.port_range)
+        ssh_port = self.get_available_port(executor_info.port_range, executor_info.ssh_port)
         executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
         default_extra = {
             "job_batch_id": job_batch_id,
@@ -159,6 +166,16 @@ class TaskService:
             "ssh_port": ssh_port,
         }
         context.set(f"[_docker_connection_check][{executor_name}]")
+
+        if ssh_port == 0:
+            log_text = _m(
+                "No port available for docker container",
+                extra=get_extra_info(default_extra),
+            )
+            log_status = "error"
+            logger.error(log_text, exc_info=True)
+
+            return False, log_text, log_status
 
         try:
             log_text = _m(
@@ -203,7 +220,9 @@ class TaskService:
                 key = f"{AVAILABLE_PORTS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
                 existing_ports = await self.redis_service.get(key)
                 if existing_ports:
-                    ports = f'{existing_ports.decode()},{ssh_port}'
+                    port_set = set(existing_ports.decode().split(','))
+                    port_set.add(str(ssh_port))
+                    ports = ','.join(port_set)
                 else:
                     ports = f'{ssh_port}'
                 await self.redis_service.set(key, ports)
