@@ -23,6 +23,7 @@ from services.const import (
     MAX_GPU_COUNT,
     UNRENTED_MULTIPLIER,
     HASHCAT_CONFIGS,
+    LIB_NVIDIA_ML_DIGESTS,
 )
 from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORTS_PREFIX
 from services.ssh_service import SSHService
@@ -332,14 +333,31 @@ class TaskService:
                     max_score = GPU_MAX_SCORES.get(gpu_model, 0)
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
-                if gpu_count > MAX_GPU_COUNT:
-                    score = 0
+
+                libnvidia_ml = machine_spec.get('md5_checksums', {}).get('libnvidia_ml', '')
+
+                logger.info(
+                    _m(
+                        "Machine spec scraped",
+                        extra=get_extra_info(
+                            {**default_extra, "gpu_model": gpu_model, "gpu_count": gpu_count}
+                        ),
+                    ),
+                )
+
+                if libnvidia_ml not in LIB_NVIDIA_ML_DIGESTS:
                     log_status = "warning"
                     log_text = _m(
-                        f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
-                        extra=get_extra_info(default_extra),
+                        f"Nvidia driver is altered",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "libnvidia_ml": libnvidia_ml
+                        }),
                     )
+                    logger.warning(log_text)
+
                     await self.clear_remote_directory(ssh_client, remote_dir)
+
                     return (
                         machine_spec,
                         executor_info,
@@ -350,14 +368,25 @@ class TaskService:
                         log_text,
                     )
 
-                logger.info(
-                    _m(
-                        "Machine spec scraped",
-                        extra=get_extra_info(
-                            {**default_extra, "gpu_model": gpu_model, "gpu_count": gpu_count}
-                        ),
-                    ),
-                )
+                if gpu_count > MAX_GPU_COUNT:
+                    log_status = "warning"
+                    log_text = _m(
+                        f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 if max_score == 0 or gpu_count == 0:
                     extra_info = {
