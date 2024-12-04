@@ -23,6 +23,7 @@ from services.const import (
     MAX_GPU_COUNT,
     UNRENTED_MULTIPLIER,
     HASHCAT_CONFIGS,
+    LIB_NVIDIA_ML_DIGESTS,
 )
 from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORTS_PREFIX
 from services.ssh_service import SSHService
@@ -125,16 +126,23 @@ class TaskService:
     def get_available_port(
         self,
         port_range: str,
+        host_ssh_port: int,
     ) -> int:
         if port_range:
             if '-' in port_range:
                 min_port, max_port = map(int, (part.strip() for part in port_range.split('-')))
-                ports = range(min_port, max_port + 1)
+                ports = list(range(min_port, max_port + 1))
             else:
                 ports = list(map(int, (part.strip() for part in port_range.split(','))))
         else:
             # Default range if port_range is empty
-            ports = range(40000, 65536)
+            ports = list(range(40000, 65536))
+
+        if host_ssh_port in ports:
+            ports.remove(host_ssh_port)
+
+        if not ports:
+            return 0
 
         return random.choice(ports)
 
@@ -147,7 +155,7 @@ class TaskService:
         private_key: str,
         public_key: str,
     ):
-        ssh_port = self.get_available_port(executor_info.port_range)
+        ssh_port = self.get_available_port(executor_info.port_range, executor_info.ssh_port)
         executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
         default_extra = {
             "job_batch_id": job_batch_id,
@@ -159,6 +167,16 @@ class TaskService:
             "ssh_port": ssh_port,
         }
         context.set(f"[_docker_connection_check][{executor_name}]")
+
+        if ssh_port == 0:
+            log_text = _m(
+                "No port available for docker container",
+                extra=get_extra_info(default_extra),
+            )
+            log_status = "error"
+            logger.error(log_text, exc_info=True)
+
+            return False, log_text, log_status
 
         try:
             log_text = _m(
@@ -203,7 +221,9 @@ class TaskService:
                 key = f"{AVAILABLE_PORTS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
                 existing_ports = await self.redis_service.get(key)
                 if existing_ports:
-                    ports = f'{existing_ports.decode()},{ssh_port}'
+                    port_set = set(existing_ports.decode().split(','))
+                    port_set.add(str(ssh_port))
+                    ports = ','.join(port_set)
                 else:
                     ports = f'{ssh_port}'
                 await self.redis_service.set(key, ports)
@@ -313,14 +333,31 @@ class TaskService:
                     max_score = GPU_MAX_SCORES.get(gpu_model, 0)
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
-                if gpu_count > MAX_GPU_COUNT:
-                    score = 0
+
+                libnvidia_ml = machine_spec.get('md5_checksums', {}).get('libnvidia_ml', '')
+
+                logger.info(
+                    _m(
+                        "Machine spec scraped",
+                        extra=get_extra_info(
+                            {**default_extra, "gpu_model": gpu_model, "gpu_count": gpu_count}
+                        ),
+                    ),
+                )
+
+                if libnvidia_ml not in LIB_NVIDIA_ML_DIGESTS:
                     log_status = "warning"
                     log_text = _m(
-                        f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
-                        extra=get_extra_info(default_extra),
+                        f"Nvidia driver is altered",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "libnvidia_ml": libnvidia_ml
+                        }),
                     )
+                    logger.warning(log_text)
+
                     await self.clear_remote_directory(ssh_client, remote_dir)
+
                     return (
                         machine_spec,
                         executor_info,
@@ -331,14 +368,25 @@ class TaskService:
                         log_text,
                     )
 
-                logger.info(
-                    _m(
-                        "Machine spec scraped",
-                        extra=get_extra_info(
-                            {**default_extra, "gpu_model": gpu_model, "gpu_count": gpu_count}
-                        ),
-                    ),
-                )
+                if gpu_count > MAX_GPU_COUNT:
+                    log_status = "warning"
+                    log_text = _m(
+                        f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 if max_score == 0 or gpu_count == 0:
                     extra_info = {
