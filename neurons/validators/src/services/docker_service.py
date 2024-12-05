@@ -20,7 +20,7 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info
-from services.redis_service import RedisService, AVAILABLE_PORTS_PREFIX
+from services.redis_service import RedisService, AVAILABLE_PORT_MAPS_PREFIX
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ class DockerService:
         try:
             internal_ports = [22, 20000, 20001, 20002, 20003]
 
-            key = f"{AVAILABLE_PORTS_PREFIX}:{miner_hotkey}:{executor_id}"
+            key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
             available_ports_str = await self.redis_service.get(key)
             if available_ports_str:
                 available_ports = list(map(int, available_ports_str.decode().split(',')))
