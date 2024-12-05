@@ -3,6 +3,11 @@ import enum
 from datura.requests.base import BaseRequest
 from pydantic import BaseModel, field_validator
 
+class CustomOptions(BaseModel):
+    volumes: list[str]
+    environment: dict[str, str]
+    entrypoint: str
+    internal_ports: list[int]
 
 class MinerJobRequestPayload(BaseModel):
     job_batch_id: str
@@ -55,6 +60,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_key: str
+    custom_options: CustomOptions | None = None 
     debug: bool | None = None
 
 

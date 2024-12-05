@@ -5,7 +5,7 @@ import time
 import uuid
 
 import click
-from datura.requests.miner_requests import ExecutorSSHInfo, CustomOptions
+from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import configure_logs_of_other_modules
 from core.validator import Validator
@@ -16,6 +16,7 @@ from services.file_encrypt_service import FileEncryptService
 from payload_models.payloads import (
     MinerJobRequestPayload,
     ContainerCreateRequest,
+    CustomOptions,
 )
 
 configure_logs_of_other_modules()
@@ -197,7 +198,6 @@ async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: st
     miner_service: MinerService = ioc["MinerService"]
     # mock custom options
     custom_options = CustomOptions(
-        docker_image="daturaai/pytorch:1.9.1-py3.9-cuda11.1.1-devel-ubuntu20.04",
         volumes=["/var/runer/docker.sock:/var/runer/docker.sock"],
         environment={"UPDATED_PUBLIC_KEY":"user_public_key"},
         entrypoint="",
@@ -210,8 +210,9 @@ async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: st
         miner_hotkey=miner_hotkey,
         miner_address=miner_address,
         miner_port=miner_port,
+        custom_options=custom_options
     )
-    await miner_service.handle_container(payload, custom_options)
+    await miner_service.handle_container(payload)
 
 if __name__ == "__main__":
     cli()

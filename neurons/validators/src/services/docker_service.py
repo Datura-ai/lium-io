@@ -7,7 +7,7 @@ import asyncio
 
 import asyncssh
 import bittensor
-from datura.requests.miner_requests import ExecutorSSHInfo, CustomOptions
+from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
     ContainerCreatedResult,
@@ -16,6 +16,7 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopRequest,
     FailedContainerRequest,
+    CustomOptions,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -193,15 +194,14 @@ class DockerService:
             volume_flags = " ".join([f"-v {volume}" for volume in custom_options.volumes]) if custom_options else ""
             entrypoint_flag = f"--entrypoint {custom_options.entrypoint}" if custom_options and custom_options.entrypoint and custom_options.entrypoint.strip() else ""
             env_flags = " ".join([f"-e {key}={value}" for key, value in custom_options.environment.items()]) if custom_options else ""
-            docker_image = custom_options.docker_image if custom_options else payload.docker_image
             
             if payload.debug:
                 await ssh_client.run(
-                    f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {docker_image} {entrypoint_flag}'
+                    f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {entrypoint_flag}'
                 )
             else:
                 await ssh_client.run(
-                    f'docker run -d {port_flags} {volume_flags} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {docker_image}  {entrypoint_flag}'
+                    f'docker run -d {port_flags} {volume_flags} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image}  {entrypoint_flag}'
                 )
 
             logger.info(

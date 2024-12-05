@@ -9,7 +9,6 @@ from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     DeclineJobRequest,
     ExecutorSSHInfo,
-    CustomOptions,
     FailedRequest,
 )
 from datura.requests.validator_requests import SSHPubKeyRemoveRequest, SSHPubKeySubmitRequest
@@ -290,7 +289,7 @@ class MinerService:
                 exc_info=True,
             )
 
-    async def handle_container(self, payload: ContainerBaseRequest, custom_options: CustomOptions = None):
+    async def handle_container(self, payload: ContainerBaseRequest):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
@@ -400,7 +399,7 @@ class MinerService:
                             executor,
                             my_key,
                             private_key.decode("utf-8"),
-                            custom_options,
+                            payload.custom_options,
                         )
 
                         await miner_client.send_model(
