@@ -331,9 +331,9 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            await ssh_client.run(f"docker stop {payload.container_name}")
+            # await ssh_client.run(f"docker stop {payload.container_name}")
             await ssh_client.run(f"docker rm {payload.container_name} -f")
-            await ssh_client.run(f"docker volume rm {payload.volume_name}")
+            await ssh_client.run(f"docker volume rm {payload.volume_name} -f")
 
             logger.info(
                 _m(
