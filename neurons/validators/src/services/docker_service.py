@@ -16,7 +16,6 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopRequest,
     FailedContainerRequest,
-    CustomOptions,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -76,7 +75,6 @@ class DockerService:
         executor_info: ExecutorSSHInfo,
         keypair: bittensor.Keypair,
         private_key: str,
-        custom_options: CustomOptions,
     ):
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
@@ -94,7 +92,7 @@ class DockerService:
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
-
+        custom_options = payload.custom_options
         # generate port maps
         if custom_options and custom_options.internal_ports:
             port_maps = await self.generate_portMappings(payload.miner_hotkey, payload.executor_id, custom_options.internal_ports)
@@ -345,9 +343,9 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            await ssh_client.run(f"docker stop {payload.container_name}")
+            # await ssh_client.run(f"docker stop {payload.container_name}")
             await ssh_client.run(f"docker rm {payload.container_name} -f")
-            await ssh_client.run(f"docker volume rm {payload.volume_name}")
+            await ssh_client.run(f"docker volume rm {payload.volume_name} -f")
 
             logger.info(
                 _m(
