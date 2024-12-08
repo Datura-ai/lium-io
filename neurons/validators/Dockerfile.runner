@@ -3,7 +3,7 @@ WORKDIR /root/validator
 COPY docker-compose.app.yml docker-compose.yml
 COPY entrypoint.sh /entrypoint.sh
 
-LABEL version="3.2.6"
+LABEL version="3.2.7"
 
 RUN chmod u+x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
