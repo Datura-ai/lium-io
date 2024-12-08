@@ -717,12 +717,6 @@ def get_machine_specs():
         "libnvidia_ml": get_md5_checksum(libnvidia_path),
     }
 
-    # clear
-    try:
-        run_cmd(f"rm -rf {libnvidia_path}")
-    except:
-        pass
-
     return data
 
 
