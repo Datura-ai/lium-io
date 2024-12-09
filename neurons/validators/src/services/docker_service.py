@@ -3,6 +3,7 @@ import random
 import aiohttp
 from typing import Annotated
 from uuid import uuid4
+import asyncio
 
 import asyncssh
 import bittensor
@@ -14,11 +15,12 @@ from payload_models.payloads import (
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
+    FailedContainerRequest,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info
-from services.redis_service import RedisService
+from services.redis_service import RedisService, AVAILABLE_PORT_MAPS_PREFIX
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -41,22 +43,23 @@ class DockerService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
 
-    def generate_portMappings(self, start_external_port=40000) -> list[tuple[int, int]]:
-        internal_ports = [22, 22140, 22141, 22142, 22143]
+    async def generate_portMappings(self, miner_hotkey, executor_id):
+        try:
+            docker_internal_ports = [22, 20000, 20001, 20002, 20003]
 
-        mappings = []
-        used_external_ports = set()
+            key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
+            available_port_maps = await self.redis_service.lrange(key)
 
-        for i in range(len(internal_ports)):
-            while True:
-                external_port = random.randint(start_external_port, start_external_port + 10000)
-                if external_port not in used_external_ports:
-                    used_external_ports.add(external_port)
+            mappings = []
+            for i, docker_port in enumerate(docker_internal_ports):
+                if i < len(available_port_maps):
+                    internal_port, external_port = map(int, available_port_maps[i].decode().split(','))
+                    mappings.append((docker_port, internal_port, external_port))
+                else:
                     break
-
-            mappings.append((internal_ports[i], external_port))
-
-        return mappings
+            return mappings
+        except:
+            return []
 
     async def create_container(
         self,
@@ -81,6 +84,17 @@ class DockerService:
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
+
+        # generate port maps
+        port_maps = await self.generate_portMappings(payload.miner_hotkey, payload.executor_id)
+        if not port_maps:
+            log_text = "No port mappings found"
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=log_text
+            )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
@@ -145,9 +159,7 @@ class DockerService:
                     ),
                 )
 
-            # generate port maps
-            port_maps = self.generate_portMappings()
-            port_flags = " ".join([f"-p {external}:{internal}" for internal, external in port_maps])
+            port_flags = " ".join([f"-p {internal_port}:{docker_port}" for docker_port, internal_port, _ in port_maps])
 
             # creat docker volume
             uuid = uuid4()
@@ -191,7 +203,7 @@ class DockerService:
             return ContainerCreatedResult(
                 container_name=container_name,
                 volume_name=volume_name,
-                port_maps=port_maps,
+                port_maps=[(docker_port, external_port) for docker_port, _, external_port in port_maps],
             )
 
     async def stop_container(
@@ -313,9 +325,9 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            await ssh_client.run(f"docker stop {payload.container_name}")
+            # await ssh_client.run(f"docker stop {payload.container_name}")
             await ssh_client.run(f"docker rm {payload.container_name} -f")
-            await ssh_client.run(f"docker volume rm {payload.volume_name}")
+            await ssh_client.run(f"docker volume rm {payload.volume_name} -f")
 
             logger.info(
                 _m(
@@ -394,3 +406,76 @@ class DockerService:
                     print(f"Error retrieving data for {repo}: {e}")
 
         return all_digests
+
+    async def setup_ssh_access(
+            self,
+            ssh_client: asyncssh.SSHClientConnection,
+            container_name: str,
+            ip_address: str,
+            username: str = "root",
+            port_maps: list[tuple[int, int]] = None
+    ) -> tuple[bool, str, str]:
+        """Generate an SSH key pair, add the public key to the Docker container, and check SSH connection."""
+
+        my_key = "my_key"
+        private_key, public_key = self.ssh_service.generate_ssh_key(my_key)
+
+        public_key = public_key.decode("utf-8")
+        private_key = private_key.decode("utf-8")
+
+        private_key = self.ssh_service.decrypt_payload(my_key, private_key)
+        pkey = asyncssh.import_private_key(private_key)
+
+        await asyncio.sleep(5)
+
+        command = f"docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
+
+        result = await ssh_client.run(command)
+        if result.exit_status != 0:
+            log_text = "Error creating docker connection"
+            log_status = "error"
+            logger.error(log_text)
+
+            return False, log_text, log_status
+
+        port = 0
+        for internal, external in port_maps:
+            if internal == 22:
+                port = external
+        # Check SSH connection
+        try:
+            async with asyncssh.connect(
+                host=ip_address,
+                port=port,
+                username=username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client_1:
+                log_status = "info"
+                log_text = "SSH connection successful!"
+                logger.info(
+                    _m(
+                        log_text,
+                        extra={
+                            "container_name": container_name,
+                            "ip_address": ip_address,
+                            "port_maps": port_maps,
+                        },
+                    )
+                )
+                return True, log_text, log_status
+        except Exception as e:
+            log_text = "SSH connection failed"
+            log_status = "error"
+            logger.error(
+                _m(
+                    log_text,
+                    extra={
+                        "container_name": container_name,
+                        "ip_address": ip_address,
+                        "port_maps": port_maps,
+                        "error": str(e),
+                    },
+                )
+            )
+            return False, log_text, log_status
