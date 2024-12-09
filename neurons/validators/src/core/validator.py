@@ -93,6 +93,8 @@ class Validator:
                     self.miner_scores = {}
                 else:
                     self.miner_scores = json.loads(miner_scores_json)
+
+            await self.redis_service.clear_all_ssh_ports()
         except Exception as e:
             bittensor.logging.error(f"Failed to initialize miner_scores: {str(e)}")
             self.miner_scores = {}
@@ -308,10 +310,7 @@ class Validator:
             current_block = self.get_current_block(subtensor)
             bittensor.logging.info(f"Current block: {current_block}", "sync", "sync")
 
-            if (
-                current_block % settings.BLOCKS_FOR_JOB == 0
-                or current_block - self.last_job_run_blocks > int(settings.BLOCKS_FOR_JOB * 1.5)
-            ):
+            if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.get_time_from_block(subtensor, job_block)
 
@@ -340,7 +339,7 @@ class Validator:
                 )
 
                 encypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
-                
+
                 task_info = {}
 
                 # request jobs
@@ -359,7 +358,7 @@ class Validator:
                     )
                     for miner in miners
                 ]
-                
+
                 for miner, job in zip(miners, jobs):
                     task_info[job] = {
                         "miner_hotkey": miner.hotkey,
@@ -367,7 +366,7 @@ class Validator:
                         "miner_port": miner.axon_info.port,
                         "job_batch_id": job_batch_id
                     }
-                    
+
                 try:
                     # Run all jobs with asyncio.wait and set a timeout
                     done, pending = await asyncio.wait(jobs, timeout=60 * 10)

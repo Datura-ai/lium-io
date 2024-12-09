@@ -1,3 +1,4 @@
+import asyncio
 from fastapi.testclient import TestClient
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.docker_service import DockerService
@@ -30,9 +31,13 @@ def test_socket_connections():
             assert response.status_code == 200
 
 
+async def check_docker_port_mappings():
+    docker_service: DockerService = ioc["DockerService"]
+    miner_hotkey = '5Df8qGLMd19BXByefGCZFN57fWv6jDm5hUbnQeUTu2iqNBhT'
+    executor_id = 'c272060f-8eae-4265-8e26-1d83ac96b498'
+    port_mappings = await docker_service.generate_portMappings(miner_hotkey, executor_id)
+    print('port_mappings ==>', port_mappings)
+
 if __name__ == "__main__":
     # test_socket_connections()
-    docker_service: DockerService = ioc["DockerService"]
-    range_external_ports = '3000 - 5000 '
-    port_mappings = docker_service.generate_portMappings(range_external_ports)
-    print('port_mappings ==>', port_mappings)
+    asyncio.run(check_docker_port_mappings())
