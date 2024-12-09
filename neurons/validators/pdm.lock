@@ -224,7 +224,7 @@ files = [
 
 [[package]]
 name = "asyncssh"
-version = "2.17.0"
+version = "2.18.0"
 requires_python = ">=3.6"
 summary = "AsyncSSH: Asynchronous SSHv2 client and server library"
 groups = ["default"]
@@ -233,8 +233,8 @@ dependencies = [
     "typing-extensions>=4.0.0",
 ]
 files = [
-    {file = "asyncssh-2.17.0-py3-none-any.whl", hash = "sha256:70bfe4081793255b0115f7a72efd92d5bad8562639302531223bb00188db9747"},
-    {file = "asyncssh-2.17.0.tar.gz", hash = "sha256:3b159c105aa388c1e2245c4faf483f540ada8cad99402281119100166e5edb3c"},
+    {file = "asyncssh-2.18.0-py3-none-any.whl", hash = "sha256:ee09081200753eca137c893995ce3b95f8e157945aa8bda455ea810b30762d96"},
+    {file = "asyncssh-2.18.0.tar.gz", hash = "sha256:1a322161c01f60b9719dc8f39f80db71e61f3f5e04abbc3420ce503126d87123"},
 ]
 
 [[package]]
@@ -1359,15 +1359,15 @@ files = [
 
 [[package]]
 name = "pyarmor"
-version = "9.0.5"
+version = "9.0.6"
 summary = "A tool used to obfuscate python scripts, bind obfuscated scripts to fixed machine or expire obfuscated scripts."
 groups = ["default"]
 dependencies = [
     "pyarmor-cli-core~=7.6.2",
 ]
 files = [
-    {file = "pyarmor-9.0.5-py3-none-any.whl", hash = "sha256:71a0519e19efbcffca93ebb0a221497ffb11725d941a250c1a7b0cb69c5fabd7"},
-    {file = "pyarmor-9.0.5.zip", hash = "sha256:48d69e5bdda2715f60081afb0e3c7f15cceb4bf956dde05c555f3327dcdf4ad8"},
+    {file = "pyarmor-9.0.6-py3-none-any.whl", hash = "sha256:bda6fb51a4df24d8d2ad26cd4ef529dde6bbc977ccb206163fb20caae4b54693"},
+    {file = "pyarmor-9.0.6.zip", hash = "sha256:e740eabd1aa98844e3da003249bd48861e0d7d53d93d5e7d421fd365dbc3cab7"},
 ]
 
 [[package]]
