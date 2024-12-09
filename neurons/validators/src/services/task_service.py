@@ -362,6 +362,7 @@ class TaskService:
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
 
+                nvidia_driver = machine_spec.get("gpu", {}).get("driver", '')
                 libnvidia_ml = machine_spec.get('md5_checksums', {}).get('libnvidia_ml', '')
 
                 logger.info(
@@ -371,12 +372,13 @@ class TaskService:
                             **default_extra,
                             "gpu_model": gpu_model,
                             "gpu_count": gpu_count,
+                            "nvidia_driver": nvidia_driver,
                             "libnvidia_ml": libnvidia_ml,
                         }),
                     ),
                 )
 
-                if libnvidia_ml not in LIB_NVIDIA_ML_DIGESTS:
+                if not nvidia_driver or LIB_NVIDIA_ML_DIGESTS[nvidia_driver] != libnvidia_ml:
                     log_status = "warning"
                     log_text = _m(
                         f"Nvidia driver is altered",
