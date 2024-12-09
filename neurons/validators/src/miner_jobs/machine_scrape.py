@@ -573,9 +573,9 @@ def random_string(length: int = 30) -> str:
 def get_libnvidia_ml_path():
     try:
         original_path = run_cmd("find /usr -name 'libnvidia-ml.so.1'").strip()
-        lib_path = f"/usr/bin/{random_string(random.randint(10, 20))}"
-        run_cmd(f"cp {original_path} {lib_path}")
-        return lib_path
+        # lib_path = f"/usr/bin/{random_string(random.randint(10, 20))}"
+        # run_cmd(f"cp {original_path} {lib_path}")
+        return original_path
     except:
         return ''
 
@@ -716,12 +716,6 @@ def get_machine_specs():
         "nvidia_smi": get_md5_checksum(run_cmd("which nvidia-smi").strip()),
         "libnvidia_ml": get_md5_checksum(libnvidia_path),
     }
-
-    # clear
-    try:
-        run_cmd(f"rm -rf {libnvidia_path}")
-    except:
-        pass
 
     return data
 

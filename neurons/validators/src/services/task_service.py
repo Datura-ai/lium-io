@@ -150,8 +150,7 @@ class TaskService:
             # Default range if port_range is empty
             ports = list(range(40000, 65536))
 
-        if executor_info.ssh_port in ports:
-            ports.remove(executor_info.ssh_port)
+        ports = [port for port in ports if port != executor_info.ssh_port]
 
         if not ports:
             return None
@@ -368,9 +367,12 @@ class TaskService:
                 logger.info(
                     _m(
                         "Machine spec scraped",
-                        extra=get_extra_info(
-                            {**default_extra, "gpu_model": gpu_model, "gpu_count": gpu_count}
-                        ),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "gpu_model": gpu_model,
+                            "gpu_count": gpu_count,
+                            "libnvidia_ml": libnvidia_ml,
+                        }),
                     ),
                 )
 
