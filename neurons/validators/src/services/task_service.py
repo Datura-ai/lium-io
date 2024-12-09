@@ -4,7 +4,7 @@ import json
 import logging
 import time
 import random
-from typing import Annotated
+from typing import Annotated, Optional, Tuple
 
 import asyncssh
 import bittensor
@@ -25,7 +25,7 @@ from services.const import (
     HASHCAT_CONFIGS,
     LIB_NVIDIA_ML_DIGESTS,
 )
-from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORTS_PREFIX
+from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORT_MAPS_PREFIX
 from services.ssh_service import SSHService
 from services.hash_service import HashService
 
@@ -123,27 +123,41 @@ class TaskService:
         except:
             pass
 
-    def get_available_port(
+    def get_available_port_map(
         self,
-        port_range: str,
-        host_ssh_port: int,
-    ) -> int:
-        if port_range:
-            if '-' in port_range:
-                min_port, max_port = map(int, (part.strip() for part in port_range.split('-')))
+        executor_info: ExecutorSSHInfo,
+    ) -> Optional[Tuple[int, int]]:
+        if executor_info.port_mappings:
+            port_mappings: list[Tuple[int, int]] = json.loads(executor_info.port_mappings)
+            port_mappings = [
+                (internal_port, external_port)
+                for internal_port, external_port in port_mappings
+                if internal_port != executor_info.ssh_port and external_port != executor_info.ssh_port
+            ]
+
+            if not port_mappings:
+                return None
+
+            return random.choice(port_mappings)
+
+        if executor_info.port_range:
+            if '-' in executor_info.port_range:
+                min_port, max_port = map(int, (part.strip() for part in executor_info.port_range.split('-')))
                 ports = list(range(min_port, max_port + 1))
             else:
-                ports = list(map(int, (part.strip() for part in port_range.split(','))))
+                ports = list(map(int, (part.strip() for part in executor_info.port_range.split(','))))
         else:
             # Default range if port_range is empty
             ports = list(range(40000, 65536))
 
-        ports = [port for port in ports if port != host_ssh_port]
+        ports = [port for port in ports if port != executor_info.ssh_port]
 
         if not ports:
-            return 0
+            return None
 
-        return random.choice(ports)
+        internal_port = random.choice(ports)
+
+        return internal_port, internal_port
 
     async def docker_connection_check(
         self,
@@ -154,7 +168,26 @@ class TaskService:
         private_key: str,
         public_key: str,
     ):
-        ssh_port = self.get_available_port(executor_info.port_range, executor_info.ssh_port)
+        port_map = self.get_available_port_map(executor_info)
+        if port_map is None:
+            log_text = _m(
+                "No port available for docker container",
+                extra=get_extra_info({
+                    "job_batch_id": job_batch_id,
+                    "miner_hotkey": miner_hotkey,
+                    "executor_uuid": executor_info.uuid,
+                    "executor_ip_address": executor_info.address,
+                    "executor_port": executor_info.port,
+                    "ssh_username": executor_info.ssh_username,
+                    "ssh_port": executor_info.ssh_port,
+                }),
+            )
+            log_status = "error"
+            logger.error(log_text, exc_info=True)
+
+            return False, log_text, log_status
+
+        internal_port, external_port = port_map
         executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
         default_extra = {
             "job_batch_id": job_batch_id,
@@ -163,19 +196,11 @@ class TaskService:
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "ssh_username": executor_info.ssh_username,
-            "ssh_port": ssh_port,
+            "ssh_port": executor_info.ssh_port,
+            "internal_port": internal_port,
+            "external_port": external_port,
         }
         context.set(f"[_docker_connection_check][{executor_name}]")
-
-        if ssh_port == 0:
-            log_text = _m(
-                "No port available for docker container",
-                extra=get_extra_info(default_extra),
-            )
-            log_status = "error"
-            logger.error(log_text, exc_info=True)
-
-            return False, log_text, log_status
 
         try:
             log_text = _m(
@@ -187,7 +212,7 @@ class TaskService:
 
             container_name = f"container_{miner_hotkey}"
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"docker run -d --name {container_name} -p {ssh_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
+            command = f"docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
             result = await ssh_client.run(command, timeout=20)
             if result.exit_status != 0:
@@ -205,7 +230,7 @@ class TaskService:
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
                 host=executor_info.address,
-                port=ssh_port,
+                port=external_port,
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
                 known_hosts=None,
@@ -217,15 +242,19 @@ class TaskService:
                 logger.info(log_text)
 
                 # set port on redis
-                key = f"{AVAILABLE_PORTS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
-                existing_ports = await self.redis_service.get(key)
-                if existing_ports:
-                    port_set = set(existing_ports.decode().split(','))
-                    port_set.add(str(ssh_port))
-                    ports = ','.join(port_set)
-                else:
-                    ports = f'{ssh_port}'
-                await self.redis_service.set(key, ports)
+                key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
+                port_map = f"{internal_port},{external_port}"
+
+                # delete all the same port_maps in the list
+                await self.redis_service.lrem(key=key, element=port_map)
+
+                # insert port_map in the list
+                await self.redis_service.lpush(key, port_map)
+
+                # keep the latest 10 port maps
+                port_maps = await self.redis_service.lrange(key)
+                if len(port_maps) > 10:
+                    await self.redis_service.rpop(key)
 
             command = f"docker rm {container_name} -f"
             await ssh_client.run(command, timeout=20)
@@ -333,6 +362,7 @@ class TaskService:
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
 
+                nvidia_driver = machine_spec.get("gpu", {}).get("driver", '')
                 libnvidia_ml = machine_spec.get('md5_checksums', {}).get('libnvidia_ml', '')
 
                 logger.info(
@@ -342,12 +372,13 @@ class TaskService:
                             **default_extra,
                             "gpu_model": gpu_model,
                             "gpu_count": gpu_count,
+                            "nvidia_driver": nvidia_driver,
                             "libnvidia_ml": libnvidia_ml,
                         }),
                     ),
                 )
 
-                if libnvidia_ml not in LIB_NVIDIA_ML_DIGESTS:
+                if not nvidia_driver or LIB_NVIDIA_ML_DIGESTS[nvidia_driver] != libnvidia_ml:
                     log_status = "warning"
                     log_text = _m(
                         f"Nvidia driver is altered",
@@ -688,11 +719,11 @@ class TaskService:
             )
 
             try:
-                key = f"{AVAILABLE_PORTS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
-                await self.redis_service.set(key, '')
+                key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
+                await self.redis_service.delete(key)
             except Exception as redis_error:
                 log_text = _m(
-                    "Error creating task for executor",
+                    "Error creating task redis_reset_error",
                     extra=get_extra_info({
                         **default_extra,
                         "error": str(e),

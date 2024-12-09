@@ -17,8 +17,6 @@ COPY --from=datura . /datura
 RUN --mount=type=cache,target=/tmp/pdm_cache \
   pdm config cache_dir /tmp/pdm_cache && \
   pdm config python.use_venv False && \
-  # compute-horde from path computes version from git tag which is unavailable here, 
-  # hence we pass PDM_BUILD_SCM_VERSION=0 manually
   PDM_BUILD_SCM_VERSION=0 pdm sync --prod --group :all
 RUN mkdir -p /opt/ && mv __pypackages__/3.11/ /opt/pypackages/
 
@@ -48,6 +46,6 @@ RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bash_profile
 COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 
-LABEL version="3.2.9"
+LABEL version="3.3.0"
 
 CMD ["bash", "run.sh"]

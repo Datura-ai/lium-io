@@ -45,7 +45,7 @@ class ExecutorService:
                     if response.status != 200:
                         logger.error("API request failed to register SSH key. url=%s", url)
                         return None
-                    response_obj: str = await response.json()
+                    response_obj: dict = await response.json()
                     logger.info(
                         "Get response from Executor(%s:%s): %s",
                         executor.address,

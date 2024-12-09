@@ -7,7 +7,7 @@ from core.config import settings
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 RENTED_MACHINE_SET = "rented_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
-AVAILABLE_PORTS_PREFIX = "available_ports"
+AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 
 
 class RedisService:
@@ -41,35 +41,64 @@ class RedisService:
             await self.redis.delete(key)
 
     async def sadd(self, key: str, elem: str):
-        """Add a machine ID to the set of rented machines."""
+        """Add an element to a set in Redis."""
         async with self.lock:
             await self.redis.sadd(key, elem)
 
     async def srem(self, key: str, elem: str):
-        """Remove a machine ID from the set of rented machines."""
+        """Remove an element from a set in Redis."""
         async with self.lock:
             await self.redis.srem(key, elem)
 
     async def is_elem_exists_in_set(self, key: str, elem: str) -> bool:
-        """Check if a machine ID is in the set of rented machines."""
+        """Check an element exists or not in a set in Redis."""
         async with self.lock:
             return await self.redis.sismember(key, elem)
 
-    async def get_all_elements(self, key: str):
-        """Get all elements from a set in Redis."""
+    async def smembers(self, key: str):
         async with self.lock:
             return await self.redis.smembers(key)
-
-    async def clear_set(self, key: str):
-        """Clear all elements from a set in Redis."""
-        async with self.lock:
-            await self.redis.delete(key)
 
     async def add_rented_machine(self, machine: RentedMachine):
         await self.sadd(RENTED_MACHINE_SET, f"{machine.miner_hotkey}:{machine.executor_id}")
 
     async def remove_rented_machine(self, machine: RentedMachine):
         await self.srem(RENTED_MACHINE_SET, f"{machine.miner_hotkey}:{machine.executor_id}")
+
+    async def lpush(self, key: str, element: bytes):
+        """Add an element to a list in Redis."""
+        async with self.lock:
+            await self.redis.lpush(key, element)
+
+    async def lrange(self, key: str) -> list[bytes]:
+        """Get all elements from a list in Redis in order."""
+        async with self.lock:
+            return await self.redis.lrange(key, 0, -1)
+
+    async def lrem(self, key: str, element: bytes, count: int = 0):
+        """Remove elements from a list in Redis."""
+        async with self.lock:
+            await self.redis.lrem(key, count, element)
+
+    async def ltrim(self, key: str, max_length: int):
+        """Trim the list to maintain a maximum length."""
+        async with self.lock:
+            await self.redis.ltrim(key, 0, max_length - 1)
+
+    async def lpop(self, key: str) -> bytes:
+        """Remove and return the first element (last inserted) from a list in Redis."""
+        async with self.lock:
+            return await self.redis.lpop(key)
+
+    async def rpop(self, key: str) -> bytes:
+        """Remove and return the last element (first inserted) from a list in Redis."""
+        async with self.lock:
+            return await self.redis.rpop(key)
+
+    async def clear_set(self, key: str):
+        """Clear all elements from a set in Redis."""
+        async with self.lock:
+            await self.redis.delete(key)
 
     async def hset(self, key: str, field: str, value: str):
         async with self.lock:
@@ -86,11 +115,6 @@ class RedisService:
     async def hdel(self, key: str, *fields: str):
         async with self.lock:
             await self.redis.hdel(key, *fields)
-
-    async def delete_executor_count_hash(self, miner_hotkey: str):
-        redis_key = f"{EXECUTOR_COUNT_PREFIX}:{miner_hotkey}"
-        async with self.lock:
-            await self.redis.delete(redis_key)
 
     async def clear_by_pattern(self, pattern: str):
         async with self.lock:
@@ -110,5 +134,5 @@ class RedisService:
                     break
 
     async def clear_all_ssh_ports(self):
-        pattern = f"{AVAILABLE_PORTS_PREFIX}:*"
+        pattern = f"{AVAILABLE_PORT_MAPS_PREFIX}:*"
         await self.clear_by_pattern(pattern)
