@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -11,7 +12,8 @@ class Settings(BaseSettings):
 
     MINER_HOTKEY_SS58_ADDRESS: str = Field(env="MINER_HOTKEY_SS58_ADDRESS")
 
-    RENTING_PORT_RANGE: str = Field(env="RENTING_PORT_RANGE", default='40000-65535')
+    RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
+    RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
 
     ENV: str = Field(env="ENV", default="dev")
 
