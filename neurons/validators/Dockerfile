@@ -35,6 +35,7 @@ RUN apt-get update \
 WORKDIR /root/app/
 
 ENV ENV=prod
+ENV USE_TORCH=0
 ENV PYTHONUNBUFFERED=1
 ENV PATH=/opt/pypackages/bin:$PATH
 ENV PYTHONPATH=/opt/pypackages/lib:/root/app
