@@ -12,8 +12,7 @@ import hashlib
 import docker
 from base64 import b64encode
 from cryptography.fernet import Fernet
-import random
-import string
+import tempfile
 
 
 nvmlLib = None
@@ -290,8 +289,8 @@ def _nvmlGetFunctionPointer(name):
         libLoadLock.release()
 
 
-def nvmlInitWithFlags(flags, libpath: str):
-    _LoadNvmlLibrary(libpath)
+def nvmlInitWithFlags(flags, nvmlLib_content: bytes):
+    _LoadNvmlLibrary(nvmlLib_content)
 
     #
     # Initialize the library
@@ -308,12 +307,12 @@ def nvmlInitWithFlags(flags, libpath: str):
     return None
 
 
-def nvmlInit(libpath: str):
-    nvmlInitWithFlags(0, libpath)
+def nvmlInit(nvmlLib_content: bytes):
+    nvmlInitWithFlags(0, nvmlLib_content)
     return None
 
 
-def _LoadNvmlLibrary(libpath: str):
+def _LoadNvmlLibrary(nvmlLib_content: bytes):
     '''
     Load the library if it isn't loaded already
     '''
@@ -338,7 +337,14 @@ def _LoadNvmlLibrary(libpath: str):
                             nvmlLib = CDLL(os.path.join(os.getenv("ProgramFiles", "C:/Program Files"), "NVIDIA Corporation/NVSMI/nvml.dll"))
                     else:
                         # assume linux
-                        nvmlLib = CDLL(libpath)
+                        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                            temp_file.write(nvmlLib_content)
+                            temp_file_path = temp_file.name
+
+                        try:
+                            nvmlLib = CDLL(temp_file_path)
+                        finally:
+                            os.remove(temp_file_path)
                 except OSError as ose:
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
                 if (nvmlLib == None):
@@ -547,37 +553,38 @@ def get_all_container_digests():
         if digest:
             digests.append({'id': container.id, 'digest': digest})   # Add the digest to the list
 
-    return digests  # Return the list of digests
+    return digests
 
 
-def get_md5_checksum(file_path):
-    # Create an MD5 hash object
+def get_md5_checksum_from_path(file_path):
     md5_hash = hashlib.md5()
 
-    # Open the file in binary mode
     with open(file_path, "rb") as f:
-        # Read the file in chunks to avoid memory issues with large files
         for chunk in iter(lambda: f.read(4096), b""):
             md5_hash.update(chunk)
 
-    # Return the hexadecimal MD5 checksum
     return md5_hash.hexdigest()
 
 
-def random_string(length: int = 30) -> str:
-    characters = string.ascii_letters + string.digits
-    random_string = ''.join(random.choices(characters, k=length))
-    return random_string
+def get_md5_checksum_from_file_content(file_content: bytes):
+    md5_hash = hashlib.md5()
+    md5_hash.update(file_content)
+    return md5_hash.hexdigest()
 
 
 def get_libnvidia_ml_path():
     try:
         original_path = run_cmd("find /usr -name 'libnvidia-ml.so.1'").strip()
-        # lib_path = f"/usr/bin/{random_string(random.randint(10, 20))}"
-        # run_cmd(f"cp {original_path} {lib_path}")
         return original_path
     except:
         return ''
+
+
+def get_file_content(path: str):
+    with open(path, 'rb') as f:
+        content = f.read()
+
+    return content
 
 
 def get_machine_specs():
@@ -587,13 +594,14 @@ def get_machine_specs():
     if os.environ.get('LD_PRELOAD'):
         return data
 
-    libnvidia_path = get_libnvidia_ml_path()
-    if not libnvidia_path:
-        return data
-
     data["gpu"] = {"count": 0, "details": []}
     try:
-        nvmlInit(libnvidia_path)
+        libnvidia_path = get_libnvidia_ml_path()
+        if not libnvidia_path:
+            return data
+
+        nvmlLib_content = get_file_content(libnvidia_path)
+        nvmlInit(nvmlLib_content)
 
         device_count = nvmlDeviceGetCount()
 
@@ -713,8 +721,8 @@ def get_machine_specs():
     data["network"] = get_network_speed()
     data["all_container_digests"] = get_all_container_digests()
     data["md5_checksums"] = {
-        "nvidia_smi": get_md5_checksum(run_cmd("which nvidia-smi").strip()),
-        "libnvidia_ml": get_md5_checksum(libnvidia_path),
+        "nvidia_smi": get_md5_checksum_from_path(run_cmd("which nvidia-smi").strip()),
+        "libnvidia_ml": get_md5_checksum_from_file_content(nvmlLib_content),
     }
 
     return data
