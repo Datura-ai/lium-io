@@ -8,6 +8,7 @@ class CustomOptions(BaseModel):
     environment: dict[str, str]
     entrypoint: str
     internal_ports: list[int]
+    startup_commands: str
 
 class MinerJobRequestPayload(BaseModel):
     job_batch_id: str

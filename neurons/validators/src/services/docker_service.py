@@ -186,14 +186,15 @@ class DockerService:
             volume_flags = " ".join([f"-v {volume}" for volume in custom_options.volumes]) if custom_options else ""
             entrypoint_flag = f"--entrypoint {custom_options.entrypoint}" if custom_options and custom_options.entrypoint and custom_options.entrypoint.strip() else ""
             env_flags = " ".join([f"-e {key}={value}" for key, value in custom_options.environment.items()]) if custom_options else ""
+            startup_commands = f"{custom_options.startup_commands}" if custom_options and custom_options.startup_commands and custom_options.startup_commands.strip() else ""
             
             if payload.debug:
                 await ssh_client.run(
-                    f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {entrypoint_flag}'
+                    f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
                 )
             else:
                 await ssh_client.run(
-                    f'docker run -d {port_flags} {volume_flags} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image}  {entrypoint_flag}'
+                    f'docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
                 )
 
             logger.info(

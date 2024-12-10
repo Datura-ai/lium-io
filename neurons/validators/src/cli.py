@@ -201,7 +201,8 @@ async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: st
         volumes=["/var/runer/docker.sock:/var/runer/docker.sock"],
         environment={"UPDATED_PUBLIC_KEY":"user_public_key"},
         entrypoint="",
-        internal_ports=[22, 8002]
+        internal_ports=[22, 8002],
+        startup_commands="/bin/bash -c 'apt-get update && apt-get install -y ffmpeg && pip install opencv-python'",
     )
     payload = ContainerCreateRequest(
         docker_image=docker_image,
