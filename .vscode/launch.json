@@ -12,6 +12,23 @@
             "console": "integratedTerminal",
             "args": ["debug-set-weights"],
             "cwd": "${workspaceFolder}/neurons/validators"
+        },
+        {
+            "name": "Validator: Debug Run Job",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/cli.py",
+            "console": "integratedTerminal",
+            "args": ["debug-send-job-to-miner", "--miner_hotkey", "5Dtbwfafi4cyiDwH5HBFEAWJA913EB6G1rX7wBnfcXwiPssR", "--miner_address", "127.0.0.1", "--miner_port", "8000"],
+            "cwd": "${workspaceFolder}/neurons/validators"
+        },
+        {
+            "name": "Validator: Connector",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/connector.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/neurons/validators"
         }
     ]
 }
