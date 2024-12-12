@@ -310,10 +310,7 @@ class Validator:
             current_block = self.get_current_block(subtensor)
             bittensor.logging.info(f"Current block: {current_block}", "sync", "sync")
 
-            if (
-                current_block % settings.BLOCKS_FOR_JOB == 0
-                or current_block - self.last_job_run_blocks > int(settings.BLOCKS_FOR_JOB * 1.5)
-            ):
+            if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.get_time_from_block(subtensor, job_block)
 
