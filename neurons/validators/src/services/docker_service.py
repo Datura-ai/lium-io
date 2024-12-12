@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Annotated
 from uuid import uuid4
 
@@ -69,11 +70,16 @@ class DockerService:
             return []
 
     async def check_container_running(
-        self, ssh_client: asyncssh.SSHClientConnection, container_name: str
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, timeout: int = 10
     ):
         """Check if the container is running"""
-        result = await ssh_client.run(f"docker ps -q -f name={container_name}")
-        return not (not (result.stdout.strip()))
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            result = await ssh_client.run(f"docker ps -q -f name={container_name}")
+            if result.stdout.strip():
+                return True
+            await asyncio.sleep(1)
+        return False
 
     async def create_container(
         self,
