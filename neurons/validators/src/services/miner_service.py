@@ -1,7 +1,7 @@
 import asyncio
+import json
 import logging
 from typing import Annotated
-import json
 
 import bittensor
 from clients.miner_client import MinerClient
@@ -23,16 +23,17 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopped,
     ContainerStopRequest,
+    FailedContainerErrorCodes,
     FailedContainerRequest,
-    MinerJobRequestPayload,
     MinerJobEnryptedFiles,
+    MinerJobRequestPayload,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
-from services.redis_service import RedisService, MACHINE_SPEC_CHANNEL_NAME, EXECUTOR_COUNT_PREFIX
+from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL_NAME, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
@@ -57,7 +58,7 @@ class MinerService:
         self,
         payload: MinerJobRequestPayload,
         encypted_files: MinerJobEnryptedFiles,
-        docker_hub_digests: dict[str, str]
+        docker_hub_digests: dict[str, str],
     ):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -150,7 +151,9 @@ class MinerService:
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
                     await self.publish_machine_specs(results, miner_client.miner_hotkey)
-                    await self.store_executor_counts(payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results)
+                    await self.store_executor_counts(
+                        payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results
+                    )
 
                     total_score = 0
                     for _, _, score, _, _, _, _ in results:
@@ -220,7 +223,15 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "results": len(results)}),
             ),
         )
-        for specs, ssh_info, score, synthetic_job_score, job_batch_id, log_status, log_text in results:
+        for (
+            specs,
+            ssh_info,
+            score,
+            synthetic_job_score,
+            job_batch_id,
+            log_status,
+            log_text,
+        ) in results:
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL_NAME,
@@ -246,7 +257,9 @@ class MinerService:
                     exc_info=True,
                 )
 
-    async def store_executor_counts(self, miner_hotkey: str, job_batch_id: str, total: int, results: list[dict]):
+    async def store_executor_counts(
+        self, miner_hotkey: str, job_batch_id: str, total: int, results: list[dict]
+    ):
         default_extra = {
             "job_batch_id": job_batch_id,
             "miner_hotkey": miner_hotkey,
@@ -261,11 +274,7 @@ class MinerService:
             else:
                 failed += 1
 
-        data = {
-            "total": total,
-            "success": success,
-            "failed": failed
-        }
+        data = {"total": total, "success": success, "failed": failed}
 
         key = f"{EXECUTOR_COUNT_PREFIX}:{miner_hotkey}"
 
@@ -327,7 +336,8 @@ class MinerService:
 
                 try:
                     msg = await asyncio.wait_for(
-                        miner_client.job_state.miner_accepted_ssh_key_or_failed_future, timeout=JOB_LENGTH
+                        miner_client.job_state.miner_accepted_ssh_key_or_failed_future,
+                        timeout=JOB_LENGTH,
                     )
                 except TimeoutError:
                     logger.error(
@@ -388,6 +398,7 @@ class MinerService:
                             miner_hotkey=payload.miner_hotkey,
                             executor_id=payload.executor_id,
                             msg=f"Invalid executor id {payload.executor_id}",
+                            error_code=FailedContainerErrorCodes.InvalidExecutorId,
                         )
 
                     try:
@@ -395,7 +406,9 @@ class MinerService:
                             logger.info(
                                 _m(
                                     "Creating container",
-                                    extra=get_extra_info({**default_extra, "payload": str(payload)}),
+                                    extra=get_extra_info(
+                                        {**default_extra, "payload": str(payload)}
+                                    ),
                                 ),
                             )
                             result = await docker_service.create_container(
@@ -426,7 +439,9 @@ class MinerService:
                             logger.info(
                                 _m(
                                     "Starting container",
-                                    extra=get_extra_info({**default_extra, "payload": str(payload)}),
+                                    extra=get_extra_info(
+                                        {**default_extra, "payload": str(payload)}
+                                    ),
                                 ),
                             )
                             await docker_service.start_container(
@@ -439,7 +454,9 @@ class MinerService:
                             logger.info(
                                 _m(
                                     "Started Container",
-                                    extra=get_extra_info({**default_extra, "payload": str(payload)}),
+                                    extra=get_extra_info(
+                                        {**default_extra, "payload": str(payload)}
+                                    ),
                                 ),
                             )
                             await miner_client.send_model(
@@ -475,7 +492,9 @@ class MinerService:
                             logger.info(
                                 _m(
                                     "Deleting container",
-                                    extra=get_extra_info({**default_extra, "payload": str(payload)}),
+                                    extra=get_extra_info(
+                                        {**default_extra, "payload": str(payload)}
+                                    ),
                                 ),
                             )
                             await docker_service.delete_container(
@@ -488,7 +507,9 @@ class MinerService:
                             logger.info(
                                 _m(
                                     "Deleted Container",
-                                    extra=get_extra_info({**default_extra, "payload": str(payload)}),
+                                    extra=get_extra_info(
+                                        {**default_extra, "payload": str(payload)}
+                                    ),
                                 ),
                             )
                             await miner_client.send_model(
@@ -507,13 +528,16 @@ class MinerService:
                             logger.error(
                                 _m(
                                     "Unexpected request",
-                                    extra=get_extra_info({**default_extra, "payload": str(payload)}),
+                                    extra=get_extra_info(
+                                        {**default_extra, "payload": str(payload)}
+                                    ),
                                 ),
                             )
                             return FailedContainerRequest(
                                 miner_hotkey=payload.miner_hotkey,
                                 executor_id=payload.executor_id,
                                 msg=f"Unexpected request: {payload}",
+                                error_code=FailedContainerErrorCodes.UnknownError,
                             )
 
                     except Exception as e:
@@ -533,6 +557,7 @@ class MinerService:
                             miner_hotkey=payload.miner_hotkey,
                             executor_id=payload.executor_id,
                             msg=f"create container error: {str(e)}",
+                            error_code=FailedContainerErrorCodes.ExceptionError,
                         )
 
                 elif isinstance(msg, FailedRequest):
@@ -545,7 +570,8 @@ class MinerService:
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=f"create container error: {str(msg)}",
+                        msg=f"Failed request from miner: {str(msg)}",
+                        error_code=FailedContainerErrorCodes.FailedMsgFromMiner,
                     )
                 else:
                     logger.error(
@@ -558,6 +584,7 @@ class MinerService:
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
                         msg=f"Unexpected msg: {str(msg)}",
+                        error_code=FailedContainerErrorCodes.UnknownError,
                     )
         except Exception as e:
             log_text = _m(
@@ -570,7 +597,8 @@ class MinerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=f"Unexpected msg: {str(e)}",
+                msg=f"Exception: {str(e)}",
+                error_code=FailedContainerErrorCodes.ExceptionError,
             )
 
 

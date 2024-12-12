@@ -16,6 +16,7 @@ from services.file_encrypt_service import FileEncryptService
 from payload_models.payloads import (
     MinerJobRequestPayload,
     ContainerCreateRequest,
+    CustomOptions,
 )
 
 configure_logs_of_other_modules()
@@ -183,6 +184,36 @@ async def _create_container_to_miner(miner_hotkey: str, miner_address: str, mine
     )
     await miner_service.handle_container(payload)
 
+@cli.command()
+@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
+@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
+@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
+@click.option("--executor_id", prompt="Executor Id", help="Executor Id")
+@click.option("--docker_image", prompt="Docker Image", help="Docker Image")
+def create_custom_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
+    asyncio.run(_create_custom_container_to_miner(miner_hotkey, miner_address, miner_port, executor_id, docker_image))
+
+
+async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
+    miner_service: MinerService = ioc["MinerService"]
+    # mock custom options
+    custom_options = CustomOptions(
+        volumes=["/var/runer/docker.sock:/var/runer/docker.sock"],
+        environment={"UPDATED_PUBLIC_KEY":"user_public_key"},
+        entrypoint="",
+        internal_ports=[22, 8002],
+        startup_commands="/bin/bash -c 'apt-get update && apt-get install -y ffmpeg && pip install opencv-python'",
+    )
+    payload = ContainerCreateRequest(
+        docker_image=docker_image,
+        user_public_key="user_public_key",
+        executor_id=executor_id,
+        miner_hotkey=miner_hotkey,
+        miner_address=miner_address,
+        miner_port=miner_port,
+        custom_options=custom_options
+    )
+    await miner_service.handle_container(payload)
 
 if __name__ == "__main__":
     cli()
