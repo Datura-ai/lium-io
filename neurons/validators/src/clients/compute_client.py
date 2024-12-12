@@ -19,13 +19,18 @@ from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     ExecutorSpecRequest,
     RentedMachineRequest,
+    LogStreamRequest,
 )
 from pydantic import BaseModel
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
-from services.redis_service import MACHINE_SPEC_CHANNEL_NAME, RENTED_MACHINE_SET
+from services.redis_service import (
+    MACHINE_SPEC_CHANNEL_NAME,
+    RENTED_MACHINE_SET,
+    STREAMING_LOG_CHANNEL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +105,11 @@ class ComputeClient:
         try:
             # subscribe to channel to get machine specs
             pubsub = await self.miner_service.redis_service.subscribe(MACHINE_SPEC_CHANNEL_NAME)
+            log_channel = await self.miner_service.redis_service.subscribe(STREAMING_LOG_CHANNEL)
 
             # send machine specs to facilitator
             self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
+            asyncio.create_task(self.wait_for_log_streams(log_channel))
         except Exception as exc:
             logger.error(
                 _m("redis connection error", extra={**self.logging_extra, "error": str(exc)})
@@ -272,6 +279,70 @@ class ComputeClient:
                         extra=self.logging_extra,
                     )
                 )
+
+    async def wait_for_log_streams(self, channel: aioredis.client.PubSub):
+        logs_queue = []
+        while True:
+            validator_hotkey = self.my_hotkey()
+            logger.info(
+                _m(
+                    f"Waiting for log streams: {validator_hotkey}",
+                    extra=self.logging_extra,
+                )
+            )
+            try:
+                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=100 * 60)
+                if msg is None:
+                    logger.warning(
+                        _m(
+                            "No log streams yet",
+                            extra=self.logging_extra,
+                        )
+                    )
+                    continue
+
+                msg = json.loads(msg["data"])
+                log_stream = None
+
+                try:
+                    log_stream = LogStreamRequest(
+                        logs=msg["logs"],
+                        miner_hotkey=msg["miner_hotkey"],
+                        validator_hotkey=validator_hotkey,
+                        executor_uuid=msg["executor_uuid"],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            msg,
+                            extra={
+                                **self.logging_extra,
+                                "error": str(exc),
+                            },
+                        )
+                    )
+                    continue
+
+                logs_queue.append(log_stream)
+                if self.ws is not None:
+                    while len(logs_queue) > 0:
+                        log_to_send = logs_queue.pop(0)
+                        try:
+                            await self.send_model(log_to_send)
+                        except Exception as exc:
+                            logs_queue.insert(0, log_to_send)
+                            logger.error(
+                                _m(
+                                    msg,
+                                    extra={
+                                        **self.logging_extra,
+                                        "error": str(exc),
+                                    },
+                                )
+                            )
+                            break
+            except TimeoutError:
+                pass
 
     def create_metagraph_refresh_task(self, period=None):
         return create_metagraph_refresh_task(period=period)

@@ -47,12 +47,10 @@ class MinerService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
-        docker_service: Annotated[DockerService, Depends(DockerService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
-        self.docker_service = docker_service
         self.redis_service = redis_service
 
     async def request_job_to_miner(
@@ -300,6 +298,11 @@ class MinerService:
             "container_request_type": str(payload.message_type),
         }
 
+        docker_service = DockerService(
+            ssh_service=self.ssh_service,
+            redis_service=self.redis_service,
+        )
+
         try:
             miner_client = MinerClient(
                 loop=loop,
@@ -395,7 +398,7 @@ class MinerService:
                                     extra=get_extra_info({**default_extra, "payload": str(payload)}),
                                 ),
                             )
-                            result = await self.docker_service.create_container(
+                            result = await docker_service.create_container(
                                 payload,
                                 executor,
                                 my_key,
@@ -426,7 +429,7 @@ class MinerService:
                                     extra=get_extra_info({**default_extra, "payload": str(payload)}),
                                 ),
                             )
-                            await self.docker_service.start_container(
+                            await docker_service.start_container(
                                 payload,
                                 executor,
                                 my_key,
@@ -451,7 +454,7 @@ class MinerService:
                                 container_name=payload.container_name,
                             )
                         elif isinstance(payload, ContainerStopRequest):
-                            await self.docker_service.stop_container(
+                            await docker_service.stop_container(
                                 payload,
                                 executor,
                                 my_key,
@@ -475,7 +478,7 @@ class MinerService:
                                     extra=get_extra_info({**default_extra, "payload": str(payload)}),
                                 ),
                             )
-                            await self.docker_service.delete_container(
+                            await docker_service.delete_container(
                                 payload,
                                 executor,
                                 my_key,

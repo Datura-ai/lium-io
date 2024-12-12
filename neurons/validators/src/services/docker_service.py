@@ -20,7 +20,11 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info
-from services.redis_service import RedisService, AVAILABLE_PORT_MAPS_PREFIX
+from services.redis_service import (
+    RedisService,
+    AVAILABLE_PORT_MAPS_PREFIX,
+    STREAMING_LOG_CHANNEL,
+)
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,9 @@ class DockerService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.lock = asyncio.Lock()
+        self.logs_queue: list[dict] = []
+        self.logs_time_clock_set = False
 
     async def generate_portMappings(self, miner_hotkey, executor_id):
         try:
@@ -65,17 +72,68 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         command: str,
+        type: str,
     ):
         result = True
         async with ssh_client.create_process(command) as process:
             async for line in process.stdout:
-                print(f"Status: {line.strip()}")
+                async with self.lock:
+                    self.logs_queue.append({
+                        "log_text": line.strip(),
+                        "log_status": 'success',
+                        "type": type,
+                    })
 
             async for line in process.stderr:
-                print(f"ERROR: {line.strip()}")
                 result = False
+                async with self.lock:
+                    self.logs_queue.append({
+                        "log_text": line.strip(),
+                        "log_status": 'error',
+                        "type": type,
+                    })
 
         return result
+
+    async def handle_stream_logs(
+        self,
+        miner_hotkey,
+        executor_id,
+    ):
+        default_extra = {
+            "miner_hotkey": miner_hotkey,
+            "executor_uuid": executor_id,
+        }
+
+        while True:
+            await asyncio.sleep(5)
+
+            async with self.lock:
+                logs_to_process = self.logs_queue[:]
+                if logs_to_process:
+                    try:
+                        await self.redis_service.publish(
+                            STREAMING_LOG_CHANNEL,
+                            {
+                                "logs": logs_to_process,
+                                "miner_hotkey": miner_hotkey,
+                                "executor_uuid": executor_id,
+                            },
+                        )
+
+                        self.logs_queue.clear()
+
+                    except Exception as e:
+                        logger.error(
+                            _m(
+                                f"Error publishing log stream",
+                                extra=get_extra_info({**default_extra, "error": str(e)}),
+                            ),
+                            exc_info=True,
+                        )
+
+            if not self.logs_time_clock_set:
+                break
 
     async def create_container(
         self,

@@ -24,7 +24,6 @@ async def initiate_services():
     ioc["MinerService"] = MinerService(
         ssh_service=ioc["SSHService"],
         task_service=ioc["TaskService"],
-        docker_service=ioc["DockerService"],
         redis_service=ioc["RedisService"]
     )
     ioc["FileEncryptService"] = FileEncryptService(
