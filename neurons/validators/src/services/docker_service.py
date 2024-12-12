@@ -61,6 +61,22 @@ class DockerService:
         except:
             return []
 
+    async def execute_and_stream_logs(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        command: str,
+    ):
+        result = True
+        async with ssh_client.create_process(command) as process:
+            async for line in process.stdout:
+                print(f"Status: {line.strip()}")
+
+            async for line in process.stderr:
+                print(f"ERROR: {line.strip()}")
+                result = False
+
+        return result
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
