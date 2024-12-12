@@ -110,27 +110,34 @@ class DockerService:
 
             async with self.lock:
                 logs_to_process = self.logs_queue[:]
-                if logs_to_process:
-                    try:
-                        await self.redis_service.publish(
-                            STREAMING_LOG_CHANNEL,
-                            {
-                                "logs": logs_to_process,
-                                "miner_hotkey": miner_hotkey,
-                                "executor_uuid": executor_id,
-                            },
-                        )
+                self.logs_queue.clear()
 
-                        self.logs_queue.clear()
+            if logs_to_process:
+                try:
+                    await self.redis_service.publish(
+                        STREAMING_LOG_CHANNEL,
+                        {
+                            "logs": logs_to_process,
+                            "miner_hotkey": miner_hotkey,
+                            "executor_uuid": executor_id,
+                        },
+                    )
 
-                    except Exception as e:
-                        logger.error(
-                            _m(
-                                f"Error publishing log stream",
-                                extra=get_extra_info({**default_extra, "error": str(e)}),
-                            ),
-                            exc_info=True,
+                    logger.info(
+                        _m(
+                            f"Successfully published {len(logs_to_process)} logs",
+                            extra=get_extra_info(default_extra),
                         )
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        _m(
+                            f"Error publishing log stream",
+                            extra=get_extra_info({**default_extra, "error": str(e)}),
+                        ),
+                        exc_info=True,
+                    )
 
             if not self.logs_time_clock_set:
                 break
