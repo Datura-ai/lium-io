@@ -49,6 +49,7 @@ class DockerService:
         self.redis_service = redis_service
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
+        self.log_task: asyncio.Task | None = None
         self.is_realtime_logging = False
 
     async def generate_portMappings(self, miner_hotkey, executor_id, internal_ports=None):
@@ -113,6 +114,8 @@ class DockerService:
             "executor_uuid": executor_id,
         }
 
+        self.is_realtime_logging = True
+
         while True:
             await asyncio.sleep(5)
 
@@ -149,6 +152,18 @@ class DockerService:
 
             if not self.is_realtime_logging:
                 break
+
+        logger.info(
+            _m(
+                "Exit handle_stream_logs",
+                extra=get_extra_info(default_extra),
+            )
+        )
+
+    async def finish_stream_logs(self):
+        self.is_realtime_logging = False
+        if self.log_task:
+            await self.log_task
 
     async def check_container_running(
         self,
@@ -233,8 +248,7 @@ class DockerService:
                 log_tag = 'container_creation'
 
                 # set real-time logging
-                self.is_realtime_logging = True
-                asyncio.create_task(self.handle_stream_logs(
+                self.log_task = asyncio.create_task(self.handle_stream_logs(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                 ))
@@ -259,7 +273,7 @@ class DockerService:
                     )
                     logger.error(log_text)
 
-                    self.is_realtime_logging = False
+                    await self.finish_stream_logs()
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -322,7 +336,7 @@ class DockerService:
                     )
                     logger.error(log_text)
 
-                    self.is_realtime_logging = False
+                    await self.finish_stream_logs()
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -365,7 +379,7 @@ class DockerService:
                     )
                     logger.error(log_text)
 
-                    self.is_realtime_logging = False
+                    await self.finish_stream_logs()
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -382,7 +396,7 @@ class DockerService:
                     )
                     logger.error(log_text)
 
-                    self.is_realtime_logging = False
+                    await self.finish_stream_logs()
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -398,7 +412,7 @@ class DockerService:
                     ),
                 )
 
-                self.is_realtime_logging = False
+                await self.finish_stream_logs()
 
                 await self.redis_service.add_rented_machine(
                     RentedMachine(
@@ -426,7 +440,7 @@ class DockerService:
             )
             logger.error(log_text)
 
-            self.is_realtime_logging = False
+            await self.finish_stream_logs()
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,

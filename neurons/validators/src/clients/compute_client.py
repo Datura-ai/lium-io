@@ -311,6 +311,13 @@ class ComputeClient:
                         validator_hotkey=validator_hotkey,
                         executor_uuid=msg["executor_uuid"],
                     )
+
+                    logger.info(
+                        _m(
+                            f'Successfully sent {len(msg["logs"])} logs',
+                            extra=self.logging_extra,
+                        )
+                    )
                 except Exception as exc:
                     logger.error(
                         _m(
