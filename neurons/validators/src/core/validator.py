@@ -66,7 +66,6 @@ class Validator:
         self.miner_service = MinerService(
             ssh_service=ssh_service,
             task_service=task_service,
-            docker_service=self.docker_service,
             redis_service=self.redis_service,
         )
         self.file_encrypt_service = FileEncryptService(

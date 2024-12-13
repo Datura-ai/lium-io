@@ -761,7 +761,7 @@ class TaskService:
                 "executor_ip_address": executor_info.address,
                 "executor_port": executor_info.port,
                 "miner_hotkey": miner_hotkey,
-                "command": command,
+                "command": command[:100] + ('...' if len(command) > 100 else ''),
             }
             context.set(f"[_run_task][{executor_name}]")
             logger.info(
