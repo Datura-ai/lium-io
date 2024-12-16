@@ -378,29 +378,6 @@ class TaskService:
                     ),
                 )
 
-                if not nvidia_driver or LIB_NVIDIA_ML_DIGESTS[nvidia_driver] != libnvidia_ml:
-                    log_status = "warning"
-                    log_text = _m(
-                        f"Nvidia driver is altered",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "libnvidia_ml": libnvidia_ml
-                        }),
-                    )
-                    logger.warning(log_text)
-
-                    await self.clear_remote_directory(ssh_client, remote_dir)
-
-                    return (
-                        machine_spec,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        log_status,
-                        log_text,
-                    )
-
                 if gpu_count > MAX_GPU_COUNT:
                     log_status = "warning"
                     log_text = _m(
@@ -450,6 +427,32 @@ class TaskService:
                         }),
                     )
                     log_status = "warning"
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
+                if nvidia_driver and LIB_NVIDIA_ML_DIGESTS.get(nvidia_driver) != libnvidia_ml:
+                    log_status = "warning"
+                    log_text = _m(
+                        f"Nvidia driver is altered",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "gpu_model": gpu_model,
+                            "gpu_count": gpu_count,
+                            "nvidia_driver": nvidia_driver,
+                            "libnvidia_ml": libnvidia_ml,
+                        }),
+                    )
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
