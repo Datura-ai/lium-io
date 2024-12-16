@@ -43,7 +43,6 @@ class Settings(BaseSettings):
         parser = argparse.ArgumentParser()
         # bittensor.wallet.add_args(parser)
         # bittensor.subtensor.add_args(parser)
-        # bittensor.logging.add_args(parser)
         # bittensor.axon.add_args(parser)
 
         if self.BITTENSOR_NETWORK:

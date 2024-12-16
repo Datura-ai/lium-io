@@ -8,6 +8,7 @@ import pydantic
 import redis.asyncio as aioredis
 import tenacity
 import websockets
+from websockets.asyncio.client import ClientConnection
 from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
@@ -48,7 +49,7 @@ class ComputeClient:
         self, keypair: bittensor.Keypair, compute_app_uri: str, miner_service: MinerService
     ):
         self.keypair = keypair
-        self.ws: websockets.WebSocketClientProtocol | None = None
+        self.ws: ClientConnection | None = None
         self.compute_app_uri = compute_app_uri
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
@@ -162,7 +163,7 @@ class ComputeClient:
                 )
             )
 
-    async def handle_connection(self, ws: websockets.WebSocketClientProtocol):
+    async def handle_connection(self, ws: ClientConnection):
         """handle a single websocket connection"""
         await ws.send(AuthenticateRequest.from_keypair(self.keypair).model_dump_json())
 
@@ -427,7 +428,7 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Rented machines",
-                    extra={**self.logging_extra, "machines": raw_msg},
+                    extra={**self.logging_extra, "machines": len(response.machines)},
                 )
             )
 

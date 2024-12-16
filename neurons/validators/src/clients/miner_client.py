@@ -6,6 +6,8 @@ import time
 
 import bittensor
 import websockets
+from websockets.asyncio.client import ClientConnection
+from websockets.protocol import State as WebSocketClientState
 from datura.errors.protocol import UnsupportedMessageReceived
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import (
@@ -49,7 +51,7 @@ class MinerClient(abc.ABC):
         self.max_debounce_count: int | None = 5  # set to None for unlimited debounce
         self.loop = loop
         self.miner_name = f"{miner_hotkey}({miner_address}:{miner_port})"
-        self.ws: websockets.WebSocketClientProtocol | None = None
+        self.ws: ClientConnection | None = None
         self.read_messages_task: asyncio.Task | None = None
         self.deferred_send_tasks: list[asyncio.Task] = []
 
@@ -100,7 +102,7 @@ class MinerClient(abc.ABC):
         if self.read_messages_task is not None and not self.read_messages_task.done():
             self.read_messages_task.cancel()
 
-        if self.ws is not None and not self.ws.closed:
+        if self.ws is not None and self.ws.state is WebSocketClientState.OPEN:
             try:
                 await self.ws.close()
             except Exception:
@@ -146,7 +148,7 @@ class MinerClient(abc.ABC):
                     await asyncio.sleep(sleep_time)
                 self.ws = await self._connect()
                 self.read_messages_task = self.loop.create_task(self.read_messages())
-                
+
                 if self.debounce_counter:
                     logger.info(
                         _m(
@@ -170,7 +172,7 @@ class MinerClient(abc.ABC):
         return (2**self.debounce_counter) + random.random()
 
     async def ensure_connected(self):
-        if self.ws is None or self.ws.closed:
+        if self.ws is None or self.ws.state is not WebSocketClientState.OPEN:
             if self.read_messages_task is not None and not self.read_messages_task.done():
                 self.read_messages_task.cancel()
             await self.await_connect()
