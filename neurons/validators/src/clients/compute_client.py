@@ -18,8 +18,8 @@ from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, 
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     ExecutorSpecRequest,
-    RentedMachineRequest,
     LogStreamRequest,
+    RentedMachineRequest,
 )
 from pydantic import BaseModel
 
@@ -281,7 +281,7 @@ class ComputeClient:
                 )
 
     async def wait_for_log_streams(self, channel: aioredis.client.PubSub):
-        logs_queue = []
+        logs_queue: list[LogStreamRequest] = []
         while True:
             validator_hotkey = self.my_hotkey()
             logger.info(
@@ -314,17 +314,18 @@ class ComputeClient:
 
                     logger.info(
                         _m(
-                            f'Successfully sent {len(msg["logs"])} logs',
+                            f'Successfully created LogStreamRequest instance with {len(msg["logs"])} logs',
                             extra=self.logging_extra,
                         )
                     )
                 except Exception as exc:
                     logger.error(
                         _m(
-                            msg,
+                            "Failed to get LogStreamRequest instance",
                             extra={
                                 **self.logging_extra,
                                 "error": str(exc),
+                                "msg": str(msg),
                             },
                         )
                     )
