@@ -5,14 +5,14 @@ The following is a set of guidelines for contributing to the Bittensor ecosystem
 ## Table Of Contents
 1. [How Can I Contribute?](#how-can-i-contribute)
    1. [Communication Channels](#communication-channels)
-   1. [Code Contribution General Guideline](#code-contribution-general-guidelines)
+   1. [Code Contribution General Guidelines](#code-contribution-general-guidelines)
    1. [Pull Request Philosophy](#pull-request-philosophy)
    1. [Pull Request Process](#pull-request-process)
    1. [Addressing Feedback](#addressing-feedback)
    1. [Squashing Commits](#squashing-commits)
    1. [Refactoring](#refactoring)
    1. [Peer Review](#peer-review)
- 1. [Suggesting Features](#suggesting-enhancements-and-features)
+ 1. [Suggesting Enhancements and Features](#suggesting-enhancements-and-features)
 
 
 ## How Can I Contribute?
@@ -199,7 +199,7 @@ When you are creating an enhancement suggestion, please [include as many details
 
 * **Check the [debugging guide](./DEBUGGING.md).** for tips — you might discover that the enhancement is already available. Most importantly, check if you're using the latest version of the project first.
 
-#### How Submit A (Good) Feature Suggestion
+#### How to Submit A (Good) Feature Suggestion
 
 * **Use a clear and descriptive title** for the issue to identify the problem.
 * **Provide a step-by-step description of the suggested enhancement** in as many details as possible.
