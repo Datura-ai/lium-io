@@ -1,9 +1,13 @@
+from typing import TYPE_CHECKING
 import argparse
 import pathlib
 
 import bittensor
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from bittensor_wallet import Wallet
 
 
 class Settings(BaseSettings):
@@ -34,7 +38,7 @@ class Settings(BaseSettings):
 
     ENV: str = Field(env="ENV", default="dev")
 
-    def get_bittensor_wallet(self) -> bittensor.wallet:
+    def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
         wallet = bittensor.wallet(
@@ -49,7 +53,6 @@ class Settings(BaseSettings):
         parser = argparse.ArgumentParser()
         # bittensor.wallet.add_args(parser)
         # bittensor.subtensor.add_args(parser)
-        # bittensor.logging.add_args(parser)
         # bittensor.axon.add_args(parser)
 
         if self.BITTENSOR_NETWORK:
