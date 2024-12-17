@@ -1,3 +1,4 @@
+from typing import TYPE_CHECKING
 import logging
 import traceback
 import asyncio
@@ -8,6 +9,9 @@ from core.db import get_db
 from core.utils import _m, get_extra_info
 from daos.validator import ValidatorDao, Validator
 
+if TYPE_CHECKING:
+    from bittensor_wallet import Wallet
+
 logger = logging.getLogger(__name__)
 
 MIN_STAKE = 10
@@ -16,7 +20,7 @@ SYNC_CYCLE = 2 * 60
 
 
 class Miner:
-    wallet: bittensor.wallet
+    wallet: "Wallet"
     subtensor: bittensor.subtensor
     netuid: int
 
@@ -73,7 +77,7 @@ class Miner:
         try:
             logger.info(
                 _m(
-                    'checking miner is registered',
+                    '[check_registered] checking miner is registered',
                     extra=get_extra_info(self.default_extra),
                 ),
             )
@@ -83,7 +87,7 @@ class Miner:
             ):
                 logger.error(
                     _m(
-                        f"Wallet: {self.wallet} is not registered on netuid {self.netuid}.",
+                        f"[check_registered] Wallet: {self.wallet} is not registered on netuid {self.netuid}.",
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
@@ -91,7 +95,7 @@ class Miner:
         except Exception as e:
             logger.error(
                 _m(
-                    'Checking validator registered failed',
+                    '[check_registered] Checking miner registered failed',
                     extra=get_extra_info({
                         **self.default_extra,
                         "error": str(e)
@@ -109,7 +113,7 @@ class Miner:
 
                 logger.info(
                     _m(
-                        'Announce miner',
+                        '[announce] Announce miner',
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
@@ -117,7 +121,7 @@ class Miner:
         except Exception as e:
             logger.error(
                 _m(
-                    'Annoucing miner error',
+                    '[announce] Annoucing miner error',
                     extra=get_extra_info({
                         **self.default_extra,
                         "error": str(e)
@@ -133,7 +137,7 @@ class Miner:
     async def save_validators(self, validators):
         logger.info(
             _m(
-                'Sync validators',
+                '[save_validators] Sync validators',
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -159,7 +163,7 @@ class Miner:
         except Exception as e:
             logger.error(
                 _m(
-                    'Miner sync failed',
+                    '[sync] Miner sync failed',
                     extra=get_extra_info({
                         **self.default_extra,
                         "error": str(e)

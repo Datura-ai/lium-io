@@ -303,7 +303,7 @@ class DockerService:
                 ]
                 volume_flags = (
                     " ".join([f"-v {volume}" for volume in sanitized_volumes])
-                    if custom_options and custom_options.volumes
+                    if sanitized_volumes
                     else ""
                 )
                 entrypoint_flag = (
