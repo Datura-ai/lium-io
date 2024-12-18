@@ -169,3 +169,5 @@ testing/
 .env.test
 .env.main
 .env
+
+**/.python-version

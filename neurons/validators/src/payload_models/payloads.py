@@ -4,6 +4,14 @@ from datura.requests.base import BaseRequest
 from pydantic import BaseModel, field_validator
 
 
+class CustomOptions(BaseModel):
+    volumes: list[str] | None = None
+    environment: dict[str, str] | None = None
+    entrypoint: str | None = None
+    internal_ports: list[int] | None = None
+    startup_commands: str | None = None
+
+
 class MinerJobRequestPayload(BaseModel):
     job_batch_id: str
     miner_hotkey: str
@@ -16,6 +24,7 @@ class MinerJobEnryptedFiles(BaseModel):
     tmp_directory: str
     machine_scrape_file_name: str
     score_file_name: str
+
 
 class ResourceType(BaseModel):
     cpu: int
@@ -55,6 +64,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_key: str
+    custom_options: CustomOptions | None = None
     debug: bool | None = None
 
 
@@ -114,6 +124,16 @@ class ContainerDeleted(ContainerBaseResponse):
     volume_name: str
 
 
+class FailedContainerErrorCodes(enum.Enum):
+    UnknownError = "UnknownError"
+    ContainerNotRunning = "ContainerNotRunning"
+    NoPortMappings = "NoPortMappings"
+    InvalidExecutorId = "InvalidExecutorId"
+    ExceptionError = "ExceptionError"
+    FailedMsgFromMiner = "FailedMsgFromMiner"
+
+
 class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
     msg: str
+    error_code: FailedContainerErrorCodes | None = None
