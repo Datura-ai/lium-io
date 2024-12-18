@@ -9,9 +9,10 @@ from core.config import settings
 from core.miner import Miner
 from routes.debug_routes import debug_apis_router
 from routes.validator_interface import validator_router
+from core.utils import configure_logs_of_other_modules, wait_for_services_sync
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+configure_logs_of_other_modules()
+wait_for_services_sync()
 
 
 @asynccontextmanager

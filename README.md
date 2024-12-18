@@ -25,7 +25,7 @@ The Compute Subnet on Bittensor is a decentralized network that allows miners to
 - **Validators**: Securely connect to miner machines to verify hardware specs and performance. They maintain the network's integrity.
 - **Renters**: Rent computational resources from the network to run their tasks.
 - **Frontend (celiumcompute.ai)**: The web interface facilitating easy interaction between miners and renters.
-- **Bittensor Network**: The decentralized blockchain in which the compensation is managed and paid out by the validatators to the miners through its native token, $TAO.
+- **Bittensor Network**: The decentralized blockchain in which the compensation is managed and paid out by the validators to the miners through its native token, $TAO.
 
 ## Getting Started
 

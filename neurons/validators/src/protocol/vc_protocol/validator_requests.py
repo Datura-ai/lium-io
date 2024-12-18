@@ -12,6 +12,7 @@ class RequestType(enum.Enum):
     MachineSpecRequest = "MachineSpecRequest"
     ExecutorSpecRequest = "ExecutorSpecRequest"
     RentedMachineRequest = "RentedMachineRequest"
+    LogStreamRequest = "LogStreamRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -61,3 +62,11 @@ class ExecutorSpecRequest(BaseValidatorRequest):
 
 class RentedMachineRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.RentedMachineRequest
+
+
+class LogStreamRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.LogStreamRequest
+    miner_hotkey: str
+    validator_hotkey: str
+    executor_uuid: str
+    logs: list[dict]

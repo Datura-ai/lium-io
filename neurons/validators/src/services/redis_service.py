@@ -5,6 +5,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 from core.config import settings
 
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
+STREAMING_LOG_CHANNEL = "channel:2"
 RENTED_MACHINE_SET = "rented_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
