@@ -1,8 +1,7 @@
-from typing import TYPE_CHECKING
 import asyncio
 import json
-import logging
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import bittensor
 import numpy as np
@@ -13,18 +12,18 @@ from bittensor.utils.weight_utils import (
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
-from core.utils import _m, get_extra_info
-from services.docker_service import DockerService, REPOSITORYS
+from core.utils import _m, get_extra_info, get_logger
+from services.docker_service import REPOSITORYS, DockerService
+from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import RedisService, EXECUTOR_COUNT_PREFIX
+from services.redis_service import EXECUTOR_COUNT_PREFIX, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
-from services.file_encrypt_service import FileEncryptService
 
 if TYPE_CHECKING:
     from bittensor_wallet import Wallet
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 SYNC_CYCLE = 12
 WEIGHT_MAX_COUNTER = 6
@@ -72,9 +71,7 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
         )
-        self.file_encrypt_service = FileEncryptService(
-            ssh_service=ssh_service
-        )
+        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
 
         # init miner_scores
         try:
@@ -86,18 +83,15 @@ class Validator:
                     await self.redis_service.clear_all_executor_counts()
                     logger.info(
                         _m(
-                            '[initiate_services] Cleared executor_counts',
+                            "[initiate_services] Cleared executor_counts",
                             extra=get_extra_info(self.default_extra),
                         ),
                     )
                 except Exception as e:
                     logger.error(
                         _m(
-                            '[initiate_services] Failed to clear executor_counts',
-                            extra=get_extra_info({
-                                **self.default_extra,
-                                "error": str(e)
-                            }),
+                            "[initiate_services] Failed to clear executor_counts",
+                            extra=get_extra_info({**self.default_extra, "error": str(e)}),
                         ),
                     )
             else:
@@ -105,7 +99,7 @@ class Validator:
                 if miner_scores_json is None:
                     logger.info(
                         _m(
-                            '[initiate_services] No data found in Redis for MINER_SCORES_KEY, initializing empty miner_scores.',
+                            "[initiate_services] No data found in Redis for MINER_SCORES_KEY, initializing empty miner_scores.",
                             extra=get_extra_info(self.default_extra),
                         ),
                     )
@@ -117,29 +111,28 @@ class Validator:
         except Exception as e:
             logger.error(
                 _m(
-                    '[initiate_services] Failed to initialize miner_scores',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "error": str(e)
-                    }),
+                    "[initiate_services] Failed to initialize miner_scores",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 ),
             )
             self.miner_scores = {}
 
         logger.info(
             _m(
-                '[initiate_services] miner scores',
-                extra=get_extra_info({
-                    **self.default_extra,
-                    **self.miner_scores,
-                }),
+                "[initiate_services] miner scores",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        **self.miner_scores,
+                    }
+                ),
             ),
         )
 
     def get_subtensor(self):
         logger.info(
             _m(
-                'Getting subtensor',
+                "Getting subtensor",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -182,25 +175,22 @@ class Validator:
                 exit()
             logger.info(
                 _m(
-                    '[check_registered] Validator is registered',
+                    "[check_registered] Validator is registered",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
         except Exception as e:
             logger.error(
                 _m(
-                    '[check_registered] Checking validator registered failed',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "error": str(e)
-                    }),
+                    "[check_registered] Checking validator registered failed",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 ),
             )
 
     def fetch_miners(self, subtensor: bittensor.subtensor):
         logger.info(
             _m(
-                '[fetch_miners] Fetching miners',
+                "[fetch_miners] Fetching miners",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -221,7 +211,7 @@ class Validator:
             ]
         logger.info(
             _m(
-                f'[fetch_miners] Found {len(miners)} miners',
+                f"[fetch_miners] Found {len(miners)} miners",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -230,18 +220,20 @@ class Validator:
     async def set_weights(self, miners, subtensor: bittensor.subtensor):
         logger.info(
             _m(
-                '[set_weights] scores',
-                extra=get_extra_info({
-                    **self.default_extra,
-                    **self.miner_scores,
-                }),
+                "[set_weights] scores",
+                extra=get_extra_info(
+                    {
+                        **self.default_extra,
+                        **self.miner_scores,
+                    }
+                ),
             ),
         )
 
         if not self.miner_scores:
             logger.info(
                 _m(
-                    '[set_weights] No miner scores available, skipping set_weights.',
+                    "[set_weights] No miner scores available, skipping set_weights.",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
@@ -255,7 +247,7 @@ class Validator:
 
         logger.info(
             _m(
-                f'[set_weights] uids: {uids} weights: {weights}',
+                f"[set_weights] uids: {uids} weights: {weights}",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -271,7 +263,7 @@ class Validator:
 
         logger.info(
             _m(
-                f'[set_weights] processed_uids: {processed_uids} processed_weights: {processed_weights}',
+                f"[set_weights] processed_uids: {processed_uids} processed_weights: {processed_weights}",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -282,7 +274,7 @@ class Validator:
 
         logger.info(
             _m(
-                f'[set_weights] uint_uids: {uint_uids} uint_weights: {uint_weights}',
+                f"[set_weights] uint_uids: {uint_uids} uint_weights: {uint_weights}",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -298,18 +290,20 @@ class Validator:
         if result is True:
             logger.info(
                 _m(
-                    '[set_weights] set weights successfully',
+                    "[set_weights] set weights successfully",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
         else:
             logger.error(
                 _m(
-                    '[set_weights] set weights failed',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "msg": msg,
-                    }),
+                    "[set_weights] set weights failed",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "msg": msg,
+                        }
+                    ),
                 ),
             )
 
@@ -320,18 +314,20 @@ class Validator:
             await self.redis_service.clear_all_executor_counts()
             logger.info(
                 _m(
-                    '[set_weights] Cleared executor_counts',
+                    "[set_weights] Cleared executor_counts",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
         except Exception as e:
             logger.error(
                 _m(
-                    '[set_weights] Failed to clear executor_counts',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "error": str(e),
-                    }),
+                    "[set_weights] Failed to clear executor_counts",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "error": str(e),
+                        }
+                    ),
                 ),
             )
 
@@ -347,11 +343,13 @@ class Validator:
         except Exception as e:
             logger.error(
                 _m(
-                    '[get_last_update] Error getting last update',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "error": str(e),
-                    }),
+                    "[get_last_update] Error getting last update",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "error": str(e),
+                        }
+                    ),
                 ),
             )
             # means that the validator is not registered yet. The validator should break if this is the case anyways
@@ -359,7 +357,7 @@ class Validator:
 
         logger.info(
             _m(
-                f'[get_last_update] last set weights successfully {last_update_blocks} blocks ago',
+                f"[get_last_update] last set weights successfully {last_update_blocks} blocks ago",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -381,27 +379,31 @@ class Validator:
 
             logger.info(
                 _m(
-                    '[should_set_weights] Checking should set weights',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "weights_rate_limit": weights_rate_limit,
-                        "tempo": tempo,
-                        "current_block": current_block,
-                        "last_update": last_update,
-                        "blocks_till_epoch": blocks_till_epoch,
-                        "should_set_weights": should_set_weights,
-                    }),
+                    "[should_set_weights] Checking should set weights",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "weights_rate_limit": weights_rate_limit,
+                            "tempo": tempo,
+                            "current_block": current_block,
+                            "last_update": last_update,
+                            "blocks_till_epoch": blocks_till_epoch,
+                            "should_set_weights": should_set_weights,
+                        }
+                    ),
                 ),
             )
             return should_set_weights
         except Exception as e:
             logger.error(
                 _m(
-                    '[should_set_weights] Checking set weights failed',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "error": str(e),
-                    }),
+                    "[should_set_weights] Checking set weights failed",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "error": str(e),
+                        }
+                    ),
                 ),
             )
             return False
@@ -419,12 +421,14 @@ class Validator:
             except Exception as e:
                 logger.error(
                     _m(
-                        '[get_time_from_block] Error getting time from block',
-                        extra=get_extra_info({
-                            **self.default_extra,
-                            "retries": retries,
-                            "error": str(e),
-                        }),
+                        "[get_time_from_block] Error getting time from block",
+                        extra=get_extra_info(
+                            {
+                                **self.default_extra,
+                                "retries": retries,
+                                "error": str(e),
+                            }
+                        ),
                     ),
                 )
                 retries += 1
@@ -435,7 +439,7 @@ class Validator:
             subtensor = self.get_subtensor()
             logger.info(
                 _m(
-                    '[sync] Syncing at subtensor',
+                    "[sync] Syncing at subtensor",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
@@ -449,11 +453,13 @@ class Validator:
             current_block = self.get_current_block(subtensor)
             logger.info(
                 _m(
-                    '[sync] Current block',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "current_block": current_block,
-                    }),
+                    "[sync] Current block",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "current_block": current_block,
+                        }
+                    ),
                 ),
             )
 
@@ -463,13 +469,15 @@ class Validator:
 
                 logger.info(
                     _m(
-                        '[sync] Send jobs to miners',
-                        extra=get_extra_info({
-                            **self.default_extra,
-                            "miners": len(miners),
-                            "current_block": current_block,
-                            "job_batch_id": job_batch_id,
-                        }),
+                        "[sync] Send jobs to miners",
+                        extra=get_extra_info(
+                            {
+                                **self.default_extra,
+                                "miners": len(miners),
+                                "current_block": current_block,
+                                "job_batch_id": job_batch_id,
+                            }
+                        ),
                     ),
                 )
 
@@ -480,10 +488,7 @@ class Validator:
                     _m(
                         "Docker Hub Digests",
                         extra=get_extra_info(
-                            {
-                                "job_batch_id": job_batch_id,
-                                "docker_hub_digests": docker_hub_digests
-                            }
+                            {"job_batch_id": job_batch_id, "docker_hub_digests": docker_hub_digests}
                         ),
                     ),
                 )
@@ -514,7 +519,7 @@ class Validator:
                         "miner_hotkey": miner.hotkey,
                         "miner_address": miner.axon_info.ip,
                         "miner_port": miner.axon_info.port,
-                        "job_batch_id": job_batch_id
+                        "job_batch_id": job_batch_id,
                     }
 
                 try:
@@ -528,11 +533,13 @@ class Validator:
                             if result:
                                 logger.info(
                                     _m(
-                                        '[sync] Job_Result',
-                                        extra=get_extra_info({
-                                            **self.default_extra,
-                                            "result": result,
-                                        }),
+                                        "[sync] Job_Result",
+                                        extra=get_extra_info(
+                                            {
+                                                **self.default_extra,
+                                                "result": result,
+                                            }
+                                        ),
                                     ),
                                 )
                                 miner_hotkey = result.get("miner_hotkey")
@@ -544,8 +551,8 @@ class Validator:
                                     executor_counts = await self.redis_service.hgetall(key)
                                     parsed_counts = [
                                         {
-                                            "job_batch_id": job_id.decode('utf-8'),
-                                            **json.loads(data.decode('utf-8')),
+                                            "job_batch_id": job_id.decode("utf-8"),
+                                            **json.loads(data.decode("utf-8")),
                                         }
                                         for job_id, data in executor_counts.items()
                                     ]
@@ -553,41 +560,51 @@ class Validator:
                                     if parsed_counts:
                                         logger.info(
                                             _m(
-                                                '[sync] executor counts list',
-                                                extra=get_extra_info({
-                                                    **self.default_extra,
-                                                    "miner_hotkey": miner_hotkey,
-                                                    "parsed_counts": parsed_counts,
-                                                }),
+                                                "[sync] executor counts list",
+                                                extra=get_extra_info(
+                                                    {
+                                                        **self.default_extra,
+                                                        "miner_hotkey": miner_hotkey,
+                                                        "parsed_counts": parsed_counts,
+                                                    }
+                                                ),
                                             ),
                                         )
 
-                                        max_executors = max(parsed_counts, key=lambda x: x['total'])['total']
-                                        min_executors = min(parsed_counts, key=lambda x: x['total'])['total']
+                                        max_executors = max(
+                                            parsed_counts, key=lambda x: x["total"]
+                                        )["total"]
+                                        min_executors = min(
+                                            parsed_counts, key=lambda x: x["total"]
+                                        )["total"]
 
                                         logger.info(
                                             _m(
-                                                '[sync] executor counts',
-                                                extra=get_extra_info({
-                                                    **self.default_extra,
-                                                    "miner_hotkey": miner_hotkey,
-                                                    "job_batch_id": job_batch_id,
-                                                    "max_executors": max_executors,
-                                                    "min_executors": min_executors,
-                                                }),
+                                                "[sync] executor counts",
+                                                extra=get_extra_info(
+                                                    {
+                                                        **self.default_extra,
+                                                        "miner_hotkey": miner_hotkey,
+                                                        "job_batch_id": job_batch_id,
+                                                        "max_executors": max_executors,
+                                                        "min_executors": min_executors,
+                                                    }
+                                                ),
                                             ),
                                         )
 
                                 except Exception as e:
                                     logger.error(
                                         _m(
-                                            '[sync] Get executor counts error',
-                                            extra=get_extra_info({
-                                                **self.default_extra,
-                                                "miner_hotkey": miner_hotkey,
-                                                "job_batch_id": job_batch_id,
-                                                "error": str(e),
-                                            }),
+                                            "[sync] Get executor counts error",
+                                            extra=get_extra_info(
+                                                {
+                                                    **self.default_extra,
+                                                    "miner_hotkey": miner_hotkey,
+                                                    "job_batch_id": job_batch_id,
+                                                    "error": str(e),
+                                                }
+                                            ),
                                         ),
                                     )
 
@@ -601,24 +618,28 @@ class Validator:
                                 job_batch_id = info.get("job_batch_id", "unknown")
                                 logger.error(
                                     _m(
-                                        '[sync] No_Job_Result',
-                                        extra=get_extra_info({
-                                            **self.default_extra,
-                                            "miner_hotkey": miner_hotkey,
-                                            "job_batch_id": job_batch_id,
-                                        }),
+                                        "[sync] No_Job_Result",
+                                        extra=get_extra_info(
+                                            {
+                                                **self.default_extra,
+                                                "miner_hotkey": miner_hotkey,
+                                                "job_batch_id": job_batch_id,
+                                            }
+                                        ),
                                     ),
                                 )
 
                         except Exception as e:
                             logger.error(
                                 _m(
-                                    '[sync] Error processing job result',
-                                    extra=get_extra_info({
-                                        **self.default_extra,
-                                        "job_batch_id": job_batch_id,
-                                        "error": str(e),
-                                    }),
+                                    "[sync] Error processing job result",
+                                    extra=get_extra_info(
+                                        {
+                                            **self.default_extra,
+                                            "job_batch_id": job_batch_id,
+                                            "error": str(e),
+                                        }
+                                    ),
                                 ),
                             )
 
@@ -631,36 +652,42 @@ class Validator:
 
                             logger.error(
                                 _m(
-                                    '[sync] Job_Timeout',
-                                    extra=get_extra_info({
-                                        **self.default_extra,
-                                        "miner_hotkey": miner_hotkey,
-                                        "job_batch_id": job_batch_id,
-                                    }),
+                                    "[sync] Job_Timeout",
+                                    extra=get_extra_info(
+                                        {
+                                            **self.default_extra,
+                                            "miner_hotkey": miner_hotkey,
+                                            "job_batch_id": job_batch_id,
+                                        }
+                                    ),
                                 ),
                             )
                             task.cancel()
 
                     logger.info(
                         _m(
-                            '[sync] All Jobs finished',
-                            extra=get_extra_info({
-                                **self.default_extra,
-                                "job_batch_id": job_batch_id,
-                                "miner_scores": self.miner_scores,
-                            }),
+                            "[sync] All Jobs finished",
+                            extra=get_extra_info(
+                                {
+                                    **self.default_extra,
+                                    "job_batch_id": job_batch_id,
+                                    "miner_scores": self.miner_scores,
+                                }
+                            ),
                         ),
                     )
 
                 except Exception as e:
                     logger.error(
                         _m(
-                            '[sync] Unexpected error',
-                            extra=get_extra_info({
-                                **self.default_extra,
-                                "job_batch_id": job_batch_id,
-                                "error": str(e),
-                            }),
+                            "[sync] Unexpected error",
+                            extra=get_extra_info(
+                                {
+                                    **self.default_extra,
+                                    "job_batch_id": job_batch_id,
+                                    "error": str(e),
+                                }
+                            ),
                         ),
                     )
             else:
@@ -670,30 +697,34 @@ class Validator:
 
                 logger.info(
                     _m(
-                        '[sync] Remaining blocks for next job',
-                        extra=get_extra_info({
-                            **self.default_extra,
-                            "remaining_blocks": remaining_blocks,
-                            "last_job_run_blocks": self.last_job_run_blocks,
-                            "current_block": current_block,
-                        }),
+                        "[sync] Remaining blocks for next job",
+                        extra=get_extra_info(
+                            {
+                                **self.default_extra,
+                                "remaining_blocks": remaining_blocks,
+                                "last_job_run_blocks": self.last_job_run_blocks,
+                                "current_block": current_block,
+                            }
+                        ),
                     ),
                 )
         except Exception as e:
             logger.error(
                 _m(
-                    '[sync] Unknown error',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "error": str(e),
-                    }),
+                    "[sync] Unknown error",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "error": str(e),
+                        }
+                    ),
                 ),
             )
 
     async def start(self):
         logger.info(
             _m(
-                '[start] Starting Validator in background',
+                "[start] Starting Validator in background",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -707,7 +738,7 @@ class Validator:
         except KeyboardInterrupt:
             logger.info(
                 _m(
-                    '[start] Validator killed by keyboard interrupt',
+                    "[start] Validator killed by keyboard interrupt",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
@@ -715,18 +746,15 @@ class Validator:
         except Exception as e:
             logger.info(
                 _m(
-                    '[start] Unknown error',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "error": str(e)
-                    }),
+                    "[start] Unknown error",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 ),
             )
 
     async def stop(self):
         logger.info(
             _m(
-                '[stop] Stopping Validator process',
+                "[stop] Stopping Validator process",
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -736,11 +764,8 @@ class Validator:
         except Exception as e:
             logger.info(
                 _m(
-                    '[stop] Failed to save miner_scores',
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "error": str(e)
-                    }),
+                    "[stop] Failed to save miner_scores",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 ),
             )
 
