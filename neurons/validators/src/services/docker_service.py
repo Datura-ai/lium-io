@@ -30,7 +30,7 @@ from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
 
-REPOSITORYS = [
+REPOSITORIES = [
     "daturaai/compute-subnet-executor:latest",
     "daturaai/compute-subnet-executor-runner:latest",
     "containrrr/watchtower:1.7.1",
@@ -296,10 +296,14 @@ class DockerService:
                 )
 
                 # Prepare extra options
-                sanitized_volumes = [volume for volume in custom_options.volumes if volume.strip()]
+                sanitized_volumes = [
+                    volume for volume
+                    in (custom_options.volumes if custom_options and custom_options.volumes else [])
+                    if volume.strip()
+                ]
                 volume_flags = (
                     " ".join([f"-v {volume}" for volume in sanitized_volumes])
-                    if custom_options and custom_options.volumes
+                    if sanitized_volumes
                     else ""
                 )
                 entrypoint_flag = (
