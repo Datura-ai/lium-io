@@ -1,3 +1,4 @@
+from typing import TYPE_CHECKING
 import logging
 import traceback
 import asyncio
@@ -5,7 +6,11 @@ import bittensor
 
 from core.config import settings
 from core.db import get_db
+from core.utils import _m, get_extra_info
 from daos.validator import ValidatorDao, Validator
+
+if TYPE_CHECKING:
+    from bittensor_wallet import Wallet
 
 logger = logging.getLogger(__name__)
 
@@ -13,8 +18,9 @@ MIN_STAKE = 10
 VALIDATORS_LIMIT = 24
 SYNC_CYCLE = 2 * 60
 
+
 class Miner:
-    wallet: bittensor.wallet
+    wallet: "Wallet"
     subtensor: bittensor.subtensor
     netuid: int
 
@@ -30,29 +36,98 @@ class Miner:
             port=settings.INTERNAL_PORT,
             ip=settings.EXTERNAL_IP_ADDRESS,
         )
-        
+
         self.should_exit = False
         self.session = next(get_db())
         self.validator_dao = ValidatorDao(session=self.session)
-        
+        self.last_announced_block = 0
+
+        self.default_extra = {
+            "external_port": settings.EXTERNAL_PORT,
+            "external_ip": settings.EXTERNAL_IP_ADDRESS,
+        }
+
     def get_subtensor(self):
+        logger.info(
+            _m(
+                'Getting subtensor',
+                extra=get_extra_info(self.default_extra),
+            ),
+        )
         return bittensor.subtensor(config=self.config)
 
+    def get_metagraph(self, subtensor: bittensor.subtensor):
+        return subtensor.metagraph(netuid=self.netuid)
+
+    def get_node(self, subtensor: bittensor.subtensor):
+        return subtensor.substrate
+
+    def get_my_uid(self, subtensor: bittensor.subtensor):
+        metagraph = self.get_metagraph(subtensor)
+        return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+
+    def get_current_block(self, subtensor: bittensor.subtensor):
+        node = self.get_node(subtensor)
+        return node.query("System", "Number", []).value
+
+    def get_tempo(self, subtensor: bittensor.subtensor):
+        return subtensor.tempo(self.netuid)
+
     async def check_registered(self, subtensor: bittensor.subtensor):
-        bittensor.logging.info('checking miner is registered')
-        if not subtensor.is_hotkey_registered(
-            netuid=self.netuid,
-            hotkey_ss58=self.wallet.get_hotkey().ss58_address,
-        ):
-            bittensor.logging.error(
-                f"Wallet: {self.wallet} is not registered on netuid {self.netuid}."
-                f" Please register the hotkey using `btcli subnets register` before trying again"
+        try:
+            logger.info(
+                _m(
+                    '[check_registered] checking miner is registered',
+                    extra=get_extra_info(self.default_extra),
+                ),
             )
-            exit()
+            if not subtensor.is_hotkey_registered(
+                netuid=self.netuid,
+                hotkey_ss58=self.wallet.get_hotkey().ss58_address,
+            ):
+                logger.error(
+                    _m(
+                        f"[check_registered] Wallet: {self.wallet} is not registered on netuid {self.netuid}.",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+                exit()
+        except Exception as e:
+            logger.error(
+                _m(
+                    '[check_registered] Checking miner registered failed',
+                    extra=get_extra_info({
+                        **self.default_extra,
+                        "error": str(e)
+                    }),
+                ),
+            )
 
     async def announce(self, subtensor: bittensor.subtensor):
-        bittensor.logging.info('Announce miner')
-        self.axon.serve(netuid=self.netuid, subtensor=subtensor)
+        try:
+            current_block = self.get_current_block(subtensor)
+            tempo = self.get_tempo(subtensor)
+
+            if current_block - self.last_announced_block >= tempo:
+                self.last_announced_block = current_block
+
+                logger.info(
+                    _m(
+                        '[announce] Announce miner',
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+                self.axon.serve(netuid=self.netuid, subtensor=subtensor)
+        except Exception as e:
+            logger.error(
+                _m(
+                    '[announce] Annoucing miner error',
+                    extra=get_extra_info({
+                        **self.default_extra,
+                        "error": str(e)
+                    }),
+                ),
+            )
 
     async def fetch_validators(self, subtensor: bittensor.subtensor):
         metagraph = subtensor.metagraph(netuid=self.netuid)
@@ -60,7 +135,12 @@ class Miner:
         return neurons[:VALIDATORS_LIMIT]
 
     async def save_validators(self, validators):
-        bittensor.logging.info('Sync validators')
+        logger.info(
+            _m(
+                '[save_validators] Sync validators',
+                extra=get_extra_info(self.default_extra),
+            ),
+        )
         for v in validators:
             existing = self.validator_dao.get_validator_by_hotkey(v.hotkey)
             if not existing:
@@ -72,20 +152,36 @@ class Miner:
                 )
 
     async def sync(self):
-        subtensor = self.get_subtensor()
-        
-        await self.check_registered(subtensor)
-        await self.announce(subtensor)
-        
-        validators = await self.fetch_validators(subtensor)
-        await self.save_validators(validators)
+        try:
+            subtensor = self.get_subtensor()
+
+            await self.check_registered(subtensor)
+            await self.announce(subtensor)
+
+            validators = await self.fetch_validators(subtensor)
+            await self.save_validators(validators)
+        except Exception as e:
+            logger.error(
+                _m(
+                    '[sync] Miner sync failed',
+                    extra=get_extra_info({
+                        **self.default_extra,
+                        "error": str(e)
+                    }),
+                ),
+            )
 
     async def start(self):
-        bittensor.logging.info('Start Miner in background')
+        logger.info(
+            _m(
+                'Start Miner in background',
+                extra=get_extra_info(self.default_extra),
+            ),
+        )
         try:
             while not self.should_exit:
                 await self.sync()
-                
+
                 # sync every 2 mins
                 await asyncio.sleep(SYNC_CYCLE)
         except KeyboardInterrupt:
@@ -95,5 +191,10 @@ class Miner:
             logger.error(traceback.format_exc())
 
     async def stop(self):
-        bittensor.logging.info('Stop Miner process')
+        logger.info(
+            _m(
+                'Stop Miner process',
+                extra=get_extra_info(self.default_extra),
+            ),
+        )
         self.should_exit = True

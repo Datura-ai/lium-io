@@ -8,6 +8,7 @@ import pydantic
 import redis.asyncio as aioredis
 import tenacity
 import websockets
+from websockets.asyncio.client import ClientConnection
 from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
@@ -18,8 +19,8 @@ from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, 
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     ExecutorSpecRequest,
-    RentedMachineRequest,
     LogStreamRequest,
+    RentedMachineRequest,
 )
 from pydantic import BaseModel
 
@@ -48,7 +49,7 @@ class ComputeClient:
         self, keypair: bittensor.Keypair, compute_app_uri: str, miner_service: MinerService
     ):
         self.keypair = keypair
-        self.ws: websockets.WebSocketClientProtocol | None = None
+        self.ws: ClientConnection | None = None
         self.compute_app_uri = compute_app_uri
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
@@ -162,7 +163,7 @@ class ComputeClient:
                 )
             )
 
-    async def handle_connection(self, ws: websockets.WebSocketClientProtocol):
+    async def handle_connection(self, ws: ClientConnection):
         """handle a single websocket connection"""
         await ws.send(AuthenticateRequest.from_keypair(self.keypair).model_dump_json())
 
@@ -281,7 +282,7 @@ class ComputeClient:
                 )
 
     async def wait_for_log_streams(self, channel: aioredis.client.PubSub):
-        logs_queue = []
+        logs_queue: list[LogStreamRequest] = []
         while True:
             validator_hotkey = self.my_hotkey()
             logger.info(
@@ -314,17 +315,18 @@ class ComputeClient:
 
                     logger.info(
                         _m(
-                            f'Successfully sent {len(msg["logs"])} logs',
+                            f'Successfully created LogStreamRequest instance with {len(msg["logs"])} logs',
                             extra=self.logging_extra,
                         )
                     )
                 except Exception as exc:
                     logger.error(
                         _m(
-                            msg,
+                            "Failed to get LogStreamRequest instance",
                             extra={
                                 **self.logging_extra,
                                 "error": str(exc),
+                                "msg": str(msg),
                             },
                         )
                     )
@@ -426,7 +428,7 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Rented machines",
-                    extra={**self.logging_extra, "machines": raw_msg},
+                    extra={**self.logging_extra, "machines": len(response.machines)},
                 )
             )
 
