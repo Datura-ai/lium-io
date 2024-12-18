@@ -15,7 +15,7 @@ from payload_models.payloads import (
     FailedContainerRequest,
     ContainerStartRequest,
     ContainerStopRequest,
-    ContainerRequestType,
+    ContainerBaseRequest,
 )
 from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
@@ -25,6 +25,7 @@ from protocol.vc_protocol.validator_requests import (
     RentedMachineRequest,
 )
 from pydantic import BaseModel
+from datura.requests.base import BaseRequest
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.utils import _m, get_extra_info
@@ -65,7 +66,9 @@ class ComputeClient:
                 "compute_app_uri": compute_app_uri,
             }
         )
-
+    def accepted_request_type(self) -> type[BaseRequest]:
+        return ContainerBaseRequest
+    
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
         logger.info(
@@ -470,35 +473,20 @@ class ComputeClient:
             await self.miner_drivers.put(task)
             return
 
-        if ContainerRequestType(json.loads(raw_msg).get('message_type')) == ContainerRequestType.ContainerStartRequest:
-            try:
-                job_request = pydantic.TypeAdapter(ContainerStartRequest).validate_json(raw_msg)
-            except pydantic.ValidationError as exc:
-                logger.error(
-                    _m(
-                        "could not parse raw message as ContainerStartRequest",
-                        extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
-                    )
+        try:
+            msg = self.accepted_request_type().parse(raw_msg)
+        except Exception as ex:
+            error_msg = f"could not parse raw message as {str(ex)}"
+            logger.error(
+                _m(
+                    error_msg,
+                    extra=get_extra_info({**self.logging_extra, "error": str(ex)}),
                 )
-            else:
-                task = asyncio.create_task(self.miner_driver(job_request))
-                await self.miner_drivers.put(task)
-                return
-
-        elif ContainerRequestType(json.loads(raw_msg).get('message_type')) == ContainerRequestType.ContainerStopRequest:
-            try:
-                job_request = pydantic.TypeAdapter(ContainerStopRequest).validate_json(raw_msg)
-            except pydantic.ValidationError as exc:
-                logger.error(
-                    _m(
-                        "could not parse raw message as ContainerStopRequest",
-                        extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
-                    )
-                )
-            else:
-                task = asyncio.create_task(self.miner_driver(job_request))
-                await self.miner_drivers.put(task)
-                return           
+            )
+        else:
+            task = asyncio.create_task(self.miner_driver(msg))
+            await self.miner_drivers.put(task)
+            return
         # logger.error("unsupported message received from facilitator: %s", raw_msg)
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
