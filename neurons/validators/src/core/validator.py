@@ -14,7 +14,7 @@ from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.docker_service import DockerService, REPOSITORYS
+from services.docker_service import DockerService, REPOSITORIES
 from services.miner_service import MinerService
 from services.redis_service import RedisService, EXECUTOR_COUNT_PREFIX
 from services.ssh_service import SSHService
@@ -475,7 +475,7 @@ class Validator:
 
                 self.last_job_run_blocks = current_block
 
-                docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORYS)
+                docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORIES)
                 logger.info(
                     _m(
                         "Docker Hub Digests",
