@@ -8,7 +8,6 @@ import pydantic
 import redis.asyncio as aioredis
 import tenacity
 import websockets
-from websockets.asyncio.client import ClientConnection
 from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
@@ -26,6 +25,7 @@ from protocol.vc_protocol.validator_requests import (
     RentedMachineRequest,
 )
 from pydantic import BaseModel
+from websockets.asyncio.client import ClientConnection
 from datura.requests.base import BaseRequest
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
@@ -204,7 +204,7 @@ class ComputeClient:
                 logger.info(
                     _m(
                         "Received machine specs from validator app.",
-                        extra={**self.logging_extra, "msg": str(msg)},
+                        extra={**self.logging_extra},
                     )
                 )
 
