@@ -447,45 +447,17 @@ class ComputeClient:
             return
 
         try:
-            job_request = pydantic.TypeAdapter(ContainerCreateRequest).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            logger.error(
-                _m(
-                    "could not parse raw message as ContainerCreateRequest",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
-                )
-            )
-        else:
-            task = asyncio.create_task(self.miner_driver(job_request))
-            await self.miner_drivers.put(task)
-            return
-
-        try:
-            job_request = pydantic.TypeAdapter(ContainerDeleteRequest).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            logger.error(
-                _m(
-                    "could not parse raw message as ContainerDeleteRequest",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
-                )
-            )
-        else:
-            task = asyncio.create_task(self.miner_driver(job_request))
-            await self.miner_drivers.put(task)
-            return
-
-        try:
-            msg = self.accepted_request_type().parse(raw_msg)
+            job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = f"could not parse raw message as {str(ex)}"
             logger.error(
                 _m(
                     error_msg,
-                    extra=get_extra_info({**self.logging_extra, "error": str(ex)}),
+                    extra={**self.logging_extra, "error": str(ex), "raw_msg": raw_msg},
                 )
             )
         else:
-            task = asyncio.create_task(self.miner_driver(msg))
+            task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
         # logger.error("unsupported message received from facilitator: %s", raw_msg)
