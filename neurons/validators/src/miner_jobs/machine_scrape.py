@@ -569,6 +569,8 @@ def get_docker_info(content: bytes):
 
             if digest:
                 containers.append({'id': container_id, 'digest': digest})
+            else:
+                containers.append({'id': container_id, 'digest': ''})
 
         data["containers"] = containers
 
