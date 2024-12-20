@@ -24,6 +24,7 @@ from services.const import (
     UNRENTED_MULTIPLIER,
     HASHCAT_CONFIGS,
     LIB_NVIDIA_ML_DIGESTS,
+    DOCKER_DIGESTS,
 )
 from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORT_MAPS_PREFIX
 from services.ssh_service import SSHService
@@ -71,45 +72,22 @@ class TaskService:
                 # Await all upload tasks for the current directory
                 await asyncio.gather(*upload_tasks)
 
-    def check_digests(self, result, list_digests):
-        # Check if each digest exists in list_digests
-        digests_in_list = {}
-        each_digests = result['all_container_digests']
-        for each_digest in each_digests:
-            digest = each_digest['digest']
-            digests_in_list[digest] = digest in list_digests.values()
-
-        return digests_in_list
-
-    def check_duplidate_digests(self, result):
-        # Find duplicate digests in results
-        digest_count = {}
-        all_container_digests = result.get('all_container_digests', [])
-        for container_digest in all_container_digests:
-            digest = container_digest['digest']
-            if digest in digest_count:
-                digest_count[digest] += 1
-            else:
-                digest_count[digest] = 1
-
-        duplicates = {digest: count for digest, count in digest_count.items() if count > 1}
-        return duplicates
-
-    def check_empty_digests(self, result):
-        # Find empty digests in results
-        all_container_digests = result.get('all_container_digests', [])
-        return len(all_container_digests) == 0
-
-    def validate_digests(self, digests_in_list, duplicates, digests_empty):
-        # Check if any digest in digests_in_list is False
-        if any(not is_in_list for is_in_list in digests_in_list.values()):
+    def validate_digests(self, docker_digests, docker_hub_digests):
+        # Check if the list is empty
+        if not docker_digests:
             return False
 
-        if duplicates:
+        # Get unique digests
+        unique_digests = list({item['digest'] for item in docker_digests})
+
+        # Check for duplicates
+        if len(unique_digests) != len(docker_digests):
             return False
 
-        if digests_empty:
-            return False
+        # Check if any digest is invalid
+        for digest in unique_digests:
+            if digest not in docker_hub_digests.values():
+                return False
 
         return True
 
@@ -365,6 +343,10 @@ class TaskService:
                 nvidia_driver = machine_spec.get("gpu", {}).get("driver", '')
                 libnvidia_ml = machine_spec.get('md5_checksums', {}).get('libnvidia_ml', '')
 
+                docker_version = machine_spec.get("docker", {}).get("version", '')
+                docker_digest = machine_spec.get('md5_checksums', {}).get('docker', '')
+                container_id = machine_spec.get('docker', {}).get('container_id', '')
+
                 logger.info(
                     _m(
                         "Machine spec scraped",
@@ -441,6 +423,31 @@ class TaskService:
                         log_text,
                     )
 
+                if not docker_version or DOCKER_DIGESTS.get(docker_version) != docker_digest:
+                    log_status = "warning"
+                    log_text = _m(
+                        f"Docker is altered",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "docker_version": docker_version,
+                            "docker_digest": docker_digest,
+                            "container_id": container_id,
+                        }),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+                    
                 if nvidia_driver and LIB_NVIDIA_ML_DIGESTS.get(nvidia_driver) != libnvidia_ml:
                     log_status = "warning"
                     log_text = _m(
@@ -500,17 +507,14 @@ class TaskService:
                     )
                 else:
                     # if not rented, check docker digests
-                    digests_in_list = self.check_digests(machine_spec, docker_hub_digests)
-                    duplicates = self.check_duplidate_digests(machine_spec)
-                    digests_empty = self.check_empty_digests(machine_spec)  # True: docker image empty, False: docker image not empty
-                    # Validate digests
-                    self.is_valid = self.validate_digests(digests_in_list, duplicates, digests_empty)
+                    docker_digests = machine_spec.get("docker", {}).get("containers", [])
+                    self.is_valid = self.validate_digests(docker_digests, docker_hub_digests)
                     if not self.is_valid:
                         log_text = _m(
                             "Docker digests are not valid",
                             extra=get_extra_info({
                                 **default_extra,
-                                "docker_digests": machine_spec.get('all_container_digests', [])
+                                "docker_digests": docker_digests
                             }),
                         )
                         log_status = "error"
