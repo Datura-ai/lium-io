@@ -344,7 +344,8 @@ class TaskService:
                 libnvidia_ml = machine_spec.get('md5_checksums', {}).get('libnvidia_ml', '')
 
                 docker_version = machine_spec.get("docker", {}).get("version", '')
-                docker_checksum = machine_spec.get('md5_checksums', {}).get('docker', '')
+                docker_digest = machine_spec.get('md5_checksums', {}).get('docker', '')
+                container_id = machine_spec.get('docker', {}).get('container_id', '')
 
                 logger.info(
                     _m(
@@ -422,6 +423,31 @@ class TaskService:
                         log_text,
                     )
 
+                if not docker_version or DOCKER_DIGESTS.get(docker_version) != docker_digest:
+                    log_status = "warning"
+                    log_text = _m(
+                        f"Docker is altered",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "docker_version": docker_version,
+                            "docker_digest": docker_digest,
+                            "container_id": container_id,
+                        }),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+                    
                 if nvidia_driver and LIB_NVIDIA_ML_DIGESTS.get(nvidia_driver) != libnvidia_ml:
                     log_status = "warning"
                     log_text = _m(

@@ -536,6 +536,7 @@ def get_network_speed():
 def get_docker_info(content: bytes):
     data = {
         "version": "",
+        "container_id": "",
         "containers": []
     }
 
@@ -549,7 +550,7 @@ def get_docker_info(content: bytes):
         result = run_cmd(f'{docker_path} version --format "{{{{.Client.Version}}}}"')
         data["version"] = result.strip()
 
-        result = run_cmd(f'{docker_path} ps --format "{{{{.ID}}}}"')
+        result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
 
         containers = []
@@ -566,6 +567,8 @@ def get_docker_info(content: bytes):
             digest = None
             if repo_digests:
                 digest = repo_digests[0].split('@')[1]
+                if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
+                    data["container_id"] = container_id
 
             if digest:
                 containers.append({'id': container_id, 'digest': digest})
