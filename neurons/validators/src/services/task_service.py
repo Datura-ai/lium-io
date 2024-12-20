@@ -180,6 +180,8 @@ class TaskService:
         }
         context.set(f"[_docker_connection_check][{executor_name}]")
 
+        container_name = f"container_{miner_hotkey}"
+
         try:
             log_text = _m(
                 "Creating docker container",
@@ -188,7 +190,6 @@ class TaskService:
             log_status = "info"
             logger.info(log_text)
 
-            container_name = f"container_{miner_hotkey}"
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
             command = f"docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
@@ -201,9 +202,15 @@ class TaskService:
                 log_status = "error"
                 logger.error(log_text, exc_info=True)
 
+                try:
+                    command = f"docker rm {container_name} -f"
+                    await ssh_client.run(command, timeout=20)
+                except:
+                    pass
+
                 return False, log_text, log_status
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
@@ -247,7 +254,7 @@ class TaskService:
             logger.error(log_text, exc_info=True)
 
             try:
-                command = f"docker container stop {container_name} && docker container prune -f"
+                command = f"docker rm {container_name} -f"
                 await ssh_client.run(command, timeout=20)
             except:
                 pass
@@ -447,7 +454,7 @@ class TaskService:
                         log_status,
                         log_text,
                     )
-                    
+
                 if nvidia_driver and LIB_NVIDIA_ML_DIGESTS.get(nvidia_driver) != libnvidia_ml:
                     log_status = "warning"
                     log_text = _m(
