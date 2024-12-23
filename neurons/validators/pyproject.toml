@@ -20,7 +20,7 @@ dependencies = [
     "attrs==24.3.0",
     "backoff==2.2.1",
     "base58==2.1.1",
-    "bittensor==8.5.0",
+    "bittensor==8.5.1",
     "bittensor-cli==8.4.2",
     "bittensor-commit-reveal==0.1.0",
     "bittensor-wallet==2.1.3",
