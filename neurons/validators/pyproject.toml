@@ -20,7 +20,7 @@ dependencies = [
     "attrs==24.3.0",
     "backoff==2.2.1",
     "base58==2.1.1",
-    "bittensor==8.5.0",
+    "bittensor==8.5.1",
     "bittensor-cli==8.4.2",
     "bittensor-commit-reveal==0.1.0",
     "bittensor-wallet==2.1.3",
@@ -35,7 +35,6 @@ dependencies = [
     "databases==0.9.0",
     "datura @ file:///${PROJECT_ROOT}/../../datura",
     "decorator==5.1.1",
-    "docker==7.1.0",
     "ecdsa==0.19.0",
     "eth-hash==0.7.0",
     "eth-keys==0.6.0",
@@ -119,6 +118,7 @@ dependencies = [
     "wheel==0.45.1",
     "xxhash==3.5.0",
     "yarl==1.18.3",
+    "httpx>=0.28.1",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"

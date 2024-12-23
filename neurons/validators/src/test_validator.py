@@ -1,4 +1,7 @@
 import asyncio
+import bittensor
+
+from core.config import settings
 from fastapi.testclient import TestClient
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.docker_service import DockerService
@@ -41,3 +44,14 @@ async def check_docker_port_mappings():
 if __name__ == "__main__":
     # test_socket_connections()
     asyncio.run(check_docker_port_mappings())
+
+    config = settings.get_bittensor_config()
+    subtensor = bittensor.subtensor(config=config)
+    node = subtensor.substrate
+
+    netuid = settings.BITTENSOR_NETUID
+    tempo = subtensor.tempo(netuid)
+    weights_rate_limit = node.query("SubtensorModule", "WeightsSetRateLimit", [netuid]).value
+    server_rate_limit = node.query("SubtensorModule", "WeightsSetRateLimit", [netuid]).value
+    serving_rate_limit = node.query("SubtensorModule", "ServingRateLimit", [netuid]).value
+    print('rate limit ===>', tempo, weights_rate_limit, serving_rate_limit)
