@@ -2,6 +2,7 @@ MIN_JOB_TAKEN_TIME = 20
 
 GPU_MAX_SCORES = {
     # Latest Gen NVIDIA GPUs (Averaged if applicable)
+    "NVIDIA H200": 4.65,
     "NVIDIA H100 80GB HBM3": 3.49,
     "NVIDIA H100 NVL": 2.79,
     "NVIDIA H100 PCIe": 2.69,
@@ -281,6 +282,19 @@ HASHCAT_CONFIGS = {
             12.915648317337036,
             16.706109033312117,
             17.858580154180526,
+        ],
+    },
+    "NVIDIA H200": {
+        "digits": 11,
+        "average_time": [
+            13.78846188,
+            13.20821786,
+            14.69337816,
+            17.86422935,
+            19.47975516,
+            21.64789315,
+            22.24125861,
+            25.43047319,
         ],
     },
 }
