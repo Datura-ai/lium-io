@@ -586,7 +586,7 @@ class TaskService:
                     )
 
                 num_digits = hashcat_config.get('digits', 11)
-                avg_job_time = hashcat_config.get("average_time")[gpu_count - 1] if hashcat_config.get("average_time") else 60
+                avg_job_time = hashcat_config.get("average_time")[gpu_count - 1 if gpu_count <= 8 else 7] if hashcat_config.get("average_time") else 60
                 hash_service = HashService.generate(
                     gpu_count=gpu_count,
                     num_digits=num_digits,
