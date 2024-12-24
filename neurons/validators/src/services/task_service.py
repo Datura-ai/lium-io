@@ -29,6 +29,7 @@ from services.const import (
 from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORT_MAPS_PREFIX
 from services.ssh_service import SSHService
 from services.hash_service import HashService
+from services.file_encrypt_service import FileEncryptService
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class TaskService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.is_valid = True
+        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
 
     async def upload_directory(
         self,
@@ -302,6 +304,7 @@ class TaskService:
 
                 remote_machine_scrape_file_path = f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
                 remote_score_file_path = f"{remote_dir}/{encypted_files.score_file_name}"
+                remote_check_monistoring_script_path = self.file_encrypt_service.ecrypt_generate_signature(f"{executor_info.uuid}|{executor_info.address}|{executor_info.port}") 
 
                 logger.info(
                     _m(
@@ -713,6 +716,14 @@ class TaskService:
                         "SSH connection closed for executor",
                         extra=get_extra_info(default_extra),
                     ),
+                )
+
+    
+                result, _ = await self._run_task(
+                    ssh_client=ssh_client,
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_info=executor_info,
+                    command=f"chmod +x {remote_check_monistoring_script_path} && {remote_check_monistoring_script_path}"
                 )
 
                 await self.clear_remote_directory(ssh_client, remote_dir)

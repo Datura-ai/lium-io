@@ -10,6 +10,7 @@ from fastapi import Depends
 from services.ssh_service import SSHService
 
 from payload_models.payloads import MinerJobEnryptedFiles
+from core.config import settings
 
 
 class FileEncryptService:
@@ -18,6 +19,7 @@ class FileEncryptService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
     ):
         self.ssh_service = ssh_service
+        self.wallet = settings.get_bittensor_wallet()
 
     def make_obfuscated_file(self, tmp_directory: str, file_path: str):
         subprocess.run(
@@ -81,3 +83,22 @@ class FileEncryptService:
             machine_scrape_file_name=machine_scrape_file_name,
             score_file_name=score_file_name,
         )
+        
+    def ecrypt_generate_signature(self, message: str):
+        tmp_directory = Path(__file__).parent / "temp"
+        if tmp_directory.exists() and tmp_directory.is_dir():
+            shutil.rmtree(tmp_directory)
+        # generate signature
+        private_key, public_key = self.ssh_service.generate_ssh_key(self.wallet.get_hotkey().ss58_address)
+        check_monitoring_script_path = str(Path(__file__).parent / ".." / "miner_jobs/check_monitoring_script.py")
+        with open(check_monitoring_script_path, 'r') as file:
+            content = file.read()
+        modified_content = content.replace('private_key', private_key)
+        modified_content = modified_content.replace('message', message)
+        with tempfile.NamedTemporaryFile(delete=True, suffix='.py') as check_monitoring_script:
+            check_monitoring_script.write(modified_content.encode('utf-8'))
+            check_monitoring_script.flush()
+            os.fsync(check_monitoring_script.fileno())
+            check_monitoring_script_name = self.make_binary_file(str(tmp_directory), check_monitoring_script.name)
+
+        return check_monitoring_script_name
