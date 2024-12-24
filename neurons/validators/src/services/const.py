@@ -2,6 +2,7 @@ MIN_JOB_TAKEN_TIME = 20
 
 GPU_MAX_SCORES = {
     # Latest Gen NVIDIA GPUs (Averaged if applicable)
+    "NVIDIA H200": 4.65,
     "NVIDIA H100 80GB HBM3": 3.49,
     "NVIDIA H100 NVL": 2.79,
     "NVIDIA H100 PCIe": 2.69,
@@ -283,6 +284,19 @@ HASHCAT_CONFIGS = {
             17.858580154180526,
         ],
     },
+    "NVIDIA H200": {
+        "digits": 11,
+        "average_time": [
+            13.78846188,
+            13.20821786,
+            14.69337816,
+            17.86422935,
+            19.47975516,
+            21.64789315,
+            22.24125861,
+            25.43047319,
+        ],
+    },
 }
 
 LIB_NVIDIA_ML_DIGESTS = {
@@ -305,4 +319,9 @@ LIB_NVIDIA_ML_DIGESTS = {
     "560.35.05": "1eec299b50e33a6cfa5155ded53495ab",
     "565.57.01": "c801dd3fc4660f3a8ddf977cfdffe113",
     "550.127.08": "ac925f2cd192ad971c5466d55945a243",
+}
+
+DOCKER_DIGESTS = {
+    "26.1.3": "52d8fcc2c4370bf324cdf17cbc586784",
+    "27.3.1": "40f1f7724fa0432ea6878692a05b998c",
 }

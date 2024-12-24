@@ -9,6 +9,7 @@ from bittensor.utils.weight_utils import (
     convert_weights_and_uids_for_emit,
     process_weights_for_netuid,
 )
+from websockets.protocol import State as WebSocketClientState
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
@@ -33,6 +34,7 @@ MINER_SCORES_KEY = "miner_scores"
 class Validator:
     wallet: "Wallet"
     netuid: int
+    subtensor: bittensor.Subtensor
 
     def __init__(self, debug_miner=None):
         self.config = settings.get_bittensor_config()
@@ -45,17 +47,15 @@ class Validator:
         self.last_job_run_blocks = 0
         self.default_extra = {}
 
-        subtensor = self.get_subtensor()
-
-        # check registered
-        self.check_registered(subtensor)
+        self.subtensor = None
+        self.set_subtensor()
 
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.initiate_services(subtensor))
+        loop.run_until_complete(self.initiate_services())
 
         self.debug_miner = debug_miner
 
-    async def initiate_services(self, subtensor: bittensor.subtensor):
+    async def initiate_services(self):
         ssh_service = SSHService()
         self.redis_service = RedisService()
         task_service = TaskService(
@@ -75,7 +75,7 @@ class Validator:
 
         # init miner_scores
         try:
-            if await self.should_set_weights(subtensor):
+            if await self.should_set_weights():
                 self.miner_scores = {}
 
                 # clear executor_counts
@@ -129,36 +129,38 @@ class Validator:
             ),
         )
 
-    def get_subtensor(self):
-        logger.info(
-            _m(
-                "Getting subtensor",
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
-        return bittensor.subtensor(config=self.config)
+    def set_subtensor(self):
+        try:
+            if (
+                self.subtensor
+                and self.subtensor.substrate
+                and self.subtensor.substrate.websocket
+                and self.subtensor.substrate.websocket.state is WebSocketClientState.OPEN
+            ):
+                return
 
-    def get_metagraph(self, subtensor: bittensor.subtensor):
-        return subtensor.metagraph(netuid=self.netuid)
+            logger.info(
+                _m(
+                    "Getting subtensor",
+                    extra=get_extra_info(self.default_extra),
+                ),
+            )
+            subtensor = bittensor.subtensor(config=self.config)
 
-    def get_node(self, subtensor: bittensor.subtensor):
-        # return SubstrateInterface(url=self.config.subtensor.chain_endpoint)
-        return subtensor.substrate
+            # check registered
+            self.check_registered(subtensor)
 
-    def get_current_block(self, subtensor: bittensor.subtensor):
-        node = self.get_node(subtensor)
-        return node.query("System", "Number", []).value
-
-    def get_weights_rate_limit(self, subtensor: bittensor.subtensor):
-        node = self.get_node(subtensor)
-        return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
-
-    def get_my_uid(self, subtensor: bittensor.subtensor):
-        metagraph = self.get_metagraph(subtensor)
-        return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
-
-    def get_tempo(self, subtensor: bittensor.subtensor):
-        return subtensor.tempo(self.netuid)
+            self.subtensor = subtensor
+        except Exception as e:
+            logger.info(
+                _m(
+                    "[Error] Getting subtensor",
+                    extra=get_extra_info({
+                        ** self.default_extra,
+                        "error": str(e),
+                    }),
+                ),
+            )
 
     def check_registered(self, subtensor: bittensor.subtensor):
         try:
@@ -187,7 +189,29 @@ class Validator:
                 ),
             )
 
-    def fetch_miners(self, subtensor: bittensor.subtensor):
+    def get_metagraph(self):
+        return self.subtensor.metagraph(netuid=self.netuid)
+
+    def get_node(self):
+        # return SubstrateInterface(url=self.config.subtensor.chain_endpoint)
+        return self.subtensor.substrate
+
+    def get_current_block(self):
+        node = self.get_node()
+        return node.query("System", "Number", []).value
+
+    def get_weights_rate_limit(self):
+        node = self.get_node()
+        return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
+
+    def get_my_uid(self):
+        metagraph = self.get_metagraph()
+        return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+
+    def get_tempo(self):
+        return self.subtensor.tempo(self.netuid)
+
+    def fetch_miners(self):
         logger.info(
             _m(
                 "[fetch_miners] Fetching miners",
@@ -198,7 +222,7 @@ class Validator:
         if self.debug_miner:
             miners = [self.debug_miner]
         else:
-            metagraph = self.get_metagraph(subtensor)
+            metagraph = self.get_metagraph()
             miners = [
                 neuron
                 for neuron in metagraph.neurons
@@ -217,7 +241,7 @@ class Validator:
         )
         return miners
 
-    async def set_weights(self, miners, subtensor: bittensor.subtensor):
+    async def set_weights(self, miners):
         logger.info(
             _m(
                 "[set_weights] scores",
@@ -252,12 +276,12 @@ class Validator:
             ),
         )
 
-        metagraph = self.get_metagraph(subtensor)
+        metagraph = self.get_metagraph()
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
             weights=weights,
             netuid=self.netuid,
-            subtensor=subtensor,
+            subtensor=self.subtensor,
             metagraph=metagraph,
         )
 
@@ -279,7 +303,7 @@ class Validator:
             ),
         )
 
-        result, msg = subtensor.set_weights(
+        result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
             netuid=self.netuid,
             uids=uint_uids,
@@ -331,13 +355,13 @@ class Validator:
                 ),
             )
 
-    def get_last_update(self, subtensor: bittensor.subtensor, block):
+    def get_last_update(self, block):
         try:
-            node = self.get_node(subtensor)
+            node = self.get_node()
             last_update_blocks = (
                 block
                 - node.query("SubtensorModule", "LastUpdate", [self.netuid]).value[
-                    self.get_my_uid(subtensor)
+                    self.get_my_uid()
                 ]
             )
         except Exception as e:
@@ -363,13 +387,13 @@ class Validator:
         )
         return last_update_blocks
 
-    async def should_set_weights(self, subtensor: bittensor.subtensor) -> bool:
+    async def should_set_weights(self) -> bool:
         """Check if current block is for setting weights."""
         try:
-            current_block = self.get_current_block(subtensor)
-            last_update = self.get_last_update(subtensor, current_block)
-            tempo = self.get_tempo(subtensor)
-            weights_rate_limit = self.get_weights_rate_limit(subtensor)
+            current_block = self.get_current_block()
+            last_update = self.get_last_update(current_block)
+            tempo = self.get_tempo()
+            weights_rate_limit = self.get_weights_rate_limit()
 
             blocks_till_epoch = tempo - (current_block + self.netuid + 1) % (tempo + 1)
 
@@ -408,12 +432,12 @@ class Validator:
             )
             return False
 
-    async def get_time_from_block(self, subtensor: bittensor.subtensor, block: int):
+    async def get_time_from_block(self, block: int):
         max_retries = 3
         retries = 0
         while retries < max_retries:
             try:
-                node = self.get_node(subtensor)
+                node = self.get_node()
                 block_hash = node.get_block_hash(block)
                 return datetime.fromtimestamp(
                     node.query("Timestamp", "Now", block_hash=block_hash).value / 1000
@@ -436,7 +460,8 @@ class Validator:
 
     async def sync(self):
         try:
-            subtensor = self.get_subtensor()
+            self.set_subtensor()
+
             logger.info(
                 _m(
                     "[sync] Syncing at subtensor",
@@ -445,12 +470,12 @@ class Validator:
             )
 
             # fetch miners
-            miners = self.fetch_miners(subtensor)
+            miners = self.fetch_miners()
 
-            if await self.should_set_weights(subtensor):
-                await self.set_weights(miners=miners, subtensor=subtensor)
+            if await self.should_set_weights():
+                await self.set_weights(miners=miners)
 
-            current_block = self.get_current_block(subtensor)
+            current_block = self.get_current_block()
             logger.info(
                 _m(
                     "[sync] Current block",
@@ -465,7 +490,7 @@ class Validator:
 
             if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
-                job_batch_id = await self.get_time_from_block(subtensor, job_block)
+                job_batch_id = await self.get_time_from_block(job_block)
 
                 logger.info(
                     _m(
