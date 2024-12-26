@@ -482,7 +482,7 @@ class DockerService:
 
         logger.info(
             _m(
-                "Stop Docker Container", extra=get_extra_info({**default_extra, "payload": payload})
+                "Stop Docker Container", extra=get_extra_info({**default_extra, "payload": str(payload)})
             ),
         )
 
@@ -526,7 +526,7 @@ class DockerService:
         logger.info(
             _m(
                 "Restart Docker Container",
-                extra=get_extra_info({**default_extra, "payload": payload}),
+                extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
 
