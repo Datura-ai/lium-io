@@ -13,6 +13,7 @@ from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerDeleteRequest,
     FailedContainerRequest,
+    DuplicateContainersResponse,
 )
 from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
@@ -20,6 +21,7 @@ from protocol.vc_protocol.validator_requests import (
     ExecutorSpecRequest,
     LogStreamRequest,
     RentedMachineRequest,
+    DuplicateContainersRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
@@ -30,6 +32,7 @@ from services.miner_service import MinerService
 from services.redis_service import (
     MACHINE_SPEC_CHANNEL_NAME,
     RENTED_MACHINE_SET,
+    DUPLICATED_MACHINE_SET,
     STREAMING_LOG_CHANNEL,
 )
 
@@ -390,6 +393,15 @@ class ComputeClient:
                     )
                 )
                 await self.send_model(RentedMachineRequest())
+
+                logger.info(
+                    _m(
+                        "Request duplicated machines",
+                        extra=self.logging_extra,
+                    )
+                )
+                await self.send_model(DuplicateContainersRequest())
+
                 await asyncio.sleep(10 * 60)
             else:
                 await asyncio.sleep(10)
@@ -433,10 +445,38 @@ class ComputeClient:
             )
 
             redis_service = self.miner_service.redis_service
-            await redis_service.clear_set(RENTED_MACHINE_SET)
+            await redis_service.delete(RENTED_MACHINE_SET)
 
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
+
+            return
+
+        try:
+            response = pydantic.TypeAdapter(DuplicateContainersResponse).validate_json(raw_msg)
+        except pydantic.ValidationError as exc:
+            logger.error(
+                _m(
+                    "could not parse raw message as DuplicateContainersResponse",
+                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                )
+            )
+        else:
+            logger.info(
+                _m(
+                    "Duplicated containers",
+                    extra={**self.logging_extra, "machines": response.containers},
+                )
+            )
+
+            redis_service = self.miner_service.redis_service
+            await redis_service.delete(DUPLICATED_MACHINE_SET)
+
+            for container_id, details_list in response.containers.items():
+                for detail in details_list:
+                    executor_id = detail.get("executor_id")
+                    miner_hotkey = detail.get("miner_hotkey")
+                    await redis_service.sadd(DUPLICATED_MACHINE_SET, f"{miner_hotkey}:{executor_id}")
 
             return
 
