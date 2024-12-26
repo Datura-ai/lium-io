@@ -14,6 +14,7 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobRequestPayload, MinerJobEnryptedFiles
 
 from core.utils import _m, context, get_extra_info
+from core.config import settings
 from services.const import (
     DOWNLOAD_SPEED_WEIGHT,
     GPU_MAX_SCORES,
@@ -30,7 +31,6 @@ from services.const import (
 from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORT_MAPS_PREFIX
 from services.ssh_service import SSHService
 from services.hash_service import HashService
-from services.file_encrypt_service import FileEncryptService
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +46,7 @@ class TaskService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.is_valid = True
-        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
-
+        self.wallet = settings.get_bittensor_wallet()
     async def upload_directory(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -306,8 +305,35 @@ class TaskService:
                 remote_machine_scrape_file_path = f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
                 remote_score_file_path = f"{remote_dir}/{encypted_files.score_file_name}"
                 program_id = uuid.uuid4()
-                remote_check_monistoring_script_path = self.file_encrypt_service.ecrypt_generate_signature(program_id, executor_info.uuid) 
-
+                print("--------------1111Checking if gpus_utility.py is running--------")
+                try:
+                    print("--------------Checking if gpus_utility.py is running--------")
+                    # Check for any running machine scrape processes
+                    result = await ssh_client.run('ps aux | grep "python.*gpus_utility.py"', timeout=10)
+                    # Filter out the grep process itself and check if there are any matching processes
+                    processes = [line for line in result.stdout.splitlines() if 'grep' not in line]
+                    print('processes')
+                    print(processes)
+                    if processes:
+                        logger.info(f"gpus_utility.py is still running: {processes}")
+                    else:
+                        signature = keypair.sign(program_id.encode())
+                        # If not running, start the script with all required arguments
+                        logger.info("gpus_utility.py is not running, starting it now")
+                        command = (
+                            f"python3 gpus_utility.py "
+                            f"--program_id {program_id} "
+                            f"--signature {signature} "
+                            f"--executor_id {executor_info.uuid} "
+                            f"--validator_hotkey {keypair.ss58_address} "
+                        )
+                        await ssh_client.run(command, timeout=10)
+                        print('command run finished')
+                        
+                except Exception as e:
+                    logger.error(f"Error in running gpus_utility.py: {str(e)}")
+                    pass
+            
                 logger.info(
                     _m(
                         "Uploaded files to run job",
@@ -720,13 +746,7 @@ class TaskService:
                     ),
                 )
 
-    
-                result, _ = await self._run_task(
-                    ssh_client=ssh_client,
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_info=executor_info,
-                    command=f"chmod +x {remote_check_monistoring_script_path} && {remote_check_monistoring_script_path}"
-                )
+
 
                 await self.clear_remote_directory(ssh_client, remote_dir)
                 return (
