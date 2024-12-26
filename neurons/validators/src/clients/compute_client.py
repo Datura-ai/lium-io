@@ -14,6 +14,9 @@ from payload_models.payloads import (
     ContainerDeleteRequest,
     FailedContainerRequest,
     DuplicateContainersResponse,
+    ContainerStartRequest,
+    ContainerStopRequest,
+    ContainerBaseRequest,
 )
 from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
@@ -25,6 +28,7 @@ from protocol.vc_protocol.validator_requests import (
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
+from datura.requests.base import BaseRequest
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.utils import _m, get_extra_info
@@ -66,6 +70,9 @@ class ComputeClient:
                 "compute_app_uri": compute_app_uri,
             }
         )
+
+    def accepted_request_type(self) -> type[BaseRequest]:
+        return ContainerBaseRequest
 
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
@@ -481,39 +488,25 @@ class ComputeClient:
             return
 
         try:
-            job_request = pydantic.TypeAdapter(ContainerCreateRequest).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
+            job_request = self.accepted_request_type().parse(raw_msg)
+        except Exception as ex:
+            error_msg = f"could not parse raw message as {str(ex)}"
             logger.error(
                 _m(
-                    "could not parse raw message as ContainerCreateRequest",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                    error_msg,
+                    extra={**self.logging_extra, "error": str(ex), "raw_msg": raw_msg},
                 )
             )
         else:
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
-
-        try:
-            job_request = pydantic.TypeAdapter(ContainerDeleteRequest).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            logger.error(
-                _m(
-                    "could not parse raw message as ContainerDeleteRequest",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
-                )
-            )
-        else:
-            task = asyncio.create_task(self.miner_driver(job_request))
-            await self.miner_drivers.put(task)
-            return
-
         # logger.error("unsupported message received from facilitator: %s", raw_msg)
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         return await get_miner_axon_info(hotkey)
 
-    async def miner_driver(self, job_request: ContainerCreateRequest | ContainerDeleteRequest):
+    async def miner_driver(self, job_request: ContainerCreateRequest | ContainerDeleteRequest | ContainerStopRequest | ContainerStartRequest):
         """drive a miner client from job start to completion, then close miner connection"""
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logging_extra = {
@@ -561,6 +554,34 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Sending back deleted container info to compute app",
+                    extra={**logging_extra, "response": str(response)},
+                )
+            )
+            await self.send_model(response)
+        elif isinstance(job_request, ContainerStopRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                ContainerStopRequest | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back stopped container info to compute app",
+                    extra={**logging_extra, "response": str(response)},
+                )
+            )
+            await self.send_model(response)
+        elif isinstance(job_request, ContainerStartRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                ContainerStartRequest | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back started container info to compute app",
                     extra={**logging_extra, "response": str(response)},
                 )
             )

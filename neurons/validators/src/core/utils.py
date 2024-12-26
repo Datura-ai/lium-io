@@ -59,9 +59,13 @@ def wait_for_services_sync(timeout=30):
 
 
 def get_extra_info(extra: dict) -> dict:
-    task = asyncio.current_task()
-    coro_name = task.get_coro().__name__ if task else "NoTask"
-    task_id = id(task) if task else "NoTaskID"
+    try:
+        task = asyncio.current_task()
+        coro_name = task.get_coro().__name__ if task else "NoTask"
+        task_id = id(task) if task else "NoTaskID"
+    except Exception:
+        coro_name = "NoTask"
+        task_id = "NoTaskID"
     extra_info = {
         "coro_name": coro_name,
         "task_id": task_id,
