@@ -7,6 +7,7 @@ from core.config import settings
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 STREAMING_LOG_CHANNEL = "channel:2"
 RENTED_MACHINE_SET = "rented_machines"
+DUPLICATED_MACHINE_SET = "duplicated_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 
@@ -95,11 +96,6 @@ class RedisService:
         """Remove and return the last element (first inserted) from a list in Redis."""
         async with self.lock:
             return await self.redis.rpop(key)
-
-    async def clear_set(self, key: str):
-        """Clear all elements from a set in Redis."""
-        async with self.lock:
-            await self.redis.delete(key)
 
     async def hset(self, key: str, field: str, value: str):
         async with self.lock:

@@ -26,7 +26,12 @@ from services.const import (
     LIB_NVIDIA_ML_DIGESTS,
     DOCKER_DIGESTS,
 )
-from services.redis_service import RedisService, RENTED_MACHINE_SET, AVAILABLE_PORT_MAPS_PREFIX
+from services.redis_service import (
+    RedisService,
+    RENTED_MACHINE_SET,
+    DUPLICATED_MACHINE_SET,
+    AVAILABLE_PORT_MAPS_PREFIX,
+)
 from services.ssh_service import SSHService
 from services.hash_service import HashService
 
@@ -487,6 +492,30 @@ class TaskService:
                         extra=get_extra_info(default_extra),
                     ),
                 )
+
+                # check duplicated
+                is_duplicated = await self.redis_service.is_elem_exists_in_set(
+                    DUPLICATED_MACHINE_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
+                )
+                if is_duplicated:
+                    log_status = "warning"
+                    log_text = _m(
+                        f"Executor is duplicated",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 # check rented status
                 is_rented = await self.redis_service.is_elem_exists_in_set(
