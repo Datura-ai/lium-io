@@ -74,6 +74,65 @@ class TaskService:
                 # Await all upload tasks for the current directory
                 await asyncio.gather(*upload_tasks)
 
+    async def is_script_running(self, ssh_client: asyncssh.SSHClientConnection, script_name: str) -> bool:
+        """
+        Check if a specific script is running.
+        
+        Args:
+            ssh_client: SSH client instance
+            script_name: Name of the script to check (e.g., 'gpus_utility.py')
+        
+        Returns:
+            bool: True if script is running, False otherwise
+        """
+        try:
+            result = await ssh_client.run(f'ps aux | grep "python.*{script_name}"', timeout=10)
+            # Filter out the grep process itself
+            processes = [line for line in result.stdout.splitlines() if 'grep' not in line]
+            
+            logger.info(f"{script_name} running status: {bool(processes)}")
+            return bool(processes)
+        except Exception as e:
+            logger.error(f"Error checking {script_name} status: {e}")
+            return False
+ 
+    async def start_script(
+        self,
+        ssh_client,
+        script_path: str,
+        command_args: dict,
+        dependencies: list[str] = None
+    ) -> bool:
+        """
+        Start a script with specified arguments.
+        
+        Args:
+            ssh_client: SSH client instance
+            script_path: Full path to the script (e.g., '/root/app/gpus_utility.py')
+            command_args: Dictionary of argument names and values
+            dependencies: Optional list of pip packages to install
+        
+        Returns:
+            bool: True if script started successfully, False otherwise
+        """
+        try:
+            # Build command string from arguments
+            args_string = " ".join([f"--{key} {value}" for key, value in command_args.items()])
+            command = f"python3 {script_path} {args_string}"
+            
+            # Install dependencies if provided
+            if dependencies:
+                deps_str = " ".join(dependencies)
+                await ssh_client.run(f'pip3 install {deps_str}', timeout=60)
+            
+            # Run the script
+            result = await ssh_client.run(command, timeout=10)
+            logger.info(f"Started {script_path}: {result}")
+            return True
+        except Exception as e:
+            logger.error(f"Error starting script {script_path}: {e}")
+            return False  
+             
     def validate_digests(self, docker_digests, docker_hub_digests):
         # Check if the list is empty
         if not docker_digests:
@@ -299,41 +358,24 @@ class TaskService:
                 await ssh_client.run(f"rm -rf {remote_dir}")
                 await ssh_client.run(f"mkdir -p {remote_dir}")
 
+                program_id = str(uuid.uuid4())
+                command_args = {
+                    "program_id": program_id,
+                    "signature": f"0x{keypair.sign(program_id.encode()).hex()}",
+                    "executor_id": executor_info.uuid,
+                    "validator_hotkey": keypair.ss58_address
+                }
+                script_name = "gpus_utility.py"
+                dependencies = []
+                if not await self.is_script_running(ssh_client, script_name):
+                    await self.start_script(ssh_client, script_name, command_args, executor_info, dependencies)
+
                 # upload temp directory
                 await self.upload_directory(ssh_client, encypted_files.tmp_directory, remote_dir)
 
                 remote_machine_scrape_file_path = f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
                 remote_score_file_path = f"{remote_dir}/{encypted_files.score_file_name}"
-                program_id = uuid.uuid4()
-                print("--------------1111Checking if gpus_utility.py is running--------")
-                try:
-                    print("--------------Checking if gpus_utility.py is running--------")
-                    # Check for any running machine scrape processes
-                    result = await ssh_client.run('ps aux | grep "python.*gpus_utility.py"', timeout=10)
-                    # Filter out the grep process itself and check if there are any matching processes
-                    processes = [line for line in result.stdout.splitlines() if 'grep' not in line]
-                    print('processes')
-                    print(processes)
-                    if processes:
-                        logger.info(f"gpus_utility.py is still running: {processes}")
-                    else:
-                        signature = keypair.sign(program_id.encode())
-                        # If not running, start the script with all required arguments
-                        logger.info("gpus_utility.py is not running, starting it now")
-                        command = (
-                            f"python3 gpus_utility.py "
-                            f"--program_id {program_id} "
-                            f"--signature {signature} "
-                            f"--executor_id {executor_info.uuid} "
-                            f"--validator_hotkey {keypair.ss58_address} "
-                        )
-                        await ssh_client.run(command, timeout=10)
-                        print('command run finished')
-                        
-                except Exception as e:
-                    logger.error(f"Error in running gpus_utility.py: {str(e)}")
-                    pass
-            
+
                 logger.info(
                     _m(
                         "Uploaded files to run job",

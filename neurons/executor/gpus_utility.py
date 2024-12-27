@@ -5,6 +5,7 @@ import websockets
 import json
 import asyncio
 from src.core.config import settings
+from src.clients.executor_client import ExecutorClient
 import logging
 
 logger = logging.getLogger(__name__)
@@ -86,15 +87,11 @@ async def scrape_gpu_metrics(interval: int, program_id: str, signature: str, exe
         pynvml.nvmlShutdown()
 
 async def connect(websocket_url):
-    logger.info("Connecting to backend app")
-    while True:
-        try:
-            connection = await websockets.connect(websocket_url)
-            logger.info("Successfully connected to WebSocket server")
-            return connection
-        except Exception as e:
-            logger.warning(f"Connection failed: {e}. Retrying in 5 seconds...")
-            await asyncio.sleep(5)
+    execute_app_client = ExecutorClient(
+        websocket_url
+    )
+    async with execute_app_client:
+        await execute_app_client.run_forever()
 
 async def send_payload_to_backend(websocket, payload):
     while True:
