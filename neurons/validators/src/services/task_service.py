@@ -25,6 +25,8 @@ from services.const import (
     HASHCAT_CONFIGS,
     LIB_NVIDIA_ML_DIGESTS,
     DOCKER_DIGESTS,
+    GPU_UTILIZATION_LIMIT,
+    GPU_MEMORY_UTILIZATION_LIMIT,
 )
 from services.redis_service import (
     RedisService,
@@ -351,6 +353,7 @@ class TaskService:
                     max_score = GPU_MAX_SCORES.get(gpu_model, 0)
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
+                gpu_details = machine_spec.get("gpu", {}).get("details", [])
 
                 nvidia_driver = machine_spec.get("gpu", {}).get("driver", '')
                 libnvidia_ml = machine_spec.get('md5_checksums', {}).get('libnvidia_ml', '')
@@ -392,7 +395,7 @@ class TaskService:
                         log_text,
                     )
 
-                if max_score == 0 or gpu_count == 0:
+                if max_score == 0 or gpu_count == 0 or len(gpu_details) != gpu_count:
                     extra_info = {
                         **default_extra,
                         "os_version": machine_spec.get('os', ''),
@@ -542,6 +545,34 @@ class TaskService:
                         log_text,
                     )
                 else:
+                    # check gpu usages
+                    for detail in gpu_details:
+                        gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
+                        gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
+                        if gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT:
+                            log_status = "warning"
+                            log_text = _m(
+                                f"High gpu utilization detected:",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "gpu_utilization": gpu_utilization,
+                                    "gpu_memory_utilization": gpu_memory_utilization,
+                                }),
+                            )
+                            logger.warning(log_text)
+
+                            await self.clear_remote_directory(ssh_client, remote_dir)
+
+                            return (
+                                machine_spec,
+                                executor_info,
+                                0,
+                                0,
+                                miner_info.job_batch_id,
+                                log_status,
+                                log_text,
+                            )
+
                     # if not rented, check docker digests
                     docker_digests = machine_spec.get("docker", {}).get("containers", [])
                     self.is_valid = self.validate_digests(docker_digests, docker_hub_digests)
