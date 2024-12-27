@@ -44,7 +44,7 @@ async def scrape_gpu_metrics(interval: int, program_id: str, signature: str, exe
     logger.info(f"Will send metrics to: {http_url}")
     
     # Initialize the tracker
-    tracker = GPUMetricsTracker(threshold_percent=0.0)
+    tracker = GPUMetricsTracker(threshold_percent=10.0)
     
     async with aiohttp.ClientSession() as session:
         logger.info(f"Scraping metrics for {device_count} GPUs...")
