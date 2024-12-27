@@ -74,26 +74,27 @@ class TaskService:
                 # Await all upload tasks for the current directory
                 await asyncio.gather(*upload_tasks)
 
-    async def is_script_running(self, ssh_client: asyncssh.SSHClientConnection, script_name: str) -> bool:
+    async def is_script_running(self, ssh_client: asyncssh.SSHClientConnection, script_path: str) -> bool:
         """
         Check if a specific script is running.
         
         Args:
             ssh_client: SSH client instance
-            script_name: Name of the script to check (e.g., 'gpus_utility.py')
+            script_path: Full path to the script (e.g., '/root/app/gpus_utility.py')
+
         
         Returns:
             bool: True if script is running, False otherwise
         """
         try:
-            result = await ssh_client.run(f'ps aux | grep "python.*{script_name}"', timeout=10)
+            result = await ssh_client.run(f'ps aux | grep "python.*{script_path}"', timeout=10)
             # Filter out the grep process itself
             processes = [line for line in result.stdout.splitlines() if 'grep' not in line]
             
-            logger.info(f"{script_name} running status: {bool(processes)}")
+            logger.info(f"{script_path} running status: {bool(processes)}")
             return bool(processes)
         except Exception as e:
-            logger.error(f"Error checking {script_name} status: {e}")
+            logger.error(f"Error checking {script_path} status: {e}")
             return False
  
     async def start_script(
@@ -101,7 +102,7 @@ class TaskService:
         ssh_client,
         script_path: str,
         command_args: dict,
-        dependencies: list[str] = None
+        executor_info: ExecutorSSHInfo,
     ) -> bool:
         """
         Start a script with specified arguments.
@@ -110,7 +111,6 @@ class TaskService:
             ssh_client: SSH client instance
             script_path: Full path to the script (e.g., '/root/app/gpus_utility.py')
             command_args: Dictionary of argument names and values
-            dependencies: Optional list of pip packages to install
         
         Returns:
             bool: True if script started successfully, False otherwise
@@ -118,19 +118,13 @@ class TaskService:
         try:
             # Build command string from arguments
             args_string = " ".join([f"--{key} {value}" for key, value in command_args.items()])
-            command = f"python3 {script_path} {args_string}"
-            
-            # Install dependencies if provided
-            if dependencies:
-                deps_str = " ".join(dependencies)
-                await ssh_client.run(f'pip3 install {deps_str}', timeout=60)
-            
+            command = f"nohup {executor_info.python_path} {script_path} {args_string} > /dev/null 2>&1 & "
             # Run the script
-            result = await ssh_client.run(command, timeout=10)
+            result = await ssh_client.run(command, timeout=50, check=True)
             logger.info(f"Started {script_path}: {result}")
             return True
         except Exception as e:
-            logger.error(f"Error starting script {script_path}: {e}")
+            logger.error(f"Error starting script {script_path}: {e}", exc_info=True)
             return False  
              
     def validate_digests(self, docker_digests, docker_hub_digests):
@@ -358,17 +352,18 @@ class TaskService:
                 await ssh_client.run(f"rm -rf {remote_dir}")
                 await ssh_client.run(f"mkdir -p {remote_dir}")
 
+                # start gpus_utility.py
                 program_id = str(uuid.uuid4())
                 command_args = {
                     "program_id": program_id,
                     "signature": f"0x{keypair.sign(program_id.encode()).hex()}",
                     "executor_id": executor_info.uuid,
-                    "validator_hotkey": keypair.ss58_address
+                    "validator_hotkey": keypair.ss58_address,
+                    "compute_rest_app_url": settings.COMPUTE_REST_API_URL
                 }
-                script_name = "gpus_utility.py"
-                dependencies = []
-                if not await self.is_script_running(ssh_client, script_name):
-                    await self.start_script(ssh_client, script_name, command_args, executor_info, dependencies)
+                script_path = f"{executor_info.root_dir}/src/gpus_utility.py"
+                if not await self.is_script_running(ssh_client, script_path):
+                    await self.start_script(ssh_client, script_path, command_args, executor_info)
 
                 # upload temp directory
                 await self.upload_directory(ssh_client, encypted_files.tmp_directory, remote_dir)

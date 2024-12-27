@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
     COMPUTE_APP_URI: str = "wss://celiumcompute.ai"
-
+    COMPUTE_REST_API_URL: str = "https://celiumcompute.ai/api"
     ENV: str = Field(env="ENV", default="dev")
 
     def get_bittensor_wallet(self) -> "Wallet":
