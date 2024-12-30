@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:a5ab35d8d8913a254c33af035422e20739dc007f8370276f07a52c8624b9669b"
+content_hash = "sha256:a150e27c580e7a8eb194fd150f8d40435c5f9095cdf242c14c6a33580000812e"
 
 [[metadata.targets]]
 requires_python = "==3.11.*"
@@ -854,6 +854,16 @@ files = [
 ]
 
 [[package]]
+name = "nvidia-ml-py"
+version = "12.560.30"
+summary = "Python Bindings for the NVIDIA Management Library"
+groups = ["default"]
+files = [
+    {file = "nvidia-ml-py-12.560.30.tar.gz", hash = "sha256:f0254dc7400647680a072ee02509bfd46102b60bdfeca321576d4d4817e7fe97"},
+    {file = "nvidia_ml_py-12.560.30-py3-none-any.whl", hash = "sha256:fea371c94d63e38a611c17bbb85fe400e9c8ddb9e8684a9cd0e47786a4bc3c73"},
+]
+
+[[package]]
 name = "packaging"
 version = "24.2"
 requires_python = ">=3.8"
@@ -1111,6 +1121,20 @@ files = [
     {file = "PyNaCl-1.5.0-cp36-abi3-win32.whl", hash = "sha256:e46dae94e34b085175f8abb3b0aaa7da40767865ac82c928eeb9e57e1ea8a543"},
     {file = "PyNaCl-1.5.0-cp36-abi3-win_amd64.whl", hash = "sha256:20f42270d27e1b6a29f54032090b972d97f0a1b0948cc52392041ef7831fee93"},
     {file = "PyNaCl-1.5.0.tar.gz", hash = "sha256:8ac7448f09ab85811607bdd21ec2464495ac8b7c66d146bf545b0f08fb9220ba"},
+]
+
+[[package]]
+name = "pynvml"
+version = "12.0.0"
+requires_python = ">=3.9"
+summary = "Python utilities for the NVIDIA Management Library"
+groups = ["default"]
+dependencies = [
+    "nvidia-ml-py<13.0.0a0,>=12.0.0",
+]
+files = [
+    {file = "pynvml-12.0.0-py3-none-any.whl", hash = "sha256:fdff84b62a27dbe98e08e1a647eb77342bef1aebe0878bcd15e99a83fcbecb9e"},
+    {file = "pynvml-12.0.0.tar.gz", hash = "sha256:299ce2451a6a17e6822d6faee750103e25b415f06f59abb8db65d30f794166f5"},
 ]
 
 [[package]]
