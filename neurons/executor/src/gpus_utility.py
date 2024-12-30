@@ -5,8 +5,10 @@ import time
 import aiohttp
 import click
 import pynvml
+import psutil
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class GPUMetricsTracker:
@@ -61,7 +63,7 @@ async def scrape_gpu_metrics(
         try:
             while True:
                 try:
-                    gpu_metrics = []
+                    gpu_utilization = []
                     should_send = False
 
                     for i in range(device_count):
@@ -75,8 +77,8 @@ async def scrape_gpu_metrics(
                         memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
 
                         gpu_util = utilization.gpu
-                        mem_used = memory.used / 1024**2
-                        mem_total = memory.total / 1024**2
+                        mem_used = memory.used
+                        mem_total = memory.total
                         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
                         # Check if there's a significant change for this GPU
@@ -84,30 +86,41 @@ async def scrape_gpu_metrics(
                             should_send = True
                             logger.info(f"Significant change detected for GPU {i}")
 
-                        print(
-                            f"{timestamp} | GPU {i} ({name}): GPU {gpu_util}% | Memory {mem_used:.2f}/{mem_total:.2f} MB"
-                        )
-
-                        gpu_metrics.append(
+                        gpu_utilization.append(
                             {
-                                "gpu_id": i,
-                                "gpu_name": name,
-                                "gpu_utilization": gpu_util,
-                                "memory_usage": mem_used,
-                                "memory_total": mem_total,
+                                "utilization_in_percent": gpu_util,
+                                "memory_utilization_in_bytes": mem_used,
+                                "memory_utilization_in_percent": round(mem_used / mem_total * 100, 1)
                             }
                         )
 
+                    # Get CPU, RAM, and Disk metrics using psutil
+                    cpu_percent = psutil.cpu_percent(interval=1)
+                    ram = psutil.virtual_memory()
+                    disk = psutil.disk_usage('/')
+                    
+                    cpu_ram_utilization = {
+                        "cpu_utilization_in_percent": cpu_percent,
+                        "ram_utilization_in_bytes": ram.used,
+                        "ram_utilization_in_percent": ram.percent
+                    }
+
+                    disk_utilization = {
+                        "disk_utilization_in_bytes": disk.used,
+                        "disk_utilization_in_percent": disk.percent
+                    }
+                    
                     # Only send if there's a significant change in any GPU
-                    if should_send:
+                    if True:
                         payload = {
-                            "gpus": gpu_metrics,
+                            "gpu_utilization": gpu_utilization,
+                            "cpu_ram_utilization": cpu_ram_utilization,
+                            "disk_utilization": disk_utilization,
                             "timestamp": timestamp,
                             "program_id": program_id,
                             "signature": signature,
                             "executor_id": executor_id,
                         }
-
                         # Send HTTP POST request
                         async with session.post(http_url, json=payload) as response:
                             if response.status == 200:

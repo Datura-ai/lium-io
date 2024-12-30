@@ -812,7 +812,7 @@ class TaskService:
                     log_status = "error"
                     log_text = _m(
                         "Hashcat incorrect Answer",
-                        extra=get_extra_info(default_extra),
+                        extra=get_extra_info({**default_extra, "answer": answer, "hash_service_answer": hash_service.answer}),
                     )
                     logger.error(log_text)
 
@@ -961,7 +961,7 @@ class TaskService:
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
 
             if len(results) == 0 and len(actual_errors) > 0:
-                logger.error(_m("Failed to execute command!", extra=get_extra_info(default_extra)))
+                logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "errors": actual_errors})))
                 raise Exception("Failed to execute command!")
 
             return results, None
