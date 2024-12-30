@@ -16,21 +16,28 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from core.config import settings
 from core.utils import _m, context, get_extra_info
 from services.const import (
-    DOCKER_DIGESTS,
     DOWNLOAD_SPEED_WEIGHT,
     GPU_MAX_SCORES,
-    HASHCAT_CONFIGS,
     JOB_TAKEN_TIME_WEIGHT,
-    LIB_NVIDIA_ML_DIGESTS,
     MAX_DOWNLOAD_SPEED,
-    MAX_GPU_COUNT,
     MAX_UPLOAD_SPEED,
-    UNRENTED_MULTIPLIER,
     UPLOAD_SPEED_WEIGHT,
+    MAX_GPU_COUNT,
+    UNRENTED_MULTIPLIER,
+    HASHCAT_CONFIGS,
+    LIB_NVIDIA_ML_DIGESTS,
+    DOCKER_DIGESTS,
+    GPU_UTILIZATION_LIMIT,
+    GPU_MEMORY_UTILIZATION_LIMIT,
 )
-from services.hash_service import HashService
-from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX, RENTED_MACHINE_SET, RedisService
+from services.redis_service import (
+    RedisService,
+    RENTED_MACHINE_SET,
+    DUPLICATED_MACHINE_SET,
+    AVAILABLE_PORT_MAPS_PREFIX,
+)
 from services.ssh_service import SSHService
+from services.hash_service import HashService
 
 logger = logging.getLogger(__name__)
 
@@ -440,6 +447,7 @@ class TaskService:
                     max_score = GPU_MAX_SCORES.get(gpu_model, 0)
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
+                gpu_details = machine_spec.get("gpu", {}).get("details", [])
 
                 nvidia_driver = machine_spec.get("gpu", {}).get("driver", "")
                 libnvidia_ml = machine_spec.get("md5_checksums", {}).get("libnvidia_ml", "")
@@ -483,7 +491,7 @@ class TaskService:
                         log_text,
                     )
 
-                if max_score == 0 or gpu_count == 0:
+                if max_score == 0 or gpu_count == 0 or len(gpu_details) != gpu_count:
                     extra_info = {
                         **default_extra,
                         "os_version": machine_spec.get("os", ""),
@@ -590,6 +598,30 @@ class TaskService:
                     ),
                 )
 
+                # check duplicated
+                is_duplicated = await self.redis_service.is_elem_exists_in_set(
+                    DUPLICATED_MACHINE_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
+                )
+                if is_duplicated:
+                    log_status = "warning"
+                    log_text = _m(
+                        f"Executor is duplicated",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
                 # check rented status
                 is_rented = await self.redis_service.is_elem_exists_in_set(
                     RENTED_MACHINE_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
@@ -615,6 +647,34 @@ class TaskService:
                         log_text,
                     )
                 else:
+                    # check gpu usages
+                    for detail in gpu_details:
+                        gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
+                        gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
+                        if gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT:
+                            log_status = "warning"
+                            log_text = _m(
+                                f"High gpu utilization detected:",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "gpu_utilization": gpu_utilization,
+                                    "gpu_memory_utilization": gpu_memory_utilization,
+                                }),
+                            )
+                            logger.warning(log_text)
+
+                            await self.clear_remote_directory(ssh_client, remote_dir)
+
+                            return (
+                                machine_spec,
+                                executor_info,
+                                0,
+                                0,
+                                miner_info.job_batch_id,
+                                log_status,
+                                log_text,
+                            )
+
                     # if not rented, check docker digests
                     docker_digests = machine_spec.get("docker", {}).get("containers", [])
                     self.is_valid = self.validate_digests(docker_digests, docker_hub_digests)
