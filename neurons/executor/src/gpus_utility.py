@@ -3,11 +3,12 @@ import pynvml
 import click
 import asyncio
 import aiohttp
-from clients.executor_client import ExecutorClient
 import logging
-from typing import Dict, List
+from typing import Dict
+
 
 logger = logging.getLogger(__name__)
+
 
 class GPUMetricsTracker:
     def __init__(self, threshold_percent: float = 10.0):
@@ -28,6 +29,7 @@ class GPUMetricsTracker:
             return True
         return False
     
+
 async def scrape_gpu_metrics(interval: int, program_id: str, signature: str, executor_id: str, validator_hotkey: str, compute_rest_app_url: str):
     try:
         pynvml.nvmlInit()
@@ -114,11 +116,6 @@ async def scrape_gpu_metrics(interval: int, program_id: str, signature: str, exe
         finally:
             pynvml.nvmlShutdown()
 
-async def connect(websocket_url):
-    execute_app_client = ExecutorClient(websocket_url)
-    # Start the client's processing in the background
-    asyncio.create_task(execute_app_client.run_forever())
-    return execute_app_client
 
 @click.command()
 @click.option("--program_id", prompt="Program ID", help="Program ID for monitoring")
@@ -129,6 +126,7 @@ async def connect(websocket_url):
 @click.option("--interval", default=5, type=int, help="Scraping interval in seconds")
 def main(interval: int, program_id: str, signature: str, executor_id: str, validator_hotkey: str, compute_rest_app_url: str):
     asyncio.run(scrape_gpu_metrics(interval, program_id, signature, executor_id, validator_hotkey, compute_rest_app_url))
+
 
 if __name__ == "__main__":
     main()
