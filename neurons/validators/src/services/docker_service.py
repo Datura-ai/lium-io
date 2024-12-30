@@ -38,6 +38,8 @@ REPOSITORIES = [
     "daturaai/ubuntu",
 ]
 
+LOG_STREAM_INTERVAL = 5  # 5 seconds
+
 
 class DockerService:
     def __init__(
@@ -121,7 +123,7 @@ class DockerService:
         self.is_realtime_logging = True
 
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(LOG_STREAM_INTERVAL)
 
             async with self.lock:
                 logs_to_process = self.logs_queue[:]
@@ -480,7 +482,7 @@ class DockerService:
 
         logger.info(
             _m(
-                "Stop Docker Container", extra=get_extra_info({**default_extra, "payload": payload})
+                "Stop Docker Container", extra=get_extra_info({**default_extra, "payload": str(payload)})
             ),
         )
 
@@ -524,7 +526,7 @@ class DockerService:
         logger.info(
             _m(
                 "Restart Docker Container",
-                extra=get_extra_info({**default_extra, "payload": payload}),
+                extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
 

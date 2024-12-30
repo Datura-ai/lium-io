@@ -3,6 +3,7 @@ import logging
 import traceback
 import asyncio
 import bittensor
+from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
 from core.db import get_db
@@ -29,6 +30,11 @@ class Miner:
         self.wallet = settings.get_bittensor_wallet()
         self.netuid = settings.BITTENSOR_NETUID
 
+        self.default_extra = {
+            "external_port": settings.EXTERNAL_PORT,
+            "external_ip": settings.EXTERNAL_IP_ADDRESS,
+        }
+
         self.axon = bittensor.axon(
             wallet=self.wallet,
             external_port=settings.EXTERNAL_PORT,
@@ -36,44 +42,47 @@ class Miner:
             port=settings.INTERNAL_PORT,
             ip=settings.EXTERNAL_IP_ADDRESS,
         )
+        self.subtensor = None
+        self.set_subtensor()
 
         self.should_exit = False
         self.session = next(get_db())
         self.validator_dao = ValidatorDao(session=self.session)
         self.last_announced_block = 0
 
-        self.default_extra = {
-            "external_port": settings.EXTERNAL_PORT,
-            "external_ip": settings.EXTERNAL_IP_ADDRESS,
-        }
+    def set_subtensor(self):
+        try:
+            if (
+                self.subtensor
+                and self.subtensor.substrate
+                and self.subtensor.substrate.websocket
+                and self.subtensor.substrate.websocket.state is WebSocketClientState.OPEN
+            ):
+                return
 
-    def get_subtensor(self):
-        logger.info(
-            _m(
-                'Getting subtensor',
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
-        return bittensor.subtensor(config=self.config)
+            logger.info(
+                _m(
+                    "Getting subtensor",
+                    extra=get_extra_info(self.default_extra),
+                ),
+            )
 
-    def get_metagraph(self, subtensor: bittensor.subtensor):
-        return subtensor.metagraph(netuid=self.netuid)
+            self.subtensor = bittensor.subtensor(config=self.config)
 
-    def get_node(self, subtensor: bittensor.subtensor):
-        return subtensor.substrate
+            # check registered
+            self.check_registered()
+        except Exception as e:
+            logger.info(
+                _m(
+                    "[Error] Getting subtensor",
+                    extra=get_extra_info({
+                        ** self.default_extra,
+                        "error": str(e),
+                    }),
+                ),
+            )
 
-    def get_my_uid(self, subtensor: bittensor.subtensor):
-        metagraph = self.get_metagraph(subtensor)
-        return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
-
-    def get_current_block(self, subtensor: bittensor.subtensor):
-        node = self.get_node(subtensor)
-        return node.query("System", "Number", []).value
-
-    def get_tempo(self, subtensor: bittensor.subtensor):
-        return subtensor.tempo(self.netuid)
-
-    async def check_registered(self, subtensor: bittensor.subtensor):
+    def check_registered(self):
         try:
             logger.info(
                 _m(
@@ -81,7 +90,8 @@ class Miner:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            if not subtensor.is_hotkey_registered(
+
+            if not self.subtensor.is_hotkey_registered(
                 netuid=self.netuid,
                 hotkey_ss58=self.wallet.get_hotkey().ss58_address,
             ):
@@ -103,10 +113,25 @@ class Miner:
                 ),
             )
 
-    async def announce(self, subtensor: bittensor.subtensor):
+    def get_node(self):
+        # return SubstrateInterface(url=self.config.subtensor.chain_endpoint)
+        return self.subtensor.substrate
+
+    def get_current_block(self):
+        node = self.get_node()
+        return node.query("System", "Number", []).value
+
+    def get_tempo(self):
+        return self.subtensor.tempo(self.netuid)
+
+    def get_serving_rate_limit(self):
+        node = self.get_node()
+        return node.query("SubtensorModule", "ServingRateLimit", [self.netuid]).value
+
+    def announce(self):
         try:
-            current_block = self.get_current_block(subtensor)
-            tempo = self.get_tempo(subtensor)
+            current_block = self.get_current_block()
+            tempo = self.get_tempo()
 
             if current_block - self.last_announced_block >= tempo:
                 self.last_announced_block = current_block
@@ -117,7 +142,7 @@ class Miner:
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
-                self.axon.serve(netuid=self.netuid, subtensor=subtensor)
+                self.axon.serve(netuid=self.netuid, subtensor=self.subtensor)
         except Exception as e:
             logger.error(
                 _m(
@@ -129,8 +154,8 @@ class Miner:
                 ),
             )
 
-    async def fetch_validators(self, subtensor: bittensor.subtensor):
-        metagraph = subtensor.metagraph(netuid=self.netuid)
+    async def fetch_validators(self):
+        metagraph = self.subtensor.metagraph(netuid=self.netuid)
         neurons = [n for n in metagraph.neurons if (n.stake.tao >= MIN_STAKE)]
         return neurons[:VALIDATORS_LIMIT]
 
@@ -153,12 +178,11 @@ class Miner:
 
     async def sync(self):
         try:
-            subtensor = self.get_subtensor()
+            self.set_subtensor()
 
-            await self.check_registered(subtensor)
-            await self.announce(subtensor)
+            self.announce()
 
-            validators = await self.fetch_validators(subtensor)
+            validators = await self.fetch_validators()
             await self.save_validators(validators)
         except Exception as e:
             logger.error(

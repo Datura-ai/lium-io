@@ -9,7 +9,6 @@ import threading
 import psutil
 from functools import wraps
 import hashlib
-import docker
 from base64 import b64encode
 from cryptography.fernet import Fernet
 import tempfile
@@ -534,26 +533,54 @@ def get_network_speed():
     return data
 
 
-def get_all_container_digests():
-    """Verify and return the digests of all running containers."""
-    client = docker.from_env()
-    containers = client.containers.list()
+def get_docker_info(content: bytes):
+    data = {
+        "version": "",
+        "container_id": "",
+        "containers": []
+    }
 
-    digests = []  # Initialize an empty list to store digests
+    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        temp_file.write(content)
+        docker_path = temp_file.name
 
-    for container in containers:
-        image_id = container.image.id
-        image = client.images.get(image_id)
-        digest = None
-        if image.tags:
-            for repo_digest in image.attrs['RepoDigests']:
-                if repo_digest.startswith(image.tags[0].split(':')[0]):
-                    digest = repo_digest.split('@')[1]
-                    break
-        if digest:
-            digests.append({'id': container.id, 'digest': digest})   # Add the digest to the list
+    try:
+        run_cmd(f'chmod +x {docker_path}')
 
-    return digests
+        result = run_cmd(f'{docker_path} version --format "{{{{.Client.Version}}}}"')
+        data["version"] = result.strip()
+
+        result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
+        container_ids = result.strip().split('\n')
+
+        containers = []
+
+        for container_id in container_ids:
+            # Get the image ID of the container
+            result = run_cmd(f'{docker_path} inspect --format "{{{{.Image}}}}" {container_id}')
+            image_id = result.strip()
+
+            # Get the image details
+            result = run_cmd(f'{docker_path}  inspect --format "{{{{json .RepoDigests}}}}" {image_id}')
+            repo_digests = json.loads(result.strip())
+
+            digest = None
+            if repo_digests:
+                digest = repo_digests[0].split('@')[1]
+                if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
+                    data["container_id"] = container_id
+
+            if digest:
+                containers.append({'id': container_id, 'digest': digest})
+            else:
+                containers.append({'id': container_id, 'digest': ''})
+
+        data["containers"] = containers
+
+    finally:
+        os.remove(docker_path)
+
+    return data
 
 
 def get_md5_checksum_from_path(file_path):
@@ -719,10 +746,14 @@ def get_machine_specs():
         data["os_scrape_error"] = repr(exc)
 
     data["network"] = get_network_speed()
-    data["all_container_digests"] = get_all_container_digests()
+
+    docker_content = get_file_content("/usr/bin/docker")
+    data["docker"] = get_docker_info(docker_content)
+
     data["md5_checksums"] = {
         "nvidia_smi": get_md5_checksum_from_path(run_cmd("which nvidia-smi").strip()),
         "libnvidia_ml": get_md5_checksum_from_file_content(nvmlLib_content),
+        "docker": get_md5_checksum_from_file_content(docker_content),
     }
 
     return data

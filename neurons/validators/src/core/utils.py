@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import json
 import logging
+from logging.config import dictConfig  # noqa
 
 from core.config import settings
 
@@ -58,9 +59,13 @@ def wait_for_services_sync(timeout=30):
 
 
 def get_extra_info(extra: dict) -> dict:
-    task = asyncio.current_task()
-    coro_name = task.get_coro().__name__ if task else "NoTask"
-    task_id = id(task) if task else "NoTaskID"
+    try:
+        task = asyncio.current_task()
+        coro_name = task.get_coro().__name__ if task else "NoTask"
+        task_id = id(task) if task else "NoTaskID"
+    except Exception:
+        coro_name = "NoTask"
+        task_id = "NoTaskID"
     extra_info = {
         "coro_name": coro_name,
         "task_id": task_id,
@@ -117,6 +122,44 @@ def configure_logs_of_other_modules():
     handler.setFormatter(
         CustomFormatter("%(name)s %(asctime)s %(levelname)s %(filename)s %(process)d %(message)s")
     )
+
+
+def get_logger(name: str):
+    LOGGING = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "verbose": {
+                "format": "%(levelname)-8s %(asctime)s --- "
+                "%(lineno)-8s [%(name)s] %(funcName)-24s : %(message)s",
+            }
+        },
+        "handlers": {
+            "console": {
+                "class": "logging.StreamHandler",
+                "formatter": "verbose",
+            },
+        },
+        "root": {
+            "level": "INFO",
+            "handlers": ["console"],
+        },
+        "loggers": {
+            "connector": {
+                "level": "INFO",
+                "handlers": ["console"],
+                "propagate": False,
+            },
+            "asyncssh": {
+                "level": "WARNING",
+                "propagate": True,
+            },
+        },
+    }
+
+    dictConfig(LOGGING)
+    logger = logging.getLogger(name)
+    return logger
 
 
 class StructuredMessage:

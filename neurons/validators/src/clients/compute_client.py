@@ -8,12 +8,15 @@ import pydantic
 import redis.asyncio as aioredis
 import tenacity
 import websockets
-from websockets.asyncio.client import ClientConnection
 from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleteRequest,
     FailedContainerRequest,
+    DuplicateContainersResponse,
+    ContainerStartRequest,
+    ContainerStopRequest,
+    ContainerBaseRequest,
 )
 from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
@@ -21,8 +24,11 @@ from protocol.vc_protocol.validator_requests import (
     ExecutorSpecRequest,
     LogStreamRequest,
     RentedMachineRequest,
+    DuplicateContainersRequest,
 )
 from pydantic import BaseModel
+from websockets.asyncio.client import ClientConnection
+from datura.requests.base import BaseRequest
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.utils import _m, get_extra_info
@@ -30,6 +36,7 @@ from services.miner_service import MinerService
 from services.redis_service import (
     MACHINE_SPEC_CHANNEL_NAME,
     RENTED_MACHINE_SET,
+    DUPLICATED_MACHINE_SET,
     STREAMING_LOG_CHANNEL,
 )
 
@@ -63,6 +70,9 @@ class ComputeClient:
                 "compute_app_uri": compute_app_uri,
             }
         )
+
+    def accepted_request_type(self) -> type[BaseRequest]:
+        return ContainerBaseRequest
 
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
@@ -198,7 +208,7 @@ class ComputeClient:
                 logger.info(
                     _m(
                         "Received machine specs from validator app.",
-                        extra={**self.logging_extra, "msg": str(msg)},
+                        extra={**self.logging_extra},
                     )
                 )
 
@@ -390,6 +400,15 @@ class ComputeClient:
                     )
                 )
                 await self.send_model(RentedMachineRequest())
+
+                logger.info(
+                    _m(
+                        "Request duplicated machines",
+                        extra=self.logging_extra,
+                    )
+                )
+                await self.send_model(DuplicateContainersRequest())
+
                 await asyncio.sleep(10 * 60)
             else:
                 await asyncio.sleep(10)
@@ -433,7 +452,7 @@ class ComputeClient:
             )
 
             redis_service = self.miner_service.redis_service
-            await redis_service.clear_set(RENTED_MACHINE_SET)
+            await redis_service.delete(RENTED_MACHINE_SET)
 
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
@@ -441,39 +460,53 @@ class ComputeClient:
             return
 
         try:
-            job_request = pydantic.TypeAdapter(ContainerCreateRequest).validate_json(raw_msg)
+            response = pydantic.TypeAdapter(DuplicateContainersResponse).validate_json(raw_msg)
         except pydantic.ValidationError as exc:
             logger.error(
                 _m(
-                    "could not parse raw message as ContainerCreateRequest",
+                    "could not parse raw message as DuplicateContainersResponse",
                     extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
                 )
             )
         else:
-            task = asyncio.create_task(self.miner_driver(job_request))
-            await self.miner_drivers.put(task)
+            logger.info(
+                _m(
+                    "Duplicated containers",
+                    extra={**self.logging_extra, "machines": response.containers},
+                )
+            )
+
+            redis_service = self.miner_service.redis_service
+            await redis_service.delete(DUPLICATED_MACHINE_SET)
+
+            for container_id, details_list in response.containers.items():
+                for detail in details_list:
+                    executor_id = detail.get("executor_id")
+                    miner_hotkey = detail.get("miner_hotkey")
+                    await redis_service.sadd(DUPLICATED_MACHINE_SET, f"{miner_hotkey}:{executor_id}")
+
             return
 
         try:
-            job_request = pydantic.TypeAdapter(ContainerDeleteRequest).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
+            job_request = self.accepted_request_type().parse(raw_msg)
+        except Exception as ex:
+            error_msg = f"could not parse raw message as {str(ex)}"
             logger.error(
                 _m(
-                    "could not parse raw message as ContainerDeleteRequest",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                    error_msg,
+                    extra={**self.logging_extra, "error": str(ex), "raw_msg": raw_msg},
                 )
             )
         else:
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
-
         # logger.error("unsupported message received from facilitator: %s", raw_msg)
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         return await get_miner_axon_info(hotkey)
 
-    async def miner_driver(self, job_request: ContainerCreateRequest | ContainerDeleteRequest):
+    async def miner_driver(self, job_request: ContainerCreateRequest | ContainerDeleteRequest | ContainerStopRequest | ContainerStartRequest):
         """drive a miner client from job start to completion, then close miner connection"""
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logging_extra = {
@@ -521,6 +554,34 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Sending back deleted container info to compute app",
+                    extra={**logging_extra, "response": str(response)},
+                )
+            )
+            await self.send_model(response)
+        elif isinstance(job_request, ContainerStopRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                ContainerStopRequest | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back stopped container info to compute app",
+                    extra={**logging_extra, "response": str(response)},
+                )
+            )
+            await self.send_model(response)
+        elif isinstance(job_request, ContainerStartRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                ContainerStartRequest | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back started container info to compute app",
                     extra={**logging_extra, "response": str(response)},
                 )
             )
