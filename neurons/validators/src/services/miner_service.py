@@ -59,6 +59,7 @@ class MinerService:
         payload: MinerJobRequestPayload,
         encypted_files: MinerJobEnryptedFiles,
         docker_hub_digests: dict[str, str],
+        debug=False,
     ):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -78,7 +79,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 my_hotkey=my_key.ss58_address,
                 keypair=my_key,
-                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/jobs/{my_key.ss58_address}",
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/jobs/{my_key.ss58_address}"
             )
 
             async with miner_client:
@@ -130,6 +131,7 @@ class MinerService:
                                 public_key=public_key.decode("utf-8"),
                                 encypted_files=encypted_files,
                                 docker_hub_digests=docker_hub_digests,
+                                debug=debug,
                             )
                         )
                         for executor_info in msg.executors

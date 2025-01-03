@@ -9,8 +9,8 @@ from bittensor.utils.weight_utils import (
     convert_weights_and_uids_for_emit,
     process_weights_for_netuid,
 )
-from websockets.protocol import State as WebSocketClientState
 from payload_models.payloads import MinerJobRequestPayload
+from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
@@ -155,10 +155,12 @@ class Validator:
             logger.info(
                 _m(
                     "[Error] Getting subtensor",
-                    extra=get_extra_info({
-                        ** self.default_extra,
-                        "error": str(e),
-                    }),
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "error": str(e),
+                        }
+                    ),
                 ),
             )
 
@@ -534,6 +536,7 @@ class Validator:
                             ),
                             encypted_files=encypted_files,
                             docker_hub_digests=docker_hub_digests,
+                            debug=settings.DEBUG,
                         )
                     )
                     for miner in miners
