@@ -602,7 +602,7 @@ def get_md5_checksum_from_file_content(file_content: bytes):
 def get_libnvidia_ml_path():
     try:
         original_path = run_cmd("find /usr -name 'libnvidia-ml.so.1'").strip()
-        return original_path
+        return original_path.split('\n')[-1]
     except:
         return ''
 

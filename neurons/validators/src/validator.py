@@ -13,7 +13,10 @@ wait_for_services_sync()
 
 
 async def app_lifespan(app: FastAPI):
-    validator = Validator()
+    if settings.DEBUG:
+        validator = Validator(debug_miner=settings.get_debug_miner())
+    else:
+        validator = Validator()
     # Run the miner in the background
     task = asyncio.create_task(validator.start())
 

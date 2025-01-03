@@ -1,17 +1,19 @@
-import os
 import asyncio
 import json
 import logging
-import time
+import os
 import random
-from typing import Annotated, Optional, Tuple
+import time
+import uuid
+from typing import Annotated
 
 import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
-from payload_models.payloads import MinerJobRequestPayload, MinerJobEnryptedFiles
+from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
+from core.config import settings
 from core.utils import _m, context, get_extra_info
 from services.const import (
     DOWNLOAD_SPEED_WEIGHT,
@@ -51,12 +53,10 @@ class TaskService:
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.is_valid = True
+        self.wallet = settings.get_bittensor_wallet()
 
     async def upload_directory(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        local_dir: str,
-        remote_dir: str
+        self, ssh_client: asyncssh.SSHClientConnection, local_dir: str, remote_dir: str
     ):
         """Uploads a directory recursively to a remote server using AsyncSSH."""
         async with ssh_client.start_sftp_client() as sftp_client:
@@ -65,7 +65,7 @@ class TaskService:
                 remote_path = os.path.join(remote_dir, relative_dir)
 
                 # Create remote directory if it doesn't exist
-                result = await ssh_client.run(f'mkdir -p {remote_path}')
+                result = await ssh_client.run(f"mkdir -p {remote_path}")
                 if result.exit_status != 0:
                     raise Exception(f"Failed to create directory {remote_path}: {result.stderr}")
 
@@ -79,13 +79,70 @@ class TaskService:
                 # Await all upload tasks for the current directory
                 await asyncio.gather(*upload_tasks)
 
+    async def is_script_running(
+        self, ssh_client: asyncssh.SSHClientConnection, script_path: str
+    ) -> bool:
+        """
+        Check if a specific script is running.
+
+        Args:
+            ssh_client: SSH client instance
+            script_path: Full path to the script (e.g., '/root/app/gpus_utility.py')
+
+
+        Returns:
+            bool: True if script is running, False otherwise
+        """
+        try:
+            result = await ssh_client.run(f'ps aux | grep "python.*{script_path}"', timeout=10)
+            # Filter out the grep process itself
+            processes = [line for line in result.stdout.splitlines() if "grep" not in line]
+
+            logger.info(f"{script_path} running status: {bool(processes)}")
+            return bool(processes)
+        except Exception as e:
+            logger.error(f"Error checking {script_path} status: {e}")
+            return False
+
+    async def start_script(
+        self,
+        ssh_client,
+        script_path: str,
+        command_args: dict,
+        executor_info: ExecutorSSHInfo,
+    ) -> bool:
+        """
+        Start a script with specified arguments.
+
+        Args:
+            ssh_client: SSH client instance
+            script_path: Full path to the script (e.g., '/root/app/gpus_utility.py')
+            command_args: Dictionary of argument names and values
+
+        Returns:
+            bool: True if script started successfully, False otherwise
+        """
+        try:
+            # Build command string from arguments
+            args_string = " ".join([f"--{key} {value}" for key, value in command_args.items()])
+            command = (
+                f"nohup {executor_info.python_path} {script_path} {args_string} > /dev/null 2>&1 & "
+            )
+            # Run the script
+            result = await ssh_client.run(command, timeout=50, check=True)
+            logger.info(f"Started {script_path}: {result}")
+            return True
+        except Exception as e:
+            logger.error(f"Error starting script {script_path}: {e}", exc_info=True)
+            return False
+
     def validate_digests(self, docker_digests, docker_hub_digests):
         # Check if the list is empty
         if not docker_digests:
             return False
 
         # Get unique digests
-        unique_digests = list({item['digest'] for item in docker_digests})
+        unique_digests = list({item["digest"] for item in docker_digests})
 
         # Check for duplicates
         if len(unique_digests) != len(docker_digests):
@@ -99,25 +156,24 @@ class TaskService:
         return True
 
     async def clear_remote_directory(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        remote_dir: str
+        self, ssh_client: asyncssh.SSHClientConnection, remote_dir: str
     ):
         try:
             await ssh_client.run(f"rm -rf {remote_dir}", timeout=10)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error clearing remote directory: {e}")
 
     def get_available_port_map(
         self,
         executor_info: ExecutorSSHInfo,
-    ) -> Optional[Tuple[int, int]]:
+    ) -> tuple[int, int] | None:
         if executor_info.port_mappings:
-            port_mappings: list[Tuple[int, int]] = json.loads(executor_info.port_mappings)
+            port_mappings: list[tuple[int, int]] = json.loads(executor_info.port_mappings)
             port_mappings = [
                 (internal_port, external_port)
                 for internal_port, external_port in port_mappings
-                if internal_port != executor_info.ssh_port and external_port != executor_info.ssh_port
+                if internal_port != executor_info.ssh_port
+                and external_port != executor_info.ssh_port
             ]
 
             if not port_mappings:
@@ -126,11 +182,15 @@ class TaskService:
             return random.choice(port_mappings)
 
         if executor_info.port_range:
-            if '-' in executor_info.port_range:
-                min_port, max_port = map(int, (part.strip() for part in executor_info.port_range.split('-')))
+            if "-" in executor_info.port_range:
+                min_port, max_port = map(
+                    int, (part.strip() for part in executor_info.port_range.split("-"))
+                )
                 ports = list(range(min_port, max_port + 1))
             else:
-                ports = list(map(int, (part.strip() for part in executor_info.port_range.split(','))))
+                ports = list(
+                    map(int, (part.strip() for part in executor_info.port_range.split(",")))
+                )
         else:
             # Default range if port_range is empty
             ports = list(range(40000, 65536))
@@ -157,15 +217,17 @@ class TaskService:
         if port_map is None:
             log_text = _m(
                 "No port available for docker container",
-                extra=get_extra_info({
-                    "job_batch_id": job_batch_id,
-                    "miner_hotkey": miner_hotkey,
-                    "executor_uuid": executor_info.uuid,
-                    "executor_ip_address": executor_info.address,
-                    "executor_port": executor_info.port,
-                    "ssh_username": executor_info.ssh_username,
-                    "ssh_port": executor_info.ssh_port,
-                }),
+                extra=get_extra_info(
+                    {
+                        "job_batch_id": job_batch_id,
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": executor_info.uuid,
+                        "executor_ip_address": executor_info.address,
+                        "executor_port": executor_info.port,
+                        "ssh_username": executor_info.ssh_username,
+                        "ssh_port": executor_info.ssh_port,
+                    }
+                ),
             )
             log_status = "error"
             logger.error(log_text, exc_info=True)
@@ -212,8 +274,8 @@ class TaskService:
                 try:
                     command = f"docker rm {container_name} -f"
                     await ssh_client.run(command, timeout=20)
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error removing docker container: {e}")
 
                 return False, log_text, log_status
 
@@ -263,8 +325,8 @@ class TaskService:
             try:
                 command = f"docker rm {container_name} -f"
                 await ssh_client.run(command, timeout=20)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Error removing docker container: {e}")
 
             return False, log_text, log_status
 
@@ -276,7 +338,8 @@ class TaskService:
         private_key: str,
         public_key: str,
         encypted_files: MinerJobEnryptedFiles,
-        docker_hub_digests: dict[str, str]
+        docker_hub_digests: dict[str, str],
+        debug: bool = False,
     ):
         default_extra = {
             "job_batch_id": miner_info.job_batch_id,
@@ -304,10 +367,37 @@ class TaskService:
                 await ssh_client.run(f"rm -rf {remote_dir}")
                 await ssh_client.run(f"mkdir -p {remote_dir}")
 
+                # start gpus_utility.py
+                program_id = str(uuid.uuid4())
+                command_args = {
+                    "program_id": program_id,
+                    "signature": f"0x{keypair.sign(program_id.encode()).hex()}",
+                    "executor_id": executor_info.uuid,
+                    "validator_hotkey": keypair.ss58_address,
+                    "compute_rest_app_url": settings.COMPUTE_REST_API_URL,
+                }
+                script_path = f"{executor_info.root_dir}/src/gpus_utility.py"
+                if not await self.is_script_running(ssh_client, script_path):
+                    await self.start_script(ssh_client, script_path, command_args, executor_info)
+
+                if debug is True:
+                    logger.info("Debug mode is enabled. Skipping other tasks.")
+                    return (
+                        None,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        "info",
+                        "Debug mode is enabled. Skipping other tasks.",
+                    )
+
                 # upload temp directory
                 await self.upload_directory(ssh_client, encypted_files.tmp_directory, remote_dir)
 
-                remote_machine_scrape_file_path = f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
+                remote_machine_scrape_file_path = (
+                    f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
+                )
                 remote_score_file_path = f"{remote_dir}/{encypted_files.score_file_name}"
 
                 logger.info(
@@ -321,7 +411,7 @@ class TaskService:
                     ssh_client=ssh_client,
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
-                    command=f"chmod +x {remote_machine_scrape_file_path} && {remote_machine_scrape_file_path}"
+                    command=f"chmod +x {remote_machine_scrape_file_path} && {remote_machine_scrape_file_path}",
                 )
                 if not machine_specs:
                     log_status = "warning"
@@ -340,7 +430,11 @@ class TaskService:
                         log_text,
                     )
 
-                machine_spec = json.loads(self.ssh_service.decrypt_payload(encypted_files.encrypt_key, machine_specs[0].strip()))
+                machine_spec = json.loads(
+                    self.ssh_service.decrypt_payload(
+                        encypted_files.encrypt_key, machine_specs[0].strip()
+                    )
+                )
 
                 gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -355,23 +449,25 @@ class TaskService:
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
                 gpu_details = machine_spec.get("gpu", {}).get("details", [])
 
-                nvidia_driver = machine_spec.get("gpu", {}).get("driver", '')
-                libnvidia_ml = machine_spec.get('md5_checksums', {}).get('libnvidia_ml', '')
+                nvidia_driver = machine_spec.get("gpu", {}).get("driver", "")
+                libnvidia_ml = machine_spec.get("md5_checksums", {}).get("libnvidia_ml", "")
 
-                docker_version = machine_spec.get("docker", {}).get("version", '')
-                docker_digest = machine_spec.get('md5_checksums', {}).get('docker', '')
-                container_id = machine_spec.get('docker', {}).get('container_id', '')
+                docker_version = machine_spec.get("docker", {}).get("version", "")
+                docker_digest = machine_spec.get("md5_checksums", {}).get("docker", "")
+                container_id = machine_spec.get("docker", {}).get("container_id", "")
 
                 logger.info(
                     _m(
                         "Machine spec scraped",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "gpu_model": gpu_model,
-                            "gpu_count": gpu_count,
-                            "nvidia_driver": nvidia_driver,
-                            "libnvidia_ml": libnvidia_ml,
-                        }),
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "gpu_model": gpu_model,
+                                "gpu_count": gpu_count,
+                                "nvidia_driver": nvidia_driver,
+                                "libnvidia_ml": libnvidia_ml,
+                            }
+                        ),
                     ),
                 )
 
@@ -398,12 +494,12 @@ class TaskService:
                 if max_score == 0 or gpu_count == 0 or len(gpu_details) != gpu_count:
                     extra_info = {
                         **default_extra,
-                        "os_version": machine_spec.get('os', ''),
-                        "nvidia_cfg": machine_spec.get('nvidia_cfg', ''),
-                        "docker_cfg": machine_spec.get('docker_cfg', ''),
-                        "gpu_scrape_error": machine_spec.get('gpu_scrape_error', ''),
-                        "nvidia_cfg_scrape_error": machine_spec.get('nvidia_cfg_scrape_error', ''),
-                        "docker_cfg_scrape_error": machine_spec.get('docker_cfg_scrape_error', '')
+                        "os_version": machine_spec.get("os", ""),
+                        "nvidia_cfg": machine_spec.get("nvidia_cfg", ""),
+                        "docker_cfg": machine_spec.get("docker_cfg", ""),
+                        "gpu_scrape_error": machine_spec.get("gpu_scrape_error", ""),
+                        "nvidia_cfg_scrape_error": machine_spec.get("nvidia_cfg_scrape_error", ""),
+                        "docker_cfg_scrape_error": machine_spec.get("docker_cfg_scrape_error", ""),
                     }
                     if gpu_model:
                         extra_info["gpu_model"] = gpu_model
@@ -418,10 +514,12 @@ class TaskService:
 
                     log_text = _m(
                         f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
-                        extra=get_extra_info({
-                            **default_extra,
-                            **extra_info,
-                        }),
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                **extra_info,
+                            }
+                        ),
                     )
                     log_status = "warning"
                     logger.warning(log_text)
@@ -441,13 +539,15 @@ class TaskService:
                 if not docker_version or DOCKER_DIGESTS.get(docker_version) != docker_digest:
                     log_status = "warning"
                     log_text = _m(
-                        f"Docker is altered",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "docker_version": docker_version,
-                            "docker_digest": docker_digest,
-                            "container_id": container_id,
-                        }),
+                        "Docker is altered",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "docker_version": docker_version,
+                                "docker_digest": docker_digest,
+                                "container_id": container_id,
+                            }
+                        ),
                     )
                     logger.warning(log_text)
 
@@ -466,14 +566,16 @@ class TaskService:
                 if nvidia_driver and LIB_NVIDIA_ML_DIGESTS.get(nvidia_driver) != libnvidia_ml:
                     log_status = "warning"
                     log_text = _m(
-                        f"Nvidia driver is altered",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "gpu_model": gpu_model,
-                            "gpu_count": gpu_count,
-                            "nvidia_driver": nvidia_driver,
-                            "libnvidia_ml": libnvidia_ml,
-                        }),
+                        "Nvidia driver is altered",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "gpu_model": gpu_model,
+                                "gpu_count": gpu_count,
+                                "nvidia_driver": nvidia_driver,
+                                "libnvidia_ml": libnvidia_ml,
+                            }
+                        ),
                     )
                     logger.warning(log_text)
 
@@ -579,10 +681,9 @@ class TaskService:
                     if not self.is_valid:
                         log_text = _m(
                             "Docker digests are not valid",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "docker_digests": docker_digests
-                            }),
+                            extra=get_extra_info(
+                                {**default_extra, "docker_digests": docker_digests}
+                            ),
                         )
                         log_status = "error"
 
@@ -645,12 +746,14 @@ class TaskService:
                         log_text,
                     )
 
-                num_digits = hashcat_config.get('digits', 11)
-                avg_job_time = hashcat_config.get("average_time")[gpu_count - 1 if gpu_count <= 8 else 7] if hashcat_config.get("average_time") else 60
+                num_digits = hashcat_config.get("digits", 11)
+                avg_job_time = (
+                    hashcat_config.get("average_time")[gpu_count - 1 if gpu_count <= 8 else 7]
+                    if hashcat_config.get("average_time")
+                    else 60
+                )
                 hash_service = HashService.generate(
-                    gpu_count=gpu_count,
-                    num_digits=num_digits,
-                    timeout=int(avg_job_time * 2.5)
+                    gpu_count=gpu_count, num_digits=num_digits, timeout=int(avg_job_time * 2.5)
                 )
                 start_time = time.time()
 
@@ -708,8 +811,8 @@ class TaskService:
                 elif answer != hash_service.answer:
                     log_status = "error"
                     log_text = _m(
-                        f"Hashcat incorrect Answer",
-                        extra=get_extra_info(default_extra),
+                        "Hashcat incorrect Answer",
+                        extra=get_extra_info({**default_extra, "answer": answer, "hash_service_answer": hash_service.answer}),
                     )
                     logger.error(log_text)
 
@@ -744,10 +847,15 @@ class TaskService:
                     upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
                     download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
 
-                    score = max_score * gpu_count * UNRENTED_MULTIPLIER * (
-                        job_taken_score * JOB_TAKEN_TIME_WEIGHT
-                        + upload_speed_score * UPLOAD_SPEED_WEIGHT
-                        + download_speed_score * DOWNLOAD_SPEED_WEIGHT
+                    score = (
+                        max_score
+                        * gpu_count
+                        * UNRENTED_MULTIPLIER
+                        * (
+                            job_taken_score * JOB_TAKEN_TIME_WEIGHT
+                            + upload_speed_score * UPLOAD_SPEED_WEIGHT
+                            + download_speed_score * DOWNLOAD_SPEED_WEIGHT
+                        )
                     )
 
                     log_status = "info"
@@ -798,11 +906,13 @@ class TaskService:
             except Exception as redis_error:
                 log_text = _m(
                     "Error creating task redis_reset_error",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "error": str(e),
-                        "redis_reset_error": str(redis_error),
-                    }),
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "error": str(e),
+                            "redis_reset_error": str(redis_error),
+                        }
+                    ),
                 )
 
             logger.error(
@@ -835,7 +945,7 @@ class TaskService:
                 "executor_ip_address": executor_info.address,
                 "executor_port": executor_info.port,
                 "miner_hotkey": miner_hotkey,
-                "command": command[:100] + ('...' if len(command) > 100 else ''),
+                "command": command[:100] + ("..." if len(command) > 100 else ""),
             }
             context.set(f"[_run_task][{executor_name}]")
             logger.info(
@@ -851,7 +961,7 @@ class TaskService:
             actual_errors = [error for error in errors if "warnning" not in error.lower()]
 
             if len(results) == 0 and len(actual_errors) > 0:
-                logger.error(_m("Failed to execute command!", extra=get_extra_info(default_extra)))
+                logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "errors": actual_errors})))
                 raise Exception("Failed to execute command!")
 
             return results, None
