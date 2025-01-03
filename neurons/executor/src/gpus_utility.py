@@ -111,7 +111,7 @@ async def scrape_gpu_metrics(
                     }
                     
                     # Only send if there's a significant change in any GPU
-                    if True:
+                    if should_send:
                         payload = {
                             "gpu_utilization": gpu_utilization,
                             "cpu_ram_utilization": cpu_ram_utilization,
