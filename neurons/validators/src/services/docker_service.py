@@ -85,7 +85,8 @@ class DockerService:
         command: str,
         log_tag: str,
     ):
-        result = True
+        status = True
+        error = ''
         async with ssh_client.create_process(command) as process:
             async for line in process.stdout:
                 async with self.lock:
@@ -98,7 +99,8 @@ class DockerService:
                     )
 
             async for line in process.stderr:
-                result = False
+                status = False
+                error = line.strip()
                 async with self.lock:
                     self.logs_queue.append(
                         {
@@ -108,7 +110,7 @@ class DockerService:
                         }
                     )
 
-        return result
+        return status, error
 
     async def handle_stream_logs(
         self,
@@ -207,6 +209,7 @@ class DockerService:
             ),
         )
 
+        log_tag = "container_creation"
         custom_options = payload.custom_options
 
         try:
@@ -249,8 +252,6 @@ class DockerService:
                     ),
                 )
 
-                log_tag = "container_creation"
-
                 # set real-time logging
                 self.log_task = asyncio.create_task(
                     self.handle_stream_logs(
@@ -269,15 +270,18 @@ class DockerService:
                     )
 
                 command = f"docker pull {payload.docker_image}"
-                result = await self.execute_and_stream_logs(
+                status, error = await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
                     command=command,
                     log_tag=log_tag,
                 )
-                if not result:
+                if not status:
                     log_text = _m(
                         "Docker pull failed",
-                        extra=get_extra_info({default_extra}),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": error,
+                        }),
                     )
                     logger.error(log_text)
 
@@ -344,13 +348,16 @@ class DockerService:
 
                 volume_name = f"volume_{uuid}"
                 command = f"docker volume create {volume_name}"
-                result = await self.execute_and_stream_logs(
+                status, error = await self.execute_and_stream_logs(
                     ssh_client=ssh_client, command=command, log_tag="container_creation"
                 )
-                if not result:
+                if not status:
                     log_text = _m(
                         "Docker volume creation failed",
-                        extra=get_extra_info({default_extra}),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": error
+                        }),
                     )
                     logger.error(log_text)
 
@@ -387,13 +394,16 @@ class DockerService:
                 else:
                     command = f'docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
 
-                result = await self.execute_and_stream_logs(
+                status, error = await self.execute_and_stream_logs(
                     ssh_client=ssh_client, command=command, log_tag="container_creation"
                 )
-                if not result:
+                if not status:
                     log_text = _m(
                         "Docker container creation failed",
-                        extra=get_extra_info(default_extra),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": error,
+                        }),
                     )
                     logger.error(log_text)
 
@@ -410,7 +420,10 @@ class DockerService:
                 if not await self.check_container_running(ssh_client, container_name):
                     log_text = _m(
                         "Run docker run command but container is not running",
-                        extra=get_extra_info({**default_extra, "container_name": container_name}),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": container_name,
+                        }),
                     )
                     logger.error(log_text)
 
@@ -450,7 +463,7 @@ class DockerService:
                 )
         except Exception as e:
             log_text = _m(
-                "Docker container creation failed",
+                "Unknown Error create_container",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
             logger.error(log_text, exc_info=True)

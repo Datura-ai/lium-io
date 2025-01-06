@@ -52,7 +52,6 @@ class TaskService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-        self.is_valid = True
         self.wallet = settings.get_bittensor_wallet()
 
     async def upload_directory(
@@ -677,8 +676,8 @@ class TaskService:
 
                     # if not rented, check docker digests
                     docker_digests = machine_spec.get("docker", {}).get("containers", [])
-                    self.is_valid = self.validate_digests(docker_digests, docker_hub_digests)
-                    if not self.is_valid:
+                    is_docker_valid = self.validate_digests(docker_digests, docker_hub_digests)
+                    if not is_docker_valid:
                         log_text = _m(
                             "Docker digests are not valid",
                             extra=get_extra_info(
