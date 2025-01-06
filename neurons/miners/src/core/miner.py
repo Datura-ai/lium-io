@@ -146,7 +146,7 @@ class Miner:
         except Exception as e:
             logger.error(
                 _m(
-                    '[announce] Annoucing miner error',
+                    '[announce] Announcing miner error',
                     extra=get_extra_info({
                         **self.default_extra,
                         "error": str(e)
