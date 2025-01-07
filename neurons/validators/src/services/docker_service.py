@@ -322,7 +322,11 @@ class DockerService:
                 )
                 env_flags = (
                     " ".join(
-                        [f"-e {key}={value}" for key, value in custom_options.environment.items()]
+                        [
+                            f"-e {key}={value}"
+                            for key, value in custom_options.environment.items()
+                            if key and value and key.strip() and value.strip()
+                        ]
                     )
                     if custom_options and custom_options.environment
                     else ""
