@@ -246,8 +246,6 @@ class DockerService:
                 command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
                 result = await ssh_client.run(command)
                 if result.stdout.strip():
-                    ids = " ".join(result.stdout.strip().split("\n"))
-                    command = f'docker rm {ids} -f'
                     logger.info(
                         _m(
                             "Cleaning existing docker containers",
@@ -257,6 +255,12 @@ class DockerService:
                             }),
                         ),
                     )
+
+                    ids = " ".join(result.stdout.strip().split("\n"))
+                    command = f'docker rm {ids} -f'
+                    await ssh_client.run(command)
+                    
+                    command = f'docker volume prune -af'
                     await ssh_client.run(command)
 
                 logger.info(
