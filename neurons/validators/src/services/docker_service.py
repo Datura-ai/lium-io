@@ -243,6 +243,22 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
+                command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+                result = await ssh_client.run(command)
+                if result.stdout.strip():
+                    ids = " ".join(result.stdout.strip().split("\n"))
+                    command = f'docker rm {ids} -f'
+                    logger.info(
+                        _m(
+                            "Cleaning existing docker containers",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "command": command,
+                            }),
+                        ),
+                    )
+                    await ssh_client.run(command)
+
                 logger.info(
                     _m(
                         "Pulling docker image",
