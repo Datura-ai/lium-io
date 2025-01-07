@@ -246,9 +246,10 @@ class DockerService:
                 logger.info(
                     _m(
                         "Pulling docker image",
-                        extra=get_extra_info(
-                            {**default_extra, "docker_image": payload.docker_image}
-                        ),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "docker_image": payload.docker_image
+                        }),
                     ),
                 )
 
@@ -393,6 +394,16 @@ class DockerService:
                     command = f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
                     command = f'docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
+
+                logger.info(
+                    _m(
+                        "Creating docker container",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "command": command,
+                        }),
+                    ),
+                )
 
                 status, error = await self.execute_and_stream_logs(
                     ssh_client=ssh_client, command=command, log_tag="container_creation"
