@@ -251,6 +251,11 @@ class TaskService:
         container_name = f"container_{miner_hotkey}"
 
         try:
+            result = await ssh_client.run(f"docker ps -q -f name={container_name}")
+            if result.stdout.strip():
+                command = f"docker rm {container_name} -f"
+                await ssh_client.run(command)
+
             log_text = _m(
                 "Creating docker container",
                 extra=default_extra,
@@ -263,9 +268,13 @@ class TaskService:
 
             result = await ssh_client.run(command, timeout=20)
             if result.exit_status != 0:
+                error_message = result.stderr.strip() if result.stderr else "No error message available"
                 log_text = _m(
                     "Error creating docker connection",
-                    extra=get_extra_info(default_extra),
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error": error_message
+                    }),
                 )
                 log_status = "error"
                 logger.error(log_text, exc_info=True)
