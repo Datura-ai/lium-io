@@ -185,6 +185,33 @@ class DockerService:
             await asyncio.sleep(1)
         return False
 
+    async def clean_exisiting_containers(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+    ):
+        command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+        result = await ssh_client.run(command)
+        if result.stdout.strip():
+            ids = " ".join(result.stdout.strip().split("\n"))
+
+            logger.info(
+                _m(
+                    "Cleaning existing docker containers",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "command": command,
+                        "ids": ids,
+                    }),
+                ),
+            )
+
+            command = f'docker rm {ids} -f'
+            await ssh_client.run(command)
+
+            command = f'docker volume prune -af'
+            await ssh_client.run(command)
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -243,25 +270,7 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
-                result = await ssh_client.run(command)
-                if result.stdout.strip():
-                    logger.info(
-                        _m(
-                            "Cleaning existing docker containers",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "command": command,
-                            }),
-                        ),
-                    )
-
-                    ids = " ".join(result.stdout.strip().split("\n"))
-                    command = f'docker rm {ids} -f'
-                    await ssh_client.run(command)
-                    
-                    command = f'docker volume prune -af'
-                    await ssh_client.run(command)
+                await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
 
                 logger.info(
                     _m(
