@@ -100,7 +100,7 @@ class DockerService:
 
             async for line in process.stderr:
                 status = False
-                error = line.strip()
+                error += line
                 async with self.lock:
                     self.logs_queue.append(
                         {
