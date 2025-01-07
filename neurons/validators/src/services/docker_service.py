@@ -413,6 +413,7 @@ class DockerService:
                         "Docker container creation failed",
                         extra=get_extra_info({
                             **default_extra,
+                            "command": command,
                             "error": error,
                         }),
                     )
