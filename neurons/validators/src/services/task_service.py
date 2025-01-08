@@ -266,7 +266,7 @@ class TaskService:
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
             command = f"docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
-            result = await ssh_client.run(command, timeout=20)
+            result = await ssh_client.run(command)
             if result.exit_status != 0:
                 error_message = result.stderr.strip() if result.stderr else "No error message available"
                 log_text = _m(
@@ -281,7 +281,7 @@ class TaskService:
 
                 try:
                     command = f"docker rm {container_name} -f"
-                    await ssh_client.run(command, timeout=20)
+                    await ssh_client.run(command)
                 except Exception as e:
                     logger.error(f"Error removing docker container: {e}")
 
@@ -319,7 +319,7 @@ class TaskService:
                     await self.redis_service.rpop(key)
 
             command = f"docker rm {container_name} -f"
-            await ssh_client.run(command, timeout=20)
+            await ssh_client.run(command)
 
             return True, log_text, log_status
         except Exception as e:
@@ -332,7 +332,7 @@ class TaskService:
 
             try:
                 command = f"docker rm {container_name} -f"
-                await ssh_client.run(command, timeout=20)
+                await ssh_client.run(command)
             except Exception as e:
                 logger.error(f"Error removing docker container: {e}")
 
@@ -683,6 +683,28 @@ class TaskService:
                                 log_text,
                             )
 
+                    # if not rented, check renting ports
+                    success, log_text, log_status = await self.docker_connection_check(
+                        ssh_client=ssh_client,
+                        job_batch_id=miner_info.job_batch_id,
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_info=executor_info,
+                        private_key=private_key,
+                        public_key=public_key,
+                    )
+                    if not success:
+                        await self.clear_remote_directory(ssh_client, remote_dir)
+
+                        return (
+                            None,
+                            executor_info,
+                            0,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
+
                     # if not rented, check docker digests
                     docker_digests = machine_spec.get("docker", {}).get("containers", [])
                     is_docker_valid = self.validate_digests(docker_digests, docker_hub_digests)
@@ -697,28 +719,6 @@ class TaskService:
 
                         logger.warning(log_text)
 
-                        await self.clear_remote_directory(ssh_client, remote_dir)
-
-                        return (
-                            None,
-                            executor_info,
-                            0,
-                            0,
-                            miner_info.job_batch_id,
-                            log_status,
-                            log_text,
-                        )
-
-                    # if not rented, check renting ports
-                    success, log_text, log_status = await self.docker_connection_check(
-                        ssh_client=ssh_client,
-                        job_batch_id=miner_info.job_batch_id,
-                        miner_hotkey=miner_info.miner_hotkey,
-                        executor_info=executor_info,
-                        private_key=private_key,
-                        public_key=public_key,
-                    )
-                    if not success:
                         await self.clear_remote_directory(ssh_client, remote_dir)
 
                         return (
