@@ -226,6 +226,7 @@ class DockerService:
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
+            "docker_image": payload.docker_image,
             "debug": payload.debug,
         }
 
