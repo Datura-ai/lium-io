@@ -878,6 +878,7 @@ class TaskService:
                                 "download_speed": download_speed,
                                 "gpu_model": gpu_model,
                                 "gpu_count": gpu_count,
+                                "unrented_multiplier": UNRENTED_MULTIPLIER,
                             }
                         ),
                     )
