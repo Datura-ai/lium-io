@@ -7,6 +7,7 @@ GPU_MAX_SCORES = {
     "NVIDIA H100 NVL": 2.79,
     "NVIDIA H100 PCIe": 2.69,
     "NVIDIA GeForce RTX 4090": 0.69,
+    "NVIDIA GeForce RTX 4090 D": 0.62,
     "NVIDIA RTX 4000 Ada Generation": 0.38,
     "NVIDIA RTX 6000 Ada Generation": 1.03,
     "NVIDIA L4": 0.43,
@@ -272,6 +273,19 @@ HASHCAT_CONFIGS = {
             27.75535701115926,
             30.86851720128741,
             34.388632106781,
+        ],
+    },
+    "NVIDIA GeForce RTX 4090 D": {
+        "digits": 11,
+        "average_time": [
+            12.535813426971435,
+            13.367040371894836,
+            14.397390270233155,
+            15.773727321624756,
+            16.52033654212952,
+            18.87070236206055,
+            20.572682762145995,
+            22.169760519266127,
         ],
     },
     "NVIDIA GeForce RTX 4090": {
