@@ -50,7 +50,7 @@ class ContainerRequestType(enum.Enum):
     ContainerStartRequest = "ContainerStartRequest"
     ContainerStopRequest = "ContainerStopRequest"
     ContainerDeleteRequest = "ContainerDeleteRequest"
-    DuplicateContainersResponse = "DuplicateContainersResponse"
+    DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -140,6 +140,6 @@ class FailedContainerRequest(ContainerBaseResponse):
     error_code: FailedContainerErrorCodes | None = None
 
 
-class DuplicateContainersResponse(BaseModel):
-    message_type: ContainerRequestType = ContainerRequestType.DuplicateContainersResponse
-    containers: dict[str, list]
+class DuplicateExecutorsResponse(BaseModel):
+    message_type: ContainerRequestType = ContainerRequestType.DuplicateExecutorsResponse
+    executors: dict[str, list]
