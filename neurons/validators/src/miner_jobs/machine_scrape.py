@@ -370,6 +370,15 @@ def nvmlSystemGetDriverVersion():
     return c_version.value
 
 
+@convertStrBytes
+def nvmlDeviceGetUUID(handle):
+    c_uuid = create_string_buffer(NVML_DEVICE_UUID_V2_BUFFER_SIZE)
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetUUID")
+    ret = fn(handle, c_uuid, c_uint(NVML_DEVICE_UUID_V2_BUFFER_SIZE))
+    _nvmlCheckReturn(ret)
+    return c_uuid.value
+
+
 def nvmlSystemGetCudaDriverVersion():
     c_cuda_version = c_int()
     fn = _nvmlGetFunctionPointer("nvmlSystemGetCudaDriverVersion")
@@ -658,6 +667,7 @@ def get_machine_specs():
             data["gpu"]["details"].append(
                 {
                     "name": nvmlDeviceGetName(handle),
+                    "uuid": nvmlDeviceGetUUID(handle),
                     "capacity": nvmlDeviceGetMemoryInfo(handle).total / (1024 ** 2),
                     "cuda": f"{major}.{minor}",
                     "power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
