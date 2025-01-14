@@ -13,7 +13,7 @@ class RequestType(enum.Enum):
     ExecutorSpecRequest = "ExecutorSpecRequest"
     RentedMachineRequest = "RentedMachineRequest"
     LogStreamRequest = "LogStreamRequest"
-    DuplicateContainersRequest = "DuplicateContainersRequest"
+    DuplicateExecutorsRequest = "DuplicateExecutorsRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -73,5 +73,5 @@ class LogStreamRequest(BaseValidatorRequest):
     logs: list[dict]
 
 
-class DuplicateContainersRequest(BaseValidatorRequest):
-    message_type: RequestType = RequestType.DuplicateContainersRequest
+class DuplicateExecutorsRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.DuplicateExecutorsRequest
