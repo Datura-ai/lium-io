@@ -6,6 +6,6 @@ COPY entrypoint.sh /entrypoint.sh
 
 RUN chmod u+x /entrypoint.sh
 
-LABEL version="3.3.2"
+LABEL version="3.3.3"
 
 ENTRYPOINT ["/entrypoint.sh"]

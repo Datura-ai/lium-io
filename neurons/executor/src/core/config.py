@@ -8,7 +8,8 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "compute-subnet-executor"
 
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8001)
-    SSH_PORT: int = Field(env="SSH_PORT", default=22)
+    SSH_PORT: int = Field(env="SSH_PORT", default=2200)
+    SSH_PUBLIC_PORT: Optional[int] = Field(env="SSH_PUBLIC_PORT", default=None)
 
     MINER_HOTKEY_SS58_ADDRESS: str = Field(env="MINER_HOTKEY_SS58_ADDRESS")
 
