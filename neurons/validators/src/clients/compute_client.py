@@ -13,7 +13,7 @@ from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerDeleteRequest,
     FailedContainerRequest,
-    DuplicateContainersResponse,
+    DuplicateExecutorsResponse,
     ContainerStartRequest,
     ContainerStopRequest,
     ContainerBaseRequest,
@@ -24,7 +24,7 @@ from protocol.vc_protocol.validator_requests import (
     ExecutorSpecRequest,
     LogStreamRequest,
     RentedMachineRequest,
-    DuplicateContainersRequest,
+    DuplicateExecutorsRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
@@ -407,7 +407,7 @@ class ComputeClient:
                         extra=self.logging_extra,
                     )
                 )
-                await self.send_model(DuplicateContainersRequest())
+                await self.send_model(DuplicateExecutorsRequest())
 
                 await asyncio.sleep(10 * 60)
             else:
@@ -460,26 +460,26 @@ class ComputeClient:
             return
 
         try:
-            response = pydantic.TypeAdapter(DuplicateContainersResponse).validate_json(raw_msg)
+            response = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
         except pydantic.ValidationError as exc:
             logger.error(
                 _m(
-                    "could not parse raw message as DuplicateContainersResponse",
+                    "could not parse raw message as DuplicateExecutorsResponse",
                     extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
                 )
             )
         else:
             logger.info(
                 _m(
-                    "Duplicated containers",
-                    extra={**self.logging_extra, "machines": response.containers},
+                    "Duplicated executors",
+                    extra={**self.logging_extra, "executors": len(response.executors)},
                 )
             )
 
             redis_service = self.miner_service.redis_service
             await redis_service.delete(DUPLICATED_MACHINE_SET)
 
-            for container_id, details_list in response.containers.items():
+            for _, details_list in response.executors.items():
                 for detail in details_list:
                     executor_id = detail.get("executor_id")
                     miner_hotkey = detail.get("miner_hotkey")

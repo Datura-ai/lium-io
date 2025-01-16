@@ -7,6 +7,7 @@ GPU_MAX_SCORES = {
     "NVIDIA H100 NVL": 2.79,
     "NVIDIA H100 PCIe": 2.69,
     "NVIDIA GeForce RTX 4090": 0.69,
+    "NVIDIA GeForce RTX 4090 D": 0.62,
     "NVIDIA RTX 4000 Ada Generation": 0.38,
     "NVIDIA RTX 6000 Ada Generation": 1.03,
     "NVIDIA L4": 0.43,
@@ -34,7 +35,7 @@ DOWNLOAD_SPEED_WEIGHT = 0.05
 
 MAX_GPU_COUNT = 14
 
-UNRENTED_MULTIPLIER = 0.25
+UNRENTED_MULTIPLIER = 1
 
 GPU_UTILIZATION_LIMIT = 1
 GPU_MEMORY_UTILIZATION_LIMIT = 1
@@ -274,6 +275,19 @@ HASHCAT_CONFIGS = {
             34.388632106781,
         ],
     },
+    "NVIDIA GeForce RTX 4090 D": {
+        "digits": 11,
+        "average_time": [
+            12.535813426971435,
+            13.367040371894836,
+            14.397390270233155,
+            15.773727321624756,
+            16.52033654212952,
+            18.87070236206055,
+            20.572682762145995,
+            22.169760519266127,
+        ],
+    },
     "NVIDIA GeForce RTX 4090": {
         "digits": 11,
         "average_time": [
@@ -322,6 +336,7 @@ LIB_NVIDIA_ML_DIGESTS = {
     "560.35.05": "1eec299b50e33a6cfa5155ded53495ab",
     "565.57.01": "c801dd3fc4660f3a8ddf977cfdffe113",
     "550.127.08": "ac925f2cd192ad971c5466d55945a243",
+    "550.142": "e68b535a61be6434fc7f12450561a3d0"
 }
 
 DOCKER_DIGESTS = {

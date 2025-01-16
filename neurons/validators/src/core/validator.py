@@ -107,7 +107,7 @@ class Validator:
                 else:
                     self.miner_scores = json.loads(miner_scores_json)
 
-            await self.redis_service.clear_all_ssh_ports()
+            # await self.redis_service.clear_all_ssh_ports()
         except Exception as e:
             logger.error(
                 _m(

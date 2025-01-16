@@ -26,7 +26,7 @@ class MinerService:
 
         return {
             "ssh_username": self.ssh_service.get_current_os_user(),
-            "ssh_port": settings.SSH_PORT,
+            "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
             "python_path": sys.executable,
             "root_dir": str(Path(__file__).resolve().parents[2]),
             "port_range": settings.RENTING_PORT_RANGE,
