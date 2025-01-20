@@ -106,7 +106,7 @@ class TaskService:
 
     async def start_script(
         self,
-        ssh_client,
+        ssh_client: asyncssh.SSHClientConnection,
         script_path: str,
         command_args: dict,
         executor_info: ExecutorSSHInfo,
@@ -125,6 +125,7 @@ class TaskService:
         try:
             # Build command string from arguments
             args_string = " ".join([f"--{key} {value}" for key, value in command_args.items()])
+            await ssh_client.run("pip install aiohttp click pynvml psutil", timeout=30)
             command = (
                 f"nohup {executor_info.python_path} {script_path} {args_string} > /dev/null 2>&1 & "
             )
