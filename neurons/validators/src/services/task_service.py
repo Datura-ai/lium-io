@@ -105,7 +105,7 @@ class TaskService:
 
     async def start_script(
         self,
-        ssh_client,
+        ssh_client: asyncssh.SSHClientConnection,
         script_path: str,
         command_args: dict,
         executor_info: ExecutorSSHInfo,
@@ -124,6 +124,7 @@ class TaskService:
         try:
             # Build command string from arguments
             args_string = " ".join([f"--{key} {value}" for key, value in command_args.items()])
+            await ssh_client.run("pip install aiohttp click pynvml psutil", timeout=30)
             command = (
                 f"nohup {executor_info.python_path} {script_path} {args_string} > /dev/null 2>&1 & "
             )
@@ -225,6 +226,7 @@ class TaskService:
                         "executor_port": executor_info.port,
                         "ssh_username": executor_info.ssh_username,
                         "ssh_port": executor_info.ssh_port,
+                        "version": settings.VERSION
                     }
                 ),
             )
@@ -245,6 +247,7 @@ class TaskService:
             "ssh_port": executor_info.ssh_port,
             "internal_port": internal_port,
             "external_port": external_port,
+            "version": settings.VERSION,
         }
         context.set(f"[_docker_connection_check][{executor_name}]")
 
@@ -357,6 +360,7 @@ class TaskService:
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
+            "version": settings.VERSION,
         }
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
@@ -955,6 +959,7 @@ class TaskService:
                 "executor_port": executor_info.port,
                 "miner_hotkey": miner_hotkey,
                 "command": command[:100] + ("..." if len(command) > 100 else ""),
+                "version": settings.VERSION,
             }
             context.set(f"[_run_task][{executor_name}]")
             logger.info(
