@@ -3,9 +3,8 @@ WORKDIR /root/executor
 
 COPY docker-compose.app.yml docker-compose.yml
 COPY entrypoint.sh /entrypoint.sh
+COPY version.txt .
 
 RUN chmod u+x /entrypoint.sh
-
-LABEL version="3.3.3"
 
 ENTRYPOINT ["/entrypoint.sh"]
