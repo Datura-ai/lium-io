@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     )
 
     ENV: str = Field(env="ENV", default="dev")
+    
+    # Read version from version.txt
+    VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

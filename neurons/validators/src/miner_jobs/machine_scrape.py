@@ -79,6 +79,8 @@ NVML_CLOCK_MEM = 2
 NVML_CLOCK_VIDEO = 3
 NVML_CLOCK_COUNT = 4
 
+NVML_VALUE_NOT_AVAILABLE_ulonglong = c_ulonglong(-1)
+
 
 class struct_c_nvmlDevice_t(Structure):
     pass  # opaque handle
@@ -220,6 +222,21 @@ class NVMLError(Exception):
 
     def __eq__(self, other):
         return self.value == other.value
+
+
+class c_nvmlProcessInfo_v2_t(_PrintableStructure):
+    _fields_ = [
+        ('pid', c_uint),
+        ('usedGpuMemory', c_ulonglong),
+        ('gpuInstanceId', c_uint),
+        ('computeInstanceId', c_uint),
+    ]
+    _fmt_ = {'usedGpuMemory': "%d B"}
+
+
+c_nvmlProcessInfo_v3_t = c_nvmlProcessInfo_v2_t
+
+c_nvmlProcessInfo_t = c_nvmlProcessInfo_v3_t
 
 
 def convertStrBytes(func):
@@ -520,6 +537,57 @@ def nvmlDeviceGetUtilizationRates(handle):
     return c_util
 
 
+class nvmlFriendlyObject(object):
+    def __init__(self, dictionary):
+        for x in dictionary:
+            setattr(self, x, dictionary[x])
+
+    def __str__(self):
+        return self.__dict__.__str__()
+
+
+def nvmlStructToFriendlyObject(struct):
+    d = {}
+    for x in struct._fields_:
+        key = x[0]
+        value = getattr(struct, key)
+        # only need to convert from bytes if bytes, no need to check python version.
+        d[key] = value.decode() if isinstance(value, bytes) else value
+    obj = nvmlFriendlyObject(d)
+    return obj
+
+
+def nvmlDeviceGetComputeRunningProcesses_v2(handle):
+    # first call to get the size
+    c_count = c_uint(0)
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetComputeRunningProcesses_v2")
+    ret = fn(handle, byref(c_count), None)
+    if (ret == NVML_SUCCESS):
+        # special case, no running processes
+        return []
+    elif (ret == NVML_ERROR_INSUFFICIENT_SIZE):
+        # typical case
+        # oversize the array incase more processes are created
+        c_count.value = c_count.value * 2 + 5
+        proc_array = c_nvmlProcessInfo_v2_t * c_count.value
+        c_procs = proc_array()
+        # make the call again
+        ret = fn(handle, byref(c_count), c_procs)
+        _nvmlCheckReturn(ret)
+        procs = []
+        for i in range(c_count.value):
+            # use an alternative struct for this object
+            obj = nvmlStructToFriendlyObject(c_procs[i])
+            if (obj.usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value):
+                # special case for WDDM on Windows, see comment above
+                obj.usedGpuMemory = None
+            procs.append(obj)
+        return procs
+    else:
+        # error case
+        raise NVMLError(ret)
+
+
 def run_cmd(cmd):
     proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True)
     if proc.returncode != 0:
@@ -623,6 +691,28 @@ def get_file_content(path: str):
     return content
 
 
+def get_gpu_processes(pids: set):
+    if not pids:
+        return []
+
+    processes = []
+    for pid in pids:
+        try:
+            cmd = f'cat /proc/{pid}/cgroup'
+            info = run_cmd(cmd).strip()
+            processes.append({
+                "pid": pid,
+                "info": info
+            })
+        except:
+            processes.append({
+                "pid": pid,
+                "info": None
+            })
+
+    return processes
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -631,6 +721,8 @@ def get_machine_specs():
         return data
 
     data["gpu"] = {"count": 0, "details": []}
+    gpu_process_ids = set()
+
     try:
         libnvidia_path = get_libnvidia_ml_path()
         if not libnvidia_path:
@@ -680,6 +772,12 @@ def get_machine_specs():
                 }
             )
 
+            processes = nvmlDeviceGetComputeRunningProcesses_v2(handle)
+
+            # Collect process IDs
+            for proc in processes:
+                gpu_process_ids.add(proc.pid)
+
         nvmlShutdown()
     except Exception as exc:
         # print(f'Error getting os specs: {exc}', flush=True)
@@ -698,6 +796,8 @@ def get_machine_specs():
             data["docker_cfg"] = run_cmd(docker_cfg_cmd)
         except Exception as exc:
             data["docker_cfg_scrape_error"] = repr(exc)
+
+    data['gpu_processes'] = get_gpu_processes(gpu_process_ids)
 
     data["cpu"] = {"count": 0, "model": "", "clocks": []}
     try:

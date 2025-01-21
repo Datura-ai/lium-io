@@ -53,6 +53,4 @@ RUN mkdir -p /etc/docker
 RUN mkdir -p /etc/nvidia-container-runtime
 RUN mkdir -p /root/.ssh
 
-LABEL version="3.3.3"
-
 CMD ["bash", "run.sh"]
