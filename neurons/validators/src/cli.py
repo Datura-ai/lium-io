@@ -198,7 +198,7 @@ async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: st
     miner_service: MinerService = ioc["MinerService"]
     # mock custom options
     custom_options = CustomOptions(
-        volumes=["/var/runer/docker.sock:/var/runer/docker.sock"],
+        volumes="/var/runer/docker.sock:/var/runer/docker.sock",
         environment={"UPDATED_PUBLIC_KEY":"user_public_key"},
         entrypoint="",
         internal_ports=[22, 8002],

@@ -5,7 +5,7 @@ from pydantic import BaseModel, field_validator
 
 
 class CustomOptions(BaseModel):
-    volumes: list[str] | None = None
+    volumes: str | None = None
     environment: dict[str, str] | None = None
     entrypoint: str | None = None
     internal_ports: list[int] | None = None

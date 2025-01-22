@@ -335,7 +335,7 @@ class DockerService:
                 # Prepare extra options
                 sanitized_volumes = [
                     volume for volume
-                    in (custom_options.volumes if custom_options and custom_options.volumes else [])
+                    in (custom_options.volumes.split(",") if custom_options and custom_options.volumes else [])
                     if volume.strip()
                 ]
                 volume_flags = (
