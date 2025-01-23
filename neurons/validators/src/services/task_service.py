@@ -466,7 +466,6 @@ class TaskService:
 
                 docker_version = machine_spec.get("docker", {}).get("version", "")
                 docker_digest = machine_spec.get("md5_checksums", {}).get("docker", "")
-                container_id = machine_spec.get("docker", {}).get("container_id", "")
 
                 logger.info(
                     _m(
@@ -557,7 +556,6 @@ class TaskService:
                                 **default_extra,
                                 "docker_version": docker_version,
                                 "docker_digest": docker_digest,
-                                "container_id": container_id,
                             }
                         ),
                     )
@@ -778,7 +776,10 @@ class TaskService:
                 if not results:
                     log_text = _m(
                         "No result from training job task.",
-                        extra=get_extra_info(default_extra),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": str(err)
+                        }),
                     )
                     log_status = "warning"
                     logger.warning(log_text)
