@@ -641,6 +641,10 @@ def get_docker_info(content: bytes):
             result = run_cmd(f'{docker_path}  inspect --format "{{{{json .RepoDigests}}}}" {image_id}')
             repo_digests = json.loads(result.strip())
 
+            # Get the container name
+            result = run_cmd(f'{docker_path} inspect --format "{{{{.Name}}}}" {container_id}')
+            container_name = result.strip().lstrip('/')
+
             digest = None
             if repo_digests:
                 digest = repo_digests[0].split('@')[1]
@@ -648,9 +652,9 @@ def get_docker_info(content: bytes):
                     data["container_id"] = container_id
 
             if digest:
-                containers.append({'id': container_id, 'digest': digest})
+                containers.append({'id': container_id, 'digest': digest, "name": container_name})
             else:
-                containers.append({'id': container_id, 'digest': ''})
+                containers.append({'id': container_id, 'digest': '', "name": container_name})
 
         data["containers"] = containers
 
