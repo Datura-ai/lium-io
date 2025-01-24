@@ -1,4 +1,5 @@
 import os
+import random
 import subprocess
 from typing import Annotated
 from pathlib import Path
@@ -48,7 +49,8 @@ class FileEncryptService:
         if tmp_directory.exists() and tmp_directory.is_dir():
             shutil.rmtree(tmp_directory)
 
-        encrypt_key = self.ssh_service.generate_random_string()
+        string_count = random.randint(10, 100)
+        encrypt_key = self.ssh_service.generate_random_string(string_count)
 
         machine_scrape_file_path = str(
             Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
