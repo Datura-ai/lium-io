@@ -695,7 +695,7 @@ def get_file_content(path: str):
     return content
 
 
-def get_gpu_processes(pids: set):
+def get_gpu_processes(pids: set, containers: list[dict]):
     if not pids:
         return []
 
@@ -704,14 +704,31 @@ def get_gpu_processes(pids: set):
         try:
             cmd = f'cat /proc/{pid}/cgroup'
             info = run_cmd(cmd).strip()
+
+            # Find the container name by checking if the container ID is in the info
+            container_name = None
+            # if info == "0::/":
+            #     container_name = "executor"
+            # else:
+            #     for container in containers:
+            #         if container['id'] in info:
+            #             container_name = container['name']
+            #             break
+            for container in containers:
+                if container['id'] in info:
+                    container_name = container['name']
+                    break
+
             processes.append({
                 "pid": pid,
-                "info": info
+                "info": info,
+                "container_name": container_name
             })
         except:
             processes.append({
                 "pid": pid,
-                "info": None
+                "info": None,
+                "container_name": None,
             })
 
     return processes
@@ -801,7 +818,10 @@ def get_machine_specs():
         except Exception as exc:
             data["docker_cfg_scrape_error"] = repr(exc)
 
-    data['gpu_processes'] = get_gpu_processes(gpu_process_ids)
+    docker_content = get_file_content("/usr/bin/docker")
+    data["docker"] = get_docker_info(docker_content)
+
+    data['gpu_processes'] = get_gpu_processes(gpu_process_ids, data["docker"]["containers"])
 
     data["cpu"] = {"count": 0, "model": "", "clocks": []}
     try:
@@ -860,9 +880,6 @@ def get_machine_specs():
         data["os_scrape_error"] = repr(exc)
 
     data["network"] = get_network_speed()
-
-    docker_content = get_file_content("/usr/bin/docker")
-    data["docker"] = get_docker_info(docker_content)
 
     data["md5_checksums"] = {
         "nvidia_smi": get_md5_checksum_from_path(run_cmd("which nvidia-smi").strip()),
