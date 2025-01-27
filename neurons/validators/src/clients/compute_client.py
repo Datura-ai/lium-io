@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import NoReturn
 
 import bittensor
@@ -8,35 +9,34 @@ import pydantic
 import redis.asyncio as aioredis
 import tenacity
 import websockets
+from datura.requests.base import BaseRequest
 from payload_models.payloads import (
+    ContainerBaseRequest,
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleteRequest,
-    FailedContainerRequest,
-    DuplicateExecutorsResponse,
     ContainerStartRequest,
     ContainerStopRequest,
-    ContainerBaseRequest,
+    DuplicateExecutorsResponse,
+    FailedContainerRequest,
 )
 from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
-    AuthenticateRequest,
+    DuplicateExecutorsRequest,
     ExecutorSpecRequest,
     LogStreamRequest,
     RentedMachineRequest,
-    DuplicateExecutorsRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
-from datura.requests.base import BaseRequest
 
 from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
 from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
 from services.redis_service import (
+    DUPLICATED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL_NAME,
     RENTED_MACHINE_SET,
-    DUPLICATED_MACHINE_SET,
     STREAMING_LOG_CHANNEL,
 )
 
@@ -82,7 +82,15 @@ class ComputeClient:
                 extra=self.logging_extra,
             )
         )
-        return websockets.connect(self.compute_app_uri)
+        # set headers for authentication in celium backend
+        headers = {
+            "X-Validator-Timestamp": datetime.utcnow().timestamp(),
+            "X-Validator-Hotkey": self.keypair.ss58_address,
+        }
+        payload = f"{headers['X-Validator-Timestamp']}:{headers['X-Validator-Hotkey']}"
+        headers["X-Validator-Signature"] = f"0x{self.keypair.sign(payload).hex()}"
+
+        return websockets.connect(self.compute_app_uri, additional_headers=headers)
 
     async def miner_driver_awaiter(self):
         """avoid memory leak by awaiting miner driver tasks"""
@@ -175,20 +183,7 @@ class ComputeClient:
 
     async def handle_connection(self, ws: ClientConnection):
         """handle a single websocket connection"""
-        await ws.send(AuthenticateRequest.from_keypair(self.keypair).model_dump_json())
-
-        raw_msg = await ws.recv()
-        try:
-            response = Response.model_validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            raise AuthenticationError(
-                "did not receive Response for AuthenticationRequest", []
-            ) from exc
-        if response.status != "success":
-            raise AuthenticationError("auth request received failed response", response.errors)
-
         self.ws = ws
-
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
 
@@ -483,7 +478,9 @@ class ComputeClient:
                 for detail in details_list:
                     executor_id = detail.get("executor_id")
                     miner_hotkey = detail.get("miner_hotkey")
-                    await redis_service.sadd(DUPLICATED_MACHINE_SET, f"{miner_hotkey}:{executor_id}")
+                    await redis_service.sadd(
+                        DUPLICATED_MACHINE_SET, f"{miner_hotkey}:{executor_id}"
+                    )
 
             return
 
@@ -506,7 +503,13 @@ class ComputeClient:
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         return await get_miner_axon_info(hotkey)
 
-    async def miner_driver(self, job_request: ContainerCreateRequest | ContainerDeleteRequest | ContainerStopRequest | ContainerStartRequest):
+    async def miner_driver(
+        self,
+        job_request: ContainerCreateRequest
+        | ContainerDeleteRequest
+        | ContainerStopRequest
+        | ContainerStartRequest,
+    ):
         """drive a miner client from job start to completion, then close miner connection"""
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logging_extra = {
