@@ -29,6 +29,7 @@ from services.const import (
     DOCKER_DIGESTS,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
+    VERIFY_JOB_REQUIRED_COUNT,
 )
 from services.redis_service import (
     RedisService,
@@ -341,6 +342,9 @@ class TaskService:
 
             return False, log_text, log_status
 
+    async def clear_verify_count(self, executor_info: ExecutorSSHInfo):
+        await self.redis_service.set_verify_job_count(executor_info.uuid, 0)
+
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -431,6 +435,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
 
                     return (
                         None,
@@ -467,6 +472,13 @@ class TaskService:
                 docker_version = machine_spec.get("docker", {}).get("version", "")
                 docker_digest = machine_spec.get("md5_checksums", {}).get("docker", "")
 
+                ram = machine_spec.get("ram", {}).get("total", 0)
+                storage = machine_spec.get("hard_disk", {}).get("free", 0)
+
+                vram = 0
+                for detail in gpu_details:
+                    vram += detail.get("capacity", 0) * 1024
+
                 logger.info(
                     _m(
                         "Machine spec scraped",
@@ -491,6 +503,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
 
                     return (
                         machine_spec,
@@ -536,6 +549,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
 
                     return (
                         machine_spec,
@@ -562,6 +576,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
 
                     return (
                         machine_spec,
@@ -590,6 +605,39 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
+                if ram < vram or storage < vram * 1.5:
+                    log_status = "warning"
+                    log_text = _m(
+                        "Nvidia driver is altered",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "gpu_model": gpu_model,
+                                "gpu_count": gpu_count,
+                                "memory": ram,
+                                "vram": vram,
+                                "storage": storage,
+                                "nvidia_driver": nvidia_driver,
+                                "libnvidia_ml": libnvidia_ml,
+                            }
+                        ),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
 
                     return (
                         machine_spec,
@@ -621,6 +669,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
 
                     return (
                         machine_spec,
@@ -674,6 +723,7 @@ class TaskService:
                             logger.warning(log_text)
 
                             await self.clear_remote_directory(ssh_client, remote_dir)
+                            await self.clear_verify_count(executor_info)
 
                             return (
                                 machine_spec,
@@ -696,6 +746,7 @@ class TaskService:
                     )
                     if not success:
                         await self.clear_remote_directory(ssh_client, remote_dir)
+                        await self.clear_verify_count(executor_info)
 
                         return (
                             None,
@@ -722,6 +773,7 @@ class TaskService:
                         logger.warning(log_text)
 
                         await self.clear_remote_directory(ssh_client, remote_dir)
+                        await self.clear_verify_count(executor_info)
 
                         return (
                             None,
@@ -745,6 +797,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
 
                     return (
                         None,
@@ -785,6 +838,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
 
                     return (
                         machine_spec,
@@ -821,6 +875,19 @@ class TaskService:
                     )
                     logger.error(log_text)
 
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
                 elif answer != hash_service.answer:
                     log_status = "error"
                     log_text = _m(
@@ -828,6 +895,19 @@ class TaskService:
                         extra=get_extra_info({**default_extra, "answer": answer, "hash_service_answer": hash_service.answer}),
                     )
                     logger.error(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verify_count(executor_info)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 # elif job_taken_time > avg_job_time * 2:
                 #     log_status = "error"
@@ -838,12 +918,18 @@ class TaskService:
                 #     logger.error(log_text)
 
                 else:
+                    verify_count = await self.redis_service.get_verify_job_count(executor_info.uuid)
+                    verify_count += 1
+                    await self.redis_service.set_verify_job_count(executor_info.uuid, verify_count)
+
                     logger.info(
                         _m(
                             "Job taken time for executor",
-                            extra=get_extra_info(
-                                {**default_extra, "job_taken_time": job_taken_time}
-                            ),
+                            extra=get_extra_info({
+                                **default_extra,
+                                "job_taken_time": job_taken_time,
+                                "verify_job_count": verify_count,
+                            }),
                         ),
                     )
 
@@ -877,12 +963,15 @@ class TaskService:
                         extra=get_extra_info(
                             {
                                 **default_extra,
-                                "score": score,
+                                "job_score": score,
+                                "acutal_score": score if verify_count >= VERIFY_JOB_REQUIRED_COUNT else 0,
                                 "job_taken_time": job_taken_time,
                                 "upload_speed": upload_speed,
                                 "download_speed": download_speed,
                                 "gpu_model": gpu_model,
                                 "gpu_count": gpu_count,
+                                "verify_job_count": verify_count,
+                                "remaining_jobs_before_emission": 0 if verify_count >= VERIFY_JOB_REQUIRED_COUNT else VERIFY_JOB_REQUIRED_COUNT - verify_count,
                                 "unrented_multiplier": UNRENTED_MULTIPLIER,
                             }
                         ),
@@ -890,23 +979,35 @@ class TaskService:
 
                     logger.info(log_text)
 
-                logger.info(
-                    _m(
-                        "SSH connection closed for executor",
-                        extra=get_extra_info(default_extra),
-                    ),
-                )
+                    logger.info(
+                        _m(
+                            "SSH connection closed for executor",
+                            extra=get_extra_info(default_extra),
+                        ),
+                    )
 
-                await self.clear_remote_directory(ssh_client, remote_dir)
-                return (
-                    machine_spec,
-                    executor_info,
-                    score,
-                    score,
-                    miner_info.job_batch_id,
-                    log_status,
-                    log_text,
-                )
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+
+                    if verify_count >= VERIFY_JOB_REQUIRED_COUNT:
+                        return (
+                            machine_spec,
+                            executor_info,
+                            score,
+                            score,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
+                    else:
+                        return (
+                            machine_spec,
+                            executor_info,
+                            0,
+                            score,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
         except Exception as e:
             log_status = "error"
             log_text = _m(
@@ -915,6 +1016,8 @@ class TaskService:
             )
 
             try:
+                await self.clear_verify_count(executor_info)
+
                 key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
                 await self.redis_service.delete(key)
             except Exception as redis_error:
