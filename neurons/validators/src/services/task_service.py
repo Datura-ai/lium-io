@@ -342,8 +342,8 @@ class TaskService:
 
             return False, log_text, log_status
 
-    async def clear_verify_count(self, executor_info: ExecutorSSHInfo):
-        await self.redis_service.set_verify_job_count(executor_info.uuid, 0)
+    async def clear_verified_job_count(self, executor_info: ExecutorSSHInfo):
+        await self.redis_service.set_verified_job_count(executor_info.uuid, 0)
 
     async def create_task(
         self,
@@ -435,7 +435,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         None,
@@ -503,7 +503,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -549,7 +549,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -576,7 +576,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -605,7 +605,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -617,7 +617,7 @@ class TaskService:
                         log_text,
                     )
 
-                if ram < vram or storage < vram * 1.5:
+                if ram < vram * 0.9 or storage < vram * 1.5:
                     log_status = "warning"
                     log_text = _m(
                         "Nvidia driver is altered",
@@ -637,7 +637,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -669,7 +669,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -723,7 +723,7 @@ class TaskService:
                             logger.warning(log_text)
 
                             await self.clear_remote_directory(ssh_client, remote_dir)
-                            await self.clear_verify_count(executor_info)
+                            await self.clear_verified_job_count(executor_info)
 
                             return (
                                 machine_spec,
@@ -746,7 +746,7 @@ class TaskService:
                     )
                     if not success:
                         await self.clear_remote_directory(ssh_client, remote_dir)
-                        await self.clear_verify_count(executor_info)
+                        await self.clear_verified_job_count(executor_info)
 
                         return (
                             None,
@@ -773,7 +773,7 @@ class TaskService:
                         logger.warning(log_text)
 
                         await self.clear_remote_directory(ssh_client, remote_dir)
-                        await self.clear_verify_count(executor_info)
+                        await self.clear_verified_job_count(executor_info)
 
                         return (
                             None,
@@ -797,7 +797,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         None,
@@ -838,7 +838,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -876,7 +876,7 @@ class TaskService:
                     logger.error(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -897,7 +897,7 @@ class TaskService:
                     logger.error(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return (
                         machine_spec,
@@ -918,9 +918,8 @@ class TaskService:
                 #     logger.error(log_text)
 
                 else:
-                    verify_count = await self.redis_service.get_verify_job_count(executor_info.uuid)
-                    verify_count += 1
-                    await self.redis_service.set_verify_job_count(executor_info.uuid, verify_count)
+                    verified_job_count = await self.redis_service.get_verified_job_count(executor_info.uuid)
+                    verified_job_count += 1
 
                     logger.info(
                         _m(
@@ -928,7 +927,7 @@ class TaskService:
                             extra=get_extra_info({
                                 **default_extra,
                                 "job_taken_time": job_taken_time,
-                                "verify_job_count": verify_count,
+                                "verified_job_count": verified_job_count,
                             }),
                         ),
                     )
@@ -964,14 +963,14 @@ class TaskService:
                             {
                                 **default_extra,
                                 "job_score": score,
-                                "acutal_score": score if verify_count >= VERIFY_JOB_REQUIRED_COUNT else 0,
+                                "acutal_score": score if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT else 0,
                                 "job_taken_time": job_taken_time,
                                 "upload_speed": upload_speed,
                                 "download_speed": download_speed,
                                 "gpu_model": gpu_model,
                                 "gpu_count": gpu_count,
-                                "verify_job_count": verify_count,
-                                "remaining_jobs_before_emission": 0 if verify_count >= VERIFY_JOB_REQUIRED_COUNT else VERIFY_JOB_REQUIRED_COUNT - verify_count,
+                                "verified_job_count": verified_job_count,
+                                "remaining_jobs_before_emission": 0 if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT else VERIFY_JOB_REQUIRED_COUNT - verified_job_count,
                                 "unrented_multiplier": UNRENTED_MULTIPLIER,
                             }
                         ),
@@ -987,8 +986,9 @@ class TaskService:
                     )
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_count(executor_info.uuid, verified_job_count)
 
-                    if verify_count >= VERIFY_JOB_REQUIRED_COUNT:
+                    if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT:
                         return (
                             machine_spec,
                             executor_info,
@@ -1016,7 +1016,7 @@ class TaskService:
             )
 
             try:
-                await self.clear_verify_count(executor_info)
+                await self.clear_verified_job_count(executor_info)
 
                 key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
                 await self.redis_service.delete(key)

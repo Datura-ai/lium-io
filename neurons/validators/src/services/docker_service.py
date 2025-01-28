@@ -212,8 +212,8 @@ class DockerService:
             command = f'docker volume prune -af'
             await ssh_client.run(command)
 
-    async def clear_verify_count(self, executor_info: ExecutorSSHInfo):
-        await self.redis_service.set_verify_job_count(executor_info.uuid, 0)
+    async def clear_verified_job_count(self, executor_info: ExecutorSSHInfo):
+        await self.redis_service.set_verified_job_count(executor_info.uuid, 0)
 
     async def create_container(
         self,
@@ -258,7 +258,7 @@ class DockerService:
                 log_text = "No port mappings found"
                 logger.error(log_text)
 
-                await self.clear_verify_count(executor_info)
+                await self.clear_verified_job_count(executor_info)
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -323,7 +323,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -404,7 +404,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -462,7 +462,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -483,7 +483,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verify_count(executor_info)
+                    await self.clear_verified_job_count(executor_info)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -525,7 +525,7 @@ class DockerService:
             logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.clear_verify_count(executor_info)
+            await self.clear_verified_job_count(executor_info)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
