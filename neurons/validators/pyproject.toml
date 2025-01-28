@@ -119,6 +119,9 @@ dependencies = [
     "xxhash==3.5.0",
     "yarl==1.18.3",
     "httpx>=0.28.1",
+    "ordered-set==4.1.0",
+    "zstandard==0.23.0",
+    "nuitka==2.6.1",
 ]
 requires-python = "==3.11.*"
 readme = "README.md"
