@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from clients.compute_client import ComputeClient
 
@@ -21,9 +22,14 @@ async def run_forever():
 
 
 def start_process():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_forever())
+    while True:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(run_forever())
+        except Exception as e:
+            logger.error(f"Compute app connector crashed: {e}", exc_info=True)
+            time.sleep(1)
 
 
 if __name__ == "__main__":
