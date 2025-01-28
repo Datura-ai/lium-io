@@ -24,7 +24,7 @@ class FileEncryptService:
         subprocess.run(
             ['pyarmor', 'gen', '-O', tmp_directory, file_path],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE ,
+            stderr=subprocess.PIPE,
         )
         return os.path.basename(file_path)
 
@@ -41,6 +41,19 @@ class FileEncryptService:
         ])
 
         subprocess.run(['rm', '-rf', 'build', f'{file_name}.spec'])
+
+        return file_name
+
+    def make_binary_file_with_nuitka(self, tmp_directory: str, file_path: str):
+        file_name = os.path.basename(file_path)
+
+        subprocess.run([
+            'nuitka', '--standalone', '--onefile',
+            f'--output-dir={tmp_directory}',
+            '--remove-output', '--quiet', '--no-progress',
+            f'--output-filename={file_name}',
+            file_path
+        ])
 
         return file_name
 
@@ -63,7 +76,7 @@ class FileEncryptService:
             machine_scrape_file.write(modified_content.encode('utf-8'))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
-            machine_scrape_file_name = self.make_binary_file(str(tmp_directory), machine_scrape_file.name)
+            machine_scrape_file_name = self.make_binary_file_with_nuitka(str(tmp_directory), machine_scrape_file.name)
 
         # generate score_script file
         score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
