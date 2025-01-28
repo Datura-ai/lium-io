@@ -475,6 +475,8 @@ class TaskService:
                 ram = machine_spec.get("ram", {}).get("total", 0)
                 storage = machine_spec.get("hard_disk", {}).get("free", 0)
 
+                gpu_processes = machine_spec.get("gpu_processes", [])
+
                 vram = 0
                 for detail in gpu_details:
                     vram += detail.get("capacity", 0) * 1024
@@ -617,10 +619,40 @@ class TaskService:
                         log_text,
                     )
 
+                for process in gpu_processes:
+                    container_name = process.get('container_name', None)
+                    if not container_name:
+                        log_status = "warning"
+                        log_text = _m(
+                            "GPU is using in some other places",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "gpu_model": gpu_model,
+                                    "gpu_count": gpu_count,
+                                    **process,
+                                }
+                            ),
+                        )
+                        logger.warning(log_text)
+
+                        await self.clear_remote_directory(ssh_client, remote_dir)
+                        await self.clear_verified_job_count(executor_info)
+
+                        return (
+                            machine_spec,
+                            executor_info,
+                            0,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
+                    
                 if ram < vram * 0.9 or storage < vram * 1.5:
                     log_status = "warning"
                     log_text = _m(
-                        "Nvidia driver is altered",
+                        "Incorrect vram",
                         extra=get_extra_info(
                             {
                                 **default_extra,
