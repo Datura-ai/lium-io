@@ -413,12 +413,7 @@ class ComputeClient:
         try:
             response = Response.model_validate_json(raw_msg)
         except pydantic.ValidationError:
-            logger.info(
-                _m(
-                    "could not parse raw message as Response",
-                    extra={**self.logging_extra, "raw_msg": raw_msg},
-                )
-            )
+            pass
         else:
             if response.status != "success":
                 logger.error(
@@ -431,13 +426,8 @@ class ComputeClient:
 
         try:
             response = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            logger.error(
-                _m(
-                    "could not parse raw message as RentedMachineResponse",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
-                )
-            )
+        except pydantic.ValidationError:
+            pass
         else:
             logger.info(
                 _m(
@@ -456,13 +446,8 @@ class ComputeClient:
 
         try:
             response = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            logger.error(
-                _m(
-                    "could not parse raw message as DuplicateExecutorsResponse",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
-                )
-            )
+        except pydantic.ValidationError:
+            pass
         else:
             logger.info(
                 _m(
@@ -487,7 +472,7 @@ class ComputeClient:
         try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
-            error_msg = f"could not parse raw message as {str(ex)}"
+            error_msg = f"Invalid message received from celium backend: {str(ex)}"
             logger.error(
                 _m(
                     error_msg,
