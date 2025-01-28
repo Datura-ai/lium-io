@@ -649,37 +649,37 @@ class TaskService:
                             log_text,
                         )
                     
-                if ram < vram * 0.9 or storage < vram * 1.5:
-                    log_status = "warning"
-                    log_text = _m(
-                        "Incorrect vram",
-                        extra=get_extra_info(
-                            {
-                                **default_extra,
-                                "gpu_model": gpu_model,
-                                "gpu_count": gpu_count,
-                                "memory": ram,
-                                "vram": vram,
-                                "storage": storage,
-                                "nvidia_driver": nvidia_driver,
-                                "libnvidia_ml": libnvidia_ml,
-                            }
-                        ),
-                    )
-                    logger.warning(log_text)
+                # if ram < vram * 0.9 or storage < vram * 1.5:
+                #     log_status = "warning"
+                #     log_text = _m(
+                #         "Incorrect vram",
+                #         extra=get_extra_info(
+                #             {
+                #                 **default_extra,
+                #                 "gpu_model": gpu_model,
+                #                 "gpu_count": gpu_count,
+                #                 "memory": ram,
+                #                 "vram": vram,
+                #                 "storage": storage,
+                #                 "nvidia_driver": nvidia_driver,
+                #                 "libnvidia_ml": libnvidia_ml,
+                #             }
+                #         ),
+                #     )
+                #     logger.warning(log_text)
 
-                    await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verified_job_count(executor_info)
+                #     await self.clear_remote_directory(ssh_client, remote_dir)
+                #     await self.clear_verified_job_count(executor_info)
 
-                    return (
-                        machine_spec,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        log_status,
-                        log_text,
-                    )
+                #     return (
+                #         machine_spec,
+                #         executor_info,
+                #         0,
+                #         0,
+                #         miner_info.job_batch_id,
+                #         log_status,
+                #         log_text,
+                #     )
 
                 logger.info(
                     _m(
