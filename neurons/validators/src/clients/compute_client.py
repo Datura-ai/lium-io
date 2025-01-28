@@ -172,13 +172,14 @@ class ComputeClient:
                             )
                         )
 
-        except asyncio.exceptions.CancelledError:
+        except Exception as exc:
             self.ws = None
             logger.error(
                 _m(
-                    "Facilitator client received cancel, stopping",
-                    extra=self.logging_extra,
-                )
+                    "Connecting to compute app failed",
+                    extra={**self.logging_extra, "error": str(exc)},
+                ),
+                exc_info=True,
             )
 
     async def handle_connection(self, ws: ClientConnection):
