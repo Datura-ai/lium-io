@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-from datetime import datetime
 from typing import NoReturn
 
 import bittensor
@@ -22,6 +21,7 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
+    AuthenticateRequest,
     DuplicateExecutorsRequest,
     ExecutorSpecRequest,
     LogStreamRequest,
@@ -82,15 +82,7 @@ class ComputeClient:
                 extra=self.logging_extra,
             )
         )
-        # set headers for authentication in celium backend
-        headers = {
-            "X-Validator-Timestamp": datetime.utcnow().timestamp(),
-            "X-Validator-Hotkey": self.keypair.ss58_address,
-        }
-        payload = f"{headers['X-Validator-Timestamp']}:{headers['X-Validator-Hotkey']}"
-        headers["X-Validator-Signature"] = f"0x{self.keypair.sign(payload).hex()}"
-
-        return websockets.connect(self.compute_app_uri, additional_headers=headers)
+        return websockets.connect(self.compute_app_uri)
 
     async def miner_driver_awaiter(self):
         """avoid memory leak by awaiting miner driver tasks"""
@@ -172,18 +164,32 @@ class ComputeClient:
                             )
                         )
 
-        except asyncio.exceptions.CancelledError:
+        except Exception as exc:
             self.ws = None
             logger.error(
                 _m(
-                    "Facilitator client received cancel, stopping",
-                    extra=self.logging_extra,
-                )
+                    "Connecting to compute app failed",
+                    extra={**self.logging_extra, "error": str(exc)},
+                ),
+                exc_info=True,
             )
 
     async def handle_connection(self, ws: ClientConnection):
         """handle a single websocket connection"""
+        await ws.send(AuthenticateRequest.from_keypair(self.keypair).model_dump_json())
+
+        raw_msg = await ws.recv()
+        try:
+            response = Response.model_validate_json(raw_msg)
+        except pydantic.ValidationError as exc:
+            raise AuthenticationError(
+                "did not receive Response for AuthenticationRequest", []
+            ) from exc
+        if response.status != "success":
+            raise AuthenticationError("auth request received failed response", response.errors)
+
         self.ws = ws
+
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
 

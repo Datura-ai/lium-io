@@ -781,7 +781,7 @@ def get_machine_specs():
                 {
                     "name": nvmlDeviceGetName(handle),
                     "uuid": nvmlDeviceGetUUID(handle),
-                    "capacity": nvmlDeviceGetMemoryInfo(handle).total / (1024 ** 2),
+                    "capacity": nvmlDeviceGetMemoryInfo(handle).total / (1024 ** 2), # in MB
                     "cuda": f"{major}.{minor}",
                     "power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
                     "graphics_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS),
@@ -849,7 +849,7 @@ def get_machine_specs():
 
         mem = psutil.virtual_memory()
         data["ram"] = {
-            "total": mem.total / 1024,
+            "total": mem.total / 1024, # in kB
             "free": mem.free / 1024,
             "used": mem.free / 1024,
             "available": mem.available / 1024,
@@ -863,7 +863,7 @@ def get_machine_specs():
     try:
         disk_usage = shutil.disk_usage(".")
         data["hard_disk"] = {
-            "total": disk_usage.total // 1024,  # in kiB
+            "total": disk_usage.total // 1024,  # in kB
             "used": disk_usage.used // 1024,
             "free": disk_usage.free // 1024,
             "utilization": (disk_usage.used / disk_usage.total) * 100

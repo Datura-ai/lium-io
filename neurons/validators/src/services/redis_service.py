@@ -10,6 +10,7 @@ RENTED_MACHINE_SET = "rented_machines"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
+VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 
 
 class RedisService:
@@ -133,3 +134,18 @@ class RedisService:
     async def clear_all_ssh_ports(self):
         pattern = f"{AVAILABLE_PORT_MAPS_PREFIX}:*"
         await self.clear_by_pattern(pattern)
+
+    async def set_verified_job_count(self, executor_id: str, count: int):
+        data = {
+            "count": count,
+        }
+
+        await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+
+    async def get_verified_job_count(self, executor_id: str):
+        data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
+
+        if not data:
+            return 0
+
+        return json.loads(data)['count']
