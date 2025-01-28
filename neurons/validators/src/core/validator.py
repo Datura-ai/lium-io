@@ -399,9 +399,7 @@ class Validator:
 
             blocks_till_epoch = tempo - (current_block + self.netuid + 1) % (tempo + 1)
 
-            should_set_weights = last_update >= tempo * 2 or (
-                blocks_till_epoch < 20 and last_update >= weights_rate_limit
-            )
+            should_set_weights = last_update >= tempo
 
             logger.info(
                 _m(
@@ -552,7 +550,7 @@ class Validator:
 
                 try:
                     # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=60 * 10)
+                    done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 100)
 
                     # Process completed jobs
                     for task in done:
