@@ -11,8 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 class SSHService:
     def generate_random_string(self, length=30):
         characters = (
-            string.ascii_letters + string.digits +
-            "/ "
+            string.ascii_letters + string.digits
         )
         random_string = ''.join(random.choices(characters, k=length))
         return random_string

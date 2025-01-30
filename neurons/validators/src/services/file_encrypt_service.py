@@ -62,27 +62,29 @@ class FileEncryptService:
         if tmp_directory.exists() and tmp_directory.is_dir():
             shutil.rmtree(tmp_directory)
 
-        string_count = random.randint(10, 100)
-        encrypt_key = self.ssh_service.generate_random_string(string_count)
+        encrypt_key_name = self.ssh_service.generate_random_string(random.randint(10, 100))
+        encrypt_key_value = self.ssh_service.generate_random_string(random.randint(10, 100))
 
         machine_scrape_file_path = str(
             Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
         )
         with open(machine_scrape_file_path, 'r') as file:
             content = file.read()
-        modified_content = content.replace('encrypt_key', encrypt_key)
+        modified_content = content.replace('encrypt_key_name', encrypt_key_name).replace('encrypt_key_value', encrypt_key_value)
 
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:
             machine_scrape_file.write(modified_content.encode('utf-8'))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
-            machine_scrape_file_name = self.make_binary_file_with_nuitka(str(tmp_directory), machine_scrape_file.name)
+            if random.choice([True, False]):
+                machine_scrape_file_name = self.make_binary_file_with_nuitka(str(tmp_directory), machine_scrape_file.name)
+            else:
+                machine_scrape_file_name = self.make_binary_file(str(tmp_directory), machine_scrape_file.name)
 
         # generate score_script file
         score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
         with open(score_script_file_path, 'r') as file:
             content = file.read()
-        modified_content = content.replace('encrypt_key', encrypt_key)
 
         with tempfile.NamedTemporaryFile(delete=True, suffix='.py') as score_file:
             score_file.write(modified_content.encode('utf-8'))
@@ -91,7 +93,7 @@ class FileEncryptService:
             score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
         return MinerJobEnryptedFiles(
-            encrypt_key=encrypt_key,
+            encrypt_key=encrypt_key_value,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
             score_file_name=score_file_name,

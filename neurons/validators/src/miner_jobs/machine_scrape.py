@@ -894,8 +894,7 @@ def _encrypt(key: str, payload: str) -> str:
     key_bytes = b64encode(hashlib.sha256(key.encode('utf-8')).digest(), altchars=b"-_")
     return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
 
-
-key = 'encrypt_key'
+encrypt_key_name = 'encrypt_key_value'
 machine_specs = get_machine_specs()
-encoded_str = _encrypt(key, json.dumps(machine_specs))
+encoded_str = _encrypt(encrypt_key_name, json.dumps(machine_specs))
 print(encoded_str)
