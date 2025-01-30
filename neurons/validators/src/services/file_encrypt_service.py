@@ -85,6 +85,7 @@ class FileEncryptService:
         score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
         with open(score_script_file_path, 'r') as file:
             content = file.read()
+        modified_content = content
 
         with tempfile.NamedTemporaryFile(delete=True, suffix='.py') as score_file:
             score_file.write(modified_content.encode('utf-8'))
