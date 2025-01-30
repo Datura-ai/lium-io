@@ -213,7 +213,7 @@ class DockerService:
             await ssh_client.run(command)
 
     async def clear_verified_job_count(self, executor_info: ExecutorSSHInfo):
-        await self.redis_service.set_verified_job_count(executor_info.uuid, 0)
+        await self.redis_service.clear_verified_job_info(executor_info.uuid)
 
     async def create_container(
         self,
