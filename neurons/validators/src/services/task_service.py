@@ -950,7 +950,8 @@ class TaskService:
                 #     logger.error(log_text)
 
                 else:
-                    verified_job_count += verified_job_info.get('count', 0)
+                    verified_job_count = verified_job_info.get('count', 0)
+                    verified_job_count += 1
 
                     logger.info(
                         _m(
