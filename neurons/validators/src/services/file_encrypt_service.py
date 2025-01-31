@@ -63,6 +63,8 @@ class FileEncryptService:
             shutil.rmtree(tmp_directory)
 
         encrypt_key_name = self.ssh_service.generate_random_string(random.randint(10, 100))
+
+        # first chracter of variable shouldn't be digit
         encrypt_key_value = f"v{self.ssh_service.generate_random_string(random.randint(10, 100))}"
 
         machine_scrape_file_path = str(
