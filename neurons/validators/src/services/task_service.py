@@ -365,6 +365,7 @@ class TaskService:
         }
 
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
+        prev_spec = verified_job_info.get('spec', '')
 
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
@@ -465,6 +466,7 @@ class TaskService:
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
                 gpu_details = machine_spec.get("gpu", {}).get("details", [])
+                gpu_model_count = f'{gpu_model}:{gpu_count}'
 
                 nvidia_driver = machine_spec.get("gpu", {}).get("driver", "")
                 libnvidia_ml = machine_spec.get("md5_checksums", {}).get("libnvidia_ml", "")
@@ -601,6 +603,33 @@ class TaskService:
                                 "gpu_count": gpu_count,
                                 "nvidia_driver": nvidia_driver,
                                 "libnvidia_ml": libnvidia_ml,
+                            }
+                        ),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
+                if prev_spec and prev_spec != gpu_model_count:
+                    log_status = "warning"
+                    log_text = _m(
+                        "Machine spec is changed",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "prev_spec": prev_spec,
+                                "current_spec": gpu_model_count,
                             }
                         ),
                     )
@@ -1018,7 +1047,7 @@ class TaskService:
                     )
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, True)
+                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, True, gpu_model_count)
 
                     if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT:
                         return (
