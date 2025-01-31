@@ -584,7 +584,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verified_job_count(executor_info, verified_job_info)
+                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
 
                     return (
                         machine_spec,
