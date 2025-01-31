@@ -342,6 +342,9 @@ class TaskService:
 
             return False, log_text, log_status
 
+    async def clear_verified_job_count(self, executor_info: ExecutorSSHInfo, prev_info: dict = {}):
+        await self.redis_service.clear_verified_job_info(executor_info.uuid, prev_info)
+
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -493,6 +496,7 @@ class TaskService:
                                 "gpu_count": gpu_count,
                                 "nvidia_driver": nvidia_driver,
                                 "libnvidia_ml": libnvidia_ml,
+                                **verified_job_info
                             }
                         ),
                     ),
@@ -609,7 +613,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.clear_verified_job_count(executor_info, verified_job_info)
 
                     return (
                         machine_spec,
@@ -636,7 +640,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.clear_verified_job_count(executor_info, verified_job_info)
 
                     return (
                         machine_spec,
@@ -730,7 +734,7 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.clear_verified_job_count(executor_info, verified_job_info)
 
                     return (
                         machine_spec,
