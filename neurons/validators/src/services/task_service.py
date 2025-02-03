@@ -34,6 +34,7 @@ from services.const import (
 from services.redis_service import (
     RedisService,
     RENTED_MACHINE_SET,
+    PENDING_PODS_SET,
     DUPLICATED_MACHINE_SET,
     AVAILABLE_PORT_MAPS_PREFIX,
 )
@@ -800,28 +801,31 @@ class TaskService:
                                 log_text,
                             )
 
-                    # if not rented, check renting ports
-                    success, log_text, log_status = await self.docker_connection_check(
-                        ssh_client=ssh_client,
-                        job_batch_id=miner_info.job_batch_id,
-                        miner_hotkey=miner_info.miner_hotkey,
-                        executor_info=executor_info,
-                        private_key=private_key,
-                        public_key=public_key,
+                    renting_in_progress = await self.redis_service.is_elem_exists_in_set(
+                        PENDING_PODS_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
                     )
-                    if not success:
-                        await self.clear_remote_directory(ssh_client, remote_dir)
-                        await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
-
-                        return (
-                            None,
-                            executor_info,
-                            0,
-                            0,
-                            miner_info.job_batch_id,
-                            log_status,
-                            log_text,
+                    if not renting_in_progress:
+                        success, log_text, log_status = await self.docker_connection_check(
+                            ssh_client=ssh_client,
+                            job_batch_id=miner_info.job_batch_id,
+                            miner_hotkey=miner_info.miner_hotkey,
+                            executor_info=executor_info,
+                            private_key=private_key,
+                            public_key=public_key,
                         )
+                        if not success:
+                            await self.clear_remote_directory(ssh_client, remote_dir)
+                            await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+
+                            return (
+                                None,
+                                executor_info,
+                                0,
+                                0,
+                                miner_info.job_batch_id,
+                                log_status,
+                                log_text,
+                            )
 
                     # if not rented, check docker digests
                     docker_digests = machine_spec.get("docker", {}).get("containers", [])

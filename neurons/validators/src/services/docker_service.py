@@ -84,31 +84,55 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         command: str,
         log_tag: str,
+        timeout: int = 0
     ):
         status = True
         error = ''
-        async with ssh_client.create_process(command) as process:
-            async for line in process.stdout:
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": line.strip(),
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
-                    )
+        try:
+            async with ssh_client.create_process(command) as process:
+                if timeout != 0:
+                    status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
+                else:
+                    status, error = await self._stream_process_output(process, log_tag)
+        except asyncio.TimeoutError:
+            status = False
+            error = "Process timed out"
+            async with self.lock:
+                self.logs_queue.append(
+                    {
+                        "log_text": error,
+                        "log_status": "error",
+                        "log_tag": log_tag,
+                    }
+                )
 
-            async for line in process.stderr:
+        return status, error
+
+    async def _stream_process_output(self, process, log_tag):
+        status = True
+        error = ''
+
+        async for line in process.stdout:
+            async with self.lock:
+                self.logs_queue.append(
+                    {
+                        "log_text": line.strip(),
+                        "log_status": "success",
+                        "log_tag": log_tag,
+                    }
+                )
+
+        async for line in process.stderr:
+            async with self.lock:
                 status = False
-                error += line
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": line.strip(),
-                            "log_status": "error",
-                            "log_tag": log_tag,
-                        }
-                    )
+                error += line.strip() + "\n"
+                self.logs_queue.append(
+                    {
+                        "log_text": line.strip(),
+                        "log_status": "error",
+                        "log_tag": log_tag,
+                    }
+                )
 
         return status, error
 
@@ -212,8 +236,9 @@ class DockerService:
             command = f'docker volume prune -af'
             await ssh_client.run(command)
 
-    async def clear_verified_job_count(self, executor_info: ExecutorSSHInfo):
-        await self.redis_service.clear_verified_job_info(executor_info.uuid)
+    async def clear_verified_job_count(self, renting_machine: RentedMachine):
+        await self.redis_service.remove_pending_pod(renting_machine)
+        await self.redis_service.clear_verified_job_info(renting_machine.executor_id)
 
     async def create_container(
         self,
@@ -232,6 +257,13 @@ class DockerService:
             "docker_image": payload.docker_image,
             "debug": payload.debug,
         }
+
+        renting_machine = RentedMachine(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            executor_ip_address=executor_info.address,
+            executor_ip_port=str(executor_info.port),
+        )
 
         logger.info(
             _m(
@@ -258,7 +290,7 @@ class DockerService:
                 log_text = "No port mappings found"
                 logger.error(log_text)
 
-                await self.clear_verified_job_count(executor_info)
+                await self.clear_verified_job_count(renting_machine)
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -266,6 +298,9 @@ class DockerService:
                     msg=str(log_text),
                     error_code=FailedContainerErrorCodes.NoPortMappings,
                 )
+
+            # add executor in pending status dict
+            await self.redis_service.add_pending_pod(renting_machine)
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
@@ -277,8 +312,6 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
-
                 logger.info(
                     _m(
                         "Pulling docker image",
@@ -323,7 +356,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(executor_info)
+                    await self.clear_verified_job_count(renting_machine)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -388,10 +421,12 @@ class DockerService:
                         }
                     )
 
+                await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+
                 volume_name = f"volume_{uuid}"
                 command = f"docker volume create {volume_name}"
                 status, error = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client, command=command, log_tag="container_creation"
+                    ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=10
                 )
                 if not status:
                     log_text = _m(
@@ -404,7 +439,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(executor_info)
+                    await self.clear_verified_job_count(renting_machine)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -448,7 +483,7 @@ class DockerService:
                 )
 
                 status, error = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client, command=command, log_tag="container_creation"
+                    ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=30
                 )
                 if not status:
                     log_text = _m(
@@ -462,7 +497,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(executor_info)
+                    await self.clear_verified_job_count(renting_machine)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -483,7 +518,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(executor_info)
+                    await self.clear_verified_job_count(renting_machine)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -501,14 +536,8 @@ class DockerService:
 
                 await self.finish_stream_logs()
 
-                await self.redis_service.add_rented_machine(
-                    RentedMachine(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        executor_ip_address=executor_info.address,
-                        executor_ip_port=str(executor_info.port),
-                    )
-                )
+                await self.redis_service.add_rented_machine(renting_machine)
+                await self.redis_service.remove_pending_pod(renting_machine)
 
                 return ContainerCreatedResult(
                     container_name=container_name,
@@ -525,7 +554,7 @@ class DockerService:
             logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.clear_verified_job_count(executor_info)
+            await self.clear_verified_job_count(renting_machine)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
