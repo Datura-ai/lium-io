@@ -84,31 +84,55 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         command: str,
         log_tag: str,
+        timeout: int = 0
     ):
         status = True
         error = ''
-        async with ssh_client.create_process(command) as process:
-            async for line in process.stdout:
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": line.strip(),
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
-                    )
+        try:
+            async with ssh_client.create_process(command) as process:
+                if timeout != 0:
+                    status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
+                else:
+                    status, error = await self._stream_process_output(process, log_tag)
+        except asyncio.TimeoutError:
+            status = False
+            error = "Process timed out"
+            async with self.lock:
+                self.logs_queue.append(
+                    {
+                        "log_text": error,
+                        "log_status": "error",
+                        "log_tag": log_tag,
+                    }
+                )
 
-            async for line in process.stderr:
+        return status, error
+
+    async def _stream_process_output(self, process, log_tag):
+        status = True
+        error = ''
+
+        async for line in process.stdout:
+            async with self.lock:
+                self.logs_queue.append(
+                    {
+                        "log_text": line.strip(),
+                        "log_status": "success",
+                        "log_tag": log_tag,
+                    }
+                )
+
+        async for line in process.stderr:
+            async with self.lock:
                 status = False
-                error += line
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": line.strip(),
-                            "log_status": "error",
-                            "log_tag": log_tag,
-                        }
-                    )
+                error += line.strip() + "\n"
+                self.logs_queue.append(
+                    {
+                        "log_text": line.strip(),
+                        "log_status": "error",
+                        "log_tag": log_tag,
+                    }
+                )
 
         return status, error
 
@@ -277,8 +301,6 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
-
                 logger.info(
                     _m(
                         "Pulling docker image",
@@ -388,10 +410,12 @@ class DockerService:
                         }
                     )
 
+                await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+
                 volume_name = f"volume_{uuid}"
                 command = f"docker volume create {volume_name}"
                 status, error = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client, command=command, log_tag="container_creation"
+                    ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=10
                 )
                 if not status:
                     log_text = _m(
@@ -448,7 +472,7 @@ class DockerService:
                 )
 
                 status, error = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client, command=command, log_tag="container_creation"
+                    ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=30
                 )
                 if not status:
                     log_text = _m(
