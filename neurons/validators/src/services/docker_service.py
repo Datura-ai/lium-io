@@ -236,8 +236,9 @@ class DockerService:
             command = f'docker volume prune -af'
             await ssh_client.run(command)
 
-    async def clear_verified_job_count(self, executor_info: ExecutorSSHInfo):
-        await self.redis_service.clear_verified_job_info(executor_info.uuid)
+    async def clear_verified_job_count(self, renting_machine: RentedMachine):
+        await self.redis_service.remove_pending_pod(renting_machine)
+        await self.redis_service.clear_verified_job_info(renting_machine.executor_id)
 
     async def create_container(
         self,
@@ -256,6 +257,13 @@ class DockerService:
             "docker_image": payload.docker_image,
             "debug": payload.debug,
         }
+
+        renting_machine = RentedMachine(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            executor_ip_address=executor_info.address,
+            executor_ip_port=str(executor_info.port),
+        )
 
         logger.info(
             _m(
@@ -282,7 +290,7 @@ class DockerService:
                 log_text = "No port mappings found"
                 logger.error(log_text)
 
-                await self.clear_verified_job_count(executor_info)
+                await self.clear_verified_job_count(renting_machine)
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -290,6 +298,9 @@ class DockerService:
                     msg=str(log_text),
                     error_code=FailedContainerErrorCodes.NoPortMappings,
                 )
+
+            # add executor in pending status dict
+            await self.redis_service.add_pending_pod(renting_machine)
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
@@ -345,7 +356,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(executor_info)
+                    await self.clear_verified_job_count(renting_machine)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -428,7 +439,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(executor_info)
+                    await self.clear_verified_job_count(renting_machine)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -486,7 +497,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(executor_info)
+                    await self.clear_verified_job_count(renting_machine)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -507,7 +518,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(executor_info)
+                    await self.clear_verified_job_count(renting_machine)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -525,14 +536,8 @@ class DockerService:
 
                 await self.finish_stream_logs()
 
-                await self.redis_service.add_rented_machine(
-                    RentedMachine(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        executor_ip_address=executor_info.address,
-                        executor_ip_port=str(executor_info.port),
-                    )
-                )
+                await self.redis_service.add_rented_machine(renting_machine)
+                await self.redis_service.remove_pending_pod(renting_machine)
 
                 return ContainerCreatedResult(
                     container_name=container_name,
@@ -549,7 +554,7 @@ class DockerService:
             logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.clear_verified_job_count(executor_info)
+            await self.clear_verified_job_count(renting_machine)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,

@@ -7,6 +7,7 @@ from core.config import settings
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 STREAMING_LOG_CHANNEL = "channel:2"
 RENTED_MACHINE_SET = "rented_machines"
+PENDING_PODS_SET = "pending_pods"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
@@ -53,7 +54,7 @@ class RedisService:
         async with self.lock:
             await self.redis.srem(key, elem)
 
-    async def is_elem_exists_in_set(self, key: str, elem: str) -> bool:
+    async def is_elem_exists_in_set(self, key: str, elem: str):
         """Check an element exists or not in a set in Redis."""
         async with self.lock:
             return await self.redis.sismember(key, elem)
@@ -67,6 +68,12 @@ class RedisService:
 
     async def remove_rented_machine(self, machine: RentedMachine):
         await self.srem(RENTED_MACHINE_SET, f"{machine.miner_hotkey}:{machine.executor_id}")
+
+    async def add_pending_pod(self, machine: RentedMachine):
+        await self.sadd(PENDING_PODS_SET, f"{machine.miner_hotkey}:{machine.executor_id}")
+
+    async def remove_pending_pod(self, machine: RentedMachine):
+        await self.srem(PENDING_PODS_SET, f"{machine.miner_hotkey}:{machine.executor_id}")
 
     async def lpush(self, key: str, element: bytes):
         """Add an element to a list in Redis."""
