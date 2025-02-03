@@ -69,6 +69,12 @@ class FileEncryptService:
         machine_scrape_file_path = str(
             Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
         )
+        obfuscator_machine_scrape_file_path = str(
+            Path(__file__).parent / ".." / "miner_jobs/obfuscator.py"
+        )
+        obfuscated_machine_scrape_file_path = str(
+            Path(__file__).parent / ".." / "miner_jobs/obfuscated_machine_scrape.py"
+        )
         with open(machine_scrape_file_path, 'r') as file:
             content = file.read()
         modified_content = content.replace('encrypt_key_name', encrypt_key_name).replace('encrypt_key_value', encrypt_key_value)
@@ -77,10 +83,12 @@ class FileEncryptService:
             machine_scrape_file.write(modified_content.encode('utf-8'))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
+            command = ["python", obfuscator_machine_scrape_file_path, machine_scrape_file.name]
+            subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if random.choice([True, False]):
-                machine_scrape_file_name = self.make_binary_file_with_nuitka(str(tmp_directory), machine_scrape_file.name)
+                machine_scrape_file_name = self.make_binary_file_with_nuitka(str(tmp_directory), obfuscated_machine_scrape_file_path)
             else:
-                machine_scrape_file_name = self.make_binary_file(str(tmp_directory), machine_scrape_file.name)
+                machine_scrape_file_name = self.make_binary_file(str(tmp_directory), obfuscated_machine_scrape_file_path)
 
         # generate score_script file
         score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
