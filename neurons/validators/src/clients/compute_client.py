@@ -25,6 +25,7 @@ from protocol.vc_protocol.validator_requests import (
     DuplicateExecutorsRequest,
     ExecutorSpecRequest,
     LogStreamRequest,
+    ResetVerifiedJobRequest,
     RentedMachineRequest,
 )
 from pydantic import BaseModel
@@ -38,6 +39,7 @@ from services.redis_service import (
     MACHINE_SPEC_CHANNEL_NAME,
     RENTED_MACHINE_PREFIX,
     STREAMING_LOG_CHANNEL,
+    RESET_VERIFIED_JOB_CHANNEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,10 +120,12 @@ class ComputeClient:
             # subscribe to channel to get machine specs
             pubsub = await self.miner_service.redis_service.subscribe(MACHINE_SPEC_CHANNEL_NAME)
             log_channel = await self.miner_service.redis_service.subscribe(STREAMING_LOG_CHANNEL)
+            reset_verified_job_channel = await self.miner_service.redis_service.subscribe(RESET_VERIFIED_JOB_CHANNEL)
 
             # send machine specs to facilitator
             self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
             asyncio.create_task(self.wait_for_log_streams(log_channel))
+            asyncio.create_task(self.wait_for_reset_verified_job(reset_verified_job_channel))
         except Exception as exc:
             logger.error(
                 _m("redis connection error", extra={**self.logging_extra, "error": str(exc)})
@@ -346,6 +350,78 @@ class ComputeClient:
                     continue
 
                 logs_queue.append(log_stream)
+                if self.ws is not None:
+                    while len(logs_queue) > 0:
+                        log_to_send = logs_queue.pop(0)
+                        try:
+                            await self.send_model(log_to_send)
+                        except Exception as exc:
+                            logs_queue.insert(0, log_to_send)
+                            logger.error(
+                                _m(
+                                    msg,
+                                    extra={
+                                        **self.logging_extra,
+                                        "error": str(exc),
+                                    },
+                                )
+                            )
+                            break
+            except TimeoutError:
+                pass
+
+    async def wait_for_reset_verified_job(self, channel: aioredis.client.PubSub):
+        logs_queue: list[ResetVerifiedJobRequest] = []
+        while True:
+            validator_hotkey = self.my_hotkey()
+            logger.info(
+                _m(
+                    f"Waiting for clear verified jobs: {validator_hotkey}",
+                    extra=self.logging_extra,
+                )
+            )
+            try:
+                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=100 * 60)
+                if msg is None:
+                    logger.warning(
+                        _m(
+                            "No clear job request yet",
+                            extra=self.logging_extra,
+                        )
+                    )
+                    continue
+
+                msg = json.loads(msg["data"])
+                reset_request = None
+
+                try:
+                    reset_request = ResetVerifiedJobRequest(
+                        miner_hotkey=msg["miner_hotkey"],
+                        validator_hotkey=validator_hotkey,
+                        executor_uuid=msg["executor_uuid"],
+                    )
+
+                    logger.info(
+                        _m(
+                            f'Successfully created ResetVerifiedJobRequest instance with {msg}',
+                            extra=self.logging_extra,
+                        )
+                    )
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            "Failed to get ResetVerifiedJobRequest instance",
+                            extra={
+                                **self.logging_extra,
+                                "error": str(exc),
+                                "msg": str(msg),
+                            },
+                        ),
+                        exc_info=True,
+                    )
+                    continue
+
+                logs_queue.append(reset_request)
                 if self.ws is not None:
                     while len(logs_queue) > 0:
                         log_to_send = logs_queue.pop(0)

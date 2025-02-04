@@ -6,6 +6,7 @@ from core.config import settings
 
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 STREAMING_LOG_CHANNEL = "channel:2"
+RESET_VERIFIED_JOB_CHANNEL = "channel:3"
 RENTED_MACHINE_SET = "rented_machines"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_SET = "pending_pods"
@@ -195,6 +196,13 @@ class RedisService:
             "spec": spec,
         }
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+        await self.publish(
+            RESET_VERIFIED_JOB_CHANNEL,
+            {
+                "miner_hotkey": miner_hotkey,
+                "executor_uuid": executor_id,
+            },
+        )
 
     async def get_verified_job_info(self, executor_id: str):
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
