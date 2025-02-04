@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import shutil
 import PyInstaller.__main__
+import sys
 from fastapi import Depends
 
 from services.ssh_service import SSHService
@@ -83,7 +84,7 @@ class FileEncryptService:
             machine_scrape_file.write(modified_content.encode('utf-8'))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
-            command = ["python", obfuscator_machine_scrape_file_path, machine_scrape_file.name]
+            command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file.name]
             subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if random.choice([True, False]):
                 machine_scrape_file_name = self.make_binary_file_with_nuitka(str(tmp_directory), obfuscated_machine_scrape_file_path)
