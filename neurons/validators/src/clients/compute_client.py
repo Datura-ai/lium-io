@@ -36,7 +36,7 @@ from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL_NAME,
-    RENTED_MACHINE_SET,
+    RENTED_MACHINE_PREFIX,
     STREAMING_LOG_CHANNEL,
 )
 
@@ -443,7 +443,7 @@ class ComputeClient:
             )
 
             redis_service = self.miner_service.redis_service
-            await redis_service.delete(RENTED_MACHINE_SET)
+            await redis_service.delete(RENTED_MACHINE_PREFIX)
 
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)

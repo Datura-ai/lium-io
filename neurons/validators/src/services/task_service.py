@@ -346,6 +346,23 @@ class TaskService:
     async def clear_verified_job_count(self, executor_info: ExecutorSSHInfo, prev_info: dict = {}):
         await self.redis_service.clear_verified_job_info(executor_info.uuid, prev_info)
 
+    async def check_pod_running(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        miner_hotkey: str,
+        container_name: str,
+        executor_info: ExecutorSSHInfo,
+    ):
+        # check container running or not
+        result = await ssh_client.run(f"docker ps -q -f name={container_name}")
+        if result.stdout.strip():
+            return True
+
+        # remove pod in redis
+        await self.redis_service.remove_rented_machine(miner_hotkey, executor_info.uuid)
+        
+        return False
+
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -751,7 +768,43 @@ class TaskService:
                 is_rented = await self.redis_service.is_elem_exists_in_set(
                     RENTED_MACHINE_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
                 )
-                if is_rented:
+                rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info.uuid)
+                if is_rented or rented_machine:
+                    if rented_machine:
+                        print('rented machine ==>', rented_machine)
+                        container_name = rented_machine.get("container_name", "")
+                        is_pod_running = await self.check_pod_running(
+                            ssh_client=ssh_client,
+                            miner_hotkey=miner_info.miner_hotkey,
+                            container_name=container_name,
+                            executor_info=executor_info,
+                        )
+                        if not is_pod_running:
+                            log_status = "warning"
+                            log_text = _m(
+                                "Pod is not running",
+                                extra=get_extra_info(
+                                    {
+                                        **default_extra,
+                                        "container_name": container_name,
+                                    }
+                                ),
+                            )
+                            logger.warning(log_text)
+
+                            await self.clear_remote_directory(ssh_client, remote_dir)
+                            await self.clear_verified_job_count(executor_info, verified_job_info)
+
+                            return (
+                                machine_spec,
+                                executor_info,
+                                0,
+                                0,
+                                miner_info.job_batch_id,
+                                log_status,
+                                log_text,
+                            )
+
                     score = max_score * gpu_count
                     log_text = _m(
                         "Executor is already rented.",
