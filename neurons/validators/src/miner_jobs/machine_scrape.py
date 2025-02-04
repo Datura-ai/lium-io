@@ -469,10 +469,10 @@ def nvmlDeviceGetPowerManagementLimit(handle):
     return c_limit.value
 
 
-def nvmlDeviceGetClockInfo(handle, type):
+def nvmlDeviceGetClockInfo(handle, type_clock):
     c_clock = c_uint()
     fn = _nvmlGetFunctionPointer("nvmlDeviceGetClockInfo")
-    ret = fn(handle, _nvmlClockType_t(type), byref(c_clock))
+    ret = fn(handle, _nvmlClockType_t(type_clock), byref(c_clock))
     _nvmlCheckReturn(ret)
     return c_clock.value
 
@@ -493,10 +493,10 @@ def nvmlDeviceGetPcieSpeed(device):
     return c_speed.value
 
 
-def nvmlDeviceGetDefaultApplicationsClock(handle, type):
+def nvmlDeviceGetDefaultApplicationsClock(handle, type_clock):
     c_clock = c_uint()
     fn = _nvmlGetFunctionPointer("nvmlDeviceGetDefaultApplicationsClock")
-    ret = fn(handle, _nvmlClockType_t(type), byref(c_clock))
+    ret = fn(handle, _nvmlClockType_t(type_clock), byref(c_clock))
     _nvmlCheckReturn(ret)
     return c_clock.value
 

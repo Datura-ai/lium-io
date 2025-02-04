@@ -3,6 +3,7 @@ from ast import Name, FunctionDef
 import random
 import string
 import sys
+import os
 
 python_keywords = [
     'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 
@@ -25,7 +26,7 @@ python_keywords = [
     'NVML_ERROR_MEMORY', 'NVML_ERROR_UNKNOWN', 'Exception', 'wrapper', 'args', 'kwargs', 'wraps', 'sys',
     'c_char_p', 'AttributeError', '_nvmlLib_refcount', 'nvmlLib', 'CDLL', 'os', 'tempfile', 'NVMLError', 
     'OSError', 'c_uint', 'byref', 'create_string_buffer', 'c_int',  'setattr', 'subprocess', 'RuntimeError', 'hashlib',
-    'iter', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'encoded_str', 
+    'iter', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'encoded_str', 'machine_specs'
 ]
 
 
@@ -216,5 +217,8 @@ if __name__ == "__main__":
     
     obfuscated = obfuscate_code(source)
     
-    with open("obfuscated_machine_scrape.py", "w") as f:
+    current_directory = os.path.dirname(os.path.abspath(__file__))
+    output_file_path = os.path.join(current_directory, "obfuscated_machine_scrape.py")
+    
+    with open(output_file_path, "w") as f:
         f.write(obfuscated)
