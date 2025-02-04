@@ -98,7 +98,8 @@ class ComputeClient:
                     _m(
                         "Error occurred during driving a miner client",
                         extra={**self.logging_extra, "error": str(exc)},
-                    )
+                    ),
+                    exc_info=True,
                 )
 
     async def __aenter__(self):
@@ -339,7 +340,8 @@ class ComputeClient:
                                 "error": str(exc),
                                 "msg": str(msg),
                             },
-                        )
+                        ),
+                        exc_info=True,
                     )
                     continue
 
@@ -502,6 +504,9 @@ class ComputeClient:
         | ContainerStartRequest,
     ):
         """drive a miner client from job start to completion, then close miner connection"""
+        logger.info(
+            _m(f"Getting miner axon info for {job_request.miner_hotkey}", extra=self.logging_extra)
+        )
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logging_extra = {
             **self.logging_extra,
