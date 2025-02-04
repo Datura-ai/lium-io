@@ -150,7 +150,14 @@ class RedisService:
         pattern = f"{AVAILABLE_PORT_MAPS_PREFIX}:*"
         await self.clear_by_pattern(pattern)
 
-    async def set_verified_job_info(self, executor_id: str, prev_info: dict, success: bool = True, spec: str = ''):
+    async def set_verified_job_info(
+        self,
+        miner_hotkey: str,
+        executor_id: str,
+        prev_info: dict = {},
+        success: bool = True,
+        spec: str = ''
+    ):
         count = prev_info.get('count', 0)
         failed = prev_info.get('failed', 0)
         prev_spec = prev_info.get('spec', '')
@@ -161,8 +168,11 @@ class RedisService:
             failed += 1
 
         if failed * 20 >= count:
-            count = 0
-            failed = 0
+            return await self.clear_verified_job_info(
+                miner_hotkey=miner_hotkey,
+                executor_id=executor_id,
+                prev_info=prev_info,
+            )
 
         data = {
             "count": count,
@@ -172,7 +182,12 @@ class RedisService:
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
-    async def clear_verified_job_info(self, executor_id, prev_info: dict = {}):
+    async def clear_verified_job_info(
+        self,
+        miner_hotkey: str,
+        executor_id,
+        prev_info: dict = {}
+    ):
         spec = prev_info.get('spec', '')
         data = {
             "count": 0,

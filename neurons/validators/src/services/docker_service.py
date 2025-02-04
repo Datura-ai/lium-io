@@ -238,7 +238,7 @@ class DockerService:
 
     async def clear_verified_job_count(self, miner_hotkey: str, executor_id: str):
         await self.redis_service.remove_pending_pod(miner_hotkey, executor_id)
-        await self.redis_service.clear_verified_job_info(executor_id)
+        await self.redis_service.clear_verified_job_info(miner_hotkey, executor_id)
 
     async def create_container(
         self,

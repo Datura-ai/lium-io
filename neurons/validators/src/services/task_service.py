@@ -343,8 +343,17 @@ class TaskService:
 
             return False, log_text, log_status
 
-    async def clear_verified_job_count(self, executor_info: ExecutorSSHInfo, prev_info: dict = {}):
-        await self.redis_service.clear_verified_job_info(executor_info.uuid, prev_info)
+    async def clear_verified_job_count(
+        self,
+        miner_info: MinerJobRequestPayload,
+        executor_info: ExecutorSSHInfo,
+        prev_info: dict = {}
+    ):
+        await self.redis_service.clear_verified_job_info(
+            miner_hotkey=miner_info.miner_hotkey,
+            executor_id=executor_info.uuid,
+            prev_info=prev_info,
+        )
 
     async def check_pod_running(
         self,
@@ -360,7 +369,7 @@ class TaskService:
 
         # remove pod in redis
         await self.redis_service.remove_rented_machine(miner_hotkey, executor_info.uuid)
-        
+
         return False
 
     async def create_task(
@@ -457,7 +466,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         None,
@@ -529,7 +543,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         machine_spec,
@@ -575,7 +594,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         machine_spec,
@@ -602,7 +626,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         machine_spec,
@@ -631,7 +660,11 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verified_job_count(executor_info, verified_job_info)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
 
                     return (
                         machine_spec,
@@ -658,7 +691,11 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verified_job_count(executor_info, verified_job_info)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
 
                     return (
                         machine_spec,
@@ -688,7 +725,12 @@ class TaskService:
                         logger.warning(log_text)
 
                         await self.clear_remote_directory(ssh_client, remote_dir)
-                        await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                        await self.redis_service.set_verified_job_info(
+                            miner_hotkey=miner_info.miner_hotkey,
+                            executor_id=executor_info.uuid,
+                            prev_info=verified_job_info,
+                            success=False,
+                        )
 
                         return (
                             machine_spec,
@@ -720,7 +762,12 @@ class TaskService:
                 #     logger.warning(log_text)
 
                 #     await self.clear_remote_directory(ssh_client, remote_dir)
-                #     await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                #     await self.redis_service.set_verified_job_info(
+                #         miner_hotkey=miner_info.miner_hotkey,
+                #         executor_id=executor_info.uuid,
+                #         prev_info=verified_job_info,
+                #         success=False,
+                #     )
 
                 #     return (
                 #         machine_spec,
@@ -752,7 +799,11 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.clear_verified_job_count(executor_info, verified_job_info)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
 
                     return (
                         machine_spec,
@@ -771,7 +822,6 @@ class TaskService:
                 rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info.uuid)
                 if is_rented or rented_machine:
                     if rented_machine:
-                        print('rented machine ==>', rented_machine)
                         container_name = rented_machine.get("container_name", "")
                         is_pod_running = await self.check_pod_running(
                             ssh_client=ssh_client,
@@ -793,7 +843,11 @@ class TaskService:
                             logger.warning(log_text)
 
                             await self.clear_remote_directory(ssh_client, remote_dir)
-                            await self.clear_verified_job_count(executor_info, verified_job_info)
+                            await self.clear_verified_job_count(
+                                miner_info=miner_info,
+                                executor_info=executor_info,
+                                prev_info=verified_job_info
+                            )
 
                             return (
                                 machine_spec,
@@ -842,7 +896,12 @@ class TaskService:
                             logger.warning(log_text)
 
                             await self.clear_remote_directory(ssh_client, remote_dir)
-                            await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                            await self.redis_service.set_verified_job_info(
+                                miner_hotkey=miner_info.miner_hotkey,
+                                executor_id=executor_info.uuid,
+                                prev_info=verified_job_info,
+                                success=False,
+                            )
 
                             return (
                                 machine_spec,
@@ -868,7 +927,12 @@ class TaskService:
                         )
                         if not success:
                             await self.clear_remote_directory(ssh_client, remote_dir)
-                            await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                            await self.redis_service.set_verified_job_info(
+                                miner_hotkey=miner_info.miner_hotkey,
+                                executor_id=executor_info.uuid,
+                                prev_info=verified_job_info,
+                                success=False,
+                            )
 
                             return (
                                 None,
@@ -895,7 +959,12 @@ class TaskService:
                         logger.warning(log_text)
 
                         await self.clear_remote_directory(ssh_client, remote_dir)
-                        await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                        await self.redis_service.set_verified_job_info(
+                            miner_hotkey=miner_info.miner_hotkey,
+                            executor_id=executor_info.uuid,
+                            prev_info=verified_job_info,
+                            success=False,
+                        )
 
                         return (
                             None,
@@ -919,7 +988,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         None,
@@ -960,7 +1034,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         machine_spec,
@@ -998,7 +1077,12 @@ class TaskService:
                     logger.error(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         machine_spec,
@@ -1019,7 +1103,12 @@ class TaskService:
                     logger.error(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         machine_spec,
@@ -1108,7 +1197,13 @@ class TaskService:
                     )
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, True, gpu_model_count)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=True,
+                        spec=gpu_model_count,
+                    )
 
                     if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT:
                         return (
@@ -1138,7 +1233,12 @@ class TaskService:
             )
 
             try:
-                await self.redis_service.set_verified_job_info(executor_info.uuid, verified_job_info, False)
+                await self.redis_service.set_verified_job_info(
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_id=executor_info.uuid,
+                    prev_info=verified_job_info,
+                    success=False,
+                )
 
                 key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
                 await self.redis_service.delete(key)
