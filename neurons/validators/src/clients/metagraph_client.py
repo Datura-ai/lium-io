@@ -49,12 +49,15 @@ class AsyncMetagraphClient:
         else:
             return await future
 
-    def _get_subtensor(self):
-        return bittensor.subtensor(config=self.config)
-
     @sync_to_async(thread_sensitive=False)
     def _get_metagraph(self):
-        return self._get_subtensor().metagraph(netuid=settings.BITTENSOR_NETUID)
+        try:
+            return bittensor.metagraph(
+                netuid=settings.BITTENSOR_NETUID, network=settings.BITTENSOR_NETWORK
+            )
+        except Exception as exc:
+            logger.error(f"Failed to get metagraph: {exc}", exc_info=True)
+            raise
 
     async def periodic_refresh(self, period=None):
         if period is None:
@@ -64,7 +67,7 @@ class AsyncMetagraphClient:
                 await self.get_metagraph(ignore_cache=True)
             except Exception as exc:
                 msg = f"Failed to refresh metagraph: {exc}"
-                logger.warning(msg)
+                logger.warning(msg, exc_info=True)
 
             await asyncio.sleep(period)
 
