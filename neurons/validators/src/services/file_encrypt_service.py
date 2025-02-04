@@ -8,6 +8,7 @@ import shutil
 import PyInstaller.__main__
 import sys
 from fastapi import Depends
+import string
 
 from services.ssh_service import SSHService
 
@@ -20,6 +21,8 @@ class FileEncryptService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
     ):
         self.ssh_service = ssh_service
+        self.all_keys = {}
+        self.original_keys = {}
 
     def make_obfuscated_file(self, tmp_directory: str, file_path: str):
         subprocess.run(
@@ -58,6 +61,60 @@ class FileEncryptService:
 
         return file_name
 
+    def generate_random_name(self, length=10):
+        return '_' + ''.join(random.choices(string.ascii_letters, k=length))
+    
+    def generate_key_mappings(self):
+        keys_for_encryption_key_generation = [
+            'gpu.name', 'gpu.uuid', 'gpu.capacity', 'gpu.cuda', 'gpu.power_limit', 
+            'gpu.graphics_speed', 'gpu.memory_speed', 'gpu.pcie', 'gpu.speed_pcie', 'gpu.utilization', 
+            'gpu.memory_utilization'
+        ]
+
+        all_keys = {
+            "gpu.name": "",
+            "gpu.uuid": "",
+            "gpu.capacity": "",
+            "gpu.cuda": "",
+            "gpu.power_limit": "",
+            "gpu.graphics_speed": "",
+            "gpu.memory_speed": "",
+            "gpu.pcie": "",
+            "gpu.speed_pcie": "",
+            "gpu.utilization": "",
+            "gpu.memory_utilization": ""
+        }
+        
+        original_keys = {
+            "gpu.name": "name",
+            "gpu.uuid": "uuid",
+            "gpu.capacity": "capacity",
+            "gpu.cuda": "cuda",
+            "gpu.power_limit": "power_limit",
+            "gpu.graphics_speed": "graphics_speed",
+            "gpu.memory_speed": "memory_speed",
+            "gpu.pcie": "pcie",
+            "gpu.speed_pcie": "pcie_speed",
+            "gpu.utilization": "gpu_utilization",
+            "gpu.memory_utilization": "memory_utilization"
+        }
+
+        # Generate dictionary key mapping on validator side
+        for key in keys_for_encryption_key_generation:
+            all_keys[key] = self.generate_random_name()
+
+        self.all_keys = all_keys
+        self.original_keys = original_keys
+        
+        encryption_key = ":".join([all_keys[key] for key in keys_for_encryption_key_generation])
+        return all_keys, encryption_key
+
+    def get_original_key(self, key: str):
+        return self.original_keys.get(key, key)
+    
+    def get_all_keys(self):
+        return self.all_keys
+    
     def ecrypt_miner_job_files(self):
         tmp_directory = Path(__file__).parent / "temp"
         if tmp_directory.exists() and tmp_directory.is_dir():
@@ -78,18 +135,26 @@ class FileEncryptService:
         )
         with open(machine_scrape_file_path, 'r') as file:
             content = file.read()
-        modified_content = content.replace('encrypt_key_name', encrypt_key_name).replace('encrypt_key_value', encrypt_key_value)
+
+        command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file_path]
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        with open(obfuscated_machine_scrape_file_path, 'r') as file:
+            obfuscated_content = file.read()
+            
+        all_keys, encryption_key = self.generate_key_mappings()
+        for key, value in all_keys.items():
+            obfuscated_content = obfuscated_content.replace(key, value)
 
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:
-            machine_scrape_file.write(modified_content.encode('utf-8'))
+            machine_scrape_file.write(obfuscated_content.encode('utf-8'))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
-            command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file.name]
-            subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
             if random.choice([True, False]):
-                machine_scrape_file_name = self.make_binary_file_with_nuitka(str(tmp_directory), obfuscated_machine_scrape_file_path)
+                machine_scrape_file_name = self.make_binary_file_with_nuitka(str(tmp_directory), machine_scrape_file.name)
             else:
-                machine_scrape_file_name = self.make_binary_file(str(tmp_directory), obfuscated_machine_scrape_file_path)
+                machine_scrape_file_name = self.make_binary_file(str(tmp_directory), machine_scrape_file.name)
 
         # generate score_script file
         score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
@@ -104,7 +169,7 @@ class FileEncryptService:
             score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
         return MinerJobEnryptedFiles(
-            encrypt_key=encrypt_key_value,
+            encrypt_key=encryption_key,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
             score_file_name=score_file_name,

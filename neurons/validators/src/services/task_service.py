@@ -39,6 +39,7 @@ from services.redis_service import (
 )
 from services.ssh_service import SSHService
 from services.hash_service import HashService
+from services.file_encrypt_service import FileEncryptService
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +51,11 @@ class TaskService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        file_encrypt_service: Annotated[FileEncryptService, Depends(FileEncryptService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.file_encrypt_service = file_encrypt_service
         self.wallet = settings.get_bittensor_wallet()
 
     async def upload_directory(
@@ -458,6 +461,10 @@ class TaskService:
                 )
 
                 gpu_model = None
+                all_keys = self.file_encrypt_service.get_all_keys()
+                machine_spec["gpu"]["details"] = [
+                    {self.file_encrypt_service.get_original_key(self.get_key_from_value(all_keys, key)): value for key, value in detail.items()} for detail in machine_spec["gpu"].get("details", [])
+                ]
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
                     details = machine_spec["gpu"].get("details", [])
                     if len(details) > 0:
@@ -1156,5 +1163,10 @@ class TaskService:
 
             return None, str(e)
 
+    def get_key_from_value(self, dictionary, target_value):
+        for key, value in dictionary.items():
+            if value == target_value:
+                return key
+        return None 
 
 TaskServiceDep = Annotated[TaskService, Depends(TaskService)]

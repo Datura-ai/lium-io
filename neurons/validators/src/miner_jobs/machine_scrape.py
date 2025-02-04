@@ -779,17 +779,17 @@ def get_machine_specs():
 
             data["gpu"]["details"].append(
                 {
-                    "name": nvmlDeviceGetName(handle),
-                    "uuid": nvmlDeviceGetUUID(handle),
-                    "capacity": nvmlDeviceGetMemoryInfo(handle).total / (1024 ** 2), # in MB
-                    "cuda": f"{major}.{minor}",
-                    "power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
-                    "graphics_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS),
-                    "memory_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM),
-                    "pcie": nvmlDeviceGetCurrPcieLinkWidth(handle),
-                    "pcie_speed": nvmlDeviceGetPcieSpeed(handle),
-                    "gpu_utilization": utilization.gpu,
-                    "memory_utilization": utilization.memory,
+                    "gpu.name": nvmlDeviceGetName(handle),
+                    "gpu.uuid": nvmlDeviceGetUUID(handle),
+                    "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).total / (1024 ** 2), # in MB
+                    "gpu.cuda": f"{major}.{minor}",
+                    "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
+                    "gpu.graphics_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS),
+                    "gpu.memory_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM),
+                    "gpu.pcie": nvmlDeviceGetCurrPcieLinkWidth(handle),
+                    "gpu.speed_pcie": nvmlDeviceGetPcieSpeed(handle),
+                    "gpu.utilization": utilization.gpu,
+                    "gpu.memory_utilization": utilization.memory,
                 }
             )
 
@@ -894,7 +894,7 @@ def _encrypt(key: str, payload: str) -> str:
     key_bytes = b64encode(hashlib.sha256(key.encode('utf-8')).digest(), altchars=b"-_")
     return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
 
-encrypt_key_name = 'encrypt_key_value'
 machine_specs = get_machine_specs()
-encoded_str = _encrypt(encrypt_key_name, json.dumps(machine_specs))
+encryption_key = ":".join(machine_specs["gpu"]["details"][0].keys())
+encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
 print(encoded_str)

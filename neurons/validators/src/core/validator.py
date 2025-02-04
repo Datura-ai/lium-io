@@ -58,9 +58,11 @@ class Validator:
     async def initiate_services(self):
         ssh_service = SSHService()
         self.redis_service = RedisService()
+        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
+            file_encrypt_service=self.file_encrypt_service
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
@@ -71,7 +73,6 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
         )
-        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
 
         # init miner_scores
         try:
