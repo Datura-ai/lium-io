@@ -462,9 +462,13 @@ class TaskService:
 
                 gpu_model = None
                 all_keys = self.file_encrypt_service.get_all_keys()
-                machine_spec["gpu"]["details"] = [
-                    {self.file_encrypt_service.get_original_key(self.get_key_from_value(all_keys, key)): value for key, value in detail.items()} for detail in machine_spec["gpu"].get("details", [])
-                ]
+                original_keys = self.file_encrypt_service.get_original_key()
+                reverse_all_keys = {v: k for k, v in all_keys.items()}
+                
+                updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
+                updated_machine_spec = self.update_keys(updated_machine_spec, original_keys)
+                
+                machine_spec = updated_machine_spec
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
                     details = machine_spec["gpu"].get("details", [])
                     if len(details) > 0:
@@ -1163,10 +1167,24 @@ class TaskService:
 
             return None, str(e)
 
-    def get_key_from_value(self, dictionary, target_value):
-        for key, value in dictionary.items():
-            if value == target_value:
-                return key
-        return None 
+    def update_keys(self, d, key_mapping):
+        updated_dict = {}
+        for key, value in d.items():
+            # Get the original key using the reverse mapping
+            original_key = key_mapping.get(key)  # Default to the same key if not found
+            # Recursively update keys if the value is a dictionary
+            if isinstance(value, dict):
+                updated_dict[original_key] = self.update_keys(value, key_mapping)
+            elif isinstance(value, list):
+                updated_list = []
+                for item in value:
+                    if isinstance(item, dict):
+                        updated_list.append(self.update_keys(item, key_mapping))
+                    else:
+                        updated_list.append(item)
+                updated_dict[original_key] = updated_list
+            else:
+                updated_dict[original_key] = value
+        return updated_dict
 
 TaskServiceDep = Annotated[TaskService, Depends(TaskService)]

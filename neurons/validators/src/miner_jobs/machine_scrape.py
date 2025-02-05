@@ -145,20 +145,20 @@ class _PrintableStructure(Structure):
 
 class c_nvmlMemory_t(_PrintableStructure):
     _fields_ = [
-        ('total', c_ulonglong),
-        ('free', c_ulonglong),
-        ('used', c_ulonglong),
+        ('c_nvmlMemory_t_total', c_ulonglong),
+        ('c_nvmlMemory_t_free', c_ulonglong),
+        ('c_nvmlMemory_t_used', c_ulonglong),
     ]
     _fmt_ = {'<default>': "%d B"}
 
 
 class c_nvmlMemory_v2_t(_PrintableStructure):
     _fields_ = [
-        ('version', c_uint),
-        ('total', c_ulonglong),
-        ('reserved', c_ulonglong),
-        ('free', c_ulonglong),
-        ('used', c_ulonglong),
+        ('c_nvmlMemory_v2_t_version', c_uint),
+        ('c_nvmlMemory_v2_t_total', c_ulonglong),
+        ('c_nvmlMemory_v2_t_reserved', c_ulonglong),
+        ('c_nvmlMemory_v2_t_free', c_ulonglong),
+        ('c_nvmlMemory_v2_t_used', c_ulonglong),
     ]
     _fmt_ = {'<default>': "%d B"}
 
@@ -168,8 +168,8 @@ nvmlMemory_v2 = 0x02000028
 
 class c_nvmlUtilization_t(_PrintableStructure):
     _fields_ = [
-        ('gpu', c_uint),
-        ('memory', c_uint),
+        ('c_nvmlUtilization_t_gpu', c_uint),
+        ('c_nvmlUtilization_t_memory', c_uint),
     ]
     _fmt_ = {'<default>': "%d %%"}
 
@@ -226,12 +226,12 @@ class NVMLError(Exception):
 
 class c_nvmlProcessInfo_v2_t(_PrintableStructure):
     _fields_ = [
-        ('pid', c_uint),
-        ('usedGpuMemory', c_ulonglong),
-        ('gpuInstanceId', c_uint),
-        ('computeInstanceId', c_uint),
+        ('c_nvmlProcessInfo_v2_t_pid', c_uint),
+        ('c_nvmlProcessInfo_v2_t_usedGpuMemory', c_ulonglong),
+        ('c_nvmlProcessInfo_v2_t_gpuInstanceId', c_uint),
+        ('c_nvmlProcessInfo_v2_t_computeInstanceId', c_uint),
     ]
-    _fmt_ = {'usedGpuMemory': "%d B"}
+    _fmt_ = {'_fmt_usedGpuMemory': "%d B"}
 
 
 c_nvmlProcessInfo_v3_t = c_nvmlProcessInfo_v2_t
@@ -454,7 +454,7 @@ def nvmlDeviceGetMemoryInfo(handle, version=None):
         fn = _nvmlGetFunctionPointer("nvmlDeviceGetMemoryInfo")
     else:
         c_memory = c_nvmlMemory_v2_t()
-        c_memory.version = version
+        c_memory.c_nvmlMemory_v2_t_version = version
         fn = _nvmlGetFunctionPointer("nvmlDeviceGetMemoryInfo_v2")
     ret = fn(handle, byref(c_memory))
     _nvmlCheckReturn(ret)
@@ -578,9 +578,9 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         for i in range(c_count.value):
             # use an alternative struct for this object
             obj = nvmlStructToFriendlyObject(c_procs[i])
-            if (obj.usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value):
+            if (obj._fmt_usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value):
                 # special case for WDDM on Windows, see comment above
-                obj.usedGpuMemory = None
+                obj._fmt_usedGpuMemory = None
             procs.append(obj)
         return procs
     else:
@@ -612,9 +612,9 @@ def get_network_speed():
 
 def get_docker_info(content: bytes):
     data = {
-        "version": "",
-        "container_id": "",
-        "containers": []
+        "docker_version": "",
+        "docker_container_id": "",
+        "docker_containers": []
     }
 
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -625,7 +625,7 @@ def get_docker_info(content: bytes):
         run_cmd(f'chmod +x {docker_path}')
 
         result = run_cmd(f'{docker_path} version --format "{{{{.Client.Version}}}}"')
-        data["version"] = result.strip()
+        data["docker_version"] = result.strip()
 
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
@@ -649,14 +649,14 @@ def get_docker_info(content: bytes):
             if repo_digests:
                 digest = repo_digests[0].split('@')[1]
                 if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
-                    data["container_id"] = container_id
+                    data["docker_container_id"] = container_id
 
             if digest:
-                containers.append({'id': container_id, 'digest': digest, "name": container_name})
+                containers.append({'each_container_id': container_id, 'each_digest': digest, "each_name": container_name})
             else:
-                containers.append({'id': container_id, 'digest': '', "name": container_name})
+                containers.append({'each_container_id': container_id, 'each_digest': '', "each_name": container_name})
 
-        data["containers"] = containers
+        data["docker_containers"] = containers
 
     finally:
         os.remove(docker_path)
@@ -715,20 +715,20 @@ def get_gpu_processes(pids: set, containers: list[dict]):
             #             container_name = container['name']
             #             break
             for container in containers:
-                if container['id'] in info:
-                    container_name = container['name']
+                if container['each_container_id'] in info:
+                    container_name = container['each_name']
                     break
 
             processes.append({
-                "pid": pid,
-                "info": info,
-                "container_name": container_name
+                "processes_pid": pid,
+                "processes_info": info,
+                "processes_container_name": container_name
             })
         except:
             processes.append({
-                "pid": pid,
-                "info": None,
-                "container_name": None,
+                "processes_pid": pid,
+                "processes_info": None,
+                "processes_container_name": None,
             })
 
     return processes
@@ -741,7 +741,7 @@ def get_machine_specs():
     if os.environ.get('LD_PRELOAD'):
         return data
 
-    data["gpu"] = {"count": 0, "details": []}
+    data["data_gpu"] = {"gpu_count": 0, "gpu_details": []}
     gpu_process_ids = set()
 
     try:
@@ -754,11 +754,11 @@ def get_machine_specs():
 
         device_count = nvmlDeviceGetCount()
 
-        data["gpu"] = {
-            "count": device_count,
-            "driver": nvmlSystemGetDriverVersion(),
-            "cuda_driver": nvmlSystemGetCudaDriverVersion(),
-            "details": []
+        data["data_gpu"] = {
+            "gpu_count": device_count,
+            "gpu_driver": nvmlSystemGetDriverVersion(),
+            "gpu_cuda_driver": nvmlSystemGetCudaDriverVersion(),
+            "gpu_details": []
         }
 
         for i in range(device_count):
@@ -777,19 +777,19 @@ def get_machine_specs():
             # Get GPU utilization rates
             utilization = nvmlDeviceGetUtilizationRates(handle)
 
-            data["gpu"]["details"].append(
+            data["data_gpu"]["gpu_details"].append(
                 {
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
-                    "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).total / (1024 ** 2), # in MB
+                    "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_total / (1024 ** 2), # in MB
                     "gpu.cuda": f"{major}.{minor}",
                     "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
                     "gpu.graphics_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS),
                     "gpu.memory_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM),
                     "gpu.pcie": nvmlDeviceGetCurrPcieLinkWidth(handle),
                     "gpu.speed_pcie": nvmlDeviceGetPcieSpeed(handle),
-                    "gpu.utilization": utilization.gpu,
-                    "gpu.memory_utilization": utilization.memory,
+                    "gpu.utilization": utilization.c_nvmlUtilization_t_gpu,
+                    "gpu.memory_utilization": utilization.c_nvmlUtilization_t_memory,
                 }
             )
 
@@ -807,33 +807,33 @@ def get_machine_specs():
         # Scrape the NVIDIA Container Runtime config
         nvidia_cfg_cmd = 'cat /etc/nvidia-container-runtime/config.toml'
         try:
-            data["nvidia_cfg"] = run_cmd(nvidia_cfg_cmd)
+            data["data_nvidia_cfg"] = run_cmd(nvidia_cfg_cmd)
         except Exception as exc:
             data["nvidia_cfg_scrape_error"] = repr(exc)
 
         # Scrape the Docker Daemon config
         docker_cfg_cmd = 'cat /etc/docker/daemon.json'
         try:
-            data["docker_cfg"] = run_cmd(docker_cfg_cmd)
+            data["data_docker_cfg"] = run_cmd(docker_cfg_cmd)
         except Exception as exc:
-            data["docker_cfg_scrape_error"] = repr(exc)
+            data["data_docker_cfg_scrape_error"] = repr(exc)
 
     docker_content = get_file_content("/usr/bin/docker")
-    data["docker"] = get_docker_info(docker_content)
+    data["data_docker"] = get_docker_info(docker_content)
 
-    data['gpu_processes'] = get_gpu_processes(gpu_process_ids, data["docker"]["containers"])
+    data['data_gpu_processes'] = get_gpu_processes(gpu_process_ids, data["data_docker"]["docker_containers"])
 
-    data["cpu"] = {"count": 0, "model": "", "clocks": []}
+    data["data_cpu"] = {"cpu_count": 0, "cpu_model": "", "cpu_clocks": []}
     try:
         lscpu_output = run_cmd("lscpu")
-        data["cpu"]["model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
-        data["cpu"]["count"] = int(re.search(r"CPU\(s\):\s*(.*)", lscpu_output).group(1))
-        data["cpu"]["utilization"] = psutil.cpu_percent(interval=1)
+        data["data_cpu"]["cpu_model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
+        data["data_cpu"]["cpu_count"] = int(re.search(r"CPU\(s\):\s*(.*)", lscpu_output).group(1))
+        data["data_cpu"]["cpu_utilization"] = psutil.cpu_percent(interval=1)
     except Exception as exc:
         # print(f'Error getting cpu specs: {exc}', flush=True)
         data["cpu_scrape_error"] = repr(exc)
 
-    data["ram"] = {}
+    data["data_ram"] = {}
     try:
         # with open("/proc/meminfo") as f:
         #     meminfo = f.read()
@@ -848,43 +848,43 @@ def get_machine_specs():
         # data['ram']['utilization'] = (data["ram"]["used"] / data["ram"]["total"]) * 100
 
         mem = psutil.virtual_memory()
-        data["ram"] = {
-            "total": mem.total / 1024, # in kB
-            "free": mem.free / 1024,
-            "used": mem.free / 1024,
-            "available": mem.available / 1024,
-            "utilization": mem.percent
+        data["data_ram"] = {
+            "ram_total": mem.total / 1024, # in kB
+            "ram_free": mem.free / 1024,
+            "ram_used": mem.free / 1024,
+            "ram_available": mem.available / 1024,
+            "ram_utilization": mem.percent
         }
     except Exception as exc:
         # print(f"Error reading /proc/meminfo; Exc: {exc}", file=sys.stderr)
         data["ram_scrape_error"] = repr(exc)
 
-    data["hard_disk"] = {}
+    data["data_hard_disk"] = {}
     try:
         disk_usage = shutil.disk_usage(".")
-        data["hard_disk"] = {
-            "total": disk_usage.total // 1024,  # in kB
-            "used": disk_usage.used // 1024,
-            "free": disk_usage.free // 1024,
-            "utilization": (disk_usage.used / disk_usage.total) * 100
+        data["data_hard_disk"] = {
+            "hard_disk_total": disk_usage.total // 1024,  # in kB
+            "hard_disk_used": disk_usage.used // 1024,
+            "hard_disk_free": disk_usage.free // 1024,
+            "hard_disk_utilization": (disk_usage.used / disk_usage.total) * 100
         }
     except Exception as exc:
         # print(f"Error getting disk_usage from shutil: {exc}", file=sys.stderr)
         data["hard_disk_scrape_error"] = repr(exc)
 
-    data["os"] = ""
+    data["data_os"] = ""
     try:
-        data["os"] = run_cmd('lsb_release -d | grep -Po "Description:\\s*\\K.*"').strip()
+        data["data_os"] = run_cmd('lsb_release -d | grep -Po "Description:\\s*\\K.*"').strip()
     except Exception as exc:
         # print(f'Error getting os specs: {exc}', flush=True)
         data["os_scrape_error"] = repr(exc)
 
-    data["network"] = get_network_speed()
+    data["data_network"] = get_network_speed()
 
-    data["md5_checksums"] = {
-        "nvidia_smi": get_md5_checksum_from_path(run_cmd("which nvidia-smi").strip()),
-        "libnvidia_ml": get_md5_checksum_from_file_content(nvmlLib_content),
-        "docker": get_md5_checksum_from_file_content(docker_content),
+    data["data_md5_checksums"] = {
+        "md5_checksums_nvidia_smi": get_md5_checksum_from_path(run_cmd("which nvidia-smi").strip()),
+        "md5_checksums_libnvidia_ml": get_md5_checksum_from_file_content(nvmlLib_content),
+        "md5_checksums_docker": get_md5_checksum_from_file_content(docker_content),
     }
 
     return data
@@ -895,6 +895,6 @@ def _encrypt(key: str, payload: str) -> str:
     return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
 
 machine_specs = get_machine_specs()
-encryption_key = ":".join(machine_specs["gpu"]["details"][0].keys())
+encryption_key = ":".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
 encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
 print(encoded_str)
