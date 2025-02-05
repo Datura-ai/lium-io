@@ -21,6 +21,7 @@ class RentedMachine(BaseModel):
     executor_id: str
     executor_ip_address: str
     executor_ip_port: str
+    container_name: str
 
 
 class RentedMachineResponse(BaseModel):
