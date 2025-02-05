@@ -25,8 +25,8 @@ from protocol.vc_protocol.validator_requests import (
     DuplicateExecutorsRequest,
     ExecutorSpecRequest,
     LogStreamRequest,
-    ResetVerifiedJobRequest,
     RentedMachineRequest,
+    ResetVerifiedJobRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
@@ -38,8 +38,8 @@ from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL_NAME,
     RENTED_MACHINE_PREFIX,
-    STREAMING_LOG_CHANNEL,
     RESET_VERIFIED_JOB_CHANNEL,
+    STREAMING_LOG_CHANNEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,7 +120,9 @@ class ComputeClient:
             # subscribe to channel to get machine specs
             pubsub = await self.miner_service.redis_service.subscribe(MACHINE_SPEC_CHANNEL_NAME)
             log_channel = await self.miner_service.redis_service.subscribe(STREAMING_LOG_CHANNEL)
-            reset_verified_job_channel = await self.miner_service.redis_service.subscribe(RESET_VERIFIED_JOB_CHANNEL)
+            reset_verified_job_channel = await self.miner_service.redis_service.subscribe(
+                RESET_VERIFIED_JOB_CHANNEL
+            )
 
             # send machine specs to facilitator
             self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
@@ -289,12 +291,13 @@ class ComputeClient:
                                 )
                             )
                             break
-            except TimeoutError:
+            except Exception as exc:
                 logger.error(
                     _m(
-                        "wait_for_specs still running",
-                        extra=self.logging_extra,
-                    )
+                        "Error happened while waiting for machine specs",
+                        extra={**self.logging_extra, "error": str(exc)},
+                    ),
+                    exc_info=True,
                 )
 
     async def wait_for_log_streams(self, channel: aioredis.client.PubSub):
@@ -367,8 +370,14 @@ class ComputeClient:
                                 )
                             )
                             break
-            except TimeoutError:
-                pass
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "Error happened while waiting for log streams",
+                        extra={**self.logging_extra, "error": str(exc)},
+                    ),
+                    exc_info=True,
+                )
 
     async def wait_for_reset_verified_job(self, channel: aioredis.client.PubSub):
         logs_queue: list[ResetVerifiedJobRequest] = []
@@ -403,7 +412,7 @@ class ComputeClient:
 
                     logger.info(
                         _m(
-                            f'Successfully created ResetVerifiedJobRequest instance with {msg}',
+                            f"Successfully created ResetVerifiedJobRequest instance with {msg}",
                             extra=self.logging_extra,
                         )
                     )
@@ -439,8 +448,14 @@ class ComputeClient:
                                 )
                             )
                             break
-            except TimeoutError:
-                pass
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "Error happened while waiting for clear verified jobs",
+                        extra={**self.logging_extra, "error": str(exc)},
+                    ),
+                    exc_info=True,
+                )
 
     def create_metagraph_refresh_task(self, period=None):
         return create_metagraph_refresh_task(period=period)
