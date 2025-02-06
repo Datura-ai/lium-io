@@ -48,6 +48,7 @@ class Validator:
 
         self.subtensor = None
         self.debug_miner = debug_miner
+        self.miner_scores = {}
 
     async def initiate_services(self):
         ssh_service = SSHService()
@@ -592,7 +593,7 @@ class Validator:
                                                         "parsed_counts": parsed_counts,
                                                     }
                                                 ),
-                                            ),
+                                            ),  
                                         )
 
                                         max_executors = max(
@@ -743,6 +744,7 @@ class Validator:
                         }
                     ),
                 ),
+                exc_info=True,
             )
 
     async def start(self):
