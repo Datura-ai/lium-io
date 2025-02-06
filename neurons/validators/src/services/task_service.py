@@ -294,7 +294,7 @@ class TaskService:
 
                 return False, log_text, log_status
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(10)
 
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
