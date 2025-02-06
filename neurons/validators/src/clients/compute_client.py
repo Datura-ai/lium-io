@@ -116,7 +116,7 @@ class ComputeClient:
 
     async def run_forever(self) -> NoReturn:
         asyncio.create_task(self.validator.warm_up_subtensor())
-        asyncio.create_task(self.subscrib_mesages_from_redis())
+        asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
 
         try:
@@ -184,7 +184,7 @@ class ComputeClient:
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
 
-    async def subscrib_mesages_from_redis(self):
+    async def subscribe_mesages_from_redis(self):
         validator_hotkey = self.my_hotkey()
         queue = []
         
