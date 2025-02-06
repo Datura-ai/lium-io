@@ -33,7 +33,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL_NAME, RedisService
+from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
@@ -236,7 +236,7 @@ class MinerService:
         ) in results:
             try:
                 await self.redis_service.publish(
-                    MACHINE_SPEC_CHANNEL_NAME,
+                    MACHINE_SPEC_CHANNEL,
                     {
                         "specs": specs,
                         "miner_hotkey": miner_hotkey,
