@@ -43,16 +43,10 @@ class Validator:
         self.netuid = settings.BITTENSOR_NETUID
 
         self.should_exit = False
-        self.is_running = False
         self.last_job_run_blocks = 0
         self.default_extra = {}
 
         self.subtensor = None
-        self.set_subtensor()
-
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.initiate_services())
-
         self.debug_miner = debug_miner
 
     async def initiate_services(self):
@@ -759,6 +753,10 @@ class Validator:
             ),
         )
         try:
+            self.set_subtensor()
+            await self.initiate_services()
+            self.should_exit = False
+
             while not self.should_exit:
                 await self.sync()
 
@@ -800,3 +798,19 @@ class Validator:
             )
 
         self.should_exit = True
+        
+    async def warm_up_subtensor(self):
+        while True:
+            try:
+                self.set_subtensor()
+
+                # sync every 12 seconds
+                await asyncio.sleep(SYNC_CYCLE)
+            except Exception as e:
+                logger.info(
+                    _m(
+                        "[stop] Failed to save miner_scores",
+                        extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                    ),
+                )
+                await asyncio.sleep(SYNC_CYCLE)
