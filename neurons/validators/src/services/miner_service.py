@@ -387,14 +387,7 @@ class MinerService:
                             )
                         )
 
-                        await self.redis_service.remove_rented_machine(
-                            RentedMachine(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                executor_ip_address=executor.address if executor else "",
-                                executor_ip_port=str(executor.port if executor else ""),
-                            )
-                        )
+                        await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
 
                         return FailedContainerRequest(
                             miner_hotkey=payload.miner_hotkey,

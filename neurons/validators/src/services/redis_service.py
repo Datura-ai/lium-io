@@ -6,7 +6,10 @@ from core.config import settings
 
 MACHINE_SPEC_CHANNEL_NAME = "channel:1"
 STREAMING_LOG_CHANNEL = "channel:2"
+RESET_VERIFIED_JOB_CHANNEL = "channel:3"
 RENTED_MACHINE_SET = "rented_machines"
+RENTED_MACHINE_PREFIX = "rented_machines_prefix"
+PENDING_PODS_SET = "pending_pods"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
@@ -53,7 +56,7 @@ class RedisService:
         async with self.lock:
             await self.redis.srem(key, elem)
 
-    async def is_elem_exists_in_set(self, key: str, elem: str) -> bool:
+    async def is_elem_exists_in_set(self, key: str, elem: str):
         """Check an element exists or not in a set in Redis."""
         async with self.lock:
             return await self.redis.sismember(key, elem)
@@ -61,12 +64,6 @@ class RedisService:
     async def smembers(self, key: str):
         async with self.lock:
             return await self.redis.smembers(key)
-
-    async def add_rented_machine(self, machine: RentedMachine):
-        await self.sadd(RENTED_MACHINE_SET, f"{machine.miner_hotkey}:{machine.executor_id}")
-
-    async def remove_rented_machine(self, machine: RentedMachine):
-        await self.srem(RENTED_MACHINE_SET, f"{machine.miner_hotkey}:{machine.executor_id}")
 
     async def lpush(self, key: str, element: bytes):
         """Add an element to a list in Redis."""
@@ -119,6 +116,25 @@ class RedisService:
             async for key in self.redis.scan_iter(match=pattern):
                 await self.redis.delete(key.decode())
 
+    async def add_rented_machine(self, machine: RentedMachine):
+        await self.hset(RENTED_MACHINE_PREFIX, f"{machine.miner_hotkey}:{machine.executor_id}", machine.model_dump_json())
+
+    async def remove_rented_machine(self, miner_hotkey: str, executor_id: str):
+        await self.hdel(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+
+    async def get_rented_machine(self, miner_hotkey: str, executor_id: str):
+        data = await self.hget(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+        if not data:
+            return None
+
+        return json.loads(data)
+
+    async def add_pending_pod(self, miner_hotkey: str, executor_id: str):
+        await self.sadd(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+
+    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str):
+        await self.srem(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+
     async def clear_all_executor_counts(self):
         pattern = f"{EXECUTOR_COUNT_PREFIX}:*"
         cursor = 0
@@ -135,7 +151,14 @@ class RedisService:
         pattern = f"{AVAILABLE_PORT_MAPS_PREFIX}:*"
         await self.clear_by_pattern(pattern)
 
-    async def set_verified_job_info(self, executor_id: str, prev_info: dict, success: bool = True, spec: str = ''):
+    async def set_verified_job_info(
+        self,
+        miner_hotkey: str,
+        executor_id: str,
+        prev_info: dict = {},
+        success: bool = True,
+        spec: str = ''
+    ):
         count = prev_info.get('count', 0)
         failed = prev_info.get('failed', 0)
         prev_spec = prev_info.get('spec', '')
@@ -146,8 +169,11 @@ class RedisService:
             failed += 1
 
         if failed * 20 >= count:
-            count = 0
-            failed = 0
+            return await self.clear_verified_job_info(
+                miner_hotkey=miner_hotkey,
+                executor_id=executor_id,
+                prev_info=prev_info,
+            )
 
         data = {
             "count": count,
@@ -157,7 +183,12 @@ class RedisService:
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
-    async def clear_verified_job_info(self, executor_id, prev_info: dict = {}):
+    async def clear_verified_job_info(
+        self,
+        miner_hotkey: str,
+        executor_id,
+        prev_info: dict = {}
+    ):
         spec = prev_info.get('spec', '')
         data = {
             "count": 0,
@@ -165,6 +196,13 @@ class RedisService:
             "spec": spec,
         }
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+        await self.publish(
+            RESET_VERIFIED_JOB_CHANNEL,
+            {
+                "miner_hotkey": miner_hotkey,
+                "executor_uuid": executor_id,
+            },
+        )
 
     async def get_verified_job_info(self, executor_id: str):
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)

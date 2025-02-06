@@ -26,6 +26,7 @@ from protocol.vc_protocol.validator_requests import (
     ExecutorSpecRequest,
     LogStreamRequest,
     RentedMachineRequest,
+    ResetVerifiedJobRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
@@ -36,7 +37,8 @@ from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL_NAME,
-    RENTED_MACHINE_SET,
+    RENTED_MACHINE_PREFIX,
+    RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
 )
 
@@ -98,7 +100,8 @@ class ComputeClient:
                     _m(
                         "Error occurred during driving a miner client",
                         extra={**self.logging_extra, "error": str(exc)},
-                    )
+                    ),
+                    exc_info=True,
                 )
 
     async def __aenter__(self):
@@ -117,10 +120,14 @@ class ComputeClient:
             # subscribe to channel to get machine specs
             pubsub = await self.miner_service.redis_service.subscribe(MACHINE_SPEC_CHANNEL_NAME)
             log_channel = await self.miner_service.redis_service.subscribe(STREAMING_LOG_CHANNEL)
+            reset_verified_job_channel = await self.miner_service.redis_service.subscribe(
+                RESET_VERIFIED_JOB_CHANNEL
+            )
 
             # send machine specs to facilitator
             self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
             asyncio.create_task(self.wait_for_log_streams(log_channel))
+            asyncio.create_task(self.wait_for_reset_verified_job(reset_verified_job_channel))
         except Exception as exc:
             logger.error(
                 _m("redis connection error", extra={**self.logging_extra, "error": str(exc)})
@@ -284,12 +291,13 @@ class ComputeClient:
                                 )
                             )
                             break
-            except TimeoutError:
+            except Exception as exc:
                 logger.error(
                     _m(
-                        "wait_for_specs still running",
-                        extra=self.logging_extra,
-                    )
+                        "Error happened while waiting for machine specs",
+                        extra={**self.logging_extra, "error": str(exc)},
+                    ),
+                    exc_info=True,
                 )
 
     async def wait_for_log_streams(self, channel: aioredis.client.PubSub):
@@ -339,7 +347,8 @@ class ComputeClient:
                                 "error": str(exc),
                                 "msg": str(msg),
                             },
-                        )
+                        ),
+                        exc_info=True,
                     )
                     continue
 
@@ -361,8 +370,92 @@ class ComputeClient:
                                 )
                             )
                             break
-            except TimeoutError:
-                pass
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "Error happened while waiting for log streams",
+                        extra={**self.logging_extra, "error": str(exc)},
+                    ),
+                    exc_info=True,
+                )
+
+    async def wait_for_reset_verified_job(self, channel: aioredis.client.PubSub):
+        logs_queue: list[ResetVerifiedJobRequest] = []
+        while True:
+            validator_hotkey = self.my_hotkey()
+            logger.info(
+                _m(
+                    f"Waiting for clear verified jobs: {validator_hotkey}",
+                    extra=self.logging_extra,
+                )
+            )
+            try:
+                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=100 * 60)
+                if msg is None:
+                    logger.warning(
+                        _m(
+                            "No clear job request yet",
+                            extra=self.logging_extra,
+                        )
+                    )
+                    continue
+
+                msg = json.loads(msg["data"])
+                reset_request = None
+
+                try:
+                    reset_request = ResetVerifiedJobRequest(
+                        miner_hotkey=msg["miner_hotkey"],
+                        validator_hotkey=validator_hotkey,
+                        executor_uuid=msg["executor_uuid"],
+                    )
+
+                    logger.info(
+                        _m(
+                            f"Successfully created ResetVerifiedJobRequest instance with {msg}",
+                            extra=self.logging_extra,
+                        )
+                    )
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            "Failed to get ResetVerifiedJobRequest instance",
+                            extra={
+                                **self.logging_extra,
+                                "error": str(exc),
+                                "msg": str(msg),
+                            },
+                        ),
+                        exc_info=True,
+                    )
+                    continue
+
+                logs_queue.append(reset_request)
+                if self.ws is not None:
+                    while len(logs_queue) > 0:
+                        log_to_send = logs_queue.pop(0)
+                        try:
+                            await self.send_model(log_to_send)
+                        except Exception as exc:
+                            logs_queue.insert(0, log_to_send)
+                            logger.error(
+                                _m(
+                                    msg,
+                                    extra={
+                                        **self.logging_extra,
+                                        "error": str(exc),
+                                    },
+                                )
+                            )
+                            break
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "Error happened while waiting for clear verified jobs",
+                        extra={**self.logging_extra, "error": str(exc)},
+                    ),
+                    exc_info=True,
+                )
 
     def create_metagraph_refresh_task(self, period=None):
         return create_metagraph_refresh_task(period=period)
@@ -443,7 +536,7 @@ class ComputeClient:
             )
 
             redis_service = self.miner_service.redis_service
-            await redis_service.delete(RENTED_MACHINE_SET)
+            await redis_service.delete(RENTED_MACHINE_PREFIX)
 
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
@@ -502,6 +595,9 @@ class ComputeClient:
         | ContainerStartRequest,
     ):
         """drive a miner client from job start to completion, then close miner connection"""
+        logger.info(
+            _m(f"Getting miner axon info for {job_request.miner_hotkey}", extra=self.logging_extra)
+        )
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logging_extra = {
             **self.logging_extra,
