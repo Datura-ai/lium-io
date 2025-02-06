@@ -4,10 +4,9 @@ import redis.asyncio as aioredis
 from protocol.vc_protocol.compute_requests import RentedMachine
 from core.config import settings
 
-MACHINE_SPEC_CHANNEL_NAME = "channel:1"
-STREAMING_LOG_CHANNEL = "channel:2"
-RESET_VERIFIED_JOB_CHANNEL = "channel:3"
-RENTED_MACHINE_SET = "rented_machines"
+MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
+STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
+RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_SET = "pending_pods"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
@@ -25,10 +24,10 @@ class RedisService:
         """Publish a message to a Redis channel."""
         await self.redis.publish(channel, json.dumps(message))
 
-    async def subscribe(self, channel: str):
+    async def subscribe(self, *channel: str):
         """Subscribe to a Redis channel."""
         pubsub = self.redis.pubsub()
-        await pubsub.subscribe(channel)
+        await pubsub.subscribe(*channel)
         return pubsub
 
     async def set(self, key: str, value: str):
