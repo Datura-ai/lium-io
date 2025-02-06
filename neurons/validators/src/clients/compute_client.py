@@ -200,24 +200,14 @@ class ComputeClient:
                         channel = message['channel'].decode('utf-8')
                         data = json.loads(message['data'])
                     except Exception as exc:
-                        logger.error(
-                            _m(
-                                f"Error: mesage parsing error {message}",
-                                extra={
-                                    **self.logging_extra,
-                                    "error": str(exc),
-                                },
-                            )
-                        )
                         continue
                     
                     logger.info(
                         _m(
-                            'message',
+                            'Received message from redis',
                             extra={
                                 **self.logging_extra,
                                 "channel": channel,
-                                **data,
                             }
                         )
                     )
