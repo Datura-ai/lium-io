@@ -48,13 +48,16 @@ class Validator:
 
         self.subtensor = None
         self.debug_miner = debug_miner
+        self.miner_scores = {}
 
     async def initiate_services(self):
         ssh_service = SSHService()
         self.redis_service = RedisService()
+        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
+            file_encrypt_service=self.file_encrypt_service,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
@@ -65,7 +68,6 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
         )
-        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
 
         # init miner_scores
         try:
@@ -505,9 +507,12 @@ class Validator:
                 docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORIES)
                 logger.info(
                     _m(
-                        "Docker Hub Digests",
+                        "Docker Hub Digests: get docker hub digests",
                         extra=get_extra_info(
-                            {"job_batch_id": job_batch_id, "docker_hub_digests": docker_hub_digests}
+                            {
+                                "job_batch_id": job_batch_id,
+                                "docker_hub_digests": len(docker_hub_digests),
+                            }
                         ),
                     ),
                 )
@@ -588,7 +593,7 @@ class Validator:
                                                         "parsed_counts": parsed_counts,
                                                     }
                                                 ),
-                                            ),
+                                            ),  
                                         )
 
                                         max_executors = max(
@@ -739,6 +744,7 @@ class Validator:
                         }
                     ),
                 ),
+                exc_info=True,
             )
 
     async def start(self):
