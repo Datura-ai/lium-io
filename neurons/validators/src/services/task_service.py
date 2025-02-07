@@ -39,7 +39,7 @@ from services.redis_service import (
 )
 from services.ssh_service import SSHService
 from services.hash_service import HashService
-from services.file_encrypt_service import FileEncryptService
+from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +51,9 @@ class TaskService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
-        file_encrypt_service: Annotated[FileEncryptService, Depends(FileEncryptService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-        self.file_encrypt_service = file_encrypt_service
         self.wallet = settings.get_bittensor_wallet()
 
     async def upload_directory(
@@ -492,12 +490,11 @@ class TaskService:
                 )
 
                 gpu_model = None
-                all_keys = self.file_encrypt_service.get_all_keys()
-                original_keys = self.file_encrypt_service.get_original_key()
+                all_keys = encypted_files.all_keys
                 reverse_all_keys = {v: k for k, v in all_keys.items()}
                 
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
-                updated_machine_spec = self.update_keys(updated_machine_spec, original_keys)
+                updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
                 
                 machine_spec = updated_machine_spec
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -538,7 +535,7 @@ class TaskService:
                                 "gpu_count": gpu_count,
                                 "nvidia_driver": nvidia_driver,
                                 "libnvidia_ml": libnvidia_ml,
-                                **verified_job_info
+                                **verified_job_info,
                             }
                         ),
                     ),

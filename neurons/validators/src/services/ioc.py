@@ -19,7 +19,6 @@ async def initiate_services():
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
         redis_service=ioc["RedisService"],
-        file_encrypt_service=ioc["FileEncryptService"]
     )
     ioc["DockerService"] = DockerService(
         ssh_service=ioc["SSHService"],
