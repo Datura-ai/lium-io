@@ -536,7 +536,6 @@ class TaskService:
                                 "nvidia_driver": nvidia_driver,
                                 "libnvidia_ml": libnvidia_ml,
                                 **verified_job_info,
-                                **machine_spec,
                             }
                         ),
                     ),
