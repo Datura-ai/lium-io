@@ -57,7 +57,6 @@ class Validator:
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
-            file_encrypt_service=self.file_encrypt_service,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,

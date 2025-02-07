@@ -679,6 +679,11 @@ def get_md5_checksum_from_file_content(file_content: bytes):
     md5_hash.update(file_content)
     return md5_hash.hexdigest()
 
+def get_sha256_checksum_from_file_content(file_content: bytes):
+    sha256_hash = hashlib.sha256()
+    sha256_hash.update(file_content)
+    return sha256_hash.hexdigest()
+
 
 def get_libnvidia_ml_path():
     try:
@@ -883,7 +888,7 @@ def get_machine_specs():
 
     data["data_md5_checksums"] = {
         "md5_checksums_nvidia_smi": get_md5_checksum_from_path(run_cmd("which nvidia-smi").strip()),
-        "md5_checksums_libnvidia_ml": get_md5_checksum_from_file_content(nvmlLib_content),
+        "md5_checksums_libnvidia_ml": f"{get_md5_checksum_from_file_content(nvmlLib_content)}:{get_sha256_checksum_from_file_content(nvmlLib_content)}",
         "md5_checksums_docker": get_md5_checksum_from_file_content(docker_content),
     }
 

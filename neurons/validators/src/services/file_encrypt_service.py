@@ -14,6 +14,100 @@ from payload_models.payloads import MinerJobEnryptedFiles
 
 from services.ssh_service import SSHService
 
+KEYS_FOR_ENCRYPTION_KEY_GENERATION = [
+    "gpu.name",
+    "gpu.uuid",
+    "gpu.capacity",
+    "gpu.cuda",
+    "gpu.power_limit",
+    "gpu.graphics_speed",
+    "gpu.memory_speed",
+    "gpu.pcie",
+    "gpu.speed_pcie",
+    "gpu.utilization",
+    "gpu.memory_utilization",
+]
+
+ORIGINAL_KEYS = {
+    "gpu.name": "name",
+    "gpu.uuid": "uuid",
+    "gpu.capacity": "capacity",
+    "gpu.cuda": "cuda",
+    "gpu.power_limit": "power_limit",
+    "gpu.graphics_speed": "graphics_speed",
+    "gpu.memory_speed": "memory_speed",
+    "gpu.pcie": "pcie",
+    "gpu.speed_pcie": "pcie_speed",
+    "gpu.utilization": "gpu_utilization",
+    "gpu.memory_utilization": "memory_utilization",
+    '<default>': "<default>",
+    'c_nvmlMemory_t_total': "total",
+    'c_nvmlMemory_t_free': "free",
+    'c_nvmlMemory_t_used': "used",
+    'c_nvmlMemory_v2_t_version': "version",
+    'c_nvmlMemory_v2_t_total': "total",
+    'c_nvmlMemory_v2_t_reserved': "reserved",
+    'c_nvmlMemory_v2_t_free': "free",
+    'c_nvmlMemory_v2_t_used': "used",
+    'c_nvmlUtilization_t_gpu': "gpu",
+    'c_nvmlUtilization_t_memory': "memory",
+    'upload_speed': "upload_speed",
+    'download_speed': "download_speed",
+    'network_speed_error': "network_speed_error",
+    'gpu_count': "count",
+    'gpu_driver': "driver",
+    'gpu_cuda_driver': "cuda_driver",
+    'gpu_details': "details",
+    'gpu_scrape_error': "gpu_scrape_error",
+    "data_gpu": "gpu",
+    "data_gpu_processes": "gpu_processes",
+    "data_cpu": "cpu",
+    "data_nvidia_cfg": "nvidia_cfg",
+    "nvidia_cfg_scrape_error": "nvidia_cfg_scrape_error",
+    "cpu_count": "count",
+    "cpu_model": "model",
+    "cpu_clocks": "clocks",
+    "cpu_utilization": "utilization",
+    "cpu_scrape_error": "cpu_scrape_error",
+    "ram_total": "total",
+    "ram_free": "free",
+    "ram_used": "used",
+    "ram_available": "available",
+    "ram_utilization": "utilization",
+    "ram_scrape_error": "ram_scrape_error",
+    "processes_pid": "pid",
+    "processes_info": "info",
+    "processes_container_name": "container_name",
+    'hard_disk_total': "total",
+    'hard_disk_used': "used",
+    'hard_disk_free': "free",
+    'hard_disk_utilization': "utilization",
+    'hard_disk_scrape_error': "hard_disk_scrape_error",
+    'data_os': "os",
+    'data_ram': "ram",
+    'data_hard_disk': "hard_disk",
+    "data_docker_cfg": "docker_cfg",
+    "data_docker_cfg_scrape_error": "docker_cfg_scrape_error",
+    'os_scrape_error': "os_scrape_error",
+    'data_network': "network",
+    'data_md5_checksums': "md5_checksums",
+    'md5_checksums_nvidia_smi': "nvidia_smi",
+    'md5_checksums_libnvidia_ml': "libnvidia_ml",
+    'md5_checksums_docker': "docker",
+    'c_nvmlProcessInfo_v2_t_pid': "pid",
+    'c_nvmlProcessInfo_v2_t_usedGpuMemory': "usedGpuMemory",
+    'c_nvmlProcessInfo_v2_t_gpuInstanceId': "gpuInstanceId",
+    'c_nvmlProcessInfo_v2_t_computeInstanceId': "computeInstanceId",
+    '_fmt_usedGpuMemory': "usedGpuMemory",
+    'docker_version': "version",
+    'docker_container_id': "container_id",
+    'docker_containers': "containers",
+    'data_docker': "docker",
+    'each_container_id': "container_id",
+    'each_digest': "digest",
+    'each_name': "name",
+}
+
 
 class FileEncryptService:
     def __init__(
@@ -21,8 +115,6 @@ class FileEncryptService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
     ):
         self.ssh_service = ssh_service
-        self.all_keys = {}
-        self.original_keys = {}
 
     def make_obfuscated_file(self, tmp_directory: str, file_path: str):
         subprocess.run(
@@ -74,20 +166,6 @@ class FileEncryptService:
         return "_" + "".join(random.choices(string.ascii_letters, k=length))
 
     def generate_key_mappings(self):
-        keys_for_encryption_key_generation = [
-            "gpu.name",
-            "gpu.uuid",
-            "gpu.capacity",
-            "gpu.cuda",
-            "gpu.power_limit",
-            "gpu.graphics_speed",
-            "gpu.memory_speed",
-            "gpu.pcie",
-            "gpu.speed_pcie",
-            "gpu.utilization",
-            "gpu.memory_utilization",
-        ]
-
         all_keys = {
             "gpu.name": "",
             "gpu.uuid": "",
@@ -168,101 +246,12 @@ class FileEncryptService:
             'each_name': "",
         }
 
-        original_keys = {
-            "gpu.name": "name",
-            "gpu.uuid": "uuid",
-            "gpu.capacity": "capacity",
-            "gpu.cuda": "cuda",
-            "gpu.power_limit": "power_limit",
-            "gpu.graphics_speed": "graphics_speed",
-            "gpu.memory_speed": "memory_speed",
-            "gpu.pcie": "pcie",
-            "gpu.speed_pcie": "pcie_speed",
-            "gpu.utilization": "gpu_utilization",
-            "gpu.memory_utilization": "memory_utilization",
-            '<default>': "<default>",
-            'c_nvmlMemory_t_total': "total",
-            'c_nvmlMemory_t_free': "free",
-            'c_nvmlMemory_t_used': "used",
-            'c_nvmlMemory_v2_t_version': "version",
-            'c_nvmlMemory_v2_t_total': "total",
-            'c_nvmlMemory_v2_t_reserved': "reserved",
-            'c_nvmlMemory_v2_t_free': "free",
-            'c_nvmlMemory_v2_t_used': "used",
-            'c_nvmlUtilization_t_gpu': "gpu",
-            'c_nvmlUtilization_t_memory': "memory",
-            'upload_speed': "upload_speed",
-            'download_speed': "download_speed",
-            'network_speed_error': "network_speed_error",
-            'gpu_count': "count",
-            'gpu_driver': "driver",
-            'gpu_cuda_driver': "cuda_driver",
-            'gpu_details': "details",
-            'gpu_scrape_error': "gpu_scrape_error",
-            "data_gpu": "gpu",
-            "data_gpu_processes": "gpu_processes",
-            "data_cpu": "cpu",
-            "data_nvidia_cfg": "nvidia_cfg",
-            "nvidia_cfg_scrape_error": "nvidia_cfg_scrape_error",
-            "cpu_count": "count",
-            "cpu_model": "model",
-            "cpu_clocks": "clocks",
-            "cpu_utilization": "utilization",
-            "cpu_scrape_error": "cpu_scrape_error",
-            "ram_total": "total",
-            "ram_free": "free",
-            "ram_used": "used",
-            "ram_available": "available",
-            "ram_utilization": "utilization",
-            "ram_scrape_error": "ram_scrape_error",
-            "processes_pid": "pid",
-            "processes_info": "info",
-            "processes_container_name": "container_name",
-            'hard_disk_total': "total",
-            'hard_disk_used': "used",
-            'hard_disk_free': "free",
-            'hard_disk_utilization': "utilization",
-            'hard_disk_scrape_error': "hard_disk_scrape_error",
-            'data_os': "os",
-            'data_ram': "ram",
-            'data_hard_disk': "hard_disk",
-            "data_docker_cfg": "docker_cfg",
-            "data_docker_cfg_scrape_error": "docker_cfg_scrape_error",
-            'os_scrape_error': "os_scrape_error",
-            'data_network': "network",
-            'data_md5_checksums': "md5_checksums",
-            'md5_checksums_nvidia_smi': "nvidia_smi",
-            'md5_checksums_libnvidia_ml': "libnvidia_ml",
-            'md5_checksums_docker': "docker",
-            'c_nvmlProcessInfo_v2_t_pid': "pid",
-            'c_nvmlProcessInfo_v2_t_usedGpuMemory': "usedGpuMemory",
-            'c_nvmlProcessInfo_v2_t_gpuInstanceId': "gpuInstanceId",
-            'c_nvmlProcessInfo_v2_t_computeInstanceId': "computeInstanceId",
-            '_fmt_usedGpuMemory': "usedGpuMemory",
-            'docker_version': "version",
-            'docker_container_id': "container_id",
-            'docker_containers': "containers",
-            'data_docker': "docker",
-            'each_container_id': "container_id",
-            'each_digest': "digest",
-            'each_name': "name",
-        }
-
         # Generate dictionary key mapping on validator side
         for key, value in all_keys.items():
             all_keys[key] = self.generate_random_name()
 
-        self.all_keys = all_keys
-        self.original_keys = original_keys
-
-        encryption_key = ":".join([all_keys[key] for key in keys_for_encryption_key_generation])
+        encryption_key = ":".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
         return all_keys, encryption_key
-
-    def get_original_key(self):
-        return self.original_keys
-    
-    def get_all_keys(self):
-        return self.all_keys
 
     def ecrypt_miner_job_files(self):
         """
@@ -334,6 +323,7 @@ class FileEncryptService:
 
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
+            all_keys=all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
             score_file_name=score_file_name,
