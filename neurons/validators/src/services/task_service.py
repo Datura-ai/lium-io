@@ -33,7 +33,6 @@ from services.const import (
 )
 from services.redis_service import (
     RedisService,
-    RENTED_MACHINE_SET,
     PENDING_PODS_SET,
     DUPLICATED_MACHINE_SET,
     AVAILABLE_PORT_MAPS_PREFIX,
@@ -295,7 +294,7 @@ class TaskService:
 
                 return False, log_text, log_status
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(10)
 
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
@@ -827,48 +826,44 @@ class TaskService:
                     )
 
                 # check rented status
-                is_rented = await self.redis_service.is_elem_exists_in_set(
-                    RENTED_MACHINE_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
-                )
                 rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info.uuid)
-                if is_rented or rented_machine:
-                    if rented_machine:
-                        container_name = rented_machine.get("container_name", "")
-                        is_pod_running = await self.check_pod_running(
-                            ssh_client=ssh_client,
-                            miner_hotkey=miner_info.miner_hotkey,
-                            container_name=container_name,
-                            executor_info=executor_info,
+                if rented_machine:
+                    container_name = rented_machine.get("container_name", "")
+                    is_pod_running = await self.check_pod_running(
+                        ssh_client=ssh_client,
+                        miner_hotkey=miner_info.miner_hotkey,
+                        container_name=container_name,
+                        executor_info=executor_info,
+                    )
+                    if not is_pod_running:
+                        log_status = "warning"
+                        log_text = _m(
+                            "Pod is not running",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "container_name": container_name,
+                                }
+                            ),
                         )
-                        if not is_pod_running:
-                            log_status = "warning"
-                            log_text = _m(
-                                "Pod is not running",
-                                extra=get_extra_info(
-                                    {
-                                        **default_extra,
-                                        "container_name": container_name,
-                                    }
-                                ),
-                            )
-                            logger.warning(log_text)
+                        logger.warning(log_text)
 
-                            await self.clear_remote_directory(ssh_client, remote_dir)
-                            await self.clear_verified_job_count(
-                                miner_info=miner_info,
-                                executor_info=executor_info,
-                                prev_info=verified_job_info
-                            )
+                        await self.clear_remote_directory(ssh_client, remote_dir)
+                        await self.clear_verified_job_count(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            prev_info=verified_job_info
+                        )
 
-                            return (
-                                machine_spec,
-                                executor_info,
-                                0,
-                                0,
-                                miner_info.job_batch_id,
-                                log_status,
-                                log_text,
-                            )
+                        return (
+                            machine_spec,
+                            executor_info,
+                            0,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
 
                     score = max_score * gpu_count
                     log_text = _m(

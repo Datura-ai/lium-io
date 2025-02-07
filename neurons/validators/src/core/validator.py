@@ -43,17 +43,12 @@ class Validator:
         self.netuid = settings.BITTENSOR_NETUID
 
         self.should_exit = False
-        self.is_running = False
         self.last_job_run_blocks = 0
         self.default_extra = {}
 
         self.subtensor = None
-        self.set_subtensor()
-
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.initiate_services())
-
         self.debug_miner = debug_miner
+        self.miner_scores = {}
 
     async def initiate_services(self):
         ssh_service = SSHService()
@@ -62,7 +57,7 @@ class Validator:
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
-            file_encrypt_service=self.file_encrypt_service
+            file_encrypt_service=self.file_encrypt_service,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
@@ -512,9 +507,12 @@ class Validator:
                 docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORIES)
                 logger.info(
                     _m(
-                        "Docker Hub Digests",
+                        "Docker Hub Digests: get docker hub digests",
                         extra=get_extra_info(
-                            {"job_batch_id": job_batch_id, "docker_hub_digests": docker_hub_digests}
+                            {
+                                "job_batch_id": job_batch_id,
+                                "docker_hub_digests": len(docker_hub_digests),
+                            }
                         ),
                     ),
                 )
@@ -595,7 +593,7 @@ class Validator:
                                                         "parsed_counts": parsed_counts,
                                                     }
                                                 ),
-                                            ),
+                                            ),  
                                         )
 
                                         max_executors = max(
@@ -746,6 +744,7 @@ class Validator:
                         }
                     ),
                 ),
+                exc_info=True,
             )
 
     async def start(self):
@@ -756,6 +755,10 @@ class Validator:
             ),
         )
         try:
+            self.set_subtensor()
+            await self.initiate_services()
+            self.should_exit = False
+
             while not self.should_exit:
                 await self.sync()
 
@@ -797,3 +800,19 @@ class Validator:
             )
 
         self.should_exit = True
+        
+    async def warm_up_subtensor(self):
+        while True:
+            try:
+                self.set_subtensor()
+
+                # sync every 12 seconds
+                await asyncio.sleep(SYNC_CYCLE)
+            except Exception as e:
+                logger.info(
+                    _m(
+                        "[stop] Failed to save miner_scores",
+                        extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                    ),
+                )
+                await asyncio.sleep(SYNC_CYCLE)
