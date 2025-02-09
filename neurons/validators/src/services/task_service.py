@@ -39,6 +39,7 @@ from services.redis_service import (
 )
 from services.ssh_service import SSHService
 from services.hash_service import HashService
+from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +292,7 @@ class TaskService:
 
                 return False, log_text, log_status
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(10)
 
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
@@ -489,6 +490,13 @@ class TaskService:
                 )
 
                 gpu_model = None
+                all_keys = encypted_files.all_keys
+                reverse_all_keys = {v: k for k, v in all_keys.items()}
+                
+                updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
+                updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
+                
+                machine_spec = updated_machine_spec
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
                     details = machine_spec["gpu"].get("details", [])
                     if len(details) > 0:
@@ -527,7 +535,7 @@ class TaskService:
                                 "gpu_count": gpu_count,
                                 "nvidia_driver": nvidia_driver,
                                 "libnvidia_ml": libnvidia_ml,
-                                **verified_job_info
+                                **verified_job_info,
                             }
                         ),
                     ),
@@ -1308,5 +1316,24 @@ class TaskService:
 
             return None, str(e)
 
+    def update_keys(self, d, key_mapping):
+        updated_dict = {}
+        for key, value in d.items():
+            # Get the original key using the reverse mapping
+            original_key = key_mapping.get(key)  # Default to the same key if not found
+            # Recursively update keys if the value is a dictionary
+            if isinstance(value, dict):
+                updated_dict[original_key] = self.update_keys(value, key_mapping)
+            elif isinstance(value, list):
+                updated_list = []
+                for item in value:
+                    if isinstance(item, dict):
+                        updated_list.append(self.update_keys(item, key_mapping))
+                    else:
+                        updated_list.append(item)
+                updated_dict[original_key] = updated_list
+            else:
+                updated_dict[original_key] = value
+        return updated_dict
 
 TaskServiceDep = Annotated[TaskService, Depends(TaskService)]

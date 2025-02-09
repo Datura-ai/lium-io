@@ -40,7 +40,7 @@ def debug_send_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: i
     miner.axon_info.ip = miner_address
     miner.axon_info.port = miner_port
     validator = Validator(debug_miner=miner)
-    asyncio.run(validator.sync())
+    asyncio.run(validator.start())
 
 
 def generate_random_ip():

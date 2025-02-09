@@ -162,3 +162,5 @@ cython_debug/
 #.idea/
 logs
 temp/
+
+obfuscated_machine_scrape.py
