@@ -218,7 +218,7 @@ class ComputeClient:
                             score=data["score"],
                             synthetic_job_score=data["synthetic_job_score"],
                             log_status=data["log_status"],
-                            job_batch_id=f"job_batch_id: {data['job_batch_id']}",
+                            job_batch_id=data['job_batch_id'],
                             log_text=data["log_text"],
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
