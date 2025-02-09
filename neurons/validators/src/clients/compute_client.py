@@ -226,7 +226,8 @@ class ComputeClient:
                             executor_ip=data["executor_ip"],
                             executor_port=data["executor_port"],
                         )
-                        
+
+                        logger.info("Debug: Send specs to compute app with job batch id: %s", data["job_batch_id"])
                         queue.append(specs)
                     elif channel == STREAMING_LOG_CHANNEL:
                         log_stream = LogStreamRequest(
