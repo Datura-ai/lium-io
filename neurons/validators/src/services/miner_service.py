@@ -207,7 +207,6 @@ class MinerService:
                     "Requesting job to miner resulted in an exception",
                     extra=get_extra_info({**default_extra, "error": str(e)}),
                 ),
-                exc_info=True,
             )
             return None
 
