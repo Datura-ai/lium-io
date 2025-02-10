@@ -432,6 +432,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
                     await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
@@ -490,6 +491,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
                     await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
@@ -511,6 +513,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
                     await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
