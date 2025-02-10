@@ -218,6 +218,7 @@ class DockerService:
         command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
+            # wait until the docker connection check is finished.
             await asyncio.sleep(sleep)
 
             ids = " ".join(result.stdout.strip().split("\n"))

@@ -256,6 +256,7 @@ class TaskService:
         container_name = f"container_{miner_hotkey}"
 
         try:
+            # remove all containers that has conatiner_ prefix in its name, since it's unrented
             command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
             result = await ssh_client.run(command)
             if result.stdout.strip():
