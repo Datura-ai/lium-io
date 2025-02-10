@@ -947,37 +947,37 @@ class TaskService:
                                 log_text,
                             )
 
-                    # if not rented, check docker digests
-                    docker_digests = machine_spec.get("docker", {}).get("containers", [])
-                    is_docker_valid = self.validate_digests(docker_digests, docker_hub_digests)
-                    if not is_docker_valid:
-                        log_text = _m(
-                            "Docker digests are not valid",
-                            extra=get_extra_info(
-                                {**default_extra, "docker_digests": docker_digests}
-                            ),
-                        )
-                        log_status = "error"
+                        # if not rented, check docker digests
+                        docker_digests = machine_spec.get("docker", {}).get("containers", [])
+                        is_docker_valid = self.validate_digests(docker_digests, docker_hub_digests)
+                        if not is_docker_valid:
+                            log_text = _m(
+                                "Docker digests are not valid",
+                                extra=get_extra_info(
+                                    {**default_extra, "docker_digests": docker_digests}
+                                ),
+                            )
+                            log_status = "error"
 
-                        logger.warning(log_text)
+                            logger.warning(log_text)
 
-                        await self.clear_remote_directory(ssh_client, remote_dir)
-                        await self.redis_service.set_verified_job_info(
-                            miner_hotkey=miner_info.miner_hotkey,
-                            executor_id=executor_info.uuid,
-                            prev_info=verified_job_info,
-                            success=False,
-                        )
+                            await self.clear_remote_directory(ssh_client, remote_dir)
+                            await self.redis_service.set_verified_job_info(
+                                miner_hotkey=miner_info.miner_hotkey,
+                                executor_id=executor_info.uuid,
+                                prev_info=verified_job_info,
+                                success=False,
+                            )
 
-                        return (
-                            None,
-                            executor_info,
-                            0,
-                            0,
-                            miner_info.job_batch_id,
-                            log_status,
-                            log_text,
-                        )
+                            return (
+                                None,
+                                executor_info,
+                                0,
+                                0,
+                                miner_info.job_batch_id,
+                                log_status,
+                                log_text,
+                            )
 
                 # scoring
                 hashcat_config = HASHCAT_CONFIGS[gpu_model]
