@@ -213,10 +213,13 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
+        sleep: int = 0,
     ):
         command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
+            await asyncio.sleep(sleep)
+
             ids = " ".join(result.stdout.strip().split("\n"))
 
             logger.info(
@@ -414,7 +417,11 @@ class DockerService:
                         }
                     )
 
-                await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                await self.clean_exisiting_containers(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    sleep=10,
+                )
 
                 volume_name = f"volume_{uuid}"
                 command = f"docker volume create {volume_name}"
