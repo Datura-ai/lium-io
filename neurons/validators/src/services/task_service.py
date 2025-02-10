@@ -256,9 +256,14 @@ class TaskService:
         container_name = f"container_{miner_hotkey}"
 
         try:
-            result = await ssh_client.run(f"docker ps -q -f name={container_name}")
+            command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+            result = await ssh_client.run(command)
             if result.stdout.strip():
-                command = f"docker rm {container_name} -f"
+                ids = " ".join(result.stdout.strip().split("\n"))
+                command = f'docker rm {ids} -f'
+                await ssh_client.run(command)
+
+                command = f'docker volume prune -af'
                 await ssh_client.run(command)
 
             log_text = _m(
@@ -292,7 +297,7 @@ class TaskService:
 
                 return False, log_text, log_status
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
@@ -492,10 +497,10 @@ class TaskService:
                 gpu_model = None
                 all_keys = encypted_files.all_keys
                 reverse_all_keys = {v: k for k, v in all_keys.items()}
-                
+
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
                 updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
-                
+
                 machine_spec = updated_machine_spec
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
                     details = machine_spec["gpu"].get("details", [])
@@ -1335,5 +1340,6 @@ class TaskService:
             else:
                 updated_dict[original_key] = value
         return updated_dict
+
 
 TaskServiceDep = Annotated[TaskService, Depends(TaskService)]
