@@ -102,8 +102,6 @@ class Validator:
                 else:
                     self.miner_scores = json.loads(miner_scores_json)
 
-            # await self.redis_service.clear_all_ssh_ports()
-
             # remove pod renting-in-progress status
             await self.redis_service.delete(PENDING_PODS_SET)
         except Exception as e:
