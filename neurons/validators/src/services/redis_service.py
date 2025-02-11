@@ -146,10 +146,6 @@ class RedisService:
                 if cursor == 0:
                     break
 
-    async def clear_all_ssh_ports(self):
-        pattern = f"{AVAILABLE_PORT_MAPS_PREFIX}:*"
-        await self.clear_by_pattern(pattern)
-
     async def set_verified_job_info(
         self,
         miner_hotkey: str,
@@ -195,6 +191,11 @@ class RedisService:
             "spec": spec,
         }
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
+
+        # remove available port maps for the executor
+        port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
+        await self.delete(port_map_key)
+
         await self.publish(
             RESET_VERIFIED_JOB_CHANNEL,
             {

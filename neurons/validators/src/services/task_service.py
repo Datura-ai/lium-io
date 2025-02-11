@@ -1251,8 +1251,6 @@ class TaskService:
                     success=False,
                 )
 
-                key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
-                await self.redis_service.delete(key)
             except Exception as redis_error:
                 log_text = _m(
                     "Error creating task redis_reset_error",
