@@ -579,6 +579,8 @@ class TaskService:
                         "os_version": machine_spec.get("os", ""),
                         "nvidia_cfg": machine_spec.get("nvidia_cfg", ""),
                         "docker_cfg": machine_spec.get("docker_cfg", ""),
+                        "gpu_count": gpu_count,
+                        "gpu_details_length": len(gpu_details),
                         "gpu_scrape_error": machine_spec.get("gpu_scrape_error", ""),
                         "nvidia_cfg_scrape_error": machine_spec.get("nvidia_cfg_scrape_error", ""),
                         "docker_cfg_scrape_error": machine_spec.get("docker_cfg_scrape_error", ""),
