@@ -213,10 +213,14 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
+        sleep: int = 0,
     ):
         command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
+            # wait until the docker connection check is finished.
+            await asyncio.sleep(sleep)
+
             ids = " ".join(result.stdout.strip().split("\n"))
 
             logger.info(
@@ -414,7 +418,11 @@ class DockerService:
                         }
                     )
 
-                await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                await self.clean_exisiting_containers(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    sleep=10,
+                )
 
                 volume_name = f"volume_{uuid}"
                 command = f"docker volume create {volume_name}"
@@ -432,6 +440,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
                     await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
@@ -490,6 +499,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
                     await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
@@ -511,6 +521,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
                     await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
