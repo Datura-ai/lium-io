@@ -695,6 +695,7 @@ class DockerService:
             # await ssh_client.run(f"docker stop {payload.container_name}")
             await ssh_client.run(f"docker rm {payload.container_name} -f")
             await ssh_client.run(f"docker volume rm {payload.volume_name} -f")
+            await ssh_client.run(f"docker image prune -af")
 
             logger.info(
                 _m(
