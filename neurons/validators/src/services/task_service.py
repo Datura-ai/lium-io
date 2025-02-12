@@ -5,6 +5,7 @@ import os
 import random
 import time
 import uuid
+import hashlib
 from typing import Annotated
 
 import asyncssh
@@ -26,7 +27,8 @@ from services.const import (
     UNRENTED_MULTIPLIER,
     HASHCAT_CONFIGS,
     LIB_NVIDIA_ML_DIGESTS,
-    DOCKER_DIGESTS,
+    DOCKER_DIGEST,
+    PYTHON_DIGEST,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     VERIFY_JOB_REQUIRED_COUNT,
@@ -138,7 +140,7 @@ class TaskService:
             logger.error(f"Error starting script {script_path}: {e}", exc_info=True)
             return False
 
-    def validate_digests(self, docker_digests, docker_hub_digests):
+    def validate_docker_image_digests(self, docker_digests, docker_hub_digests):
         # Check if the list is empty
         if not docker_digests:
             return False
@@ -257,14 +259,14 @@ class TaskService:
 
         try:
             # remove all containers that has conatiner_ prefix in its name, since it's unrented
-            command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
             result = await ssh_client.run(command)
             if result.stdout.strip():
                 ids = " ".join(result.stdout.strip().split("\n"))
-                command = f'docker rm {ids} -f'
+                command = f'/usr/bin/docker rm {ids} -f'
                 await ssh_client.run(command)
 
-                command = f'docker volume prune -af'
+                command = f'/usr/bin/docker volume prune -af'
                 await ssh_client.run(command)
 
             log_text = _m(
@@ -275,7 +277,7 @@ class TaskService:
             logger.info(log_text)
 
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
+            command = f"/usr/bin/docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
             result = await ssh_client.run(command)
             if result.exit_status != 0:
@@ -291,7 +293,7 @@ class TaskService:
                 logger.error(log_text, exc_info=True)
 
                 try:
-                    command = f"docker rm {container_name} -f"
+                    command = f"/usr/bin/docker rm {container_name} -f"
                     await ssh_client.run(command)
                 except Exception as e:
                     logger.error(f"Error removing docker container: {e}")
@@ -329,7 +331,7 @@ class TaskService:
                 if len(port_maps) > 10:
                     await self.redis_service.rpop(key)
 
-            command = f"docker rm {container_name} -f"
+            command = f"/usr/bin/docker rm {container_name} -f"
             await ssh_client.run(command)
 
             return True, log_text, log_status
@@ -342,7 +344,7 @@ class TaskService:
             logger.error(log_text, exc_info=True)
 
             try:
-                command = f"docker rm {container_name} -f"
+                command = f"/usr/bin/docker rm {container_name} -f"
                 await ssh_client.run(command)
             except Exception as e:
                 logger.error(f"Error removing docker container: {e}")
@@ -369,7 +371,7 @@ class TaskService:
         executor_info: ExecutorSSHInfo,
     ):
         # check container running or not
-        result = await ssh_client.run(f"docker ps -q -f name={container_name}")
+        result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name}")
         if result.stdout.strip():
             return True
 
@@ -377,6 +379,27 @@ class TaskService:
         await self.redis_service.remove_rented_machine(miner_hotkey, executor_info.uuid)
 
         return False
+
+    async def read_file_content_over_scp(self, ssh_client: asyncssh.SSHClientConnection, file_path: str) -> bytes:
+        async with ssh_client.start_sftp_client() as sftp_client:
+            async with sftp_client.open(file_path, 'rb') as file:
+                file_content = await file.read()
+
+        return file_content
+
+    def get_md5_checksum_from_file_content(self, file_content: bytes):
+        md5_hash = hashlib.md5()
+        md5_hash.update(file_content)
+        return md5_hash.hexdigest()
+
+    def get_sha256_checksum_from_file_content(self, file_content: bytes):
+        sha256_hash = hashlib.sha256()
+        sha256_hash.update(file_content)
+        return sha256_hash.hexdigest()
+
+    async def get_checksums_over_scp(self, ssh_client: asyncssh.SSHClientConnection, file_path: str):
+        file_content = await self.read_file_content_over_scp(ssh_client, file_path)
+        return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
 
     async def create_task(
         self,
@@ -416,9 +439,74 @@ class TaskService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                remote_dir = f"{executor_info.root_dir}/temp"
+                random_length = random.randint(5, 15)
+                remote_dir = f"{executor_info.root_dir}/{self.ssh_service.generate_random_string(length=random_length, string_only=True)}"
                 await ssh_client.run(f"rm -rf {remote_dir}")
                 await ssh_client.run(f"mkdir -p {remote_dir}")
+
+                # if debug is True:
+                #     logger.info("Debug mode is enabled. Skipping other tasks.")
+                #     return (
+                #         None,
+                #         executor_info,
+                #         0,
+                #         0,
+                #         miner_info.job_batch_id,
+                #         "info",
+                #         "Debug mode is enabled. Skipping other tasks.",
+                #     )
+
+                docker_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/docker')
+                if docker_checksums != DOCKER_DIGEST:
+                    log_status = "warning"
+                    log_text = _m(
+                        "Docker is altered",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
+
+                    return (
+                        None,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
+                python_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/python')
+                if python_checksums != PYTHON_DIGEST:
+                    log_status = "warning"
+                    log_text = _m(
+                        "Python is altered",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
+
+                    return (
+                        None,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 # start gpus_utility.py
                 program_id = str(uuid.uuid4())
@@ -432,18 +520,6 @@ class TaskService:
                 script_path = f"{executor_info.root_dir}/src/gpus_utility.py"
                 if not await self.is_script_running(ssh_client, script_path):
                     await self.start_script(ssh_client, script_path, command_args, executor_info)
-
-                if debug is True:
-                    logger.info("Debug mode is enabled. Skipping other tasks.")
-                    return (
-                        None,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        "info",
-                        "Debug mode is enabled. Skipping other tasks.",
-                    )
 
                 # upload temp directory
                 await self.upload_directory(ssh_client, encypted_files.tmp_directory, remote_dir)
@@ -460,11 +536,12 @@ class TaskService:
                     ),
                 )
 
+                await ssh_client.run(f"chmod +x {remote_machine_scrape_file_path}")
                 machine_specs, _ = await self._run_task(
                     ssh_client=ssh_client,
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
-                    command=f"chmod +x {remote_machine_scrape_file_path} && {remote_machine_scrape_file_path}",
+                    command=f"{remote_machine_scrape_file_path}",
                 )
                 if not machine_specs:
                     log_status = "warning"
@@ -606,38 +683,6 @@ class TaskService:
                         ),
                     )
                     log_status = "warning"
-                    logger.warning(log_text)
-
-                    await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(
-                        miner_hotkey=miner_info.miner_hotkey,
-                        executor_id=executor_info.uuid,
-                        prev_info=verified_job_info,
-                        success=False,
-                    )
-
-                    return (
-                        machine_spec,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        log_status,
-                        log_text,
-                    )
-
-                if not docker_version or DOCKER_DIGESTS.get(docker_version) != docker_digest:
-                    log_status = "warning"
-                    log_text = _m(
-                        "Docker is altered",
-                        extra=get_extra_info(
-                            {
-                                **default_extra,
-                                "docker_version": docker_version,
-                                "docker_digest": docker_digest,
-                            }
-                        ),
-                    )
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
@@ -957,7 +1002,7 @@ class TaskService:
 
                         # if not rented, check docker digests
                         docker_digests = machine_spec.get("docker", {}).get("containers", [])
-                        is_docker_valid = self.validate_digests(docker_digests, docker_hub_digests)
+                        is_docker_valid = self.validate_docker_image_digests(docker_digests, docker_hub_digests)
                         if not is_docker_valid:
                             log_text = _m(
                                 "Docker digests are not valid",
