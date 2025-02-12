@@ -679,6 +679,7 @@ def get_md5_checksum_from_file_content(file_content: bytes):
     md5_hash.update(file_content)
     return md5_hash.hexdigest()
 
+
 def get_sha256_checksum_from_file_content(file_content: bytes):
     sha256_hash = hashlib.sha256()
     sha256_hash.update(file_content)
@@ -749,12 +750,15 @@ def get_machine_specs():
     data["data_gpu"] = {"gpu_count": 0, "gpu_details": []}
     gpu_process_ids = set()
 
-    try:
-        libnvidia_path = get_libnvidia_ml_path()
-        if not libnvidia_path:
-            return data
+    libnvidia_path = get_libnvidia_ml_path()
+    if not libnvidia_path:
+        return data
 
-        nvmlLib_content = get_file_content(libnvidia_path)
+    nvmlLib_content = get_file_content(libnvidia_path)
+    docker_content = get_file_content("/usr/bin/docker")
+    nvidia_smi_content = get_file_content('/usr/bin/nvidia-smi')
+
+    try:
         nvmlInit(nvmlLib_content)
 
         device_count = nvmlDeviceGetCount()
@@ -786,7 +790,7 @@ def get_machine_specs():
                 {
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
-                    "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_total / (1024 ** 2), # in MB
+                    "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_total / (1024 ** 2),  # in MB
                     "gpu.cuda": f"{major}.{minor}",
                     "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
                     "gpu.graphics_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS),
@@ -823,7 +827,6 @@ def get_machine_specs():
         except Exception as exc:
             data["data_docker_cfg_scrape_error"] = repr(exc)
 
-    docker_content = get_file_content("/usr/bin/docker")
     data["data_docker"] = get_docker_info(docker_content)
 
     data['data_gpu_processes'] = get_gpu_processes(gpu_process_ids, data["data_docker"]["docker_containers"])
@@ -854,7 +857,7 @@ def get_machine_specs():
 
         mem = psutil.virtual_memory()
         data["data_ram"] = {
-            "ram_total": mem.total / 1024, # in kB
+            "ram_total": mem.total / 1024,  # in kB
             "ram_free": mem.free / 1024,
             "ram_used": mem.free / 1024,
             "ram_available": mem.available / 1024,
@@ -887,9 +890,9 @@ def get_machine_specs():
     data["data_network"] = get_network_speed()
 
     data["data_md5_checksums"] = {
-        "md5_checksums_nvidia_smi": get_md5_checksum_from_path(run_cmd("which nvidia-smi").strip()),
+        "md5_checksums_nvidia_smi": f"{get_md5_checksum_from_file_content(nvidia_smi_content)}:{get_sha256_checksum_from_file_content(nvidia_smi_content)}",
         "md5_checksums_libnvidia_ml": f"{get_md5_checksum_from_file_content(nvmlLib_content)}:{get_sha256_checksum_from_file_content(nvmlLib_content)}",
-        "md5_checksums_docker": get_md5_checksum_from_file_content(docker_content),
+        "md5_checksums_docker": f"{get_md5_checksum_from_file_content(docker_content)}:{get_sha256_checksum_from_file_content(docker_content)}",
     }
 
     return data
@@ -898,6 +901,7 @@ def get_machine_specs():
 def _encrypt(key: str, payload: str) -> str:
     key_bytes = b64encode(hashlib.sha256(key.encode('utf-8')).digest(), altchars=b"-_")
     return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
+
 
 machine_specs = get_machine_specs()
 encryption_key = ":".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
