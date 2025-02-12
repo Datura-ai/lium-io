@@ -483,7 +483,7 @@ class TaskService:
                     )
 
                 python_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/python')
-                if python_checksums != PYTHON_DIGEST:
+                if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
                     log_status = "warning"
                     log_text = _m(
                         "Python is altered",
