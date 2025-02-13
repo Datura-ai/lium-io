@@ -33,7 +33,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL_NAME, RedisService
+from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
@@ -207,7 +207,6 @@ class MinerService:
                     "Requesting job to miner resulted in an exception",
                     extra=get_extra_info({**default_extra, "error": str(e)}),
                 ),
-                exc_info=True,
             )
             return None
 
@@ -236,7 +235,7 @@ class MinerService:
         ) in results:
             try:
                 await self.redis_service.publish(
-                    MACHINE_SPEC_CHANNEL_NAME,
+                    MACHINE_SPEC_CHANNEL,
                     {
                         "specs": specs,
                         "miner_hotkey": miner_hotkey,
@@ -387,14 +386,7 @@ class MinerService:
                             )
                         )
 
-                        await self.redis_service.remove_rented_machine(
-                            RentedMachine(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                executor_ip_address=executor.address if executor else "",
-                                executor_ip_port=str(executor.port if executor else ""),
-                            )
-                        )
+                        await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
 
                         return FailedContainerRequest(
                             miner_hotkey=payload.miner_hotkey,

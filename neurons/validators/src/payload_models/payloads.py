@@ -21,6 +21,7 @@ class MinerJobRequestPayload(BaseModel):
 
 class MinerJobEnryptedFiles(BaseModel):
     encrypt_key: str
+    all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
     score_file_name: str

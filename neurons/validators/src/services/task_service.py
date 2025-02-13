@@ -5,6 +5,7 @@ import os
 import random
 import time
 import uuid
+import hashlib
 from typing import Annotated
 
 import asyncssh
@@ -26,18 +27,21 @@ from services.const import (
     UNRENTED_MULTIPLIER,
     HASHCAT_CONFIGS,
     LIB_NVIDIA_ML_DIGESTS,
-    DOCKER_DIGESTS,
+    DOCKER_DIGEST,
+    PYTHON_DIGEST,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
+    VERIFY_JOB_REQUIRED_COUNT,
 )
 from services.redis_service import (
     RedisService,
-    RENTED_MACHINE_SET,
+    PENDING_PODS_SET,
     DUPLICATED_MACHINE_SET,
     AVAILABLE_PORT_MAPS_PREFIX,
 )
 from services.ssh_service import SSHService
 from services.hash_service import HashService
+from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +140,7 @@ class TaskService:
             logger.error(f"Error starting script {script_path}: {e}", exc_info=True)
             return False
 
-    def validate_digests(self, docker_digests, docker_hub_digests):
+    def validate_docker_image_digests(self, docker_digests, docker_hub_digests):
         # Check if the list is empty
         if not docker_digests:
             return False
@@ -254,9 +258,15 @@ class TaskService:
         container_name = f"container_{miner_hotkey}"
 
         try:
-            result = await ssh_client.run(f"docker ps -q -f name={container_name}")
+            # remove all containers that has conatiner_ prefix in its name, since it's unrented
+            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+            result = await ssh_client.run(command)
             if result.stdout.strip():
-                command = f"docker rm {container_name} -f"
+                ids = " ".join(result.stdout.strip().split("\n"))
+                command = f'/usr/bin/docker rm {ids} -f'
+                await ssh_client.run(command)
+
+                command = f'/usr/bin/docker volume prune -af'
                 await ssh_client.run(command)
 
             log_text = _m(
@@ -267,7 +277,7 @@ class TaskService:
             logger.info(log_text)
 
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
+            command = f"/usr/bin/docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
             result = await ssh_client.run(command)
             if result.exit_status != 0:
@@ -283,14 +293,14 @@ class TaskService:
                 logger.error(log_text, exc_info=True)
 
                 try:
-                    command = f"docker rm {container_name} -f"
+                    command = f"/usr/bin/docker rm {container_name} -f"
                     await ssh_client.run(command)
                 except Exception as e:
                     logger.error(f"Error removing docker container: {e}")
 
                 return False, log_text, log_status
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
 
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
@@ -321,7 +331,7 @@ class TaskService:
                 if len(port_maps) > 10:
                     await self.redis_service.rpop(key)
 
-            command = f"docker rm {container_name} -f"
+            command = f"/usr/bin/docker rm {container_name} -f"
             await ssh_client.run(command)
 
             return True, log_text, log_status
@@ -334,12 +344,62 @@ class TaskService:
             logger.error(log_text, exc_info=True)
 
             try:
-                command = f"docker rm {container_name} -f"
+                command = f"/usr/bin/docker rm {container_name} -f"
                 await ssh_client.run(command)
             except Exception as e:
                 logger.error(f"Error removing docker container: {e}")
 
             return False, log_text, log_status
+
+    async def clear_verified_job_count(
+        self,
+        miner_info: MinerJobRequestPayload,
+        executor_info: ExecutorSSHInfo,
+        prev_info: dict = {}
+    ):
+        await self.redis_service.clear_verified_job_info(
+            miner_hotkey=miner_info.miner_hotkey,
+            executor_id=executor_info.uuid,
+            prev_info=prev_info,
+        )
+
+    async def check_pod_running(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        miner_hotkey: str,
+        container_name: str,
+        executor_info: ExecutorSSHInfo,
+    ):
+        # check container running or not
+        result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name}")
+        if result.stdout.strip():
+            return True
+
+        # remove pod in redis
+        await self.redis_service.remove_rented_machine(miner_hotkey, executor_info.uuid)
+
+        return False
+
+    async def read_file_content_over_scp(self, ssh_client: asyncssh.SSHClientConnection, file_path: str) -> bytes:
+        async with ssh_client.start_sftp_client() as sftp_client:
+            async with sftp_client.open(file_path, 'rb') as file:
+                file_content = await file.read()
+
+        return file_content
+
+    def get_md5_checksum_from_file_content(self, file_content: bytes):
+        md5_hash = hashlib.md5()
+        md5_hash.update(file_content)
+        return md5_hash.hexdigest()
+
+    def get_sha256_checksum_from_file_content(self, file_content: bytes):
+        sha256_hash = hashlib.sha256()
+        sha256_hash.update(file_content)
+        return sha256_hash.hexdigest()
+
+    async def get_checksums_over_scp(self, ssh_client: asyncssh.SSHClientConnection, file_path: str):
+        file_content = await self.read_file_content_over_scp(ssh_client, file_path)
+        return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
 
     async def create_task(
         self,
@@ -362,6 +422,10 @@ class TaskService:
             "executor_ssh_port": executor_info.ssh_port,
             "version": settings.VERSION,
         }
+
+        verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
+        prev_spec = verified_job_info.get('spec', '')
+
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
 
@@ -375,9 +439,74 @@ class TaskService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                remote_dir = f"{executor_info.root_dir}/temp"
+                random_length = random.randint(5, 15)
+                remote_dir = f"{executor_info.root_dir}/{self.ssh_service.generate_random_string(length=random_length, string_only=True)}"
                 await ssh_client.run(f"rm -rf {remote_dir}")
                 await ssh_client.run(f"mkdir -p {remote_dir}")
+
+                # if debug is True:
+                #     logger.info("Debug mode is enabled. Skipping other tasks.")
+                #     return (
+                #         None,
+                #         executor_info,
+                #         0,
+                #         0,
+                #         miner_info.job_batch_id,
+                #         "info",
+                #         "Debug mode is enabled. Skipping other tasks.",
+                #     )
+
+                docker_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/docker')
+                if docker_checksums != DOCKER_DIGEST:
+                    log_status = "warning"
+                    log_text = _m(
+                        "Docker is altered",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
+
+                    return (
+                        None,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
+                python_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/python')
+                if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
+                    log_status = "warning"
+                    log_text = _m(
+                        "Python is altered",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
+
+                    return (
+                        None,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 # start gpus_utility.py
                 program_id = str(uuid.uuid4())
@@ -391,18 +520,6 @@ class TaskService:
                 script_path = f"{executor_info.root_dir}/src/gpus_utility.py"
                 if not await self.is_script_running(ssh_client, script_path):
                     await self.start_script(ssh_client, script_path, command_args, executor_info)
-
-                if debug is True:
-                    logger.info("Debug mode is enabled. Skipping other tasks.")
-                    return (
-                        None,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        "info",
-                        "Debug mode is enabled. Skipping other tasks.",
-                    )
 
                 # upload temp directory
                 await self.upload_directory(ssh_client, encypted_files.tmp_directory, remote_dir)
@@ -419,11 +536,12 @@ class TaskService:
                     ),
                 )
 
+                await ssh_client.run(f"chmod +x {remote_machine_scrape_file_path}")
                 machine_specs, _ = await self._run_task(
                     ssh_client=ssh_client,
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
-                    command=f"chmod +x {remote_machine_scrape_file_path} && {remote_machine_scrape_file_path}",
+                    command=f"{remote_machine_scrape_file_path}",
                 )
                 if not machine_specs:
                     log_status = "warning"
@@ -431,6 +549,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         None,
@@ -449,6 +573,13 @@ class TaskService:
                 )
 
                 gpu_model = None
+                all_keys = encypted_files.all_keys
+                reverse_all_keys = {v: k for k, v in all_keys.items()}
+
+                updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
+                updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
+
+                machine_spec = updated_machine_spec
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
                     details = machine_spec["gpu"].get("details", [])
                     if len(details) > 0:
@@ -460,13 +591,22 @@ class TaskService:
 
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
                 gpu_details = machine_spec.get("gpu", {}).get("details", [])
+                gpu_model_count = f'{gpu_model}:{gpu_count}'
 
                 nvidia_driver = machine_spec.get("gpu", {}).get("driver", "")
                 libnvidia_ml = machine_spec.get("md5_checksums", {}).get("libnvidia_ml", "")
 
                 docker_version = machine_spec.get("docker", {}).get("version", "")
                 docker_digest = machine_spec.get("md5_checksums", {}).get("docker", "")
-                container_id = machine_spec.get("docker", {}).get("container_id", "")
+
+                ram = machine_spec.get("ram", {}).get("total", 0)
+                storage = machine_spec.get("hard_disk", {}).get("free", 0)
+
+                gpu_processes = machine_spec.get("gpu_processes", [])
+
+                vram = 0
+                for detail in gpu_details:
+                    vram += detail.get("capacity", 0) * 1024
 
                 logger.info(
                     _m(
@@ -478,6 +618,7 @@ class TaskService:
                                 "gpu_count": gpu_count,
                                 "nvidia_driver": nvidia_driver,
                                 "libnvidia_ml": libnvidia_ml,
+                                **verified_job_info,
                             }
                         ),
                     ),
@@ -492,6 +633,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         machine_spec,
@@ -509,6 +656,8 @@ class TaskService:
                         "os_version": machine_spec.get("os", ""),
                         "nvidia_cfg": machine_spec.get("nvidia_cfg", ""),
                         "docker_cfg": machine_spec.get("docker_cfg", ""),
+                        "gpu_count": gpu_count,
+                        "gpu_details_length": len(gpu_details),
                         "gpu_scrape_error": machine_spec.get("gpu_scrape_error", ""),
                         "nvidia_cfg_scrape_error": machine_spec.get("nvidia_cfg_scrape_error", ""),
                         "docker_cfg_scrape_error": machine_spec.get("docker_cfg_scrape_error", ""),
@@ -537,33 +686,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
-
-                    return (
-                        machine_spec,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        log_status,
-                        log_text,
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
                     )
-
-                if not docker_version or DOCKER_DIGESTS.get(docker_version) != docker_digest:
-                    log_status = "warning"
-                    log_text = _m(
-                        "Docker is altered",
-                        extra=get_extra_info(
-                            {
-                                **default_extra,
-                                "docker_version": docker_version,
-                                "docker_digest": docker_digest,
-                                "container_id": container_id,
-                            }
-                        ),
-                    )
-                    logger.warning(log_text)
-
-                    await self.clear_remote_directory(ssh_client, remote_dir)
 
                     return (
                         machine_spec,
@@ -592,6 +720,11 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
 
                     return (
                         machine_spec,
@@ -602,6 +735,109 @@ class TaskService:
                         log_status,
                         log_text,
                     )
+
+                if prev_spec and prev_spec != gpu_model_count:
+                    log_status = "warning"
+                    log_text = _m(
+                        "Machine spec is changed",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "prev_spec": prev_spec,
+                                "current_spec": gpu_model_count,
+                            }
+                        ),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
+                for process in gpu_processes:
+                    container_name = process.get('container_name', None)
+                    if not container_name:
+                        log_status = "warning"
+                        log_text = _m(
+                            "GPU is using in some other places",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "gpu_model": gpu_model,
+                                    "gpu_count": gpu_count,
+                                    **process,
+                                }
+                            ),
+                        )
+                        logger.warning(log_text)
+
+                        await self.clear_remote_directory(ssh_client, remote_dir)
+                        await self.redis_service.set_verified_job_info(
+                            miner_hotkey=miner_info.miner_hotkey,
+                            executor_id=executor_info.uuid,
+                            prev_info=verified_job_info,
+                            success=False,
+                        )
+
+                        return (
+                            machine_spec,
+                            executor_info,
+                            0,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
+
+                # if ram < vram * 0.9 or storage < vram * 1.5:
+                #     log_status = "warning"
+                #     log_text = _m(
+                #         "Incorrect vram",
+                #         extra=get_extra_info(
+                #             {
+                #                 **default_extra,
+                #                 "gpu_model": gpu_model,
+                #                 "gpu_count": gpu_count,
+                #                 "memory": ram,
+                #                 "vram": vram,
+                #                 "storage": storage,
+                #                 "nvidia_driver": nvidia_driver,
+                #                 "libnvidia_ml": libnvidia_ml,
+                #             }
+                #         ),
+                #     )
+                #     logger.warning(log_text)
+
+                #     await self.clear_remote_directory(ssh_client, remote_dir)
+                #     await self.redis_service.set_verified_job_info(
+                #         miner_hotkey=miner_info.miner_hotkey,
+                #         executor_id=executor_info.uuid,
+                #         prev_info=verified_job_info,
+                #         success=False,
+                #     )
+
+                #     return (
+                #         machine_spec,
+                #         executor_info,
+                #         0,
+                #         0,
+                #         miner_info.job_batch_id,
+                #         log_status,
+                #         log_text,
+                #     )
 
                 logger.info(
                     _m(
@@ -623,6 +859,11 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
 
                     return (
                         machine_spec,
@@ -635,10 +876,45 @@ class TaskService:
                     )
 
                 # check rented status
-                is_rented = await self.redis_service.is_elem_exists_in_set(
-                    RENTED_MACHINE_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
-                )
-                if is_rented:
+                rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info.uuid)
+                if rented_machine:
+                    container_name = rented_machine.get("container_name", "")
+                    is_pod_running = await self.check_pod_running(
+                        ssh_client=ssh_client,
+                        miner_hotkey=miner_info.miner_hotkey,
+                        container_name=container_name,
+                        executor_info=executor_info,
+                    )
+                    if not is_pod_running:
+                        log_status = "warning"
+                        log_text = _m(
+                            "Pod is not running",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "container_name": container_name,
+                                }
+                            ),
+                        )
+                        logger.warning(log_text)
+
+                        await self.clear_remote_directory(ssh_client, remote_dir)
+                        await self.clear_verified_job_count(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            prev_info=verified_job_info
+                        )
+
+                        return (
+                            machine_spec,
+                            executor_info,
+                            0,
+                            0,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
+
                     score = max_score * gpu_count
                     log_text = _m(
                         "Executor is already rented.",
@@ -676,6 +952,12 @@ class TaskService:
                             logger.warning(log_text)
 
                             await self.clear_remote_directory(ssh_client, remote_dir)
+                            await self.redis_service.set_verified_job_info(
+                                miner_hotkey=miner_info.miner_hotkey,
+                                executor_id=executor_info.uuid,
+                                prev_info=verified_job_info,
+                                success=False,
+                            )
 
                             return (
                                 machine_spec,
@@ -687,53 +969,68 @@ class TaskService:
                                 log_text,
                             )
 
-                    # if not rented, check renting ports
-                    success, log_text, log_status = await self.docker_connection_check(
-                        ssh_client=ssh_client,
-                        job_batch_id=miner_info.job_batch_id,
-                        miner_hotkey=miner_info.miner_hotkey,
-                        executor_info=executor_info,
-                        private_key=private_key,
-                        public_key=public_key,
+                    renting_in_progress = await self.redis_service.is_elem_exists_in_set(
+                        PENDING_PODS_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
                     )
-                    if not success:
-                        await self.clear_remote_directory(ssh_client, remote_dir)
-
-                        return (
-                            None,
-                            executor_info,
-                            0,
-                            0,
-                            miner_info.job_batch_id,
-                            log_status,
-                            log_text,
+                    if not renting_in_progress:
+                        success, log_text, log_status = await self.docker_connection_check(
+                            ssh_client=ssh_client,
+                            job_batch_id=miner_info.job_batch_id,
+                            miner_hotkey=miner_info.miner_hotkey,
+                            executor_info=executor_info,
+                            private_key=private_key,
+                            public_key=public_key,
                         )
+                        if not success:
+                            await self.clear_remote_directory(ssh_client, remote_dir)
+                            await self.redis_service.set_verified_job_info(
+                                miner_hotkey=miner_info.miner_hotkey,
+                                executor_id=executor_info.uuid,
+                                prev_info=verified_job_info,
+                                success=False,
+                            )
 
-                    # if not rented, check docker digests
-                    docker_digests = machine_spec.get("docker", {}).get("containers", [])
-                    is_docker_valid = self.validate_digests(docker_digests, docker_hub_digests)
-                    if not is_docker_valid:
-                        log_text = _m(
-                            "Docker digests are not valid",
-                            extra=get_extra_info(
-                                {**default_extra, "docker_digests": docker_digests}
-                            ),
-                        )
-                        log_status = "error"
+                            return (
+                                None,
+                                executor_info,
+                                0,
+                                0,
+                                miner_info.job_batch_id,
+                                log_status,
+                                log_text,
+                            )
 
-                        logger.warning(log_text)
+                        # if not rented, check docker digests
+                        docker_digests = machine_spec.get("docker", {}).get("containers", [])
+                        is_docker_valid = self.validate_docker_image_digests(docker_digests, docker_hub_digests)
+                        if not is_docker_valid:
+                            log_text = _m(
+                                "Docker digests are not valid",
+                                extra=get_extra_info(
+                                    {**default_extra, "docker_digests": docker_digests}
+                                ),
+                            )
+                            log_status = "error"
 
-                        await self.clear_remote_directory(ssh_client, remote_dir)
+                            logger.warning(log_text)
 
-                        return (
-                            None,
-                            executor_info,
-                            0,
-                            0,
-                            miner_info.job_batch_id,
-                            log_status,
-                            log_text,
-                        )
+                            await self.clear_remote_directory(ssh_client, remote_dir)
+                            await self.redis_service.set_verified_job_info(
+                                miner_hotkey=miner_info.miner_hotkey,
+                                executor_id=executor_info.uuid,
+                                prev_info=verified_job_info,
+                                success=False,
+                            )
+
+                            return (
+                                None,
+                                executor_info,
+                                0,
+                                0,
+                                miner_info.job_batch_id,
+                                log_status,
+                                log_text,
+                            )
 
                 # scoring
                 hashcat_config = HASHCAT_CONFIGS[gpu_model]
@@ -747,6 +1044,12 @@ class TaskService:
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         None,
@@ -778,12 +1081,21 @@ class TaskService:
                 if not results:
                     log_text = _m(
                         "No result from training job task.",
-                        extra=get_extra_info(default_extra),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": str(err)
+                        }),
                     )
                     log_status = "warning"
                     logger.warning(log_text)
 
                     await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
 
                     return (
                         machine_spec,
@@ -820,6 +1132,24 @@ class TaskService:
                     )
                     logger.error(log_text)
 
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
                 elif answer != hash_service.answer:
                     log_status = "error"
                     log_text = _m(
@@ -827,6 +1157,24 @@ class TaskService:
                         extra=get_extra_info({**default_extra, "answer": answer, "hash_service_answer": hash_service.answer}),
                     )
                     logger.error(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=False,
+                    )
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
 
                 # elif job_taken_time > avg_job_time * 2:
                 #     log_status = "error"
@@ -837,12 +1185,17 @@ class TaskService:
                 #     logger.error(log_text)
 
                 else:
+                    verified_job_count = verified_job_info.get('count', 0)
+                    verified_job_count += 1
+
                     logger.info(
                         _m(
                             "Job taken time for executor",
-                            extra=get_extra_info(
-                                {**default_extra, "job_taken_time": job_taken_time}
-                            ),
+                            extra=get_extra_info({
+                                **default_extra,
+                                "job_taken_time": job_taken_time,
+                                "verified_job_count": verified_job_count,
+                            }),
                         ),
                     )
 
@@ -876,12 +1229,15 @@ class TaskService:
                         extra=get_extra_info(
                             {
                                 **default_extra,
-                                "score": score,
+                                "job_score": score,
+                                "acutal_score": score if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT else 0,
                                 "job_taken_time": job_taken_time,
                                 "upload_speed": upload_speed,
                                 "download_speed": download_speed,
                                 "gpu_model": gpu_model,
                                 "gpu_count": gpu_count,
+                                "verified_job_count": verified_job_count,
+                                "remaining_jobs_before_emission": 0 if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT else VERIFY_JOB_REQUIRED_COUNT - verified_job_count,
                                 "unrented_multiplier": UNRENTED_MULTIPLIER,
                             }
                         ),
@@ -889,23 +1245,42 @@ class TaskService:
 
                     logger.info(log_text)
 
-                logger.info(
-                    _m(
-                        "SSH connection closed for executor",
-                        extra=get_extra_info(default_extra),
-                    ),
-                )
+                    logger.info(
+                        _m(
+                            "SSH connection closed for executor",
+                            extra=get_extra_info(default_extra),
+                        ),
+                    )
 
-                await self.clear_remote_directory(ssh_client, remote_dir)
-                return (
-                    machine_spec,
-                    executor_info,
-                    score,
-                    score,
-                    miner_info.job_batch_id,
-                    log_status,
-                    log_text,
-                )
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.redis_service.set_verified_job_info(
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_id=executor_info.uuid,
+                        prev_info=verified_job_info,
+                        success=True,
+                        spec=gpu_model_count,
+                    )
+
+                    if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT:
+                        return (
+                            machine_spec,
+                            executor_info,
+                            score,
+                            score,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
+                    else:
+                        return (
+                            machine_spec,
+                            executor_info,
+                            0,
+                            score,
+                            miner_info.job_batch_id,
+                            log_status,
+                            log_text,
+                        )
         except Exception as e:
             log_status = "error"
             log_text = _m(
@@ -914,8 +1289,13 @@ class TaskService:
             )
 
             try:
-                key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
-                await self.redis_service.delete(key)
+                await self.redis_service.set_verified_job_info(
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_id=executor_info.uuid,
+                    prev_info=verified_job_info,
+                    success=False,
+                )
+
             except Exception as redis_error:
                 log_text = _m(
                     "Error creating task redis_reset_error",
@@ -986,6 +1366,26 @@ class TaskService:
             )
 
             return None, str(e)
+
+    def update_keys(self, d, key_mapping):
+        updated_dict = {}
+        for key, value in d.items():
+            # Get the original key using the reverse mapping
+            original_key = key_mapping.get(key)  # Default to the same key if not found
+            # Recursively update keys if the value is a dictionary
+            if isinstance(value, dict):
+                updated_dict[original_key] = self.update_keys(value, key_mapping)
+            elif isinstance(value, list):
+                updated_list = []
+                for item in value:
+                    if isinstance(item, dict):
+                        updated_list.append(self.update_keys(item, key_mapping))
+                    else:
+                        updated_list.append(item)
+                updated_dict[original_key] = updated_list
+            else:
+                updated_dict[original_key] = value
+        return updated_dict
 
 
 TaskServiceDep = Annotated[TaskService, Depends(TaskService)]
