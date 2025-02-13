@@ -9,20 +9,20 @@ from bittensor.utils.weight_utils import (
     convert_weights_and_uids_for_emit,
     process_weights_for_netuid,
 )
-from websockets.protocol import State as WebSocketClientState
 from payload_models.payloads import MinerJobRequestPayload
+from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from services.docker_service import REPOSITORIES, DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, RedisService
+from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
 if TYPE_CHECKING:
-    from bittensor_wallet import Wallet
+    from bittensor_wallet import bittensor_wallet
 
 logger = get_logger(__name__)
 
@@ -32,7 +32,7 @@ MINER_SCORES_KEY = "miner_scores"
 
 
 class Validator:
-    wallet: "Wallet"
+    wallet: "bittensor_wallet"
     netuid: int
     subtensor: bittensor.Subtensor
 
@@ -43,21 +43,20 @@ class Validator:
         self.netuid = settings.BITTENSOR_NETUID
 
         self.should_exit = False
-        self.is_running = False
         self.last_job_run_blocks = 0
         self.default_extra = {}
 
         self.subtensor = None
-        self.set_subtensor()
-
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(self.initiate_services())
-
         self.debug_miner = debug_miner
+        self.miner_scores = {}
+
+        major, minor, patch = map(int, settings.VERSION.split('.'))
+        self.version_key = major * 1000 + minor * 100 + patch
 
     async def initiate_services(self):
         ssh_service = SSHService()
         self.redis_service = RedisService()
+        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
@@ -71,7 +70,6 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
         )
-        self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
 
         # init miner_scores
         try:
@@ -107,7 +105,8 @@ class Validator:
                 else:
                     self.miner_scores = json.loads(miner_scores_json)
 
-            await self.redis_service.clear_all_ssh_ports()
+            # remove pod renting-in-progress status
+            await self.redis_service.delete(PENDING_PODS_SET)
         except Exception as e:
             logger.error(
                 _m(
@@ -134,8 +133,8 @@ class Validator:
             if (
                 self.subtensor
                 and self.subtensor.substrate
-                and self.subtensor.substrate.websocket
-                and self.subtensor.substrate.websocket.state is WebSocketClientState.OPEN
+                and self.subtensor.substrate.ws
+                and self.subtensor.substrate.ws.state is WebSocketClientState.OPEN
             ):
                 return
 
@@ -155,10 +154,12 @@ class Validator:
             logger.info(
                 _m(
                     "[Error] Getting subtensor",
-                    extra=get_extra_info({
-                        ** self.default_extra,
-                        "error": str(e),
-                    }),
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "error": str(e),
+                        }
+                    ),
                 ),
             )
 
@@ -267,7 +268,13 @@ class Validator:
         weights = np.zeros(len(miners), dtype=np.float32)
         for ind, miner in enumerate(miners):
             uids[ind] = miner.uid
-            weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
+            if miner.uid == 4:
+                weights[ind] = 1
+            else:
+                weights[ind] = 0
+
+            # uids[ind] = miner.uid
+            # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
 
         logger.info(
             _m(
@@ -299,7 +306,10 @@ class Validator:
         logger.info(
             _m(
                 f"[set_weights] uint_uids: {uint_uids} uint_weights: {uint_weights}",
-                extra=get_extra_info(self.default_extra),
+                extra=get_extra_info({
+                    **self.default_extra,
+                    "version_key": self.version_key,
+                }),
             ),
         )
 
@@ -308,6 +318,7 @@ class Validator:
             netuid=self.netuid,
             uids=uint_uids,
             weights=uint_weights,
+            version_key=self.version_key,
             wait_for_finalization=False,
             wait_for_inclusion=False,
         )
@@ -397,9 +408,7 @@ class Validator:
 
             blocks_till_epoch = tempo - (current_block + self.netuid + 1) % (tempo + 1)
 
-            should_set_weights = last_update >= tempo * 2 or (
-                blocks_till_epoch < 20 and last_update >= weights_rate_limit
-            )
+            should_set_weights = last_update >= tempo
 
             logger.info(
                 _m(
@@ -511,9 +520,12 @@ class Validator:
                 docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORIES)
                 logger.info(
                     _m(
-                        "Docker Hub Digests",
+                        "Docker Hub Digests: get docker hub digests",
                         extra=get_extra_info(
-                            {"job_batch_id": job_batch_id, "docker_hub_digests": docker_hub_digests}
+                            {
+                                "job_batch_id": job_batch_id,
+                                "docker_hub_digests": len(docker_hub_digests),
+                            }
                         ),
                     ),
                 )
@@ -534,6 +546,7 @@ class Validator:
                             ),
                             encypted_files=encypted_files,
                             docker_hub_digests=docker_hub_digests,
+                            debug=settings.DEBUG,
                         )
                     )
                     for miner in miners
@@ -549,7 +562,7 @@ class Validator:
 
                 try:
                     # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=60 * 10)
+                    done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 100)
 
                     # Process completed jobs
                     for task in done:
@@ -744,6 +757,7 @@ class Validator:
                         }
                     ),
                 ),
+                exc_info=True,
             )
 
     async def start(self):
@@ -754,6 +768,10 @@ class Validator:
             ),
         )
         try:
+            self.set_subtensor()
+            await self.initiate_services()
+            self.should_exit = False
+
             while not self.should_exit:
                 await self.sync()
 
@@ -795,3 +813,19 @@ class Validator:
             )
 
         self.should_exit = True
+
+    async def warm_up_subtensor(self):
+        while True:
+            try:
+                self.set_subtensor()
+
+                # sync every 12 seconds
+                await asyncio.sleep(SYNC_CYCLE)
+            except Exception as e:
+                logger.info(
+                    _m(
+                        "[stop] Failed to connect into subtensor",
+                        extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                    ),
+                )
+                await asyncio.sleep(SYNC_CYCLE)

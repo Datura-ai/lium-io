@@ -47,7 +47,8 @@ You can change the ports for `INTERNAL_PORT`, `EXTERNAL_PORT`, `SSH_PORT` based 
 
 - **INTERNAL_PORT**: internal port of your executor docker container
 - **EXTERNAL_PORT**: external expose port of your executor docker container
-- **SSH_PORT**: ssh access port of your executor docker container
+- **SSH_PORT**: ssh port map into 22 of your executor docker container
+- **SSH_PUBLIC_PORT**: [Optional] ssh public access port of your executor docker container. If `SSH_PUBLIC_PORT` is equal to `SSH_PORT` then you don't have to specify this port.
 - **MINER_HOTKEY_SS58_ADDRESS**: the miner hotkey address
 - **RENTING_PORT_RANGE**: The port range that are publicly accessible. This can be empty if all ports are open. Available formats are: 
   - Range Specification(`from-to`): Miners can specify a range of ports, such as 2000-2005. This means ports from 2000 to 2005 will be open for the validator to select.

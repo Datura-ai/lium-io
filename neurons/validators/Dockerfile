@@ -29,7 +29,7 @@ FROM $BASE_IMAGE AS secondary-image
 LABEL builder=false
 
 RUN apt-get update \
-  && apt-get install -y wget docker.io docker-compose \
+  && apt-get install -y wget gcc ccache patchelf \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
@@ -46,7 +46,5 @@ RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bash_profile
 
 COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
-
-LABEL version="3.3.10"
 
 CMD ["bash", "run.sh"]

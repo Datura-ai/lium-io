@@ -1,13 +1,13 @@
-from typing import TYPE_CHECKING
 import argparse
 import pathlib
+from typing import TYPE_CHECKING
 
 import bittensor
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
-    from bittensor_wallet import Wallet
+    from bittensor_wallet import bittensor_wallet
 
 
 class Settings(BaseSettings):
@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
     DEBUG: bool = Field(env="DEBUG", default=False)
     DEBUG_MINER_HOTKEY: str = Field(env="DEBUG_MINER_HOTKEY", default="")
+    DEBUG_MINER_ADDRESS: str | None = Field(env="DEBUG_MINER_ADDRESS", default=None)
+    DEBUG_MINER_PORT: int | None = Field(env="DEBUG_MINER_PORT", default=None)
 
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     BLOCKS_FOR_JOB: int = 50
@@ -35,10 +37,16 @@ class Settings(BaseSettings):
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
     COMPUTE_APP_URI: str = "wss://celiumcompute.ai"
+    COMPUTE_REST_API_URL: str | None = Field(
+        env="COMPUTE_REST_API_URL", default="https://celiumcompute.ai/api"
+    )
 
     ENV: str = Field(env="ENV", default="dev")
+    
+    # Read version from version.txt
+    VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
-    def get_bittensor_wallet(self) -> "Wallet":
+    def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
         wallet = bittensor.wallet(
@@ -89,6 +97,17 @@ class Settings(BaseSettings):
             )
 
         return bittensor.config(parser)
+
+    def get_debug_miner(self) -> dict:
+        if not self.DEBUG_MINER_ADDRESS or not self.DEBUG_MINER_PORT:
+            raise RuntimeError("Debug miner not configured")
+
+        miner = type("Miner", (object,), {})()
+        miner.hotkey = self.DEBUG_MINER_HOTKEY
+        miner.axon_info = type("AxonInfo", (object,), {})()
+        miner.axon_info.ip = self.DEBUG_MINER_ADDRESS
+        miner.axon_info.port = self.DEBUG_MINER_PORT
+        return miner
 
 
 settings = Settings()

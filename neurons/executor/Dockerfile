@@ -29,7 +29,7 @@ LABEL builder=false
 
 RUN apt-get update -y \
   && apt-get upgrade -y \
-  && apt-get install -y hashcat hashcat-data nvidia-cuda-toolkit \
+  && apt-get install -y speedtest-cli hashcat hashcat-data nvidia-cuda-toolkit \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
@@ -52,7 +52,5 @@ COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 RUN mkdir -p /etc/docker
 RUN mkdir -p /etc/nvidia-container-runtime
 RUN mkdir -p /root/.ssh
-
-LABEL version="3.3.0"
 
 CMD ["bash", "run.sh"]

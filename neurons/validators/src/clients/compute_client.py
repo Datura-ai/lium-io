@@ -8,28 +8,37 @@ import pydantic
 import redis.asyncio as aioredis
 import tenacity
 import websockets
+from datura.requests.base import BaseRequest
 from payload_models.payloads import (
+    ContainerBaseRequest,
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleteRequest,
+    ContainerStartRequest,
+    ContainerStopRequest,
+    DuplicateExecutorsResponse,
     FailedContainerRequest,
 )
 from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
+    DuplicateExecutorsRequest,
     ExecutorSpecRequest,
     LogStreamRequest,
     RentedMachineRequest,
+    ResetVerifiedJobRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
-from clients.metagraph_client import create_metagraph_refresh_task, get_miner_axon_info
+from core.validator import Validator
 from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
 from services.redis_service import (
-    MACHINE_SPEC_CHANNEL_NAME,
-    RENTED_MACHINE_SET,
+    DUPLICATED_MACHINE_SET,
+    MACHINE_SPEC_CHANNEL,
+    RENTED_MACHINE_PREFIX,
+    RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
 )
 
@@ -54,8 +63,9 @@ class ComputeClient:
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
-        self.refresh_metagraph_task = self.create_metagraph_refresh_task()
         self.miner_service = miner_service
+        self.validator = Validator()
+        self.message_queue = []
 
         self.logging_extra = get_extra_info(
             {
@@ -63,6 +73,9 @@ class ComputeClient:
                 "compute_app_uri": compute_app_uri,
             }
         )
+
+    def accepted_request_type(self) -> type[BaseRequest]:
+        return ContainerBaseRequest
 
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
@@ -88,7 +101,8 @@ class ComputeClient:
                     _m(
                         "Error occurred during driving a miner client",
                         extra={**self.logging_extra, "error": str(exc)},
-                    )
+                    ),
+                    exc_info=True,
                 )
 
     async def __aenter__(self):
@@ -102,20 +116,9 @@ class ComputeClient:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        """connect (and re-connect) to facilitator and keep reading messages ... forever"""
-        try:
-            # subscribe to channel to get machine specs
-            pubsub = await self.miner_service.redis_service.subscribe(MACHINE_SPEC_CHANNEL_NAME)
-            log_channel = await self.miner_service.redis_service.subscribe(STREAMING_LOG_CHANNEL)
-
-            # send machine specs to facilitator
-            self.specs_task = asyncio.create_task(self.wait_for_specs(pubsub))
-            asyncio.create_task(self.wait_for_log_streams(log_channel))
-        except Exception as exc:
-            logger.error(
-                _m("redis connection error", extra={**self.logging_extra, "error": str(exc)})
-            )
-
+        asyncio.create_task(self.validator.warm_up_subtensor())
+        asyncio.create_task(self.handle_send_messages())
+        asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
 
         try:
@@ -154,13 +157,14 @@ class ComputeClient:
                             )
                         )
 
-        except asyncio.exceptions.CancelledError:
+        except Exception as exc:
             self.ws = None
             logger.error(
                 _m(
-                    "Facilitator client received cancel, stopping",
-                    extra=self.logging_extra,
-                )
+                    "Connecting to compute app failed",
+                    extra={**self.logging_extra, "error": str(exc)},
+                ),
+                exc_info=True,
             )
 
     async def handle_connection(self, ws: ClientConnection):
@@ -182,179 +186,78 @@ class ComputeClient:
         async for raw_msg in ws:
             await self.handle_message(raw_msg)
 
-    async def wait_for_specs(self, channel: aioredis.client.PubSub):
-        specs_queue = []
+    async def subscribe_mesages_from_redis(self):
+        validator_hotkey = self.my_hotkey()
+
         while True:
-            validator_hotkey = self.my_hotkey()
-
-            logger.info(
-                _m(
-                    f"Waiting for machine specs from validator app: {validator_hotkey}",
-                    extra=self.logging_extra,
-                )
-            )
             try:
-                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=100 * 60)
-                logger.info(
-                    _m(
-                        "Received machine specs from validator app.",
-                        extra={**self.logging_extra},
-                    )
+                pubsub = await self.miner_service.redis_service.subscribe(
+                    MACHINE_SPEC_CHANNEL,
+                    STREAMING_LOG_CHANNEL,
+                    RESET_VERIFIED_JOB_CHANNEL,
                 )
-
-                if msg is None:
-                    logger.warning(
-                        _m(
-                            "No message received from validator app.",
-                            extra=self.logging_extra,
-                        )
-                    )
-                    continue
-
-                msg = json.loads(msg["data"])
-                specs = None
-                executor_logging_extra = {}
-                try:
-                    specs = ExecutorSpecRequest(
-                        specs=msg["specs"],
-                        score=msg["score"],
-                        synthetic_job_score=msg["synthetic_job_score"],
-                        log_status=msg["log_status"],
-                        job_batch_id=msg["job_batch_id"],
-                        log_text=msg["log_text"],
-                        miner_hotkey=msg["miner_hotkey"],
-                        validator_hotkey=validator_hotkey,
-                        executor_uuid=msg["executor_uuid"],
-                        executor_ip=msg["executor_ip"],
-                        executor_port=msg["executor_port"],
-                    )
-                    executor_logging_extra = {
-                        "executor_uuid": msg["executor_uuid"],
-                        "executor_ip": msg["executor_ip"],
-                        "executor_port": msg["executor_port"],
-                        "job_batch_id": msg["job_batch_id"],
-                    }
-                except Exception as exc:
-                    msg = "Error occurred while parsing msg"
-                    logger.error(
-                        _m(
-                            msg,
-                            extra={
-                                **self.logging_extra,
-                                **executor_logging_extra,
-                                "error": str(exc),
-                            },
-                        )
-                    )
-                    continue
-
-                logger.info(
-                    "Sending machine specs update of executor to compute app",
-                    extra={**self.logging_extra, **executor_logging_extra, "specs": str(specs)},
-                )
-
-                specs_queue.append(specs)
-                if self.ws is not None:
-                    while len(specs_queue) > 0:
-                        spec_to_send = specs_queue.pop(0)
-                        try:
-                            await self.send_model(spec_to_send)
-                        except Exception as exc:
-                            specs_queue.insert(0, spec_to_send)
-                            msg = "Error occurred while sending specs of executor"
-                            logger.error(
-                                _m(
-                                    msg,
-                                    extra={
-                                        **self.logging_extra,
-                                        **executor_logging_extra,
-                                        "error": str(exc),
-                                    },
-                                )
-                            )
-                            break
-            except TimeoutError:
-                logger.error(
-                    _m(
-                        "wait_for_specs still running",
-                        extra=self.logging_extra,
-                    )
-                )
-
-    async def wait_for_log_streams(self, channel: aioredis.client.PubSub):
-        logs_queue: list[LogStreamRequest] = []
-        while True:
-            validator_hotkey = self.my_hotkey()
-            logger.info(
-                _m(
-                    f"Waiting for log streams: {validator_hotkey}",
-                    extra=self.logging_extra,
-                )
-            )
-            try:
-                msg = await channel.get_message(ignore_subscribe_messages=True, timeout=100 * 60)
-                if msg is None:
-                    logger.warning(
-                        _m(
-                            "No log streams yet",
-                            extra=self.logging_extra,
-                        )
-                    )
-                    continue
-
-                msg = json.loads(msg["data"])
-                log_stream = None
-
-                try:
-                    log_stream = LogStreamRequest(
-                        logs=msg["logs"],
-                        miner_hotkey=msg["miner_hotkey"],
-                        validator_hotkey=validator_hotkey,
-                        executor_uuid=msg["executor_uuid"],
-                    )
+                async for message in pubsub.listen():
+                    try:
+                        channel = message['channel'].decode('utf-8')
+                        data = json.loads(message['data'])
+                    except Exception as exc:
+                        continue
 
                     logger.info(
                         _m(
-                            f'Successfully created LogStreamRequest instance with {len(msg["logs"])} logs',
-                            extra=self.logging_extra,
-                        )
-                    )
-                except Exception as exc:
-                    logger.error(
-                        _m(
-                            "Failed to get LogStreamRequest instance",
+                            'Received message from redis',
                             extra={
                                 **self.logging_extra,
-                                "error": str(exc),
-                                "msg": str(msg),
-                            },
+                                "channel": channel,
+                            }
                         )
                     )
-                    continue
 
-                logs_queue.append(log_stream)
-                if self.ws is not None:
-                    while len(logs_queue) > 0:
-                        log_to_send = logs_queue.pop(0)
-                        try:
-                            await self.send_model(log_to_send)
-                        except Exception as exc:
-                            logs_queue.insert(0, log_to_send)
-                            logger.error(
-                                _m(
-                                    msg,
-                                    extra={
-                                        **self.logging_extra,
-                                        "error": str(exc),
-                                    },
-                                )
-                            )
-                            break
-            except TimeoutError:
-                pass
+                    if channel == MACHINE_SPEC_CHANNEL:
+                        specs = ExecutorSpecRequest(
+                            specs=data["specs"],
+                            score=data["score"],
+                            synthetic_job_score=data["synthetic_job_score"],
+                            log_status=data["log_status"],
+                            job_batch_id=data['job_batch_id'],
+                            log_text=data["log_text"],
+                            miner_hotkey=data["miner_hotkey"],
+                            validator_hotkey=validator_hotkey,
+                            executor_uuid=data["executor_uuid"],
+                            executor_ip=data["executor_ip"],
+                            executor_port=data["executor_port"],
+                        )
+                        self.message_queue.append(specs)
+                    elif channel == STREAMING_LOG_CHANNEL:
+                        log_stream = LogStreamRequest(
+                            logs=data["logs"],
+                            miner_hotkey=data["miner_hotkey"],
+                            validator_hotkey=validator_hotkey,
+                            executor_uuid=data["executor_uuid"],
+                        )
 
-    def create_metagraph_refresh_task(self, period=None):
-        return create_metagraph_refresh_task(period=period)
+                        self.message_queue.append(log_stream)
+                    elif channel == RESET_VERIFIED_JOB_CHANNEL:
+                        reset_request = ResetVerifiedJobRequest(
+                            miner_hotkey=data["miner_hotkey"],
+                            validator_hotkey=validator_hotkey,
+                            executor_uuid=data["executor_uuid"],
+                        )
+
+                        self.message_queue.append(reset_request)
+
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "Error: unknown",
+                        extra={
+                            **self.logging_extra,
+                            "error": str(exc),
+                        },
+                    )
+                )
+
+            await asyncio.sleep(1)
 
     async def heartbeat(self):
         pass
@@ -368,17 +271,37 @@ class ComputeClient:
         #     await asyncio.sleep(self.HEARTBEAT_PERIOD)
 
     @tenacity.retry(
-        stop=tenacity.stop_after_attempt(7),
+        stop=tenacity.stop_after_attempt(3),
         wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
         retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
     )
     async def send_model(self, msg: BaseModel):
-        if self.ws is None:
-            raise websockets.ConnectionClosed(rcvd=None, sent=None)
         await self.ws.send(msg.model_dump_json())
-        # Summary: https://github.com/python-websockets/websockets/issues/867
-        # Longer discussion: https://github.com/python-websockets/websockets/issues/865
-        await asyncio.sleep(0)
+
+    async def handle_send_messages(self):
+        while True:
+            if self.ws is None:
+                await asyncio.sleep(1)
+                continue
+
+            while len(self.message_queue) > 0:
+                log_to_send = self.message_queue.pop(0)
+                try:
+                    await self.send_model(log_to_send)
+                except Exception as exc:
+                    self.message_queue.insert(0, log_to_send)
+                    logger.error(
+                        _m(
+                            "Error: message sent error",
+                            extra={
+                                **self.logging_extra,
+                                "error": str(exc),
+                            },
+                        )
+                    )
+                    break
+
+            await asyncio.sleep(1)
 
     async def poll_rented_machines(self):
         while True:
@@ -389,7 +312,16 @@ class ComputeClient:
                         extra=self.logging_extra,
                     )
                 )
-                await self.send_model(RentedMachineRequest())
+                self.message_queue(RentedMachineRequest())
+
+                logger.info(
+                    _m(
+                        "Request duplicated machines",
+                        extra=self.logging_extra,
+                    )
+                )
+                self.message_queue(DuplicateExecutorsRequest())
+
                 await asyncio.sleep(10 * 60)
             else:
                 await asyncio.sleep(10)
@@ -399,12 +331,7 @@ class ComputeClient:
         try:
             response = Response.model_validate_json(raw_msg)
         except pydantic.ValidationError:
-            logger.info(
-                _m(
-                    "could not parse raw message as Response",
-                    extra={**self.logging_extra, "raw_msg": raw_msg},
-                )
-            )
+            pass
         else:
             if response.status != "success":
                 logger.error(
@@ -417,13 +344,8 @@ class ComputeClient:
 
         try:
             response = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            logger.error(
-                _m(
-                    "could not parse raw message as RentedMachineResponse",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
-                )
-            )
+        except pydantic.ValidationError:
+            pass
         else:
             logger.info(
                 _m(
@@ -433,7 +355,7 @@ class ComputeClient:
             )
 
             redis_service = self.miner_service.redis_service
-            await redis_service.clear_set(RENTED_MACHINE_SET)
+            await redis_service.delete(RENTED_MACHINE_PREFIX)
 
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
@@ -441,40 +363,64 @@ class ComputeClient:
             return
 
         try:
-            job_request = pydantic.TypeAdapter(ContainerCreateRequest).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            logger.error(
+            response = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            logger.info(
                 _m(
-                    "could not parse raw message as ContainerCreateRequest",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                    "Duplicated executors",
+                    extra={**self.logging_extra, "executors": len(response.executors)},
                 )
             )
-        else:
-            task = asyncio.create_task(self.miner_driver(job_request))
-            await self.miner_drivers.put(task)
+
+            redis_service = self.miner_service.redis_service
+            await redis_service.delete(DUPLICATED_MACHINE_SET)
+
+            for _, details_list in response.executors.items():
+                for detail in details_list:
+                    executor_id = detail.get("executor_id")
+                    miner_hotkey = detail.get("miner_hotkey")
+                    await redis_service.sadd(
+                        DUPLICATED_MACHINE_SET, f"{miner_hotkey}:{executor_id}"
+                    )
+
             return
 
         try:
-            job_request = pydantic.TypeAdapter(ContainerDeleteRequest).validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
+            job_request = self.accepted_request_type().parse(raw_msg)
+        except Exception as ex:
+            error_msg = f"Invalid message received from celium backend: {str(ex)}"
             logger.error(
                 _m(
-                    "could not parse raw message as ContainerDeleteRequest",
-                    extra={**self.logging_extra, "error": str(exc), "raw_msg": raw_msg},
+                    error_msg,
+                    extra={**self.logging_extra, "error": str(ex), "raw_msg": raw_msg},
                 )
             )
         else:
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
-
         # logger.error("unsupported message received from facilitator: %s", raw_msg)
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
-        return await get_miner_axon_info(hotkey)
+        miners = self.validator.fetch_miners()
+        neurons = [n for n in miners if n.hotkey == hotkey]
+        if not neurons:
+            raise ValueError(f"Miner with {hotkey=} not present in this subnetwork")
+        return neurons[0].axon_info
 
-    async def miner_driver(self, job_request: ContainerCreateRequest | ContainerDeleteRequest):
+    async def miner_driver(
+        self,
+        job_request: ContainerCreateRequest
+        | ContainerDeleteRequest
+        | ContainerStopRequest
+        | ContainerStartRequest,
+    ):
         """drive a miner client from job start to completion, then close miner connection"""
+        logger.info(
+            _m(f"Getting miner axon info for {job_request.miner_hotkey}", extra=self.logging_extra)
+        )
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logging_extra = {
             **self.logging_extra,
@@ -500,17 +446,17 @@ class ComputeClient:
             )
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
-            container_created: (
+            response: (
                 ContainerCreated | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
                 _m(
                     "Sending back created container info to compute app",
-                    extra={**logging_extra, "container_created": str(container_created)},
+                    extra={**logging_extra, "response": str(response)},
                 )
             )
-            await self.send_model(container_created)
+            self.message_queue.append(response)
         elif isinstance(job_request, ContainerDeleteRequest):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
@@ -524,4 +470,32 @@ class ComputeClient:
                     extra={**logging_extra, "response": str(response)},
                 )
             )
-            await self.send_model(response)
+            self.message_queue.append(response)
+        elif isinstance(job_request, ContainerStopRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                ContainerStopRequest | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back stopped container info to compute app",
+                    extra={**logging_extra, "response": str(response)},
+                )
+            )
+            self.message_queue.append(response)
+        elif isinstance(job_request, ContainerStartRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                ContainerStartRequest | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back started container info to compute app",
+                    extra={**logging_extra, "response": str(response)},
+                )
+            )
+            self.message_queue.append(response)

@@ -21,6 +21,7 @@ class MinerJobRequestPayload(BaseModel):
 
 class MinerJobEnryptedFiles(BaseModel):
     encrypt_key: str
+    all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
     score_file_name: str
@@ -50,6 +51,7 @@ class ContainerRequestType(enum.Enum):
     ContainerStartRequest = "ContainerStartRequest"
     ContainerStopRequest = "ContainerStopRequest"
     ContainerDeleteRequest = "ContainerDeleteRequest"
+    DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -137,3 +139,8 @@ class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
     msg: str
     error_code: FailedContainerErrorCodes | None = None
+
+
+class DuplicateExecutorsResponse(BaseModel):
+    message_type: ContainerRequestType = ContainerRequestType.DuplicateExecutorsResponse
+    executors: dict[str, list]

@@ -11,7 +11,7 @@ from core.utils import _m, get_extra_info
 from daos.validator import ValidatorDao, Validator
 
 if TYPE_CHECKING:
-    from bittensor_wallet import Wallet
+    from bittensor_wallet import bittensor_wallet
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ SYNC_CYCLE = 2 * 60
 
 
 class Miner:
-    wallet: "Wallet"
+    wallet: "bittensor_wallet"
     subtensor: bittensor.subtensor
     netuid: int
 
@@ -55,8 +55,8 @@ class Miner:
             if (
                 self.subtensor
                 and self.subtensor.substrate
-                and self.subtensor.substrate.websocket
-                and self.subtensor.substrate.websocket.state is WebSocketClientState.OPEN
+                and self.subtensor.substrate.ws
+                and self.subtensor.substrate.ws.state is WebSocketClientState.OPEN
             ):
                 return
 
@@ -146,7 +146,7 @@ class Miner:
         except Exception as e:
             logger.error(
                 _m(
-                    '[announce] Annoucing miner error',
+                    '[announce] Announcing miner error',
                     extra=get_extra_info({
                         **self.default_extra,
                         "error": str(e)

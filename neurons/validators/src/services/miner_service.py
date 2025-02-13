@@ -33,7 +33,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL_NAME, RedisService
+from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
@@ -59,6 +59,7 @@ class MinerService:
         payload: MinerJobRequestPayload,
         encypted_files: MinerJobEnryptedFiles,
         docker_hub_digests: dict[str, str],
+        debug=False,
     ):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -78,7 +79,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 my_hotkey=my_key.ss58_address,
                 keypair=my_key,
-                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/jobs/{my_key.ss58_address}",
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/jobs/{my_key.ss58_address}"
             )
 
             async with miner_client:
@@ -130,6 +131,7 @@ class MinerService:
                                 public_key=public_key.decode("utf-8"),
                                 encypted_files=encypted_files,
                                 docker_hub_digests=docker_hub_digests,
+                                debug=debug,
                             )
                         )
                         for executor_info in msg.executors
@@ -205,7 +207,6 @@ class MinerService:
                     "Requesting job to miner resulted in an exception",
                     extra=get_extra_info({**default_extra, "error": str(e)}),
                 ),
-                exc_info=True,
             )
             return None
 
@@ -234,7 +235,7 @@ class MinerService:
         ) in results:
             try:
                 await self.redis_service.publish(
-                    MACHINE_SPEC_CHANNEL_NAME,
+                    MACHINE_SPEC_CHANNEL,
                     {
                         "specs": specs,
                         "miner_hotkey": miner_hotkey,
@@ -385,14 +386,7 @@ class MinerService:
                             )
                         )
 
-                        await self.redis_service.remove_rented_machine(
-                            RentedMachine(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                executor_ip_address=executor.address if executor else "",
-                                executor_ip_port=str(executor.port if executor else ""),
-                            )
-                        )
+                        await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
 
                         return FailedContainerRequest(
                             miner_hotkey=payload.miner_hotkey,
@@ -435,59 +429,59 @@ class MinerService:
                                 port_maps=result.port_maps,
                             )
 
-                        elif isinstance(payload, ContainerStartRequest):
-                            logger.info(
-                                _m(
-                                    "Starting container",
-                                    extra=get_extra_info(
-                                        {**default_extra, "payload": str(payload)}
-                                    ),
-                                ),
-                            )
-                            await docker_service.start_container(
-                                payload,
-                                executor,
-                                my_key,
-                                private_key.decode("utf-8"),
-                            )
+                        # elif isinstance(payload, ContainerStartRequest):
+                        #     logger.info(
+                        #         _m(
+                        #             "Starting container",
+                        #             extra=get_extra_info(
+                        #                 {**default_extra, "payload": str(payload)}
+                        #             ),
+                        #         ),
+                        #     )
+                        #     await docker_service.start_container(
+                        #         payload,
+                        #         executor,
+                        #         my_key,
+                        #         private_key.decode("utf-8"),
+                        #     )
 
-                            logger.info(
-                                _m(
-                                    "Started Container",
-                                    extra=get_extra_info(
-                                        {**default_extra, "payload": str(payload)}
-                                    ),
-                                ),
-                            )
-                            await miner_client.send_model(
-                                SSHPubKeyRemoveRequest(
-                                    public_key=public_key, executor_id=payload.executor_id
-                                )
-                            )
+                        #     logger.info(
+                        #         _m(
+                        #             "Started Container",
+                        #             extra=get_extra_info(
+                        #                 {**default_extra, "payload": str(payload)}
+                        #             ),
+                        #         ),
+                        #     )
+                        #     await miner_client.send_model(
+                        #         SSHPubKeyRemoveRequest(
+                        #             public_key=public_key, executor_id=payload.executor_id
+                        #         )
+                        #     )
 
-                            return ContainerStarted(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                container_name=payload.container_name,
-                            )
-                        elif isinstance(payload, ContainerStopRequest):
-                            await docker_service.stop_container(
-                                payload,
-                                executor,
-                                my_key,
-                                private_key.decode("utf-8"),
-                            )
-                            await miner_client.send_model(
-                                SSHPubKeyRemoveRequest(
-                                    public_key=public_key, executor_id=payload.executor_id
-                                )
-                            )
+                        #     return ContainerStarted(
+                        #         miner_hotkey=payload.miner_hotkey,
+                        #         executor_id=payload.executor_id,
+                        #         container_name=payload.container_name,
+                        #     )
+                        # elif isinstance(payload, ContainerStopRequest):
+                        #     await docker_service.stop_container(
+                        #         payload,
+                        #         executor,
+                        #         my_key,
+                        #         private_key.decode("utf-8"),
+                        #     )
+                        #     await miner_client.send_model(
+                        #         SSHPubKeyRemoveRequest(
+                        #             public_key=public_key, executor_id=payload.executor_id
+                        #         )
+                        #     )
 
-                            return ContainerStopped(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                container_name=payload.container_name,
-                            )
+                        #     return ContainerStopped(
+                        #         miner_hotkey=payload.miner_hotkey,
+                        #         executor_id=payload.executor_id,
+                        #         container_name=payload.container_name,
+                        #     )
                         elif isinstance(payload, ContainerDeleteRequest):
                             logger.info(
                                 _m(

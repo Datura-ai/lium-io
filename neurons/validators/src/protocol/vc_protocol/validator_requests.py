@@ -13,6 +13,8 @@ class RequestType(enum.Enum):
     ExecutorSpecRequest = "ExecutorSpecRequest"
     RentedMachineRequest = "RentedMachineRequest"
     LogStreamRequest = "LogStreamRequest"
+    ResetVerifiedJobRequest = "ResetVerifiedJobRequest"
+    DuplicateExecutorsRequest = "DuplicateExecutorsRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -70,3 +72,14 @@ class LogStreamRequest(BaseValidatorRequest):
     validator_hotkey: str
     executor_uuid: str
     logs: list[dict]
+
+
+class ResetVerifiedJobRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.ResetVerifiedJobRequest
+    validator_hotkey: str
+    miner_hotkey: str
+    executor_uuid: str
+
+
+class DuplicateExecutorsRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.DuplicateExecutorsRequest

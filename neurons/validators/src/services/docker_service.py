@@ -84,31 +84,57 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         command: str,
         log_tag: str,
+        timeout: int = 0
     ):
-        result = True
-        async with ssh_client.create_process(command) as process:
-            async for line in process.stdout:
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": line.strip(),
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
-                    )
+        status = True
+        error = ''
+        try:
+            async with ssh_client.create_process(command) as process:
+                if timeout != 0:
+                    status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
+                else:
+                    status, error = await self._stream_process_output(process, log_tag)
+        except asyncio.TimeoutError:
+            status = False
+            error = "Process timed out"
+            async with self.lock:
+                self.logs_queue.append(
+                    {
+                        "log_text": error,
+                        "log_status": "error",
+                        "log_tag": log_tag,
+                    }
+                )
 
-            async for line in process.stderr:
-                result = False
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": line.strip(),
-                            "log_status": "error",
-                            "log_tag": log_tag,
-                        }
-                    )
+        return status, error
 
-        return result
+    async def _stream_process_output(self, process, log_tag):
+        status = True
+        error = ''
+
+        async for line in process.stdout:
+            async with self.lock:
+                self.logs_queue.append(
+                    {
+                        "log_text": line.strip(),
+                        "log_status": "success",
+                        "log_tag": log_tag,
+                    }
+                )
+
+        async for line in process.stderr:
+            async with self.lock:
+                status = False
+                error += line.strip() + "\n"
+                self.logs_queue.append(
+                    {
+                        "log_text": line.strip(),
+                        "log_status": "error",
+                        "log_tag": log_tag,
+                    }
+                )
+
+        return status, error
 
     async def handle_stream_logs(
         self,
@@ -177,11 +203,46 @@ class DockerService:
         """Check if the container is running"""
         start_time = time.time()
         while time.time() - start_time < timeout:
-            result = await ssh_client.run(f"docker ps -q -f name={container_name}")
+            result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name}")
             if result.stdout.strip():
                 return True
             await asyncio.sleep(1)
         return False
+
+    async def clean_exisiting_containers(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        sleep: int = 0,
+    ):
+        command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+        result = await ssh_client.run(command)
+        if result.stdout.strip():
+            # wait until the docker connection check is finished.
+            await asyncio.sleep(sleep)
+
+            ids = " ".join(result.stdout.strip().split("\n"))
+
+            logger.info(
+                _m(
+                    "Cleaning existing docker containers",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "command": command,
+                        "ids": ids,
+                    }),
+                ),
+            )
+
+            command = f'/usr/bin/docker rm {ids} -f'
+            await ssh_client.run(command)
+
+            command = f'/usr/bin/docker volume prune -af'
+            await ssh_client.run(command)
+
+    async def clear_verified_job_count(self, miner_hotkey: str, executor_id: str):
+        await self.redis_service.remove_pending_pod(miner_hotkey, executor_id)
+        await self.redis_service.clear_verified_job_info(miner_hotkey, executor_id)
 
     async def create_container(
         self,
@@ -197,6 +258,7 @@ class DockerService:
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
+            "docker_image": payload.docker_image,
             "debug": payload.debug,
         }
 
@@ -207,6 +269,7 @@ class DockerService:
             ),
         )
 
+        log_tag = "container_creation"
         custom_options = payload.custom_options
 
         try:
@@ -223,12 +286,18 @@ class DockerService:
             if not port_maps:
                 log_text = "No port mappings found"
                 logger.error(log_text)
+
+                await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
+
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     msg=str(log_text),
                     error_code=FailedContainerErrorCodes.NoPortMappings,
                 )
+
+            # add executor in pending status dict
+            await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id)
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
@@ -243,13 +312,12 @@ class DockerService:
                 logger.info(
                     _m(
                         "Pulling docker image",
-                        extra=get_extra_info(
-                            {**default_extra, "docker_image": payload.docker_image}
-                        ),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "docker_image": payload.docker_image
+                        }),
                     ),
                 )
-
-                log_tag = "container_creation"
 
                 # set real-time logging
                 self.log_task = asyncio.create_task(
@@ -268,20 +336,24 @@ class DockerService:
                         }
                     )
 
-                command = f"docker pull {payload.docker_image}"
-                result = await self.execute_and_stream_logs(
+                command = f"/usr/bin/docker pull {payload.docker_image}"
+                status, error = await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
                     command=command,
                     log_tag=log_tag,
                 )
-                if not result:
+                if not status:
                     log_text = _m(
                         "Docker pull failed",
-                        extra=get_extra_info({default_extra}),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": error,
+                        }),
                     )
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -317,7 +389,11 @@ class DockerService:
                 )
                 env_flags = (
                     " ".join(
-                        [f"-e {key}={value}" for key, value in custom_options.environment.items()]
+                        [
+                            f"-e {key}={value}"
+                            for key, value in custom_options.environment.items()
+                            if key and value and key.strip() and value.strip()
+                        ]
                     )
                     if custom_options and custom_options.environment
                     else ""
@@ -342,19 +418,30 @@ class DockerService:
                         }
                     )
 
-                volume_name = f"volume_{uuid}"
-                command = f"docker volume create {volume_name}"
-                result = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client, command=command, log_tag="container_creation"
+                await self.clean_exisiting_containers(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    sleep=10,
                 )
-                if not result:
+
+                volume_name = f"volume_{uuid}"
+                command = f"/usr/bin/docker volume create {volume_name}"
+                status, error = await self.execute_and_stream_logs(
+                    ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=10
+                )
+                if not status:
                     log_text = _m(
                         "Docker volume creation failed",
-                        extra=get_extra_info({default_extra}),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "error": error
+                        }),
                     )
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -383,21 +470,37 @@ class DockerService:
                 container_name = f"container_{uuid}"
 
                 if payload.debug:
-                    command = f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
-                    command = f'docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
 
-                result = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client, command=command, log_tag="container_creation"
+                logger.info(
+                    _m(
+                        "Creating docker container",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "command": command,
+                        }),
+                    ),
                 )
-                if not result:
+
+                status, error = await self.execute_and_stream_logs(
+                    ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=30
+                )
+                if not status:
                     log_text = _m(
                         "Docker container creation failed",
-                        extra=get_extra_info(default_extra),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "command": command,
+                            "error": error,
+                        }),
                     )
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -410,11 +513,16 @@ class DockerService:
                 if not await self.check_container_running(ssh_client, container_name):
                     log_text = _m(
                         "Run docker run command but container is not running",
-                        extra=get_extra_info({**default_extra, "container_name": container_name}),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": container_name,
+                        }),
                     )
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -432,14 +540,14 @@ class DockerService:
 
                 await self.finish_stream_logs()
 
-                await self.redis_service.add_rented_machine(
-                    RentedMachine(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        executor_ip_address=executor_info.address,
-                        executor_ip_port=str(executor_info.port),
-                    )
-                )
+                await self.redis_service.add_rented_machine(RentedMachine(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    executor_ip_address=executor_info.address,
+                    executor_ip_port=str(executor_info.port),
+                    container_name=container_name,
+                ))
+                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
 
                 return ContainerCreatedResult(
                     container_name=container_name,
@@ -450,12 +558,13 @@ class DockerService:
                 )
         except Exception as e:
             log_text = _m(
-                "Docker container creation failed",
+                "Unknown Error create_container",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
             logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
+            await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -482,7 +591,7 @@ class DockerService:
 
         logger.info(
             _m(
-                "Stop Docker Container", extra=get_extra_info({**default_extra, "payload": payload})
+                "Stop Docker Container", extra=get_extra_info({**default_extra, "payload": str(payload)})
             ),
         )
 
@@ -496,7 +605,7 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            await ssh_client.run(f"docker stop {payload.container_name}")
+            await ssh_client.run(f"/usr/bin/docker stop {payload.container_name}")
 
             logger.info(
                 _m(
@@ -526,7 +635,7 @@ class DockerService:
         logger.info(
             _m(
                 "Restart Docker Container",
-                extra=get_extra_info({**default_extra, "payload": payload}),
+                extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
 
@@ -540,7 +649,7 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            await ssh_client.run(f"docker start {payload.container_name}")
+            await ssh_client.run(f"/usr/bin/docker start {payload.container_name}")
             logger.info(
                 _m(
                     "Started Docker Container",
@@ -584,8 +693,9 @@ class DockerService:
             known_hosts=None,
         ) as ssh_client:
             # await ssh_client.run(f"docker stop {payload.container_name}")
-            await ssh_client.run(f"docker rm {payload.container_name} -f")
-            await ssh_client.run(f"docker volume rm {payload.volume_name} -f")
+            await ssh_client.run(f"/usr/bin/docker rm {payload.container_name} -f")
+            await ssh_client.run(f"/usr/bin/docker volume rm {payload.volume_name} -f")
+            await ssh_client.run(f"/usr/bin/docker image prune -af")
 
             logger.info(
                 _m(
@@ -600,14 +710,7 @@ class DockerService:
                 ),
             )
 
-            await self.redis_service.remove_rented_machine(
-                RentedMachine(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    executor_ip_address=executor_info.address,
-                    executor_ip_port=str(executor_info.port),
-                )
-            )
+            await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
 
     async def get_docker_hub_digests(self, repositories) -> dict[str, str]:
         """Retrieve all tags and their corresponding digests from Docker Hub."""
@@ -686,7 +789,7 @@ class DockerService:
 
         await asyncio.sleep(5)
 
-        command = f"docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
+        command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
 
         result = await ssh_client.run(command)
         if result.exit_status != 0:
