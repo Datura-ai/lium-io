@@ -22,7 +22,7 @@ from services.ssh_service import SSHService
 from services.task_service import TaskService
 
 if TYPE_CHECKING:
-    from bittensor_wallet import Wallet
+    from bittensor_wallet import bittensor_wallet
 
 logger = get_logger(__name__)
 
@@ -32,7 +32,7 @@ MINER_SCORES_KEY = "miner_scores"
 
 
 class Validator:
-    wallet: "Wallet"
+    wallet: "bittensor_wallet"
     netuid: int
     subtensor: bittensor.Subtensor
 
@@ -49,6 +49,9 @@ class Validator:
         self.subtensor = None
         self.debug_miner = debug_miner
         self.miner_scores = {}
+
+        major, minor, patch = map(int, settings.VERSION.split('.'))
+        self.version_key = major * 1000 + minor * 100 + patch
 
     async def initiate_services(self):
         ssh_service = SSHService()
@@ -130,8 +133,8 @@ class Validator:
             if (
                 self.subtensor
                 and self.subtensor.substrate
-                and self.subtensor.substrate.websocket
-                and self.subtensor.substrate.websocket.state is WebSocketClientState.OPEN
+                and self.subtensor.substrate.ws
+                and self.subtensor.substrate.ws.state is WebSocketClientState.OPEN
             ):
                 return
 
@@ -269,7 +272,7 @@ class Validator:
                 weights[ind] = 1
             else:
                 weights[ind] = 0
-                
+
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
 
@@ -303,7 +306,10 @@ class Validator:
         logger.info(
             _m(
                 f"[set_weights] uint_uids: {uint_uids} uint_weights: {uint_weights}",
-                extra=get_extra_info(self.default_extra),
+                extra=get_extra_info({
+                    **self.default_extra,
+                    "version_key": self.version_key,
+                }),
             ),
         )
 
@@ -312,6 +318,7 @@ class Validator:
             netuid=self.netuid,
             uids=uint_uids,
             weights=uint_weights,
+            version_key=self.version_key,
             wait_for_finalization=False,
             wait_for_inclusion=False,
         )
@@ -817,7 +824,7 @@ class Validator:
             except Exception as e:
                 logger.info(
                     _m(
-                        "[stop] Failed to save miner_scores",
+                        "[stop] Failed to connect into subtensor",
                         extra=get_extra_info({**self.default_extra, "error": str(e)}),
                     ),
                 )
