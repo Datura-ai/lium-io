@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:ebff6a43c52877987f6996835a47b115d0ef2440dff8e440a4a0c901f57a791a"
+content_hash = "sha256:5a3a37ee7b55be52f0cbce80872aafe5e13c794c101d8d2f40fef3845176a196"
 
 [[metadata.targets]]
 requires_python = "==3.11.11"
@@ -176,17 +176,17 @@ files = [
 
 [[package]]
 name = "bittensor"
-version = "9.0.0rc6"
+version = "9.0.0"
 requires_python = ">=3.9"
 summary = "bittensor"
 groups = ["default"]
 dependencies = [
     "aiohttp~=3.9",
-    "async-substrate-interface>=1.0.0rc14",
+    "async-substrate-interface>=1.0.0",
     "asyncstdlib~=3.13.0",
-    "bittensor-cli>=9.0.0rc3",
+    "bittensor-cli>=9.0.0",
     "bittensor-commit-reveal>=0.2.0",
-    "bittensor-wallet>=3.0.2",
+    "bittensor-wallet>=3.0.3",
     "colorama~=0.4.6",
     "fastapi~=0.110.1",
     "msgpack-numpy-opentensor~=0.5.0",
@@ -210,13 +210,13 @@ dependencies = [
     "wheel",
 ]
 files = [
-    {file = "bittensor-9.0.0rc6-py3-none-any.whl", hash = "sha256:7cd371a0f065be7cabf5d9307429853bef642ea3157873560a295286e5a54729"},
-    {file = "bittensor-9.0.0rc6.tar.gz", hash = "sha256:d7933b77114aee3993a5c802459e4064a038ae0b06731534d48951da3f1d16b7"},
+    {file = "bittensor-9.0.0-py3-none-any.whl", hash = "sha256:1f5e97d2333b46c535b03e780b7e3d58204e2ed116db6244227433449f6616cc"},
+    {file = "bittensor-9.0.0.tar.gz", hash = "sha256:64321a5f3acc07dbde41ecb81d753f05d0a8fcd19a22f35cb56e5af8e15e81aa"},
 ]
 
 [[package]]
 name = "bittensor-cli"
-version = "9.0.0rc4"
+version = "9.0.0"
 requires_python = ">=3.9"
 summary = "Bittensor CLI"
 groups = ["default"]
@@ -226,9 +226,9 @@ dependencies = [
     "PyYAML~=6.0.1",
     "aiohttp~=3.10.2",
     "async-property==0.2.2",
-    "async-substrate-interface>=1.0.0rc12",
+    "async-substrate-interface>=1.0.0",
     "backoff~=2.2.1",
-    "bittensor-wallet>=3.0.2",
+    "bittensor-wallet>=3.0.3",
     "fuzzywuzzy~=0.18.0",
     "netaddr~=1.3.0",
     "numpy>=2.0.1",
@@ -245,8 +245,8 @@ dependencies = [
     "wheel",
 ]
 files = [
-    {file = "bittensor-cli-9.0.0rc4.tar.gz", hash = "sha256:d08d22734022a4a0ff4a3853ef85f65ac6a1013c2e00da5a6a82d9e8a1478f3c"},
-    {file = "bittensor_cli-9.0.0rc4-py3-none-any.whl", hash = "sha256:27c618a65706bb0b0f7621b47ed4650aec8ea31bf3e40972edcf896071f138f7"},
+    {file = "bittensor-cli-9.0.0.tar.gz", hash = "sha256:f775c24b6acf574c4b64d009d8728f2657c2894fecb15385478fd8ac4501f0fd"},
+    {file = "bittensor_cli-9.0.0-py3-none-any.whl", hash = "sha256:211334018e878dd4145d1b7998630edd2e3a486ac4e992493b535306e3d0c178"},
 ]
 
 [[package]]

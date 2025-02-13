@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:89394ec1281e7853c641a6711120045a547593a59acfc7c221964c4c79bb0995"
+content_hash = "sha256:ee9e463932212a5fc5c51ce79c1144f8b73628b2aed9dd47b2f2fccb8165bd30"
 
 [[metadata.targets]]
 requires_python = "==3.11.11"
@@ -144,7 +144,7 @@ files = [
 
 [[package]]
 name = "async-substrate-interface"
-version = "1.0.0rc14"
+version = "1.0.0"
 requires_python = "<3.13,>=3.9"
 summary = "Asyncio library for interacting with substrate. Mostly API-compatible with py-substrate-interface"
 groups = ["default"]
@@ -158,8 +158,8 @@ dependencies = [
     "xxhash",
 ]
 files = [
-    {file = "async_substrate_interface-1.0.0rc14-py3-none-any.whl", hash = "sha256:8befdf8528a1493e48c25438b8fc303eb76723b914766df619984f56864681f4"},
-    {file = "async_substrate_interface-1.0.0rc14.tar.gz", hash = "sha256:bb8b9aa0c727015115debb8f2aa1c190f600bb8cc06a1fcea6a27d22a3edc5ca"},
+    {file = "async_substrate_interface-1.0.0-py3-none-any.whl", hash = "sha256:1df2107e221559c5127e4673c55c42db310bf72a344a7da0aaaa4cde400d28c0"},
+    {file = "async_substrate_interface-1.0.0.tar.gz", hash = "sha256:1b045fa9fb4077bd20dbe5e670efe1a7346a50db1a126380c9fa4e32b03cb5de"},
 ]
 
 [[package]]
@@ -229,17 +229,17 @@ files = [
 
 [[package]]
 name = "bittensor"
-version = "9.0.0rc6"
+version = "9.0.0"
 requires_python = ">=3.9"
 summary = "bittensor"
 groups = ["default"]
 dependencies = [
     "aiohttp~=3.9",
-    "async-substrate-interface>=1.0.0rc14",
+    "async-substrate-interface>=1.0.0",
     "asyncstdlib~=3.13.0",
-    "bittensor-cli>=9.0.0rc3",
+    "bittensor-cli>=9.0.0",
     "bittensor-commit-reveal>=0.2.0",
-    "bittensor-wallet>=3.0.2",
+    "bittensor-wallet>=3.0.3",
     "colorama~=0.4.6",
     "fastapi~=0.110.1",
     "msgpack-numpy-opentensor~=0.5.0",
@@ -263,13 +263,13 @@ dependencies = [
     "wheel",
 ]
 files = [
-    {file = "bittensor-9.0.0rc6-py3-none-any.whl", hash = "sha256:7cd371a0f065be7cabf5d9307429853bef642ea3157873560a295286e5a54729"},
-    {file = "bittensor-9.0.0rc6.tar.gz", hash = "sha256:d7933b77114aee3993a5c802459e4064a038ae0b06731534d48951da3f1d16b7"},
+    {file = "bittensor-9.0.0-py3-none-any.whl", hash = "sha256:1f5e97d2333b46c535b03e780b7e3d58204e2ed116db6244227433449f6616cc"},
+    {file = "bittensor-9.0.0.tar.gz", hash = "sha256:64321a5f3acc07dbde41ecb81d753f05d0a8fcd19a22f35cb56e5af8e15e81aa"},
 ]
 
 [[package]]
 name = "bittensor-cli"
-version = "9.0.0rc4"
+version = "9.0.0"
 requires_python = ">=3.9"
 summary = "Bittensor CLI"
 groups = ["default"]
@@ -279,9 +279,9 @@ dependencies = [
     "PyYAML~=6.0.1",
     "aiohttp~=3.10.2",
     "async-property==0.2.2",
-    "async-substrate-interface>=1.0.0rc12",
+    "async-substrate-interface>=1.0.0",
     "backoff~=2.2.1",
-    "bittensor-wallet>=3.0.2",
+    "bittensor-wallet>=3.0.3",
     "fuzzywuzzy~=0.18.0",
     "netaddr~=1.3.0",
     "numpy>=2.0.1",
@@ -298,8 +298,8 @@ dependencies = [
     "wheel",
 ]
 files = [
-    {file = "bittensor-cli-9.0.0rc4.tar.gz", hash = "sha256:d08d22734022a4a0ff4a3853ef85f65ac6a1013c2e00da5a6a82d9e8a1478f3c"},
-    {file = "bittensor_cli-9.0.0rc4-py3-none-any.whl", hash = "sha256:27c618a65706bb0b0f7621b47ed4650aec8ea31bf3e40972edcf896071f138f7"},
+    {file = "bittensor-cli-9.0.0.tar.gz", hash = "sha256:f775c24b6acf574c4b64d009d8728f2657c2894fecb15385478fd8ac4501f0fd"},
+    {file = "bittensor_cli-9.0.0-py3-none-any.whl", hash = "sha256:211334018e878dd4145d1b7998630edd2e3a486ac4e992493b535306e3d0c178"},
 ]
 
 [[package]]
@@ -318,7 +318,7 @@ files = [
 
 [[package]]
 name = "bittensor-wallet"
-version = "3.0.2"
+version = "3.0.3"
 requires_python = ">=3.9"
 summary = ""
 groups = ["default"]
@@ -332,11 +332,11 @@ dependencies = [
     "termcolor",
 ]
 files = [
-    {file = "bittensor_wallet-3.0.2-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:157d4f62b2567fc2926bb0524fe330922ddca74ac65d696f2c986711cd326aad"},
-    {file = "bittensor_wallet-3.0.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:eb01fc99d8862362bf17502376e02e13c39ba66e2f8a9c96fce58538b99daaab"},
-    {file = "bittensor_wallet-3.0.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5b2a95a01878f2a25442620b05203e8f14ecbb41715950ba6dbe323fe17507b7"},
-    {file = "bittensor_wallet-3.0.2-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:52a3b23e97d2fd0f541cbcf5ffb47ffeb0f650df412c899e07eeb0ffda976a96"},
-    {file = "bittensor_wallet-3.0.2.tar.gz", hash = "sha256:2e4d1caf290e07ed4fa7cc78acdcae5b380501100e17929c06630fc622a5d24b"},
+    {file = "bittensor_wallet-3.0.3-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:3060507bd941edf2677661e2ea6680cfd950211b4855db926071541afb36e46c"},
+    {file = "bittensor_wallet-3.0.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:a0ac0e96c139fb191241ae4a751763357fcbf5d333c5d5496429bd3396cfc180"},
+    {file = "bittensor_wallet-3.0.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:158600cb19a05a91eeab79e39e5d87eb1cde247ba19de2a3eb5738ae6ac73222"},
+    {file = "bittensor_wallet-3.0.3-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:1600afcabf42f2463bc84f1a8ff07230e8aa6e301dff22ab2fd1df60bdb95daf"},
+    {file = "bittensor_wallet-3.0.3.tar.gz", hash = "sha256:60e534e1f1c256e4dac788acac4724ec92c445c24058954b7e12a3aca6828e1b"},
 ]
 
 [[package]]
