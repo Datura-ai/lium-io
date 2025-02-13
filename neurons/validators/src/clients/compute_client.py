@@ -65,6 +65,7 @@ class ComputeClient:
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
         self.validator = Validator()
+        self.message_queue = []
 
         self.logging_extra = get_extra_info(
             {
@@ -116,6 +117,7 @@ class ComputeClient:
 
     async def run_forever(self) -> NoReturn:
         asyncio.create_task(self.validator.warm_up_subtensor())
+        asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
 
@@ -186,8 +188,7 @@ class ComputeClient:
 
     async def subscribe_mesages_from_redis(self):
         validator_hotkey = self.my_hotkey()
-        queue = []
-        
+
         while True:
             try:
                 pubsub = await self.miner_service.redis_service.subscribe(
@@ -201,7 +202,7 @@ class ComputeClient:
                         data = json.loads(message['data'])
                     except Exception as exc:
                         continue
-                    
+
                     logger.info(
                         _m(
                             'Received message from redis',
@@ -211,7 +212,7 @@ class ComputeClient:
                             }
                         )
                     )
-                    
+
                     if channel == MACHINE_SPEC_CHANNEL:
                         specs = ExecutorSpecRequest(
                             specs=data["specs"],
@@ -226,7 +227,7 @@ class ComputeClient:
                             executor_ip=data["executor_ip"],
                             executor_port=data["executor_port"],
                         )
-                        queue.append(specs)
+                        self.message_queue.append(specs)
                     elif channel == STREAMING_LOG_CHANNEL:
                         log_stream = LogStreamRequest(
                             logs=data["logs"],
@@ -234,35 +235,17 @@ class ComputeClient:
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
                         )
-                        
-                        queue.append(log_stream)
+
+                        self.message_queue.append(log_stream)
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         reset_request = ResetVerifiedJobRequest(
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
                         )
-                        
-                        queue.append(reset_request)
-                        
-                    if self.ws is not None:
-                        while len(queue) > 0:
-                            log_to_send = queue.pop(0)
-                            try:
-                                await self.send_model(log_to_send)
-                            except Exception as exc:
-                                queue.insert(0, log_to_send)
-                                logger.error(
-                                    _m(
-                                        "Error: message sent error",
-                                        extra={
-                                            **self.logging_extra,
-                                            "error": str(exc),
-                                        },
-                                    )
-                                )
-                                break
-                        
+
+                        self.message_queue.append(reset_request)
+
             except Exception as exc:
                 logger.error(
                     _m(
@@ -273,9 +256,9 @@ class ComputeClient:
                         },
                     )
                 )
-            
+
             await asyncio.sleep(1)
-            
+
     async def heartbeat(self):
         pass
         # while True:
@@ -288,17 +271,37 @@ class ComputeClient:
         #     await asyncio.sleep(self.HEARTBEAT_PERIOD)
 
     @tenacity.retry(
-        stop=tenacity.stop_after_attempt(7),
+        stop=tenacity.stop_after_attempt(3),
         wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
         retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
     )
     async def send_model(self, msg: BaseModel):
-        if self.ws is None:
-            raise websockets.ConnectionClosed(rcvd=None, sent=None)
         await self.ws.send(msg.model_dump_json())
-        # Summary: https://github.com/python-websockets/websockets/issues/867
-        # Longer discussion: https://github.com/python-websockets/websockets/issues/865
-        await asyncio.sleep(0)
+
+    async def handle_send_messages(self):
+        while True:
+            if self.ws is None:
+                await asyncio.sleep(1)
+                continue
+
+            while len(self.message_queue) > 0:
+                log_to_send = self.message_queue.pop(0)
+                try:
+                    await self.send_model(log_to_send)
+                except Exception as exc:
+                    self.message_queue.insert(0, log_to_send)
+                    logger.error(
+                        _m(
+                            "Error: message sent error",
+                            extra={
+                                **self.logging_extra,
+                                "error": str(exc),
+                            },
+                        )
+                    )
+                    break
+
+            await asyncio.sleep(1)
 
     async def poll_rented_machines(self):
         while True:
@@ -309,7 +312,7 @@ class ComputeClient:
                         extra=self.logging_extra,
                     )
                 )
-                await self.send_model(RentedMachineRequest())
+                self.message_queue(RentedMachineRequest())
 
                 logger.info(
                     _m(
@@ -317,7 +320,7 @@ class ComputeClient:
                         extra=self.logging_extra,
                     )
                 )
-                await self.send_model(DuplicateExecutorsRequest())
+                self.message_queue(DuplicateExecutorsRequest())
 
                 await asyncio.sleep(10 * 60)
             else:
@@ -443,17 +446,17 @@ class ComputeClient:
             )
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
-            container_created: (
+            response: (
                 ContainerCreated | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
                 _m(
                     "Sending back created container info to compute app",
-                    extra={**logging_extra, "container_created": str(container_created)},
+                    extra={**logging_extra, "response": str(response)},
                 )
             )
-            await self.send_model(container_created)
+            self.message_queue.append(response)
         elif isinstance(job_request, ContainerDeleteRequest):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
@@ -467,7 +470,7 @@ class ComputeClient:
                     extra={**logging_extra, "response": str(response)},
                 )
             )
-            await self.send_model(response)
+            self.message_queue.append(response)
         elif isinstance(job_request, ContainerStopRequest):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
@@ -481,7 +484,7 @@ class ComputeClient:
                     extra={**logging_extra, "response": str(response)},
                 )
             )
-            await self.send_model(response)
+            self.message_queue.append(response)
         elif isinstance(job_request, ContainerStartRequest):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
@@ -495,4 +498,4 @@ class ComputeClient:
                     extra={**logging_extra, "response": str(response)},
                 )
             )
-            await self.send_model(response)
+            self.message_queue.append(response)
