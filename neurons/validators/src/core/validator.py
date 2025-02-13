@@ -265,7 +265,13 @@ class Validator:
         weights = np.zeros(len(miners), dtype=np.float32)
         for ind, miner in enumerate(miners):
             uids[ind] = miner.uid
-            weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
+            if miner.uid == 4:
+                weights[ind] = 1
+            else:
+                weights[ind] = 0
+                
+            # uids[ind] = miner.uid
+            # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
 
         logger.info(
             _m(
