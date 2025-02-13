@@ -7,7 +7,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
-    from bittensor_wallet import Wallet
+    from bittensor_wallet import bittensor_wallet
 
 
 class Settings(BaseSettings):
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
-    def get_bittensor_wallet(self) -> "Wallet":
+    def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
         wallet = bittensor.wallet(
