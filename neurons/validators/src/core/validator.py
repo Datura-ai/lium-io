@@ -266,12 +266,18 @@ class Validator:
 
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
-        for ind, miner in enumerate(miners):
-            uids[ind] = miner.uid
-            if miner.uid == 4:
-                weights[ind] = 1
-            else:
-                weights[ind] = 0
+
+        total_score = sum(self.miner_scores.values())
+        if total_score <= 0:
+            uids[0] = 4
+            weights[0] = 1
+        else:
+            for ind, miner in enumerate(miners):
+                uids[ind] = miner.uid
+                if miner.uid == 4:
+                    weights[ind] = 95
+                else:
+                    weights[ind] = 5 * self.miner_scores.get(miner.hotkey, 0.0) / total_score
 
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
