@@ -1245,6 +1245,13 @@ class TaskService:
 
                     logger.info(log_text)
 
+                    logger.debug(
+                        _m(
+                            "SSH connection closed for executor",
+                            extra=get_extra_info(default_extra),
+                        ),
+                    )
+
                     await self.clear_remote_directory(ssh_client, remote_dir)
                     await self.redis_service.set_verified_job_info(
                         miner_hotkey=miner_info.miner_hotkey,
