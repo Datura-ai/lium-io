@@ -1245,7 +1245,7 @@ class TaskService:
 
                     logger.info(log_text)
 
-                    logger.info(
+                    logger.debug(
                         _m(
                             "SSH connection closed for executor",
                             extra=get_extra_info(default_extra),
