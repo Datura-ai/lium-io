@@ -159,14 +159,6 @@ class MinerClient(abc.ABC):
                 return
             except (websockets.WebSocketException, OSError) as ex:
                 self.debounce_counter += 1
-                logger.error(
-                    _m(
-                        f"Could not connect to miner: {str(ex)}",
-                        extra=get_extra_info(
-                            {**self.logging_extra, "debounce_counter": self.debounce_counter}
-                        ),
-                    )
-                )
 
     def sleep_time(self):
         return (2**self.debounce_counter) + random.random()

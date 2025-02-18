@@ -282,13 +282,6 @@ class Validator:
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
 
-        logger.info(
-            _m(
-                f"[set_weights] uids: {uids} weights: {weights}",
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
-
         metagraph = self.get_metagraph()
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
