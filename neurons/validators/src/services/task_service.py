@@ -425,6 +425,7 @@ class TaskService:
 
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
         prev_spec = verified_job_info.get('spec', '')
+        prev_uuids = verified_job_info.get('uuids', '')
 
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
@@ -608,6 +609,8 @@ class TaskService:
                 for detail in gpu_details:
                     vram += detail.get("capacity", 0) * 1024
 
+                gpu_uuids = ','.join([detail.get('uuid', '') for detail in gpu_details])
+
                 logger.info(
                     _m(
                         "Machine spec scraped",
@@ -745,6 +748,37 @@ class TaskService:
                                 **default_extra,
                                 "prev_spec": prev_spec,
                                 "current_spec": gpu_model_count,
+                            }
+                        ),
+                    )
+                    logger.warning(log_text)
+
+                    await self.clear_remote_directory(ssh_client, remote_dir)
+                    await self.clear_verified_job_count(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        prev_info=verified_job_info
+                    )
+
+                    return (
+                        machine_spec,
+                        executor_info,
+                        0,
+                        0,
+                        miner_info.job_batch_id,
+                        log_status,
+                        log_text,
+                    )
+
+                if prev_uuids and prev_uuids != gpu_uuids:
+                    log_status = "warning"
+                    log_text = _m(
+                        "GPUs are changed",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "prev_uuids": prev_uuids,
+                                "gpu_uuids": gpu_uuids,
                             }
                         ),
                     )
@@ -1259,6 +1293,7 @@ class TaskService:
                         prev_info=verified_job_info,
                         success=True,
                         spec=gpu_model_count,
+                        uuids=gpu_uuids,
                     )
 
                     if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT:
