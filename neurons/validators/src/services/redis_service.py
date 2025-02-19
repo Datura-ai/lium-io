@@ -152,11 +152,13 @@ class RedisService:
         executor_id: str,
         prev_info: dict = {},
         success: bool = True,
-        spec: str = ''
+        spec: str = '',
+        uuids: str = '',
     ):
         count = prev_info.get('count', 0)
         failed = prev_info.get('failed', 0)
         prev_spec = prev_info.get('spec', '')
+        prev_uuids = prev_info.get('uuids', '')
 
         if (success):
             count += 1
@@ -173,7 +175,8 @@ class RedisService:
         data = {
             "count": count,
             "failed": failed,
-            "spec": spec if spec else prev_spec
+            "spec": spec if spec else prev_spec,
+            "uuids": uuids if uuids else prev_uuids,
         }
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
