@@ -144,3 +144,4 @@ class FailedContainerRequest(ContainerBaseResponse):
 class DuplicateExecutorsResponse(BaseModel):
     message_type: ContainerRequestType = ContainerRequestType.DuplicateExecutorsResponse
     executors: dict[str, list]
+    rental_failed_executors: list[str] | None = None
