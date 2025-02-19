@@ -398,7 +398,7 @@ class TaskService:
         spec: dict | None,
         score: float,
         job_score: float,
-        log_text: str,
+        log_text: object,
         verified_job_info: dict,
         success: bool = True,
         clear_verified_job_info: bool = False,
