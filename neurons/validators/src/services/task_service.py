@@ -37,6 +37,7 @@ from services.redis_service import (
     RedisService,
     PENDING_PODS_SET,
     DUPLICATED_MACHINE_SET,
+    RENTAL_FAILED_MACHINE_SET,
     AVAILABLE_PORT_MAPS_PREFIX,
 )
 from services.ssh_service import SSHService
@@ -592,7 +593,7 @@ class TaskService:
                     )
                 )
 
-                gpu_model = None
+                # de-obfuscate machine_spec
                 all_keys = encypted_files.all_keys
                 reverse_all_keys = {v: k for k, v in all_keys.items()}
 
@@ -605,6 +606,15 @@ class TaskService:
                     if len(details) > 0:
                         gpu_model = details[0].get("name", None)
 
+                # get available port maps
+                port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
+                port_maps = await self.redis_service.lrange(port_map_key)
+                machine_spec = {
+                    **machine_spec,
+                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                }
+
+                gpu_model = None
                 max_score = 0
                 if gpu_model:
                     max_score = GPU_MAX_SCORES.get(gpu_model, 0)
@@ -851,6 +861,30 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=True,
+                    )
+
+                # check rental failed
+                is_rental_failed = await self.redis_service.is_elem_exists_in_set(
+                    RENTAL_FAILED_MACHINE_SET, executor_info.uuid
+                )
+                if is_rental_failed:
+                    log_text = _m(
+                        f"Executor is reantal failed",
+                        extra=get_extra_info(default_extra),
+                    )
+
+                    return await self._handle_task_result(
+                        ssh_client=ssh_client,
+                        remote_dir=remote_dir,
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=machine_spec,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        clear_verified_job_info=False,
                     )
 
                 # check rented status
