@@ -828,7 +828,7 @@ class Validator:
                 # sync every 12 seconds
                 await asyncio.sleep(SYNC_CYCLE)
             except Exception as e:
-                logger.info(
+                logger.error(
                     _m(
                         "[stop] Failed to connect into subtensor",
                         extra=get_extra_info({**self.default_extra, "error": str(e)}),

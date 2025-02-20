@@ -68,12 +68,10 @@ class ComputeClient:
         self.message_queue = []
         self.lock = asyncio.Lock()
 
-        self.logging_extra = get_extra_info(
-            {
-                "validator_hotkey": self.my_hotkey(),
-                "compute_app_uri": compute_app_uri,
-            }
-        )
+        self.logging_extra = {
+            "validator_hotkey": self.my_hotkey(),
+            "compute_app_uri": compute_app_uri,
+        }
 
     def accepted_request_type(self) -> type[BaseRequest]:
         return ContainerBaseRequest
@@ -83,7 +81,7 @@ class ComputeClient:
         logger.info(
             _m(
                 "Connecting to backend app",
-                extra=self.logging_extra,
+                extra=get_extra_info(self.logging_extra)
             )
         )
         return websockets.connect(self.compute_app_uri)
@@ -101,9 +99,11 @@ class ComputeClient:
                 logger.error(
                     _m(
                         "Error occurred during driving a miner client",
-                        extra={**self.logging_extra, "error": str(exc)},
-                    ),
-                    exc_info=True,
+                        extra=get_extra_info({
+                            **self.logging_extra,
+                            "error": str(exc)
+                        }),
+                    )
                 )
 
     async def __aenter__(self):
@@ -129,7 +129,7 @@ class ComputeClient:
                         logger.info(
                             _m(
                                 "Connected to backend app",
-                                extra=self.logging_extra,
+                                extra=get_extra_info(self.logging_extra),
                             )
                         )
                         await self.handle_connection(ws)
@@ -138,7 +138,7 @@ class ComputeClient:
                         logger.warning(
                             _m(
                                 f"validator connection to backend app closed with code {exc.code} and reason {exc.reason}, reconnecting...",
-                                extra=self.logging_extra,
+                                extra=get_extra_info(self.logging_extra),
                             )
                         )
                     except asyncio.exceptions.CancelledError:
@@ -146,7 +146,7 @@ class ComputeClient:
                         logger.warning(
                             _m(
                                 "Facilitator client received cancel, stopping",
-                                extra=self.logging_extra,
+                                extra=get_extra_info(self.logging_extra),
                             )
                         )
                     except Exception:
@@ -154,7 +154,7 @@ class ComputeClient:
                         logger.error(
                             _m(
                                 "Error in connecting to compute app",
-                                extra=self.logging_extra,
+                                extra=get_extra_info(self.logging_extra),
                             )
                         )
 
@@ -163,7 +163,7 @@ class ComputeClient:
             logger.error(
                 _m(
                     "Connecting to compute app failed",
-                    extra={**self.logging_extra, "error": str(exc)},
+                    extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
                 ),
                 exc_info=True,
             )
@@ -207,10 +207,10 @@ class ComputeClient:
                     logger.info(
                         _m(
                             'Received message from redis',
-                            extra={
+                            extra=get_extra_info({
                                 **self.logging_extra,
                                 "channel": channel,
-                            }
+                            }),
                         )
                     )
 
@@ -255,10 +255,10 @@ class ComputeClient:
                 logger.error(
                     _m(
                         "Error: unknown",
-                        extra={
+                        extra=get_extra_info({
                             **self.logging_extra,
                             "error": str(exc),
-                        },
+                        }),
                     )
                 )
 
@@ -293,20 +293,21 @@ class ComputeClient:
                 async with self.lock:
                     log_to_send = self.message_queue.pop(0)
 
-                try:
-                    await self.send_model(log_to_send)
-                except Exception as exc:
-                    async with self.lock:
-                        self.message_queue.insert(0, log_to_send)
-                    logger.error(
-                        _m(
-                            "Error: message sent error",
-                            extra={
-                                **self.logging_extra,
-                                "error": str(exc),
-                            },
+                if log_to_send:
+                    try:
+                        await self.send_model(log_to_send)
+                    except Exception as exc:
+                        async with self.lock:
+                            self.message_queue.insert(0, log_to_send)
+                        logger.error(
+                            _m(
+                                "Error: message sent error",
+                                extra=get_extra_info({
+                                    **self.logging_extra,
+                                    "error": str(exc),
+                                }),
+                            )
                         )
-                    )
             else:
                 await asyncio.sleep(1)
 
@@ -316,18 +317,18 @@ class ComputeClient:
                 logger.info(
                     _m(
                         "Request rented machines",
-                        extra=self.logging_extra,
+                        extra=get_extra_info(self.logging_extra),
                     )
                 )
-                self.message_queue(RentedMachineRequest())
+                self.message_queue.append(RentedMachineRequest())
 
                 logger.info(
                     _m(
                         "Request duplicated machines",
-                        extra=self.logging_extra,
+                        extra=get_extra_info(self.logging_extra),
                     )
                 )
-                self.message_queue(DuplicateExecutorsRequest())
+                self.message_queue.append(DuplicateExecutorsRequest())
 
             await asyncio.sleep(10 * 60)
 
@@ -342,7 +343,10 @@ class ComputeClient:
                 logger.error(
                     _m(
                         "received error response from facilitator",
-                        extra={**self.logging_extra, "response": str(response)},
+                        extra=get_extra_info({
+                            **self.logging_extra,
+                            "response": str(response)
+                        }),
                     )
                 )
             return
@@ -355,7 +359,10 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Rented machines",
-                    extra={**self.logging_extra, "machines": len(response.machines)},
+                    extra=get_extra_info({
+                        **self.logging_extra,
+                        "machines": len(response.machines)
+                    }),
                 )
             )
 
@@ -375,7 +382,11 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Duplicated executors",
-                    extra={**self.logging_extra, "executors": len(response.executors)},
+                    extra=get_extra_info({
+                        **self.logging_extra,
+                        "executors": len(response.executors),
+                        "rental_failed_executors": len(response.rental_failed_executors)
+                    }),
                 )
             )
 
@@ -399,14 +410,14 @@ class ComputeClient:
             logger.error(
                 _m(
                     error_msg,
-                    extra={**self.logging_extra, "error": str(ex), "raw_msg": raw_msg},
+                    extra=get_extra_info({**self.logging_extra, "error": str(ex), "raw_msg": raw_msg}),
                 )
             )
+            pass
         else:
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
-        # logger.error("unsupported message received from facilitator: %s", raw_msg)
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miners = self.validator.fetch_miners()
@@ -424,7 +435,10 @@ class ComputeClient:
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
-            _m(f"Getting miner axon info for {job_request.miner_hotkey}", extra=self.logging_extra)
+            _m(
+                f"Getting miner axon info for {job_request.miner_hotkey}",
+                extra=get_extra_info(self.logging_extra),
+            )
         )
         miner_axon_info = await self.get_miner_axon_info(job_request.miner_hotkey)
         logging_extra = {
@@ -438,7 +452,7 @@ class ComputeClient:
         logger.info(
             _m(
                 "Miner driver to miner",
-                extra=logging_extra,
+                extra=get_extra_info(logging_extra),
             )
         )
 
@@ -446,7 +460,7 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Creating container for executor.",
-                    extra={**logging_extra, "job_request": str(job_request)},
+                    extra=get_extra_info({**logging_extra, "job_request": str(job_request)}),
                 )
             )
             job_request.miner_address = miner_axon_info.ip
@@ -458,7 +472,7 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Sending back created container info to compute app",
-                    extra={**logging_extra, "response": str(response)},
+                    extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )
 
@@ -474,7 +488,7 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Sending back deleted container info to compute app",
-                    extra={**logging_extra, "response": str(response)},
+                    extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )
 
@@ -490,7 +504,7 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Sending back stopped container info to compute app",
-                    extra={**logging_extra, "response": str(response)},
+                    extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )
 
@@ -506,7 +520,7 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Sending back started container info to compute app",
-                    extra={**logging_extra, "response": str(response)},
+                    extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )
 
