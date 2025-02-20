@@ -600,21 +600,20 @@ class TaskService:
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
                 updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
 
-                machine_spec = updated_machine_spec
+                # get available port maps
+                port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
+                port_maps = await self.redis_service.lrange(port_map_key)
+                machine_spec = {
+                    **updated_machine_spec,
+                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                }
+
+                gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
                     details = machine_spec["gpu"].get("details", [])
                     if len(details) > 0:
                         gpu_model = details[0].get("name", None)
 
-                # get available port maps
-                port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
-                port_maps = await self.redis_service.lrange(port_map_key)
-                machine_spec = {
-                    **machine_spec,
-                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
-                }
-
-                gpu_model = None
                 max_score = 0
                 if gpu_model:
                     max_score = GPU_MAX_SCORES.get(gpu_model, 0)
