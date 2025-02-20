@@ -289,25 +289,26 @@ class ComputeClient:
                 await asyncio.sleep(1)
                 continue
 
-            async with self.lock:
-                while len(self.message_queue) > 0:
+            if len(self.message_queue) > 0:
+                async with self.lock:
                     log_to_send = self.message_queue.pop(0)
-                    try:
-                        await self.send_model(log_to_send)
-                    except Exception as exc:
-                        self.message_queue.insert(0, log_to_send)
-                        logger.error(
-                            _m(
-                                "Error: message sent error",
-                                extra={
-                                    **self.logging_extra,
-                                    "error": str(exc),
-                                },
-                            )
-                        )
-                        break
 
-            await asyncio.sleep(1)
+                try:
+                    await self.send_model(log_to_send)
+                except Exception as exc:
+                    async with self.lock:
+                        self.message_queue.insert(0, log_to_send)
+                    logger.error(
+                        _m(
+                            "Error: message sent error",
+                            extra={
+                                **self.logging_extra,
+                                "error": str(exc),
+                            },
+                        )
+                    )
+            else:
+                await asyncio.sleep(1)
 
     async def poll_rented_machines(self):
         while True:
