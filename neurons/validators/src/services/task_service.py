@@ -593,7 +593,7 @@ class TaskService:
                     )
                 )
 
-                gpu_model = None
+                # de-obfuscate machine_spec
                 all_keys = encypted_files.all_keys
                 reverse_all_keys = {v: k for k, v in all_keys.items()}
 
@@ -606,6 +606,15 @@ class TaskService:
                     if len(details) > 0:
                         gpu_model = details[0].get("name", None)
 
+                # get available port maps
+                port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
+                port_maps = await self.redis_service.lrange(port_map_key)
+                machine_spec = {
+                    **machine_spec,
+                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                }
+
+                gpu_model = None
                 max_score = 0
                 if gpu_model:
                     max_score = GPU_MAX_SCORES.get(gpu_model, 0)
