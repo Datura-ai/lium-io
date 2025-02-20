@@ -36,6 +36,7 @@ from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
+    RENTAL_FAILED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
@@ -149,12 +150,15 @@ class ComputeClient:
                                 extra=get_extra_info(self.logging_extra),
                             )
                         )
-                    except Exception:
+                    except Exception as e:
                         self.ws = None
                         logger.error(
                             _m(
                                 "Error in connecting to compute app",
-                                extra=get_extra_info(self.logging_extra),
+                                extra=get_extra_info({
+                                    **self.logging_extra,
+                                    "error": str(e),
+                                }),
                             )
                         )
 
@@ -385,11 +389,12 @@ class ComputeClient:
                     extra=get_extra_info({
                         **self.logging_extra,
                         "executors": len(response.executors),
-                        "rental_failed_executors": len(response.rental_failed_executors)
+                        "rental_failed_executors": len(response.rental_failed_executors) if response.rental_failed_executors else 0
                     }),
                 )
             )
 
+            # Reset duplicated machines
             redis_service = self.miner_service.redis_service
             await redis_service.delete(DUPLICATED_MACHINE_SET)
 
@@ -399,6 +404,15 @@ class ComputeClient:
                     miner_hotkey = detail.get("miner_hotkey")
                     await redis_service.sadd(
                         DUPLICATED_MACHINE_SET, f"{miner_hotkey}:{executor_id}"
+                    )
+
+            # Reset rental failed machines
+            await redis_service.delete(RENTAL_FAILED_MACHINE_SET)
+
+            if response.rental_failed_executors:
+                for executor_uuid in response.rental_failed_executors:
+                    await redis_service.sadd(
+                        RENTAL_FAILED_MACHINE_SET, executor_uuid
                     )
 
             return
