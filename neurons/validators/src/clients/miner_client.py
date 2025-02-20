@@ -159,7 +159,7 @@ class MinerClient(abc.ABC):
                 return
             except (websockets.WebSocketException, OSError) as ex:
                 self.debounce_counter += 1
-                logger.error(
+                logger.debug(
                     _m(
                         f"Could not connect to miner: {str(ex)}",
                         extra=get_extra_info(

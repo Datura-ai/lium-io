@@ -203,7 +203,7 @@ class DockerService:
         """Check if the container is running"""
         start_time = time.time()
         while time.time() - start_time < timeout:
-            result = await ssh_client.run(f"docker ps -q -f name={container_name}")
+            result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name}")
             if result.stdout.strip():
                 return True
             await asyncio.sleep(1)
@@ -213,10 +213,14 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
+        sleep: int = 0,
     ):
-        command = 'docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+        command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
+            # wait until the docker connection check is finished.
+            await asyncio.sleep(sleep)
+
             ids = " ".join(result.stdout.strip().split("\n"))
 
             logger.info(
@@ -230,15 +234,15 @@ class DockerService:
                 ),
             )
 
-            command = f'docker rm {ids} -f'
+            command = f'/usr/bin/docker rm {ids} -f'
             await ssh_client.run(command)
 
-            command = f'docker volume prune -af'
+            command = f'/usr/bin/docker volume prune -af'
             await ssh_client.run(command)
 
-    async def clear_verified_job_count(self, renting_machine: RentedMachine):
-        await self.redis_service.remove_pending_pod(renting_machine)
-        await self.redis_service.clear_verified_job_info(renting_machine.executor_id)
+    async def clear_verified_job_count(self, miner_hotkey: str, executor_id: str):
+        await self.redis_service.remove_pending_pod(miner_hotkey, executor_id)
+        await self.redis_service.clear_verified_job_info(miner_hotkey, executor_id)
 
     async def create_container(
         self,
@@ -257,13 +261,6 @@ class DockerService:
             "docker_image": payload.docker_image,
             "debug": payload.debug,
         }
-
-        renting_machine = RentedMachine(
-            miner_hotkey=payload.miner_hotkey,
-            executor_id=payload.executor_id,
-            executor_ip_address=executor_info.address,
-            executor_ip_port=str(executor_info.port),
-        )
 
         logger.info(
             _m(
@@ -290,7 +287,7 @@ class DockerService:
                 log_text = "No port mappings found"
                 logger.error(log_text)
 
-                await self.clear_verified_job_count(renting_machine)
+                await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -300,7 +297,7 @@ class DockerService:
                 )
 
             # add executor in pending status dict
-            await self.redis_service.add_pending_pod(renting_machine)
+            await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id)
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
@@ -339,7 +336,7 @@ class DockerService:
                         }
                     )
 
-                command = f"docker pull {payload.docker_image}"
+                command = f"/usr/bin/docker pull {payload.docker_image}"
                 status, error = await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
                     command=command,
@@ -356,7 +353,7 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(renting_machine)
+                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -421,10 +418,14 @@ class DockerService:
                         }
                     )
 
-                await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                await self.clean_exisiting_containers(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    sleep=10,
+                )
 
                 volume_name = f"volume_{uuid}"
-                command = f"docker volume create {volume_name}"
+                command = f"/usr/bin/docker volume create {volume_name}"
                 status, error = await self.execute_and_stream_logs(
                     ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=10
                 )
@@ -439,7 +440,8 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(renting_machine)
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -468,9 +470,9 @@ class DockerService:
                 container_name = f"container_{uuid}"
 
                 if payload.debug:
-                    command = f'docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
-                    command = f'docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
 
                 logger.info(
                     _m(
@@ -497,7 +499,8 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(renting_machine)
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -518,7 +521,8 @@ class DockerService:
                     logger.error(log_text)
 
                     await self.finish_stream_logs()
-                    await self.clear_verified_job_count(renting_machine)
+                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
@@ -536,8 +540,14 @@ class DockerService:
 
                 await self.finish_stream_logs()
 
-                await self.redis_service.add_rented_machine(renting_machine)
-                await self.redis_service.remove_pending_pod(renting_machine)
+                await self.redis_service.add_rented_machine(RentedMachine(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    executor_ip_address=executor_info.address,
+                    executor_ip_port=str(executor_info.port),
+                    container_name=container_name,
+                ))
+                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
 
                 return ContainerCreatedResult(
                     container_name=container_name,
@@ -554,7 +564,7 @@ class DockerService:
             logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.clear_verified_job_count(renting_machine)
+            await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -595,7 +605,7 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            await ssh_client.run(f"docker stop {payload.container_name}")
+            await ssh_client.run(f"/usr/bin/docker stop {payload.container_name}")
 
             logger.info(
                 _m(
@@ -639,7 +649,7 @@ class DockerService:
             client_keys=[pkey],
             known_hosts=None,
         ) as ssh_client:
-            await ssh_client.run(f"docker start {payload.container_name}")
+            await ssh_client.run(f"/usr/bin/docker start {payload.container_name}")
             logger.info(
                 _m(
                     "Started Docker Container",
@@ -683,8 +693,9 @@ class DockerService:
             known_hosts=None,
         ) as ssh_client:
             # await ssh_client.run(f"docker stop {payload.container_name}")
-            await ssh_client.run(f"docker rm {payload.container_name} -f")
-            await ssh_client.run(f"docker volume rm {payload.volume_name} -f")
+            await ssh_client.run(f"/usr/bin/docker rm {payload.container_name} -f")
+            await ssh_client.run(f"/usr/bin/docker volume rm {payload.volume_name} -f")
+            await ssh_client.run(f"/usr/bin/docker image prune -af")
 
             logger.info(
                 _m(
@@ -699,14 +710,7 @@ class DockerService:
                 ),
             )
 
-            await self.redis_service.remove_rented_machine(
-                RentedMachine(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    executor_ip_address=executor_info.address,
-                    executor_ip_port=str(executor_info.port),
-                )
-            )
+            await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
 
     async def get_docker_hub_digests(self, repositories) -> dict[str, str]:
         """Retrieve all tags and their corresponding digests from Docker Hub."""
@@ -785,7 +789,7 @@ class DockerService:
 
         await asyncio.sleep(5)
 
-        command = f"docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
+        command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
 
         result = await ssh_client.run(command)
         if result.exit_status != 0:
