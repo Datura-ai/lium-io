@@ -66,6 +66,7 @@ class ComputeClient:
         self.miner_service = miner_service
         self.validator = Validator()
         self.message_queue = []
+        self.lock = asyncio.Lock()
 
         self.logging_extra = get_extra_info(
             {
@@ -227,7 +228,9 @@ class ComputeClient:
                             executor_ip=data["executor_ip"],
                             executor_port=data["executor_port"],
                         )
-                        self.message_queue.append(specs)
+
+                        async with self.lock:
+                            self.message_queue.append(specs)
                     elif channel == STREAMING_LOG_CHANNEL:
                         log_stream = LogStreamRequest(
                             logs=data["logs"],
@@ -236,7 +239,8 @@ class ComputeClient:
                             executor_uuid=data["executor_uuid"],
                         )
 
-                        self.message_queue.append(log_stream)
+                        async with self.lock:
+                            self.message_queue.append(log_stream)
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         reset_request = ResetVerifiedJobRequest(
                             miner_hotkey=data["miner_hotkey"],
@@ -244,7 +248,8 @@ class ComputeClient:
                             executor_uuid=data["executor_uuid"],
                         )
 
-                        self.message_queue.append(reset_request)
+                        async with self.lock:
+                            self.message_queue.append(reset_request)
 
             except Exception as exc:
                 logger.error(
@@ -284,28 +289,29 @@ class ComputeClient:
                 await asyncio.sleep(1)
                 continue
 
-            while len(self.message_queue) > 0:
-                log_to_send = self.message_queue.pop(0)
-                try:
-                    await self.send_model(log_to_send)
-                except Exception as exc:
-                    self.message_queue.insert(0, log_to_send)
-                    logger.error(
-                        _m(
-                            "Error: message sent error",
-                            extra={
-                                **self.logging_extra,
-                                "error": str(exc),
-                            },
+            async with self.lock:
+                while len(self.message_queue) > 0:
+                    log_to_send = self.message_queue.pop(0)
+                    try:
+                        await self.send_model(log_to_send)
+                    except Exception as exc:
+                        self.message_queue.insert(0, log_to_send)
+                        logger.error(
+                            _m(
+                                "Error: message sent error",
+                                extra={
+                                    **self.logging_extra,
+                                    "error": str(exc),
+                                },
+                            )
                         )
-                    )
-                    break
+                        break
 
             await asyncio.sleep(1)
 
     async def poll_rented_machines(self):
         while True:
-            if self.ws is not None:
+            async with self.lock:
                 logger.info(
                     _m(
                         "Request rented machines",
@@ -322,9 +328,7 @@ class ComputeClient:
                 )
                 self.message_queue(DuplicateExecutorsRequest())
 
-                await asyncio.sleep(10 * 60)
-            else:
-                await asyncio.sleep(10)
+            await asyncio.sleep(10 * 60)
 
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
@@ -456,7 +460,9 @@ class ComputeClient:
                     extra={**logging_extra, "response": str(response)},
                 )
             )
-            self.message_queue.append(response)
+
+            async with self.lock:
+                self.message_queue.append(response)
         elif isinstance(job_request, ContainerDeleteRequest):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
@@ -470,7 +476,9 @@ class ComputeClient:
                     extra={**logging_extra, "response": str(response)},
                 )
             )
-            self.message_queue.append(response)
+
+            async with self.lock:
+                self.message_queue.append(response)
         elif isinstance(job_request, ContainerStopRequest):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
@@ -484,7 +492,9 @@ class ComputeClient:
                     extra={**logging_extra, "response": str(response)},
                 )
             )
-            self.message_queue.append(response)
+
+            async with self.lock:
+                self.message_queue.append(response)
         elif isinstance(job_request, ContainerStartRequest):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
@@ -498,4 +508,6 @@ class ComputeClient:
                     extra={**logging_extra, "response": str(response)},
                 )
             )
-            self.message_queue.append(response)
+
+            async with self.lock:
+                self.message_queue.append(response)
