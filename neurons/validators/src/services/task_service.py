@@ -605,7 +605,7 @@ class TaskService:
                 port_maps = await self.redis_service.lrange(port_map_key)
                 machine_spec = {
                     **updated_machine_spec,
-                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                    "available_port_maps": len(port_maps),
                 }
 
                 gpu_model = None
