@@ -829,7 +829,7 @@ def get_machine_specs():
 
     data["data_docker"] = get_docker_info(docker_content)
 
-    data['data_gpu_processes'] = get_gpu_processes(gpu_process_ids, data["data_docker"]["docker_containers"])
+    data['data_processes'] = get_gpu_processes(gpu_process_ids, data["data_docker"]["docker_containers"])
 
     data["data_cpu"] = {"cpu_count": 0, "cpu_model": "", "cpu_clocks": []}
     try:
