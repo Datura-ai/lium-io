@@ -6,6 +6,7 @@ from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.redis_service import RedisService
 from services.file_encrypt_service import FileEncryptService
+from services.matrix_validation_service import ValidationService
 
 ioc = {}
 
@@ -16,9 +17,13 @@ async def initiate_services():
     ioc["FileEncryptService"] = FileEncryptService(
         ssh_service=ioc["SSHService"],
     )
+    ioc["ValidationService"] = ValidationService(
+        redis_service=ioc["RedisService"],
+    )
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
         redis_service=ioc["RedisService"],
+        validation_service=ioc["ValidationService"]
     )
     ioc["DockerService"] = DockerService(
         ssh_service=ioc["SSHService"],

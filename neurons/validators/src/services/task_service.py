@@ -42,7 +42,7 @@ from services.redis_service import (
 )
 from services.ssh_service import SSHService
 from services.hash_service import HashService
-from services.matrix_validation_service import VerifierParams, H100Prover
+from services.matrix_validation_service import VerifierParams, H100Prover, ValidationService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -55,9 +55,11 @@ class TaskService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        validation_service: Annotated[ValidationService, Depends(ValidationService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.validation_service = validation_service
         self.wallet = settings.get_bittensor_wallet()
 
     async def upload_directory(
@@ -556,8 +558,6 @@ class TaskService:
                     f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
                 )
                 remote_score_file_path = f"{remote_dir}/{encypted_files.score_file_name}"
-                remote_verifier_file_path = f"{remote_dir}/{encypted_files.verifier_file_name}"
-                remote_result_validation_file_path = f"{remote_dir}/validate_result.txt"
 
                 logger.info(
                     _m(
@@ -865,113 +865,38 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                verifier_params = VerifierParams.generate()
-                verifier_params.result_path = remote_result_validation_file_path
-
-                await ssh_client.run(f"chmod +x {remote_verifier_file_path}")
-
-                verify_results, err = await self._run_task(
-                    ssh_client=ssh_client,
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_info=executor_info,
-                    command=f"{remote_verifier_file_path} {verifier_params}",
-                )
-                if not verify_results:
-                    log_text = _m(
-                        "No result from multiplication job task.",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "error": str(err)
-                        }),
-                    )
-                    log_status = "warning"
-                    logger.warning(log_text)
-
-                    await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(
-                        miner_hotkey=miner_info.miner_hotkey,
-                        executor_id=executor_info.uuid,
-                        prev_info=verified_job_info,
-                        success=False,
+                is_high_end = self.validation_service.is_high_end_gpu(machine_spec)
+                if is_high_end:
+                    is_valid = await self.validation_service.validate_gpu_model_and_process_job(
+                        ssh_client=ssh_client,
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        remote_dir=remote_dir,
+                        verifier_file_name=encypted_files.verifier_file_name,
+                        verified_job_info=verified_job_info,
+                        machine_spec=machine_spec,
+                        default_extra=default_extra,
+                        _run_task=self._run_task
                     )
 
-                    return (
-                        machine_spec,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        log_status,
-                        log_text,
-                    )
-                
-                validation_results, err = await self._run_task(
-                    ssh_client=ssh_client,
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_info=executor_info,
-                    command=f"cat {remote_result_validation_file_path}",
-                )
-                if not validation_results:
-                    log_text = _m(
-                        "No result from multiplication job task.",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "error": str(err)
-                        }),
-                    )
-                    log_status = "warning"
-                    logger.warning(log_text)
-
-                    await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(
-                        miner_hotkey=miner_info.miner_hotkey,
-                        executor_id=executor_info.uuid,
-                        prev_info=verified_job_info,
-                        success=False,
-                    )
-
-                    return (
-                        machine_spec,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        log_status,
-                        log_text,
-                    )
-                
-                prover = H100Prover(0, 0, verifier_params.seed)
-                prover.parse_validate_result_content(validation_results)
-                is_valid = prover.validate_verification_result()
-
-                if not is_valid:
-                    log_text = _m(
-                        "There is no valid H100 GPU",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "error": str(err)
-                        }),
-                    )
-                    log_status = "warning"
-                    logger.warning(log_text)
-
-                    await self.clear_remote_directory(ssh_client, remote_dir)
-                    await self.redis_service.set_verified_job_info(
-                        miner_hotkey=miner_info.miner_hotkey,
-                        executor_id=executor_info.uuid,
-                        prev_info=verified_job_info,
-                        success=False,
-                    )
-
-                    return (
-                        machine_spec,
-                        executor_info,
-                        0,
-                        0,
-                        miner_info.job_batch_id,
-                        log_status,
-                        log_text,
-                    )
+                    if not is_valid:
+                        log_text = _m(
+                            "Verification failed",
+                            extra=get_extra_info(default_extra),
+                        )
+                        return await self._handle_task_result(
+                            ssh_client=ssh_client,
+                            remote_dir=remote_dir,
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            spec=None,
+                            score=0,
+                            job_score=0,
+                            log_text=log_text,
+                            verified_job_info=verified_job_info,
+                            success=False,
+                            clear_verified_job_info=True,
+                        )
 
                 # check rental failed
                 is_rental_failed = await self.redis_service.is_elem_exists_in_set(
