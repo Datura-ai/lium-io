@@ -51,6 +51,7 @@ class ContainerRequestType(enum.Enum):
     ContainerStartRequest = "ContainerStartRequest"
     ContainerStopRequest = "ContainerStopRequest"
     ContainerDeleteRequest = "ContainerDeleteRequest"
+    AddSshPublicKey = "AddSshPublicKey"
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
 
 
@@ -75,6 +76,12 @@ class ContainerStartRequest(ContainerBaseRequest):
     container_name: str
 
 
+class AddSshPublicKeyRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.AddSshPublicKey
+    container_name: str
+    user_public_key: str
+
+
 class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
@@ -91,6 +98,7 @@ class ContainerResponseType(enum.Enum):
     ContainerStarted = "ContainerStarted"
     ContainerStopped = "ContainerStopped"
     ContainerDeleted = "ContainerDeleted"
+    SshPubKeyAdded = "SshPubKeyAdded"
     FailedRequest = "FailedRequest"
 
 
@@ -100,14 +108,11 @@ class ContainerBaseResponse(BaseRequest):
     executor_id: str
 
 
-class ContainerCreatedResult(BaseModel):
+class ContainerCreated(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
     container_name: str
     volume_name: str
     port_maps: list[tuple[int, int]]
-
-
-class ContainerCreated(ContainerBaseResponse, ContainerCreatedResult):
-    message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -124,6 +129,10 @@ class ContainerDeleted(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
     container_name: str
     volume_name: str
+
+
+class SshPubKeyAdded(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
 
 
 class FailedContainerErrorCodes(enum.Enum):

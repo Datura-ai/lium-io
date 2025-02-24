@@ -10,11 +10,16 @@ import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
-    ContainerCreatedResult,
     ContainerCreateRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
+    AddSshPublicKeyRequest,
+    ContainerCreated,
+    ContainerDeleted,
+    ContainerStarted,
+    ContainerStopped,
+    SshPubKeyAdded,
     FailedContainerErrorCodes,
     FailedContainerRequest,
 )
@@ -549,7 +554,9 @@ class DockerService:
                 ))
                 await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
 
-                return ContainerCreatedResult(
+                return ContainerCreated(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
                     container_name=container_name,
                     volume_name=volume_name,
                     port_maps=[
@@ -685,32 +692,115 @@ class DockerService:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
-        async with asyncssh.connect(
-            host=executor_info.address,
-            port=executor_info.ssh_port,
-            username=executor_info.ssh_username,
-            client_keys=[pkey],
-            known_hosts=None,
-        ) as ssh_client:
-            # await ssh_client.run(f"docker stop {payload.container_name}")
-            await ssh_client.run(f"/usr/bin/docker rm {payload.container_name} -f")
-            await ssh_client.run(f"/usr/bin/docker volume rm {payload.volume_name} -f")
-            await ssh_client.run(f"/usr/bin/docker image prune -af")
+        try:
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client:
+                # await ssh_client.run(f"docker stop {payload.container_name}")
+                await ssh_client.run(f"/usr/bin/docker rm {payload.container_name} -f")
+                await ssh_client.run(f"/usr/bin/docker volume rm {payload.volume_name} -f")
+                await ssh_client.run(f"/usr/bin/docker image prune -af")
 
-            logger.info(
-                _m(
-                    "Deleted Docker Container",
-                    extra=get_extra_info(
-                        {
-                            **default_extra,
-                            "container_name": payload.container_name,
-                            "volume_name": payload.volume_name,
-                        }
+                logger.info(
+                    _m(
+                        "Deleted Docker Container",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "container_name": payload.container_name,
+                                "volume_name": payload.volume_name,
+                            }
+                        ),
                     ),
-                ),
+                )
+
+                await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
+
+                return ContainerDeleted(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    container_name=payload.container_name,
+                    volume_name=payload.volume_name,
+                )
+        except Exception as e:
+            log_text = _m(
+                "Unknown Error add_ssh_key",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=str(log_text),
+                error_code=FailedContainerErrorCodes.UnknownError,
             )
 
-            await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
+    async def add_ssh_key(
+        self,
+        payload: AddSshPublicKeyRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_uuid": payload.executor_id,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "executor_ssh_username": executor_info.ssh_username,
+            "executor_ssh_port": executor_info.ssh_port,
+        }
+
+        logger.info(
+            _m(
+                "Restart Docker Container",
+                extra=get_extra_info({**default_extra, "payload": str(payload)}),
+            ),
+        )
+
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
+
+        try:
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client:
+                await ssh_client.run(f"/usr/bin/docker exec -it {payload.container_name} sh -c 'echo \"{payload.user_public_key}\" >> ~/.ssh/authorized_keys'")
+                logger.info(
+                    _m(
+                        "Started Docker Container",
+                        extra=get_extra_info(
+                            {**default_extra, "container_name": payload.container_name}
+                        ),
+                    ),
+                )
+
+                return SshPubKeyAdded(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                )
+        except Exception as e:
+            log_text = _m(
+                "Unknown Error add_ssh_key",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=str(log_text),
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
 
     async def get_docker_hub_digests(self, repositories) -> dict[str, str]:
         """Retrieve all tags and their corresponding digests from Docker Hub."""
