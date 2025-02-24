@@ -5,7 +5,6 @@ from typing import NoReturn
 
 import bittensor
 import pydantic
-import redis.asyncio as aioredis
 import tenacity
 import websockets
 from datura.requests.base import BaseRequest

@@ -57,9 +57,8 @@ class MinerService:
     async def request_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
-        encypted_files: MinerJobEnryptedFiles,
+        encrypted_files: MinerJobEnryptedFiles,
         docker_hub_digests: dict[str, str],
-        debug=False,
     ):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -129,9 +128,8 @@ class MinerService:
                                 keypair=my_key,
                                 private_key=private_key.decode("utf-8"),
                                 public_key=public_key.decode("utf-8"),
-                                encypted_files=encypted_files,
+                                encrypted_files=encrypted_files,
                                 docker_hub_digests=docker_hub_digests,
-                                debug=debug,
                             )
                         )
                         for executor_info in msg.executors

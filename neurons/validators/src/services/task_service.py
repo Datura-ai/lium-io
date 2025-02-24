@@ -456,9 +456,8 @@ class TaskService:
         keypair: bittensor.Keypair,
         private_key: str,
         public_key: str,
-        encypted_files: MinerJobEnryptedFiles,
+        encrypted_files: MinerJobEnryptedFiles,
         docker_hub_digests: dict[str, str],
-        debug: bool = False,
     ):
         default_extra = {
             "job_batch_id": miner_info.job_batch_id,
@@ -549,12 +548,12 @@ class TaskService:
                     await self.start_script(ssh_client, script_path, command_args, executor_info)
 
                 # upload temp directory
-                await self.upload_directory(ssh_client, encypted_files.tmp_directory, remote_dir)
+                await self.upload_directory(ssh_client, encrypted_files.tmp_directory, remote_dir)
 
                 remote_machine_scrape_file_path = (
-                    f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
+                    f"{remote_dir}/{encrypted_files.machine_scrape_file_name}"
                 )
-                remote_score_file_path = f"{remote_dir}/{encypted_files.score_file_name}"
+                remote_score_file_path = f"{remote_dir}/{encrypted_files.score_file_name}"
 
                 logger.info(
                     _m(
@@ -589,12 +588,12 @@ class TaskService:
 
                 machine_spec = json.loads(
                     self.ssh_service.decrypt_payload(
-                        encypted_files.encrypt_key, machine_specs[0].strip()
+                        encrypted_files.encrypt_key, machine_specs[0].strip()
                     )
                 )
 
                 # de-obfuscate machine_spec
-                all_keys = encypted_files.all_keys
+                all_keys = encrypted_files.all_keys
                 reverse_all_keys = {v: k for k, v in all_keys.items()}
 
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)

@@ -536,7 +536,7 @@ class Validator:
                     ),
                 )
 
-                encypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
+                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
 
                 task_info = {}
 
@@ -550,9 +550,8 @@ class Validator:
                                 miner_address=miner.axon_info.ip,
                                 miner_port=miner.axon_info.port,
                             ),
-                            encypted_files=encypted_files,
+                            encrypted_files=encrypted_files,
                             docker_hub_digests=docker_hub_digests,
-                            debug=settings.DEBUG,
                         )
                     )
                     for miner in miners
