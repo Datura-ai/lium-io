@@ -292,13 +292,22 @@ class DockerService:
                 log_text = "No port mappings found"
                 logger.error(log_text)
 
-                await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
-
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     msg=str(log_text),
                     error_code=FailedContainerErrorCodes.NoPortMappings,
+                )
+
+            if not payload.user_public_keys:
+                log_text = "No public keys"
+                logger.error(log_text)
+
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    msg=str(log_text),
+                    error_code=FailedContainerErrorCodes.NoSshKeys,
                 )
 
             # add executor in pending status dict
@@ -474,10 +483,12 @@ class DockerService:
 
                 container_name = f"container_{uuid}"
 
+                user_public_keys = payload.user_public_keys
+                public_key = user_public_keys.pop(0)
                 if payload.debug:
-                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
-                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{payload.user_public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
 
                 logger.info(
                     _m(
@@ -542,6 +553,11 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "container_name": container_name}),
                     ),
                 )
+
+                # add rest of public keys
+                for public_key in user_public_keys:
+                    command = f"/usr/bin/docker exec -i {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
+                    await ssh_client.run(command)
 
                 await self.finish_stream_logs()
 
@@ -774,34 +790,13 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                command = f"/usr/bin/docker exec -i {payload.container_name} sh -c 'echo \"{payload.user_public_key}\" >> ~/.ssh/authorized_keys'"
-                result = await ssh_client.run(command)
-                stderr = result.stderr
-                exit_status = result.exit_status
-
-                # Log or process the output
-                if exit_status == 0:
-                    logger.info(
-                        _m(
-                            "Added ssh key into Docker Container",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "container_name": payload.container_name
-                            }),
-                        ),
-                    )
-
-                    return SshPubKeyAdded(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                    )
-                else:
+                if not payload.user_public_keys:
                     log_text = _m(
-                        "ssh key Add error",
+                        "ssh key Add error: no public key",
                         extra=get_extra_info({
                             **default_extra,
                             "container_name": payload.container_name,
-                            "error": stderr
+                            "error": "No public keys",
                         }),
                     )
                     logger.error(log_text)
@@ -810,8 +805,27 @@ class DockerService:
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
                         msg=str(log_text),
-                        error_code=FailedContainerErrorCodes.UnknownError,
+                        error_code=FailedContainerErrorCodes.NoSshKeys,
                     )
+
+                for public_key in payload.user_public_keys:
+                    command = f"/usr/bin/docker exec -i {payload.container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
+                    await ssh_client.run(command)
+
+                logger.info(
+                    _m(
+                        "Added ssh key into Docker Container",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": payload.container_name
+                        }),
+                    ),
+                )
+
+                return SshPubKeyAdded(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                )
         except Exception as e:
             log_text = _m(
                 "Unknown Error add_ssh_key",

@@ -178,7 +178,7 @@ async def _create_container_to_miner(miner_hotkey: str, miner_address: str, mine
 
     payload = ContainerCreateRequest(
         docker_image=docker_image,
-        user_public_key="user_public_key",
+        user_public_keys=["user_public_key"],
         executor_id=executor_id,
         miner_hotkey=miner_hotkey,
         miner_address=miner_address,
@@ -210,7 +210,7 @@ async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: st
     )
     payload = ContainerCreateRequest(
         docker_image=docker_image,
-        user_public_key="user_public_key",
+        user_public_keys=["user_public_key"],
         executor_id=executor_id,
         miner_hotkey=miner_hotkey,
         miner_address=miner_address,
@@ -240,7 +240,7 @@ async def _add_sshkey_to_container(miner_hotkey: str, miner_address: str, miner_
         miner_address=miner_address,
         miner_port=miner_port,
         container_name=container_name,
-        user_public_key=user_public_key,
+        user_public_keys=[user_public_key],
     )
     response = await miner_service.handle_container(payload)
     print('response ==>', response)

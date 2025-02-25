@@ -66,7 +66,7 @@ class ContainerBaseRequest(BaseRequest):
 class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
-    user_public_key: str
+    user_public_keys: list[str] = []
     custom_options: CustomOptions | None = None
     debug: bool | None = None
 
@@ -79,7 +79,7 @@ class ContainerStartRequest(ContainerBaseRequest):
 class AddSshPublicKeyRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.AddSshPublicKey
     container_name: str
-    user_public_key: str
+    user_public_keys: list[str] = []
 
 
 class ContainerStopRequest(ContainerBaseRequest):
@@ -137,6 +137,7 @@ class SshPubKeyAdded(ContainerBaseResponse):
 
 class FailedContainerErrorCodes(enum.Enum):
     UnknownError = "UnknownError"
+    NoSshKeys = "NoSshKeys"
     ContainerNotRunning = "ContainerNotRunning"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
