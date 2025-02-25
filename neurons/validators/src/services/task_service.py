@@ -865,36 +865,6 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                is_high_end = self.validation_service.is_high_end_gpu(machine_spec)
-                if is_high_end:
-                    is_valid = await self.validation_service.validate_gpu_model_and_process_job(
-                        ssh_client=ssh_client,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        remote_dir=remote_dir,
-                        verifier_file_name=encypted_files.verifier_file_name,
-                        default_extra=default_extra,
-                        _run_task=self._run_task
-                    )
-
-                    if not is_valid:
-                        log_text = _m(
-                            "Verification failed",
-                            extra=get_extra_info(default_extra),
-                        )
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=None,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=True,
-                        )
 
                 # check rental failed
                 is_rental_failed = await self.redis_service.is_elem_exists_in_set(
@@ -1029,6 +999,37 @@ class TaskService:
                                 success=False,
                                 clear_verified_job_info=False,
                             )
+                        
+                        is_high_end = self.validation_service.is_high_end_gpu(machine_spec)
+                        if is_high_end:
+                            is_valid = await self.validation_service.validate_gpu_model_and_process_job(
+                                ssh_client=ssh_client,
+                                miner_info=miner_info,
+                                executor_info=executor_info,
+                                remote_dir=remote_dir,
+                                verifier_file_name=encypted_files.verifier_file_name,
+                                default_extra=default_extra,
+                                _run_task=self._run_task
+                            )
+
+                            if not is_valid:
+                                log_text = _m(
+                                    "GPU Verification failed",
+                                    extra=get_extra_info(default_extra),
+                                )
+                                return await self._handle_task_result(
+                                    ssh_client=ssh_client,
+                                    remote_dir=remote_dir,
+                                    miner_info=miner_info,
+                                    executor_info=executor_info,
+                                    spec=None,
+                                    score=0,
+                                    job_score=0,
+                                    log_text=log_text,
+                                    verified_job_info=verified_job_info,
+                                    success=False,
+                                    clear_verified_job_info=True,
+                                )
 
                         # if not rented, check docker digests
                         docker_digests = machine_spec.get("docker", {}).get("containers", [])
