@@ -157,6 +157,7 @@ class ValidationService:
         Returns:
             bool: is_data_center
         """
+        is_data_center = False
         if machine_spec.get("gpu", {}).get("count", 0) > 0:
             details = machine_spec["gpu"].get("details", [])
             if len(details) > 0:
@@ -166,10 +167,10 @@ class ValidationService:
                 
                 # Check if GPU model is in our data center list and verify memory capacity
                 for model, min_memory in DATA_CENTER_GPU_MODELS.items():
-                    if gpu_model in model and gpu_memory_gb >= min_memory - 2:
-                        return True
+                    if model in gpu_model and gpu_memory_gb >= min_memory - 2:
+                        is_data_center = True
                         
-        return False
+        return is_data_center
         
     async def validate_gpu_model_and_process_job(
         self,
