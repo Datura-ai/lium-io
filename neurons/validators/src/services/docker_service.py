@@ -774,20 +774,44 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                await ssh_client.run(f"/usr/bin/docker exec -it {payload.container_name} sh -c 'echo \"{payload.user_public_key}\" >> ~/.ssh/authorized_keys'")
-                logger.info(
-                    _m(
-                        "Started Docker Container",
-                        extra=get_extra_info(
-                            {**default_extra, "container_name": payload.container_name}
-                        ),
-                    ),
-                )
+                command = f"/usr/bin/docker exec -i {payload.container_name} sh -c 'echo \"{payload.user_public_key}\" >> ~/.ssh/authorized_keys'"
+                result = await ssh_client.run(command)
+                stderr = result.stderr
+                exit_status = result.exit_status
 
-                return SshPubKeyAdded(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                )
+                # Log or process the output
+                if exit_status == 0:
+                    logger.info(
+                        _m(
+                            "Added ssh key into Docker Container",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "container_name": payload.container_name
+                            }),
+                        ),
+                    )
+
+                    return SshPubKeyAdded(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                    )
+                else:
+                    log_text = _m(
+                        "ssh key Add error",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": payload.container_name,
+                            "error": stderr
+                        }),
+                    )
+                    logger.error(log_text)
+
+                    return FailedContainerRequest(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        msg=str(log_text),
+                        error_code=FailedContainerErrorCodes.UnknownError,
+                    )
         except Exception as e:
             log_text = _m(
                 "Unknown Error add_ssh_key",
