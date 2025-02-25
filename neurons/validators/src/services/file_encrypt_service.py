@@ -321,6 +321,8 @@ class FileEncryptService:
             os.fsync(score_file.fileno())
             score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
+        subprocess.run(["make", "-f", "../miner_jobs/Makefile"])
+
         verifier_origin_path = str(Path(__file__).parent / ".." / "miner_jobs/H100Verifier")
         verifier_file_name = tmp_directory / "H100Verifier"
         shutil.copy(verifier_origin_path, verifier_file_name)
