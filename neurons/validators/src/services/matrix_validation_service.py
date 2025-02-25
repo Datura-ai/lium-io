@@ -7,7 +7,7 @@ from typing import Self, Annotated, Callable
 from services.redis_service import RedisService
 from fastapi import Depends
 from core.utils import _m, get_extra_info
-from const import DATA_CENTER_GPU_MODELS
+from .const import DATA_CENTER_GPU_MODELS
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +166,7 @@ class ValidationService:
                 
                 # Check if GPU model is in our data center list and verify memory capacity
                 for model, min_memory in DATA_CENTER_GPU_MODELS.items():
-                    if model == gpu_model and gpu_memory_gb >= min_memory - 2:
+                    if gpu_model in model and gpu_memory_gb >= min_memory - 2:
                         return True
                         
         return False
