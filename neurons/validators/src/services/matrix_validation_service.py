@@ -3,7 +3,7 @@ import random
 import logging
 
 from dataclasses import dataclass
-from typing import Self, Any, Tuple, Annotated, Callable
+from typing import Self, Annotated, Callable
 from services.redis_service import RedisService
 from fastapi import Depends
 from core.utils import _m, get_extra_info
@@ -184,8 +184,6 @@ class ValidationService:
         executor_info,
         remote_dir: str,
         verifier_file_name: str,
-        verified_job_info: Any,
-        machine_spec: Any,
         default_extra: dict,
         _run_task: Callable
     ) -> bool:

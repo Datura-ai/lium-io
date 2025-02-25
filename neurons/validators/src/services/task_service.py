@@ -42,7 +42,7 @@ from services.redis_service import (
 )
 from services.ssh_service import SSHService
 from services.hash_service import HashService
-from services.matrix_validation_service import VerifierParams, H100Prover, ValidationService
+from services.matrix_validation_service import ValidationService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -873,8 +873,6 @@ class TaskService:
                         executor_info=executor_info,
                         remote_dir=remote_dir,
                         verifier_file_name=encypted_files.verifier_file_name,
-                        verified_job_info=verified_job_info,
-                        machine_spec=machine_spec,
                         default_extra=default_extra,
                         _run_task=self._run_task
                     )
