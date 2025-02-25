@@ -1000,8 +1000,8 @@ class TaskService:
                                 clear_verified_job_info=False,
                             )
                         
-                        is_high_end = self.validation_service.is_high_end_gpu(machine_spec)
-                        if is_high_end:
+                        is_data_center_gpu = self.validation_service.is_data_center_gpu(machine_spec)
+                        if is_data_center_gpu:
                             is_valid = await self.validation_service.validate_gpu_model_and_process_job(
                                 ssh_client=ssh_client,
                                 miner_info=miner_info,

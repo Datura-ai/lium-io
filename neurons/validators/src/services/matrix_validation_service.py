@@ -7,17 +7,10 @@ from typing import Self, Annotated, Callable
 from services.redis_service import RedisService
 from fastapi import Depends
 from core.utils import _m, get_extra_info
+from const import DATA_CENTER_GPU_MODELS
 
 logger = logging.getLogger(__name__)
 
-
-HIGH_END_GPU_MODELS = {
-    "NVIDIA A100": 40,  # 40GB or 80GB variants
-    "NVIDIA H100": 80,  # 80GB
-    "NVIDIA H200": 141, # 141GB
-    "NVIDIA A800": 80,  # 80GB - Chinese market version of A100
-    "NVIDIA H800": 80,  # 80GB - Chinese market version of H100
-}
 
 @dataclass
 class VerifierParams:
@@ -153,15 +146,16 @@ class ValidationService:
     ):
         self.redis_service = redis_service
 
-    def is_high_end_gpu(self, machine_spec: dict) -> bool:
+    def is_data_center_gpu(self, machine_spec: dict) -> bool:
         """
-        Check if machine has high-end GPUs (A100, H100, H200 or similar with >40GB memory)
-        
+        Check if machine has data center GPUs (A100, H100, H200 or similar with >40GB memory)
+        A data center GPU, or Graphics Processing Unit, is a specialized electronic circuit that speeds up tasks in data centers. 
+        GPUs are used to perform parallel processing, which is ideal for workloads that require simultaneous computations. 
         Args:
             machine_spec: Machine specification dictionary
             
         Returns:
-            tuple[bool, str, int]: (is_high_end, gpu_model, gpu_memory_gb)
+            bool: is_data_center
         """
         if machine_spec.get("gpu", {}).get("count", 0) > 0:
             details = machine_spec["gpu"].get("details", [])
@@ -170,9 +164,9 @@ class ValidationService:
                 gpu_memory = details[0].get("capacity", 0)  # Memory in MB
                 gpu_memory_gb = gpu_memory / 1024  # Convert to GB
                 
-                # Check if GPU model is in our high-end list and verify memory capacity
-                for model, min_memory in HIGH_END_GPU_MODELS.items():
-                    if model in gpu_model and gpu_memory_gb >= min_memory:
+                # Check if GPU model is in our data center list and verify memory capacity
+                for model, min_memory in DATA_CENTER_GPU_MODELS.items():
+                    if model == gpu_model and gpu_memory_gb >= min_memory - 2:
                         return True
                         
         return False
