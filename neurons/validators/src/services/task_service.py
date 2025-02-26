@@ -37,7 +37,7 @@ from services.redis_service import (
     RedisService,
     PENDING_PODS_SET,
     DUPLICATED_MACHINE_SET,
-    RENTAL_FAILED_MACHINE_SET,
+    RENTAL_SUCCEED_MACHINE_SET,
     AVAILABLE_PORT_MAPS_PREFIX,
 )
 from services.ssh_service import SSHService
@@ -456,9 +456,8 @@ class TaskService:
         keypair: bittensor.Keypair,
         private_key: str,
         public_key: str,
-        encypted_files: MinerJobEnryptedFiles,
+        encrypted_files: MinerJobEnryptedFiles,
         docker_hub_digests: dict[str, str],
-        debug: bool = False,
     ):
         default_extra = {
             "job_batch_id": miner_info.job_batch_id,
@@ -549,12 +548,12 @@ class TaskService:
                     await self.start_script(ssh_client, script_path, command_args, executor_info)
 
                 # upload temp directory
-                await self.upload_directory(ssh_client, encypted_files.tmp_directory, remote_dir)
+                await self.upload_directory(ssh_client, encrypted_files.tmp_directory, remote_dir)
 
                 remote_machine_scrape_file_path = (
-                    f"{remote_dir}/{encypted_files.machine_scrape_file_name}"
+                    f"{remote_dir}/{encrypted_files.machine_scrape_file_name}"
                 )
-                remote_score_file_path = f"{remote_dir}/{encypted_files.score_file_name}"
+                remote_score_file_path = f"{remote_dir}/{encrypted_files.score_file_name}"
 
                 logger.info(
                     _m(
@@ -589,12 +588,12 @@ class TaskService:
 
                 machine_spec = json.loads(
                     self.ssh_service.decrypt_payload(
-                        encypted_files.encrypt_key, machine_specs[0].strip()
+                        encrypted_files.encrypt_key, machine_specs[0].strip()
                     )
                 )
 
                 # de-obfuscate machine_spec
-                all_keys = encypted_files.all_keys
+                all_keys = encrypted_files.all_keys
                 reverse_all_keys = {v: k for k, v in all_keys.items()}
 
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
@@ -862,30 +861,6 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                # check rental failed
-                is_rental_failed = await self.redis_service.is_elem_exists_in_set(
-                    RENTAL_FAILED_MACHINE_SET, executor_info.uuid
-                )
-                if is_rental_failed:
-                    log_text = _m(
-                        f"Executor is reantal failed",
-                        extra=get_extra_info(default_extra),
-                    )
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=machine_spec,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
-                    )
-
                 # check rented status
                 rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info.uuid)
                 if rented_machine:
@@ -1124,16 +1099,12 @@ class TaskService:
                 #     logger.error(log_text)
 
                 else:
-                    verified_job_count = verified_job_info.get('count', 0)
-                    verified_job_count += 1
-
                     logger.info(
                         _m(
                             "Job taken time for executor",
                             extra=get_extra_info({
                                 **default_extra,
                                 "job_taken_time": job_taken_time,
-                                "verified_job_count": verified_job_count,
                             }),
                         ),
                     )
@@ -1161,7 +1132,15 @@ class TaskService:
                             + download_speed_score * DOWNLOAD_SPEED_WEIGHT
                         )
                     )
-                    actual_score = job_score if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT else 0
+
+                    actual_score = 0
+
+                    # check rental success
+                    is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
+                        RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
+                    )
+                    if is_rental_succeed:
+                        actual_score = job_score
 
                     log_text = _m(
                         "Train task finished",
@@ -1175,8 +1154,6 @@ class TaskService:
                                 "download_speed": download_speed,
                                 "gpu_model": gpu_model,
                                 "gpu_count": gpu_count,
-                                "verified_job_count": verified_job_count,
-                                "remaining_jobs_before_emission": 0 if verified_job_count >= VERIFY_JOB_REQUIRED_COUNT else VERIFY_JOB_REQUIRED_COUNT - verified_job_count,
                                 "unrented_multiplier": UNRENTED_MULTIPLIER,
                             }
                         ),
