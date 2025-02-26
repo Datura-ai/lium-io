@@ -162,7 +162,8 @@ class FileEncryptService:
 
         return file_name
 
-    def generate_random_name(self, length=10):
+    def generate_random_name(self):
+        length = random.randint(3, 15)
         return "_" + "".join(random.choices(string.ascii_letters, k=length))
 
     def generate_key_mappings(self):
@@ -244,13 +245,14 @@ class FileEncryptService:
             'each_container_id': "",
             'each_digest': "",
             'each_name': "",
+            'machine_specs': ""
         }
 
         # Generate dictionary key mapping on validator side
         for key, value in all_keys.items():
             all_keys[key] = self.generate_random_name()
 
-        encryption_key = ":".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
+        encryption_key = "".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
         return all_keys, encryption_key
 
     def ecrypt_miner_job_files(self):
