@@ -23,8 +23,8 @@ class VerifierParams:
     @classmethod
     def generate(cls) -> Self:
         # You can modify the range for more randomness or based on specific needs
-        dim_n = random.randint(1000, 2000)  # Random dim_n between 500 and 2000
-        dim_k = random.randint(100000, 200000)  # Random dim_k between 2000 and 4000
+        dim_n = random.randint(1900, 2000)  # Random dim_n between 500 and 2000
+        dim_k = random.randint(2000000, 2586932)  # Random dim_k between 2000 and 4000
         seed = int(time.time())
 
         return cls(dim_n=dim_n, dim_k=dim_k, seed=seed)
@@ -112,8 +112,8 @@ class H100Prover:
             dim_line = contents[0].strip()
             dimensions_str = dim_line.split("Dimension N: ")[1]
             DIM_N_str, DIM_K_str = dimensions_str.split(", K: ")
-            self.dim_n = int(DIM_N_str)
-            self.dim_k = int(DIM_K_str)
+            # self.dim_n = int(DIM_N_str)
+            # self.dim_k = int(DIM_K_str)
 
             # Read the matrix values
             self.matrix = [
@@ -213,7 +213,7 @@ class ValidationService:
             logger.warning(_m("No result from GPU model validation job", extra=get_extra_info(default_extra)))
             return False
         # Validate the verification result
-        prover = H100Prover(0, 0, verifier_params.seed)
+        prover = H100Prover(verifier_params.dim_n, verifier_params.dim_k, verifier_params.seed)
         prover.parse_validate_result_content(file_read_results)
         is_valid = prover.validate_verification_result()
         return is_valid
