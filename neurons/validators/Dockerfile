@@ -34,7 +34,7 @@ FROM $BASE_IMAGE AS secondary-image
 LABEL builder=false
 
 RUN apt-get update \
-  && apt-get install -y wget gcc ccache patchelf \
+  && apt-get install -y make wget gcc ccache patchelf \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
