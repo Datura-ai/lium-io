@@ -35,9 +35,9 @@ __device__ double lcgRandDevice(unsigned long long seed) {
     return rand_val;
 }
 
-__global__ void MatrixMultiply(double *A, double *B, double *C, int n, int k) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void MatrixMultiply(double *A, double *B, double *C, long n, long k) {
+    long row = blockIdx.y * blockDim.y + threadIdx.y;
+    long col = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Ensure within matrix bounds
     if (row < n && col < n) {
@@ -55,11 +55,15 @@ __global__ void MatrixMultiply(double *A, double *B, double *C, int n, int k) {
     }
 }
 
-__global__ void GenerateRandomMatrix(double* A, int n, int k, unsigned long long seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+__global__ void GenerateRandomMatrix(double* A, long n, long k, unsigned long long seed) {
+    // int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    long idx = blockIdx.y * blockDim.y + threadIdx.x;
+    long idy = blockIdx.x * blockDim.x + threadIdx.y;
 
-    int divider = 1;
+    // printf("blockDim.x: %d, blockDim.y: %d, blockIdx.x: %d , blockIdx.y: %d, threadIdx.x: %d, threadIdx.y: %d, Row: %d, Col: %d \n", 
+        // blockDim.x, blockDim.y,  blockIdx.x, blockIdx.y, threadIdx.x ,threadIdx.y, idx, idy);
+    long divider = 1;
 
     if (n > 100 || k > 100) {
         divider = 10;
@@ -110,7 +114,7 @@ std::string getCurrentDateTime() {
     return oss.str();
 }
 
-void writeToResultFile(int N, int K, long seed, float bandwidth, double *mulMatrix, const std::string& result_path) {
+void writeToResultFile(long N, long K, long seed, float bandwidth, double *mulMatrix, const std::string& result_path) {
     std::ofstream outFile(result_path);
 
     if (!outFile) {
@@ -121,8 +125,8 @@ void writeToResultFile(int N, int K, long seed, float bandwidth, double *mulMatr
     outFile << "Dimension N: " << N << ", K: " << K << std::endl;
 
     outFile << "Matrix:\n";
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j < N; ++j) {
+    for (long i = 0; i < N; ++i) {
+        for (long j = 0; j < N; ++j) {
             outFile << std::fixed << std::setprecision(2) << mulMatrix[i * N + j] << " ";  // 2 decimal precision
         }
         outFile << "\n";
@@ -174,7 +178,7 @@ int findAvailableGPU() {
 
 class H100Verifier {
 public:
-    H100Verifier(int m_dim_n, int m_dim_k) {
+    H100Verifier(long m_dim_n, long m_dim_k) {
         this->m_dim_n = m_dim_n;
         this->m_dim_k = m_dim_k;
         m_MulMatrix = new double[m_dim_n * m_dim_n];
@@ -212,21 +216,21 @@ public:
         m_bandWidth = (MEMORY_TEST_SIZE / (elapsedTime * 0.001)) * (1.0f / 1e9f);
     }
 
-    void printMatrixFromDevice(double* d_A, int n, int k) {
+    void printMatrixFromDevice(double* d_A, long n, long k) {
         // Allocate memory on the host to hold the matrix
         double* h_A = new double[n * k];
 
         // Copy the matrix from device to host
         cudaError_t err = cudaMemcpy(h_A, d_A, n * k * sizeof(double), cudaMemcpyDeviceToHost);
         if (err != cudaSuccess) {
-            std::cerr << "CUDA Error: " << cudaGetErrorString(err) << std::endl;
+            std::cerr << "printMatrixFromDevice Error: " << cudaGetErrorString(err) << std::endl;
             delete[] h_A;
             return;
         }
 
         // Print the matrix
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < k; j++) {
+        for (long i = 0; i < n; i++) {
+            for (long j = 0; j < k; j++) {
                 std::cout << std::fixed << std::setprecision(2) << h_A[i * k + j] << " ";  // Print with 2 decimal points
             }
             std::cout << std::endl;
@@ -236,12 +240,34 @@ public:
         delete[] h_A;
     }
 
-    void generateMatrix(double* matrix, int n, int k, unsigned long long seed) {
-        dim3 threadsPerBlock(16, 16); // 16x16 block of threads
-        dim3 numBlocks((n + threadsPerBlock.x - 1) / threadsPerBlock.x, (k + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    void generateMatrix(double* matrix, long n, long k, unsigned long long seed) {
+        dim3 threadsPerBlock(32, 32); // 1024 threads per block (32x32 block of threads)
 
+        long temp = n;
+        if (n > k) {
+            n = k;
+            k = temp;
+        }
+
+        std::cout << "n:" << n<< std::endl;
+        std::cout << "k:" << k << std::endl;
+
+        dim3 numBlocks((k + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                       (n + threadsPerBlock.y - 1) / threadsPerBlock.y);
+        
+        // numBlocks.x = min(numBlocks.x, 65535); // Ensure numBlocks.x does not exceed the max allowed
+        numBlocks.y = min(numBlocks.y, 65535); // Ensure numBlocks.y does not exceed the max allowed
+        
+        std::cout << "Num Block x:" <<  numBlocks.x << std::endl;
+        std::cout << "Num Block y:" <<  numBlocks.y << std::endl;
+        
         GenerateRandomMatrix<<<numBlocks, threadsPerBlock>>>(matrix, n, k, seed);
         cudaDeviceSynchronize();
+        
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::cerr << "generateMatrix CUDA Error in kernel launch: " << cudaGetErrorString(err) << std::endl;
+        }
     }
     
     int verifyChallenge(unsigned long long seed = 1234, const std::string& result_path = "validate_result.txt") {
@@ -253,13 +279,19 @@ public:
         // deviceId = 1;
         cudaSetDevice(deviceId); // Set the chosen GPU
 
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cout << "Free memory: " << free_mem / (1024 * 1024 * 1024) << " GB" << std::endl;
+        std::cout << "Total memory: " << total_mem / (1024 * 1024 * 1024) << " GB" << std::endl;
+
         // Allocate memory on device
+        std::cout << "Generating Matrix A" << std::endl;
         err = cudaMalloc(&d_A, m_dim_n * m_dim_k * sizeof(double));
         if (err != cudaSuccess) return handleCudaError(err);
-    
+        std::cout << "Generating Matrix B" << std::endl;
         err = cudaMalloc(&d_B, m_dim_k * m_dim_n * sizeof(double));
         if (err != cudaSuccess) return handleCudaError(err);
-    
+        std::cout << "Generating Matrix C" << std::endl;
         err = cudaMalloc(&d_C, m_dim_n * m_dim_n * sizeof(double));
         if (err != cudaSuccess) return handleCudaError(err);
     
@@ -280,15 +312,15 @@ public:
         if (err != cudaSuccess) return handleCudaError(err);
         
         // Launch kernel for matrix multiplication C = A * B
-        dim3 threadsPerBlock(16, 16);
+        dim3 threadsPerBlock(32, 32);
         dim3 numBlocks((m_dim_n + threadsPerBlock.x - 1) / threadsPerBlock.x, (m_dim_n + threadsPerBlock.y - 1) / threadsPerBlock.y);
-
+        std::cout << "Matrix multiply:" << std::endl;
         MatrixMultiply<<<numBlocks, threadsPerBlock>>>(d_A, d_B, d_C, m_dim_n, m_dim_k);
         // Check for errors during kernel launch
 
         cudaDeviceSynchronize();
-        // err = cudaGetLastError();
-        // if (err != cudaSuccess) return handleCudaError(err);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return handleCudaError(err);
     
         // Copy result matrix C back to the host
         err = cudaMemcpy(m_MulMatrix, d_C, m_dim_n * m_dim_n * sizeof(double), cudaMemcpyDeviceToHost);
@@ -337,9 +369,10 @@ public:
         long maxElements = maxMemory / elementSize;  // Max number of elements we can allocate
         
         // Let's assume square matrix for simplicity (n = m)
-        m_dim_k = maxElements / (2 * m_dim_n) - m_dim_n;
-        
-        std::cout << "Max matrix dimension (n = m): " << m_dim_n << " x " << m_dim_k << std::endl;
+        long max_m_dim_k = maxElements / (2 * m_dim_n) - m_dim_n;
+        // m_dim_k = max_m_dim_k;
+
+        std::cout << "Max matrix dimension (n = m): " << m_dim_n << " x " << max_m_dim_k << std::endl;
     
         // If you want to handle non-square matrices, you can change the logic accordingly.
         // For example, you could use a different approach to split the available memory into n and m.
@@ -354,8 +387,8 @@ public:
     }
 
 private:
-    int m_dim_n;
-    int m_dim_k;
+    long m_dim_n;
+    long m_dim_k;
     double* m_MulMatrix;
     unsigned long m_seed;
     float m_bandWidth = 0.0f;
@@ -369,7 +402,7 @@ private:
 
 class ArgumentParser {
 public:
-    static void parseArguments(int argc, char* argv[], int& dim_n, int& dim_k, unsigned long long& seed, std::string& result_path) {
+    static void parseArguments(int argc, char* argv[], long& dim_n, long& dim_k, unsigned long long& seed, std::string& result_path) {
         static struct option long_options[] = {
             {"dim_n", required_argument, 0, 'n'},
             {"dim_k", required_argument, 0, 'k'},
@@ -403,7 +436,7 @@ public:
 };
     
 int main(int argc, char* argv[]) {
-    int N = 500, K = 3100000;
+    long N = 1000, K = 5176864;
     unsigned long long seed = 234;
     std::string result_path = "validate_result.txt";
 
