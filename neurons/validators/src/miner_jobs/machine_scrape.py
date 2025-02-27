@@ -904,6 +904,6 @@ def _encrypt(key: str, payload: str) -> str:
 
 
 machine_specs = get_machine_specs()
-encryption_key = ":".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
+encryption_key = "".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
 encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
 print(encoded_str)

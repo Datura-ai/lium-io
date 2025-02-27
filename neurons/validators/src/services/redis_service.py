@@ -10,7 +10,7 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_SET = "pending_pods"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
-RENTAL_FAILED_MACHINE_SET = "rental_failed_machines"
+RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
@@ -176,8 +176,8 @@ class RedisService:
         data = {
             "count": count,
             "failed": failed,
-            "spec": spec if spec else prev_spec,
-            "uuids": uuids if uuids else prev_uuids,
+            "spec": prev_spec if prev_spec else spec,
+            "uuids": prev_uuids if prev_uuids else uuids,
         }
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
@@ -189,10 +189,13 @@ class RedisService:
         prev_info: dict = {}
     ):
         spec = prev_info.get('spec', '')
+        uuids = prev_info.get('uuids', '')
+
         data = {
             "count": 0,
             "failed": 0,
             "spec": spec,
+            "uuids": uuids,
         }
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 

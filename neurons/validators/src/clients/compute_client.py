@@ -40,7 +40,7 @@ from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
-    RENTAL_FAILED_MACHINE_SET,
+    RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
@@ -393,7 +393,7 @@ class ComputeClient:
                     extra=get_extra_info({
                         **self.logging_extra,
                         "executors": len(response.executors),
-                        "rental_failed_executors": len(response.rental_failed_executors) if response.rental_failed_executors else 0
+                        "rental_succeed_executors": len(response.rental_succeed_executors) if response.rental_succeed_executors else 0
                     }),
                 )
             )
@@ -411,12 +411,11 @@ class ComputeClient:
                     )
 
             # Reset rental failed machines
-            await redis_service.delete(RENTAL_FAILED_MACHINE_SET)
-
-            if response.rental_failed_executors:
-                for executor_uuid in response.rental_failed_executors:
+            await redis_service.delete(RENTAL_SUCCEED_MACHINE_SET)
+            if response.rental_succeed_executors:
+                for executor_uuid in response.rental_succeed_executors:
                     await redis_service.sadd(
-                        RENTAL_FAILED_MACHINE_SET, executor_uuid
+                        RENTAL_SUCCEED_MACHINE_SET, executor_uuid
                     )
 
             return
