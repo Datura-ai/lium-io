@@ -1145,7 +1145,7 @@ class TaskService:
                         actual_score = 0
 
                     log_text = _m(
-                        message="Train task finished" if is_rental_succeed else "Need to verify rental check",
+                        message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
                         extra=get_extra_info(
                             {
                                 **default_extra,
