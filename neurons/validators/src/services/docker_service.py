@@ -774,7 +774,7 @@ class DockerService:
 
         logger.info(
             _m(
-                "Restart Docker Container",
+                "Add ssh key to pod",
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
