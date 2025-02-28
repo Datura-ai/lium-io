@@ -22,8 +22,6 @@ from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.const import BURN_EMISSION
 
-from services.const import BURN_EMISSION
-
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
 
