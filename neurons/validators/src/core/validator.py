@@ -21,6 +21,8 @@ from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, Redi
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 
+from services.const import BURN_EMISSION
+
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
 
@@ -275,9 +277,9 @@ class Validator:
             for ind, miner in enumerate(miners):
                 uids[ind] = miner.uid
                 if miner.uid == 4:
-                    weights[ind] = 95
+                    weights[ind] = BURN_EMISSION
                 else:
-                    weights[ind] = 5 * self.miner_scores.get(miner.hotkey, 0.0) / total_score
+                    weights[ind] = (1 - BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
 
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
