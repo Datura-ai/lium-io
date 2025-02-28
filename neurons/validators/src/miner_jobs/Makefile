@@ -9,11 +9,7 @@ CUDA_MAJOR := $(shell echo $(CUDA_VERSION) | cut -d'.' -f1)
 CUDA_MINOR := $(shell echo $(CUDA_VERSION) | cut -d'.' -f2)
 
 # Set architecture based on CUDA version
-ifeq ($(shell expr $(CUDA_MAJOR) \>= 11), 1)
-    ARCH = -arch=sm_86
-else
-    ARCH = -arch=sm_75
-endif
+ARCH =-gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_120,code=sm_120
 
 # Add version-specific flags
 CFLAGS += -DCUDA_VERSION=$(CUDA_MAJOR)$(CUDA_MINOR)0
@@ -21,7 +17,7 @@ CFLAGS += -DCUDA_VERSION=$(CUDA_MAJOR)$(CUDA_MINOR)0
 all: H100Verifier
 
 H100Verifier: H100Verifier.cu
-	$(NVCC) $(CFLAGS) $^ $(LDFLAGS) -o $@ -DDEBUG
+	$(NVCC) $(CFLAGS) $^ $(LDFLAGS) $(ARCH) -o $@ -DDEBUG
 
 # Print CUDA information
 cuda-info:
