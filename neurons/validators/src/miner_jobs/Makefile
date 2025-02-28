@@ -7,6 +7,7 @@ LDFLAGS = -L$(CUDA_HOME)/lib64 -lcuda
 CUDA_VERSION := $(shell $(NVCC) --version | grep "release" | sed 's/.*release //' | sed 's/,.*//')
 CUDA_MAJOR := $(shell echo $(CUDA_VERSION) | cut -d'.' -f1)
 CUDA_MINOR := $(shell echo $(CUDA_VERSION) | cut -d'.' -f2)
+SOURCE_FILE := $(CURDIR)/src/miner_jobs/H100Verifier.cu
 
 # Set architecture based on CUDA version
 ARCH =-gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_120,code=sm_120
@@ -16,7 +17,7 @@ CFLAGS += -DCUDA_VERSION=$(CUDA_MAJOR)$(CUDA_MINOR)0
 
 all: H100Verifier
 
-H100Verifier: H100Verifier.cu
+H100Verifier: $(SOURCE_FILE)
 	$(NVCC) $(CFLAGS) $^ $(LDFLAGS) $(ARCH) -o $@ -DDEBUG
 
 # Print CUDA information
