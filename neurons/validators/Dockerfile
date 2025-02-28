@@ -34,7 +34,7 @@ FROM $BASE_IMAGE AS secondary-image
 LABEL builder=false
 
 RUN apt-get update \
-  && apt-get install -y make wget gcc ccache patchelf \
+  && apt-get install -y make wget gcc ccache patchelf g++ \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
@@ -55,4 +55,5 @@ COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 COPY --from=cuda-build /usr/local/cuda /usr/local/cuda
 
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1
 CMD ["bash", "run.sh"]
