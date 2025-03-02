@@ -10,11 +10,16 @@ import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     ContainerBaseRequest,
-    ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
+    AddSshPublicKeyRequest,
+    ContainerCreated,
+    ContainerStarted,
+    ContainerStopped,
+    SshPubKeyAdded,
+    ContainerDeleted,
     DuplicateExecutorsResponse,
     FailedContainerRequest,
 )
@@ -443,7 +448,8 @@ class ComputeClient:
         job_request: ContainerCreateRequest
         | ContainerDeleteRequest
         | ContainerStopRequest
-        | ContainerStartRequest,
+        | ContainerStartRequest
+        | AddSshPublicKeyRequest,
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -494,7 +500,7 @@ class ComputeClient:
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             response: (
-                ContainerDeleteRequest | FailedContainerRequest
+                ContainerDeleted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
@@ -510,7 +516,7 @@ class ComputeClient:
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             response: (
-                ContainerStopRequest | FailedContainerRequest
+                ContainerStopped | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
@@ -526,12 +532,28 @@ class ComputeClient:
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             response: (
-                ContainerStartRequest | FailedContainerRequest
+                ContainerStarted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
                 _m(
                     "Sending back started container info to compute app",
+                    extra=get_extra_info({**logging_extra, "response": str(response)}),
+                )
+            )
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, AddSshPublicKeyRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                SshPubKeyAdded | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back ssh key add result to compute app",
                     extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )

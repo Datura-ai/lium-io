@@ -578,7 +578,7 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         for i in range(c_count.value):
             # use an alternative struct for this object
             obj = nvmlStructToFriendlyObject(c_procs[i])
-            if (obj._fmt_usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value):
+            if hasattr(obj, '_fmt_usedGpuMemory') and (obj._fmt_usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value):
                 # special case for WDDM on Windows, see comment above
                 obj._fmt_usedGpuMemory = None
             procs.append(obj)
