@@ -20,7 +20,6 @@ from services.miner_service import MinerService
 from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
-
 from services.const import BURN_EMISSION
 
 if TYPE_CHECKING:

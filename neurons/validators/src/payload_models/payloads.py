@@ -51,6 +51,7 @@ class ContainerRequestType(enum.Enum):
     ContainerStartRequest = "ContainerStartRequest"
     ContainerStopRequest = "ContainerStopRequest"
     ContainerDeleteRequest = "ContainerDeleteRequest"
+    AddSshPublicKey = "AddSshPublicKey"
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
 
 
@@ -65,7 +66,7 @@ class ContainerBaseRequest(BaseRequest):
 class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
-    user_public_key: str
+    user_public_keys: list[str] = []
     custom_options: CustomOptions | None = None
     debug: bool | None = None
 
@@ -73,6 +74,12 @@ class ContainerCreateRequest(ContainerBaseRequest):
 class ContainerStartRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStartRequest
     container_name: str
+
+
+class AddSshPublicKeyRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.AddSshPublicKey
+    container_name: str
+    user_public_keys: list[str] = []
 
 
 class ContainerStopRequest(ContainerBaseRequest):
@@ -91,6 +98,7 @@ class ContainerResponseType(enum.Enum):
     ContainerStarted = "ContainerStarted"
     ContainerStopped = "ContainerStopped"
     ContainerDeleted = "ContainerDeleted"
+    SshPubKeyAdded = "SshPubKeyAdded"
     FailedRequest = "FailedRequest"
 
 
@@ -100,14 +108,11 @@ class ContainerBaseResponse(BaseRequest):
     executor_id: str
 
 
-class ContainerCreatedResult(BaseModel):
+class ContainerCreated(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
     container_name: str
     volume_name: str
     port_maps: list[tuple[int, int]]
-
-
-class ContainerCreated(ContainerBaseResponse, ContainerCreatedResult):
-    message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -126,8 +131,13 @@ class ContainerDeleted(ContainerBaseResponse):
     volume_name: str
 
 
+class SshPubKeyAdded(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
+
+
 class FailedContainerErrorCodes(enum.Enum):
     UnknownError = "UnknownError"
+    NoSshKeys = "NoSshKeys"
     ContainerNotRunning = "ContainerNotRunning"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
