@@ -981,7 +981,7 @@ class TaskService:
                                 miner_info=miner_info,
                                 executor_info=executor_info,
                                 remote_dir=remote_dir,
-                                verifier_file_name=encypted_files.verifier_file_name,
+                                verifier_file_name=encrypted_files.verifier_file_name,
                                 default_extra=default_extra,
                                 _run_task=self._run_task
                             )
