@@ -16,6 +16,7 @@ from services.file_encrypt_service import FileEncryptService
 from payload_models.payloads import (
     MinerJobRequestPayload,
     ContainerCreateRequest,
+    AddSshPublicKeyRequest,
     CustomOptions,
 )
 
@@ -148,7 +149,7 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
     file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
 
     docker_hub_digests = await docker_service.get_docker_hub_digests(REPOSITORIES)
-    encypted_files = file_encrypt_service.ecrypt_miner_job_files()
+    encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
 
     await miner_service.request_job_to_miner(
         MinerJobRequestPayload(
@@ -157,9 +158,10 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
             miner_address=miner_address,
             miner_port=miner_port,
         ),
-        encypted_files=encypted_files,
+        encrypted_files=encrypted_files,
         docker_hub_digests=docker_hub_digests,
     )
+
 
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
@@ -176,13 +178,15 @@ async def _create_container_to_miner(miner_hotkey: str, miner_address: str, mine
 
     payload = ContainerCreateRequest(
         docker_image=docker_image,
-        user_public_key="user_public_key",
+        user_public_keys=["user_public_key"],
         executor_id=executor_id,
         miner_hotkey=miner_hotkey,
         miner_address=miner_address,
         miner_port=miner_port,
     )
-    await miner_service.handle_container(payload)
+    response = await miner_service.handle_container(payload)
+    print('response ==>', response)
+
 
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
@@ -199,14 +203,14 @@ async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: st
     # mock custom options
     custom_options = CustomOptions(
         volumes=["/var/runer/docker.sock:/var/runer/docker.sock"],
-        environment={"UPDATED_PUBLIC_KEY":"user_public_key"},
+        environment={"UPDATED_PUBLIC_KEY": "user_public_key"},
         entrypoint="",
         internal_ports=[22, 8002],
         startup_commands="/bin/bash -c 'apt-get update && apt-get install -y ffmpeg && pip install opencv-python'",
     )
     payload = ContainerCreateRequest(
         docker_image=docker_image,
-        user_public_key="user_public_key",
+        user_public_keys=["user_public_key"],
         executor_id=executor_id,
         miner_hotkey=miner_hotkey,
         miner_address=miner_address,
@@ -214,6 +218,33 @@ async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: st
         custom_options=custom_options
     )
     await miner_service.handle_container(payload)
+
+
+@cli.command()
+@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
+@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
+@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
+@click.option("--executor_id", prompt="Executor Id", help="Executor Id")
+@click.option("--container_name", prompt="Container name", help="Docker container name")
+@click.option("--user_public_key", prompt="User Public key", help="public ssh key")
+def add_sshkey_to_container(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str, user_public_key: str):
+    asyncio.run(_add_sshkey_to_container(miner_hotkey, miner_address, miner_port, executor_id, container_name, user_public_key))
+
+
+async def _add_sshkey_to_container(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str, user_public_key: str):
+    miner_service: MinerService = ioc["MinerService"]
+
+    payload = AddSshPublicKeyRequest(
+        executor_id=executor_id,
+        miner_hotkey=miner_hotkey,
+        miner_address=miner_address,
+        miner_port=miner_port,
+        container_name=container_name,
+        user_public_keys=[user_public_key],
+    )
+    response = await miner_service.handle_container(payload)
+    print('response ==>', response)
+
 
 if __name__ == "__main__":
     cli()

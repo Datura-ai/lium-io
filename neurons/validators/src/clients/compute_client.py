@@ -5,17 +5,21 @@ from typing import NoReturn
 
 import bittensor
 import pydantic
-import redis.asyncio as aioredis
 import tenacity
 import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     ContainerBaseRequest,
-    ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
+    AddSshPublicKeyRequest,
+    ContainerCreated,
+    ContainerStarted,
+    ContainerStopped,
+    SshPubKeyAdded,
+    ContainerDeleted,
     DuplicateExecutorsResponse,
     FailedContainerRequest,
 )
@@ -36,7 +40,7 @@ from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
-    RENTAL_FAILED_MACHINE_SET,
+    RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
@@ -389,7 +393,7 @@ class ComputeClient:
                     extra=get_extra_info({
                         **self.logging_extra,
                         "executors": len(response.executors),
-                        "rental_failed_executors": len(response.rental_failed_executors) if response.rental_failed_executors else 0
+                        "rental_succeed_executors": len(response.rental_succeed_executors) if response.rental_succeed_executors else 0
                     }),
                 )
             )
@@ -407,12 +411,11 @@ class ComputeClient:
                     )
 
             # Reset rental failed machines
-            await redis_service.delete(RENTAL_FAILED_MACHINE_SET)
-
-            if response.rental_failed_executors:
-                for executor_uuid in response.rental_failed_executors:
+            await redis_service.delete(RENTAL_SUCCEED_MACHINE_SET)
+            if response.rental_succeed_executors:
+                for executor_uuid in response.rental_succeed_executors:
                     await redis_service.sadd(
-                        RENTAL_FAILED_MACHINE_SET, executor_uuid
+                        RENTAL_SUCCEED_MACHINE_SET, executor_uuid
                     )
 
             return
@@ -445,7 +448,8 @@ class ComputeClient:
         job_request: ContainerCreateRequest
         | ContainerDeleteRequest
         | ContainerStopRequest
-        | ContainerStartRequest,
+        | ContainerStartRequest
+        | AddSshPublicKeyRequest,
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -496,7 +500,7 @@ class ComputeClient:
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             response: (
-                ContainerDeleteRequest | FailedContainerRequest
+                ContainerDeleted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
@@ -512,7 +516,7 @@ class ComputeClient:
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             response: (
-                ContainerStopRequest | FailedContainerRequest
+                ContainerStopped | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
@@ -528,12 +532,28 @@ class ComputeClient:
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             response: (
-                ContainerStartRequest | FailedContainerRequest
+                ContainerStarted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
 
             logger.info(
                 _m(
                     "Sending back started container info to compute app",
+                    extra=get_extra_info({**logging_extra, "response": str(response)}),
+                )
+            )
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, AddSshPublicKeyRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                SshPubKeyAdded | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back ssh key add result to compute app",
                     extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )

@@ -15,14 +15,9 @@ from datura.requests.validator_requests import SSHPubKeyRemoveRequest, SSHPubKey
 from fastapi import Depends
 from payload_models.payloads import (
     ContainerBaseRequest,
-    ContainerCreated,
     ContainerCreateRequest,
-    ContainerDeleted,
     ContainerDeleteRequest,
-    ContainerStarted,
-    ContainerStartRequest,
-    ContainerStopped,
-    ContainerStopRequest,
+    AddSshPublicKeyRequest,
     FailedContainerErrorCodes,
     FailedContainerRequest,
     MinerJobEnryptedFiles,
@@ -57,9 +52,8 @@ class MinerService:
     async def request_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
-        encypted_files: MinerJobEnryptedFiles,
+        encrypted_files: MinerJobEnryptedFiles,
         docker_hub_digests: dict[str, str],
-        debug=False,
     ):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -129,9 +123,8 @@ class MinerService:
                                 keypair=my_key,
                                 private_key=private_key.decode("utf-8"),
                                 public_key=public_key.decode("utf-8"),
-                                encypted_files=encypted_files,
+                                encrypted_files=encrypted_files,
                                 docker_hub_digests=docker_hub_digests,
-                                debug=debug,
                             )
                         )
                         for executor_info in msg.executors
@@ -418,16 +411,7 @@ class MinerService:
                                 )
                             )
 
-                            if isinstance(result, FailedContainerRequest):
-                                return result
-
-                            return ContainerCreated(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                container_name=result.container_name,
-                                volume_name=result.volume_name,
-                                port_maps=result.port_maps,
-                            )
+                            return result
 
                         # elif isinstance(payload, ContainerStartRequest):
                         #     logger.info(
@@ -491,7 +475,7 @@ class MinerService:
                                     ),
                                 ),
                             )
-                            await docker_service.delete_container(
+                            result = await docker_service.delete_container(
                                 payload,
                                 executor,
                                 my_key,
@@ -512,12 +496,39 @@ class MinerService:
                                 )
                             )
 
-                            return ContainerDeleted(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                container_name=payload.container_name,
-                                volume_name=payload.volume_name,
+                            return result
+                        elif isinstance(payload, AddSshPublicKeyRequest):
+                            logger.info(
+                                _m(
+                                    "adding ssh key to container",
+                                    extra=get_extra_info(
+                                        {**default_extra, "payload": str(payload)}
+                                    ),
+                                ),
                             )
+                            result = await docker_service.add_ssh_key(
+                                payload,
+                                executor,
+                                my_key,
+                                private_key.decode("utf-8"),
+                            )
+
+                            logger.info(
+                                _m(
+                                    "Added ssh to the container",
+                                    extra=get_extra_info(
+                                        {**default_extra, "payload": str(payload)}
+                                    ),
+                                ),
+                            )
+
+                            await miner_client.send_model(
+                                SSHPubKeyRemoveRequest(
+                                    public_key=public_key, executor_id=payload.executor_id
+                                )
+                            )
+
+                            return result
                         else:
                             logger.error(
                                 _m(
@@ -527,6 +538,13 @@ class MinerService:
                                     ),
                                 ),
                             )
+
+                            await miner_client.send_model(
+                                SSHPubKeyRemoveRequest(
+                                    public_key=public_key, executor_id=payload.executor_id
+                                )
+                            )
+
                             return FailedContainerRequest(
                                 miner_hotkey=payload.miner_hotkey,
                                 executor_id=payload.executor_id,
@@ -541,6 +559,7 @@ class MinerService:
                                 extra=get_extra_info({**default_extra, "error": str(e)}),
                             ),
                         )
+
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key, executor_id=payload.executor_id
