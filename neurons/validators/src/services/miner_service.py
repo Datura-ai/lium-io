@@ -151,7 +151,7 @@ class MinerService:
                     )
 
                     total_score = 0
-                    for _, _, score, _, _, _, _, _ in results:
+                    for _, _, score, _, _, _, _ in results:
                         total_score += score
 
                     logger.info(
