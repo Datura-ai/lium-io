@@ -33,7 +33,7 @@ class VerifierParams:
 
 
 class H100Prover:
-    def __init__(self, dim_n, dim_k, seed):
+    def __init__(self, dim_n, dim_k, seed, default_extra: dict):
         """Initialize the prover with matrix dimensions and seed."""
         self.dim_n = dim_n
         self.dim_k = dim_k
@@ -43,6 +43,7 @@ class H100Prover:
         self.M = 9223372036854775807
         self.bandwidth = 0
         self.matrix = []
+        self.default_extra = default_extra
 
     def lcg_rand_host(self, seed):
         """Linear congruential generator to simulate random values."""
@@ -70,7 +71,7 @@ class H100Prover:
     def validate_verification_result(self):
         """Validate the verification result."""
 
-        logger.info(_m("Validation started", extra={}))
+        logger.info(_m("Validation started", extra=get_extra_info(self.default_extra)))
 
         start_time = time.time()
 
@@ -80,27 +81,27 @@ class H100Prover:
         col = random.randint(0, min_dim - 1)
         sum_val = round(self.matrix_mul(row, col), 2)
 
-        logger.info(_m(f"Multiplication value on validator = {sum_val}", extra={}))
-        logger.info(_m(f"Multiplication value from ssh client = {self.matrix[row * self.dim_n + col]}", extra={}))
+        logger.info(_m(f"Multiplication value on validator = {sum_val}", extra=get_extra_info(self.default_extra)))
+        logger.info(_m(f"Multiplication value from ssh client = {self.matrix[row * self.dim_n + col]}", extra=get_extra_info(self.default_extra)))
 
         end_time = time.time()
-        logger.info(_m(f"Matrix calculation time = {end_time - start_time} seconds", extra={}))
+        logger.info(_m(f"Matrix calculation time = {end_time - start_time} seconds", extra=get_extra_info(self.default_extra)))
 
         if abs(self.matrix[row * self.dim_n + col] - sum_val) < 0.001 * self.dim_n:
-            logger.info(_m("Verification Results matches", extra={}))
+            logger.info(_m("Verification Results matches", extra=get_extra_info(self.default_extra)))
         else:
-            logger.error(_m("Verification Failed. Result does not match", extra={}))
+            logger.error(_m("Verification Failed. Result does not match", extra=get_extra_info(self.default_extra)))
             return False
 
         BANDWIDTH_MIN = 1800.0
         BANDWIDTH_MAX = 2004.0
 
         if not (BANDWIDTH_MIN <= self.bandwidth <= BANDWIDTH_MAX):
-            logger.info(_m(f"ERROR: Memory bandwidth {self.bandwidth} GB/s outside expected range ({BANDWIDTH_MIN}-{BANDWIDTH_MAX} GB/s)", extra={}))
+            logger.info(_m(f"ERROR: Memory bandwidth {self.bandwidth} GB/s outside expected range ({BANDWIDTH_MIN}-{BANDWIDTH_MAX} GB/s)", extra=get_extra_info(self.default_extra)))
 
             return False
 
-        logger.info(_m("SUCCESS: Validate Passed", extra={}))
+        logger.info(_m("SUCCESS: Validate Passed", extra=get_extra_info(self.default_extra)))
 
         return True
 
@@ -117,7 +118,7 @@ class H100Prover:
             # Read the matrix values
             self.matrix = [
                 float(value)
-                for line in contents[2 : 2 + self.dim_n]
+                for line in contents[2: 2 + self.dim_n]
                 for value in line.split()
             ]
 
@@ -128,6 +129,7 @@ class H100Prover:
             self.bandwidth = bandwidth
 
             default_extra = {
+                **self.default_extra,
                 "dim_n": self.dim_n,
                 "dim_k": self.dim_k,
                 "bandwidth": bandwidth
@@ -146,7 +148,7 @@ class ValidationService:
         GPUs are used to perform parallel processing, which is ideal for workloads that require simultaneous computations. 
         Args:
             machine_spec: Machine specification dictionary
-            
+
         Returns:
             bool: is_data_center
         """
@@ -157,14 +159,14 @@ class ValidationService:
                 gpu_model = details[0].get("name", "")
                 gpu_memory = details[0].get("capacity", 0)  # Memory in MB
                 gpu_memory_gb = gpu_memory / 1024  # Convert to GB
-                
+
                 # Check if GPU model is in our data center list and verify memory capacity
                 for model, min_memory in DATA_CENTER_GPU_MODELS.items():
                     if model in gpu_model and gpu_memory_gb >= min_memory - 2:
                         is_data_center = True
-                        
+
         return is_data_center
-        
+
     async def validate_gpu_model_and_process_job(
         self,
         ssh_client,
@@ -206,7 +208,7 @@ class ValidationService:
             logger.warning(_m("No result from GPU model validation job", extra=get_extra_info(default_extra)))
             return False
         # Validate the verification result
-        prover = H100Prover(verifier_params.dim_n, verifier_params.dim_k, verifier_params.seed)
+        prover = H100Prover(verifier_params.dim_n, verifier_params.dim_k, verifier_params.seed, default_extra)
         prover.parse_validate_result_content(file_read_results)
         is_valid = prover.validate_verification_result()
         return is_valid
