@@ -17,9 +17,7 @@ async def initiate_services():
     ioc["FileEncryptService"] = FileEncryptService(
         ssh_service=ioc["SSHService"],
     )
-    ioc["ValidationService"] = ValidationService(
-        redis_service=ioc["RedisService"],
-    )
+    ioc["ValidationService"] = ValidationService()
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
         redis_service=ioc["RedisService"],

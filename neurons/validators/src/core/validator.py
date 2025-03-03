@@ -59,7 +59,7 @@ class Validator:
         ssh_service = SSHService()
         self.redis_service = RedisService()
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
-        self.validation_service = ValidationService(redis_service=self.redis_service)
+        self.validation_service = ValidationService()
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,

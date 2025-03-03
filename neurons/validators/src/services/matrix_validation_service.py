@@ -4,7 +4,6 @@ import logging
 
 from dataclasses import dataclass
 from typing import Self, Annotated, Callable
-from services.redis_service import RedisService
 from fastapi import Depends
 from core.utils import _m, get_extra_info
 from .const import DATA_CENTER_GPU_MODELS
@@ -140,12 +139,6 @@ class H100Prover:
 
 
 class ValidationService:
-    def __init__(
-        self,
-        redis_service: Annotated[RedisService, Depends(RedisService)],
-    ):
-        self.redis_service = redis_service
-
     def is_data_center_gpu(self, machine_spec: dict) -> bool:
         """
         Check if machine has data center GPUs (A100, H100, H200 or similar with >40GB memory)
