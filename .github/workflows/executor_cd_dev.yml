@@ -1,0 +1,32 @@
+name: "CD: executor (dev)"
+
+on:
+  push:
+    branches:
+      - 'dev_executor'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      TAG: "latest" 
+      DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make scripts executable
+        run: |
+          chmod +x neurons/executor/docker_publish.sh
+          chmod +x neurons/executor/docker_runner_publish.sh
+          
+      - name: Run docker_publish.sh
+        run: |
+          cd neurons/executor
+          ./docker_publish.sh
+          
+      - name: Run docker_runner_publish.sh
+        run: |
+          cd neurons/executor
+          ./docker_runner_publish.sh
