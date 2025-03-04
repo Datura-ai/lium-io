@@ -235,6 +235,7 @@ class MinerService:
                         "executor_uuid": ssh_info.uuid,
                         "executor_ip": ssh_info.address,
                         "executor_port": ssh_info.port,
+                        "executor_price": ssh_info.price,
                         "score": score,
                         "synthetic_job_score": synthetic_job_score,
                         "job_batch_id": job_batch_id,
