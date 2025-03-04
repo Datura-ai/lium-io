@@ -1,16 +1,16 @@
-name: "CD: executor (prod)"
+name: "CD: executor (dev)"
 
 on:
   push:
     branches:
-      - 'prod_executor'
+      - 'dev_executor'
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      TAG: "latest" 
-      TARGET_FILE: "docker-compose.app.yml"
+      TAG: "dev" 
+      TARGET_FILE: "docker-compose.app.dev.yml"
       DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 

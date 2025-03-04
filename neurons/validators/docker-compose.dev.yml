@@ -1,0 +1,19 @@
+version: '3.7'
+
+services:
+  validator-runner:
+    image: daturaai/compute-subnet-validator-runner:dev
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
+      - ./.env:/root/validator/.env
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 60 --cleanup --label-enable
