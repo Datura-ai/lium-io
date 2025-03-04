@@ -1,0 +1,10 @@
+FROM docker:26-cli
+WORKDIR /root/executor
+
+COPY docker-compose.app.dev.yml docker-compose.dev.yml
+COPY entrypoint.sh /entrypoint.sh
+COPY version.txt .
+
+RUN chmod u+x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

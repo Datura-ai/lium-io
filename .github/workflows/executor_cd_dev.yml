@@ -9,7 +9,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      TAG: "latest" 
+      TAG: "dev" 
       DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 
@@ -19,14 +19,14 @@ jobs:
       - name: Make scripts executable
         run: |
           chmod +x neurons/executor/docker_publish.sh
-          chmod +x neurons/executor/docker_runner_publish.sh
+          chmod +x neurons/executor/docker_runner_publish_dev.sh
           
       - name: Run docker_publish.sh
         run: |
           cd neurons/executor
           ./docker_publish.sh
           
-      - name: Run docker_runner_publish.sh
+      - name: Run docker_runner_publish_dev.sh
         run: |
           cd neurons/executor
-          ./docker_runner_publish.sh
+          ./docker_runner_publish_dev.sh
