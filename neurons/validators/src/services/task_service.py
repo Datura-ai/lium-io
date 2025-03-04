@@ -42,6 +42,7 @@ from services.redis_service import (
 )
 from services.ssh_service import SSHService
 from services.hash_service import HashService
+from services.matrix_validation_service import ValidationService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -54,9 +55,11 @@ class TaskService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        validation_service: Annotated[ValidationService, Depends(ValidationService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.validation_service = validation_service
         self.wallet = settings.get_bittensor_wallet()
 
     async def upload_directory(
@@ -987,6 +990,37 @@ class TaskService:
                                 success=False,
                                 clear_verified_job_info=False,
                             )
+                        
+                        is_data_center_gpu = self.validation_service.is_data_center_gpu(machine_spec)
+                        if is_data_center_gpu:
+                            is_valid = await self.validation_service.validate_gpu_model_and_process_job(
+                                ssh_client=ssh_client,
+                                miner_info=miner_info,
+                                executor_info=executor_info,
+                                remote_dir=remote_dir,
+                                verifier_file_name=encrypted_files.verifier_file_name,
+                                default_extra=default_extra,
+                                _run_task=self._run_task
+                            )
+
+                            if not is_valid:
+                                log_text = _m(
+                                    "GPU Verification failed",
+                                    extra=get_extra_info(default_extra),
+                                )
+                                return await self._handle_task_result(
+                                    ssh_client=ssh_client,
+                                    remote_dir=remote_dir,
+                                    miner_info=miner_info,
+                                    executor_info=executor_info,
+                                    spec=None,
+                                    score=0,
+                                    job_score=0,
+                                    log_text=log_text,
+                                    verified_job_info=verified_job_info,
+                                    success=False,
+                                    clear_verified_job_info=True,
+                                )
 
                         # if not rented, check docker digests
                         docker_digests = machine_spec.get("docker", {}).get("containers", [])
