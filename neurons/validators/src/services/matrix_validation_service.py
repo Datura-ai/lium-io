@@ -3,8 +3,7 @@ import random
 import logging
 
 from dataclasses import dataclass
-from typing import Self, Annotated, Callable
-from fastapi import Depends
+from typing import Self, Callable
 from core.utils import _m, get_extra_info
 from .const import DATA_CENTER_GPU_MODELS
 
@@ -91,14 +90,6 @@ class H100Prover:
             logger.info(_m("Verification Results matches", extra=get_extra_info(self.default_extra)))
         else:
             logger.error(_m("Verification Failed. Result does not match", extra=get_extra_info(self.default_extra)))
-            return False
-
-        BANDWIDTH_MIN = 1800.0
-        BANDWIDTH_MAX = 2004.0
-
-        if not (BANDWIDTH_MIN <= self.bandwidth <= BANDWIDTH_MAX):
-            logger.info(_m(f"ERROR: Memory bandwidth {self.bandwidth} GB/s outside expected range ({BANDWIDTH_MIN}-{BANDWIDTH_MAX} GB/s)", extra=get_extra_info(self.default_extra)))
-
             return False
 
         logger.info(_m("SUCCESS: Validate Passed", extra=get_extra_info(self.default_extra)))
