@@ -20,6 +20,7 @@ from services.miner_service import MinerService
 from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.matrix_validation_service import ValidationService
 from services.const import BURN_EMISSION
 
 if TYPE_CHECKING:
@@ -58,9 +59,11 @@ class Validator:
         ssh_service = SSHService()
         self.redis_service = RedisService()
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
+        self.validation_service = ValidationService()
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
+            validation_service=self.validation_service
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,

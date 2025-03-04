@@ -54,6 +54,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     executor_uuid: str
     executor_ip: str
     executor_port: int
+    executor_price: float | None = None
     specs: dict | None
     score: float | None
     synthetic_job_score: float | None
