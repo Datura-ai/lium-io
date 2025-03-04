@@ -42,6 +42,7 @@ from services.redis_service import (
 )
 from services.ssh_service import SSHService
 from services.hash_service import HashService
+from services.matrix_validation_service import ValidationService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -54,9 +55,11 @@ class TaskService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        validation_service: Annotated[ValidationService, Depends(ValidationService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.validation_service = validation_service
         self.wallet = settings.get_bittensor_wallet()
 
     async def upload_directory(
@@ -896,10 +899,27 @@ class TaskService:
                             clear_verified_job_info=True,
                         )
 
+                    # In backend, there are 2 scores. actual score and job score. 
+                    # job score is the score which executor gets when hashcat/matrix multiply is finished.
+                    # actual score is the score which executor gets for incentive
+                    # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check. 
+                    # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and max_score * gpu_count for job score, because if both scores are 0, executor will be flagged as invalid in backend.
                     score = max_score * gpu_count
+                    job_score = 0
+                    log_msg = "Executor is already rented."
+
+                    # check rental success
+                    is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
+                        RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
+                    )
+                    if not is_rental_succeed:
+                        score = 0
+                        job_score = max_score * gpu_count
+                        log_msg = "Executor is rented but in progress of rental check. This can be finished in an hour or so."
+
                     log_text = _m(
-                        "Executor is already rented.",
-                        extra=get_extra_info({**default_extra, "score": score}),
+                        log_msg,
+                        extra=get_extra_info({**default_extra, "score": score, "is_rental_succeed": is_rental_succeed}),
                     )
 
                     return await self._handle_task_result(
@@ -909,7 +929,7 @@ class TaskService:
                         executor_info=executor_info,
                         spec=machine_spec,
                         score=score,
-                        job_score=0,
+                        job_score=job_score,
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=True,
@@ -970,6 +990,37 @@ class TaskService:
                                 success=False,
                                 clear_verified_job_info=False,
                             )
+                        
+                        is_data_center_gpu = self.validation_service.is_data_center_gpu(machine_spec)
+                        if is_data_center_gpu:
+                            is_valid = await self.validation_service.validate_gpu_model_and_process_job(
+                                ssh_client=ssh_client,
+                                miner_info=miner_info,
+                                executor_info=executor_info,
+                                remote_dir=remote_dir,
+                                verifier_file_name=encrypted_files.verifier_file_name,
+                                default_extra=default_extra,
+                                _run_task=self._run_task
+                            )
+
+                            if not is_valid:
+                                log_text = _m(
+                                    "GPU Verification failed",
+                                    extra=get_extra_info(default_extra),
+                                )
+                                return await self._handle_task_result(
+                                    ssh_client=ssh_client,
+                                    remote_dir=remote_dir,
+                                    miner_info=miner_info,
+                                    executor_info=executor_info,
+                                    spec=None,
+                                    score=0,
+                                    job_score=0,
+                                    log_text=log_text,
+                                    verified_job_info=verified_job_info,
+                                    success=False,
+                                    clear_verified_job_info=True,
+                                )
 
                         # if not rented, check docker digests
                         docker_digests = machine_spec.get("docker", {}).get("containers", [])
