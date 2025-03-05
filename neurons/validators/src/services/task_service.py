@@ -993,26 +993,10 @@ class TaskService:
                     # if not rented, check docker digests
                     docker_digests = machine_spec.get("docker", {}).get("containers", [])
                     is_docker_valid = self.validate_docker_image_digests(docker_digests, docker_hub_digests)
-                    if not is_docker_valid:
-                        log_text = _m(
-                            "Docker digests are not valid",
-                            extra=get_extra_info(
-                                {**default_extra, "docker_digests": docker_digests}
-                            ),
-                        )
-
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
+                    if not is_docker_valid:          
+                        return await self.handle_task_failure(
+                            ssh_client, remote_dir, miner_info, executor_info, machine_spec, 
+                            "Docker digests are not valid", verified_job_info, {**default_extra, "docker_digests": docker_digests}, True
                         )
                     
                 is_data_center_gpu = self.validation_service.is_data_center_gpu(machine_spec)
@@ -1028,46 +1012,17 @@ class TaskService:
                     )
 
                     if not is_valid:
-                        log_text = _m(
-                            "GPU Verification failed",
-                            extra=get_extra_info(default_extra),
-                        )
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=True,
+                        return await self.handle_task_failure(
+                            ssh_client, remote_dir, miner_info, executor_info, machine_spec, "GPU Verification failed", verified_job_info, default_extra, True
                         )
                 else:
                     # scoring
                     hashcat_config = HASHCAT_CONFIGS[gpu_model]
                     if not hashcat_config:
-                        log_text = _m(
-                            "No config for hashcat",
-                            extra=get_extra_info(default_extra),
+                        return await self.handle_task_failure(
+                            ssh_client, remote_dir, miner_info, executor_info, machine_spec, "No config for hashcat", verified_job_info, default_extra, False
                         )
-
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-
+                    
                     num_digits = hashcat_config.get("digits", 11)
                     avg_job_time = (
                         hashcat_config.get("average_time")[gpu_count - 1 if gpu_count <= 8 else 7]
@@ -1101,25 +1056,10 @@ class TaskService:
                     )
 
                     if err is not None:
-                        log_text = _m(
-                            f"Error executing task on executor: {err}",
-                            extra=get_extra_info(default_extra),
+                        return await self.handle_task_failure(
+                            ssh_client, remote_dir, miner_info, executor_info, machine_spec, f"Error executing task on executor: {err}", verified_job_info, default_extra, False
                         )
-
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-
+                    
                     elif answer != hash_service.answer:
                         log_text = _m(
                             "Hashcat incorrect Answer",
@@ -1140,50 +1080,12 @@ class TaskService:
                             clear_verified_job_info=False,
                         )
 
-                    logger.info(
-                        _m(
-                            "Job taken time for executor",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "job_taken_time": job_taken_time,
-                            }),
-                        ),
+                    job_score, upload_speed, download_speed = self.calc_hashcat_job_score(
+                        machine_spec, gpu_count, avg_job_time, job_taken_time, max_score
                     )
-
-                    upload_speed = machine_spec.get("network", {}).get("upload_speed", 0)
-                    download_speed = machine_spec.get("network", {}).get("download_speed", 0)
-
-                    # Ensure upload_speed and download_speed are not None
-                    upload_speed = upload_speed if upload_speed is not None else 0
-                    download_speed = download_speed if download_speed is not None else 0
-
-                    job_taken_score = (
-                        min(avg_job_time * 0.7 / job_taken_time, 1) if job_taken_time > 0 else 0
-                    )
-                    upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
-                    download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
-
-                    job_score = (
-                        max_score
-                        * gpu_count
-                        * UNRENTED_MULTIPLIER
-                        * (
-                            job_taken_score * JOB_TAKEN_TIME_WEIGHT
-                            + upload_speed_score * UPLOAD_SPEED_WEIGHT
-                            + download_speed_score * DOWNLOAD_SPEED_WEIGHT
-                        )
-                    )
-
-                    actual_score = 0
-
-                    # check rental success
-                    is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
+                    actual_score = job_score if await self.redis_service.is_elem_exists_in_set(
                         RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
-                    )
-                    if is_rental_succeed:
-                        actual_score = job_score
-                    else:
-                        actual_score = 0
+                    ) else 0
 
                     log_text = _m(
                         message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
@@ -1330,5 +1232,52 @@ class TaskService:
                 updated_dict[original_key] = value
         return updated_dict
 
+    def calc_hashcat_job_score(self, machine_spec, gpu_count, avg_job_time, job_taken_time, max_score):
+        """Calculates the job score based on execution time and network speeds."""
+        upload_speed = machine_spec.get("network", {}).get("upload_speed", 0) or 0
+        download_speed = machine_spec.get("network", {}).get("download_speed", 0) or 0
+        
+        job_taken_score = min(avg_job_time * 0.7 / job_taken_time, 1) if job_taken_time > 0 else 0
+        upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
+        download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
+
+        job_score = (
+            max_score
+            * gpu_count
+            * UNRENTED_MULTIPLIER
+            * (
+                job_taken_score * JOB_TAKEN_TIME_WEIGHT
+                + upload_speed_score * UPLOAD_SPEED_WEIGHT
+                + download_speed_score * DOWNLOAD_SPEED_WEIGHT
+            )
+        )
+
+        return job_score, upload_speed, download_speed
+    
+
+    async def handle_task_failure(
+        self, 
+        ssh_client, remote_dir, miner_info, executor_info, machine_spec, 
+        log_message, verified_job_info, default_extra, clear_verified_job_info=False
+    ):
+        """Handles task failure with a consistent structure."""
+        log_text = _m(
+            log_message,
+            extra=get_extra_info(default_extra)
+        )
+        
+        return await self._handle_task_result(
+            ssh_client=ssh_client,
+            remote_dir=remote_dir,
+            miner_info=miner_info,
+            executor_info=executor_info,
+            spec=machine_spec,
+            score=0,
+            job_score=0,
+            log_text=log_text,
+            verified_job_info=verified_job_info,
+            success=False,
+            clear_verified_job_info=clear_verified_job_info,
+        )
 
 TaskServiceDep = Annotated[TaskService, Depends(TaskService)]
