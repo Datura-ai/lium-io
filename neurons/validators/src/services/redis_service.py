@@ -199,10 +199,6 @@ class RedisService:
         }
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
-        # remove available port maps for the executor
-        port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
-        await self.delete(port_map_key)
-
         await self.publish(
             RESET_VERIFIED_JOB_CHANNEL,
             {

@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG: "latest" 
+      TARGET_FILE: "docker-compose.app.yml"
       DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 
