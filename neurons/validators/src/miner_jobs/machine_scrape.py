@@ -578,9 +578,9 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         for i in range(c_count.value):
             # use an alternative struct for this object
             obj = nvmlStructToFriendlyObject(c_procs[i])
-            if hasattr(obj, '_fmt_usedGpuMemory') and (obj._fmt_usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value):
+            if obj.c_nvmlProcessInfo_v2_t_usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value:
                 # special case for WDDM on Windows, see comment above
-                obj._fmt_usedGpuMemory = None
+                obj.c_nvmlProcessInfo_v2_t_usedGpuMemory = None
             procs.append(obj)
         return procs
     else:
@@ -806,7 +806,7 @@ def get_machine_specs():
 
             # Collect process IDs
             for proc in processes:
-                gpu_process_ids.add(proc.pid)
+                gpu_process_ids.add(proc.c_nvmlProcessInfo_v2_t_pid)
 
         nvmlShutdown()
     except Exception as exc:
