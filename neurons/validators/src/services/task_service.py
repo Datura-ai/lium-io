@@ -1130,6 +1130,7 @@ class TaskService:
                             "acutal_score": actual_score,
                             "gpu_model": gpu_model,
                             "gpu_count": gpu_count,
+                            "is_rental_succeed": is_rental_succeed,
                             "unrented_multiplier": UNRENTED_MULTIPLIER,
                         }
                     ),
