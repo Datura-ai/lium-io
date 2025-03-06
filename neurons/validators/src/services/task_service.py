@@ -1068,17 +1068,6 @@ class TaskService:
                         executor_info=executor_info,
                         command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path} '{hash_service.payload}'",
                     )
-
-                    result = json.loads(results[0])
-                    answer = result["answer"]
-
-                    logger.info(
-                        _m(
-                            f"Results from training job task: {str(result)}",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
-
                     if err is not None:
                         log_text = _m(
                             f"Error executing task on executor: {err}",
@@ -1098,7 +1087,17 @@ class TaskService:
                             clear_verified_job_info=False,
                         )
 
-                    elif answer != hash_service.answer:
+                    result = json.loads(results[0])
+                    answer = result["answer"]
+
+                    logger.info(
+                        _m(
+                            f"Results from training job task: {str(result)}",
+                            extra=get_extra_info(default_extra),
+                        ),
+                    )
+
+                    if answer != hash_service.answer:
                         log_text = _m(
                             "Hashcat incorrect Answer",
                             extra=get_extra_info({**default_extra, "answer": answer, "hash_service_answer": hash_service.answer}),
@@ -1233,7 +1232,11 @@ class TaskService:
 
             if len(results) == 0 and len(actual_errors) > 0:
                 logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "errors": actual_errors})))
-                raise Exception("Failed to execute command!")
+                return None, str(actual_errors)
+
+            if len(results) == 0:
+                logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "error": "No results"})))
+                return None, "No results"
 
             return results, None
         except Exception as e:
