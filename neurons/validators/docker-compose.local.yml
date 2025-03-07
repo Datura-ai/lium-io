@@ -14,8 +14,7 @@ services:
       - ${POSTGRES_PORT}:5432
 
   redis:
-    image: redis:6-alpine
-    command: redis-server --appendonly yes
+    image: daturaai/redis:7.4.2
     healthcheck:
       test: redis-cli ping
     volumes:
