@@ -3,6 +3,8 @@ import contextvars
 import json
 import logging
 from logging.config import dictConfig  # noqa
+from tenacity import retry, stop_after_attempt, wait_fixed
+import asyncssh
 
 from core.config import settings
 
@@ -172,3 +174,19 @@ class StructuredMessage:
 
 
 _m = StructuredMessage
+
+
+async def retry_ssh_command(
+    ssh_client: asyncssh.SSHClientConnection,
+    command: str,
+    tag: str,
+    max_attempts: int = 5,
+    wait_seconds: int = 10,
+):
+    @retry(stop=stop_after_attempt(max_attempts), wait=wait_fixed(wait_seconds))
+    async def execute_command():
+        result = await ssh_client.run(command)
+        if result.exit_status != 0:
+            raise Exception(f"[{tag}] command: {command} exit_code {result.exit_status}, stderr: {result.stderr.strip()}")
+
+    await execute_command()
