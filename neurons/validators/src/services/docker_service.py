@@ -472,25 +472,8 @@ class DockerService:
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
-                    log_text = _m(
-                        "Run docker run command but container is not running",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "container_name": container_name,
-                        }),
-                    )
-                    logger.error(log_text)
-
-                    await self.finish_stream_logs()
                     await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
-                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
-
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        msg=str(log_text),
-                        error_code=FailedContainerErrorCodes.ContainerNotRunning,
-                    )
+                    raise Exception("Run docker run command but container is not running")
 
                 logger.info(
                     _m(
@@ -760,7 +743,7 @@ class DockerService:
 
                 for public_key in payload.user_public_keys:
                     command = f"/usr/bin/docker exec -i {payload.container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
-                    await ssh_client.run(command)
+                    await retry_ssh_command(ssh_client, command, "add_ssh_key", 3, 5)
 
                 logger.info(
                     _m(
@@ -778,7 +761,7 @@ class DockerService:
                 )
         except Exception as e:
             log_text = _m(
-                "Unknown Error add_ssh_key",
+                "Failed add_ssh_key",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
             logger.error(log_text, exc_info=True)
