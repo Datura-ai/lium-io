@@ -25,7 +25,7 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
-from core.utils import _m, get_extra_info
+from core.utils import _m, get_extra_info, retry_ssh_command
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
@@ -233,17 +233,16 @@ class DockerService:
                     "Cleaning existing docker containers",
                     extra=get_extra_info({
                         **default_extra,
-                        "command": command,
                         "ids": ids,
                     }),
                 ),
             )
 
             command = f'/usr/bin/docker rm {ids} -f'
-            await ssh_client.run(command)
+            await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
 
             command = f'/usr/bin/docker volume prune -af'
-            await ssh_client.run(command)
+            await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
 
     async def clear_verified_job_count(self, miner_hotkey: str, executor_id: str):
         await self.redis_service.remove_pending_pod(miner_hotkey, executor_id)
@@ -357,24 +356,7 @@ class DockerService:
                     log_tag=log_tag,
                 )
                 if not status:
-                    log_text = _m(
-                        "Docker pull failed",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "error": error,
-                        }),
-                    )
-                    logger.error(log_text)
-
-                    await self.finish_stream_logs()
-                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
-
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        msg=str(log_text),
-                        error_code=FailedContainerErrorCodes.UnknownError,
-                    )
+                    raise Exception(f"Docker pull failed. error: {error}")
 
                 port_flags = " ".join(
                     [
@@ -444,25 +426,7 @@ class DockerService:
                     ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=10
                 )
                 if not status:
-                    log_text = _m(
-                        "Docker volume creation failed",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "error": error
-                        }),
-                    )
-                    logger.error(log_text)
-
-                    await self.finish_stream_logs()
-                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
-                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
-
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        msg=str(log_text),
-                        error_code=FailedContainerErrorCodes.UnknownError,
-                    )
+                    raise Exception(f"Docker volume creation failed. error: {error}")
 
                 logger.info(
                     _m(
@@ -504,48 +468,12 @@ class DockerService:
                     ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=30
                 )
                 if not status:
-                    log_text = _m(
-                        "Docker container creation failed",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "command": command,
-                            "error": error,
-                        }),
-                    )
-                    logger.error(log_text)
-
-                    await self.finish_stream_logs()
-                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
-                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
-
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        msg=str(log_text),
-                        error_code=FailedContainerErrorCodes.UnknownError,
-                    )
+                    raise Exception(f"Docker run command failed. error: {error}")
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
-                    log_text = _m(
-                        "Run docker run command but container is not running",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "container_name": container_name,
-                        }),
-                    )
-                    logger.error(log_text)
-
-                    await self.finish_stream_logs()
                     await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
-                    await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
-
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        msg=str(log_text),
-                        error_code=FailedContainerErrorCodes.ContainerNotRunning,
-                    )
+                    raise Exception("Run docker run command but container is not running")
 
                 logger.info(
                     _m(
@@ -581,7 +509,7 @@ class DockerService:
                 )
         except Exception as e:
             log_text = _m(
-                "Unknown Error create_container",
+                "Failed create_container",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
             logger.error(log_text, exc_info=True)
@@ -717,9 +645,14 @@ class DockerService:
                 known_hosts=None,
             ) as ssh_client:
                 # await ssh_client.run(f"docker stop {payload.container_name}")
-                await ssh_client.run(f"/usr/bin/docker rm {payload.container_name} -f")
-                await ssh_client.run(f"/usr/bin/docker volume rm {payload.volume_name} -f")
-                await ssh_client.run(f"/usr/bin/docker image prune -af")
+                command = f"/usr/bin/docker rm {payload.container_name} -f"
+                await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+
+                command = f"/usr/bin/docker volume rm {payload.volume_name} -f"
+                await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+
+                command = f"/usr/bin/docker image prune -af"
+                await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
                 logger.info(
                     _m(
@@ -810,7 +743,7 @@ class DockerService:
 
                 for public_key in payload.user_public_keys:
                     command = f"/usr/bin/docker exec -i {payload.container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
-                    await ssh_client.run(command)
+                    await retry_ssh_command(ssh_client, command, "add_ssh_key", 3, 5)
 
                 logger.info(
                     _m(
@@ -828,7 +761,7 @@ class DockerService:
                 )
         except Exception as e:
             log_text = _m(
-                "Unknown Error add_ssh_key",
+                "Failed add_ssh_key",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
             logger.error(log_text, exc_info=True)
