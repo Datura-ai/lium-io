@@ -63,7 +63,7 @@ check_compatibility
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}All requirements are compatible with Python $python_version.${NC}"
 else
-    echo -e "${RED}All requirements are NOT compatible with Python $python_version.${NC}"
+    echo -e "${RED}Some requirements are NOT compatible with Python $python_version.${NC}"
     all_passed=false
 fi
 
