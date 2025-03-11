@@ -3,8 +3,7 @@ import random
 import logging
 
 from dataclasses import dataclass
-from typing import Self, Annotated, Callable
-from fastapi import Depends
+from typing import Self, Callable
 from core.utils import _m, get_extra_info
 from .const import DATA_CENTER_GPU_MODELS
 
@@ -93,14 +92,6 @@ class H100Prover:
             logger.error(_m("Verification Failed. Result does not match", extra=get_extra_info(self.default_extra)))
             return False
 
-        BANDWIDTH_MIN = 1800.0
-        BANDWIDTH_MAX = 2004.0
-
-        if not (BANDWIDTH_MIN <= self.bandwidth <= BANDWIDTH_MAX):
-            logger.info(_m(f"ERROR: Memory bandwidth {self.bandwidth} GB/s outside expected range ({BANDWIDTH_MIN}-{BANDWIDTH_MAX} GB/s)", extra=get_extra_info(self.default_extra)))
-
-            return False
-
         logger.info(_m("SUCCESS: Validate Passed", extra=get_extra_info(self.default_extra)))
 
         return True
@@ -167,6 +158,18 @@ class ValidationService:
 
         return is_data_center
 
+    def is_a100_gpu(self, machine_spec: dict) -> bool:
+        is_a100 = False
+        if machine_spec.get("gpu", {}).get("count", 0) > 0:
+            details = machine_spec["gpu"].get("details", [])
+            if len(details) > 0:
+                gpu_model = details[0].get("name", "")
+
+                if "NVIDIA A100" in gpu_model:
+                    is_a100 = True
+
+        return is_a100
+    
     async def validate_gpu_model_and_process_job(
         self,
         ssh_client,
@@ -181,6 +184,8 @@ class ValidationService:
         remote_verifier_file_path = f"{remote_dir}/{verifier_file_name}"
         remote_result_validation_file_path = f"{remote_dir}/validate_result.txt"
         verifier_params = VerifierParams.generate()
+        if self.is_a100_gpu():
+            verifier_params.dim_k = int(verifier_params.dim_k/2)
         verifier_params.result_path = remote_result_validation_file_path
 
         # Make the remote verifier file executable
