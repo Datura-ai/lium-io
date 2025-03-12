@@ -158,6 +158,20 @@ class ValidationService:
 
         return is_data_center
 
+    def is_a100_40g_gpu(self, machine_spec: dict) -> bool:
+        is_a100_40g = False
+        if machine_spec.get("gpu", {}).get("count", 0) > 0:
+            details = machine_spec["gpu"].get("details", [])
+            if len(details) > 0:
+                gpu_model = details[0].get("name", "")
+                gpu_memory = details[0].get("capacity", 0)  # Memory in MB
+                gpu_memory_gb = gpu_memory / 1024  # Convert to GB
+
+                if "NVIDIA A100" in gpu_model and gpu_memory_gb < 41:
+                    is_a100_40g = True
+
+        return is_a100_40g
+    
     async def validate_gpu_model_and_process_job(
         self,
         ssh_client,
@@ -172,6 +186,8 @@ class ValidationService:
         remote_verifier_file_path = f"{remote_dir}/{verifier_file_name}"
         remote_result_validation_file_path = f"{remote_dir}/validate_result.txt"
         verifier_params = VerifierParams.generate()
+        if self.is_a100_40g_gpu():
+            verifier_params.dim_k = int(verifier_params.dim_k/2)
         verifier_params.result_path = remote_result_validation_file_path
 
         # Make the remote verifier file executable
