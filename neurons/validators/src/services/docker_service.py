@@ -89,8 +89,29 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         command: str,
         log_tag: str,
+        log_text: str,
+        log_extra: dict = {},
         timeout: int = 0
     ):
+        logger.info(
+            _m(
+                log_text,
+                extra=get_extra_info({
+                    **log_extra,
+                    "command": command
+                }),
+            ),
+        )
+
+        async with self.lock:
+            self.logs_queue.append(
+                {
+                    "log_text": log_text,
+                    "log_status": "success",
+                    "log_tag": log_tag,
+                }
+            )
+
         status = True
         error = ''
         try:
@@ -111,7 +132,8 @@ class DockerService:
                     }
                 )
 
-        return status, error
+        if not status:
+            raise Exception(f"Failed ${log_text}. command: {command} error: {error}")
 
     async def _stream_process_output(self, process, log_tag):
         status = True
@@ -219,6 +241,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         sleep: int = 0,
+        clear_volume: bool = True
     ):
         command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
         result = await ssh_client.run(command)
@@ -241,8 +264,9 @@ class DockerService:
             command = f'/usr/bin/docker rm {ids} -f'
             await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
 
-            command = f'/usr/bin/docker volume prune -af'
-            await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
+            if clear_volume:
+                command = f'/usr/bin/docker volume prune -af'
+                await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
 
     async def clear_verified_job_count(self, miner_hotkey: str, executor_id: str):
         await self.redis_service.remove_pending_pod(miner_hotkey, executor_id)
@@ -255,6 +279,8 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        volume_name = payload.volume_name
+
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
@@ -263,12 +289,14 @@ class DockerService:
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
             "docker_image": payload.docker_image,
+            "volume_name": volume_name,
+            "edit_pod": True if volume_name else False,
             "debug": payload.debug,
         }
 
         logger.info(
             _m(
-                "Create Docker Container",
+                "Edit Docker Container" if volume_name else "Create Docker Container",
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
@@ -322,16 +350,6 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
-                logger.info(
-                    _m(
-                        "Pulling docker image",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "docker_image": payload.docker_image
-                        }),
-                    ),
-                )
-
                 # set real-time logging
                 self.log_task = asyncio.create_task(
                     self.handle_stream_logs(
@@ -340,23 +358,14 @@ class DockerService:
                     )
                 )
 
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": f"Pulling docker image {payload.docker_image}",
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
-                    )
-
                 command = f"/usr/bin/docker pull {payload.docker_image}"
-                status, error = await self.execute_and_stream_logs(
+                await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
                     command=command,
                     log_tag=log_tag,
+                    log_text=f"Pulling docker image {payload.docker_image}",
+                    log_extra=default_extra,
                 )
-                if not status:
-                    raise Exception(f"Docker pull failed. error: {error}")
 
                 port_flags = " ".join(
                     [
@@ -404,45 +413,24 @@ class DockerService:
 
                 uuid = uuid4()
 
-                # creat docker volume
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": "Creating docker volume",
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
-                    )
-
                 await self.clean_exisiting_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     sleep=10,
+                    clear_volume=False if volume_name else True
                 )
 
-                volume_name = f"volume_{uuid}"
-                command = f"/usr/bin/docker volume create {volume_name}"
-                status, error = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=10
-                )
-                if not status:
-                    raise Exception(f"Docker volume creation failed. error: {error}")
-
-                logger.info(
-                    _m(
-                        "Created Docker Volume",
-                        extra=get_extra_info({**default_extra, "volume_name": volume_name}),
-                    ),
-                )
-
-                # create docker container with the port map & resource
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": "Creating docker container",
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
+                if not volume_name:
+                    # create docker volume
+                    volume_name = f"volume_{uuid}"
+                    command = f"/usr/bin/docker volume create {volume_name}"
+                    await self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=command,
+                        log_tag=log_tag,
+                        log_text=f"Creating docker volume ${volume_name}",
+                        log_extra=default_extra,
+                        timeout=10,
                     )
 
                 container_name = f"container_{uuid}"
@@ -454,21 +442,14 @@ class DockerService:
                 else:
                     command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
 
-                logger.info(
-                    _m(
-                        "Creating docker container",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "command": command,
-                        }),
-                    ),
+                await self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=command,
+                    log_tag=log_tag,
+                    log_text="Creating docker container",
+                    log_extra=default_extra,
+                    timeout=30
                 )
-
-                status, error = await self.execute_and_stream_logs(
-                    ssh_client=ssh_client, command=command, log_tag="container_creation", timeout=30
-                )
-                if not status:
-                    raise Exception(f"Docker run command failed. error: {error}")
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
@@ -481,6 +462,15 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "container_name": container_name}),
                     ),
                 )
+
+                async with self.lock:
+                    self.logs_queue.append(
+                        {
+                            "log_text": "Created Docker Container",
+                            "log_status": "success",
+                            "log_tag": log_tag,
+                        }
+                    )
 
                 # add rest of public keys
                 for public_key in user_public_keys:

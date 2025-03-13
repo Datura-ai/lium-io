@@ -70,6 +70,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
     custom_options: CustomOptions | None = None
     debug: bool | None = None
+    volume_name: str | None = None  # when edit pod, volume_name is required
 
 
 class ContainerStartRequest(ContainerBaseRequest):
