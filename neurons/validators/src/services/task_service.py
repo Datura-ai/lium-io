@@ -1009,6 +1009,7 @@ class TaskService:
                         remote_dir=remote_dir,
                         verifier_file_name=encrypted_files.verifier_file_name,
                         default_extra=default_extra,
+                        machine_spec=machine_spec,
                         _run_task=self._run_task
                     )
 
