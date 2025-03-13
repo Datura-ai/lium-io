@@ -169,11 +169,12 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
 @click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--docker_image", prompt="Docker Image", help="Docker Image")
-def create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
-    asyncio.run(_create_container_to_miner(miner_hotkey, miner_address, miner_port, executor_id, docker_image))
+@click.option("--volume_name", required=False, help="Volume name when editing pod") 
+def create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str, volume_name: str):
+    asyncio.run(_create_container_to_miner(miner_hotkey, miner_address, miner_port, executor_id, docker_image, volume_name))
 
 
-async def _create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
+async def _create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str, volume_name: str):
     miner_service: MinerService = ioc["MinerService"]
 
     payload = ContainerCreateRequest(
@@ -183,6 +184,7 @@ async def _create_container_to_miner(miner_hotkey: str, miner_address: str, mine
         miner_hotkey=miner_hotkey,
         miner_address=miner_address,
         miner_port=miner_port,
+        volume_name=volume_name,
     )
     response = await miner_service.handle_container(payload)
     print('response ==>', response)
