@@ -171,7 +171,7 @@ class ValidationService:
                     is_a100_40g = True
 
         return is_a100_40g
-    
+
     async def validate_gpu_model_and_process_job(
         self,
         ssh_client,
@@ -180,13 +180,14 @@ class ValidationService:
         remote_dir: str,
         verifier_file_name: str,
         default_extra: dict,
+        machine_spec: dict,
         _run_task: Callable
     ) -> bool:
 
         remote_verifier_file_path = f"{remote_dir}/{verifier_file_name}"
         remote_result_validation_file_path = f"{remote_dir}/validate_result.txt"
         verifier_params = VerifierParams.generate()
-        if self.is_a100_40g_gpu():
+        if self.is_a100_40g_gpu(machine_spec):
             verifier_params.dim_k = int(verifier_params.dim_k/2)
         verifier_params.result_path = remote_result_validation_file_path
 
