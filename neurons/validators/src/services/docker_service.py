@@ -91,7 +91,8 @@ class DockerService:
         log_tag: str,
         log_text: str,
         log_extra: dict = {},
-        timeout: int = 0
+        timeout: int = 0,
+        raise_exception: bool = True,
     ):
         logger.info(
             _m(
@@ -132,8 +133,10 @@ class DockerService:
                     }
                 )
 
-        if not status:
+        if not status and raise_exception:
             raise Exception(f"Failed ${log_text}. command: {command} error: {error}")
+
+        return status, error
 
     async def _stream_process_output(self, process, log_tag):
         status = True
@@ -267,6 +270,49 @@ class DockerService:
             if clear_volume:
                 command = f'/usr/bin/docker volume prune -af'
                 await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
+
+    async def install_open_ssh_server_and_start_ssh_service(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        log_tag: str,
+        log_extra: dict,
+    ) -> None:
+        # Step 1: check openssh-server is installed
+        command = f"/usr/bin/docker exec {container_name} dpkg -l | grep openssh-server"
+        # result = await ssh_client.run(command)
+        status, _ = await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Checking openssh-server installed",
+            log_extra=log_extra,
+            raise_exception=False
+        )
+        if not status:
+            # Step 1.1: install if it's not installed in docker container.
+            # logger.info(_m("openssh-server isn't installed in the container. Installing it now.", extra={**log_extra, "container_name": container_name}))
+            command = f"/usr/bin/docker exec {container_name} sh -c 'apt-get update; apt-get install -y openssh-server; '"
+            await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Installing openssh-server now.",
+                log_extra=log_extra,
+                raise_exception=False
+            )
+
+        # Step 2: start SSH service
+        # logger.info(_m("Starting SSH service", extra={**log_extra, "container_name": container_name}))
+        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A; mkdir -p /root/.ssh; chmod 700 /root/.ssh; service ssh start;'"
+        await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Starting SSH service",
+            log_extra=log_extra,
+            raise_exception=False
+        )
 
     async def clear_verified_job_count(self, miner_hotkey: str, executor_id: str):
         await self.redis_service.remove_pending_pod(miner_hotkey, executor_id)
@@ -435,12 +481,10 @@ class DockerService:
 
                 container_name = f"container_{uuid}"
 
-                user_public_keys = payload.user_public_keys
-                public_key = user_public_keys.pop(0)
                 if payload.debug:
-                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{public_key}" {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
-                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} -e PUBLIC_KEY="{public_key}" {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
 
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -472,9 +516,16 @@ class DockerService:
                         }
                     )
 
+                await self.install_open_ssh_server_and_start_ssh_service(
+                    ssh_client=ssh_client,
+                    container_name=container_name,
+                    log_tag=log_tag,
+                    log_extra=default_extra,
+                )
+
                 # add rest of public keys
-                for public_key in user_public_keys:
-                    command = f"/usr/bin/docker exec -i {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
+                for public_key in payload.user_public_keys:
+                    command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
                     await ssh_client.run(command)
 
                 await self.finish_stream_logs()
