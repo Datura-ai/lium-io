@@ -36,10 +36,11 @@ def run_hashcat(device_id: int, job: dict) -> list[str]:
             if not os.path.exists(f"/usr/bin/hashcat{device_id}"):
                 subprocess.check_output(f"cp /usr/bin/hashcat /usr/bin/hashcat{device_id}", shell=True)
 
-            cmd = f'hashcat{device_id} --potfile-disable --restore-disable --attack-mode 3 -d {device_id} --workload-profile 3 --optimized-kernel-enable --hash-type {algorithm} --hex-salt -1 "?l?d?u" --outfile-format 2 --quiet {payload_file.name} "{mask}"'
+            cmd = f'hashcat{device_id} --session=hashcat{device_id} --potfile-disable --restore-disable --attack-mode 3 -d {device_id} --workload-profile 3 --optimized-kernel-enable --hash-type {algorithm} --hex-salt -1 "?l?d?u" --outfile-format 2 --quiet --hwmon-disable {payload_file.name} "{mask}"'
             stdout = subprocess.check_output(cmd, shell=True, text=True)
-            passwords = [p for p in sorted(stdout.split("\n")) if p != ""]
-            answers.append(passwords)
+            if stdout:
+                passwords = [p for p in sorted(stdout.split("\n")) if p != ""]
+                answers.append(passwords)
 
     return answers
 
