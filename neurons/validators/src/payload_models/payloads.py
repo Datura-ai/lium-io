@@ -148,8 +148,18 @@ class FailedContainerErrorCodes(enum.Enum):
     RentingInProgress = "RentingInProgress"
 
 
+class FailedContainerErrorTypes(enum.Enum):
+    ContainerCreationFailed = "ContainerCreationFailed"
+    ContainerDeletionFailed = "ContainerDeletionFailed"
+    ContainerStopFailed = "ContainerStopFailed"
+    ContainerStartFailed = "ContainerStartFailed"
+    AddSSkeyFailed = "AddSSkeyFailed"
+    UnknownRequest = "UnknownRequest"
+
+
 class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
+    error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     msg: str
     error_code: FailedContainerErrorCodes | None = None
 

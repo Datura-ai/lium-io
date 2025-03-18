@@ -22,6 +22,7 @@ from payload_models.payloads import (
     SshPubKeyAdded,
     FailedContainerErrorCodes,
     FailedContainerRequest,
+    FailedContainerErrorTypes,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -372,6 +373,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     msg=str(log_text),
+                    error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
                 )
 
@@ -386,6 +388,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     msg=str(log_text),
+                    error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoSshKeys,
                 )
 
@@ -568,6 +571,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
@@ -733,6 +737,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
@@ -785,6 +790,7 @@ class DockerService:
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
                         msg=str(log_text),
+                        error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
                     )
 
@@ -817,6 +823,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
