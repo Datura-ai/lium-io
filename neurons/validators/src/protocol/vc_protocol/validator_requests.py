@@ -50,6 +50,7 @@ class AuthenticateRequest(BaseValidatorRequest):
 class ExecutorSpecRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ExecutorSpecRequest
     miner_hotkey: str
+    miner_coldkey: str
     validator_hotkey: str
     executor_uuid: str
     executor_ip: str

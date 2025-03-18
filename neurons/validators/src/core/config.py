@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
     DEBUG: bool = Field(env="DEBUG", default=False)
-    DEBUG_MINER_HOTKEY: str = Field(env="DEBUG_MINER_HOTKEY", default="")
+    DEBUG_MINER_HOTKEY: str | None = Field(env="DEBUG_MINER_HOTKEY", default=None)
+    DEBUG_MINER_COLDKEY: str | None = Field(env="DEBUG_MINER_COLDKEY", default=None)
     DEBUG_MINER_ADDRESS: str | None = Field(env="DEBUG_MINER_ADDRESS", default=None)
     DEBUG_MINER_PORT: int | None = Field(env="DEBUG_MINER_PORT", default=None)
 
@@ -42,7 +43,7 @@ class Settings(BaseSettings):
     )
 
     ENV: str = Field(env="ENV", default="dev")
-    
+
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
@@ -104,6 +105,7 @@ class Settings(BaseSettings):
 
         miner = type("Miner", (object,), {})()
         miner.hotkey = self.DEBUG_MINER_HOTKEY
+        miner.coldkey = self.DEBUG_MINER_COLDKEY
         miner.axon_info = type("AxonInfo", (object,), {})()
         miner.axon_info.ip = self.DEBUG_MINER_ADDRESS
         miner.axon_info.port = self.DEBUG_MINER_PORT
