@@ -135,6 +135,9 @@ class RedisService:
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str):
         await self.srem(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
 
+    async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
+        return await self.is_elem_exists_in_set(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+
     async def clear_all_executor_counts(self):
         pattern = f"{EXECUTOR_COUNT_PREFIX}:*"
         cursor = 0

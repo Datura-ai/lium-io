@@ -35,7 +35,6 @@ from services.const import (
 )
 from services.redis_service import (
     RedisService,
-    PENDING_PODS_SET,
     DUPLICATED_MACHINE_SET,
     RENTAL_SUCCEED_MACHINE_SET,
     AVAILABLE_PORT_MAPS_PREFIX,
@@ -965,9 +964,7 @@ class TaskService:
                             clear_verified_job_info=False,
                         )
 
-                renting_in_progress = await self.redis_service.is_elem_exists_in_set(
-                    PENDING_PODS_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
-                )
+                renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress:
                     success, log_text, log_status = await self.docker_connection_check(
                         ssh_client=ssh_client,
