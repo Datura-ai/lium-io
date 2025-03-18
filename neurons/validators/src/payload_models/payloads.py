@@ -15,6 +15,7 @@ class CustomOptions(BaseModel):
 class MinerJobRequestPayload(BaseModel):
     job_batch_id: str
     miner_hotkey: str
+    miner_coldkey: str
     miner_address: str
     miner_port: int
 

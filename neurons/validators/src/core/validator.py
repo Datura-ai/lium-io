@@ -551,6 +551,7 @@ class Validator:
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
+                                miner_coldkey=miner.coldkey,
                                 miner_address=miner.axon_info.ip,
                                 miner_port=miner.axon_info.port,
                             ),

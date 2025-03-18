@@ -99,6 +99,7 @@ def debug_send_machine_specs_to_connector():
                     )
                 ],
                 miner_hotkey="5Cco1xUS8kXuaCzAHAXZ36nr6mLzmY5B9ufxrfb8Q3HB6ZdN",
+                miner_coldkey="5Cco1xUS8kXuaCzAHAXZ36nr6mLzmY5B9ufxrfb8Q3HB6ZdN",
             )
         )
 
@@ -119,6 +120,7 @@ def debug_send_machine_specs_to_connector():
                     )
                 ],
                 miner_hotkey="5Cco1xUS8kXuaCzAHAXZ36nr6mLzmY5B9ufxrfb8Q3HB6ZdN",
+                miner_coldkey="5Cco1xUS8kXuaCzAHAXZ36nr6mLzmY5B9ufxrfb8Q3HB6ZdN",
             )
         )
 
@@ -155,6 +157,7 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
         MinerJobRequestPayload(
             job_batch_id='job_batch_id',
             miner_hotkey=miner_hotkey,
+            miner_coldkey='miner_coldkey',
             miner_address=miner_address,
             miner_port=miner_port,
         ),
