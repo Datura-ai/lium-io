@@ -231,6 +231,7 @@ class ComputeClient:
                             job_batch_id=data['job_batch_id'],
                             log_text=data["log_text"],
                             miner_hotkey=data["miner_hotkey"],
+                            miner_coldkey=data["miner_coldkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
                             executor_ip=data["executor_ip"],

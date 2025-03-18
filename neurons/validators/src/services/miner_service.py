@@ -146,7 +146,7 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
-                    await self.publish_machine_specs(results, miner_client.miner_hotkey)
+                    await self.publish_machine_specs(results, miner_client.miner_hotkey, payload.miner_coldkey)
                     await self.store_executor_counts(
                         payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results
                     )
@@ -205,7 +205,7 @@ class MinerService:
             return None
 
     async def publish_machine_specs(
-        self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str
+        self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str, miner_coldkey: str
     ):
         """Publish machine specs to compute app connector process"""
         default_extra = {
@@ -233,6 +233,7 @@ class MinerService:
                     {
                         "specs": specs,
                         "miner_hotkey": miner_hotkey,
+                        "miner_coldkey": miner_coldkey,
                         "executor_uuid": ssh_info.uuid,
                         "executor_ip": ssh_info.address,
                         "executor_port": ssh_info.port,
