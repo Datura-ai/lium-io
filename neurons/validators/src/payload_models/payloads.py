@@ -145,6 +145,7 @@ class FailedContainerErrorCodes(enum.Enum):
     InvalidExecutorId = "InvalidExecutorId"
     ExceptionError = "ExceptionError"
     FailedMsgFromMiner = "FailedMsgFromMiner"
+    RentingInProgress = "RentingInProgress"
 
 
 class FailedContainerRequest(ContainerBaseResponse):

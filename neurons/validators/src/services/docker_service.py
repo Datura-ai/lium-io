@@ -362,7 +362,10 @@ class DockerService:
                 )
 
             if not port_maps:
-                log_text = "No port mappings found"
+                log_text = _m(
+                    "No port mappings found",
+                    extra=get_extra_info(default_extra),
+                )
                 logger.error(log_text)
 
                 return FailedContainerRequest(
@@ -373,7 +376,10 @@ class DockerService:
                 )
 
             if not payload.user_public_keys:
-                log_text = "No public keys"
+                log_text = _m(
+                    "No public keys",
+                    extra=get_extra_info(default_extra),
+                )
                 logger.error(log_text)
 
                 return FailedContainerRequest(
