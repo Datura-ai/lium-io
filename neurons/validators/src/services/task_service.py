@@ -25,7 +25,6 @@ from services.const import (
     UPLOAD_SPEED_WEIGHT,
     MAX_GPU_COUNT,
     UNRENTED_MULTIPLIER,
-    HASHCAT_CONFIGS,
     LIB_NVIDIA_ML_DIGESTS,
     DOCKER_DIGEST,
     PYTHON_DIGEST,
@@ -1015,92 +1014,6 @@ class TaskService:
                             "GPU Verification failed",
                             extra=get_extra_info(default_extra),
                         )
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-                else:
-                    # scoring
-                    hashcat_config = HASHCAT_CONFIGS[gpu_model]
-                    if not hashcat_config:
-                        log_text = _m(
-                            "No config for hashcat",
-                            extra=get_extra_info(default_extra),
-                        )
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-
-                    num_digits = hashcat_config.get("digits", 11)
-                    avg_job_time = (
-                        hashcat_config.get("average_time")[gpu_count - 1 if gpu_count <= 8 else 7]
-                        if hashcat_config.get("average_time")
-                        else 60
-                    )
-                    hash_service = HashService.generate(
-                        gpu_count=gpu_count, num_digits=num_digits, timeout=int(avg_job_time * 2.5)
-                    )
-
-                    results, err = await self._run_task(
-                        ssh_client=ssh_client,
-                        miner_hotkey=miner_info.miner_hotkey,
-                        executor_info=executor_info,
-                        command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path} '{hash_service.payload}'",
-                    )
-                    if err is not None:
-                        log_text = _m(
-                            f"Error executing task on executor: {err}",
-                            extra=get_extra_info(default_extra),
-                        )
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-
-                    result = json.loads(results[0])
-                    answer = result["answer"]
-
-                    logger.info(
-                        _m(
-                            f"Results from training job task: {str(result)}",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
-
-                    if answer != hash_service.answer:
-                        log_text = _m(
-                            "Hashcat incorrect Answer",
-                            extra=get_extra_info({**default_extra, "answer": answer, "hash_service_answer": hash_service.answer}),
-                        )
-
                         return await self._handle_task_result(
                             ssh_client=ssh_client,
                             remote_dir=remote_dir,
