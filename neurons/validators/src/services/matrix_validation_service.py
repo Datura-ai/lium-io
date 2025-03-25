@@ -21,8 +21,8 @@ class VerifierParams:
     @classmethod
     def generate(cls) -> Self:
         # You can modify the range for more randomness or based on specific needs
-        dim_n = random.randint(1900, 2000)  # Random dim_n between 500 and 2000
-        dim_k = random.randint(2000000, 2586932)  # Random dim_k between 2000 and 4000
+        dim_n = random.randint(1900, 2000)  # Random dim_n between 1900 and 2000
+        dim_k = random.randint(2000000, 2586932)  # Random dim_k between 2000000 and 2586932
         seed = int(time.time())
 
         return cls(dim_n=dim_n, dim_k=dim_k, seed=seed)
@@ -132,7 +132,7 @@ class H100Prover:
 
 
 class ValidationService:
-    def is_data_center_gpu(self, machine_spec: dict) -> bool:
+    def get_gpu_memory(self, machine_spec: dict) -> bool:
         """
         Check if machine has data center GPUs (A100, H100, H200 or similar with >40GB memory)
         A data center GPU, or Graphics Processing Unit, is a specialized electronic circuit that speeds up tasks in data centers. 
@@ -143,34 +143,28 @@ class ValidationService:
         Returns:
             bool: is_data_center
         """
-        is_data_center = False
         if machine_spec.get("gpu", {}).get("count", 0) > 0:
             details = machine_spec["gpu"].get("details", [])
             if len(details) > 0:
                 gpu_model = details[0].get("name", "")
                 gpu_memory = details[0].get("capacity", 0)  # Memory in MB
-                gpu_memory_gb = gpu_memory / 1024  # Convert to GB
 
-                # Check if GPU model is in our data center list and verify memory capacity
-                for model, min_memory in DATA_CENTER_GPU_MODELS.items():
-                    if model in gpu_model and gpu_memory_gb >= min_memory - 2:
-                        is_data_center = True
+                return gpu_memory
 
-        return is_data_center
+        return 0
 
-    def is_a100_40g_gpu(self, machine_spec: dict) -> bool:
-        is_a100_40g = False
-        if machine_spec.get("gpu", {}).get("count", 0) > 0:
-            details = machine_spec["gpu"].get("details", [])
-            if len(details) > 0:
-                gpu_model = details[0].get("name", "")
-                gpu_memory = details[0].get("capacity", 0)  # Memory in MB
-                gpu_memory_gb = gpu_memory / 1024  # Convert to GB
+    def get_max_matrix_dimensions(self, gpu_memory, dim_n):
+        gpu_memory = gpu_memory - 2 * 1024
+        max_memory = gpu_memory * (1024.0 ** 2)
 
-                if "NVIDIA A100" in gpu_model and gpu_memory_gb < 41:
-                    is_a100_40g = True
+        element_size = 8  # 8 bytes for double precision
 
-        return is_a100_40g
+        # Calculate maximum number of elements that can fit in the available memory
+        max_elements = max_memory // element_size
+
+        max_dim_k = max_elements // (2 * dim_n) - dim_n
+
+        return max_dim_k
 
     async def validate_gpu_model_and_process_job(
         self,
@@ -187,13 +181,20 @@ class ValidationService:
         remote_verifier_file_path = f"{remote_dir}/{verifier_file_name}"
         remote_result_validation_file_path = f"{remote_dir}/validate_result.txt"
         verifier_params = VerifierParams.generate()
-        if self.is_a100_40g_gpu(machine_spec):
-            verifier_params.dim_k = int(verifier_params.dim_k/2)
+        gpu_memory = self.get_gpu_memory(machine_spec)
+        verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
         verifier_params.result_path = remote_result_validation_file_path
+
+        log_extra = {
+            **default_extra,
+            "dim_n": verifier_params.dim_n,
+            "dim_k": verifier_params.dim_k,
+        }
+
+        logger.info(_m("Start matrix job", extra=get_extra_info(log_extra)))
 
         # Make the remote verifier file executable
         await ssh_client.run(f"chmod +x {remote_verifier_file_path}")
-
         # Run the verifier command
         verify_results, err = await _run_task(
             ssh_client=ssh_client,
@@ -202,7 +203,7 @@ class ValidationService:
             command=f"{remote_verifier_file_path} {verifier_params}",
         )
         if not verify_results:
-            logger.warning(_m("GPU model validation job failed", extra=get_extra_info(default_extra)))
+            logger.warning(_m("GPU model validation job failed", extra=get_extra_info(log_extra)))
             return False
 
         # Read the result from the validation file
@@ -213,7 +214,7 @@ class ValidationService:
             command=f"cat {remote_result_validation_file_path}",
         )
         if not file_read_results:
-            logger.warning(_m("No result from GPU model validation job", extra=get_extra_info(default_extra)))
+            logger.warning(_m("No result from GPU model validation job", extra=get_extra_info(log_extra)))
             return False
         # Validate the verification result
         prover = H100Prover(verifier_params.dim_n, verifier_params.dim_k, verifier_params.seed, default_extra)

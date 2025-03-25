@@ -491,9 +491,9 @@ class DockerService:
                 container_name = f"container_{uuid}"
 
                 if payload.debug:
-                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} {env_flags} --mount source={volume_name},target=/root --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} {env_flags} --mount source={volume_name},target=/root --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
-                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} {env_flags} --mount source={volume_name},target=/root --gpus all --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} {env_flags} --mount source={volume_name},target=/root --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
 
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
