@@ -148,22 +148,22 @@ class ValidationService:
             if len(details) > 0:
                 gpu_model = details[0].get("name", "")
                 gpu_memory = details[0].get("capacity", 0)  # Memory in MB
-                
-                return gpu_memory         
+
+                return gpu_memory
 
         return 0
 
     def get_max_matrix_dimensions(self, gpu_memory, dim_n):
         gpu_memory = gpu_memory - 2 * 1024
         max_memory = gpu_memory * (1024.0 ** 2)
-        
+
         element_size = 8  # 8 bytes for double precision
-        
+
         # Calculate maximum number of elements that can fit in the available memory
         max_elements = max_memory // element_size
-        
+
         max_dim_k = max_elements // (2 * dim_n) - dim_n
-        print(f"Max matrix dimension (n = m): {dim_n} x {max_dim_k}")
+
         return max_dim_k
 
     async def validate_gpu_model_and_process_job(
@@ -185,6 +185,14 @@ class ValidationService:
         verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
         verifier_params.result_path = remote_result_validation_file_path
 
+        log_extra = {
+            **default_extra,
+            "dim_n": verifier_params.dim_n,
+            "dim_k": verifier_params.dim_k,
+        }
+
+        logger.info(_m("Start matrix job", extra=get_extra_info(log_extra)))
+
         # Make the remote verifier file executable
         await ssh_client.run(f"chmod +x {remote_verifier_file_path}")
         # Run the verifier command
@@ -195,7 +203,7 @@ class ValidationService:
             command=f"{remote_verifier_file_path} {verifier_params}",
         )
         if not verify_results:
-            logger.warning(_m("GPU model validation job failed", extra=get_extra_info(default_extra)))
+            logger.warning(_m("GPU model validation job failed", extra=get_extra_info(log_extra)))
             return False
 
         # Read the result from the validation file
@@ -206,7 +214,7 @@ class ValidationService:
             command=f"cat {remote_result_validation_file_path}",
         )
         if not file_read_results:
-            logger.warning(_m("No result from GPU model validation job", extra=get_extra_info(default_extra)))
+            logger.warning(_m("No result from GPU model validation job", extra=get_extra_info(log_extra)))
             return False
         # Validate the verification result
         prover = H100Prover(verifier_params.dim_n, verifier_params.dim_k, verifier_params.seed, default_extra)
