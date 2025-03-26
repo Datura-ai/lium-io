@@ -44,7 +44,19 @@ class InteractiveShellService:
         # Add the destination
         ssh_command += f" {self.username}@{self.host}"
 
-        self.i_shell = pexpect.spawn(ssh_command, timeout=10)
+        try:
+            self.i_shell = pexpect.spawn(ssh_command, timeout=10)
+
+            i = self.i_shell.expect(['password:', 'continue connecting', 'Last login', pexpect.EOF, pexpect.TIMEOUT], timeout=30)
+            if i == 1:  # Host key verification
+                self.i_shell.sendline('yes')
+
+            # Wait for shell prompt
+            i = self.i_shell.expect(['root@'], timeout=30)
+        except pexpect.TIMEOUT:
+            raise Exception("i-ssh connection Timeout")
+        except pexpect.EOF:
+            raise Exception("i-ssh connection EOF error")
 
     async def connect_asyncssh(self):
         pkey = asyncssh.import_private_key(self.private_key)
@@ -108,7 +120,7 @@ class InteractiveShellService:
         try:
             self.exec_shell_command(f"rm -rf {self.remote_dir}")
         except Exception as e:
-            logger.error(f"Error clearing remote directory: {e}")
+            pass
 
     async def read_file_content_over_scp(self, file_path: str) -> bytes:
         async with self.ssh_client.start_sftp_client() as sftp_client:
@@ -131,8 +143,24 @@ class InteractiveShellService:
         file_content = await self.read_file_content_over_scp(file_path)
         return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
 
+    def get_checksums_by_path(self, file_path: str):
+        md5_output = self.exec_shell_command(f'md5sum {file_path}')
+        sha256_output = self.exec_shell_command(f'sha256sum {file_path}')
+
+        # Extract the checksums from the command outputs
+        md5_sum = md5_output.replace(file_path, '').strip() if md5_output else None
+        sha256_sum = sha256_output.replace(file_path, '').strip() if sha256_output else None
+
+        return f'{md5_sum}:{sha256_sum}'
+
     def exec_shell_command(self, command: str):
-        self.i_shell.sendline(f"{command} && echo 'STOPPED'")
-        self.i_shell.expect(['STOPPED'], timeout=30)
-        output_lines = [line.strip() for line in re.split(r'[\r\n]', self.i_shell.before.decode('utf-8')) if line.strip()]
-        return output_lines
+        try:
+            self.i_shell.sendline(f"{command} && echo 'STOPPED'")
+            self.i_shell.expect(['STOPPED'], timeout=30)
+            self.i_shell.expect(['STOPPED'], timeout=30)
+            output_lines = [line.strip() for line in re.split(r'[\r\n]', self.i_shell.before.decode('utf-8')) if line.strip()]
+            return output_lines[-1]
+        except pexpect.TIMEOUT:
+            raise Exception("i-ssh connection Timeout")
+        except pexpect.EOF:
+            raise Exception("i-ssh connection EOF error")

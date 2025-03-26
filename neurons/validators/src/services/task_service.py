@@ -426,11 +426,11 @@ class TaskService:
                 port=executor_info.ssh_port,
             ) as shell:
 
-                docker_checksums = await shell.get_checksums_over_scp('/usr/bin/docker')
+                docker_checksums = shell.get_checksums_by_path('/usr/bin/docker')
                 if docker_checksums != DOCKER_DIGEST:
                     raise Exception("Docker is altered")
 
-                python_checksums = await shell.get_checksums_over_scp('/usr/bin/python')
+                python_checksums = shell.get_checksums_by_path('/usr/bin/python')
                 if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
                     raise Exception("Python is altered")
 
