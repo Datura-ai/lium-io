@@ -131,11 +131,12 @@ class MinerService:
                         for executor_info in msg.executors
                     ]
 
-                    results = [
-                        result
-                        for result in await asyncio.gather(*tasks, return_exceptions=True)
-                        if result
-                    ]
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=180
+                    )
+
+                    results = [result for result in results if result]
 
                     logger.info(
                         _m(
@@ -193,6 +194,11 @@ class MinerService:
         except asyncio.CancelledError:
             logger.error(
                 _m("Requesting job to miner was cancelled", extra=get_extra_info(default_extra)),
+            )
+            return None
+        except asyncio.TimeoutError:
+            logger.error(
+                _m("Requesting job to miner was timed out", extra=get_extra_info(default_extra)),
             )
             return None
         except Exception as e:
