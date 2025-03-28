@@ -3,7 +3,6 @@ import json
 import logging
 import random
 import uuid
-import hashlib
 from typing import Annotated
 
 import asyncssh
@@ -425,12 +424,11 @@ class TaskService:
                 private_key=private_key,
                 port=executor_info.ssh_port,
             ) as shell:
-
-                docker_checksums = shell.get_checksums_by_path('/usr/bin/docker')
+                docker_checksums = await shell.get_checksums_over_scp('/usr/bin/docker')
                 if docker_checksums != DOCKER_DIGEST:
                     raise Exception("Docker is altered")
 
-                python_checksums = shell.get_checksums_by_path('/usr/bin/python')
+                python_checksums = await shell.get_checksums_over_scp('/usr/bin/python')
                 if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
                     raise Exception("Python is altered")
 
@@ -455,7 +453,6 @@ class TaskService:
                 remote_machine_scrape_file_path = (
                     f"{remote_dir}/{encrypted_files.machine_scrape_file_name}"
                 )
-                remote_score_file_path = f"{remote_dir}/{encrypted_files.score_file_name}"
 
                 logger.info(
                     _m(
