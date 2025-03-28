@@ -54,6 +54,6 @@ RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bash_profile
 COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 COPY --from=cuda-build /usr/local/cuda /usr/local/cuda
-
+RUN mv /root/app/libdmcompverify.so /usr/lib/
 RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1
 CMD ["bash", "run.sh"]
