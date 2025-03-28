@@ -435,11 +435,15 @@ class DockerService:
                     in (custom_options.volumes if custom_options and custom_options.volumes else [])
                     if volume.strip()
                 ]
-                volume_flags = (
-                    " ".join([f"-v {volume}" for volume in sanitized_volumes])
-                    if sanitized_volumes
-                    else ""
-                )
+
+                # volume_flags = (
+                #     " ".join([f"-v {volume}" for volume in sanitized_volumes])
+                #     if sanitized_volumes
+                #     else ""
+                # )
+
+                # Get the container path from the first volume
+                container_path = sanitized_volumes[0].split(':')[1] if sanitized_volumes else '/root'
                 entrypoint_flag = (
                     f"--entrypoint {custom_options.entrypoint}"
                     if custom_options
@@ -493,12 +497,14 @@ class DockerService:
                         timeout=10,
                     )
 
+                # Create a volume flag for the Docker run command from the first element's container path
+                volume_flag = f"-v {volume_name}:{container_path}"
                 container_name = f"container_{uuid}"
 
                 if payload.debug:
-                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} {env_flags} {shm_size_flag} --mount source={volume_name},target=/root --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
-                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} {env_flags} {shm_size_flag} --mount source={volume_name},target=/root --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
 
                 logger.info(f"Running command: {command}")
 
