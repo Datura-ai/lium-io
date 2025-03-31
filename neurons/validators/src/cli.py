@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import random
 import time
 import uuid
@@ -7,7 +6,7 @@ import uuid
 import click
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from core.utils import configure_logs_of_other_modules
+from core.utils import configure_logs_of_other_modules, _m, get_extra_info, get_logger
 from core.validator import Validator
 from services.ioc import ioc
 from services.miner_service import MinerService
@@ -21,7 +20,8 @@ from payload_models.payloads import (
 )
 
 configure_logs_of_other_modules()
-logger = logging.getLogger(__name__)
+
+logger = get_logger(__name__)
 
 
 @click.group()
@@ -37,6 +37,7 @@ def debug_send_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: i
     """Debug sending job to miner"""
     miner = type("Miner", (object,), {})()
     miner.hotkey = miner_hotkey
+    miner.coldkey = miner_hotkey
     miner.axon_info = type("AxonInfo", (object,), {})()
     miner.axon_info.ip = miner_address
     miner.axon_info.port = miner_port
@@ -167,12 +168,127 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
 
 
 @cli.command()
+def debug_validator():
+    asyncio.run(_debug_validator())
+
+
+async def _debug_validator():
+    validator = Validator()
+    validator.set_subtensor()
+
+    # fetch miners
+    miners = validator.fetch_miners()
+
+    miner_service: MinerService = ioc["MinerService"]
+    docker_service: DockerService = ioc["DockerService"]
+    file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
+
+    docker_hub_digests = await docker_service.get_docker_hub_digests(REPOSITORIES)
+    encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
+
+    job_batch_id = "123456789"
+
+    jobs = [
+        asyncio.create_task(
+            miner_service.request_job_to_miner(
+                payload=MinerJobRequestPayload(
+                    job_batch_id=job_batch_id,
+                    miner_hotkey=miner.hotkey,
+                    miner_coldkey=miner.coldkey,
+                    miner_address=miner.axon_info.ip,
+                    miner_port=miner.axon_info.port,
+                ),
+                encrypted_files=encrypted_files,
+                docker_hub_digests=docker_hub_digests,
+            )
+        )
+        for miner in miners
+    ]
+
+    task_info = {}
+
+    for miner, job in zip(miners, jobs):
+        task_info[job] = {
+            "miner_hotkey": miner.hotkey,
+            "miner_address": miner.axon_info.ip,
+            "miner_port": miner.axon_info.port,
+            "job_batch_id": job_batch_id,
+        }
+
+    try:
+        # Run all jobs with asyncio.wait and set a timeout
+        done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 50)
+
+        success = []
+        errors = []
+        pendings = []
+        error_count = 0
+
+        # Process completed jobs
+        for task in done:
+            try:
+                result = task.result()
+                if result:
+                    miner_hotkey = result.get("miner_hotkey")
+
+                    success.append({"miner_hotkey": miner_hotkey})
+                else:
+                    info = task_info.get(task, {})
+                    miner_hotkey = info.get("miner_hotkey", "unknown")
+
+                    errors.append({"miner_hotkey": miner_hotkey})
+            except Exception as e:
+                error_count += 1
+                logger.error(
+                    _m(
+                        "[sync] Error processing job result",
+                        extra=get_extra_info(
+                            {
+                                "error": str(e),
+                            }
+                        ),
+                    ),
+                )
+
+        # Handle pending jobs (those that did not complete within the timeout)
+        if pending:
+            for task in pending:
+                info = task_info.get(task, {})
+                miner_hotkey = info.get("miner_hotkey", "unknown")
+                task.cancel()
+
+                pendings.append({"miner_hotkey": miner_hotkey})
+
+        logger.info(_m("[sync] All Jobs finished", extra={
+            "success": success,
+            "errors": errors,
+            "pendings": pendings,
+            "success_count": len(success),
+            "errors_count": len(errors),
+            "pendings_count": len(pendings),
+            "error_count": error_count,
+        }))
+
+    except Exception as e:
+        logger.error(
+            _m(
+                "[sync] Unexpected error",
+                extra=get_extra_info(
+                    {
+                        "error": str(e),
+                    }
+                ),
+            ),
+        )
+
+
+@cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
 @click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
 @click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--docker_image", prompt="Docker Image", help="Docker Image")
-@click.option("--volume_name", required=False, help="Volume name when editing pod") 
+@click.option("--volume_name", required=False, help="Volume name when editing pod")
 def create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str, volume_name: str):
     asyncio.run(_create_container_to_miner(miner_hotkey, miner_address, miner_port, executor_id, docker_image, volume_name))
 

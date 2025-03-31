@@ -32,11 +32,12 @@ from services.docker_service import DockerService
 from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.const import JOB_TIME_OUT
 
 logger = logging.getLogger(__name__)
 
 
-JOB_LENGTH = 300
+JOB_LENGTH = 30
 
 
 class MinerService:
@@ -118,14 +119,17 @@ class MinerService:
 
                     tasks = [
                         asyncio.create_task(
-                            self.task_service.create_task(
-                                miner_info=payload,
-                                executor_info=executor_info,
-                                keypair=my_key,
-                                private_key=private_key.decode("utf-8"),
-                                public_key=public_key.decode("utf-8"),
-                                encrypted_files=encrypted_files,
-                                docker_hub_digests=docker_hub_digests,
+                            asyncio.wait_for(
+                                self.task_service.create_task(
+                                    miner_info=payload,
+                                    executor_info=executor_info,
+                                    keypair=my_key,
+                                    private_key=private_key.decode("utf-8"),
+                                    public_key=public_key.decode("utf-8"),
+                                    encrypted_files=encrypted_files,
+                                    docker_hub_digests=docker_hub_digests,
+                                ),
+                                timeout=JOB_TIME_OUT - 60
                             )
                         )
                         for executor_info in msg.executors
@@ -134,7 +138,7 @@ class MinerService:
                     results = [
                         result
                         for result in await asyncio.gather(*tasks, return_exceptions=True)
-                        if result
+                        if result and not isinstance(result, Exception)
                     ]
 
                     logger.info(
@@ -193,6 +197,11 @@ class MinerService:
         except asyncio.CancelledError:
             logger.error(
                 _m("Requesting job to miner was cancelled", extra=get_extra_info(default_extra)),
+            )
+            return None
+        except asyncio.TimeoutError:
+            logger.error(
+                _m("Requesting job to miner was timed out", extra=get_extra_info(default_extra)),
             )
             return None
         except Exception as e:

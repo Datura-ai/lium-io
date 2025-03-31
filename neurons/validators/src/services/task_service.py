@@ -1,11 +1,8 @@
 import asyncio
 import json
 import logging
-import os
 import random
-import time
 import uuid
-import hashlib
 from typing import Annotated
 
 import asyncssh
@@ -17,12 +14,7 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from core.config import settings
 from core.utils import _m, context, get_extra_info
 from services.const import (
-    DOWNLOAD_SPEED_WEIGHT,
     GPU_MAX_SCORES,
-    JOB_TAKEN_TIME_WEIGHT,
-    MAX_DOWNLOAD_SPEED,
-    MAX_UPLOAD_SPEED,
-    UPLOAD_SPEED_WEIGHT,
     MAX_GPU_COUNT,
     UNRENTED_MULTIPLIER,
     LIB_NVIDIA_ML_DIGESTS,
@@ -30,7 +22,6 @@ from services.const import (
     PYTHON_DIGEST,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
-    VERIFY_JOB_REQUIRED_COUNT,
 )
 from services.redis_service import (
     RedisService,
@@ -39,7 +30,7 @@ from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
 )
 from services.ssh_service import SSHService
-from services.hash_service import HashService
+from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
@@ -59,30 +50,6 @@ class TaskService:
         self.redis_service = redis_service
         self.validation_service = validation_service
         self.wallet = settings.get_bittensor_wallet()
-
-    async def upload_directory(
-        self, ssh_client: asyncssh.SSHClientConnection, local_dir: str, remote_dir: str
-    ):
-        """Uploads a directory recursively to a remote server using AsyncSSH."""
-        async with ssh_client.start_sftp_client() as sftp_client:
-            for root, dirs, files in os.walk(local_dir):
-                relative_dir = os.path.relpath(root, local_dir)
-                remote_path = os.path.join(remote_dir, relative_dir)
-
-                # Create remote directory if it doesn't exist
-                result = await ssh_client.run(f"mkdir -p {remote_path}")
-                if result.exit_status != 0:
-                    raise Exception(f"Failed to create directory {remote_path}: {result.stderr}")
-
-                # Upload files
-                upload_tasks = []
-                for file in files:
-                    local_file = os.path.join(root, file)
-                    remote_file = os.path.join(remote_path, file)
-                    upload_tasks.append(sftp_client.put(local_file, remote_file))
-
-                # Await all upload tasks for the current directory
-                await asyncio.gather(*upload_tasks)
 
     async def is_script_running(
         self, ssh_client: asyncssh.SSHClientConnection, script_path: str
@@ -160,14 +127,6 @@ class TaskService:
                 return False
 
         return True
-
-    async def clear_remote_directory(
-        self, ssh_client: asyncssh.SSHClientConnection, remote_dir: str
-    ):
-        try:
-            await ssh_client.run(f"rm -rf {remote_dir}", timeout=10)
-        except Exception as e:
-            logger.error(f"Error clearing remote directory: {e}")
 
     def get_available_port_map(
         self,
@@ -370,31 +329,8 @@ class TaskService:
 
         return False
 
-    async def read_file_content_over_scp(self, ssh_client: asyncssh.SSHClientConnection, file_path: str) -> bytes:
-        async with ssh_client.start_sftp_client() as sftp_client:
-            async with sftp_client.open(file_path, 'rb') as file:
-                file_content = await file.read()
-
-        return file_content
-
-    def get_md5_checksum_from_file_content(self, file_content: bytes):
-        md5_hash = hashlib.md5()
-        md5_hash.update(file_content)
-        return md5_hash.hexdigest()
-
-    def get_sha256_checksum_from_file_content(self, file_content: bytes):
-        sha256_hash = hashlib.sha256()
-        sha256_hash.update(file_content)
-        return sha256_hash.hexdigest()
-
-    async def get_checksums_over_scp(self, ssh_client: asyncssh.SSHClientConnection, file_path: str):
-        file_content = await self.read_file_content_over_scp(ssh_client, file_path)
-        return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
-
     async def _handle_task_result(
         self,
-        ssh_client: asyncssh.SSHClientConnection,
-        remote_dir: str,
         miner_info: MinerJobRequestPayload,
         executor_info: ExecutorSSHInfo,
         spec: dict | None,
@@ -407,8 +343,6 @@ class TaskService:
         gpu_model_count: str = '',
         gpu_uuids: str = '',
     ):
-        await self.clear_remote_directory(ssh_client, remote_dir)
-
         if success:
             log_status = "info"
             logger.info(log_text)
@@ -483,61 +417,20 @@ class TaskService:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-            pkey = asyncssh.import_private_key(private_key)
 
-            async with asyncssh.connect(
+            async with InteractiveShellService(
                 host=executor_info.address,
-                port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
-            ) as ssh_client:
-                random_length = random.randint(5, 15)
-                remote_dir = f"{executor_info.root_dir}/{self.ssh_service.generate_random_string(length=random_length, string_only=True)}"
-                await ssh_client.run(f"rm -rf {remote_dir}")
-                await ssh_client.run(f"mkdir -p {remote_dir}")
-
-                docker_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/docker')
+                private_key=private_key,
+                port=executor_info.ssh_port,
+            ) as shell:
+                docker_checksums = await shell.get_checksums_over_scp('/usr/bin/docker')
                 if docker_checksums != DOCKER_DIGEST:
-                    log_text = _m(
-                        "Docker is altered",
-                        extra=get_extra_info(default_extra),
-                    )
+                    raise Exception("Docker is altered")
 
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=True,
-                    )
-
-                python_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/python')
+                python_checksums = await shell.get_checksums_over_scp('/usr/bin/python')
                 if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
-                    log_text = _m(
-                        "Python is altered",
-                        extra=get_extra_info(default_extra),
-                    )
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=True,
-                    )
+                    raise Exception("Python is altered")
 
                 # start gpus_utility.py
                 program_id = str(uuid.uuid4())
@@ -549,16 +442,17 @@ class TaskService:
                     "compute_rest_app_url": settings.COMPUTE_REST_API_URL,
                 }
                 script_path = f"{executor_info.root_dir}/src/gpus_utility.py"
-                if not await self.is_script_running(ssh_client, script_path):
-                    await self.start_script(ssh_client, script_path, command_args, executor_info)
+                if not await self.is_script_running(shell.ssh_client, script_path):
+                    await self.start_script(shell.ssh_client, script_path, command_args, executor_info)
 
                 # upload temp directory
-                await self.upload_directory(ssh_client, encrypted_files.tmp_directory, remote_dir)
+                random_length = random.randint(5, 15)
+                remote_dir = f"{executor_info.root_dir}/{self.ssh_service.generate_random_string(length=random_length, string_only=True)}"
+                await shell.upload_directory(encrypted_files.tmp_directory, remote_dir)
 
                 remote_machine_scrape_file_path = (
                     f"{remote_dir}/{encrypted_files.machine_scrape_file_name}"
                 )
-                remote_score_file_path = f"{remote_dir}/{encrypted_files.score_file_name}"
 
                 logger.info(
                     _m(
@@ -567,29 +461,15 @@ class TaskService:
                     ),
                 )
 
-                await ssh_client.run(f"chmod +x {remote_machine_scrape_file_path}")
+                await shell.ssh_client.run(f"chmod +x {remote_machine_scrape_file_path}")
                 machine_specs, _ = await self._run_task(
-                    ssh_client=ssh_client,
+                    ssh_client=shell.ssh_client,
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
                     command=f"{remote_machine_scrape_file_path}",
                 )
                 if not machine_specs:
-                    log_text = _m("No machine specs found", extra=get_extra_info(default_extra))
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
-                    )
+                    raise Exception("No machine specs found")
 
                 machine_spec = json.loads(
                     self.ssh_service.decrypt_payload(
@@ -666,8 +546,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -713,8 +591,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -741,8 +617,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -767,8 +641,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -793,8 +665,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -822,8 +692,6 @@ class TaskService:
                         )
 
                         return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
                             miner_info=miner_info,
                             executor_info=executor_info,
                             spec=machine_spec,
@@ -853,8 +721,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -871,7 +737,7 @@ class TaskService:
                 if rented_machine:
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running = await self.check_pod_running(
-                        ssh_client=ssh_client,
+                        ssh_client=shell.ssh_client,
                         miner_hotkey=miner_info.miner_hotkey,
                         container_name=container_name,
                         executor_info=executor_info,
@@ -888,8 +754,6 @@ class TaskService:
                         )
 
                         return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
                             miner_info=miner_info,
                             executor_info=executor_info,
                             spec=machine_spec,
@@ -922,8 +786,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -950,8 +812,6 @@ class TaskService:
                         )
 
                         return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
                             miner_info=miner_info,
                             executor_info=executor_info,
                             spec=machine_spec,
@@ -966,7 +826,7 @@ class TaskService:
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress:
                     success, log_text, log_status = await self.docker_connection_check(
-                        ssh_client=ssh_client,
+                        ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
                         executor_info=executor_info,
@@ -975,8 +835,6 @@ class TaskService:
                     )
                     if not success:
                         return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
                             miner_info=miner_info,
                             executor_info=executor_info,
                             spec=machine_spec,
@@ -997,7 +855,7 @@ class TaskService:
                 #     )
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
-                    ssh_client=ssh_client,
+                    ssh_client=shell.ssh_client,
                     miner_info=miner_info,
                     executor_info=executor_info,
                     remote_dir=remote_dir,
@@ -1013,8 +871,6 @@ class TaskService:
                         extra=get_extra_info(default_extra),
                     )
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -1052,8 +908,6 @@ class TaskService:
                 )
 
                 return await self._handle_task_result(
-                    ssh_client=ssh_client,
-                    remote_dir=remote_dir,
                     miner_info=miner_info,
                     executor_info=executor_info,
                     spec=machine_spec,
