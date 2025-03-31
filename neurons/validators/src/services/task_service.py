@@ -998,13 +998,9 @@ class TaskService:
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
                     ssh_client=ssh_client,
-                    miner_info=miner_info,
                     executor_info=executor_info,
-                    remote_dir=remote_dir,
-                    verifier_file_name=encrypted_files.verifier_file_name,
                     default_extra=default_extra,
-                    machine_spec=machine_spec,
-                    _run_task=self._run_task
+                    machine_spec=machine_spec
                 )
 
                 if not is_valid:

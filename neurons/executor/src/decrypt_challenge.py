@@ -69,8 +69,9 @@ class DMCompVerifyWrapper:
         """
         # Fetch the cipher text from the C++ function (assumes it's returned as a char*).
         cipher_text_ptr = self._lib.getCipherText(verifier_ptr)
-
+        print("cipher_text_ptr", cipher_text_ptr)
         if cipher_text_ptr:
+            print("Dddd", c_char_p(cipher_text_ptr))
             cipher_text = c_char_p(cipher_text_ptr).value  # Decode the C string
             return cipher_text
         else:
@@ -86,7 +87,7 @@ class DMCompVerifyWrapper:
 
         if cipher_text_ptr:
             cipher_text = c_char_p(cipher_text_ptr).value  # Decode the C string
-            return cipher_text.decode('utf-8')
+            return cipher_text.decode('utf-8', errors="replace")
         else:
             return None
 
@@ -98,9 +99,9 @@ class DMCompVerifyWrapper:
 
 def decrypt_challenge():
     parser = argparse.ArgumentParser(description="DMCompVerify Python Wrapper")
-    parser.add_argument("--lib", type=str, default="libdmcompverify.so", help="Path to the shared library")
-    parser.add_argument("--m_dim_n", type=int, default=1024, help="Matrix dimension n")
-    parser.add_argument("--m_dim_k", type=int, default=2043345, help="Matrix dimension k")
+    parser.add_argument("--lib", type=str, default="/usr/lib/libdmcompverify.so", help="Path to the shared library")
+    parser.add_argument("--dim_n", type=int, default=1024, help="Matrix dimension n")
+    parser.add_argument("--dim_k", type=int, default=2043345, help="Matrix dimension k")
     parser.add_argument("--seed", type=int, default=1234567890, help="Random seed")
     parser.add_argument("--cipher_text", type=str, default="IjBR7kbPvwFfxImr+M/f0lsKvgNoYb3RenOe4l12nzI79R9z", help="Cipher Text")
 
@@ -110,7 +111,7 @@ def decrypt_challenge():
     wrapper = DMCompVerifyWrapper(args.lib)
 
     # Create a new DMCompVerify object
-    verifier_ptr = wrapper.DMCompVerify_new(args.m_dim_n, args.m_dim_k)
+    verifier_ptr = wrapper.DMCompVerify_new(args.dim_n, args.dim_k)
     
     decoded_binary = base64.b64decode(args.cipher_text)
 
