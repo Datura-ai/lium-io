@@ -443,7 +443,7 @@ class DockerService:
                 # )
 
                 # Get the container path from the first volume
-                container_path = sanitized_volumes[0].split(':')[1] if sanitized_volumes else '/root'
+                container_path = sanitized_volumes[0].split(':')[-1] if sanitized_volumes else '/root'
                 entrypoint_flag = (
                     f"--entrypoint {custom_options.entrypoint}"
                     if custom_options
