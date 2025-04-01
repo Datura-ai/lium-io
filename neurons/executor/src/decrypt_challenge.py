@@ -25,13 +25,13 @@ class DMCompVerifyWrapper:
         self._lib.generateChallenge.restype = None
 
         self._lib.processChallengeResult.argtypes = [POINTER(c_void_p), c_longlong, c_char_p]
-        self._lib.processChallengeResult.restype = c_int
+        self._lib.processChallengeResult.restype = c_char_p
 
         self._lib.getUUID.argtypes = [c_void_p]
-        self._lib.getUUID.restype = c_int
+        self._lib.getUUID.restype = c_char_p
 
         self._lib.getCipherText.argtypes = [c_void_p]
-        self._lib.getCipherText.restype = c_int
+        self._lib.getCipherText.restype = c_char_p
 
         self._lib.free.argtypes = [c_void_p]
         self._lib.free.restype = None

@@ -35,13 +35,13 @@ class DMCompVerifyWrapper:
         self._lib.generateChallenge.restype = None
 
         self._lib.processChallengeResult.argtypes = [POINTER(c_void_p), c_longlong, c_char_p]
-        self._lib.processChallengeResult.restype = c_int
+        self._lib.processChallengeResult.restype = c_char_p
 
         self._lib.getUUID.argtypes = [c_void_p]
-        self._lib.getUUID.restype = c_int
+        self._lib.getUUID.restype = c_char_p
 
-        # self._lib.getCipherText.argtypes = [c_void_p]
-        # self._lib.getCipherText.restype = c_int
+        self._lib.getCipherText.argtypes = [c_void_p]
+        self._lib.getCipherText.restype = c_char_p
 
         self._lib.free.argtypes = [c_void_p]
         self._lib.free.restype = None
@@ -115,19 +115,12 @@ def encrypt_challenge(m_dim_n, m_dim_k, seed, machine_info, uuid):
         verifier_ptr = wrapper.DMCompVerify_new(m_dim_n, m_dim_k)
 
         print("machine_info:", machine_info)
-        print("seed:", seed)
-        print("uuid:", uuid)
-
-        # Example challenge generation
         wrapper.generateChallenge(verifier_ptr, seed, machine_info, uuid)
-        print("generateChallenge")
+
         cipher_text = wrapper.getCipherText(verifier_ptr)
-        print("cipher_text", cipher_text)
         base64_string = base64.b64encode(cipher_text).decode()
-        print("base64_string", base64_string)
         
         return base64_string
-        # return "IjBR7kbPvwFfxImr+M/f0lsKvgNoYb3RenOe4l12nzI79R9z"
     except Exception as e:
         logger.error("Failed encrypt challenge request: %s", str(e))
         return ""
@@ -212,23 +205,15 @@ class ValidationService:
         gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
         machine_info = json.dumps(gpu_info, sort_keys=True)
 
-        print("machine_info:", machine_info)
-
         verifier_params = VerifierParams.generate()
         gpu_memory = self.get_gpu_memory(machine_spec)
         verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
 
         verifier_params.cipher_text = encrypt_challenge(verifier_params.dim_n, verifier_params.dim_k, verifier_params.seed, machine_info, verifier_params.uuid)
 
-        print("cipher_text", verifier_params.cipher_text)
         command = (
             f"{executor_info.python_path} {script_path} {verifier_params}"
         )
-
-        print("command", command)
-        # Run the script
-        result = await ssh_client.run(command)
-        logger.info(f"{script_path}: {result}")
 
         log_extra = {
             **default_extra,
@@ -236,14 +221,19 @@ class ValidationService:
             "dim_k": verifier_params.dim_k,
             "seed": verifier_params.seed,
             "uuid": verifier_params.uuid,
+            "cipher_text": verifier_params.cipher_text,
         }
 
-        if not result:
+        logger.info(_m("Matrix Multiplication Python Script Command", extra=get_extra_info(log_extra)))
+        # Run the script
+        result = await ssh_client.run(command)
+        logger.info(f"{script_path}: {result}")
+
+        if result is None:
             logger.warning(_m("GPU model validation job failed", extra=get_extra_info(log_extra)))
             return False
 
         uuid = result.stdout.strip()
-        print("uuid", uuid)
 
         if uuid == verifier_params.uuid:
             logger.info(_m("Matrix Mulitiplication Verification Succeed", extra=get_extra_info(log_extra)))
