@@ -447,6 +447,11 @@ class DockerService:
                     and custom_options.entrypoint.strip()
                     else ""
                 )
+                shm_size_flag = (
+                    f"--shm-size {custom_options.shm_size}"
+                    if custom_options and custom_options.shm_size
+                    else ""
+                )
                 env_flags = (
                     " ".join(
                         [
@@ -491,9 +496,11 @@ class DockerService:
                 container_name = f"container_{uuid}"
 
                 if payload.debug:
-                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} {env_flags} --mount source={volume_name},target=/root --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flags} {entrypoint_flag} {env_flags} {shm_size_flag} --mount source={volume_name},target=/root --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
-                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} {env_flags} --mount source={volume_name},target=/root --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {port_flags} {volume_flags} {entrypoint_flag} {env_flags} {shm_size_flag} --mount source={volume_name},target=/root --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
+
+                logger.info(f"Running command: {command}")
 
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
