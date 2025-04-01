@@ -1,16 +1,16 @@
-name: "CD: validtor (prod)"
+name: "CD: miner (dev)"
 
 on:
   push:
     branches:
-      - 'prod_validtor'
+      - 'dev_miner'
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      TAG: "latest" 
-      TARGET_FILE: "docker-compose.app.yml"
+      TAG: "dev" 
+      TARGET_FILE: "docker-compose.app.dev.yml"
       DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 
@@ -19,15 +19,15 @@ jobs:
 
       - name: Make scripts executable
         run: |
-          chmod +x neurons/validators/docker_publish.sh
-          chmod +x neurons/validators/docker_runner_publish.sh
+          chmod +x neurons/miners/docker_publish.sh
+          chmod +x neurons/miners/docker_runner_publish.sh
           
       - name: Run docker_publish.sh
         run: |
-          cd neurons/validators
+          cd neurons/miners
           ./docker_publish.sh
           
       - name: Run docker_runner_publish.sh
         run: |
-          cd neurons/validators
+          cd neurons/miners
           ./docker_runner_publish.sh

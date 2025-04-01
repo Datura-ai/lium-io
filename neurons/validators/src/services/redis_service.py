@@ -10,6 +10,7 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_SET = "pending_pods"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
+RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
@@ -134,6 +135,9 @@ class RedisService:
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str):
         await self.srem(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
 
+    async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
+        return await self.is_elem_exists_in_set(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+
     async def clear_all_executor_counts(self):
         pattern = f"{EXECUTOR_COUNT_PREFIX}:*"
         cursor = 0
@@ -152,11 +156,13 @@ class RedisService:
         executor_id: str,
         prev_info: dict = {},
         success: bool = True,
-        spec: str = ''
+        spec: str = '',
+        uuids: str = '',
     ):
         count = prev_info.get('count', 0)
         failed = prev_info.get('failed', 0)
         prev_spec = prev_info.get('spec', '')
+        prev_uuids = prev_info.get('uuids', '')
 
         if (success):
             count += 1
@@ -173,7 +179,8 @@ class RedisService:
         data = {
             "count": count,
             "failed": failed,
-            "spec": spec if spec else prev_spec
+            "spec": prev_spec if prev_spec else spec,
+            "uuids": prev_uuids if prev_uuids else uuids,
         }
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
@@ -185,16 +192,15 @@ class RedisService:
         prev_info: dict = {}
     ):
         spec = prev_info.get('spec', '')
+        uuids = prev_info.get('uuids', '')
+
         data = {
             "count": 0,
             "failed": 0,
             "spec": spec,
+            "uuids": uuids,
         }
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
-
-        # remove available port maps for the executor
-        port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
-        await self.delete(port_map_key)
 
         await self.publish(
             RESET_VERIFIED_JOB_CHANNEL,

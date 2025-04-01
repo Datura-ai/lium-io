@@ -10,11 +10,13 @@ class CustomOptions(BaseModel):
     entrypoint: str | None = None
     internal_ports: list[int] | None = None
     startup_commands: str | None = None
+    shm_size: str | None = None
 
 
 class MinerJobRequestPayload(BaseModel):
     job_batch_id: str
     miner_hotkey: str
+    miner_coldkey: str
     miner_address: str
     miner_port: int
 
@@ -25,6 +27,7 @@ class MinerJobEnryptedFiles(BaseModel):
     tmp_directory: str
     machine_scrape_file_name: str
     score_file_name: str
+    verifier_file_name: str
 
 
 class ResourceType(BaseModel):
@@ -51,6 +54,7 @@ class ContainerRequestType(enum.Enum):
     ContainerStartRequest = "ContainerStartRequest"
     ContainerStopRequest = "ContainerStopRequest"
     ContainerDeleteRequest = "ContainerDeleteRequest"
+    AddSshPublicKey = "AddSshPublicKey"
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
 
 
@@ -65,14 +69,21 @@ class ContainerBaseRequest(BaseRequest):
 class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
-    user_public_key: str
+    user_public_keys: list[str] = []
     custom_options: CustomOptions | None = None
     debug: bool | None = None
+    volume_name: str | None = None  # when edit pod, volume_name is required
 
 
 class ContainerStartRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStartRequest
     container_name: str
+
+
+class AddSshPublicKeyRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.AddSshPublicKey
+    container_name: str
+    user_public_keys: list[str] = []
 
 
 class ContainerStopRequest(ContainerBaseRequest):
@@ -91,6 +102,7 @@ class ContainerResponseType(enum.Enum):
     ContainerStarted = "ContainerStarted"
     ContainerStopped = "ContainerStopped"
     ContainerDeleted = "ContainerDeleted"
+    SshPubKeyAdded = "SshPubKeyAdded"
     FailedRequest = "FailedRequest"
 
 
@@ -100,14 +112,11 @@ class ContainerBaseResponse(BaseRequest):
     executor_id: str
 
 
-class ContainerCreatedResult(BaseModel):
+class ContainerCreated(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
     container_name: str
     volume_name: str
     port_maps: list[tuple[int, int]]
-
-
-class ContainerCreated(ContainerBaseResponse, ContainerCreatedResult):
-    message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -126,17 +135,33 @@ class ContainerDeleted(ContainerBaseResponse):
     volume_name: str
 
 
+class SshPubKeyAdded(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
+
+
 class FailedContainerErrorCodes(enum.Enum):
     UnknownError = "UnknownError"
+    NoSshKeys = "NoSshKeys"
     ContainerNotRunning = "ContainerNotRunning"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
     ExceptionError = "ExceptionError"
     FailedMsgFromMiner = "FailedMsgFromMiner"
+    RentingInProgress = "RentingInProgress"
+
+
+class FailedContainerErrorTypes(enum.Enum):
+    ContainerCreationFailed = "ContainerCreationFailed"
+    ContainerDeletionFailed = "ContainerDeletionFailed"
+    ContainerStopFailed = "ContainerStopFailed"
+    ContainerStartFailed = "ContainerStartFailed"
+    AddSSkeyFailed = "AddSSkeyFailed"
+    UnknownRequest = "UnknownRequest"
 
 
 class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
+    error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     msg: str
     error_code: FailedContainerErrorCodes | None = None
 
@@ -144,3 +169,4 @@ class FailedContainerRequest(ContainerBaseResponse):
 class DuplicateExecutorsResponse(BaseModel):
     message_type: ContainerRequestType = ContainerRequestType.DuplicateExecutorsResponse
     executors: dict[str, list]
+    rental_succeed_executors: list[str] | None = None

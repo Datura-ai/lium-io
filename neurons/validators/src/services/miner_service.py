@@ -15,15 +15,11 @@ from datura.requests.validator_requests import SSHPubKeyRemoveRequest, SSHPubKey
 from fastapi import Depends
 from payload_models.payloads import (
     ContainerBaseRequest,
-    ContainerCreated,
     ContainerCreateRequest,
-    ContainerDeleted,
     ContainerDeleteRequest,
-    ContainerStarted,
-    ContainerStartRequest,
-    ContainerStopped,
-    ContainerStopRequest,
+    AddSshPublicKeyRequest,
     FailedContainerErrorCodes,
+    FailedContainerErrorTypes,
     FailedContainerRequest,
     MinerJobEnryptedFiles,
     MinerJobRequestPayload,
@@ -57,9 +53,8 @@ class MinerService:
     async def request_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
-        encypted_files: MinerJobEnryptedFiles,
+        encrypted_files: MinerJobEnryptedFiles,
         docker_hub_digests: dict[str, str],
-        debug=False,
     ):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -129,9 +124,8 @@ class MinerService:
                                 keypair=my_key,
                                 private_key=private_key.decode("utf-8"),
                                 public_key=public_key.decode("utf-8"),
-                                encypted_files=encypted_files,
+                                encrypted_files=encrypted_files,
                                 docker_hub_digests=docker_hub_digests,
-                                debug=debug,
                             )
                         )
                         for executor_info in msg.executors
@@ -152,7 +146,7 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
-                    await self.publish_machine_specs(results, miner_client.miner_hotkey)
+                    await self.publish_machine_specs(results, miner_client.miner_hotkey, payload.miner_coldkey)
                     await self.store_executor_counts(
                         payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results
                     )
@@ -211,7 +205,7 @@ class MinerService:
             return None
 
     async def publish_machine_specs(
-        self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str
+        self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str, miner_coldkey: str
     ):
         """Publish machine specs to compute app connector process"""
         default_extra = {
@@ -239,9 +233,11 @@ class MinerService:
                     {
                         "specs": specs,
                         "miner_hotkey": miner_hotkey,
+                        "miner_coldkey": miner_coldkey,
                         "executor_uuid": ssh_info.uuid,
                         "executor_ip": ssh_info.address,
                         "executor_port": ssh_info.port,
+                        "executor_price": ssh_info.price,
                         "score": score,
                         "synthetic_job_score": synthetic_job_score,
                         "job_batch_id": job_batch_id,
@@ -297,6 +293,43 @@ class MinerService:
                 exc_info=True,
             )
 
+    def _handle_container_error(self, payload: ContainerBaseRequest, msg: str, error_code: FailedContainerErrorCodes):
+        logger.error(msg)
+
+        if isinstance(payload, ContainerCreateRequest):
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=msg,
+                error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                error_code=error_code,
+            )
+
+        elif isinstance(payload, ContainerDeleteRequest):
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=msg,
+                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+                error_code=error_code,
+            )
+        elif isinstance(payload, AddSshPublicKeyRequest):
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=msg,
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                error_code=error_code,
+            )
+        else:
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=msg,
+                error_type=FailedContainerErrorTypes.UnknownRequest,
+                error_code=error_code,
+            )
+
     async def handle_container(self, payload: ContainerBaseRequest):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -335,27 +368,10 @@ class MinerService:
                     _m("Sent SSH key to miner.", extra=get_extra_info(default_extra)),
                 )
 
-                try:
-                    msg = await asyncio.wait_for(
-                        miner_client.job_state.miner_accepted_ssh_key_or_failed_future,
-                        timeout=JOB_LENGTH,
-                    )
-                except TimeoutError:
-                    logger.error(
-                        _m(
-                            "Waiting accepted ssh key or failed request from miner resulted in an timeout error",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
-                    msg = None
-                except Exception as e:
-                    logger.error(
-                        _m(
-                            "Waiting accepted ssh key or failed request from miner resulted in an exception",
-                            extra=get_extra_info({**default_extra, "error": str(e)}),
-                        ),
-                    )
-                    msg = None
+                msg = await asyncio.wait_for(
+                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future,
+                    timeout=JOB_LENGTH,
+                )
 
                 if isinstance(msg, AcceptSSHKeyRequest):
                     logger.info(
@@ -368,18 +384,11 @@ class MinerService:
                     try:
                         executor = msg.executors[0]
                     except Exception as e:
-                        logger.error(
-                            _m(
-                                "Error: Miner didn't return executor info",
-                                extra=get_extra_info({**default_extra, "error": str(e)}),
-                            ),
-                        )
                         executor = None
 
                     if executor is None or executor.uuid != payload.executor_id:
-                        logger.error(
-                            _m("Error: Invalid executor id", extra=get_extra_info(default_extra)),
-                        )
+                        log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key, executor_id=payload.executor_id
@@ -388,157 +397,77 @@ class MinerService:
 
                         await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
 
-                        return FailedContainerRequest(
-                            miner_hotkey=payload.miner_hotkey,
-                            executor_id=payload.executor_id,
-                            msg=f"Invalid executor id {payload.executor_id}",
-                            error_code=FailedContainerErrorCodes.InvalidExecutorId,
+                        return self._handle_container_error(
+                            payload=payload,
+                            msg=str(log_text),
+                            error_code=FailedContainerErrorCodes.InvalidExecutorId
                         )
 
-                    try:
-                        if isinstance(payload, ContainerCreateRequest):
-                            logger.info(
-                                _m(
-                                    "Creating container",
-                                    extra=get_extra_info(
-                                        {**default_extra, "payload": str(payload)}
-                                    ),
-                                ),
-                            )
-                            result = await docker_service.create_container(
-                                payload,
-                                executor,
-                                my_key,
-                                private_key.decode("utf-8"),
-                            )
+                    renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id)
+                    if renting_in_progress:
+                        log_text = _m(
+                            "Decline renting pod request. Renting is still in progress",
+                            extra=get_extra_info(default_extra),
+                        )
 
-                            await miner_client.send_model(
-                                SSHPubKeyRemoveRequest(
-                                    public_key=public_key, executor_id=payload.executor_id
-                                )
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
                             )
+                        )
 
-                            if isinstance(result, FailedContainerRequest):
-                                return result
+                        return self._handle_container_error(
+                            payload=payload,
+                            msg=str(log_text),
+                            error_code=FailedContainerErrorCodes.RentingInProgress,
+                        )
 
-                            return ContainerCreated(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                container_name=result.container_name,
-                                volume_name=result.volume_name,
-                                port_maps=result.port_maps,
-                            )
-
-                        # elif isinstance(payload, ContainerStartRequest):
-                        #     logger.info(
-                        #         _m(
-                        #             "Starting container",
-                        #             extra=get_extra_info(
-                        #                 {**default_extra, "payload": str(payload)}
-                        #             ),
-                        #         ),
-                        #     )
-                        #     await docker_service.start_container(
-                        #         payload,
-                        #         executor,
-                        #         my_key,
-                        #         private_key.decode("utf-8"),
-                        #     )
-
-                        #     logger.info(
-                        #         _m(
-                        #             "Started Container",
-                        #             extra=get_extra_info(
-                        #                 {**default_extra, "payload": str(payload)}
-                        #             ),
-                        #         ),
-                        #     )
-                        #     await miner_client.send_model(
-                        #         SSHPubKeyRemoveRequest(
-                        #             public_key=public_key, executor_id=payload.executor_id
-                        #         )
-                        #     )
-
-                        #     return ContainerStarted(
-                        #         miner_hotkey=payload.miner_hotkey,
-                        #         executor_id=payload.executor_id,
-                        #         container_name=payload.container_name,
-                        #     )
-                        # elif isinstance(payload, ContainerStopRequest):
-                        #     await docker_service.stop_container(
-                        #         payload,
-                        #         executor,
-                        #         my_key,
-                        #         private_key.decode("utf-8"),
-                        #     )
-                        #     await miner_client.send_model(
-                        #         SSHPubKeyRemoveRequest(
-                        #             public_key=public_key, executor_id=payload.executor_id
-                        #         )
-                        #     )
-
-                        #     return ContainerStopped(
-                        #         miner_hotkey=payload.miner_hotkey,
-                        #         executor_id=payload.executor_id,
-                        #         container_name=payload.container_name,
-                        #     )
-                        elif isinstance(payload, ContainerDeleteRequest):
-                            logger.info(
-                                _m(
-                                    "Deleting container",
-                                    extra=get_extra_info(
-                                        {**default_extra, "payload": str(payload)}
-                                    ),
-                                ),
-                            )
-                            await docker_service.delete_container(
-                                payload,
-                                executor,
-                                my_key,
-                                private_key.decode("utf-8"),
-                            )
-
-                            logger.info(
-                                _m(
-                                    "Deleted Container",
-                                    extra=get_extra_info(
-                                        {**default_extra, "payload": str(payload)}
-                                    ),
-                                ),
-                            )
-                            await miner_client.send_model(
-                                SSHPubKeyRemoveRequest(
-                                    public_key=public_key, executor_id=payload.executor_id
-                                )
-                            )
-
-                            return ContainerDeleted(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                container_name=payload.container_name,
-                                volume_name=payload.volume_name,
-                            )
-                        else:
-                            logger.error(
-                                _m(
-                                    "Unexpected request",
-                                    extra=get_extra_info(
-                                        {**default_extra, "payload": str(payload)}
-                                    ),
-                                ),
-                            )
-                            return FailedContainerRequest(
-                                miner_hotkey=payload.miner_hotkey,
-                                executor_id=payload.executor_id,
-                                msg=f"Unexpected request: {payload}",
-                                error_code=FailedContainerErrorCodes.UnknownError,
-                            )
-
-                    except Exception as e:
-                        logger.error(
+                    if isinstance(payload, ContainerCreateRequest):
+                        logger.info(
                             _m(
-                                "Error: create container error",
-                                extra=get_extra_info({**default_extra, "error": str(e)}),
+                                "Creating container",
+                                extra=get_extra_info(
+                                    {**default_extra, "payload": str(payload)}
+                                ),
+                            ),
+                        )
+                        result = await docker_service.create_container(
+                            payload,
+                            executor,
+                            my_key,
+                            private_key.decode("utf-8"),
+                        )
+
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
+                            )
+                        )
+
+                        return result
+
+                    elif isinstance(payload, ContainerDeleteRequest):
+                        logger.info(
+                            _m(
+                                "Deleting container",
+                                extra=get_extra_info(
+                                    {**default_extra, "payload": str(payload)}
+                                ),
+                            ),
+                        )
+                        result = await docker_service.delete_container(
+                            payload,
+                            executor,
+                            my_key,
+                            private_key.decode("utf-8"),
+                        )
+
+                        logger.info(
+                            _m(
+                                "Deleted Container",
+                                extra=get_extra_info(
+                                    {**default_extra, "payload": str(payload)}
+                                ),
                             ),
                         )
                         await miner_client.send_model(
@@ -547,37 +476,79 @@ class MinerService:
                             )
                         )
 
-                        return FailedContainerRequest(
-                            miner_hotkey=payload.miner_hotkey,
-                            executor_id=payload.executor_id,
-                            msg=f"create container error: {str(e)}",
-                            error_code=FailedContainerErrorCodes.ExceptionError,
+                        return result
+                    elif isinstance(payload, AddSshPublicKeyRequest):
+                        logger.info(
+                            _m(
+                                "adding ssh key to container",
+                                extra=get_extra_info(
+                                    {**default_extra, "payload": str(payload)}
+                                ),
+                            ),
+                        )
+                        result = await docker_service.add_ssh_key(
+                            payload,
+                            executor,
+                            my_key,
+                            private_key.decode("utf-8"),
+                        )
+
+                        logger.info(
+                            _m(
+                                "Added ssh to the container",
+                                extra=get_extra_info(
+                                    {**default_extra, "payload": str(payload)}
+                                ),
+                            ),
+                        )
+
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
+                            )
+                        )
+
+                        return result
+                    else:
+                        log_text = _m(
+                            "Unexpected request",
+                            extra=get_extra_info(
+                                {**default_extra, "payload": str(payload)}
+                            ),
+                        )
+
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
+                            )
+                        )
+
+                        return self._handle_container_error(
+                            payload=payload,
+                            msg=str(log_text),
+                            error_code=FailedContainerErrorCodes.UnknownError,
                         )
 
                 elif isinstance(msg, FailedRequest):
-                    logger.info(
-                        _m(
-                            "Error: Miner failed job",
-                            extra=get_extra_info({**default_extra, "msg": str(msg)}),
-                        ),
+                    log_text = _m(
+                        "Error: Miner failed job",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     )
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        msg=f"Failed request from miner: {str(msg)}",
+
+                    return self._handle_container_error(
+                        payload=payload,
+                        msg=str(log_text),
                         error_code=FailedContainerErrorCodes.FailedMsgFromMiner,
                     )
                 else:
-                    logger.error(
-                        _m(
-                            "Error: Unexpected msg",
-                            extra=get_extra_info({**default_extra, "msg": str(msg)}),
-                        ),
+                    log_text = _m(
+                        "Error: Unexpected msg",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     )
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        msg=f"Unexpected msg: {str(msg)}",
+
+                    return self._handle_container_error(
+                        payload=payload,
+                        msg=str(log_text),
                         error_code=FailedContainerErrorCodes.UnknownError,
                     )
         except Exception as e:
@@ -586,12 +557,9 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
 
-            logger.error(log_text, exc_info=True)
-
-            return FailedContainerRequest(
-                miner_hotkey=payload.miner_hotkey,
-                executor_id=payload.executor_id,
-                msg=f"Exception: {str(e)}",
+            return self._handle_container_error(
+                payload=payload,
+                msg=str(log_text),
                 error_code=FailedContainerErrorCodes.ExceptionError,
             )
 

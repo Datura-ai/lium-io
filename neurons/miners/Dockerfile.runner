@@ -1,6 +1,7 @@
 FROM docker:26-cli
 WORKDIR /root/miner
-COPY docker-compose.app.yml docker-compose.yml
+ARG targetFile
+COPY ${targetFile} docker-compose.yml
 COPY entrypoint.sh /entrypoint.sh
 COPY version.txt .
 

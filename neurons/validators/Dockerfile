@@ -25,11 +25,16 @@ ENV PYTHONPATH=/opt/pypackages/lib:/root/app
 
 COPY . .
 
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS cuda-build
+
+RUN apt-get update && apt-get install -y cmake g++ wget \
+  && apt-get install -y nvidia-cuda-toolkit
+  
 FROM $BASE_IMAGE AS secondary-image
 LABEL builder=false
 
 RUN apt-get update \
-  && apt-get install -y wget gcc ccache patchelf \
+  && apt-get install -y make wget gcc ccache patchelf g++ \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
@@ -39,6 +44,8 @@ ENV USE_TORCH=0
 ENV PYTHONUNBUFFERED=1
 ENV PATH=/opt/pypackages/bin:$PATH
 ENV PYTHONPATH=/opt/pypackages/lib:/root/app
+ENV PATH=/usr/local/cuda/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
 RUN echo "export PYTHONPATH=$PYTHONPATH" >> /etc/profile
 RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bashrc
@@ -46,5 +53,7 @@ RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bash_profile
 
 COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
+COPY --from=cuda-build /usr/local/cuda /usr/local/cuda
 
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so.1
 CMD ["bash", "run.sh"]
