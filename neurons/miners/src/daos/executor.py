@@ -10,12 +10,30 @@ class ExecutorDao(BaseDao):
         self.session.refresh(executor)
         return executor
 
-    def delete_by_address_port(self, address: str, port: int) -> None:
+    def findOne(self, address: str, port: int):
         executor = self.session.query(Executor).filter_by(
             address=address, port=port).first()
-        if executor:
-            self.session.delete(executor)
-            self.session.commit()
+        if not executor:
+            raise Exception('Not found executor')
+
+        return executor
+
+    def update(self, executor: Executor) -> Executor:
+        existing_executor = self.findOne(executor.address, executor.port)
+
+        existing_executor.address = executor.address
+        existing_executor.port = executor.port
+        existing_executor.validator = executor.validator
+
+        self.session.commit()
+        self.session.refresh(existing_executor)
+        return existing_executor
+
+    def delete_by_address_port(self, address: str, port: int) -> None:
+        executor = self.findOne(address, port)
+
+        self.session.delete(executor)
+        self.session.commit()
 
     def get_executors_for_validator(self, validator_key: str, executor_id: Optional[str] = None) -> list[Executor]:
         """Get executors that opened to valdiator

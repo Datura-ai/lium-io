@@ -10,6 +10,7 @@ class CustomOptions(BaseModel):
     entrypoint: str | None = None
     internal_ports: list[int] | None = None
     startup_commands: str | None = None
+    shm_size: str | None = None
 
 
 class MinerJobRequestPayload(BaseModel):
@@ -25,7 +26,7 @@ class MinerJobEnryptedFiles(BaseModel):
     all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
-    # score_file_name: str
+    score_file_name: str
     verifier_file_name: str
 
 

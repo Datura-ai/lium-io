@@ -120,8 +120,7 @@ dependencies = [
     "wheel==0.45.1",
     "xxhash==3.5.0",
     "yarl==1.18.3",
-    "zstandard==0.23.0",
-    "pexpect>=4.9.0"
+    "zstandard==0.23.0"
 ]
 requires-python = "==3.11.11"
 readme = "README.md"
