@@ -1,5 +1,4 @@
 import os
-import base64
 import argparse
 from ctypes import CDLL, c_longlong, POINTER, c_int, c_void_p, c_char_p
 
@@ -30,9 +29,6 @@ class DMCompVerifyWrapper:
         self._lib.getUUID.argtypes = [c_void_p]
         self._lib.getUUID.restype = c_char_p
 
-        self._lib.getCipherText.argtypes = [c_void_p]
-        self._lib.getCipherText.restype = c_char_p
-
         self._lib.free.argtypes = [c_void_p]
         self._lib.free.restype = None
 
@@ -62,32 +58,17 @@ class DMCompVerifyWrapper:
         result = self._lib.processChallengeResult(verifier_ptr, seed, cipher_text)
         return result
 
-    def getCipherText(self, verifier_ptr: POINTER(c_void_p)) -> str:
-        """
-        Wrap the C++ function getCipherText.
-        Retrieves the cipher text as a string.
-        """
-        # Fetch the cipher text from the C++ function (assumes it's returned as a char*).
-        cipher_text_ptr = self._lib.getCipherText(verifier_ptr)
-        print("cipher_text_ptr", cipher_text_ptr)
-        if cipher_text_ptr:
-            print("Dddd", c_char_p(cipher_text_ptr))
-            cipher_text = c_char_p(cipher_text_ptr).value  # Decode the C string
-            return cipher_text
-        else:
-            return None
-
     def getUUID(self, verifier_ptr: POINTER(c_void_p)) -> str:
         """
         Wrap the C++ function getUUID.
         Retrieves the UUID as a string.
         """
          # Extract the pointer returned by the C++ function, and convert it to a C string (char*) using c_char_p
-        cipher_text_ptr = self._lib.getUUID(verifier_ptr)
+        uuid_ptr = self._lib.getUUID(verifier_ptr)
 
-        if cipher_text_ptr:
-            cipher_text = c_char_p(cipher_text_ptr).value  # Decode the C string
-            return cipher_text.decode('utf-8', errors="replace")
+        if uuid_ptr:
+            uuid = c_char_p(uuid_ptr).value  # Decode the C string
+            return uuid.decode('utf-8')
         else:
             return None
 
@@ -100,10 +81,10 @@ class DMCompVerifyWrapper:
 def decrypt_challenge():
     parser = argparse.ArgumentParser(description="DMCompVerify Python Wrapper")
     parser.add_argument("--lib", type=str, default="/usr/lib/libdmcompverify.so", help="Path to the shared library")
-    parser.add_argument("--dim_n", type=int, default=1024, help="Matrix dimension n")
-    parser.add_argument("--dim_k", type=int, default=2043345, help="Matrix dimension k")
-    parser.add_argument("--seed", type=int, default=1234567890, help="Random seed")
-    parser.add_argument("--cipher_text", type=str, default="IjBR7kbPvwFfxImr+M/f0lsKvgNoYb3RenOe4l12nzI79R9z", help="Cipher Text")
+    parser.add_argument("--dim_n", type=int, default=1981, help="Matrix dimension n")
+    parser.add_argument("--dim_k", type=int, default=1555929, help="Matrix dimension k")
+    parser.add_argument("--seed", type=int, default=1743502434, help="Random seed")
+    parser.add_argument("--cipher_text", type=str, default="e28702c2f187f34d56744d64a4399e00cbecbde2d3f6ca53a8abec5cbc40481d42a1a505", help="Cipher Text")
 
     args = parser.parse_args()
     
@@ -112,11 +93,9 @@ def decrypt_challenge():
 
     # Create a new DMCompVerify object
     verifier_ptr = wrapper.DMCompVerify_new(args.dim_n, args.dim_k)
-    
-    decoded_binary = base64.b64decode(args.cipher_text)
 
     # Example of processing challenge result
-    wrapper.processChallengeResult(verifier_ptr, args.seed, decoded_binary)
+    wrapper.processChallengeResult(verifier_ptr, args.seed, args.cipher_text.encode('utf-8'))
 
     # Example to get the UUID
     uuid = wrapper.getUUID(verifier_ptr)

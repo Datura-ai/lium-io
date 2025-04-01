@@ -4,11 +4,10 @@ import logging
 import json 
 import os
 import uuid as uuid4
-import base64
 from dataclasses import dataclass
-from typing import Self, Callable
+from typing import Self
 from core.utils import _m, get_extra_info
-from ctypes import CDLL, c_longlong, POINTER, c_int, c_void_p, c_char_p
+from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +35,6 @@ class DMCompVerifyWrapper:
 
         self._lib.processChallengeResult.argtypes = [POINTER(c_void_p), c_longlong, c_char_p]
         self._lib.processChallengeResult.restype = c_char_p
-
-        self._lib.getUUID.argtypes = [c_void_p]
-        self._lib.getUUID.restype = c_char_p
 
         self._lib.getCipherText.argtypes = [c_void_p]
         self._lib.getCipherText.restype = c_char_p
@@ -82,21 +78,7 @@ class DMCompVerifyWrapper:
 
         if cipher_text_ptr:
             cipher_text = c_char_p(cipher_text_ptr).value  # Decode the C string
-            return cipher_text
-        else:
-            return None
-
-    def getUUID(self, verifier_ptr: POINTER(c_void_p)) -> str:
-        """
-        Wrap the C++ function getUUID.
-        Retrieves the UUID as a string.
-        """
-         # Extract the pointer returned by the C++ function, and convert it to a C string (char*) using c_char_p
-        uuid_ptr = self._lib.getUUID(verifier_ptr)
-
-        if uuid_ptr:
-            uuid = c_char_p(uuid_ptr).value  # Decode the C string
-            return uuid
+            return cipher_text.decode('utf-8')
         else:
             return None
 
@@ -118,9 +100,8 @@ def encrypt_challenge(m_dim_n, m_dim_k, seed, machine_info, uuid):
         wrapper.generateChallenge(verifier_ptr, seed, machine_info, uuid)
 
         cipher_text = wrapper.getCipherText(verifier_ptr)
-        base64_string = base64.b64encode(cipher_text).decode()
         
-        return base64_string
+        return cipher_text
     except Exception as e:
         logger.error("Failed encrypt challenge request: %s", str(e))
         return ""
