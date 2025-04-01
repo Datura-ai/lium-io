@@ -92,11 +92,11 @@ class DMCompVerifyWrapper:
         Retrieves the UUID as a string.
         """
          # Extract the pointer returned by the C++ function, and convert it to a C string (char*) using c_char_p
-        cipher_text_ptr = self._lib.getUUID(verifier_ptr)
+        uuid_ptr = self._lib.getUUID(verifier_ptr)
 
-        if cipher_text_ptr:
-            cipher_text = c_char_p(cipher_text_ptr).value  # Decode the C string
-            return cipher_text
+        if uuid_ptr:
+            uuid = c_char_p(uuid_ptr).value  # Decode the C string
+            return uuid
         else:
             return None
 
