@@ -394,8 +394,9 @@ class MinerService:
                                 public_key=public_key, executor_id=payload.executor_id
                             )
                         )
-
-                        await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
+                        
+                        if executor:
+                            await self.redis_service.remove_rented_machine(executor)
 
                         return self._handle_container_error(
                             payload=payload,

@@ -731,7 +731,7 @@ class DockerService:
                     ),
                 )
 
-                await self.redis_service.remove_rented_machine(payload.miner_hotkey, payload.executor_id)
+                await self.redis_service.remove_rented_machine(executor_info)
 
                 return ContainerDeleted(
                     miner_hotkey=payload.miner_hotkey,
