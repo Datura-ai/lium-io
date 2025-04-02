@@ -17,12 +17,7 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from core.config import settings
 from core.utils import _m, context, get_extra_info
 from services.const import (
-    DOWNLOAD_SPEED_WEIGHT,
     GPU_MAX_SCORES,
-    JOB_TAKEN_TIME_WEIGHT,
-    MAX_DOWNLOAD_SPEED,
-    MAX_UPLOAD_SPEED,
-    UPLOAD_SPEED_WEIGHT,
     MAX_GPU_COUNT,
     UNRENTED_MULTIPLIER,
     LIB_NVIDIA_ML_DIGESTS,
@@ -30,7 +25,6 @@ from services.const import (
     PYTHON_DIGEST,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
-    VERIFY_JOB_REQUIRED_COUNT,
 )
 from services.redis_service import (
     RedisService,
@@ -356,7 +350,6 @@ class TaskService:
     async def check_pod_running(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-        miner_hotkey: str,
         container_name: str,
         executor_info: ExecutorSSHInfo,
     ):
@@ -366,7 +359,7 @@ class TaskService:
             return True
 
         # remove pod in redis
-        await self.redis_service.remove_rented_machine(miner_hotkey, executor_info.uuid)
+        await self.redis_service.remove_rented_machine(executor_info)
 
         return False
 
@@ -867,12 +860,11 @@ class TaskService:
                     )
 
                 # check rented status
-                rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info.uuid)
+                rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info)
                 if rented_machine:
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running = await self.check_pod_running(
                         ssh_client=ssh_client,
-                        miner_hotkey=miner_info.miner_hotkey,
                         container_name=container_name,
                         executor_info=executor_info,
                     )
