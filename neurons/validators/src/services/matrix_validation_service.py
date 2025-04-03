@@ -214,11 +214,14 @@ class ValidationService:
             logger.warning(_m("GPU model validation job failed", extra=get_extra_info(log_extra)))
             return False
 
-        uuid = result.stdout.strip()
+        stdout = result.stdout.strip()
 
-        if uuid == verifier_params.uuid:
+        # Extract UUID from stdout
+        uuid_line = next((line for line in stdout.splitlines() if line.startswith("UUID:")), None)
+        uuid = uuid_line.split("UUID:")[1].strip() if uuid_line else ""
+        uuid_array = verifier_params.uuid.split(",")
+        if uuid in uuid_array:
             logger.info(_m("Matrix Mulitiplication Verification Succeed", extra=get_extra_info(log_extra)))
-            return True
         else:
             logger.info(_m("Matrix Mulitiplication Verification Failed", extra=get_extra_info(log_extra)))
             return False

@@ -99,7 +99,7 @@ def decrypt_challenge():
 
     # Example to get the UUID
     uuid = wrapper.getUUID(verifier_ptr)
-    print(uuid)
+    print("UUID: ", uuid)
 
     # Free resources
     wrapper.free(verifier_ptr)
