@@ -10,6 +10,7 @@ class CustomOptions(BaseModel):
     entrypoint: str | None = None
     internal_ports: list[int] | None = None
     startup_commands: str | None = None
+    shm_size: str | None = None
 
 
 class MinerJobRequestPayload(BaseModel):
@@ -135,6 +136,7 @@ class ContainerDeleted(ContainerBaseResponse):
 
 class SshPubKeyAdded(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
+    user_public_keys: list[str] = []
 
 
 class FailedContainerErrorCodes(enum.Enum):
