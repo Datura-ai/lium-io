@@ -824,6 +824,7 @@ class DockerService:
                 return SshPubKeyAdded(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
             log_text = _m(
