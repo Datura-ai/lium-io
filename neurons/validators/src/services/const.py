@@ -1,7 +1,5 @@
 MIN_JOB_TAKEN_TIME = 20
 
-JOB_TIME_OUT = 60 * 10
-
 GPU_MAX_SCORES = {
     # Latest Gen NVIDIA GPUs (Averaged if applicable)
     "NVIDIA H200": 4.65,
