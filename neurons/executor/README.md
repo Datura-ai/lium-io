@@ -65,3 +65,29 @@ Note: Please use either **RENTING_PORT_RANGE** or **RENTING_PORT_MAPPINGS** and 
 ```shell
 docker compose up -d
 ```
+
+## Recommended Setup For GPUs and Docker
+
+Step 1: Ensure `nvidia-container-toolkit` is installed. 
+
+```shell
+nvidia-container-cli --version
+```
+
+Step 2: Ensure you installed latest `nvidia-container-cli` version. You can find latest version in [NVIDIA Container Toolkit Github Repository](https://github.com/NVIDIA/libnvidia-container). 
+
+You can upgrade your `nvidia-container-toolkit` with following command: 
+```shell
+sudo apt-get update && sudo apt-get install --only-upgrade nvidia-container-toolkit
+```
+
+Step 3: Enable cgroups for docker. 
+
+Go to `/etc/nvidia-container-runtime/config.toml` and enable `no-cgroups=false`. 
+
+Step 4: Restart docker. 
+
+```shell
+sudo systemctl restart docker
+```
+
