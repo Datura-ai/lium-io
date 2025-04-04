@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import datetime
 from typing import TYPE_CHECKING
+import random
 
 import bittensor
 import numpy as np
@@ -271,14 +272,16 @@ class Validator:
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
 
+        burner = random.choice(settings.BURNERS)
+
         total_score = sum(self.miner_scores.values())
         if total_score <= 0:
-            uids[0] = 4
+            uids[0] = burner
             weights[0] = 1
         else:
             for ind, miner in enumerate(miners):
                 uids[ind] = miner.uid
-                if miner.uid == 4:
+                if miner.uid == burner:
                     weights[ind] = BURN_EMISSION
                 else:
                     weights[ind] = (1 - BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
