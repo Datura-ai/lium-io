@@ -932,18 +932,8 @@ class TaskService:
                     prev_info=verified_job_info,
                     success=False,
                 )
-
-            except Exception as redis_error:
-                log_text = _m(
-                    "Error creating task redis_reset_error",
-                    extra=get_extra_info(
-                        {
-                            **default_extra,
-                            "error": str(e),
-                            "redis_reset_error": str(redis_error),
-                        }
-                    ),
-                )
+            except:
+                pass
 
             logger.error(
                 log_text,

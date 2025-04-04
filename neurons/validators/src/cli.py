@@ -2,6 +2,7 @@ import asyncio
 import random
 import time
 import uuid
+import resource
 
 import click
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -168,11 +169,16 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
 
 
 @cli.command()
-def debug_validator():
-    asyncio.run(_debug_validator())
+@click.option("--count", type=int, prompt="Count", help="Number of job cycle")
+def debug_validator(count: int):
+    asyncio.run(_debug_validator(count))
 
 
-async def _debug_validator():
+async def _debug_validator(count: int):
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    soft_limit = 1024
+    resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
+
     validator = Validator()
     validator.set_subtensor()
 
@@ -188,98 +194,99 @@ async def _debug_validator():
 
     job_batch_id = "123456789"
 
-    jobs = [
-        asyncio.create_task(
-            miner_service.request_job_to_miner(
-                payload=MinerJobRequestPayload(
-                    job_batch_id=job_batch_id,
-                    miner_hotkey=miner.hotkey,
-                    miner_coldkey=miner.coldkey,
-                    miner_address=miner.axon_info.ip,
-                    miner_port=miner.axon_info.port,
-                ),
-                encrypted_files=encrypted_files,
-                docker_hub_digests=docker_hub_digests,
+    for _ in range(count):
+        jobs = [
+            asyncio.create_task(
+                miner_service.request_job_to_miner(
+                    payload=MinerJobRequestPayload(
+                        job_batch_id=job_batch_id,
+                        miner_hotkey=miner.hotkey,
+                        miner_coldkey=miner.coldkey,
+                        miner_address=miner.axon_info.ip,
+                        miner_port=miner.axon_info.port,
+                    ),
+                    encrypted_files=encrypted_files,
+                    docker_hub_digests=docker_hub_digests,
+                )
             )
-        )
-        for miner in miners
-    ]
+            for miner in miners
+        ]
 
-    task_info = {}
+        task_info = {}
 
-    for miner, job in zip(miners, jobs):
-        task_info[job] = {
-            "miner_hotkey": miner.hotkey,
-            "miner_address": miner.axon_info.ip,
-            "miner_port": miner.axon_info.port,
-            "job_batch_id": job_batch_id,
-        }
+        for miner, job in zip(miners, jobs):
+            task_info[job] = {
+                "miner_hotkey": miner.hotkey,
+                "miner_address": miner.axon_info.ip,
+                "miner_port": miner.axon_info.port,
+                "job_batch_id": job_batch_id,
+            }
 
-    try:
-        # Run all jobs with asyncio.wait and set a timeout
-        done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 50)
+        try:
+            # Run all jobs with asyncio.wait and set a timeout
+            done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 50)
 
-        success = []
-        errors = []
-        pendings = []
-        error_count = 0
+            success = []
+            errors = []
+            pendings = []
+            error_count = 0
 
-        # Process completed jobs
-        for task in done:
-            try:
-                result = task.result()
-                if result:
-                    miner_hotkey = result.get("miner_hotkey")
+            # Process completed jobs
+            for task in done:
+                try:
+                    result = task.result()
+                    if result:
+                        miner_hotkey = result.get("miner_hotkey")
 
-                    success.append({"miner_hotkey": miner_hotkey})
-                else:
+                        success.append({"miner_hotkey": miner_hotkey})
+                    else:
+                        info = task_info.get(task, {})
+                        miner_hotkey = info.get("miner_hotkey", "unknown")
+
+                        errors.append({"miner_hotkey": miner_hotkey})
+                except Exception as e:
+                    error_count += 1
+                    logger.error(
+                        _m(
+                            "[sync] Error processing job result",
+                            extra=get_extra_info(
+                                {
+                                    "error": str(e),
+                                }
+                            ),
+                        ),
+                    )
+
+            # Handle pending jobs (those that did not complete within the timeout)
+            if pending:
+                for task in pending:
                     info = task_info.get(task, {})
                     miner_hotkey = info.get("miner_hotkey", "unknown")
+                    task.cancel()
 
-                    errors.append({"miner_hotkey": miner_hotkey})
-            except Exception as e:
-                error_count += 1
-                logger.error(
-                    _m(
-                        "[sync] Error processing job result",
-                        extra=get_extra_info(
-                            {
-                                "error": str(e),
-                            }
-                        ),
+                    pendings.append({"miner_hotkey": miner_hotkey})
+
+            logger.info(_m("[sync] All Jobs finished", extra={
+                "success": success,
+                "errors": errors,
+                "pendings": pendings,
+                "success_count": len(success),
+                "errors_count": len(errors),
+                "pendings_count": len(pendings),
+                "error_count": error_count,
+            }))
+
+        except Exception as e:
+            logger.error(
+                _m(
+                    "[sync] Unexpected error",
+                    extra=get_extra_info(
+                        {
+                            "error": str(e),
+                        }
                     ),
-                )
-
-        # Handle pending jobs (those that did not complete within the timeout)
-        if pending:
-            for task in pending:
-                info = task_info.get(task, {})
-                miner_hotkey = info.get("miner_hotkey", "unknown")
-                task.cancel()
-
-                pendings.append({"miner_hotkey": miner_hotkey})
-
-        logger.info(_m("[sync] All Jobs finished", extra={
-            "success": success,
-            "errors": errors,
-            "pendings": pendings,
-            "success_count": len(success),
-            "errors_count": len(errors),
-            "pendings_count": len(pendings),
-            "error_count": error_count,
-        }))
-
-    except Exception as e:
-        logger.error(
-            _m(
-                "[sync] Unexpected error",
-                extra=get_extra_info(
-                    {
-                        "error": str(e),
-                    }
                 ),
-            ),
-        )
+            )
 
 
 @cli.command()

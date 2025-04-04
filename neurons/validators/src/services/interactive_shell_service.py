@@ -6,6 +6,7 @@ import asyncssh
 import asyncio
 import logging
 import hashlib
+from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +27,24 @@ class InteractiveShellService:
         self.username = username
         self.private_key = private_key
         self.port = port
-        self.loop = asyncio.get_event_loop()
+        self.log_extra = {
+            "host": host,
+            "username": username,
+            "port": port,
+        }
 
     async def connect_interactive_shell(self):
-        self.i_shell = await self.loop.run_in_executor(None, self._spawn_interactive_shell)
+        try:
+            # self.i_shell = await self.loop.run_in_executor(None, self._spawn_interactive_shell)
+            self.i_shell = await asyncio.to_thread(self._spawn_interactive_shell)
+        except Exception as e:
+            logger.error(_m(
+                "Error: connecting interactive shell",
+                extra=get_extra_info({
+                    **self.log_extra,
+                    "error": str(e),
+                }),
+            ))
 
     def _spawn_interactive_shell(self):
         # Build the SSH command
@@ -82,8 +97,21 @@ class InteractiveShellService:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.clear_remote_directory()
 
-        self.i_shell.close()
-        if self.priv_key_path:
+        try:
+            if await asyncio.to_thread(self.i_shell.isalive):
+                await asyncio.to_thread(self.i_shell.terminate, force=True)
+
+            await asyncio.to_thread(self.i_shell.close)
+        except Exception as e:
+            logger.error(_m(
+                "Error: close interactive shell",
+                extra=get_extra_info({
+                    **self.log_extra,
+                    "error": str(e),
+                }),
+            ))
+
+        if self.priv_key_path and os.path.isfile(self.priv_key_path):
             os.remove(self.priv_key_path)
 
     async def upload_directory(
@@ -161,7 +189,8 @@ class InteractiveShellService:
         return f'{md5_sum}:{sha256_sum}'
 
     async def exec_shell_command(self, command: str):
-        return await self.loop.run_in_executor(None, self._exec_shell_command, command)
+        # return await self.loop.run_in_executor(None, self._exec_shell_command, command)
+        return await asyncio.to_thread(self._exec_shell_command, command)
 
     def _exec_shell_command(self, command: str):
         try:

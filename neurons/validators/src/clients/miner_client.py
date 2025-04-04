@@ -163,9 +163,9 @@ class MinerClient(abc.ABC):
                     await asyncio.sleep(sleep_time)
 
     def sleep_time(self):
-        return (2**self.debounce_counter) + random.random()
+        return 2 + random.random()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+    @retry(stop=stop_after_attempt(5), wait=wait_fixed(2))
     async def send_model(self, model: BaseRequest):
         await self.ws.send(model.json())
 
