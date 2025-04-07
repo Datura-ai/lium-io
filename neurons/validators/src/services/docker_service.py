@@ -561,6 +561,13 @@ class DockerService:
                 ))
                 await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
 
+                rented_machine = await self.redis_service.get_rented_machine(executor_info)
+                if not rented_machine:
+                    logger.error(_m(
+                        "Not found rented pod from redis",
+                        extra=get_extra_info(default_extra),
+                    ))
+
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,

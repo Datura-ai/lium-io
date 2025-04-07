@@ -358,8 +358,8 @@ class TaskService:
         if result.stdout.strip():
             return True
 
-        # remove pod in redis
-        await self.redis_service.remove_rented_machine(executor_info)
+        # # remove pod in redis
+        # await self.redis_service.remove_rented_machine(executor_info)
 
         return False
 
@@ -860,7 +860,7 @@ class TaskService:
                     )
 
                 # check rented status
-                rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info)
+                rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine:
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running = await self.check_pod_running(
