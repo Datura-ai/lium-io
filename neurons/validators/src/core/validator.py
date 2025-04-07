@@ -22,7 +22,7 @@ from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, Redi
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.matrix_validation_service import ValidationService
-from services.const import BURN_EMISSION
+from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -272,19 +272,25 @@ class Validator:
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
 
-        burner = random.choice(settings.BURNERS)
+        main_burner = random.choice(settings.BURNERS)
+        other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
 
         total_score = sum(self.miner_scores.values())
         if total_score <= 0:
-            uids[0] = burner
-            weights[0] = 1
+            uids[0] = main_burner
+            weights[0] = 1 - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+            for ind, uid in enumerate(other_burners):
+                uids[ind + 1] = uid
+                weights[ind + 1] = BURNER_EMISSION
         else:
             for ind, miner in enumerate(miners):
                 uids[ind] = miner.uid
-                if miner.uid == burner:
-                    weights[ind] = BURN_EMISSION
+                if miner.uid == main_burner:
+                    weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+                elif miner.uid in other_burners:
+                    weights[ind] = BURNER_EMISSION
                 else:
-                    weights[ind] = (1 - BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
+                    weights[ind] = (1 - TOTAL_BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
 
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
