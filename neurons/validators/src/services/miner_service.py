@@ -394,8 +394,14 @@ class MinerService:
                                 public_key=public_key, executor_id=payload.executor_id
                             )
                         )
-                        
+
                         if executor:
+                            logger.info(
+                                _m(
+                                    "Remove rented machine from redis",
+                                    extra=get_extra_info(default_extra),
+                                ),
+                            )
                             await self.redis_service.remove_rented_machine(executor)
 
                         return self._handle_container_error(

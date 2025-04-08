@@ -2,6 +2,7 @@ MIN_JOB_TAKEN_TIME = 20
 
 GPU_MAX_SCORES = {
     # Latest Gen NVIDIA GPUs (Averaged if applicable)
+    "NVIDIA B200": 6.17,
     "NVIDIA H200": 4.65,
     "NVIDIA H100 80GB HBM3": 3.49,
     "NVIDIA H100 NVL": 2.79,
