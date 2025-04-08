@@ -311,17 +311,17 @@ class FileEncryptService:
                     str(tmp_directory), machine_scrape_file.name
                 )
 
-        # generate score_script file
-        score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
-        with open(score_script_file_path) as file:
-            content = file.read()
-        modified_content = content
+        # # generate score_script file
+        # score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
+        # with open(score_script_file_path) as file:
+        #     content = file.read()
+        # modified_content = content
 
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".py") as score_file:
-            score_file.write(modified_content.encode("utf-8"))
-            score_file.flush()
-            os.fsync(score_file.fileno())
-            score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
+        # with tempfile.NamedTemporaryFile(delete=True, suffix=".py") as score_file:
+        #     score_file.write(modified_content.encode("utf-8"))
+        #     score_file.flush()
+        #     os.fsync(score_file.fileno())
+        #     score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
         subprocess.run(["make", "-f", str(Path(__file__).parent / ".." / "miner_jobs/Makefile")])
 
@@ -335,6 +335,5 @@ class FileEncryptService:
             all_keys=all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
-            score_file_name=score_file_name,
             verifier_file_name=verifier_file_name
         )

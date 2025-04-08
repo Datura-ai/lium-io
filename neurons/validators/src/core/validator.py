@@ -22,7 +22,7 @@ from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, Redi
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.matrix_validation_service import ValidationService
-from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION
+from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION, JOB_TIME_OUT
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -581,7 +581,7 @@ class Validator:
 
                 try:
                     # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 100)
+                    done, pending = await asyncio.wait(jobs, timeout=JOB_TIME_OUT - 50)
 
                     # Process completed jobs
                     for task in done:

@@ -27,14 +27,13 @@ COPY . .
 
 FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS cuda-build
 
-RUN apt-get update && apt-get install -y cmake g++ wget \
-  && apt-get install -y nvidia-cuda-toolkit
+RUN apt-get update && apt-get install -y cmake g++ wget nvidia-cuda-toolkit
   
 FROM $BASE_IMAGE AS secondary-image
 LABEL builder=false
 
 RUN apt-get update \
-  && apt-get install -y make wget gcc ccache patchelf g++ \
+  && apt-get install -y make wget gcc ccache patchelf openssh-client g++ \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
