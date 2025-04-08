@@ -255,11 +255,22 @@ class TaskService:
 
         try:
             # remove all containers that has conatiner_ prefix in its name, since it's unrented
-            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
             result = await ssh_client.run(command)
             if result.stdout.strip():
-                ids = " ".join(result.stdout.strip().split("\n"))
-                command = f'/usr/bin/docker rm {ids} -f'
+                container_names = " ".join(result.stdout.strip().split("\n"))
+
+                logger.info(
+                    _m(
+                        "Cleaning existing docker containers",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_names": container_names,
+                        }),
+                    ),
+                )
+
+                command = f'/usr/bin/docker rm {container_names} -f'
                 await ssh_client.run(command)
 
                 command = f'/usr/bin/docker volume prune -af'
@@ -358,8 +369,19 @@ class TaskService:
         if result.stdout.strip():
             return True
 
-        # remove pod in redis
-        await self.redis_service.remove_rented_machine(executor_info)
+        # # remove pod in redis
+        # await self.redis_service.remove_rented_machine(executor_info)
+        logger.error(
+            _m(
+                "Pod not found, but redis is saying it's rented",
+                extra={
+                    "container_name": container_name,
+                    "executor_id": executor_info.uuid,
+                    "address": executor_info.address,
+                    "port": executor_info.port,
+                }
+            )
+        )
 
         return False
 
@@ -860,7 +882,7 @@ class TaskService:
                     )
 
                 # check rented status
-                rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info)
+                rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine:
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running = await self.check_pod_running(
