@@ -58,9 +58,52 @@ You can change the ports for `INTERNAL_PORT`, `EXTERNAL_PORT`, `SSH_PORT` based 
   - if internal port 46681 is mapped to 56681 external port and internal port 46682 is mapped to 56682 external port, then RENTING_PORT_MAPPINGS="[[46681, 56681], [46682, 56682]]"
 
 Note: Please use either **RENTING_PORT_RANGE** or **RENTING_PORT_MAPPINGS** and DO NOT use both of them if you have specific ports are available.
+- **RENTING_PRICE**: The renting price per hour in USD.
 
 
 * Run project
 ```shell
 docker compose up -d
 ```
+
+## Recommended Setup For GPUs and Docker
+
+Step 1: Ensure `nvidia-container-toolkit` is installed. 
+
+```shell
+nvidia-container-cli --version
+```
+
+Step 2: Ensure you installed latest `nvidia-container-cli` version. You can find latest version in [NVIDIA Container Toolkit Github Repository](https://github.com/NVIDIA/libnvidia-container). 
+
+You can upgrade your `nvidia-container-toolkit` with following command: 
+```shell
+sudo apt-get update && sudo apt-get install --only-upgrade nvidia-container-toolkit
+```
+
+Step 3: Enable cgroups for docker. 
+
+Go to `/etc/nvidia-container-runtime/config.toml` and enable `no-cgroups=false`. 
+
+Step 4: Update docker daemon.json file. 
+
+Go to `/etc/docker/daemon.json` and add `"exec-opts": ["native.cgroupdriver=cgroupfs"]`. 
+
+```json
+{
+    "runtimes": {
+        "nvidia": {
+            "path": "nvidia-container-runtime",
+            "runtimeArgs": []
+        }
+    },
+    "exec-opts": ["native.cgroupdriver=cgroupfs"]
+}
+```
+
+Step 5: Restart docker. 
+
+```shell
+sudo systemctl restart docker
+```
+

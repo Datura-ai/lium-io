@@ -60,7 +60,7 @@ ORIGINAL_KEYS = {
     'gpu_details': "details",
     'gpu_scrape_error': "gpu_scrape_error",
     "data_gpu": "gpu",
-    "data_gpu_processes": "gpu_processes",
+    "data_processes": "gpu_processes",
     "data_cpu": "cpu",
     "data_nvidia_cfg": "nvidia_cfg",
     "nvidia_cfg_scrape_error": "nvidia_cfg_scrape_error",
@@ -86,8 +86,8 @@ ORIGINAL_KEYS = {
     'data_os': "os",
     'data_ram': "ram",
     'data_hard_disk': "hard_disk",
-    "data_docker_cfg": "docker_cfg",
     "data_docker_cfg_scrape_error": "docker_cfg_scrape_error",
+    "data_docker_cfg": "docker_cfg",
     'os_scrape_error': "os_scrape_error",
     'data_network': "network",
     'data_md5_checksums': "md5_checksums",
@@ -162,7 +162,8 @@ class FileEncryptService:
 
         return file_name
 
-    def generate_random_name(self, length=10):
+    def generate_random_name(self):
+        length = random.randint(3, 15)
         return "_" + "".join(random.choices(string.ascii_letters, k=length))
 
     def generate_key_mappings(self):
@@ -183,9 +184,9 @@ class FileEncryptService:
             "gpu_cuda_driver": "",
             "gpu_details": "",
             "data_gpu": "",
-            "data_docker_cfg": "",
             "data_docker_cfg_scrape_error": "",
-            "data_gpu_processes": "",
+            "data_docker_cfg": "",
+            "data_processes": "",
             "data_cpu": "",
             "cpu_count": "",
             "cpu_model": "",
@@ -244,13 +245,14 @@ class FileEncryptService:
             'each_container_id': "",
             'each_digest': "",
             'each_name': "",
+            'machine_specs': ""
         }
 
         # Generate dictionary key mapping on validator side
         for key, value in all_keys.items():
             all_keys[key] = self.generate_random_name()
 
-        encryption_key = ":".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
+        encryption_key = "".join([all_keys[key] for key in KEYS_FOR_ENCRYPTION_KEY_GENERATION])
         return all_keys, encryption_key
 
     def ecrypt_miner_job_files(self):
@@ -309,22 +311,21 @@ class FileEncryptService:
                     str(tmp_directory), machine_scrape_file.name
                 )
 
-        # generate score_script file
-        score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
-        with open(score_script_file_path) as file:
-            content = file.read()
-        modified_content = content
+        # # generate score_script file
+        # score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
+        # with open(score_script_file_path) as file:
+        #     content = file.read()
+        # modified_content = content
 
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".py") as score_file:
-            score_file.write(modified_content.encode("utf-8"))
-            score_file.flush()
-            os.fsync(score_file.fileno())
-            score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
+        # with tempfile.NamedTemporaryFile(delete=True, suffix=".py") as score_file:
+        #     score_file.write(modified_content.encode("utf-8"))
+        #     score_file.flush()
+        #     os.fsync(score_file.fileno())
+        #     score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
             all_keys=all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
-            score_file_name=score_file_name,
         )

@@ -578,9 +578,9 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
         for i in range(c_count.value):
             # use an alternative struct for this object
             obj = nvmlStructToFriendlyObject(c_procs[i])
-            if (obj._fmt_usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value):
+            if obj.c_nvmlProcessInfo_v2_t_usedGpuMemory == NVML_VALUE_NOT_AVAILABLE_ulonglong.value:
                 # special case for WDDM on Windows, see comment above
-                obj._fmt_usedGpuMemory = None
+                obj.c_nvmlProcessInfo_v2_t_usedGpuMemory = None
             procs.append(obj)
         return procs
     else:
@@ -806,7 +806,7 @@ def get_machine_specs():
 
             # Collect process IDs
             for proc in processes:
-                gpu_process_ids.add(proc.pid)
+                gpu_process_ids.add(proc.c_nvmlProcessInfo_v2_t_pid)
 
         nvmlShutdown()
     except Exception as exc:
@@ -829,7 +829,7 @@ def get_machine_specs():
 
     data["data_docker"] = get_docker_info(docker_content)
 
-    data['data_gpu_processes'] = get_gpu_processes(gpu_process_ids, data["data_docker"]["docker_containers"])
+    data['data_processes'] = get_gpu_processes(gpu_process_ids, data["data_docker"]["docker_containers"])
 
     data["data_cpu"] = {"cpu_count": 0, "cpu_model": "", "cpu_clocks": []}
     try:
@@ -904,6 +904,6 @@ def _encrypt(key: str, payload: str) -> str:
 
 
 machine_specs = get_machine_specs()
-encryption_key = ":".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
+encryption_key = "".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
 encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
 print(encoded_str)

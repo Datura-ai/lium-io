@@ -33,8 +33,6 @@ app = FastAPI(
     lifespan=app_lifespan,
 )
 
-# app.include_router(apis_router)
-
 reload = True if settings.ENV == "dev" else False
 
 if __name__ == "__main__":

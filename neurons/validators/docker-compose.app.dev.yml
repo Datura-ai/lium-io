@@ -3,11 +3,11 @@ services:
     image: postgres:14.0-alpine
     healthcheck:
       test: pg_isready -U postgres || exit 1
-    restart: unless-stopped
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    restart: unless-stopped
     env_file: ./.env
     volumes:
       - db_data:/var/lib/postgresql/data
@@ -24,7 +24,7 @@ services:
       - redis_data:/data
 
   validator:
-    image: daturaai/compute-subnet-validator:latest
+    image: daturaai/compute-subnet-validator:dev
     env_file: ./.env
     environment:
       - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -42,7 +42,7 @@ services:
       - redis
 
   connector:
-    image: daturaai/compute-subnet-validator:latest
+    image: daturaai/compute-subnet-validator:dev
     env_file: ./.env
     environment:
       - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}

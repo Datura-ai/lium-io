@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import datetime
 from typing import TYPE_CHECKING
+import random
 
 import bittensor
 import numpy as np
@@ -20,6 +21,8 @@ from services.miner_service import MinerService
 from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
+from services.matrix_validation_service import ValidationService
+from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION, JOB_TIME_OUT
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -57,9 +60,11 @@ class Validator:
         ssh_service = SSHService()
         self.redis_service = RedisService()
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
+        self.validation_service = ValidationService()
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
+            validation_service=self.validation_service
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
@@ -266,17 +271,31 @@ class Validator:
 
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
-        for ind, miner in enumerate(miners):
-            uids[ind] = miner.uid
-            if miner.uid == 4:
-                weights[ind] = 1
-            else:
-                weights[ind] = 0
+
+        main_burner = random.choice(settings.BURNERS)
+        other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
+
+        total_score = sum(self.miner_scores.values())
+        if total_score <= 0:
+            uids[0] = main_burner
+            weights[0] = 1 - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+            for ind, uid in enumerate(other_burners):
+                uids[ind + 1] = uid
+                weights[ind + 1] = BURNER_EMISSION
+        else:
+            for ind, miner in enumerate(miners):
+                uids[ind] = miner.uid
+                if miner.uid == main_burner:
+                    weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+                elif miner.uid in other_burners:
+                    weights[ind] = BURNER_EMISSION
+                else:
+                    weights[ind] = (1 - TOTAL_BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
 
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
 
-        logger.info(
+        logger.debug(
             _m(
                 f"[set_weights] uids: {uids} weights: {weights}",
                 extra=get_extra_info(self.default_extra),
@@ -530,7 +549,7 @@ class Validator:
                     ),
                 )
 
-                encypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
+                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
 
                 task_info = {}
 
@@ -541,12 +560,12 @@ class Validator:
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
+                                miner_coldkey=miner.coldkey,
                                 miner_address=miner.axon_info.ip,
                                 miner_port=miner.axon_info.port,
                             ),
-                            encypted_files=encypted_files,
+                            encrypted_files=encrypted_files,
                             docker_hub_digests=docker_hub_digests,
-                            debug=settings.DEBUG,
                         )
                     )
                     for miner in miners
@@ -562,7 +581,7 @@ class Validator:
 
                 try:
                     # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 100)
+                    done, pending = await asyncio.wait(jobs, timeout=JOB_TIME_OUT - 50)
 
                     # Process completed jobs
                     for task in done:
@@ -822,7 +841,7 @@ class Validator:
                 # sync every 12 seconds
                 await asyncio.sleep(SYNC_CYCLE)
             except Exception as e:
-                logger.info(
+                logger.error(
                     _m(
                         "[stop] Failed to connect into subtensor",
                         extra=get_extra_info({**self.default_extra, "error": str(e)}),
