@@ -247,25 +247,25 @@ class DockerService:
         sleep: int = 0,
         clear_volume: bool = True
     ):
-        command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+        command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
             # wait until the docker connection check is finished.
             await asyncio.sleep(sleep)
 
-            ids = " ".join(result.stdout.strip().split("\n"))
+            container_names = " ".join(result.stdout.strip().split("\n"))
 
             logger.info(
                 _m(
                     "Cleaning existing docker containers",
                     extra=get_extra_info({
                         **default_extra,
-                        "ids": ids,
+                        "container_names": container_names,
                     }),
                 ),
             )
 
-            command = f'/usr/bin/docker rm {ids} -f'
+            command = f'/usr/bin/docker rm {container_names} -f'
             await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
 
             if clear_volume:
@@ -727,7 +727,7 @@ class DockerService:
 
                 logger.info(
                     _m(
-                        "Deleted Docker Container",
+                        "Remove rented machine from redis",
                         extra=get_extra_info(
                             {
                                 **default_extra,
