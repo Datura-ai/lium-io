@@ -85,7 +85,23 @@ Step 3: Enable cgroups for docker.
 
 Go to `/etc/nvidia-container-runtime/config.toml` and enable `no-cgroups=false`. 
 
-Step 4: Restart docker. 
+Step 4: Update docker daemon.json file. 
+
+Go to `/etc/docker/daemon.json` and add `"exec-opts": ["native.cgroupdriver=cgroupfs"]`. 
+
+```json
+{
+    "runtimes": {
+        "nvidia": {
+            "path": "nvidia-container-runtime",
+            "runtimeArgs": []
+        }
+    },
+    "exec-opts": ["native.cgroupdriver=cgroupfs"]
+}
+```
+
+Step 5: Restart docker. 
 
 ```shell
 sudo systemctl restart docker
