@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 
 class InteractiveShellService:
-    i_shell: pexpect.spawn
     ssh_client: asyncssh.SSHClientConnection
     priv_key_path: str | None = None
 
@@ -36,7 +35,7 @@ class InteractiveShellService:
     async def connect_interactive_shell(self):
         try:
             # self.i_shell = await self.loop.run_in_executor(None, self._spawn_interactive_shell)
-            self.i_shell = await asyncio.to_thread(self._spawn_interactive_shell)
+            await asyncio.to_thread(self._spawn_interactive_shell)
         except Exception as e:
             logger.error(_m(
                 "Error: connecting interactive shell",
@@ -73,7 +72,7 @@ class InteractiveShellService:
             # Wait for shell prompt
             i = i_shell.expect(['root@'], timeout=30)
 
-            return i_shell
+            i_shell.close()
         except pexpect.TIMEOUT:
             raise Exception("i-ssh connection Timeout")
         except pexpect.EOF:
@@ -97,19 +96,20 @@ class InteractiveShellService:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.clear_remote_directory()
 
-        try:
-            if await asyncio.to_thread(self.i_shell.isalive):
-                await asyncio.to_thread(self.i_shell.terminate, force=True)
+        # try:
+        #     if self.i_shell:
+        #         if await asyncio.to_thread(self.i_shell.isalive):
+        #             await asyncio.to_thread(self.i_shell.terminate, force=True)
 
-            await asyncio.to_thread(self.i_shell.close)
-        except Exception as e:
-            logger.error(_m(
-                "Error: close interactive shell",
-                extra=get_extra_info({
-                    **self.log_extra,
-                    "error": str(e),
-                }),
-            ))
+        #         await asyncio.to_thread(self.i_shell.close)
+        # except Exception as e:
+        #     logger.error(_m(
+        #         "Error: close interactive shell",
+        #         extra=get_extra_info({
+        #             **self.log_extra,
+        #             "error": str(e),
+        #         }),
+        #     ))
 
         if self.priv_key_path and os.path.isfile(self.priv_key_path):
             os.remove(self.priv_key_path)
@@ -178,28 +178,28 @@ class InteractiveShellService:
         file_content = await self.read_file_content_over_scp(file_path)
         return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
 
-    async def get_checksums_by_path(self, file_path: str):
-        md5_output = await self.exec_shell_command(f'md5sum {file_path}')
-        sha256_output = await self.exec_shell_command(f'sha256sum {file_path}')
+    # async def get_checksums_by_path(self, file_path: str):
+    #     md5_output = await self.exec_shell_command(f'md5sum {file_path}')
+    #     sha256_output = await self.exec_shell_command(f'sha256sum {file_path}')
 
-        # Extract the checksums from the command outputs
-        md5_sum = md5_output.replace(file_path, '').strip() if md5_output else None
-        sha256_sum = sha256_output.replace(file_path, '').strip() if sha256_output else None
+    #     # Extract the checksums from the command outputs
+    #     md5_sum = md5_output.replace(file_path, '').strip() if md5_output else None
+    #     sha256_sum = sha256_output.replace(file_path, '').strip() if sha256_output else None
 
-        return f'{md5_sum}:{sha256_sum}'
+    #     return f'{md5_sum}:{sha256_sum}'
 
-    async def exec_shell_command(self, command: str):
-        # return await self.loop.run_in_executor(None, self._exec_shell_command, command)
-        return await asyncio.to_thread(self._exec_shell_command, command)
+    # async def exec_shell_command(self, command: str):
+    #     # return await self.loop.run_in_executor(None, self._exec_shell_command, command)
+    #     return await asyncio.to_thread(self._exec_shell_command, command)
 
-    def _exec_shell_command(self, command: str):
-        try:
-            self.i_shell.sendline(f"{command} && echo 'STOPPED'")
-            self.i_shell.expect(['STOPPED'], timeout=30)
-            self.i_shell.expect(['STOPPED'], timeout=30)
-            output_lines = [line.strip() for line in re.split(r'[\r\n]', self.i_shell.before.decode('utf-8')) if line.strip()]
-            return output_lines[-1]
-        except pexpect.TIMEOUT:
-            raise Exception("i-ssh connection Timeout")
-        except pexpect.EOF:
-            raise Exception("i-ssh connection EOF error")
+    # def _exec_shell_command(self, command: str):
+    #     try:
+    #         self.i_shell.sendline(f"{command} && echo 'STOPPED'")
+    #         self.i_shell.expect(['STOPPED'], timeout=30)
+    #         self.i_shell.expect(['STOPPED'], timeout=30)
+    #         output_lines = [line.strip() for line in re.split(r'[\r\n]', self.i_shell.before.decode('utf-8')) if line.strip()]
+    #         return output_lines[-1]
+    #     except pexpect.TIMEOUT:
+    #         raise Exception("i-ssh connection Timeout")
+    #     except pexpect.EOF:
+    #         raise Exception("i-ssh connection EOF error")

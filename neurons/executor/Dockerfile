@@ -48,7 +48,6 @@ RUN echo "export PYTHONPATH=$PYTHONPATH" >> ~/.bash_profile
 
 COPY --from=base-image /root/app/ /root/app/
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
-RUN mv /root/app/libdmcompverify.so /usr/lib/
 
 RUN mkdir -p /etc/docker
 RUN mkdir -p /etc/nvidia-container-runtime
