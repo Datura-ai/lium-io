@@ -26,8 +26,6 @@ class MinerJobEnryptedFiles(BaseModel):
     all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
-    # score_file_name: str
-    verifier_file_name: str
 
 
 class ResourceType(BaseModel):
