@@ -1,5 +1,6 @@
 import json
 import asyncio
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 from datura.requests.miner_requests import ExecutorSSHInfo
 from protocol.vc_protocol.compute_requests import RentedMachine
@@ -190,7 +191,8 @@ class RedisService:
         self,
         miner_hotkey: str,
         executor_id,
-        prev_info: dict = {}
+        prev_info: dict = {},
+        reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
     ):
         spec = prev_info.get('spec', '')
         uuids = prev_info.get('uuids', '')
@@ -208,6 +210,7 @@ class RedisService:
             {
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_id,
+                "reason": reason.value,
             },
         )
 

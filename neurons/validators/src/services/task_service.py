@@ -13,6 +13,7 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 
 from core.config import settings
 from core.utils import _m, context, get_extra_info
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
     GPU_MAX_SCORES,
     MAX_GPU_COUNT,
@@ -363,6 +364,7 @@ class TaskService:
         clear_verified_job_info: bool = False,
         gpu_model_count: str = '',
         gpu_uuids: str = '',
+        clear_verified_job_reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
     ):
         if success:
             log_status = "info"
@@ -386,6 +388,7 @@ class TaskService:
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_id=executor_info.uuid,
                     prev_info=verified_job_info,
+                    reason=clear_verified_job_reason,
                 )
             else:
                 await self.redis_service.set_verified_job_info(
@@ -783,6 +786,7 @@ class TaskService:
                             verified_job_info=verified_job_info,
                             success=False,
                             clear_verified_job_info=True,
+                            clear_verified_job_reason=ResetVerifiedJobReason.POD_NOT_RUNNING,
                         )
 
                     # In backend, there are 2 scores. actual score and job score.

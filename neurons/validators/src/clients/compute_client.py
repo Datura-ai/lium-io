@@ -256,6 +256,7 @@ class ComputeClient:
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
+                            reason=data["reason"]
                         )
 
                         async with self.lock:
