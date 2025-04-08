@@ -29,7 +29,7 @@ FROM $BASE_IMAGE AS secondary-image
 LABEL builder=false
 
 RUN apt-get update \
-  && apt-get install -y make wget gcc ccache patchelf g++ \
+  && apt-get install -y make wget gcc ccache patchelf openssh-client g++ \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/

@@ -123,12 +123,10 @@ class RedisService:
     async def remove_rented_machine(self, executor: ExecutorSSHInfo):
         await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
 
-    async def get_rented_machine(self, miner_hotkey: str, executor: ExecutorSSHInfo):
+    async def get_rented_machine(self, executor: ExecutorSSHInfo):
         data = await self.hget(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
         if not data:
-            data = await self.hget(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor.uuid}")
-            if not data:
-                return None
+            return None
 
         return json.loads(data)
 
