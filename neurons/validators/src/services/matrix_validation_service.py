@@ -222,6 +222,7 @@ class ValidationService:
         uuid_array = verifier_params.uuid.split(",")
         if uuid in uuid_array:
             logger.info(_m("Matrix Mulitiplication Verification Succeed", extra=get_extra_info(log_extra)))
+            return True
         else:
             logger.info(_m("Matrix Mulitiplication Verification Failed", extra=get_extra_info(log_extra)))
             return False
