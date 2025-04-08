@@ -360,6 +360,17 @@ class TaskService:
 
         # # remove pod in redis
         # await self.redis_service.remove_rented_machine(executor_info)
+        logger.error(
+            _m(
+                "Pod not found, but redis is saying it's rented",
+                extra={
+                    "container_name": container_name,
+                    "executor_id": executor_info.uuid,
+                    "address": executor_info.address,
+                    "port": executor_info.port,
+                }
+            )
+        )
 
         return False
 

@@ -699,7 +699,7 @@ class DockerService:
 
         logger.info(
             _m(
-                "Delete Docker Container",
+                "Deleting Docker Container",
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
@@ -739,6 +739,13 @@ class DockerService:
                 )
 
                 await self.redis_service.remove_rented_machine(executor_info)
+
+                logger.info(
+                    _m(
+                        "Deleted Docker Container",
+                        extra=get_extra_info({**default_extra, "payload": str(payload)}),
+                    ),
+                )
 
                 return ContainerDeleted(
                     miner_hotkey=payload.miner_hotkey,
