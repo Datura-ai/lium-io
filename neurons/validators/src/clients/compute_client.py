@@ -376,15 +376,14 @@ class ComputeClient:
                     }),
                 )
             )
-
             redis_service = self.miner_service.redis_service
             await redis_service.delete(RENTED_MACHINE_PREFIX)
-
             for machine in response.machines:
-                await redis_service.add_rented_machine(machine)
-
+                if machine.is_rented:
+                    await redis_service.add_rented_machine(machine)
+                await redis_service.add_executor_uptime(machine)
             return
-
+        
         try:
             response = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
         except pydantic.ValidationError:

@@ -16,6 +16,7 @@ RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
+EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 
 
 class RedisService:
@@ -130,6 +131,15 @@ class RedisService:
             return None
 
         return json.loads(data)
+    
+    async def add_executor_uptime(self, machine: RentedMachine):
+        await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
+
+    async def get_executor_uptime(self, executor: ExecutorSSHInfo) -> int | None:
+        data = await self.hget(EXECUTORS_UPTIME_PREFIX, f"{executor.address}:{executor.port}")
+        if not data:
+            return None
+        return int(data)
 
     async def add_pending_pod(self, miner_hotkey: str, executor_id: str):
         await self.sadd(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
