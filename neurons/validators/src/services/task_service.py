@@ -818,7 +818,7 @@ class TaskService:
                     )
 
                 # skip check gpu usages for self-rented pods
-                if rented_machine.get("owner_flag", False):
+                if not rented_machine.get("owner_flag", False):
                     for detail in gpu_details:
                         gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
                         gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
