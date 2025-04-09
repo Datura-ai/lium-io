@@ -236,12 +236,7 @@ class Validator:
             miners = [
                 neuron
                 for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving
-                and (
-                    not settings.DEBUG
-                    or not settings.DEBUG_MINER_HOTKEY
-                    or settings.DEBUG_MINER_HOTKEY == neuron.axon_info.hotkey
-                )
+                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
             ]
         logger.info(
             _m(
