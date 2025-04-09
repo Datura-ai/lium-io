@@ -1,3 +1,4 @@
+import gc
 import pexpect
 import tempfile
 import os
@@ -72,7 +73,12 @@ class InteractiveShellService:
             # Wait for shell prompt
             i = i_shell.expect(['root@'], timeout=30)
 
+            # close shell
+            i_shell.sendline("exit")
+            i_shell.expect(pexpect.EOF)
             i_shell.close()
+
+            gc.collect() # Run the garbage collector
         except pexpect.TIMEOUT:
             raise Exception("i-ssh connection Timeout")
         except pexpect.EOF:
