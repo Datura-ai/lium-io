@@ -817,31 +817,32 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                # check gpu usages
-                for detail in gpu_details:
-                    gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
-                    gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
-                    if gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT:
-                        log_text = _m(
-                            "High gpu utilization detected",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "gpu_utilization": gpu_utilization,
-                                "gpu_memory_utilization": gpu_memory_utilization,
-                            }),
-                        )
+                # skip check gpu usages for self-rented pods
+                if rented_machine.get("owner_flag", False):
+                    for detail in gpu_details:
+                        gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
+                        gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
+                        if gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT:
+                            log_text = _m(
+                                "High gpu utilization detected",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "gpu_utilization": gpu_utilization,
+                                    "gpu_memory_utilization": gpu_memory_utilization,
+                                }),
+                            )
 
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
+                            return await self._handle_task_result(
+                                miner_info=miner_info,
+                                executor_info=executor_info,
+                                spec=machine_spec,
+                                score=0,
+                                job_score=0,
+                                log_text=log_text,
+                                verified_job_info=verified_job_info,
+                                success=False,
+                                clear_verified_job_info=False,
+                            )
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress:
