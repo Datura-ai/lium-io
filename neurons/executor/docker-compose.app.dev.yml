@@ -2,6 +2,7 @@ services:
   executor:
     image: daturaai/compute-subnet-executor:dev
     env_file: ./.env
+    restart: always
     ports:
       - ${EXTERNAL_PORT}:${INTERNAL_PORT}
       - ${SSH_PORT}:22
@@ -12,6 +13,11 @@ services:
       - /etc/docker/daemon.json:/etc/docker/daemon.json
       - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
     pid: host
+    healthcheck:
+      test: ["CMD-SHELL", "nvidia-smi || exit 1"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
     deploy:
       resources:
         reservations:
