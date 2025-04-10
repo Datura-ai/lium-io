@@ -79,7 +79,7 @@ class DMCompVerifyWrapper:
 
 def decrypt_challenge():
     parser = argparse.ArgumentParser(description="DMCompVerify Python Wrapper")
-    parser.add_argument("--lib", type=str, default="libdmcompverify.so", help="Path to the shared library")
+    parser.add_argument("--lib", type=str, default="/usr/lib/libdmcompverify.so", help="Path to the shared library")
     parser.add_argument("--dim_n", type=int, default=1981, help="Matrix dimension n")
     parser.add_argument("--dim_k", type=int, default=1555929, help="Matrix dimension k")
     parser.add_argument("--seed", type=int, default=1743502434, help="Random seed")
