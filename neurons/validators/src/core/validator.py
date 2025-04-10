@@ -210,6 +210,10 @@ class Validator:
         node = self.get_node()
         return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
 
+    def get_last_mechansim_step_block(self):
+        node = self.get_node()
+        return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
+
     def get_my_uid(self):
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
@@ -232,12 +236,7 @@ class Validator:
             miners = [
                 neuron
                 for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving
-                and (
-                    not settings.DEBUG
-                    or not settings.DEBUG_MINER_HOTKEY
-                    or settings.DEBUG_MINER_HOTKEY == neuron.axon_info.hotkey
-                )
+                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
             ]
         logger.info(
             _m(
@@ -272,7 +271,17 @@ class Validator:
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
 
-        main_burner = random.choice(settings.BURNERS)
+        last_mechansim_step_block = self.get_last_mechansim_step_block()
+        main_burner = random.Random(last_mechansim_step_block).choice(settings.BURNERS)
+        logger.info(
+            _m(
+                "[set_weights] main burner",
+                extra=get_extra_info({
+                    "last_mechansim_step_block": last_mechansim_step_block,
+                    "main_burner": main_burner,
+                }),
+            ),
+        )
         other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
 
         total_score = sum(self.miner_scores.values())
