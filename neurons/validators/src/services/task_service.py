@@ -366,6 +366,13 @@ class TaskService:
         gpu_uuids: str = '',
         clear_verified_job_reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
     ):
+        logger.info(_m("Handle task result: ", extra={
+            "miner_hotkey": miner_info.miner_hotkey,
+            "executor_id": executor_info.uuid,
+            "success": success,
+            "score": score,
+            "job_score": job_score,
+        }))
         if success:
             log_status = "info"
             logger.info(log_text)
@@ -407,6 +414,45 @@ class TaskService:
             log_status,
             log_text,
         )
+
+    async def _calc_score(
+        self,
+        executor_info: ExecutorSSHInfo,
+        max_score: float,
+        gpu_count: int,
+        is_rental_check_passed: bool,
+        is_rented: bool,
+    ) -> tuple[float, float]:
+        """
+        Calculate the score for the executor.
+
+        :param executor_info: The executor info.
+        :param max_score: The max score for the executor.
+        :param gpu_count: The number of GPUs in the executor.
+        :param is_rental_check_passed: Whether the executor has passed the rental check.
+        :param is_rented: Whether the executor is rented.
+
+        formula: 
+        job_score = max_score * gpu_count * (0.5 + min(0.5, uptime_in_minutes / 1 month))
+
+        :return: A tuple of the actual score and the job score.
+        """
+        # get uptime of the executor
+        uptime_in_minutes = await self.redis_service.get_executor_uptime(executor_info)
+        # if uptime in the subnet is exceed 1 month, then it'll get max score 
+        # if uptime is less than 1 month, then it'll get score based on the uptime
+        # give 50% of max still to avoid 0 score all miners at deployment
+        one_month_in_minutes = 60 * 24 * 30
+        score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / one_month_in_minutes))
+        # actual score is the score which executor gets for incentive
+        # only give actual score if executor passed the rental check
+        actual_score = score if is_rental_check_passed else 0
+        # job score is the score which executor gets when matrix multiply is finished.
+        # executor won't have job score if it didn't run the synthetic job(matrix multiply)
+        # we give job score if executor is rented but rental check is not passed, because this is in progress of rental check 
+        # this is because if either job score or actual score is 0, backend will flag this executor as invalid.
+        job_score = score if not is_rented or not is_rental_check_passed else 0
+        return actual_score, job_score
 
     async def create_task(
         self,
@@ -814,16 +860,17 @@ class TaskService:
                     # actual score is the score which executor gets for incentive
                     # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
                     # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and max_score * gpu_count for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    score = max_score * gpu_count
-                    job_score = 0
-                    log_msg = "Executor is already rented."
-
-                    # check rental success
-                    if not is_rental_succeed:
-                        score = 0
-                        job_score = max_score * gpu_count
-                        log_msg = "Executor is rented but in progress of rental check. This can be finished in an hour or so."
-
+                    score, job_score = await self._calc_score(
+                        executor_info=executor_info,
+                        max_score=max_score,
+                        gpu_count=gpu_count,
+                        is_rental_succeed=is_rental_succeed,
+                        is_rented=True,
+                    )
+                    log_msg = (
+                        "Executor is already rented." 
+                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so."
+                    )
                     log_text = _m(
                         log_msg,
                         extra=get_extra_info({**default_extra, "score": score, "is_rental_succeed": is_rental_succeed}),
@@ -922,8 +969,13 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                job_score = max_score * gpu_count
-                actual_score = job_score if is_rental_succeed else 0
+                actual_score, job_score = await self._calc_score(
+                    executor_info=executor_info,
+                    max_score=max_score,
+                    gpu_count=gpu_count,
+                    is_rental_check_passed=is_rental_succeed,
+                    is_rented=False,
+                )
 
                 log_text = _m(
                     message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
