@@ -32,10 +32,7 @@ class DMCompVerifyWrapper:
 
         self._lib.generateChallenge.argtypes = [POINTER(c_void_p), c_longlong, c_char_p, c_char_p]
         self._lib.generateChallenge.restype = None
-
-        self._lib.processChallengeResult.argtypes = [POINTER(c_void_p), c_longlong, c_char_p]
-        self._lib.processChallengeResult.restype = c_char_p
-
+        
         self._lib.getCipherText.argtypes = [c_void_p]
         self._lib.getCipherText.restype = c_char_p
 
@@ -59,14 +56,6 @@ class DMCompVerifyWrapper:
         machine_info_bytes = machine_info.encode('utf-8')
         uuid_bytes = uuid.encode('utf-8')
         self._lib.generateChallenge(verifier_ptr, seed, machine_info_bytes, uuid_bytes)
-
-    def processChallengeResult(self, verifier_ptr: POINTER(c_void_p), seed: int, cipher_text: str) -> int:
-        """
-        Wrap the C++ function processChallengeResult.
-        Processes the challenge result using the provided DMCompVerify pointer.
-        """
-        result = self._lib.processChallengeResult(verifier_ptr, seed, cipher_text)
-        return result
 
     def getCipherText(self, verifier_ptr: POINTER(c_void_p)) -> str:
         """
@@ -96,7 +85,6 @@ def encrypt_challenge(m_dim_n, m_dim_k, seed, machine_info, uuid):
         # Create a new DMCompVerify object
         verifier_ptr = wrapper.DMCompVerify_new(m_dim_n, m_dim_k)
 
-        print("machine_info:", machine_info)
         wrapper.generateChallenge(verifier_ptr, seed, machine_info, uuid)
 
         cipher_text = wrapper.getCipherText(verifier_ptr)
@@ -203,6 +191,7 @@ class ValidationService:
             "seed": verifier_params.seed,
             "uuid": verifier_params.uuid,
             "cipher_text": verifier_params.cipher_text,
+            "machine_info": machine_info,
         }
 
         logger.info(_m("Matrix Multiplication Python Script Command", extra=get_extra_info(log_extra)))

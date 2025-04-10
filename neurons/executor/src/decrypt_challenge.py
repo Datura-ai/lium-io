@@ -55,8 +55,7 @@ class DMCompVerifyWrapper:
         Wrap the C++ function processChallengeResult.
         Processes the challenge result using the provided DMCompVerify pointer.
         """
-        result = self._lib.processChallengeResult(verifier_ptr, seed, cipher_text)
-        return result
+        self._lib.processChallengeResult(verifier_ptr, seed, cipher_text)
 
     def getUUID(self, verifier_ptr: POINTER(c_void_p)) -> str:
         """

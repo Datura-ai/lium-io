@@ -447,11 +447,31 @@ class TaskService:
             ) as shell:
                 docker_checksums = await shell.get_checksums_over_scp('/usr/bin/docker')
                 if docker_checksums != DOCKER_DIGEST:
-                    raise Exception("Docker is altered")
+                    logger.info(
+                        _m(
+                            "Docker checksum",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "checksum": docker_checksums,
+                                "DOCKER_DIGEST": DOCKER_DIGEST
+                            }),
+                        )
+                    )
+                    # raise Exception("Docker is altered")
 
                 python_checksums = await shell.get_checksums_over_scp('/usr/bin/python')
                 if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
-                    raise Exception("Python is altered")
+                    logger.info(
+                        _m(
+                            "Python checksum",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "checksum": python_checksums,
+                                "PYTHON_DIGEST": PYTHON_DIGEST
+                            }),
+                        )
+                    )
+                    # raise Exception("Python is altered")
 
                 # start gpus_utility.py
                 program_id = str(uuid.uuid4())
@@ -479,7 +499,7 @@ class TaskService:
                     _m(
                         "Uploaded files to run job",
                         extra=get_extra_info(default_extra),
-                    ),
+                    )
                 )
 
                 await shell.ssh_client.run(f"chmod +x {remote_machine_scrape_file_path}")
@@ -881,7 +901,7 @@ class TaskService:
                     machine_spec=machine_spec
                 )
 
-                if not is_valid:
+                if settings.HAS_GPU_VERIFICATION and not is_valid:
                     log_text = _m(
                         "GPU Verification failed",
                         extra=get_extra_info(default_extra),

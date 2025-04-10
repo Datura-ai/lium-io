@@ -323,6 +323,7 @@ class FileEncryptService:
         #     os.fsync(score_file.fileno())
         #     score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
+
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
             all_keys=all_keys,
