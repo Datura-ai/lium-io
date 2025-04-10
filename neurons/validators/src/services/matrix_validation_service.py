@@ -5,7 +5,6 @@ import json
 import os
 import uuid as uuid4
 from dataclasses import dataclass
-from typing import Self
 from core.utils import _m, get_extra_info
 from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
 
@@ -88,7 +87,7 @@ def encrypt_challenge(m_dim_n, m_dim_k, seed, machine_info, uuid):
         wrapper.generateChallenge(verifier_ptr, seed, machine_info, uuid)
 
         cipher_text = wrapper.getCipherText(verifier_ptr)
-        
+        print("Encrypt Challenge Cipher Text:", cipher_text)
         return cipher_text
     except Exception as e:
         logger.error("Failed encrypt challenge request: %s", str(e))
@@ -103,20 +102,17 @@ class VerifierParams:
         self.seed = seed
         self.uuid = uuid
         self.cipher_text = ""
-
-    @classmethod
-    def generate(cls) -> Self:
+    
+    def generate(self):
         # You can modify the range for more randomness or based on specific needs
-        dim_n = random.randint(1900, 2000)  # Random dim_n between 1900 and 2000
-        dim_k = random.randint(2000000, 2586932)  # Random dim_k between 2000000 and 2586932
-        seed = int(time.time())
-        uuid = str(uuid4.uuid4())
-
-        return cls(dim_n=dim_n, dim_k=dim_k, seed=seed, uuid=uuid)
+        self.dim_n = random.randint(1900, 2000)  # Random dim_n between 1900 and 2000
+        self.dim_k = random.randint(2000000, 2586932)  # Random dim_k between 2000000 and 2586932
+        self.seed = int(time.time())
+        self.uuid = str(uuid4.uuid4())
 
     def __str__(self) -> str:
         return f"--dim_n {self.dim_n} --dim_k {self.dim_k} --seed {self.seed} --cipher_text {self.cipher_text}"
-
+    
 
 class ValidationService:
     def get_gpu_memory(self, machine_spec: dict) -> bool:
@@ -174,12 +170,14 @@ class ValidationService:
         gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
         machine_info = json.dumps(gpu_info, sort_keys=True)
 
-        verifier_params = VerifierParams.generate()
+        verifier_params = VerifierParams()
+        verifier_params.generate()
         gpu_memory = self.get_gpu_memory(machine_spec)
         verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
 
         verifier_params.cipher_text = encrypt_challenge(verifier_params.dim_n, verifier_params.dim_k, verifier_params.seed, machine_info, verifier_params.uuid)
 
+        print("verifier_params", verifier_params)
         command = (
             f"{executor_info.python_path} {script_path} {verifier_params}"
         )
