@@ -379,9 +379,7 @@ class ComputeClient:
             redis_service = self.miner_service.redis_service
             await redis_service.delete(RENTED_MACHINE_PREFIX)
             for machine in response.machines:
-                if machine.is_rented:
-                    await redis_service.add_rented_machine(machine)
-                await redis_service.add_executor_uptime(machine)
+                await redis_service.add_rented_machine(machine)
             return
         
         try:

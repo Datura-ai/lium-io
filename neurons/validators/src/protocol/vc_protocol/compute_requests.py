@@ -21,9 +21,7 @@ class RentedMachine(BaseModel):
     executor_id: str
     executor_ip_address: str
     executor_ip_port: str
-    container_name: str | None = None
-    is_rented: bool = True
-    uptime_in_minutes: int | None = None
+    container_name: str
 
 class RentedMachineResponse(BaseModel):
     machines: list[RentedMachine]
