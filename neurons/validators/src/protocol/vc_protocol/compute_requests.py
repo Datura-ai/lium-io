@@ -22,6 +22,7 @@ class RentedMachine(BaseModel):
     executor_ip_address: str
     executor_ip_port: str
     container_name: str
+    owner_flag: bool = False
 
 
 class RentedMachineResponse(BaseModel):
