@@ -22,7 +22,7 @@ class RentedMachine(BaseModel):
     executor_ip_address: str
     executor_ip_port: str
     container_name: str | None = None
-    is_rented: bool
+    is_rented: bool = True
     uptime_in_minutes: int | None = None
 
 class RentedMachineResponse(BaseModel):
