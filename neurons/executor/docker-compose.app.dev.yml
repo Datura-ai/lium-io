@@ -13,6 +13,8 @@ services:
       - /etc/docker/daemon.json:/etc/docker/daemon.json
       - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
     pid: host
+    labels:
+      autoheal-app: true
     healthcheck:
       test: ["CMD-SHELL", "nvidia-smi || exit 1"]
       interval: 2m
@@ -25,3 +27,11 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  autoheal:
+    restart: always
+    image: willfarrell/autoheal
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
