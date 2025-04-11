@@ -49,8 +49,8 @@ services:
       - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - COMPUTE_APP_URI=wss://celiumcompute.ai
-    command: python src/connector.py
+      - COMPUTE_APP_URI=wss://dev.celiumcompute.ai
+    command: pdm run src/connector.py
     volumes:
       - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
