@@ -15,7 +15,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MIN_STAKE = 10
 VALIDATORS_LIMIT = 24
 SYNC_CYCLE = 2 * 60
 
@@ -155,8 +154,12 @@ class Miner:
             )
 
     async def fetch_validators(self):
+        a = self.subtensor.get_metagraph_info(self.netuid)
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
-        neurons = [n for n in metagraph.neurons if (n.stake.tao >= MIN_STAKE)]
+        neurons = [
+            n for n in metagraph.neurons
+            if (n.stake.tao >= settings.MIN_ALPHA_STAKE and a.total_stake[n.uid] >= settings.MIN_TOTAL_STAKE)
+        ]
         return neurons
 
     async def save_validators(self, validators):
