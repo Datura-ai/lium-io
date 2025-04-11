@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import datetime
 from typing import TYPE_CHECKING
+import random
 
 import bittensor
 import numpy as np
@@ -21,7 +22,7 @@ from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, Redi
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.matrix_validation_service import ValidationService
-from services.const import BURN_EMISSION
+from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION, JOB_TIME_OUT
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -209,6 +210,10 @@ class Validator:
         node = self.get_node()
         return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
 
+    def get_last_mechansim_step_block(self):
+        node = self.get_node()
+        return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
+
     def get_my_uid(self):
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
@@ -231,12 +236,7 @@ class Validator:
             miners = [
                 neuron
                 for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving
-                and (
-                    not settings.DEBUG
-                    or not settings.DEBUG_MINER_HOTKEY
-                    or settings.DEBUG_MINER_HOTKEY == neuron.axon_info.hotkey
-                )
+                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
             ]
         logger.info(
             _m(
@@ -271,17 +271,35 @@ class Validator:
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
 
+        last_mechansim_step_block = self.get_last_mechansim_step_block()
+        main_burner = random.Random(last_mechansim_step_block).choice(settings.BURNERS)
+        logger.info(
+            _m(
+                "[set_weights] main burner",
+                extra=get_extra_info({
+                    "last_mechansim_step_block": last_mechansim_step_block,
+                    "main_burner": main_burner,
+                }),
+            ),
+        )
+        other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
+
         total_score = sum(self.miner_scores.values())
         if total_score <= 0:
-            uids[0] = 4
-            weights[0] = 1
+            uids[0] = main_burner
+            weights[0] = 1 - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+            for ind, uid in enumerate(other_burners):
+                uids[ind + 1] = uid
+                weights[ind + 1] = BURNER_EMISSION
         else:
             for ind, miner in enumerate(miners):
                 uids[ind] = miner.uid
-                if miner.uid == 4:
-                    weights[ind] = BURN_EMISSION
+                if miner.uid == main_burner:
+                    weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+                elif miner.uid in other_burners:
+                    weights[ind] = BURNER_EMISSION
                 else:
-                    weights[ind] = (1 - BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
+                    weights[ind] = (1 - TOTAL_BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
 
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
@@ -572,7 +590,7 @@ class Validator:
 
                 try:
                     # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 100)
+                    done, pending = await asyncio.wait(jobs, timeout=JOB_TIME_OUT - 50)
 
                     # Process completed jobs
                     for task in done:

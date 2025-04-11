@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
+    BURNERS: list[int] = [4, 206, 207, 208]
+
+    HAS_GPU_VERIFICATION: bool = False
+
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")

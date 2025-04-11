@@ -1,6 +1,7 @@
 import json
 import asyncio
 import redis.asyncio as aioredis
+from datura.requests.miner_requests import ExecutorSSHInfo
 from protocol.vc_protocol.compute_requests import RentedMachine
 from core.config import settings
 
@@ -117,13 +118,13 @@ class RedisService:
                 await self.redis.delete(key.decode())
 
     async def add_rented_machine(self, machine: RentedMachine):
-        await self.hset(RENTED_MACHINE_PREFIX, f"{machine.miner_hotkey}:{machine.executor_id}", machine.model_dump_json())
+        await self.hset(RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json())
 
-    async def remove_rented_machine(self, miner_hotkey: str, executor_id: str):
-        await self.hdel(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+    async def remove_rented_machine(self, executor: ExecutorSSHInfo):
+        await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
 
-    async def get_rented_machine(self, miner_hotkey: str, executor_id: str):
-        data = await self.hget(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+    async def get_rented_machine(self, executor: ExecutorSSHInfo):
+        data = await self.hget(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
         if not data:
             return None
 

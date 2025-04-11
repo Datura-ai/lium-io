@@ -26,8 +26,7 @@ class MinerJobEnryptedFiles(BaseModel):
     all_keys: dict
     tmp_directory: str
     machine_scrape_file_name: str
-    score_file_name: str
-    verifier_file_name: str
+    # score_file_name: str
 
 
 class ResourceType(BaseModel):
@@ -137,6 +136,7 @@ class ContainerDeleted(ContainerBaseResponse):
 
 class SshPubKeyAdded(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
+    user_public_keys: list[str] = []
 
 
 class FailedContainerErrorCodes(enum.Enum):
