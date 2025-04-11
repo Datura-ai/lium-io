@@ -5,7 +5,6 @@ import json
 import os
 import uuid as uuid4
 from dataclasses import dataclass
-from typing import Self
 from core.utils import _m, get_extra_info
 from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
 
@@ -67,6 +66,7 @@ class DMCompVerifyWrapper:
 
         if cipher_text_ptr:
             cipher_text = c_char_p(cipher_text_ptr).value  # Decode the C string
+            # self.free(cipher_text_ptr)
             return cipher_text.decode('utf-8')
         else:
             return None
@@ -88,7 +88,7 @@ def encrypt_challenge(m_dim_n, m_dim_k, seed, machine_info, uuid):
         wrapper.generateChallenge(verifier_ptr, seed, machine_info, uuid)
 
         cipher_text = wrapper.getCipherText(verifier_ptr)
-        
+        print("Encrypt Challenge Cipher Text:", cipher_text)
         return cipher_text
     except Exception as e:
         logger.error("Failed encrypt challenge request: %s", str(e))
@@ -103,20 +103,17 @@ class VerifierParams:
         self.seed = seed
         self.uuid = uuid
         self.cipher_text = ""
-
-    @classmethod
-    def generate(cls) -> Self:
+    
+    def generate(self):
         # You can modify the range for more randomness or based on specific needs
-        dim_n = random.randint(1900, 2000)  # Random dim_n between 1900 and 2000
-        dim_k = random.randint(2000000, 2586932)  # Random dim_k between 2000000 and 2586932
-        seed = int(time.time())
-        uuid = str(uuid4.uuid4())
-
-        return cls(dim_n=dim_n, dim_k=dim_k, seed=seed, uuid=uuid)
+        self.dim_n = random.randint(1900, 2000)  # Random dim_n between 1900 and 2000
+        self.dim_k = random.randint(2000000, 2586932)  # Random dim_k between 2000000 and 2586932
+        self.seed = int(time.time())
+        self.uuid = str(uuid4.uuid4())
 
     def __str__(self) -> str:
         return f"--dim_n {self.dim_n} --dim_k {self.dim_k} --seed {self.seed} --cipher_text {self.cipher_text}"
-
+    
 
 class ValidationService:
     def get_gpu_memory(self, machine_spec: dict) -> bool:
@@ -159,59 +156,89 @@ class ValidationService:
         default_extra: dict,
         machine_spec: dict,
     ) -> bool:
-        script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
+        try:
+            script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
 
-        gpu_model = ""
-        if machine_spec.get("gpu", {}).get("count", 0) > 0:
-            details = machine_spec["gpu"].get("details", [])
-            if len(details) > 0:
-                gpu_model = details[0].get("name", "")
+            gpu_model = ""
+            if machine_spec.get("gpu", {}).get("count", 0) > 0:
+                details = machine_spec["gpu"].get("details", [])
+                if len(details) > 0:
+                    gpu_model = details[0].get("name", "")
 
-        gpu_details = machine_spec.get("gpu", {}).get("details", [])
-        gpu_count = machine_spec.get("gpu", {}).get("count", 0)
-        gpu_uuids = ','.join([detail.get('uuid', '') for detail in gpu_details])
+            gpu_details = machine_spec.get("gpu", {}).get("details", [])
+            gpu_count = machine_spec.get("gpu", {}).get("count", 0)
+            gpu_uuids = ','.join([detail.get('uuid', '') for detail in gpu_details])
 
-        gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
-        machine_info = json.dumps(gpu_info, sort_keys=True)
+            gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
+            machine_info = json.dumps(gpu_info, sort_keys=True)
 
-        verifier_params = VerifierParams.generate()
-        gpu_memory = self.get_gpu_memory(machine_spec)
-        verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
+            verifier_params = VerifierParams()
+            verifier_params.generate()
+            gpu_memory = self.get_gpu_memory(machine_spec)
+            verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
 
-        verifier_params.cipher_text = encrypt_challenge(verifier_params.dim_n, verifier_params.dim_k, verifier_params.seed, machine_info, verifier_params.uuid)
+            verifier_params.cipher_text = encrypt_challenge(
+                verifier_params.dim_n,
+                verifier_params.dim_k,
+                verifier_params.seed,
+                machine_info,
+                verifier_params.uuid,
+            )
 
-        command = (
-            f"{executor_info.python_path} {script_path} {verifier_params}"
-        )
+            print("verifier_params", verifier_params)
+            command = f"{executor_info.python_path} {script_path} {verifier_params}"
 
-        log_extra = {
-            **default_extra,
-            "dim_n": verifier_params.dim_n,
-            "dim_k": verifier_params.dim_k,
-            "seed": verifier_params.seed,
-            "uuid": verifier_params.uuid,
-            "cipher_text": verifier_params.cipher_text,
-            "machine_info": machine_info,
-        }
+            log_extra = {
+                **default_extra,
+                "dim_n": verifier_params.dim_n,
+                "dim_k": verifier_params.dim_k,
+                "seed": verifier_params.seed,
+                "uuid": verifier_params.uuid,
+                "cipher_text": verifier_params.cipher_text,
+                "machine_info": machine_info,
+            }
 
-        logger.info(_m("Matrix Multiplication Python Script Command", extra=get_extra_info(log_extra)))
-        # Run the script
-        result = await ssh_client.run(command)
-        logger.info(f"{script_path}: {result}")
+            logger.info(_m("Matrix Multiplication Python Script Command", extra=get_extra_info(log_extra)))
 
-        if result is None:
-            logger.warning(_m("GPU model validation job failed", extra=get_extra_info(log_extra)))
-            return False
+            # Run the script
+            try:
+                result = await ssh_client.run(command)
+            except Exception as e:
+                logger.error(_m("Failed to execute SSH command", extra=get_extra_info(log_extra)))
+                return False
 
-        stdout = result.stdout.strip()
+            logger.info(f"{script_path}: {result}")
 
-        # Extract UUID from stdout
-        uuid_line = next((line for line in stdout.splitlines() if line.startswith("UUID:")), None)
-        uuid = uuid_line.split("UUID:")[1].strip() if uuid_line else ""
-        uuid_array = verifier_params.uuid.split(",")
-        if uuid in uuid_array:
-            logger.info(_m("Matrix Mulitiplication Verification Succeed", extra=get_extra_info(log_extra)))
-            return True
-        else:
-            logger.info(_m("Matrix Mulitiplication Verification Failed", extra=get_extra_info(log_extra)))
+            if result is None:
+                logger.warning(_m("GPU model validation job failed", extra=get_extra_info(log_extra)))
+                return False
+
+            try:
+                stdout = result.stdout.strip()
+            except AttributeError as e:
+                logger.error(_m("Result object missing stdout attribute", extra=get_extra_info(log_extra)))
+                return False
+
+            # Extract UUID from stdout
+            try:
+                uuid_line = next((line for line in stdout.splitlines() if line.startswith("UUID:")), None)
+                uuid = uuid_line.split("UUID:")[1].strip() if uuid_line else ""
+            except Exception as e:
+                logger.error(_m("Failed to extract UUID from stdout", extra=get_extra_info(log_extra)))
+                return False
+
+            try:
+                uuid_array = verifier_params.uuid.split(",")
+                if uuid in uuid_array:
+                    logger.info(_m("Matrix Multiplication Verification Succeed", extra=get_extra_info(log_extra)))
+                    return True
+                else:
+                    logger.info(_m("Matrix Multiplication Verification Failed", extra=get_extra_info(log_extra)))
+                    return False
+            except Exception as e:
+                logger.error(_m("Error during UUID verification", extra=get_extra_info(log_extra)))
+                return False
+
+        except Exception as e:
+            logger.error(_m("Unexpected error in validate_gpu_model_and_process_job", extra=default_extra))
             return False
