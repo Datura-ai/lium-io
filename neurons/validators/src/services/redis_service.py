@@ -4,7 +4,7 @@ import logging
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 from datura.requests.miner_requests import ExecutorSSHInfo
-from protocol.vc_protocol.compute_requests import RentedMachine
+from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
 from core.utils import _m
 
@@ -136,7 +136,7 @@ class RedisService:
 
         return json.loads(data)
     
-    async def add_executor_uptime(self, machine: RentedMachine):
+    async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
 
     async def get_executor_uptime(self, executor: ExecutorSSHInfo) -> int:

@@ -25,3 +25,9 @@ class RentedMachine(BaseModel):
 
 class RentedMachineResponse(BaseModel):
     machines: list[RentedMachine]
+
+
+class ExecutorUptimeResponse(BaseModel):
+    executor_ip_address: str
+    executor_ip_port: str
+    uptime_in_minutes: int
