@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     ENV: str = Field(env="ENV", default="dev")
     DEBUG: bool = Field(env="DEBUG", default=False)
 
+    MIN_ALPHA_STAKE: int = Field(env="MIN_ALPHA_STAKE", default=10)
+    MIN_TOTAL_STAKE: int = Field(env="MIN_TOTAL_STAKE", default=20000)
+
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
