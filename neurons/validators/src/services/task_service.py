@@ -864,7 +864,7 @@ class TaskService:
                         executor_info=executor_info,
                         max_score=max_score,
                         gpu_count=gpu_count,
-                        is_rental_succeed=is_rental_succeed,
+                        is_rental_check_passed=is_rental_succeed,
                         is_rented=True,
                     )
                     log_msg = (
