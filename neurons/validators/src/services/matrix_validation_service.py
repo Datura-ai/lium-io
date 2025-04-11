@@ -66,6 +66,7 @@ class DMCompVerifyWrapper:
 
         if cipher_text_ptr:
             cipher_text = c_char_p(cipher_text_ptr).value  # Decode the C string
+            self.free(cipher_text_ptr)
             return cipher_text.decode('utf-8')
         else:
             return None
