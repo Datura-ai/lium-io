@@ -302,18 +302,14 @@ class FileEncryptService:
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
 
-            machine_scrape_file_name = self.make_binary_file(
-                str(tmp_directory), machine_scrape_file.name
-            )
-
-            # if random.choice([True, False]):
-            #     machine_scrape_file_name = self.make_binary_file_with_nuitka(
-            #         str(tmp_directory), machine_scrape_file.name
-            #     )
-            # else:
-            #     machine_scrape_file_name = self.make_binary_file(
-            #         str(tmp_directory), machine_scrape_file.name
-            #     )
+            if random.choice([True, False]):
+                machine_scrape_file_name = self.make_binary_file_with_nuitka(
+                    str(tmp_directory), machine_scrape_file.name
+                )
+            else:
+                machine_scrape_file_name = self.make_binary_file(
+                    str(tmp_directory), machine_scrape_file.name
+                )
 
         # # generate score_script file
         # score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
