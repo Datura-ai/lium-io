@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from datetime import datetime
 from typing import TYPE_CHECKING
 import random
@@ -730,6 +731,8 @@ class Validator:
                             )
                             task.cancel()
 
+                    open_fd_count = len(os.listdir(f'/proc/self/fd'))
+
                     logger.info(
                         _m(
                             "[sync] All Jobs finished",
@@ -738,6 +741,7 @@ class Validator:
                                     **self.default_extra,
                                     "job_batch_id": job_batch_id,
                                     "miner_scores": self.miner_scores,
+                                    "open_fd_count": open_fd_count,
                                 }
                             ),
                         ),
