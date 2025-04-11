@@ -157,7 +157,7 @@ class Miner:
     async def fetch_validators(self):
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
         neurons = [n for n in metagraph.neurons if (n.stake.tao >= MIN_STAKE)]
-        return neurons[:VALIDATORS_LIMIT]
+        return neurons
 
     async def save_validators(self, validators):
         logger.info(
