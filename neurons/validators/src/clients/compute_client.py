@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import time
 from typing import NoReturn
 
+import aiohttp
 import bittensor
 import pydantic
 import tenacity
@@ -23,7 +25,7 @@ from payload_models.payloads import (
     DuplicateExecutorsResponse,
     FailedContainerRequest,
 )
-from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
+from protocol.vc_protocol.compute_requests import Error, ExecutorUptimeResponse, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     DuplicateExecutorsRequest,
@@ -40,6 +42,7 @@ from core.utils import _m, get_extra_info
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
+    EXECUTORS_UPTIME_PREFIX,
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
     RENTED_MACHINE_PREFIX,
@@ -65,6 +68,7 @@ class ComputeClient:
         self.keypair = keypair
         self.ws: ClientConnection | None = None
         self.compute_app_uri = compute_app_uri
+        self.compute_app_rest_api_uri = compute_app_uri.replace("ws", "http").replace("wss", "https")
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
@@ -126,6 +130,7 @@ class ComputeClient:
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
+        asyncio.create_task(self.poll_executors_uptime())
 
         try:
             while True:
@@ -256,6 +261,7 @@ class ComputeClient:
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
+                            reason=data["reason"]
                         )
 
                         async with self.lock:
@@ -342,6 +348,57 @@ class ComputeClient:
 
             await asyncio.sleep(10 * 60)
 
+    async def poll_executors_uptime(self):
+        while True:
+            try:
+                await self.get_executors_uptime()
+            except Exception as exc:
+                logger.error(
+                    _m("Exception during get executors uptime from compute app", extra={**self.logging_extra, "error": str(exc)}),
+                    exc_info=True
+                )
+            finally:
+                await asyncio.sleep(20 * 60)
+
+    async def get_executors_uptime(self):
+        """Get executors uptime from compute app."""
+        default_log_info = get_extra_info(self.logging_extra)
+        start_time = time.time()
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = f"{self.compute_app_rest_api_uri}/executors"
+                headers = {
+                    'X-Validator-Signature': f"0x{self.keypair.sign(self.my_hotkey()).hex()}"
+                }
+                async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    if response.status != 200:
+                        error_msg = await response.text()
+                        logger.error(
+                            _m("Failed to get executors uptime from compute app", extra={**default_log_info, "status": response.status, "response": error_msg}),
+                        )
+                        return
+                    
+                    executors_json = await response.json()
+                    executors = [ExecutorUptimeResponse(**executor) for executor in executors_json]
+                    logger.info(
+                        _m("Successfully got response from compute app", extra={**default_log_info, "status": len(executors), "time_cost": time.time() - start_time}),
+                    )
+                    # clean up old redis data
+                    redis_service = self.miner_service.redis_service
+                    await redis_service.delete(EXECUTORS_UPTIME_PREFIX)
+                    # need to store them into redis db.
+                    for executor in executors:
+                        await redis_service.add_executor_uptime(executor)
+
+                    logger.info(
+                        _m("Successfully stored executors uptime into redis", extra={**default_log_info, "time_cost": time.time() - start_time}),
+                    )
+            except Exception as exc:
+                logger.error(
+                    _m("Exception during get executors uptime from compute app", extra={**default_log_info, "error": str(exc)}),
+                    exc_info=True
+                )
+
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
         try:
@@ -375,15 +432,12 @@ class ComputeClient:
                     }),
                 )
             )
-
             redis_service = self.miner_service.redis_service
             await redis_service.delete(RENTED_MACHINE_PREFIX)
-
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
-
             return
-
+        
         try:
             response = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
         except pydantic.ValidationError:
