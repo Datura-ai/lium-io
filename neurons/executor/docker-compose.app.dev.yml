@@ -2,6 +2,7 @@ services:
   executor:
     image: daturaai/compute-subnet-executor:dev
     env_file: ./.env
+    restart: always
     ports:
       - ${EXTERNAL_PORT}:${INTERNAL_PORT}
       - ${SSH_PORT}:22
@@ -12,6 +13,13 @@ services:
       - /etc/docker/daemon.json:/etc/docker/daemon.json
       - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
     pid: host
+    labels:
+      autoheal-app: true
+    healthcheck:
+      test: ["CMD-SHELL", "nvidia-smi || exit 1"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
     deploy:
       resources:
         reservations:
@@ -19,3 +27,11 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  autoheal:
+    restart: always
+    image: willfarrell/autoheal
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

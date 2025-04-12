@@ -301,15 +301,19 @@ class FileEncryptService:
             machine_scrape_file.write(obfuscated_content.encode("utf-8"))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
+            
+            machine_scrape_file_name = self.make_binary_file(
+                str(tmp_directory), machine_scrape_file.name
+            )
 
-            if random.choice([True, False]):
-                machine_scrape_file_name = self.make_binary_file_with_nuitka(
-                    str(tmp_directory), machine_scrape_file.name
-                )
-            else:
-                machine_scrape_file_name = self.make_binary_file(
-                    str(tmp_directory), machine_scrape_file.name
-                )
+            # if random.choice([True, False]):
+            #     machine_scrape_file_name = self.make_binary_file_with_nuitka(
+            #         str(tmp_directory), machine_scrape_file.name
+            #     )
+            # else:
+            #     machine_scrape_file_name = self.make_binary_file(
+            #         str(tmp_directory), machine_scrape_file.name
+            #     )
 
         # # generate score_script file
         # score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
@@ -322,7 +326,6 @@ class FileEncryptService:
         #     score_file.flush()
         #     os.fsync(score_file.fileno())
         #     score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
-
 
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
