@@ -1,9 +1,12 @@
 import json
 import asyncio
+import logging
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 from datura.requests.miner_requests import ExecutorSSHInfo
-from protocol.vc_protocol.compute_requests import RentedMachine
+from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
+from core.utils import _m
 
 MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
@@ -15,6 +18,9 @@ RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
+EXECUTORS_UPTIME_PREFIX = "executors_uptime"
+
+logger = logging.getLogger(__name__)
 
 
 class RedisService:
@@ -129,6 +135,19 @@ class RedisService:
             return None
 
         return json.loads(data)
+    
+    async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
+        await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
+
+    async def get_executor_uptime(self, executor: ExecutorSSHInfo) -> int:
+        try:
+            data = await self.hget(EXECUTORS_UPTIME_PREFIX, f"{executor.address}:{executor.port}")
+            if not data:
+                return 0
+            return int(data)
+        except Exception as e:
+            logger.error(_m("Error getting executor uptime: {e}", extra={"error": e}), exc_info=True)
+            return 0
 
     async def add_pending_pod(self, miner_hotkey: str, executor_id: str):
         await self.sadd(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
@@ -190,7 +209,8 @@ class RedisService:
         self,
         miner_hotkey: str,
         executor_id,
-        prev_info: dict = {}
+        prev_info: dict = {},
+        reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
     ):
         spec = prev_info.get('spec', '')
         uuids = prev_info.get('uuids', '')
@@ -208,6 +228,7 @@ class RedisService:
             {
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_id,
+                "reason": reason.value,
             },
         )
 
