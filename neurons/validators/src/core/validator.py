@@ -19,7 +19,7 @@ from core.utils import _m, get_extra_info, get_logger
 from services.docker_service import REPOSITORIES, DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, RedisService
+from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_PREFIX, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.matrix_validation_service import ValidationService
@@ -112,7 +112,7 @@ class Validator:
                     self.miner_scores = json.loads(miner_scores_json)
 
             # remove pod renting-in-progress status
-            await self.redis_service.delete(PENDING_PODS_SET)
+            await self.redis_service.delete(PENDING_PODS_PREFIX)
         except Exception as e:
             logger.error(
                 _m(
