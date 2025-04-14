@@ -301,7 +301,7 @@ class FileEncryptService:
             machine_scrape_file.write(obfuscated_content.encode("utf-8"))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
-
+            
             machine_scrape_file_name = self.make_binary_file(
                 str(tmp_directory), machine_scrape_file.name
             )
