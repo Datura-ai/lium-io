@@ -766,33 +766,6 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                for process in gpu_processes:
-                    container_name = process.get('container_name', None)
-                    if not container_name:
-                        log_text = _m(
-                            "GPU is using in some other places",
-                            extra=get_extra_info(
-                                {
-                                    **default_extra,
-                                    "gpu_model": gpu_model,
-                                    "gpu_count": gpu_count,
-                                    **process,
-                                }
-                            ),
-                        )
-
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-
                 logger.info(
                     _m(
                         f"Got GPU specs: {gpu_model} with max score: {max_score}",
@@ -853,6 +826,39 @@ class TaskService:
                             success=False,
                             clear_verified_job_info=True,
                             clear_verified_job_reason=ResetVerifiedJobReason.POD_NOT_RUNNING,
+                        )
+
+                    # check gpu running out side of containers
+                    gpu_running_outside = False
+                    for process in gpu_processes:
+                        gpu_process_container = process.get('container_name', None)
+                        if not gpu_process_container or gpu_process_container != container_name:
+                            gpu_running_outside = True
+                            break
+
+                    if not rented_machine.get("owner_flag", False) and gpu_running_outside:
+                        log_text = _m(
+                            "GPU is using in some other places on the rented machine",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "gpu_model": gpu_model,
+                                    "gpu_count": gpu_count,
+                                    **process,
+                                }
+                            ),
+                        )
+
+                        return await self._handle_task_result(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            spec=machine_spec,
+                            score=0,
+                            job_score=0,
+                            log_text=log_text,
+                            verified_job_info=verified_job_info,
+                            success=False,
+                            clear_verified_job_info=False,
                         )
 
                     # In backend, there are 2 scores. actual score and job score.
