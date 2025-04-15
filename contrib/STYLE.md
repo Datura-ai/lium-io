@@ -1,6 +1,6 @@
 # Style Guide
 
-A project’s long-term success rests (among other things) on its maintainability, and a maintainer has few tools more powerful than his or her project’s log. It’s worth taking the time to learn how to care for one properly. What may be a hassle at first soon becomes habit, and eventually a source of pride and productivity for all involved.
+A project’s long-term success rests (among other things) on its maintainability, and a maintainer has few tools more powerful than his or her project’s log. It’s worth taking the time to learn how to care for one properly. What may be a hassle at first soon becomes a habit, and eventually a source of pride and productivity for all involved.
 
 Most programming languages have well-established conventions as to what constitutes idiomatic style, i.e. naming, formatting and so on. There are variations on these conventions, of course, but most developers agree that picking one and sticking to it is far better than the chaos that ensues when everybody does their own thing.
 
@@ -35,7 +35,7 @@ Python's official style guide is PEP 8, which provides conventions for writing c
 - `Imports:` Imports should usually be on separate lines and should be grouped in the following order:
 
     - Standard library imports.
-    - Related third party imports.
+    - Related third-party imports.
     - Local application/library specific imports.
 - `Whitespace:` Avoid extraneous whitespace in the following situations:
 
@@ -50,7 +50,7 @@ Python's official style guide is PEP 8, which provides conventions for writing c
 
 - `Generators:` Use generators when dealing with large amounts of data to save memory.
 
-- `Context Managers:` Use context managers (with statement) for resource management.
+- `Context Managers:` Use context managers (with statements) for resource management.
 
 - `String Formatting:` Use f-strings for formatting strings in Python 3.6 and above.
 
@@ -58,7 +58,7 @@ Python's official style guide is PEP 8, which provides conventions for writing c
 
 #### More details
 
-Use `black` to format your python code before committing for consistency across such a large pool of contributors. Black's code [style](https://black.readthedocs.io/en/stable/the_black_code_style/current_style.html#code-style) ensures consistent and opinionated code formatting. It automatically formats your Python code according to the Black style guide, enhancing code readability and maintainability.
+Use `black` to format your Python code before committing for consistency across such a large pool of contributors. Black's code [style](https://black.readthedocs.io/en/stable/the_black_code_style/current_style.html#code-style) ensures consistent and opinionated code formatting. It automatically formats your Python code according to the Black style guide, enhancing code readability and maintainability.
 
 Key Features of Black:
 
@@ -143,9 +143,9 @@ Commit messages like "fix", "fix2", or "fix3" don't provide any context or clear
 
     $ git commit -m "Fix typo in README file"
 
-> **Caveat**: When working with new features, an atomic commit will often consist of multiple files, since a layout file, code behind file, and additional resources may have been added/modified. You don’t want to commit all of these separately, because if you had to roll back the application to a state before the feature was added, it would involve multiple commit entries, and that can get confusing
+> **Caveat**: When working with new features, an atomic commit will often consist of multiple files, since a layout file, code behind the file, and additional resources may have been added/modified. You don’t want to commit all of these separately, because if you had to roll back the application to a state before the feature was added, it would involve multiple commit entries, and that can get confusing
 
-#### 2. Separate subject from body with a blank line
+#### 2. Separate the subject from the body with a blank line
 
 Not every commit requires both a subject and a body. Sometimes a single line is fine, especially when the change is so simple that no further context is necessary. 
 
@@ -195,7 +195,7 @@ Imperative mood just means “spoken or written as if giving a command or instru
     Close the door
     Take out the trash
 
-Each of the seven rules you’re reading about right now are written in the imperative (“Wrap the body at 72 characters”, etc.).
+Each of the seven rules you’re reading about right now is written in the imperative (“Wrap the body at 72 characters”, etc.).
 
 The imperative can sound a little rude; that’s why we don’t often use it. But it’s perfect for Git commit subject lines. One reason for this is that Git itself uses the imperative whenever it creates a commit on your behalf.
 
@@ -338,7 +338,7 @@ new resources. This change is important because it allows users to
 perform task Y more efficiently. 
 
 It includes:
-- Creation of new layout file
+- Creation of a new layout file
 - Updates in the code-behind file
 - Addition of new resources
 

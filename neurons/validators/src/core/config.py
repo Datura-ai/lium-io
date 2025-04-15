@@ -44,7 +44,7 @@ class Settings(BaseSettings):
 
     ENV: str = Field(env="ENV", default="dev")
 
-    PORTION_FOR_UPTIME: float = 0.5
+    PORTION_FOR_UPTIME: float = 0.05
 
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
