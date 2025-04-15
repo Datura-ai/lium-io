@@ -4,8 +4,8 @@ JOB_TIME_OUT = 60 * 10
 
 GPU_MAX_SCORES = {
     # Latest Gen NVIDIA GPUs (Averaged if applicable)
-    "NVIDIA B200": 6.17,
-    "NVIDIA H200": 4.65,
+    "NVIDIA B200": 8.02,
+    "NVIDIA H200": 6.04,
     "NVIDIA H100 80GB HBM3": 3.49,
     "NVIDIA H100 NVL": 2.79,
     "NVIDIA H100 PCIe": 2.69,
@@ -13,8 +13,8 @@ GPU_MAX_SCORES = {
     "NVIDIA H800 NVL": 2.09,
     "NVIDIA H800 PCIe": 2.01,
     "NVIDIA GeForce RTX 5090": 0.98,
-    "NVIDIA GeForce RTX 4090": 0.69,
-    "NVIDIA GeForce RTX 4090 D": 0.62,
+    "NVIDIA GeForce RTX 4090": 0.48,
+    "NVIDIA GeForce RTX 4090 D": 0.43,
     "NVIDIA RTX 4000 Ada Generation": 0.38,
     "NVIDIA RTX 6000 Ada Generation": 1.03,
     "NVIDIA L4": 0.43,
