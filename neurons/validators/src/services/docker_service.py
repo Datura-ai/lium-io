@@ -315,10 +315,6 @@ class DockerService:
             raise_exception=False
         )
 
-    async def clear_verified_job_count(self, miner_hotkey: str, executor_id: str):
-        await self.redis_service.remove_pending_pod(miner_hotkey, executor_id)
-        await self.redis_service.clear_verified_job_info(miner_hotkey, executor_id)
-
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -585,7 +581,7 @@ class DockerService:
             logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.clear_verified_job_count(payload.miner_hotkey, payload.executor_id)
+            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,

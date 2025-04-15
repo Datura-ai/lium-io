@@ -76,12 +76,17 @@ class LogStreamRequest(BaseValidatorRequest):
     logs: list[dict]
 
 
+class ResetVerifiedJobReason(int, enum.Enum):
+    DEFAULT                             = 0
+    POD_NOT_RUNNING                     = 1         # container for pod is not running
+
+
 class ResetVerifiedJobRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ResetVerifiedJobRequest
     validator_hotkey: str
     miner_hotkey: str
     executor_uuid: str
-
+    reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
 
 class DuplicateExecutorsRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.DuplicateExecutorsRequest
