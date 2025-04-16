@@ -55,6 +55,7 @@ class ContainerRequestType(enum.Enum):
     ContainerDeleteRequest = "ContainerDeleteRequest"
     AddSshPublicKey = "AddSshPublicKey"
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
+    ExecutorRentFinished = "ExecutorRentFinished"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -72,6 +73,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     custom_options: CustomOptions | None = None
     debug: bool | None = None
     volume_name: str | None = None  # when edit pod, volume_name is required
+
+
+class ExecutorRentFinishedRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.ExecutorRentFinished
 
 
 class ContainerStartRequest(ContainerBaseRequest):

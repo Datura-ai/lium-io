@@ -1,6 +1,7 @@
 import json
 import asyncio
 import logging
+import time
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -13,6 +14,7 @@ STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_SET = "pending_pods"
+PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 EXECUTOR_COUNT_PREFIX = "executor_counts"
@@ -135,7 +137,7 @@ class RedisService:
             return None
 
         return json.loads(data)
-    
+
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
 
@@ -150,13 +152,24 @@ class RedisService:
             return 0
 
     async def add_pending_pod(self, miner_hotkey: str, executor_id: str):
-        await self.sadd(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+        now = int(time.time())
+        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps({"time": now}))
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str):
-        await self.srem(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+        await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
 
     async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
-        return await self.is_elem_exists_in_set(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+        data = await self.hget(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+        if not data:
+            return False
+
+        now = int(time.time())
+        data = json.loads(data)
+        if now - data.get('time', 0) >= 30 * 60:  # 30 mins
+            await self.remove_pending_pod(miner_hotkey, executor_id)
+            return False
+
+        return True
 
     async def clear_all_executor_counts(self):
         pattern = f"{EXECUTOR_COUNT_PREFIX}:*"
