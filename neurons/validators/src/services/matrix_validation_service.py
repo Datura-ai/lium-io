@@ -77,24 +77,6 @@ class DMCompVerifyWrapper:
         """
         self._lib.free(ptr)
 
-def encrypt_challenge(m_dim_n, m_dim_k, seed, machine_info, uuid):
-    try:
-        # Example of usage:
-        wrapper = DMCompVerifyWrapper("/usr/lib/libdmcompverify.so")
-
-        # Create a new DMCompVerify object
-        verifier_ptr = wrapper.DMCompVerify_new(m_dim_n, m_dim_k)
-
-        wrapper.generateChallenge(verifier_ptr, seed, machine_info, uuid)
-
-        cipher_text = wrapper.getCipherText(verifier_ptr)
-        print("Encrypt Challenge Cipher Text:", cipher_text)
-        return cipher_text
-    except Exception as e:
-        logger.error("Failed encrypt challenge request: %s", str(e))
-        return ""
-
-
 @dataclass
 class VerifierParams:
     def __init__(self, dim_n: int = 1000, dim_k: int = 10000, seed: int = 0, uuid: str = ""):
@@ -116,6 +98,29 @@ class VerifierParams:
     
 
 class ValidationService:
+    def __init__(self):
+        """
+        Constructor, differentiate miner vs validator libs.
+        """
+        self.wrapper = DMCompVerifyWrapper("/usr/lib/libdmcompverify.so")
+
+    def encrypt_challenge(self, m_dim_n, m_dim_k, seed, machine_info, uuid):
+        try:
+            # Example of usage:
+            # Create a new DMCompVerify object
+            verifier_ptr = self.wrapper.DMCompVerify_new(m_dim_n, m_dim_k)
+
+            self.wrapper.generateChallenge(verifier_ptr, seed, machine_info, uuid)
+
+            cipher_text = self.wrapper.getCipherText(verifier_ptr)
+            print("Encrypt Challenge Cipher Text:", cipher_text)
+            # Free the verifier object
+            self.wrapper.free(verifier_ptr)
+            return cipher_text
+        except Exception as e:
+            logger.error("Failed encrypt challenge request: %s", str(e))
+            return ""
+    
     def get_gpu_memory(self, machine_spec: dict) -> bool:
         """
         Check if machine has data center GPUs (A100, H100, H200 or similar with >40GB memory)
@@ -177,7 +182,7 @@ class ValidationService:
             gpu_memory = self.get_gpu_memory(machine_spec)
             verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
 
-            verifier_params.cipher_text = encrypt_challenge(
+            verifier_params.cipher_text = self.encrypt_challenge(
                 verifier_params.dim_n,
                 verifier_params.dim_k,
                 verifier_params.seed,
