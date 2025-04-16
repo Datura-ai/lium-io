@@ -19,7 +19,7 @@ from core.utils import _m, get_extra_info, get_logger
 from services.docker_service import REPOSITORIES, DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, RedisService
+from services.redis_service import PENDING_PODS_SET, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.matrix_validation_service import ValidationService
@@ -81,23 +81,6 @@ class Validator:
         try:
             if await self.should_set_weights():
                 self.miner_scores = {}
-
-                # clear executor_counts
-                try:
-                    await self.redis_service.clear_all_executor_counts()
-                    logger.info(
-                        _m(
-                            "[initiate_services] Cleared executor_counts",
-                            extra=get_extra_info(self.default_extra),
-                        ),
-                    )
-                except Exception as e:
-                    logger.error(
-                        _m(
-                            "[initiate_services] Failed to clear executor_counts",
-                            extra=get_extra_info({**self.default_extra, "error": str(e)}),
-                        ),
-                    )
             else:
                 miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
                 if miner_scores_json is None:
@@ -373,28 +356,6 @@ class Validator:
 
         self.miner_scores = {}
 
-        # clear executor_counts
-        try:
-            await self.redis_service.clear_all_executor_counts()
-            logger.info(
-                _m(
-                    "[set_weights] Cleared executor_counts",
-                    extra=get_extra_info(self.default_extra),
-                ),
-            )
-        except Exception as e:
-            logger.error(
-                _m(
-                    "[set_weights] Failed to clear executor_counts",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-            )
-
     def get_last_update(self, block):
         try:
             node = self.get_node()
@@ -611,69 +572,6 @@ class Validator:
                                 )
                                 miner_hotkey = result.get("miner_hotkey")
                                 job_score = result.get("score")
-
-                                key = f"{EXECUTOR_COUNT_PREFIX}:{miner_hotkey}"
-
-                                try:
-                                    executor_counts = await self.redis_service.hgetall(key)
-                                    parsed_counts = [
-                                        {
-                                            "job_batch_id": job_id.decode("utf-8"),
-                                            **json.loads(data.decode("utf-8")),
-                                        }
-                                        for job_id, data in executor_counts.items()
-                                    ]
-
-                                    if parsed_counts:
-                                        logger.info(
-                                            _m(
-                                                "[sync] executor counts list",
-                                                extra=get_extra_info(
-                                                    {
-                                                        **self.default_extra,
-                                                        "miner_hotkey": miner_hotkey,
-                                                        "parsed_counts": parsed_counts,
-                                                    }
-                                                ),
-                                            ),
-                                        )
-
-                                        max_executors = max(
-                                            parsed_counts, key=lambda x: x["total"]
-                                        )["total"]
-                                        min_executors = min(
-                                            parsed_counts, key=lambda x: x["total"]
-                                        )["total"]
-
-                                        logger.info(
-                                            _m(
-                                                "[sync] executor counts",
-                                                extra=get_extra_info(
-                                                    {
-                                                        **self.default_extra,
-                                                        "miner_hotkey": miner_hotkey,
-                                                        "job_batch_id": job_batch_id,
-                                                        "max_executors": max_executors,
-                                                        "min_executors": min_executors,
-                                                    }
-                                                ),
-                                            ),
-                                        )
-
-                                except Exception as e:
-                                    logger.error(
-                                        _m(
-                                            "[sync] Get executor counts error",
-                                            extra=get_extra_info(
-                                                {
-                                                    **self.default_extra,
-                                                    "miner_hotkey": miner_hotkey,
-                                                    "job_batch_id": job_batch_id,
-                                                    "error": str(e),
-                                                }
-                                            ),
-                                        ),
-                                    )
 
                                 if miner_hotkey in self.miner_scores:
                                     self.miner_scores[miner_hotkey] += job_score

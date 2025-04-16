@@ -15,7 +15,6 @@ RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 PENDING_PODS_SET = "pending_pods"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
-EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
@@ -135,7 +134,7 @@ class RedisService:
             return None
 
         return json.loads(data)
-    
+
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
 
@@ -157,18 +156,6 @@ class RedisService:
 
     async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
         return await self.is_elem_exists_in_set(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
-
-    async def clear_all_executor_counts(self):
-        pattern = f"{EXECUTOR_COUNT_PREFIX}:*"
-        cursor = 0
-
-        async with self.lock:
-            while True:
-                cursor, keys = await self.redis.scan(cursor, match=pattern, count=100)
-                if keys:
-                    await self.redis.delete(*keys)
-                if cursor == 0:
-                    break
 
     async def set_verified_job_info(
         self,
