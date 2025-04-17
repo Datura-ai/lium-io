@@ -29,6 +29,9 @@ class DMCompVerifyWrapper:
         self._lib.DMCompVerify_new.argtypes = [c_longlong, c_longlong]  # Parameters (long m_dim_n, long m_dim_k)
         self._lib.DMCompVerify_new.restype = POINTER(c_void_p)  # Return type is a pointer to a structure.
 
+        self._lib.setDimension.argtypes = [POINTER(c_void_p), c_longlong, c_longlong]  # Parameters (long m_dim_n, long m_dim_k)
+        self._lib.setDimension.restype = POINTER(c_void_p)  # Return type is a pointer to a structure.
+
         self._lib.generateChallenge.argtypes = [POINTER(c_void_p), c_longlong, c_char_p, c_char_p]
         self._lib.generateChallenge.restype = None
         
@@ -71,6 +74,9 @@ class DMCompVerifyWrapper:
         else:
             return None
 
+    def setDimension(self, ptr: c_void_p, m_dim_n: int, m_dim_k: int):
+        self._lib.setDimension(ptr, m_dim_n, m_dim_k)
+
     def free(self, ptr: c_void_p):
         """
         Frees memory allocated for the given pointer.
@@ -103,19 +109,18 @@ class ValidationService:
         Constructor, differentiate miner vs validator libs.
         """
         self.wrapper = DMCompVerifyWrapper("/usr/lib/libdmcompverify.so")
+        self.verifier_ptr = self.wrapper.DMCompVerify_new(10, 10)
 
     def encrypt_challenge(self, m_dim_n, m_dim_k, seed, machine_info, uuid):
         try:
             # Example of usage:
             # Create a new DMCompVerify object
-            verifier_ptr = self.wrapper.DMCompVerify_new(m_dim_n, m_dim_k)
+            self.wrapper.setDimension(self.verifier_ptr, m_dim_n, m_dim_k)
 
-            self.wrapper.generateChallenge(verifier_ptr, seed, machine_info, uuid)
+            self.wrapper.generateChallenge(self.verifier_ptr, seed, machine_info, uuid)
 
-            cipher_text = self.wrapper.getCipherText(verifier_ptr)
+            cipher_text = self.wrapper.getCipherText(self.verifier_ptr)
             print("Encrypt Challenge Cipher Text:", cipher_text)
-            # Free the verifier object
-            self.wrapper.free(verifier_ptr)
             return cipher_text
         except Exception as e:
             logger.error("Failed encrypt challenge request: %s", str(e))
