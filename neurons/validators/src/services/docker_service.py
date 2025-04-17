@@ -555,7 +555,6 @@ class DockerService:
                     executor_ip_port=str(executor_info.port),
                     container_name=container_name,
                 ))
-                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
 
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if not rented_machine:

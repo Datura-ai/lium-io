@@ -4,11 +4,11 @@ JOB_TIME_OUT = 60 * 10
 
 GPU_MAX_SCORES = {
     # Latest Gen NVIDIA GPUs (Averaged if applicable)
-    "NVIDIA B200": 8.02,
-    "NVIDIA H200": 6.04,
-    "NVIDIA H100 80GB HBM3": 4.19,
-    "NVIDIA H100 NVL": 3.35,
-    "NVIDIA H100 PCIe": 3.23,
+    "NVIDIA B200": 9.62,
+    "NVIDIA H200": 7.25,
+    "NVIDIA H100 80GB HBM3": 4.82,
+    "NVIDIA H100 NVL": 3.85,
+    "NVIDIA H100 PCIe": 3.71,
     "NVIDIA H800 80GB HBM3": 2.61,
     "NVIDIA H800 NVL": 2.09,
     "NVIDIA H800 PCIe": 2.01,
