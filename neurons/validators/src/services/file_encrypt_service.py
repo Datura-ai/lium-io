@@ -106,6 +106,8 @@ ORIGINAL_KEYS = {
     'each_container_id': "container_id",
     'each_digest': "digest",
     'each_name': "name",
+    'data_sysbox_runtime': "sysbox_runtime",
+    'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
 }
 
 
@@ -245,7 +247,9 @@ class FileEncryptService:
             'each_container_id': "",
             'each_digest': "",
             'each_name': "",
-            'machine_specs': ""
+            'machine_specs': "",
+            'data_sysbox_runtime': "",
+            'data_sysbox_runtime_scrape_error': "",
         }
 
         # Generate dictionary key mapping on validator side
