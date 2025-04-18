@@ -73,6 +73,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     custom_options: CustomOptions | None = None
     debug: bool | None = None
     volume_name: str | None = None  # when edit pod, volume_name is required
+    is_sysbox: bool | None = None
 
 
 class ContainerStartRequest(ContainerBaseRequest):
