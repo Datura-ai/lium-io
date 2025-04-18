@@ -1,0 +1,21 @@
+{
+    "runtimes": {
+      "nvidia": {
+        "path": "nvidia-container-runtime",
+        "runtimeArgs": []
+      },
+      "sysbox-runc": {
+        "path": "/usr/bin/sysbox-runc"
+      }
+    },
+    "exec-opts": [
+      "native.cgroupdriver=cgroupfs"
+    ],
+    "bip": "172.24.0.1/16",
+    "default-address-pools": [
+      {
+        "base": "172.31.0.0/16",
+        "size": 24
+      }
+    ]
+  }
