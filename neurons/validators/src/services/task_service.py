@@ -662,7 +662,7 @@ class TaskService:
                     if gpu_model:
                         extra_info["gpu_model"] = gpu_model
                         extra_info["help_text"] = (
-                            "If you have the gpu machine and encountering this issue consistantly, "
+                            "If you have the gpu machine and encountering this issue consistently, "
                             "then please pull the latest version of github repository and follow the installation guide here: "
                             "https://github.com/Datura-ai/compute-subnet/tree/main/neurons/executor. "
                             "Also, please configure the nvidia-container-runtime correctly. Check out here: "
