@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from datetime import datetime
 from typing import TYPE_CHECKING
 import random
@@ -18,7 +19,7 @@ from core.utils import _m, get_extra_info, get_logger
 from services.docker_service import REPOSITORIES, DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, RedisService
+from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_PREFIX, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.matrix_validation_service import ValidationService
@@ -111,7 +112,7 @@ class Validator:
                     self.miner_scores = json.loads(miner_scores_json)
 
             # remove pod renting-in-progress status
-            await self.redis_service.delete(PENDING_PODS_SET)
+            await self.redis_service.delete(PENDING_PODS_PREFIX)
         except Exception as e:
             logger.error(
                 _m(
@@ -210,6 +211,10 @@ class Validator:
         node = self.get_node()
         return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
 
+    def get_last_mechansim_step_block(self):
+        node = self.get_node()
+        return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
+
     def get_my_uid(self):
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
@@ -232,12 +237,7 @@ class Validator:
             miners = [
                 neuron
                 for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving
-                and (
-                    not settings.DEBUG
-                    or not settings.DEBUG_MINER_HOTKEY
-                    or settings.DEBUG_MINER_HOTKEY == neuron.axon_info.hotkey
-                )
+                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
             ]
         logger.info(
             _m(
@@ -272,7 +272,17 @@ class Validator:
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
 
-        main_burner = random.choice(settings.BURNERS)
+        last_mechansim_step_block = self.get_last_mechansim_step_block()
+        main_burner = random.Random(last_mechansim_step_block).choice(settings.BURNERS)
+        logger.info(
+            _m(
+                "[set_weights] main burner",
+                extra=get_extra_info({
+                    "last_mechansim_step_block": last_mechansim_step_block,
+                    "main_burner": main_burner,
+                }),
+            ),
+        )
         other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
 
         total_score = sum(self.miner_scores.values())
@@ -721,6 +731,8 @@ class Validator:
                             )
                             task.cancel()
 
+                    open_fd_count = len(os.listdir(f'/proc/self/fd'))
+
                     logger.info(
                         _m(
                             "[sync] All Jobs finished",
@@ -729,6 +741,7 @@ class Validator:
                                     **self.default_extra,
                                     "job_batch_id": job_batch_id,
                                     "miner_scores": self.miner_scores,
+                                    "open_fd_count": open_fd_count,
                                 }
                             ),
                         ),

@@ -88,7 +88,7 @@ Executors are machines running on GPUs that you can add to your central miner. T
 2. Use the following command to add an executor to the central miner:
 
     ```bash
-    docker exec <container-id or name> python /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey>
+    docker exec <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey>
     ```
 
     - `<executor-ip-address>`: The IP address of the executor machine.
@@ -102,7 +102,7 @@ To list added executors from the central miner, follow these steps:
 1. run following command:
 
     ```bash
-    docker exec <docker instance> python /root/app/src/cli.py show-executors
+    docker exec <docker instance> pdm run /root/app/src/cli.py show-executors
     ```
 
 ### Removing an Executor
@@ -111,7 +111,7 @@ To remove an executor from the central miner, follow these steps:
  1. Run the following command to remove the executor:
 
     ```bash
-    docker exec -i <docker instance> python /root/app/src/cli.py remove-executor --address <executor public ip> --port <executor external port>
+    docker exec -i <docker instance> pdm run /root/app/src/cli.py remove-executor --address <executor public ip> --port <executor external port>
     ```
 2. Type "y" and click enter in the interactive shell
 
@@ -121,7 +121,7 @@ If you need to change validator hotkey of an executor, follow these steps:
 1. run following command to switch validator hotkey:
 
     ```bash
-    docker exec -i <docker instance> python /root/app/src/cli.py switch-validator --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey>
+    docker exec -i <docker instance> pdm run /root/app/src/cli.py switch-validator --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey>
     ```
 2. Type "y" and click enter in the interactive shell
 
