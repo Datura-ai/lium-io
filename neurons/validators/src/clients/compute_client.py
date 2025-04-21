@@ -69,7 +69,7 @@ class ComputeClient:
         self.keypair = keypair
         self.ws: ClientConnection | None = None
         self.compute_app_uri = compute_app_uri
-        self.compute_app_rest_api_uri = compute_app_uri.replace("ws", "http").replace("wss", "https")
+        self.compute_app_rest_api_uri = compute_app_uri.replace("wss", "https").replace("ws", "http")
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
