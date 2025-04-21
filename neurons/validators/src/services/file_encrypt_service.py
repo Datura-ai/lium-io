@@ -305,15 +305,19 @@ class FileEncryptService:
             machine_scrape_file.write(obfuscated_content.encode("utf-8"))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
+            
+            machine_scrape_file_name = self.make_binary_file(
+                str(tmp_directory), machine_scrape_file.name
+            )
 
-            if random.choice([True, False]):
-                machine_scrape_file_name = self.make_binary_file_with_nuitka(
-                    str(tmp_directory), machine_scrape_file.name
-                )
-            else:
-                machine_scrape_file_name = self.make_binary_file(
-                    str(tmp_directory), machine_scrape_file.name
-                )
+            # if random.choice([True, False]):
+            #     machine_scrape_file_name = self.make_binary_file_with_nuitka(
+            #         str(tmp_directory), machine_scrape_file.name
+            #     )
+            # else:
+            #     machine_scrape_file_name = self.make_binary_file(
+            #         str(tmp_directory), machine_scrape_file.name
+            #     )
 
         # # generate score_script file
         # score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
@@ -327,17 +331,9 @@ class FileEncryptService:
         #     os.fsync(score_file.fileno())
         #     score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
-        subprocess.run(["make", "-f", str(Path(__file__).parent / ".." / "miner_jobs/Makefile")])
-
-        verifier_origin_path = str(Path(__file__).parent / ".." / "miner_jobs/H100Verifier")
-        verifier_file_name = tmp_directory / "H100Verifier"
-        shutil.copy(verifier_origin_path, verifier_file_name)
-        verifier_file_name = "./H100Verifier"
-
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
             all_keys=all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
-            verifier_file_name=verifier_file_name
         )

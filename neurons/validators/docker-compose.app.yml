@@ -50,7 +50,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - COMPUTE_APP_URI=wss://celiumcompute.ai
-    command: python src/connector.py
+    command: pdm run src/connector.py
     volumes:
       - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:

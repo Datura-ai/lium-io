@@ -13,6 +13,7 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 
 from core.config import settings
 from core.utils import _m, context, get_extra_info
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
     GPU_MAX_SCORES,
     MAX_GPU_COUNT,
@@ -363,7 +364,15 @@ class TaskService:
         clear_verified_job_info: bool = False,
         gpu_model_count: str = '',
         gpu_uuids: str = '',
+        clear_verified_job_reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
     ):
+        logger.info(_m("Handle task result: ", extra={
+            "miner_hotkey": miner_info.miner_hotkey,
+            "executor_id": executor_info.uuid,
+            "success": success,
+            "score": score,
+            "job_score": job_score,
+        }))
         if success:
             log_status = "info"
             logger.info(log_text)
@@ -386,6 +395,7 @@ class TaskService:
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_id=executor_info.uuid,
                     prev_info=verified_job_info,
+                    reason=clear_verified_job_reason,
                 )
             else:
                 await self.redis_service.set_verified_job_info(
@@ -404,6 +414,45 @@ class TaskService:
             log_status,
             log_text,
         )
+
+    async def _calc_score(
+        self,
+        executor_info: ExecutorSSHInfo,
+        max_score: float,
+        gpu_count: int,
+        is_rental_check_passed: bool,
+        is_rented: bool,
+    ) -> tuple[float, float]:
+        """
+        Calculate the score for the executor.
+
+        :param executor_info: The executor info.
+        :param max_score: The max score for the executor.
+        :param gpu_count: The number of GPUs in the executor.
+        :param is_rental_check_passed: Whether the executor has passed the rental check.
+        :param is_rented: Whether the executor is rented.
+
+        formula: 
+        job_score = max_score * gpu_count * (0.5 + min(0.5, uptime_in_minutes / 1 month))
+
+        :return: A tuple of the actual score and the job score.
+        """
+        # get uptime of the executor
+        uptime_in_minutes = await self.redis_service.get_executor_uptime(executor_info)
+        # if uptime in the subnet is exceed 1 month, then it'll get max score 
+        # if uptime is less than 1 month, then it'll get score based on the uptime
+        # give 50% of max still to avoid 0 score all miners at deployment
+        one_month_in_minutes = 60 * 24 * 30
+        score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / one_month_in_minutes))
+        # actual score is the score which executor gets for incentive
+        # only give actual score if executor passed the rental check
+        actual_score = score if is_rental_check_passed else 0
+        # job score is the score which executor gets when matrix multiply is finished.
+        # executor won't have job score if it didn't run the synthetic job(matrix multiply)
+        # we give job score if executor is rented but rental check is not passed, because this is in progress of rental check 
+        # this is because if either job score or actual score is 0, backend will flag this executor as invalid.
+        job_score = score if not is_rented or not is_rental_check_passed else 0
+        return actual_score, job_score
 
     async def create_task(
         self,
@@ -447,11 +496,31 @@ class TaskService:
             ) as shell:
                 docker_checksums = await shell.get_checksums_over_scp('/usr/bin/docker')
                 if docker_checksums != DOCKER_DIGEST:
-                    raise Exception("Docker is altered")
+                    logger.info(
+                        _m(
+                            "Docker checksum",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "checksum": docker_checksums,
+                                "DOCKER_DIGEST": DOCKER_DIGEST
+                            }),
+                        )
+                    )
+                    # raise Exception("Docker is altered")
 
                 python_checksums = await shell.get_checksums_over_scp('/usr/bin/python')
                 if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
-                    raise Exception("Python is altered")
+                    logger.info(
+                        _m(
+                            "Python checksum",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "checksum": python_checksums,
+                                "PYTHON_DIGEST": PYTHON_DIGEST
+                            }),
+                        )
+                    )
+                    # raise Exception("Python is altered")
 
                 # start gpus_utility.py
                 program_id = str(uuid.uuid4())
@@ -479,7 +548,7 @@ class TaskService:
                     _m(
                         "Uploaded files to run job",
                         extra=get_extra_info(default_extra),
-                    ),
+                    )
                 )
 
                 await shell.ssh_client.run(f"chmod +x {remote_machine_scrape_file_path}")
@@ -697,33 +766,6 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                for process in gpu_processes:
-                    container_name = process.get('container_name', None)
-                    if not container_name:
-                        log_text = _m(
-                            "GPU is using in some other places",
-                            extra=get_extra_info(
-                                {
-                                    **default_extra,
-                                    "gpu_model": gpu_model,
-                                    "gpu_count": gpu_count,
-                                    **process,
-                                }
-                            ),
-                        )
-
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-
                 logger.info(
                     _m(
                         f"Got GPU specs: {gpu_model} with max score: {max_score}",
@@ -783,6 +825,40 @@ class TaskService:
                             verified_job_info=verified_job_info,
                             success=False,
                             clear_verified_job_info=True,
+                            clear_verified_job_reason=ResetVerifiedJobReason.POD_NOT_RUNNING,
+                        )
+
+                    # check gpu running out side of containers
+                    gpu_running_outside = False
+                    for process in gpu_processes:
+                        gpu_process_container = process.get('container_name', None)
+                        if not gpu_process_container or gpu_process_container != container_name:
+                            gpu_running_outside = True
+                            break
+
+                    if not rented_machine.get("owner_flag", False) and gpu_running_outside:
+                        log_text = _m(
+                            "GPU is using in some other places on the rented machine",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "gpu_model": gpu_model,
+                                    "gpu_count": gpu_count,
+                                    **process,
+                                }
+                            ),
+                        )
+
+                        return await self._handle_task_result(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            spec=machine_spec,
+                            score=0,
+                            job_score=0,
+                            log_text=log_text,
+                            verified_job_info=verified_job_info,
+                            success=False,
+                            clear_verified_job_info=False,
                         )
 
                     # In backend, there are 2 scores. actual score and job score.
@@ -790,16 +866,17 @@ class TaskService:
                     # actual score is the score which executor gets for incentive
                     # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
                     # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and max_score * gpu_count for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    score = max_score * gpu_count
-                    job_score = 0
-                    log_msg = "Executor is already rented."
-
-                    # check rental success
-                    if not is_rental_succeed:
-                        score = 0
-                        job_score = max_score * gpu_count
-                        log_msg = "Executor is rented but in progress of rental check. This can be finished in an hour or so."
-
+                    score, job_score = await self._calc_score(
+                        executor_info=executor_info,
+                        max_score=max_score,
+                        gpu_count=gpu_count,
+                        is_rental_check_passed=is_rental_succeed,
+                        is_rented=True,
+                    )
+                    log_msg = (
+                        "Executor is already rented." 
+                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so."
+                    )
                     log_text = _m(
                         log_msg,
                         extra=get_extra_info({**default_extra, "score": score, "is_rental_succeed": is_rental_succeed}),
@@ -876,16 +953,12 @@ class TaskService:
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
                     ssh_client=shell.ssh_client,
-                    miner_info=miner_info,
                     executor_info=executor_info,
-                    remote_dir=remote_dir,
-                    verifier_file_name=encrypted_files.verifier_file_name,
                     default_extra=default_extra,
-                    machine_spec=machine_spec,
-                    _run_task=self._run_task
+                    machine_spec=machine_spec
                 )
 
-                if not is_valid:
+                if settings.HAS_GPU_VERIFICATION and not is_valid:
                     log_text = _m(
                         "GPU Verification failed",
                         extra=get_extra_info(default_extra),
@@ -902,8 +975,13 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                job_score = max_score * gpu_count
-                actual_score = job_score if is_rental_succeed else 0
+                actual_score, job_score = await self._calc_score(
+                    executor_info=executor_info,
+                    max_score=max_score,
+                    gpu_count=gpu_count,
+                    is_rental_check_passed=is_rental_succeed,
+                    is_rented=False,
+                )
 
                 log_text = _m(
                     message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",

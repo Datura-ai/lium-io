@@ -27,7 +27,6 @@ class MinerJobEnryptedFiles(BaseModel):
     tmp_directory: str
     machine_scrape_file_name: str
     # score_file_name: str
-    verifier_file_name: str
 
 
 class ResourceType(BaseModel):
@@ -56,6 +55,7 @@ class ContainerRequestType(enum.Enum):
     ContainerDeleteRequest = "ContainerDeleteRequest"
     AddSshPublicKey = "AddSshPublicKey"
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
+    ExecutorRentFinished = "ExecutorRentFinished"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -74,6 +74,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     debug: bool | None = None
     volume_name: str | None = None  # when edit pod, volume_name is required
     is_sysbox: bool | None = None
+
+
+class ExecutorRentFinishedRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.ExecutorRentFinished
 
 
 class ContainerStartRequest(ContainerBaseRequest):
