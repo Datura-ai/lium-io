@@ -13,11 +13,9 @@ MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
-PENDING_PODS_SET = "pending_pods"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
-EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
@@ -170,18 +168,6 @@ class RedisService:
             return False
 
         return True
-
-    async def clear_all_executor_counts(self):
-        pattern = f"{EXECUTOR_COUNT_PREFIX}:*"
-        cursor = 0
-
-        async with self.lock:
-            while True:
-                cursor, keys = await self.redis.scan(cursor, match=pattern, count=100)
-                if keys:
-                    await self.redis.delete(*keys)
-                if cursor == 0:
-                    break
 
     async def set_verified_job_info(
         self,
