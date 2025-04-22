@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # db migrate
-alembic upgrade head
+pdm run alembic upgrade head
 
 # run fastapi app
-python src/miner.py
+pdm run src/miner.py

@@ -85,7 +85,7 @@ def show_executors():
     executor_dao = ExecutorDao(session=next(get_db()))
     try:
         for executor in executor_dao.get_all_executors():
-            logger.info("%s:%d -> %s", executor.address, executor.port, executor.validator)
+            logger.info("%s %s:%d -> %s", executor.uuid, executor.address, executor.port, executor.validator)
     except Exception as e:
         logger.error("Failed in showing an executor: %s", str(e))
 

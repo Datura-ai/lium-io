@@ -29,7 +29,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, MACHINE_SPEC_CHANNEL, RedisService
+from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.const import JOB_TIME_OUT
@@ -151,9 +151,6 @@ class MinerService:
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
                     await self.publish_machine_specs(results, miner_client.miner_hotkey, payload.miner_coldkey)
-                    await self.store_executor_counts(
-                        payload.miner_hotkey, payload.job_batch_id, len(msg.executors), results
-                    )
 
                     total_score = 0
                     for _, _, score, _, _, _, _ in results:
@@ -262,45 +259,6 @@ class MinerService:
                     ),
                     exc_info=True,
                 )
-
-    async def store_executor_counts(
-        self, miner_hotkey: str, job_batch_id: str, total: int, results: list[dict]
-    ):
-        default_extra = {
-            "job_batch_id": job_batch_id,
-            "miner_hotkey": miner_hotkey,
-        }
-
-        success = 0
-        failed = 0
-
-        for _, _, score, _, _, _, _ in results:
-            if score > 0:
-                success += 1
-            else:
-                failed += 1
-
-        data = {"total": total, "success": success, "failed": failed}
-
-        key = f"{EXECUTOR_COUNT_PREFIX}:{miner_hotkey}"
-
-        try:
-            await self.redis_service.hset(key, job_batch_id, json.dumps(data))
-
-            logger.info(
-                _m(
-                    "Stored executor counts",
-                    extra=get_extra_info({**default_extra, **data}),
-                ),
-            )
-        except Exception as e:
-            logger.error(
-                _m(
-                    "Failed storing executor counts",
-                    extra=get_extra_info({**default_extra, **data, "error": str(e)}),
-                ),
-                exc_info=True,
-            )
 
     def _handle_container_error(self, payload: ContainerBaseRequest, msg: str, error_code: FailedContainerErrorCodes):
         logger.error(msg)
