@@ -42,6 +42,11 @@ cd neurons/executor
 cp .env.template .env
 ```
 
+* Install Required Tools 
+```shell
+./nvidia_docker_sysbox_setup.sh
+```
+
 Add the correct miner wallet hotkey for `MINER_HOTKEY_SS58_ADDRESS`.
 You can change the ports for `INTERNAL_PORT`, `EXTERNAL_PORT`, `SSH_PORT` based on your need.
 
