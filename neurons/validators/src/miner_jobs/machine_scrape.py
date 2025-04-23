@@ -832,6 +832,13 @@ def get_machine_specs():
     data['data_processes'] = get_gpu_processes(gpu_process_ids, data["data_docker"]["docker_containers"])
 
     data["data_cpu"] = {"cpu_count": 0, "cpu_model": "", "cpu_clocks": []}
+    
+    sysbox_runtime_cmd = 'docker info | grep sysbox'
+    try:
+        data["data_sysbox_runtime"] = "sysbox" in run_cmd(sysbox_runtime_cmd).strip()
+    except Exception as exc:
+        data["data_sysbox_runtime_scrape_error"] = repr(exc)
+
     try:
         lscpu_output = run_cmd("lscpu")
         data["data_cpu"]["cpu_model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
