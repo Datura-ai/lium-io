@@ -835,7 +835,7 @@ def get_machine_specs():
     
     sysbox_runtime_cmd = 'docker info | grep sysbox'
     try:
-        data["data_sysbox_runtime"] = run_cmd(sysbox_runtime_cmd).strip()
+        data["data_sysbox_runtime"] = "sysbox" in run_cmd(sysbox_runtime_cmd).strip()
     except Exception as exc:
         data["data_sysbox_runtime_scrape_error"] = repr(exc)
 
