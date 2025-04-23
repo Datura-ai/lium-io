@@ -5,7 +5,6 @@ supported-driver-capabilities = "compat32,compute,display,graphics,ngx,utility,v
 #swarm-resource = "DOCKER_RESOURCE_GPU"
 
 [nvidia-container-cli]
-no-cgroups = false
 #debug = "/var/log/nvidia-container-toolkit.log"
 environment = []
 #ldcache = "/etc/ld.so.cache"
