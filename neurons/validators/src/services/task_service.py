@@ -443,7 +443,7 @@ class TaskService:
         # if uptime in the subnet is exceed 1 month, then it'll get max score 
         # if uptime is less than 1 month, then it'll get score based on the uptime
         # give 50% of max still to avoid 0 score all miners at deployment
-        #if sysbox_runtime is true, then it'll get 20% of max score as plus
+        # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX percent.
         one_month_in_minutes = 60 * 24 * 30
         score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / one_month_in_minutes))
 
