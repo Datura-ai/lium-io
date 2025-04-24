@@ -445,13 +445,10 @@ class TaskService:
         # give 50% of max still to avoid 0 score all miners at deployment
         #if sysbox_runtime is true, then it'll get 20% of max score as plus
         one_month_in_minutes = 60 * 24 * 30
+        score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / one_month_in_minutes))
+
         if sysbox_runtime:
-            score = max_score * gpu_count * (
-                settings.PORTION_FOR_SYSBOX + settings.PORTION_FOR_UPTIME + 
-                min(1 - settings.PORTION_FOR_UPTIME, uptime_in_minutes / one_month_in_minutes)
-            )
-        else:
-            score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / one_month_in_minutes))
+            score = score * (1 + settings.PORTION_FOR_SYSBOX)
         # actual score is the score which executor gets for incentive
         # only give actual score if executor passed the rental check
         actual_score = score if is_rental_check_passed else 0
