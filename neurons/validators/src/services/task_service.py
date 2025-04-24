@@ -443,12 +443,21 @@ class TaskService:
         # if uptime in the subnet is exceed 1 month, then it'll get max score 
         # if uptime is less than 1 month, then it'll get score based on the uptime
         # give 50% of max still to avoid 0 score all miners at deployment
-        # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX percent.
+        # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX per cent.
         one_month_in_minutes = 60 * 24 * 30
         score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / one_month_in_minutes))
 
+        logger.info(_m("Debug: calculating score", {
+            "executor_id": str(executor_info.uuid),
+            "max_score": max_score,
+            "gpu_count": gpu_count,
+            "score": score,
+            "sysbox_runtime": sysbox_runtime,
+        }))
+
         if sysbox_runtime:
             score = score * (1 + settings.PORTION_FOR_SYSBOX)
+
         # actual score is the score which executor gets for incentive
         # only give actual score if executor passed the rental check
         actual_score = score if is_rental_check_passed else 0
@@ -612,7 +621,7 @@ class TaskService:
 
                 gpu_processes = machine_spec.get("gpu_processes", [])
                 
-                sysbox_runtime = machine_spec.get("sysbox_runtime", None)
+                sysbox_runtime = machine_spec.get("sysbox_runtime", False)
                 vram = 0
                 for detail in gpu_details:
                     vram += detail.get("capacity", 0) * 1024
@@ -878,7 +887,7 @@ class TaskService:
                         gpu_count=gpu_count,
                         is_rental_check_passed=is_rental_succeed,
                         is_rented=True,
-                        sysbox_runtime=bool(sysbox_runtime),
+                        sysbox_runtime=sysbox_runtime,
                     )
                     log_msg = (
                         "Executor is already rented." 
@@ -988,7 +997,7 @@ class TaskService:
                     gpu_count=gpu_count,
                     is_rental_check_passed=is_rental_succeed,
                     is_rented=False,
-                    sysbox_runtime=bool(sysbox_runtime),
+                    sysbox_runtime=sysbox_runtime,
                 )
 
                 log_text = _m(
