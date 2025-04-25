@@ -173,14 +173,14 @@ class TaskService:
     def check_fingerprints_changed(self, prev_uuids, gpu_uuids): 
         try: 
             if not prev_uuids: 
-                return True 
+                return False 
             prev_uuids = sorted(prev_uuids.split(','))
             gpu_uuids = sorted(gpu_uuids.split(','))
             
-            return ",".join(prev_uuids) == ",".join(gpu_uuids)
+            return ",".join(prev_uuids) != ",".join(gpu_uuids)
         except Exception as e:
             logger.error(f"Error checking fingerprints changed: {e}")
-            return True 
+            return False 
 
     async def docker_connection_check(
         self,
@@ -769,7 +769,7 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                if not self.check_fingerprints_changed(prev_uuids, gpu_uuids):
+                if self.check_fingerprints_changed(prev_uuids, gpu_uuids):
                     log_text = _m(
                         "GPUs are changed",
                         extra=get_extra_info(
