@@ -757,7 +757,7 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                if prev_uuids and prev_uuids != gpu_uuids:
+                if prev_uuids and sorted(prev_uuids.split(',')) != sorted(gpu_uuids.split(',')):
                     log_text = _m(
                         "GPUs are changed",
                         extra=get_extra_info(
