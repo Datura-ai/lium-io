@@ -740,6 +740,45 @@ def get_gpu_processes(pids: set, containers: list[dict]):
     return processes
 
 
+def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
+    """
+    Checks if the system supports running Docker containers with the sysbox-runc runtime
+    and NVIDIA GPU access (--gpus all).
+
+    Returns:
+        Tuple[bool, str]: A tuple containing a boolean indicating compatibility and a message.
+    """
+    test_command = [
+        "docker", "run", "--rm",
+        "--runtime=sysbox-runc",
+        "--gpus", "all",
+        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
+    ]
+
+    try:
+        result = subprocess.run(
+            test_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            return True, "Sysbox runtime supports GPU access."
+        else:
+            return False, "Sysbox runtime does not support GPU access."
+
+    except subprocess.TimeoutExpired:
+        return False, "Test command timed out."
+
+    except FileNotFoundError:
+        return False, "Docker is not installed or not found in PATH."
+
+    except Exception as e:
+        return False, f"An unexpected error occurred: {e}"
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -833,11 +872,10 @@ def get_machine_specs():
 
     data["data_cpu"] = {"cpu_count": 0, "cpu_model": "", "cpu_clocks": []}
     
-    sysbox_runtime_cmd = 'docker info | grep sysbox'
-    try:
-        data["data_sysbox_runtime"] = "sysbox" in run_cmd(sysbox_runtime_cmd).strip()
-    except Exception as exc:
-        data["data_sysbox_runtime_scrape_error"] = repr(exc)
+    is_supported, log_text = check_sysbox_gpu_compatibility()
+    data["data_sysbox_runtime"] = is_supported
+    if not is_supported:
+        data["data_sysbox_runtime_scrape_error"] = log_text
 
     try:
         lscpu_output = run_cmd("lscpu")
