@@ -74,6 +74,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     debug: bool | None = None
     volume_name: str | None = None  # when edit pod, volume_name is required
     is_sysbox: bool | None = None
+    docker_username: str | None = None  # when edit pod, docker_username is required
+    docker_password: str | None = None  # when edit pod, docker_password is required
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
