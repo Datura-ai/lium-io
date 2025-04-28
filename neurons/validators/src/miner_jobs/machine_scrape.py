@@ -88,6 +88,15 @@ class struct_c_nvmlDevice_t(Structure):
 
 c_nvmlDevice_t = POINTER(struct_c_nvmlDevice_t)
 
+COMMANDS = {
+    "CHECK_SYSBOX_COMPATIBILITY": [
+        "docker", "run", "--rm",
+        "--runtime=sysbox-runc",
+        "--gpus", "all",
+        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
+    ],
+}
+
 
 class _PrintableStructure(Structure):
     """
@@ -748,12 +757,7 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
     Returns:
         Tuple[bool, str]: A tuple containing a boolean indicating compatibility and a message.
     """
-    test_command = [
-        "docker", "run", "--rm",
-        "--runtime=sysbox-runc",
-        "--gpus", "all",
-        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
-    ]
+    test_command = COMMANDS["CHECK_SYSBOX_COMPATIBILITY"]
 
     try:
         result = subprocess.run(
