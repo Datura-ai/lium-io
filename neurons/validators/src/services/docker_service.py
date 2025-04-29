@@ -409,13 +409,14 @@ class DockerService:
                     )
                 )
 
-                command = f"echo `{payload.docker_password}` | /usr/bin/docker login --username {payload.docker_username}"
+                command = f"echo '{payload.docker_password}' | /usr/bin/docker login --username '{payload.docker_username}' --password-stdin"
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
                     command=command,
                     log_tag=log_tag,
-                    log_text=f"Pulling docker image {payload.docker_image}",
+                    log_text=f"Logging in to Docker registry as {payload.docker_image}",
                     log_extra=default_extra,
+                    raise_exception=False
                 )
 
                 command = f"/usr/bin/docker pull {payload.docker_image}"
