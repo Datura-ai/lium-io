@@ -408,16 +408,24 @@ class DockerService:
                         executor_id=payload.executor_id,
                     )
                 )
-
-                command = f"echo '{payload.docker_password}' | /usr/bin/docker login --username '{payload.docker_username}' --password-stdin"
-                await self.execute_and_stream_logs(
-                    ssh_client=ssh_client,
-                    command=command,
-                    log_tag=log_tag,
-                    log_text=f"Logging in to Docker registry as {payload.docker_image}",
-                    log_extra=default_extra,
-                    raise_exception=False
-                )
+                # command = f"/usr/bin/docker logout"
+                # await self.execute_and_stream_logs(
+                #     ssh_client=ssh_client,
+                #     command=command,
+                #     log_tag=log_tag,
+                #     log_text=f"Logging out of Docker registry",
+                #     log_extra=default_extra,
+                # )
+                if payload.docker_username and payload.docker_password:
+                    command = f"echo '{payload.docker_password}' | /usr/bin/docker login --username '{payload.docker_username}' --password-stdin"
+                    await self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=command,
+                        log_tag=log_tag,
+                        log_text=f"Logging in to Docker registry as {payload.docker_image}",
+                        log_extra=default_extra,
+                        raise_exception=False
+                    )
 
                 command = f"/usr/bin/docker pull {payload.docker_image}"
                 await self.execute_and_stream_logs(
