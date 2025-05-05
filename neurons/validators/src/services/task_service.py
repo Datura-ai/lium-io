@@ -446,18 +446,18 @@ class TaskService:
         :param is_rented: Whether the executor is rented.
 
         formula: 
-        job_score = max_score * gpu_count * (0.5 + min(0.5, uptime_in_minutes / 1 month))
+        job_score = max_score * gpu_count * (0.5 + min(0.5, uptime_in_minutes / 5 days))
 
         :return: A tuple of the actual score and the job score.
         """
         # get uptime of the executor
         uptime_in_minutes = await self.redis_service.get_executor_uptime(executor_info)
-        # if uptime in the subnet is exceed 1 month, then it'll get max score 
-        # if uptime is less than 1 month, then it'll get score based on the uptime
+        # if uptime in the subnet is exceed 5 days, then it'll get max score 
+        # if uptime is less than 5 days, then it'll get score based on the uptime
         # give 50% of max still to avoid 0 score all miners at deployment
         # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX per cent.
-        one_month_in_minutes = 60 * 24 * 30
-        score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / one_month_in_minutes))
+        five_days_in_minutes = 60 * 24 * 5
+        score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / five_days_in_minutes))
 
         logger.info(_m("Debug: calculating score", {
             "executor_id": str(executor_info.uuid),
