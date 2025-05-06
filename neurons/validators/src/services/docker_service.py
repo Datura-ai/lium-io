@@ -750,7 +750,7 @@ class DockerService:
                 )
         except Exception as e:
             log_text = _m(
-                "Unknown Error add_ssh_key",
+                "Unknown Error delete_container",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
             logger.error(log_text, exc_info=True)
