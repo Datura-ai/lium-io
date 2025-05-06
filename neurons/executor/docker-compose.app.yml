@@ -16,10 +16,28 @@ services:
     labels:
       autoheal-app: true
     healthcheck:
-      test: ["CMD-SHELL", "nvidia-smi || exit 1"]
+      test: [ "CMD-SHELL", "nvidia-smi || exit 1" ]
       interval: 2m
       timeout: 10s
       retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+
+  monitor:
+    image: daturaai/compute-subnet-executor:latest
+    env_file: ./.env
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /dev/kmsg:/dev/kmsg:ro
+      - ./:/root/app/
+    pid: host
+    command: python src/monitor.py
     deploy:
       resources:
         reservations:

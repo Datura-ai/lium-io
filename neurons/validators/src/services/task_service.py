@@ -170,17 +170,17 @@ class TaskService:
 
         return internal_port, internal_port
 
-    def check_fingerprints_changed(self, prev_uuids, gpu_uuids): 
-        try: 
-            if not prev_uuids: 
-                return False 
+    def check_fingerprints_changed(self, prev_uuids, gpu_uuids):
+        try:
+            if not prev_uuids:
+                return False
             prev_uuids = sorted(prev_uuids.split(','))
             gpu_uuids = sorted(gpu_uuids.split(','))
-            
+
             return ",".join(prev_uuids) != ",".join(gpu_uuids)
         except Exception as e:
             logger.error(f"Error checking fingerprints changed: {e}")
-            return False 
+            return False
 
     async def docker_connection_check(
         self,
@@ -452,7 +452,7 @@ class TaskService:
         """
         # get uptime of the executor
         uptime_in_minutes = await self.redis_service.get_executor_uptime(executor_info)
-        # if uptime in the subnet is exceed 5 days, then it'll get max score 
+        # if uptime in the subnet is exceed 5 days, then it'll get max score
         # if uptime is less than 5 days, then it'll get score based on the uptime
         # give 50% of max still to avoid 0 score all miners at deployment
         # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX per cent.
@@ -475,7 +475,7 @@ class TaskService:
         actual_score = score if is_rental_check_passed else 0
         # job score is the score which executor gets when matrix multiply is finished.
         # executor won't have job score if it didn't run the synthetic job(matrix multiply)
-        # we give job score if executor is rented but rental check is not passed, because this is in progress of rental check 
+        # we give job score if executor is rented but rental check is not passed, because this is in progress of rental check
         # this is because if either job score or actual score is 0, backend will flag this executor as invalid.
         job_score = score if not is_rented or not is_rental_check_passed else 0
         return actual_score, job_score
@@ -632,7 +632,7 @@ class TaskService:
                 storage = machine_spec.get("hard_disk", {}).get("free", 0)
 
                 gpu_processes = machine_spec.get("gpu_processes", [])
-                
+
                 sysbox_runtime = machine_spec.get("sysbox_runtime", False)
                 vram = 0
                 for detail in gpu_details:
@@ -902,7 +902,7 @@ class TaskService:
                         sysbox_runtime=sysbox_runtime,
                     )
                     log_msg = (
-                        "Executor is already rented." 
+                        "Executor is already rented."
                         if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so."
                     )
                     log_text = _m(
@@ -926,13 +926,14 @@ class TaskService:
                 for detail in gpu_details:
                     gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
                     gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
-                    if gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT:
+                    if len(gpu_processes) > 0 and (gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT):
                         log_text = _m(
                             "High gpu utilization detected",
                             extra=get_extra_info({
                                 **default_extra,
                                 "gpu_utilization": gpu_utilization,
                                 "gpu_memory_utilization": gpu_memory_utilization,
+                                "gpu_processes": gpu_processes,
                             }),
                         )
 
