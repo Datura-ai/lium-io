@@ -7,6 +7,8 @@ import threading
 import time
 from datetime import datetime
 from core.config import settings
+from core.db import get_session
+from daos.pod_log import PodLog, PodLogDao
 
 # Set up logging to a file in JSON format (one JSON object per line)
 logging.basicConfig(filename="container_monitor.log", level=logging.INFO,
@@ -122,13 +124,13 @@ def classify_stop(exit_code):
         reason = "file_or_directory_not_found"
     elif exit_code == 128:
         reason = "invalid_argument_on_exit"
-    elif exit_code == 134: # SIGABRT
+    elif exit_code == 134:  # SIGABRT
         reason = "abnormal_termination"
-    elif exit_code == 137: # SIGKILL: from docker rm command
+    elif exit_code == 137:  # SIGKILL: from docker rm command
         reason = "immediate_termination"
-    elif exit_code == 139: # SIGSEGV
+    elif exit_code == 139:  # SIGSEGV
         reason = "segmentation_fault"
-    elif exit_code == 143: # SIGTERM
+    elif exit_code == 143:  # SIGTERM
         reason = "graceful_termination"
     elif exit_code == 255:
         reason = "exit_status_out_of_range"
@@ -160,35 +162,52 @@ while True:
                 if not name or not name.startswith(monitor_prefix) or name == f"{monitor_prefix}{settings.MINER_HOTKEY_SS58_ADDRESS}":
                     continue
 
-                default_log = {
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                    "event": action,
-                    "container_id": container_id[:12],
-                    "container_name": name,
-                }
+                with get_session() as session:
+                    pod_log_dao = PodLogDao()
+                    pod_log = PodLog(
+                        container_name=name,
+                        container_id=container_id,
+                        event=action,
+                        created_at=datetime.utcnow()
+                    )
+                    default_log = {
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "event": action,
+                        "container_id": container_id[:12],
+                        "container_name": name,
+                    }
 
-                if action == "start":
-                    logging.info(json.dumps(default_log))
-                elif action == "stop":
-                    logging.info(json.dumps(default_log))
-                elif action == "restart":
-                    logging.info(json.dumps(default_log))
-                elif action == "kill":
-                    logging.info(json.dumps(default_log))
-                elif action == "destroy":
-                    logging.info(json.dumps(default_log))
-                # container out of memory error
-                elif action == "oom":
-                    logging.info(json.dumps(default_log))
-                # container is exited
-                elif action == "die":
-                    exit_code = int(attrs.get("exitCode", 0))
-                    reason = classify_stop(exit_code)
-                    logging.info(json.dumps({
-                        **default_log,
-                        "exit_code": exit_code,
-                        "reason": reason,
-                    }))
+                    if action == "start":
+                        pod_log_dao.save(session, pod_log)
+                        logging.info(json.dumps(default_log))
+                    elif action == "stop":
+                        pod_log_dao.save(session, pod_log)
+                        logging.info(json.dumps(default_log))
+                    elif action == "restart":
+                        pod_log_dao.save(session, pod_log)
+                        logging.info(json.dumps(default_log))
+                    elif action == "kill":
+                        pod_log_dao.save(session, pod_log)
+                        logging.info(json.dumps(default_log))
+                    elif action == "destroy":
+                        pod_log_dao.save(session, pod_log)
+                        logging.info(json.dumps(default_log))
+                    # container out of memory error
+                    elif action == "oom":
+                        pod_log_dao.save(session, pod_log)
+                        logging.info(json.dumps(default_log))
+                    # container is exited
+                    elif action == "die":
+                        exit_code = int(attrs.get("exitCode", 0))
+                        reason = classify_stop(exit_code)
+                        pod_log.exit_code = exit_code
+                        pod_log.reason = reason
+                        pod_log_dao.save(session, pod_log)
+                        logging.info(json.dumps({
+                            **default_log,
+                            "exit_code": exit_code,
+                            "reason": reason,
+                        }))
 
             except Exception as ex:
                 # Log any exception in event handling, but continue loop
