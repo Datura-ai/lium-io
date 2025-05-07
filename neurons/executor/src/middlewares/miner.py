@@ -26,14 +26,14 @@ class MinerMiddleware(BaseHTTPMiddleware):
             logger.info(_m("miner ip", extra=default_extra))
 
             keypair = bittensor.Keypair(ss58_address=settings.MINER_HOTKEY_SS58_ADDRESS)
-            if not keypair.verify(payload.public_key, payload.signature):
+            if not keypair.verify(payload.data_to_sign, payload.signature):
                 logger.error(
                     _m(
                         "Auth failed. incorrect signature",
                         extra={
                             **default_extra,
                             "signature": payload.signature,
-                            "public_key": payload.public_key,
+                            "data_to_sign": payload.data_to_sign,
                             "miner_hotkey": settings.MINER_HOTKEY_SS58_ADDRESS,
                         },
                     )

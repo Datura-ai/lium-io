@@ -10,8 +10,13 @@ from datura.requests.miner_requests import (
     DeclineJobRequest,
     ExecutorSSHInfo,
     FailedRequest,
+    PodLogsResponse,
 )
-from datura.requests.validator_requests import SSHPubKeyRemoveRequest, SSHPubKeySubmitRequest
+from datura.requests.validator_requests import (
+    SSHPubKeyRemoveRequest,
+    SSHPubKeySubmitRequest,
+    GetPodLogsRequest,
+)
 from fastapi import Depends
 from payload_models.payloads import (
     ContainerBaseRequest,
@@ -23,8 +28,10 @@ from payload_models.payloads import (
     FailedContainerRequest,
     MinerJobEnryptedFiles,
     MinerJobRequestPayload,
+    GetPodLogsRequestFromServer,
+    PodLogsResponseToServer,
+    FailedGetPodLogs,
 )
-from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -75,7 +82,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 my_hotkey=my_key.ss58_address,
                 keypair=my_key,
-                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/jobs/{my_key.ss58_address}"
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}"
             )
 
             async with miner_client:
@@ -321,7 +328,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 my_hotkey=my_key.ss58_address,
                 keypair=my_key,
-                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/resources/{my_key.ss58_address}",
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
             )
 
             async with miner_client:
@@ -535,6 +542,99 @@ class MinerService:
                 payload=payload,
                 msg=str(log_text),
                 error_code=FailedContainerErrorCodes.ExceptionError,
+            )
+
+    async def get_pod_logs(self, payload: GetPodLogsRequestFromServer) -> PodLogsResponseToServer:
+        loop = asyncio.get_event_loop()
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_id": payload.executor_id,
+            "executor_ip": payload.miner_address,
+            "executor_port": payload.miner_port,
+            "container_request_type": str(payload.message_type),
+        }
+
+        try:
+            miner_client = MinerClient(
+                loop=loop,
+                miner_address=payload.miner_address,
+                miner_port=payload.miner_port,
+                miner_hotkey=payload.miner_hotkey,
+                my_hotkey=my_key.ss58_address,
+                keypair=my_key,
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
+            )
+
+            async with miner_client:
+                # generate ssh key and send it to miner
+                await miner_client.send_model(
+                    GetPodLogsRequest(container_name=payload.container_name, executor_id=payload.executor_id)
+                )
+
+                logger.info(
+                    _m("Sent SSH key to miner.", extra=get_extra_info(default_extra)),
+                )
+
+                msg = await asyncio.wait_for(
+                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future,
+                    timeout=JOB_LENGTH,
+                )
+
+                if isinstance(msg, PodLogsResponse):
+                    logger.info(
+                        _m(
+                            "Pod Log result",
+                            extra=get_extra_info({**default_extra, "logs": len(msg.logs)}),
+                        )
+                    )
+                    return PodLogsResponseToServer(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        container_name=payload.container_name,
+                        logs=msg.logs
+                    )
+
+                elif isinstance(msg, FailedRequest):
+                    log_text = _m(
+                        "[get_pod_logs] Error: FailedRequest",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                    )
+                    logger.error(log_text)
+
+                    return FailedGetPodLogs(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        container_name=payload.container_name,
+                        msg=str(log_text),
+                    )
+
+                else:
+                    log_text = _m(
+                        "[get_pod_logs] Error: Unexpected msg",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                    )
+                    logger.error(log_text)
+
+                    return FailedGetPodLogs(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        container_name=payload.container_name,
+                        msg=str(log_text),
+                    )
+
+        except Exception as e:
+            log_text = _m(
+                "[get_pod_logs] resulted in an exception",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text)
+
+            return FailedGetPodLogs(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                container_name=payload.container_name,
+                msg=str(log_text),
             )
 
 

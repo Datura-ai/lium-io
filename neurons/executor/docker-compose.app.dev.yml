@@ -52,7 +52,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /dev/kmsg:/dev/kmsg:ro
-      - container_monitor.log:/root/app/container_monitor.log
     pid: host
     command: python src/monitor.py
     environment:

@@ -1,6 +1,7 @@
 import enum
 
 from datura.requests.base import BaseRequest
+from datura.requests.miner_requests import PodLog
 from pydantic import BaseModel, field_validator
 
 
@@ -56,6 +57,7 @@ class ContainerRequestType(enum.Enum):
     AddSshPublicKey = "AddSshPublicKey"
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
     ExecutorRentFinished = "ExecutorRentFinished"
+    GetPodLogsRequestFromServer = "GetPodLogsRequestFromServer"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -102,6 +104,11 @@ class ContainerDeleteRequest(ContainerBaseRequest):
     volume_name: str
 
 
+class GetPodLogsRequestFromServer(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.GetPodLogsRequestFromServer
+    container_name: str
+
+
 class ContainerResponseType(enum.Enum):
     ContainerCreated = "ContainerCreated"
     ContainerStarted = "ContainerStarted"
@@ -109,6 +116,8 @@ class ContainerResponseType(enum.Enum):
     ContainerDeleted = "ContainerDeleted"
     SshPubKeyAdded = "SshPubKeyAdded"
     FailedRequest = "FailedRequest"
+    PodLogsResponseToServer = "PodLogsResponseToServer"
+    FailedGetPodLogs = "FailedGetPodLogs"
 
 
 class ContainerBaseResponse(BaseRequest):
@@ -176,3 +185,15 @@ class DuplicateExecutorsResponse(BaseModel):
     message_type: ContainerRequestType = ContainerRequestType.DuplicateExecutorsResponse
     executors: dict[str, list]
     rental_succeed_executors: list[str] | None = None
+
+
+class PodLogsResponseToServer(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.PodLogsResponseToServer
+    container_name: str
+    logs: list[PodLog] = []
+
+
+class FailedGetPodLogs(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.FailedGetPodLogs
+    container_name: str
+    msg: str
