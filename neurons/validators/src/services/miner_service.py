@@ -534,7 +534,7 @@ class MinerService:
                     )
         except Exception as e:
             log_text = _m(
-                "[handle_container] resulted in an exception",
+                "Resulted in an exception",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
 
@@ -552,7 +552,7 @@ class MinerService:
             "executor_id": payload.executor_id,
             "executor_ip": payload.miner_address,
             "executor_port": payload.miner_port,
-            "container_request_type": str(payload.message_type),
+            "container_name": payload.container_name,
         }
 
         try:
@@ -573,7 +573,7 @@ class MinerService:
                 )
 
                 logger.info(
-                    _m("Sent SSH key to miner.", extra=get_extra_info(default_extra)),
+                    _m("Getting logs from executor", extra=get_extra_info(default_extra)),
                 )
 
                 msg = await asyncio.wait_for(
@@ -597,7 +597,7 @@ class MinerService:
 
                 elif isinstance(msg, FailedRequest):
                     log_text = _m(
-                        "[get_pod_logs] Error: FailedRequest",
+                        "Error: FailedRequest",
                         extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     )
                     logger.error(log_text)
@@ -611,7 +611,7 @@ class MinerService:
 
                 else:
                     log_text = _m(
-                        "[get_pod_logs] Error: Unexpected msg",
+                        "Error: Unexpected msg",
                         extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     )
                     logger.error(log_text)
@@ -625,7 +625,7 @@ class MinerService:
 
         except Exception as e:
             log_text = _m(
-                "[get_pod_logs] resulted in an exception",
+                "Resulted in an exception",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
             logger.error(log_text)
