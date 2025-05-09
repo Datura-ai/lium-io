@@ -18,8 +18,6 @@ class Settings(BaseSettings):
     RENTING_PRICE: Optional[float] = Field(env="RENTING_PRICE", default=None)
 
     ENV: str = Field(env="ENV", default="dev")
-    
-    DB_URI: str = Field(env="DB_URI")
 
 
 settings = Settings()
