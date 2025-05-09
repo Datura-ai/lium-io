@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     PORTION_FOR_UPTIME: float = 0.05
 
+    PORTION_FOR_SYSBOX: float = 0.2
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
