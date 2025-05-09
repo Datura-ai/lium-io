@@ -276,6 +276,21 @@ class Validator:
                 uids[ind + 1] = uid
                 weights[ind + 1] = BURNER_EMISSION
         else:
+            # Add logging for normalized scores
+            normalized_scores = {
+                str(miner.hotkey): self.miner_scores.get(miner.hotkey, 0.0) / total_score 
+                for miner in miners
+            }
+            logger.info(
+                _m(
+                    "[set_weights] normalized scores",
+                    extra=get_extra_info({
+                        **self.default_extra,
+                        "normalized_scores": normalized_scores,
+                    }),
+                ),
+            )
+
             for ind, miner in enumerate(miners):
                 uids[ind] = miner.uid
                 if miner.uid == main_burner:
