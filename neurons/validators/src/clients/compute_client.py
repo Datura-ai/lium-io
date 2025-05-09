@@ -24,6 +24,10 @@ from payload_models.payloads import (
     ContainerDeleted,
     DuplicateExecutorsResponse,
     FailedContainerRequest,
+    ExecutorRentFinishedRequest,
+    GetPodLogsRequestFromServer,
+    PodLogsResponseToServer,
+    FailedGetPodLogs,
 )
 from protocol.vc_protocol.compute_requests import Error, ExecutorUptimeResponse, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
@@ -68,7 +72,7 @@ class ComputeClient:
         self.keypair = keypair
         self.ws: ClientConnection | None = None
         self.compute_app_uri = compute_app_uri
-        self.compute_app_rest_api_uri = compute_app_uri.replace("ws", "http").replace("wss", "https")
+        self.compute_app_rest_api_uri = compute_app_uri.replace("wss", "https").replace("ws", "http")
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
@@ -377,7 +381,7 @@ class ComputeClient:
                             _m("Failed to get executors uptime from compute app", extra={**default_log_info, "status": response.status, "response": error_msg}),
                         )
                         return
-                    
+
                     executors_json = await response.json()
                     executors = [ExecutorUptimeResponse(**executor) for executor in executors_json]
                     logger.info(
@@ -437,7 +441,7 @@ class ComputeClient:
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
             return
-        
+
         try:
             response = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
         except pydantic.ValidationError:
@@ -505,7 +509,9 @@ class ComputeClient:
         | ContainerDeleteRequest
         | ContainerStopRequest
         | ContainerStartRequest
-        | AddSshPublicKeyRequest,
+        | AddSshPublicKeyRequest
+        | ExecutorRentFinishedRequest
+        | GetPodLogsRequestFromServer
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -613,6 +619,22 @@ class ComputeClient:
                     extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, ExecutorRentFinishedRequest):
+            logger.info(
+                _m(
+                    "Rent finished. Clear Pending flag",
+                    extra=get_extra_info(logging_extra),
+                )
+            )
+
+            await self.miner_service.redis_service.remove_pending_pod(job_request.miner_hotkey, job_request.executor_id)
+        elif isinstance(job_request, GetPodLogsRequestFromServer):
+            response: (
+                PodLogsResponseToServer | FailedGetPodLogs
+            ) = await self.miner_service.get_pod_logs(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)

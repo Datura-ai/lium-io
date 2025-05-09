@@ -78,7 +78,7 @@ class InteractiveShellService:
             i_shell.expect(pexpect.EOF)
             i_shell.close()
 
-            gc.collect() # Run the garbage collector
+            gc.collect()  # Run the garbage collector
         except pexpect.TIMEOUT:
             raise Exception("i-ssh connection Timeout")
         except pexpect.EOF:
@@ -95,12 +95,18 @@ class InteractiveShellService:
         )
 
     async def __aenter__(self):
-        await self.connect_interactive_shell()
+        # await self.connect_interactive_shell()
         await self.connect_asyncssh()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.clear_remote_directory()
+        try:
+            await self.clear_remote_directory()
+
+            if self.priv_key_path and os.path.isfile(self.priv_key_path):
+                os.remove(self.priv_key_path)
+        except:
+            pass
 
         # try:
         #     if self.i_shell:
@@ -116,9 +122,6 @@ class InteractiveShellService:
         #             "error": str(e),
         #         }),
         #     ))
-
-        if self.priv_key_path and os.path.isfile(self.priv_key_path):
-            os.remove(self.priv_key_path)
 
     async def upload_directory(
         self, local_dir: str, remote_dir: str

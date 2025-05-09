@@ -1,6 +1,7 @@
 import enum
 
 from datura.requests.base import BaseRequest
+from datura.requests.miner_requests import PodLog
 from pydantic import BaseModel, field_validator
 
 
@@ -55,6 +56,8 @@ class ContainerRequestType(enum.Enum):
     ContainerDeleteRequest = "ContainerDeleteRequest"
     AddSshPublicKey = "AddSshPublicKey"
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
+    ExecutorRentFinished = "ExecutorRentFinished"
+    GetPodLogsRequestFromServer = "GetPodLogsRequestFromServer"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -72,6 +75,13 @@ class ContainerCreateRequest(ContainerBaseRequest):
     custom_options: CustomOptions | None = None
     debug: bool | None = None
     volume_name: str | None = None  # when edit pod, volume_name is required
+    is_sysbox: bool | None = None
+    docker_username: str | None = None  # when edit pod, docker_username is required
+    docker_password: str | None = None  # when edit pod, docker_password is required
+
+
+class ExecutorRentFinishedRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.ExecutorRentFinished
 
 
 class ContainerStartRequest(ContainerBaseRequest):
@@ -96,6 +106,11 @@ class ContainerDeleteRequest(ContainerBaseRequest):
     volume_name: str
 
 
+class GetPodLogsRequestFromServer(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.GetPodLogsRequestFromServer
+    container_name: str
+
+
 class ContainerResponseType(enum.Enum):
     ContainerCreated = "ContainerCreated"
     ContainerStarted = "ContainerStarted"
@@ -103,6 +118,8 @@ class ContainerResponseType(enum.Enum):
     ContainerDeleted = "ContainerDeleted"
     SshPubKeyAdded = "SshPubKeyAdded"
     FailedRequest = "FailedRequest"
+    PodLogsResponseToServer = "PodLogsResponseToServer"
+    FailedGetPodLogs = "FailedGetPodLogs"
 
 
 class ContainerBaseResponse(BaseRequest):
@@ -170,3 +187,15 @@ class DuplicateExecutorsResponse(BaseModel):
     message_type: ContainerRequestType = ContainerRequestType.DuplicateExecutorsResponse
     executors: dict[str, list]
     rental_succeed_executors: list[str] | None = None
+
+
+class PodLogsResponseToServer(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.PodLogsResponseToServer
+    container_name: str
+    logs: list[PodLog] = []
+
+
+class FailedGetPodLogs(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.FailedGetPodLogs
+    container_name: str
+    msg: str

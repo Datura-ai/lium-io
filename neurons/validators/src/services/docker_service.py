@@ -408,6 +408,24 @@ class DockerService:
                         executor_id=payload.executor_id,
                     )
                 )
+                # command = f"/usr/bin/docker logout"
+                # await self.execute_and_stream_logs(
+                #     ssh_client=ssh_client,
+                #     command=command,
+                #     log_tag=log_tag,
+                #     log_text=f"Logging out of Docker registry",
+                #     log_extra=default_extra,
+                # )
+                if payload.docker_username and payload.docker_password:
+                    command = f"echo '{payload.docker_password}' | /usr/bin/docker login --username '{payload.docker_username}' --password-stdin"
+                    await self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=command,
+                        log_tag=log_tag,
+                        log_text=f"Logging in to Docker registry as {payload.docker_image}",
+                        log_extra=default_extra,
+                        raise_exception=False
+                    )
 
                 command = f"/usr/bin/docker pull {payload.docker_image}"
                 await self.execute_and_stream_logs(
@@ -498,9 +516,9 @@ class DockerService:
                 container_name = f"container_{uuid}"
 
                 if payload.debug:
-                    command = f'/usr/bin/docker run -d {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {("--runtime=sysbox-runc" if payload.is_sysbox else "")} {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
                 else:
-                    command = f'/usr/bin/docker run -d {port_flags} {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = f'/usr/bin/docker run -d {("--runtime=sysbox-runc" if payload.is_sysbox else "")} {port_flags} {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
 
                 logger.info(f"Running command: {command}")
 
@@ -555,7 +573,6 @@ class DockerService:
                     executor_ip_port=str(executor_info.port),
                     container_name=container_name,
                 ))
-                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
 
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if not rented_machine:
@@ -751,7 +768,7 @@ class DockerService:
                 )
         except Exception as e:
             log_text = _m(
-                "Unknown Error add_ssh_key",
+                "Unknown Error delete_container",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
             logger.error(log_text, exc_info=True)
