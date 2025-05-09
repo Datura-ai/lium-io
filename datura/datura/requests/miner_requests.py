@@ -12,6 +12,7 @@ class RequestType(enum.Enum):
     FailedRequest = "FailedRequest"
     UnAuthorizedRequest = "UnAuthorizedRequest"
     SSHKeyRemoved = "SSHKeyRemoved"
+    PodLogsResponse = "PodLogsResponse"
 
 
 class Executor(pydantic.BaseModel):
@@ -50,6 +51,7 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     port_mappings: str | None = None
     price: float | None = None
 
+
 class AcceptSSHKeyRequest(BaseMinerRequest):
     message_type: RequestType = RequestType.AcceptSSHKeyRequest
     executors: list[ExecutorSSHInfo]
@@ -66,3 +68,19 @@ class FailedRequest(BaseMinerRequest):
 
 class UnAuthorizedRequest(FailedRequest):
     message_type: RequestType = RequestType.UnAuthorizedRequest
+
+
+class PodLog(pydantic.BaseModel):
+    uuid: str
+    container_name: str | None = None
+    container_id: str | None = None
+    event: str | None = None
+    exit_code: int | None = None
+    reason: str | None = None
+    error: str | None = None
+    created_at: str
+
+
+class PodLogsResponse(BaseMinerRequest):
+    message_type: RequestType = RequestType.PodLogsResponse
+    logs: list[PodLog] = []

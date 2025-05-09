@@ -13,12 +13,15 @@ from datura.requests.miner_requests import (
     ExecutorSSHInfo,
     FailedRequest,
     UnAuthorizedRequest,
+    PodLog,
+    PodLogsResponse,
 )
 from datura.requests.validator_requests import (
     AuthenticateRequest,
     BaseValidatorRequest,
     SSHPubKeyRemoveRequest,
     SSHPubKeySubmitRequest,
+    GetPodLogsRequest,
 )
 from fastapi import Depends, WebSocket
 
@@ -151,6 +154,17 @@ class ValidatorConsumer(BaseConsumer):
                 logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Failed SSHKeyRemoved request: %s", str(e))
+                await self.send_message(FailedRequest(details=str(e)))
+            return
+
+        if isinstance(msg, GetPodLogsRequest):
+            logger.info("Validator %s get pod logs for container %s.", self.validator_key, msg.container_name)
+            try:
+                logs: list[PodLog] = await self.executor_service.get_pod_logs(self.validator_key, msg.executor_id, msg.container_name)
+                await self.send_message(PodLogsResponse(logs=logs))
+                logger.info("Sent GetPodLogs to validator %s", self.validator_key)
+            except Exception as e:
+                logger.error("Failed GetPodLogs request: %s", str(e))
                 await self.send_message(FailedRequest(details=str(e)))
             return
 
