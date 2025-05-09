@@ -20,7 +20,6 @@ from datura.requests.miner_requests import (
     GenericError,
     SSHKeyRemoved,
     UnAuthorizedRequest,
-    PodLogsResponse,
 )
 from datura.requests.validator_requests import AuthenticateRequest, AuthenticationPayload
 
@@ -84,7 +83,7 @@ class MinerClient(abc.ABC):
                 self.job_state.miner_ready_or_declining_timestamp = time.time()
                 self.job_state.miner_ready_or_declining_future.set_result(msg)
         elif isinstance(
-            msg, AcceptSSHKeyRequest | FailedRequest | UnAuthorizedRequest | DeclineJobRequest | PodLogsResponse
+            msg, AcceptSSHKeyRequest | FailedRequest | UnAuthorizedRequest | DeclineJobRequest
         ):
             if not self.job_state.miner_accepted_ssh_key_or_failed_future.done():
                 self.job_state.miner_accepted_ssh_key_or_failed_timestamp = time.time()
