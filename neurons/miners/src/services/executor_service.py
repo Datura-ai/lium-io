@@ -5,7 +5,7 @@ from typing import Annotated, Optional
 
 import aiohttp
 import bittensor
-from datura.requests.miner_requests import ExecutorSSHInfo, PodLog
+from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 
 from core.config import settings
@@ -38,11 +38,7 @@ class ExecutorService:
         timeout = aiohttp.ClientTimeout(total=10)  # 5 seconds timeout
         url = f"http://{executor.address}:{executor.port}/upload_ssh_key"
         keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        payload = {
-            "public_key": pubkey,
-            "data_to_sign": pubkey,
-            "signature": f"0x{keypair.sign(pubkey).hex()}"
-        }
+        payload = {"public_key": pubkey, "signature": f"0x{keypair.sign(pubkey).hex()}"}
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, json=payload) as response:
@@ -74,11 +70,7 @@ class ExecutorService:
         timeout = aiohttp.ClientTimeout(total=10)  # 5 seconds timeout
         url = f"http://{executor.address}:{executor.port}/remove_ssh_key"
         keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        payload = {
-            "public_key": pubkey,
-            "data_to_sign": pubkey,
-            "signature": f"0x{keypair.sign(pubkey).hex()}"
-        }
+        payload = {"public_key": pubkey, "signature": f"0x{keypair.sign(pubkey).hex()}"}
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, json=payload) as response:
@@ -134,29 +126,3 @@ class ExecutorService:
             for executor in self.get_executors_for_validator(validator_hotkey, executor_id)
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def get_pod_logs(
-        self, validator_hotkey: str, executor_id: str, container_name: str
-    ) -> list[PodLog]:
-        executors = self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
-        if len(executors) == 0:
-            raise Exception('[get_pod_logs] Error: not found executor')
-
-        executor = executors[0]
-
-        timeout = aiohttp.ClientTimeout(total=20)  # 5 seconds timeout
-        url = f"http://{executor.address}:{executor.port}/pod_logs"
-        keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        payload = {
-            "container_name": container_name,
-            "data_to_sign": container_name,
-            "signature": f"0x{keypair.sign(container_name).hex()}"
-        }
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
-                if response.status != 200:
-                    raise Exception('[get_pod_logs] Error: API request failed')
-
-                response_obj: list[dict] = await response.json()
-                pod_logs = [PodLog.parse_obj(item) for item in response_obj]
-                return pod_logs
