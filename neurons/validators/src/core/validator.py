@@ -294,12 +294,13 @@ class Validator:
                 extra=get_extra_info(self.default_extra),
             ),
         )
-
+        miner_hotkeys = [miners[i].hotkey for i in range(len(miners))]
         await self.redis_service.publish(
             NORMALIZED_SCORE_CHANNEL,
             {
                 "uids": uids.tolist(),
                 "weights": weights.tolist(),
+                "miner_hotkeys": miner_hotkeys,
             },
         )
 

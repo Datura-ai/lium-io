@@ -273,6 +273,7 @@ class ComputeClient:
                     elif channel == NORMALIZED_SCORE_CHANNEL:
                         normalized_score = NormalizedScoreRequest(
                             uids=data["uids"],
+                            miner_hotkeys=data["miner_hotkeys"],
                             weights=data["weights"],
                         )
 
