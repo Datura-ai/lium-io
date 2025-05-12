@@ -24,7 +24,7 @@ LABEL builder=false
 
 RUN apt-get update -y \
   && apt-get upgrade -y \
-  && apt-get install -y speedtest-cli hashcat hashcat-data \
+  && apt-get install -y speedtest-cli \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /root/app/
