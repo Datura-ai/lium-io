@@ -58,6 +58,8 @@ services:
       - DB_URI=postgresql://postgres:password@db:5432/compute-subnet-db
     depends_on:
       - executor
+    cap_add:
+      - SYSLOG
     deploy:
       resources:
         reservations:
