@@ -19,6 +19,8 @@ from payload_models.payloads import (
     ContainerDeleteRequest,
     AddSshPublicKeyRequest,
     CustomOptions,
+    GetPodLogsRequestFromServer,
+    PodLogsResponseToServer,
 )
 
 configure_logs_of_other_modules()
@@ -315,7 +317,8 @@ async def _create_container_to_miner(miner_hotkey: str, miner_address: str, mine
     )
     response = await miner_service.handle_container(payload)
     print('response ==>', response)
-    
+
+
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
 @click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
@@ -397,6 +400,30 @@ async def _add_sshkey_to_container(miner_hotkey: str, miner_address: str, miner_
         user_public_keys=[user_public_key],
     )
     response = await miner_service.handle_container(payload)
+    print('response ==>', response)
+
+
+@cli.command()
+@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
+@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
+@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
+@click.option("--executor_id", prompt="Executor Id", help="Executor Id")
+@click.option("--container_name", prompt="Container name", help="Docker container name")
+def get_pod_logs(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str):
+    asyncio.run(_get_pod_logs(miner_hotkey, miner_address, miner_port, executor_id, container_name))
+
+
+async def _get_pod_logs(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str):
+    miner_service: MinerService = ioc["MinerService"]
+
+    payload = GetPodLogsRequestFromServer(
+        executor_id=executor_id,
+        miner_hotkey=miner_hotkey,
+        miner_address=miner_address,
+        miner_port=miner_port,
+        container_name=container_name,
+    )
+    response = await miner_service.get_pod_logs(payload)
     print('response ==>', response)
 
 

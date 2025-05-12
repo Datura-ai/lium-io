@@ -25,6 +25,9 @@ from payload_models.payloads import (
     DuplicateExecutorsResponse,
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
+    GetPodLogsRequestFromServer,
+    PodLogsResponseToServer,
+    FailedGetPodLogs,
 )
 from protocol.vc_protocol.compute_requests import Error, ExecutorUptimeResponse, RentedMachineResponse, Response
 from protocol.vc_protocol.validator_requests import (
@@ -520,6 +523,7 @@ class ComputeClient:
         | ContainerStartRequest
         | AddSshPublicKeyRequest
         | ExecutorRentFinishedRequest
+        | GetPodLogsRequestFromServer
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -639,3 +643,10 @@ class ComputeClient:
             )
 
             await self.miner_service.redis_service.remove_pending_pod(job_request.miner_hotkey, job_request.executor_id)
+        elif isinstance(job_request, GetPodLogsRequestFromServer):
+            response: (
+                PodLogsResponseToServer | FailedGetPodLogs
+            ) = await self.miner_service.get_pod_logs(job_request)
+
+            async with self.lock:
+                self.message_queue.append(response)
