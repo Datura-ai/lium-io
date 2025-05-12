@@ -275,9 +275,7 @@ class ComputeClient:
                             self.message_queue.append(reset_request)
                     elif channel == NORMALIZED_SCORE_CHANNEL:
                         normalized_score = NormalizedScoreRequest(
-                            uids=data["uids"],
-                            miner_hotkeys=data["miner_hotkeys"],
-                            weights=data["weights"],
+                            normalized_scores=data["normalized_scores"],
                         )
 
                         async with self.lock:

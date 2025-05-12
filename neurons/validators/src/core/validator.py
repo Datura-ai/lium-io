@@ -295,14 +295,14 @@ class Validator:
             ),
         )
         miner_hotkeys = [miners[i].hotkey for i in range(len(miners))]
-        await self.redis_service.publish(
-            NORMALIZED_SCORE_CHANNEL,
-            {
-                "uids": uids.tolist(),
-                "weights": weights.tolist(),
-                "miner_hotkeys": miner_hotkeys,
-            },
-        )
+        normalized_scores = [
+            {"uid": int(uid), "weight": float(weight), "miner_hotkey": miner_hotkey}
+            for uid, weight, miner_hotkey in zip(uids, weights, miner_hotkeys)
+        ]
+        message = {
+            "normalized_scores": normalized_scores,
+        }
+        await self.redis_service.publish(NORMALIZED_SCORE_CHANNEL, message)
 
         metagraph = self.get_metagraph()
         processed_uids, processed_weights = process_weights_for_netuid(

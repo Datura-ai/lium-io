@@ -94,6 +94,4 @@ class DuplicateExecutorsRequest(BaseValidatorRequest):
 
 class NormalizedScoreRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.NormalizedScoreRequest
-    uids: list[int]
-    miner_hotkeys: list[str]
-    weights: list[float]
+    normalized_scores: list[dict]
