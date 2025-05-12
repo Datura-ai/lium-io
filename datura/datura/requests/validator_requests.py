@@ -10,6 +10,7 @@ class RequestType(enum.Enum):
     AuthenticateRequest = "AuthenticateRequest"
     SSHPubKeySubmitRequest = "SSHPubKeySubmitRequest"
     SSHPubKeyRemoveRequest = "SSHPubKeyRemoveRequest"
+    GetPodLogsRequest = "GetPodLogsRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -45,3 +46,9 @@ class SSHPubKeyRemoveRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeyRemoveRequest
     public_key: bytes
     executor_id: Optional[str] = None
+
+
+class GetPodLogsRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.GetPodLogsRequest
+    executor_id: str
+    container_name: str
