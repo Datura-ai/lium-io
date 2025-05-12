@@ -7,6 +7,8 @@ import threading
 import time
 from datetime import datetime
 from core.config import settings
+from core.db import get_session
+from daos.pod_log import PodLog, PodLogDao
 
 # Set up logging to a file in JSON format (one JSON object per line)
 logging.basicConfig(filename="container_monitor.log", level=logging.INFO,
@@ -122,89 +124,92 @@ def classify_stop(exit_code):
         reason = "file_or_directory_not_found"
     elif exit_code == 128:
         reason = "invalid_argument_on_exit"
-    elif exit_code == 134: # SIGABRT
+    elif exit_code == 134:  # SIGABRT
         reason = "abnormal_termination"
-    elif exit_code == 137: # SIGKILL: from docker rm command
+    elif exit_code == 137:  # SIGKILL: from docker rm command
         reason = "immediate_termination"
-    elif exit_code == 139: # SIGSEGV
+    elif exit_code == 139:  # SIGSEGV
         reason = "segmentation_fault"
-    elif exit_code == 143: # SIGTERM
+    elif exit_code == 143:  # SIGTERM
         reason = "graceful_termination"
     elif exit_code == 255:
         reason = "exit_status_out_of_range"
     return reason
 
 
-while True:
+def log_event(log: PodLog):
     try:
-        # Initialize Docker client
-        client = docker.from_env()
+        with get_session() as session:
+            pod_log_dao = PodLogDao()
+            pod_log_dao.save(session, log)
+            logging.info(json.dumps(log.model_dump(), default=str))
+    except:
+        pass
 
-        for event in client.events(decode=True):
-            try:
-                # Only care about container events
+
+def handle_event(event):
+    """Process a Docker event."""
+    action = event.get("Action")
+    attrs = event.get("Actor", {}).get("Attributes", {})
+    container_id = event.get("id") or event.get("Actor", {}).get("ID")
+    name = attrs.get("name")
+
+    if not name or not name.startswith(monitor_prefix) or name == f"{monitor_prefix}{settings.MINER_HOTKEY_SS58_ADDRESS}":
+        return
+
+    pod_log = PodLog(
+        container_name=name,
+        container_id=container_id,
+        event=action,
+        created_at=datetime.utcnow()
+    )
+
+    if action in {"start", "stop", "restart", "kill", "destroy", "oom"}:
+        log_event(pod_log)
+    elif action == "die":
+        exit_code = int(attrs.get("exitCode", 0))
+        reason = classify_stop(exit_code)
+        pod_log.exit_code = exit_code
+        pod_log.reason = reason
+        log_event(pod_log)
+
+
+def main():
+    """Main loop to monitor Docker events."""
+    client = docker.from_env()
+
+    while True:
+        try:
+            for event in client.events(decode=True):
                 if event.get("Type") != "container":
                     continue
 
-                action = event.get("Action")
-                attrs = event.get("Actor", {}).get("Attributes", {})
-                container_id = event.get("id") or event.get("Actor", {}).get("ID")
-                name = attrs.get("name")
-
                 try:
-                    container = client.containers.get(container_id)
-                except Exception:
-                    continue
+                    handle_event(event)
+                except Exception as ex:
+                    pod_log = PodLog(
+                        event=event.get('Action'),
+                        error=f"Exception processing event {event.get('Action')}: {ex}",
+                        created_at=datetime.utcnow()
+                    )
+                    log_event(pod_log)
+        except docker.errors.APIError as api_error:
+            pod_log = PodLog(
+                error=f"Docker API error: {api_error}",
+                created_at=datetime.utcnow()
+            )
+            log_event(pod_log)
 
-                # skip containers not matching our prefix filter
-                if not name or not name.startswith(monitor_prefix) or name == f"{monitor_prefix}{settings.MINER_HOTKEY_SS58_ADDRESS}":
-                    continue
+            time.sleep(5)
+        except Exception as ex:
+            pod_log = PodLog(
+                error=f"Unexpected error: {ex}",
+                created_at=datetime.utcnow()
+            )
+            log_event(pod_log)
 
-                default_log = {
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                    "event": action,
-                    "container_id": container_id[:12],
-                    "container_name": name,
-                }
+            time.sleep(5)
 
-                if action == "start":
-                    logging.info(json.dumps(default_log))
-                elif action == "stop":
-                    logging.info(json.dumps(default_log))
-                elif action == "restart":
-                    logging.info(json.dumps(default_log))
-                elif action == "kill":
-                    logging.info(json.dumps(default_log))
-                elif action == "destroy":
-                    logging.info(json.dumps(default_log))
-                # container out of memory error
-                elif action == "oom":
-                    logging.info(json.dumps(default_log))
-                # container is exited
-                elif action == "die":
-                    exit_code = int(attrs.get("exitCode", 0))
-                    reason = classify_stop(exit_code)
-                    logging.info(json.dumps({
-                        **default_log,
-                        "exit_code": exit_code,
-                        "reason": reason,
-                    }))
 
-            except Exception as ex:
-                # Log any exception in event handling, but continue loop
-                logging.error(json.dumps({
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                    "error": f"Exception processing event {event.get('Action')}: {ex}"
-                }))
-    except docker.errors.APIError as api_error:
-        logging.error(json.dumps({
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "error": f"Docker API error: {api_error}"
-        }))
-        time.sleep(5)
-    except Exception as ex:
-        logging.error(json.dumps({
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "error": f"Unexpected error: {ex}"
-        }))
-        time.sleep(5)
+if __name__ == "__main__":
+    main()
