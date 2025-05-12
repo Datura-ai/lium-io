@@ -34,6 +34,7 @@ from protocol.vc_protocol.validator_requests import (
     LogStreamRequest,
     RentedMachineRequest,
     ResetVerifiedJobRequest,
+    NormalizedScoreRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
@@ -49,6 +50,7 @@ from services.redis_service import (
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
+    NORMALIZED_SCORE_CHANNEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,6 +212,7 @@ class ComputeClient:
                     MACHINE_SPEC_CHANNEL,
                     STREAMING_LOG_CHANNEL,
                     RESET_VERIFIED_JOB_CHANNEL,
+                    NORMALIZED_SCORE_CHANNEL,
                 )
                 async for message in pubsub.listen():
                     try:
@@ -267,6 +270,14 @@ class ComputeClient:
 
                         async with self.lock:
                             self.message_queue.append(reset_request)
+                    elif channel == NORMALIZED_SCORE_CHANNEL:
+                        normalized_score = NormalizedScoreRequest(
+                            uids=data["uids"],
+                            weights=data["weights"],
+                        )
+
+                        async with self.lock:
+                            self.message_queue.append(normalized_score)
 
             except Exception as exc:
                 logger.error(

@@ -19,7 +19,7 @@ from core.utils import _m, get_extra_info, get_logger
 from services.docker_service import REPOSITORIES, DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import PENDING_PODS_PREFIX, RedisService
+from services.redis_service import PENDING_PODS_PREFIX, NORMALIZED_SCORE_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.matrix_validation_service import ValidationService
@@ -276,21 +276,6 @@ class Validator:
                 uids[ind + 1] = uid
                 weights[ind + 1] = BURNER_EMISSION
         else:
-            # Add logging for normalized scores
-            normalized_scores = {
-                str(miner.hotkey): self.miner_scores.get(miner.hotkey, 0.0) / total_score 
-                for miner in miners
-            }
-            logger.info(
-                _m(
-                    "[set_weights] normalized scores",
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "normalized_scores": normalized_scores,
-                    }),
-                ),
-            )
-
             for ind, miner in enumerate(miners):
                 uids[ind] = miner.uid
                 if miner.uid == main_burner:
@@ -308,6 +293,14 @@ class Validator:
                 f"[set_weights] uids: {uids} weights: {weights}",
                 extra=get_extra_info(self.default_extra),
             ),
+        )
+
+        await self.redis_service.publish(
+            NORMALIZED_SCORE_CHANNEL,
+            {
+                "uids": uids.tolist(),
+                "weights": weights.tolist(),
+            },
         )
 
         metagraph = self.get_metagraph()
