@@ -2,5 +2,13 @@ from pydantic import BaseModel
 
 
 class MinerAuthPayload(BaseModel):
-    public_key: str
+    data_to_sign: str
     signature: str
+
+
+class UploadSShKeyPayload(MinerAuthPayload):
+    public_key: str
+
+
+class GetPodLogsPaylod(MinerAuthPayload):
+    container_name: str
