@@ -134,7 +134,11 @@ class RedisService:
         if not data:
             return None
 
-        return json.loads(data)
+        data = json.loads(data)
+        if not data.get("container_name", ""):
+            return None
+
+        return data
 
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
