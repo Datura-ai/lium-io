@@ -294,7 +294,13 @@ class Validator:
                 extra=get_extra_info(self.default_extra),
             ),
         )
-        miner_hotkeys = [miners[i].hotkey for i in range(len(miners))]
+        metagraph = self.get_metagraph()
+
+        miner_hotkeys = []
+        for neuron in metagraph.neurons:
+            if neuron.uid in uids:
+                miner_hotkeys.append(neuron.hotkey)
+
         normalized_scores = [
             {"uid": int(uid), "weight": float(weight), "miner_hotkey": miner_hotkey}
             for uid, weight, miner_hotkey in zip(uids, weights, miner_hotkeys)
@@ -304,7 +310,6 @@ class Validator:
         }
         await self.redis_service.publish(NORMALIZED_SCORE_CHANNEL, message)
 
-        metagraph = self.get_metagraph()
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
             weights=weights,
