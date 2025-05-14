@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     BURNERS: list[int] = [4, 206, 207, 208]
+    
+    DEBUG_COLLATERAL_CONTRACT: bool = True
+
+    COLLATERAL_CONTRACT_ADDRESS: str = "0x354DbD43c977A59a3EeFeAd3Cb3de0a4E0E62b6D"
+
+    DEBUG_CONTRACT_MINERS: [str] = [
+        "5Df8qGLMd19BXByefGCZFN57fWv6jDm5hUbnQeUTu2iqNBhT",
+        "5Dtbwfafi4cyiDwH5HBFEAWJA913EB6G1rX7wBnfcXwiPssR",
+        "5ECBM9caBAyJPBjVtfw4WGwdytacrZWvvt6i3T8GnqtByRFM"
+    ]
+
+    MINER_KEY: str = "259e0eded00353f71eb6be89d8749ad12bf693cbd8aeb6b80cd3a343c0dc8faf"
+    VALIDATOR_KEY: str = "434469242ece0d04889fdfa54470c3685ac226fb3756f5eaf5ddb6991e1698a3"
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

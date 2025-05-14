@@ -471,9 +471,12 @@ class Validator:
             # fetch miners
             miners = self.fetch_miners()
 
-            if await self.should_set_weights():
-                await self.set_weights(miners=miners)
-
+            try:
+                if await self.should_set_weights():
+                    await self.set_weights(miners=miners)
+            except Exception as e:
+                print("error", e)
+            
             current_block = self.get_current_block()
             logger.info(
                 _m(
