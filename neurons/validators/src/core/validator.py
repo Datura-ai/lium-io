@@ -268,16 +268,21 @@ class Validator:
         )
         other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
 
+        metagraph = self.get_metagraph()
+        miner_hotkeys = []
         total_score = sum(self.miner_scores.values())
         if total_score <= 0:
             uids[0] = main_burner
             weights[0] = 1 - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+            miner_hotkeys.append(metagraph.hotkeys[main_burner])
             for ind, uid in enumerate(other_burners):
                 uids[ind + 1] = uid
                 weights[ind + 1] = BURNER_EMISSION
+                miner_hotkeys.append(metagraph.hotkeys[uid])
         else:
             for ind, miner in enumerate(miners):
                 uids[ind] = miner.uid
+                miner_hotkeys.append(metagraph.hotkeys[miner.uid])
                 if miner.uid == main_burner:
                     weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
                 elif miner.uid in other_burners:
@@ -294,13 +299,6 @@ class Validator:
                 extra=get_extra_info(self.default_extra),
             ),
         )
-        metagraph = self.get_metagraph()
-
-        miner_hotkeys = []
-        for neuron in metagraph.neurons:
-            if neuron.uid in uids:
-                miner_hotkeys.append(neuron.hotkey)
-
         normalized_scores = [
             {"uid": int(uid), "weight": float(weight), "miner_hotkey": miner_hotkey}
             for uid, weight, miner_hotkey in zip(uids, weights, miner_hotkeys)
