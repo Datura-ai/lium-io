@@ -73,24 +73,26 @@ docker compose up -d
 
 ## Recommended Setup For GPUs and Docker
 
-Step 1: Ensure `nvidia-container-toolkit` is installed. 
+### Step 1: Ensure `nvidia-container-toolkit` is installed. 
 
 ```shell
 nvidia-container-cli --version
 ```
 
-Step 2: Ensure you installed latest `nvidia-container-cli` version. You can find latest version in [NVIDIA Container Toolkit Github Repository](https://github.com/NVIDIA/libnvidia-container). 
+### Step 2: Ensure you installed latest `nvidia-container-cli` version. 
+You can find latest version in [NVIDIA Container Toolkit Github Repository](https://github.com/NVIDIA/libnvidia-container). 
 
-You can upgrade your `nvidia-container-toolkit` with following command: 
+You can upgrade your `nvidia-container-toolkit` with following command:
+
 ```shell
 sudo apt-get update && sudo apt-get install --only-upgrade nvidia-container-toolkit
 ```
 
-Step 3: Enable cgroups for docker. 
+### Step 3: Enable cgroups for docker. 
 
 Go to `/etc/nvidia-container-runtime/config.toml` and enable `no-cgroups=false`. 
 
-Step 4: Update docker daemon.json file. 
+### Step 4: Update docker daemon.json file. 
 
 Go to `/etc/docker/daemon.json` and add `"exec-opts": ["native.cgroupdriver=cgroupfs"]`. 
 
@@ -106,7 +108,35 @@ Go to `/etc/docker/daemon.json` and add `"exec-opts": ["native.cgroupdriver=cgro
 }
 ```
 
-Step 5: Restart docker. 
+### Step 5: Sysbox setup
+
+#### System Requirments
+| os          | Version |
+|-------------|---------|
+| Ubuntu      | 22+     |
+| Kernel      | 6.0+    |
+
+Installation of sysbox
+```shell
+./nvidia_docker_sysbox_setup.sh
+```
+
+Verify sysbox is working correctly with gpu
+```shell
+docker run --rm --runtime=sysbox-runc --gpus all daturaai/compute-subnet-executor:latest nvidia-smi
+```
+
+The above command should show the `nvidia-smi` result if sysbox is installed correctly.
+
+Troubleshooting when sysbox is not working on ubuntu 22.04
+```shell
+sudo apt update
+sudo apt install --install-recommends linux-generic-hwe-22.04
+sudo reboot
+```
+
+
+### Step 6: Restart docker. 
 
 ```shell
 sudo systemctl restart docker
