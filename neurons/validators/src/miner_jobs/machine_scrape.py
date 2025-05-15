@@ -618,6 +618,20 @@ def get_network_speed():
         data["network_speed_error"] = repr(exc)
     return data
 
+def get_network_speed_other_way():
+    """Get upload and download speed of the machine."""
+    data = {"up_speed_other_way": None, "down_speed_other_way": None}
+    try:
+        speedtest_cmd = run_cmd("speedcheck run --type ookla")
+        # Find the first '{' and parse from there
+        json_start = speedtest_cmd.find('{')
+        json_str = speedtest_cmd[json_start:]
+        speedtest_data = json.loads(json_str)
+        data["down_speed_other_way"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
+        data["up_speed_other_way"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
+    except Exception as exc:
+        data["net_speed_error"] = repr(exc)
+    return data
 
 def get_docker_info(content: bytes):
     data = {
@@ -937,6 +951,7 @@ def get_machine_specs():
         data["os_scrape_error"] = repr(exc)
 
     data["data_network"] = get_network_speed()
+    data["data_net_other_way"] = get_network_speed_other_way()
 
     data["data_md5_checksums"] = {
         "md5_checksums_nvidia_smi": f"{get_md5_checksum_from_file_content(nvidia_smi_content)}:{get_sha256_checksum_from_file_content(nvidia_smi_content)}",
