@@ -111,10 +111,22 @@ Go to `/etc/docker/daemon.json` and add `"exec-opts": ["native.cgroupdriver=cgro
 ### Step 5: Sysbox setup
 
 #### System Requirments
-| os          | Version |
+| OS          | Version |
 |-------------|---------|
 | Ubuntu      | 22+     |
-| Kernel      | 6.0+    |
+| Kernel      | 6.5+    |
+
+Checking OS and Kernel version
+```shell
+hostnamectl
+```
+
+Get the latest kernel version on ubuntu 22.04 if the kernel version is less than 6.5
+```shell
+sudo apt update
+sudo apt install --install-recommends linux-generic-hwe-22.04
+sudo reboot
+```
 
 Installation of sysbox
 ```shell
@@ -127,13 +139,6 @@ docker run --rm --runtime=sysbox-runc --gpus all daturaai/compute-subnet-executo
 ```
 
 The above command should show the `nvidia-smi` result if sysbox is installed correctly.
-
-Troubleshooting when sysbox is not working on ubuntu 22.04
-```shell
-sudo apt update
-sudo apt install --install-recommends linux-generic-hwe-22.04
-sudo reboot
-```
 
 
 ### Step 6: Restart docker. 
