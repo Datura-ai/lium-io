@@ -20,9 +20,5 @@ if [ -f "$SCRIPT_DIR/config.toml" ]; then
 fi
 
 
-# Download Sysbox v0.6.6
-wget https://downloads.nestybox.com/sysbox/releases/v0.6.6/sysbox-ce_0.6.6-0.linux_amd64.deb
-
+# Install Sysbox v0.6.6
 sudo apt-get install -y ./sysbox-ce_0.6.6-0.linux_amd64.deb
-
-rm -f sysbox-ce_0.6.6-0.linux_amd64.deb
