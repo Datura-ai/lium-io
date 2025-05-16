@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     
     DEBUG_COLLATERAL_CONTRACT: bool = True
 
+    REQUIRED_TAO_COLLATERAL: float = 0.001
+
     COLLATERAL_CONTRACT_ADDRESS: str = "0x922f956Ee1B398d5b7BC35282a9cF7145c15b295"
 
     DEBUG_CONTRACT_MINERS: [str] = [

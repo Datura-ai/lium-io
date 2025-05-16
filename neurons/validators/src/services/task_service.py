@@ -584,7 +584,7 @@ class TaskService:
                 f"since there is no pod running."
             )
             logger.info(message)
-            collateral_contract.slash_collateral(0.0001, "slashit", executor_info.uuid)
+            collateral_contract.slash_collateral(settings.REQUIRED_TAO_COLLATERAL, "slashit", executor_info.uuid)
         except Exception as e:
             logger.error(
                 _m(
