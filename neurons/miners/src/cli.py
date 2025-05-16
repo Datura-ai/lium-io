@@ -194,7 +194,7 @@ def show_executors():
 @cli.command()
 @click.option("--miner_ethereum_key", type=str, prompt="Miner ethereum key", help="Miner ethereum key")
 def get_miner_collateral(miner_ethereum_key: str):
-    """Add executor machine to the database"""
+    """Get miner collateral from the collateral contract"""
 
     try:
         network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
@@ -218,7 +218,7 @@ def get_miner_collateral(miner_ethereum_key: str):
 
 @cli.command()
 def get_eligible_executors():
-    """Add executor machine to the database"""
+    """Get eligible executors from the collateral contract"""
     try:
         network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
         # Check if executor is eligible using collateral contract
@@ -238,6 +238,25 @@ def get_eligible_executors():
     except Exception as e:
         logger.error("Failed in getting eligible executors: %s", str(e))
 
+
+@cli.command()
+def get_eth_address_from_hotkey():
+    """Get ethereum address from bittensor hotkey from the collateral contract"""
+    try:
+        network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
+        collateral_contract = CollateralContract(
+            network,
+            settings.COLLATERAL_CONTRACT_ADDRESS,
+            "",
+            ""
+        )
+
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
+        logger.info(f"Ethereum address: {collateral_contract.miner_address} mapped to hotkey {my_key.ss58_address}")
+
+    except Exception as e:
+        logger.error("Failed in getting ethereum address mapped to hotkey: %s", str(e))
 
 if __name__ == "__main__":
     cli()
