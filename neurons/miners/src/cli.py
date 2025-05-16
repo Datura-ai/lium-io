@@ -135,7 +135,9 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
 
             logger.info("Miner balance: %f TAO", balance)
 
-
+            executor = executor_dao.findOne(address, port)
+            executor_uuid = executor.uuid
+            logger.info(f"Executor UUID: {executor_uuid}")
             message = (
                 f"Reclaim amount {reclaim_amount} for this executor UUID: {executor_uuid}"
                 f" since miner {my_key.ss58_address} is going to remove this executor"
