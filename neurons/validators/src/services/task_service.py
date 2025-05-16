@@ -483,8 +483,15 @@ class TaskService:
         job_score = score if not is_rented or not is_rental_check_passed else 0
         return actual_score, job_score
 
-    def is_eligible_executor(self, executor_info: ExecutorSSHInfo):
-        # Check if executor is eligible using collateral contract
+    def is_eligible_executor(self, miner_hotkey:str, executor_info: ExecutorSSHInfo):
+        """
+        Check if it is eligible for a specific executor.
+
+        Args:
+            miner_hotkey: The hotkey of the hotkey.
+            executor_info: The executor information.
+        """
+
         network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
         collateral_contract = CollateralContract(
             network,
@@ -492,8 +499,20 @@ class TaskService:
             settings.ETHEREUM_VALIDATOR_KEY,
             ""
         )
-        print("collateral_contract.validator_account", collateral_contract.validator_account.address)
-        collateral_contract.miner_address = "0x19F71e76B34A8Dc01944Cf3B76478B45DE05B75b"
+
+        collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(miner_hotkey)
+        logger.info(
+            _m(
+                f"miner ethereum address mapped to hotkey from collateral contract: {collateral_contract.miner_address}",
+                extra={
+                    "collateral_contract_address": collateral_contract.contract_address,
+                    "validator_address": collateral_contract.validator_address,
+                    "miner_hotkey": miner_hotkey,
+                    "executor_uuid": executor_info.uuid,
+                },
+            )
+        )
+
         eligible_executors = collateral_contract.get_eligible_executors(
             [executor_info.uuid]
         )
@@ -508,13 +527,14 @@ class TaskService:
     
         return True
 
-    def slash_collateral(self, validator_hotkey: str, executor_info: ExecutorSSHInfo):
+    def slash_collateral(self, validator_hotkey: str, miner_hotkey: str, executor_info: ExecutorSSHInfo):
         """
         Slash collateral for a specific executor.
 
         Args:
             validator_hotkey: The hotkey of the validator.
-            executor_uuid: The UUID of the executor.
+            miner_hotkey: The hotkey of the hotkey.
+            executor_info: The executor information.
         """
 
         # Initialize the collateral contract
@@ -526,8 +546,18 @@ class TaskService:
             ""
         )
 
-        print("collateral_contract.validator_account", collateral_contract.validator_account.address)
-        collateral_contract.miner_address = "0x19F71e76B34A8Dc01944Cf3B76478B45DE05B75b"
+        collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(miner_hotkey)
+        logger.info(
+            _m(
+                f"miner ethereum address mapped to hotkey from collateral contract: {collateral_contract.miner_address}",
+                extra={
+                    "collateral_contract_address": collateral_contract.contract_address,
+                    "validator_address": collateral_contract.validator_address,
+                    "miner_hotkey": miner_hotkey,
+                    "executor_uuid": executor_info.uuid,
+                },
+            )
+        )
 
         # Log the miner's balance
         balance = collateral_contract.get_balance(collateral_contract.miner_address)
@@ -624,9 +654,9 @@ class TaskService:
 
             if miner_info.miner_hotkey in settings.DEBUG_CONTRACT_MINERS:
                 await self.handle_reclaim_requests(keypair.ss58_address, executor_info)
-                self.slash_collateral(keypair.ss58_address, executor_info)
+                self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
 
-                if not self.is_eligible_executor(executor_info) and not settings.DEBUG_COLLATERAL_CONTRACT:
+                if not self.is_eligible_executor(miner_info.miner_hotkey, executor_info) and not settings.DEBUG_COLLATERAL_CONTRACT:
                     return await self._handle_task_result(
                         miner_info=miner_info,
                         executor_info=executor_info,
@@ -1015,7 +1045,7 @@ class TaskService:
                             clear_verified_job_info=False,
                         )
 
-                    if not self.is_eligible_executor(executor_info) and not settings.DEBUG_COLLATERAL_CONTRACT:
+                    if not self.is_eligible_executor(miner_info.miner_hotkey, executor_info) and not settings.DEBUG_COLLATERAL_CONTRACT:
                         return await self._handle_task_result(
                             miner_info=miner_info,
                             executor_info=executor_info,
