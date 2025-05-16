@@ -44,6 +44,13 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
         executor = executor_dao.save(
             Executor(executor_uuid, address=address, port=port, validator=validator)
         )
+        
+    except Exception as e:
+        logger.error("Failed in adding an executor: %s", str(e))
+    else:
+        logger.info("Added an executor(id=%s)", str(executor.uuid))
+
+    try:
         network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
         # Check if executor is eligible using collateral contract
         collateral_contract = CollateralContract(
@@ -82,10 +89,9 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
 
         collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
     except Exception as e:
-        logger.error("Failed in adding an executor: %s", str(e))
+        logger.error("Failed in depositing collateral: %s", str(e))
     else:
-        logger.info("Added an executor(id=%s) with %f TAO collateral", str(executor_uuid), deposit_amount)
-
+        logger.info("Deposited collateral successfully.")
 
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
