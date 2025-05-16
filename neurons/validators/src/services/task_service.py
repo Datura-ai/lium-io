@@ -695,20 +695,20 @@ class TaskService:
 
             if miner_info.miner_hotkey in settings.DEBUG_CONTRACT_MINERS:
                 await self.handle_reclaim_requests(keypair.ss58_address, executor_info)
-                self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
+                # self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
 
-                if not self.is_eligible_executor(miner_info.miner_hotkey, executor_info) and not settings.DEBUG_COLLATERAL_CONTRACT:
-                    return await self._handle_task_result(
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=True,
-                    )
+                # if not self.is_eligible_executor(miner_info.miner_hotkey, executor_info) and not settings.DEBUG_COLLATERAL_CONTRACT:
+                #     return await self._handle_task_result(
+                #         miner_info=miner_info,
+                #         executor_info=executor_info,
+                #         spec=None,
+                #         score=0,
+                #         job_score=0,
+                #         log_text=log_text,
+                #         verified_job_info=verified_job_info,
+                #         success=False,
+                #         clear_verified_job_info=True,
+                #     )
 
             async with InteractiveShellService(
                 host=executor_info.address,
@@ -1038,7 +1038,7 @@ class TaskService:
                             ),
                         )
 
-                        self.slash_collateral(keypair.ss58_address, executor_info)
+                        self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
 
                         return await self._handle_task_result(
                             miner_info=miner_info,
