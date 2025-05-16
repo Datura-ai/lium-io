@@ -16,6 +16,7 @@ from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
+from celium_collateral_contracts import CollateralContract
 from services.docker_service import REPOSITORIES, DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
@@ -117,6 +118,83 @@ class Validator:
             ),
         )
 
+        self.map_hotkey_to_ethereum()
+
+
+    def map_hotkey_to_ethereum(self):
+        try:
+            network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
+
+            if settings.COLLATERAL_CONTRACT_ADDRESS is None:
+                logger.error(
+                    _m(
+                        "[map_hotkey_to_ethereum] Collateral contract address is not set.",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+                return
+            
+            if settings.ETHEREUM_VALIDATOR_KEY is None:
+                logger.error(
+                    _m(
+                        "[map_hotkey_to_ethereum] Ethereum validator key is not set.",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+                return
+                
+            collateral_contract = CollateralContract(
+                network,
+                settings.COLLATERAL_CONTRACT_ADDRESS,
+                settings.ETHEREUM_VALIDATOR_KEY,
+                ""
+            )
+
+            my_hotkey = self.wallet.get_hotkey().ss58_address
+
+            validator_address_on_contract = collateral_contract.get_eth_address_from_hotkey(my_hotkey)
+            if validator_address_on_contract:
+                logger.info(
+                    _m(
+                        f"[map_hotkey_to_ethereum] Validator address <{validator_address_on_contract}> is already mapped to bittensor hotkey <{my_hotkey}> on collateral contract.",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+
+            else:
+                logger.info(
+                    _m(
+                        f"[map_hotkey_to_ethereum] Validator address <{collateral_contract.validator_account.address}> is not mapped to bittensor hotkey <{my_hotkey}> on collateral contract. Registering it now...",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+
+                collateral_contract.map_hotkey_to_ethereum(
+                    account=collateral_contract.miner_account,
+                    hotkey=self.wallet.get_hotkey().ss58_address,
+                )
+
+                logger.info(
+                    _m(
+                        f"[map_hotkey_to_ethereum] Validator address <{collateral_contract.validator_account.address}> is mapped to bittensor hotkey <{my_hotkey}> on collateral contract successfully.",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+        except Exception as e:
+            logger.error(
+                _m(
+                    "[map_hotkey_to_ethereum] Error mapping hotkey to Ethereum address",
+                    extra=get_extra_info(
+                        {
+                            **self.default_extra,
+                            "error": str(e),
+                        }
+                    ),
+                ),
+            )
+
+
+        
     def set_subtensor(self):
         try:
             if (
