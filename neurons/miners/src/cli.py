@@ -29,7 +29,8 @@ def cli():
 @click.option(
     "--deposit_amount", type=float, prompt="Deposit Amount", help="Amount of TAO to deposit as collateral"
 )
-def add_executor(address: str, port: int, validator: str, deposit_amount: float):
+@click.option("--miner_ethereum_key", type=str, prompt="Miner ethereum key", help="Miner ethereum key")
+def add_executor(address: str, port: int, validator: str, deposit_amount: float, miner_ethereum_key: str):
     """Add executor machine to the database"""
     if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
         logger.error("Error: Minimum deposit amount is %f TAO.", REQUIRED_TAO_COLLATERAL)
@@ -45,10 +46,27 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
         )
         network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
         # Check if executor is eligible using collateral contract
-        collateral_contract = CollateralContract(network, settings.COLLATERAL_CONTRACT_ADDRESS, settings.VALIDATOR_KEY, settings.MINER_KEY)
+        collateral_contract = CollateralContract(
+            network,
+            settings.COLLATERAL_CONTRACT_ADDRESS,
+            "",
+            miner_ethereum_key
+        )
+
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+
+        collateral_contract.map_hotkey_to_ethereum(
+            account=collateral_contract.miner_account,
+            hotkey=my_key.ss58_address
+        )
+
+        logger.info("Hotkey mapped to Ethereum address successfully.")
+
+        collateral_contract.validator_address = collateral_contract.get_eth_address_from_hotkey(validator)
+        logger.info(f"Validator address: {collateral_contract.validator_address} mapped to {validator}")
         balance = collateral_contract.get_balance(collateral_contract.miner_account.address)
 
-        logger.info("Miner balance: %f TAO", balance)
+        logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
 
         if balance < deposit_amount:
             logger.error("Error: Insufficient balance in miner's address.")
@@ -57,8 +75,8 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
 
         message = (
-            f"Deposit amount {deposit_amount} for this executor UUID: {executor_info.uuid}"
-            f" since miner {my_key.ss58_address} is going to remove this executor"
+            f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid}"
+            f" since miner {my_key.ss58_address} is going to add this executor"
         )
         logger.info(message)
 
@@ -76,27 +94,38 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
     "--reclaim_amount", type=float, prompt="Reclaim Amount", help="Amount of TAO to reclaim collateral"
 )
 @click.option("--reclaim_description", type=str, prompt="Reclaim Description", help="Reclaim Description")
-def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str):
+@click.option("--miner_ethereum_key", type=str, prompt="Miner ethereum key", help="Miner ethereum key")
+def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str, miner_ethereum_key: str):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
         logger.info("Removing executor (%s:%d)", address, port)
         executor_dao = ExecutorDao(session=next(get_db()))
         try:
-            executor = executor_dao.get_by_address_port(address, port)
             executor_dao.delete_by_address_port(address, port)
 
             # Check if executor is eligible using collateral contract3
             network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
-            collateral_contract = CollateralContract(network, settings.COLLATERAL_CONTRACT_ADDRESS, settings.VALIDATOR_KEY, settings.MINER_KEY)
-            balance = collateral_contract.get_balance(collateral_contract.miner_account.address)
+
+            collateral_contract = CollateralContract(
+                network,
+                settings.COLLATERAL_CONTRACT_ADDRESS,
+                "",
+                miner_ethereum_key
+            )
+
+            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+
+            collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
+
+            logger.info(f"Miner address: {collateral_contract.miner_address} mapped to {my_key.ss58_address}")
+
+            balance = collateral_contract.get_balance(collateral_contract.miner_address)
 
             logger.info("Miner balance: %f TAO", balance)
 
-            executor_uuid = uuid.uuid4()
-            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
 
             message = (
-                f"Reclaim amount {reclaim_amount} for this executor UUID: {executor_info.uuid}"
+                f"Reclaim amount {reclaim_amount} for this executor UUID: {executor_uuid}"
                 f" since miner {my_key.ss58_address} is going to remove this executor"
             )
             logger.info(message)
@@ -143,6 +172,30 @@ def show_executors():
     except Exception as e:
         logger.error("Failed in showing an executor: %s", str(e))
 
+
+@cli.command()
+@click.option("--miner_ethereum_key", type=str, prompt="Miner ethereum key", help="Miner ethereum key")
+def get_miner_collateral(miner_ethereum_key: str):
+    """Add executor machine to the database"""
+
+    try:
+        network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
+        # Check if executor is eligible using collateral contract
+        collateral_contract = CollateralContract(
+            network,
+            settings.COLLATERAL_CONTRACT_ADDRESS,
+            "",
+            miner_ethereum_key
+        )
+
+        final_collateral = collateral_contract.get_miner_collateral()
+
+        final_collateral_in_tao = collateral_contract.w3.from_wei(final_collateral, "ether")
+
+        logger.info("Miner collateral: %f TAO", final_collateral_in_tao)
+
+    except Exception as e:
+        logger.error("Failed in getting miner collateral: %s", str(e))
 
 if __name__ == "__main__":
     cli()
