@@ -656,10 +656,6 @@ class TaskService:
                     ),
                 )
 
-                if machine_spec.get("network")["network_speed_error"]:
-                    machine_spec.get("network")['upload_speed'] = machine_spec.get("network_other_way")["up_speed_other_way"]
-                    machine_spec.get("network")['download_speed'] = machine_spec.get("network_other_way")["down_speed_other_way"]
-
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
                         f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",

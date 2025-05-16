@@ -618,20 +618,60 @@ def get_network_speed():
         data["network_speed_error"] = repr(exc)
     return data
 
-def get_network_speed_other_way():
-    """Get upload and download speed of the machine."""
-    data = {"up_speed_other_way": None, "down_speed_other_way": None}
+def speedcheck_output():
+    data = {"upload_speed": None, "download_speed": None}
     try:
-        speedtest_cmd = run_cmd("speedcheck run --type ookla")
-        # Find the first '{' and parse from there
+        speedtest_cmd = run_cmd("PYTHONPATH=/opt/pypackages/lib python3 /opt/pypackages/bin/speedcheck run --type ookla")
         json_start = speedtest_cmd.find('{')
         json_str = speedtest_cmd[json_start:]
         speedtest_data = json.loads(json_str)
-        data["down_speed_other_way"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
-        data["up_speed_other_way"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
+        data["download_speed"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
+        data["upload_speed"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
     except Exception as exc:
-        data["net_speed_error"] = repr(exc)
+        data["network_speed_error"] = repr(exc)
     return data
+
+def netmeasure_output():
+    data = {"upload_speed": None, "download_speed": None}
+    try:
+        speedtest_cmd = run_cmd(f"PYTHONPATH=/opt/pypackages/lib python3 /opt/pypackages/bin/netmeasure speedtest_dotnet")
+        download_match = re.search(r'Download Rate: ([\d.]+) bit/s', speedtest_cmd)
+        upload_match = re.search(r'Upload Rate: ([\d.]+) bit/s', speedtest_cmd)
+
+        if download_match and upload_match:
+            download_speed = float(download_match.group(1))
+            upload_speed = float(upload_match.group(1))
+            
+            # Convert to Mbps
+            data["download_speed"] = download_speed / 1_000_000 # Convert to Mbps 
+            data["upload_speed"] = upload_speed / 1_000_000 # Convert to Mbps
+    except Exception as exc:
+        data["network_speed_error"] = repr(exc)
+    return data
+
+def path_of_speedcheck():
+    try:
+        speedcheck_cmd = run_cmd("which netmeasure")
+        return speedcheck_cmd.strip()
+    except Exception as exc:
+        return None
+
+def benchmark_network_speed():
+    """Benchmark network speed using different methods"""
+    data = get_network_speed()
+    if data.get("upload_speed") or data.get("download_speed"):
+        return data
+    
+    data = speedcheck_output()
+    if data.get("download_speed") or data.get("upload_speed"):
+        return data
+    
+    data = netmeasure_output()
+    if data.get("download_speed") or data.get("upload_speed"):
+        return data
+    
+    
+    return {"upload_speed": None, "download_speed": None}
 
 def get_docker_info(content: bytes):
     data = {
@@ -950,8 +990,8 @@ def get_machine_specs():
         # print(f'Error getting os specs: {exc}', flush=True)
         data["os_scrape_error"] = repr(exc)
 
-    data["data_network"] = get_network_speed()
-    data["data_net_other_way"] = get_network_speed_other_way()
+    
+    data["data_network"] = benchmark_network_speed()
 
     data["data_md5_checksums"] = {
         "md5_checksums_nvidia_smi": f"{get_md5_checksum_from_file_content(nvidia_smi_content)}:{get_sha256_checksum_from_file_content(nvidia_smi_content)}",
