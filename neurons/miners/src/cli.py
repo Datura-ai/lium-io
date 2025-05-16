@@ -29,8 +29,8 @@ def cli():
 @click.option(
     "--deposit_amount", type=float, prompt="Deposit Amount", help="Amount of TAO to deposit as collateral"
 )
-@click.option("--miner_ethereum_key", type=str, prompt="Miner ethereum key", help="Miner ethereum key")
-def add_executor(address: str, port: int, validator: str, deposit_amount: float, miner_ethereum_key: str):
+@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
+def add_executor(address: str, port: int, validator: str, deposit_amount: float, eth_private_key: str):
     """Add executor machine to the database"""
     if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
         logger.error("Error: Minimum deposit amount is %f TAO.", REQUIRED_TAO_COLLATERAL)
@@ -57,7 +57,7 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
             network,
             settings.COLLATERAL_CONTRACT_ADDRESS,
             "",
-            miner_ethereum_key
+            eth_private_key
         )
 
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -100,8 +100,8 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
     "--reclaim_amount", type=float, prompt="Reclaim Amount", help="Amount of TAO to reclaim collateral"
 )
 @click.option("--reclaim_description", type=str, prompt="Reclaim Description", help="Reclaim Description")
-@click.option("--miner_ethereum_key", type=str, prompt="Miner ethereum key", help="Miner ethereum key")
-def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str, miner_ethereum_key: str):
+@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
+def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str, eth_private_key: str):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
         logger.info("Removing executor (%s:%d)", address, port)
@@ -122,7 +122,7 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
                 network,
                 settings.COLLATERAL_CONTRACT_ADDRESS,
                 "",
-                miner_ethereum_key
+                eth_private_key
             )
 
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -192,8 +192,8 @@ def show_executors():
 
 
 @cli.command()
-@click.option("--miner_ethereum_key", type=str, prompt="Miner ethereum key", help="Miner ethereum key")
-def get_miner_collateral(miner_ethereum_key: str):
+@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
+def get_miner_collateral(eth_private_key: str):
     """Get miner collateral from the collateral contract"""
 
     try:
@@ -203,7 +203,7 @@ def get_miner_collateral(miner_ethereum_key: str):
             network,
             settings.COLLATERAL_CONTRACT_ADDRESS,
             "",
-            miner_ethereum_key
+            eth_private_key
         )
 
         final_collateral = collateral_contract.get_miner_collateral()
