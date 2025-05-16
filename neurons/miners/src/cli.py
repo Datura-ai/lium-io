@@ -215,5 +215,29 @@ def get_miner_collateral(miner_ethereum_key: str):
     except Exception as e:
         logger.error("Failed in getting miner collateral: %s", str(e))
 
+
+@cli.command()
+def get_eligible_executors():
+    """Add executor machine to the database"""
+    try:
+        network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
+        # Check if executor is eligible using collateral contract
+        collateral_contract = CollateralContract(
+            network,
+            settings.COLLATERAL_CONTRACT_ADDRESS,
+            "",
+            ""
+        )
+
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
+        eligible_executors = collateral_contract.get_eligible_executors()
+        for executor in eligible_executors:
+            logger.info("Eligible executor: %s", executor)
+
+    except Exception as e:
+        logger.error("Failed in getting eligible executors: %s", str(e))
+
+
 if __name__ == "__main__":
     cli()
