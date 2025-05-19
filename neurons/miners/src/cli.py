@@ -32,15 +32,10 @@ def cli():
 @click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
 def add_executor(address: str, port: int, validator: str, deposit_amount: float, eth_private_key: str):
     """Add executor machine to the database"""
-    if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
-        logger.error("Error: Minimum deposit amount is %f TAO.", REQUIRED_TAO_COLLATERAL)
-        return
-
     logger.info("Add an new executor (%s:%d) that opens to validator(%s)", address, port, validator)
     executor_dao = ExecutorDao(session=next(get_db()))
     executor_uuid = uuid.uuid4()
     try:
-        
         executor = executor_dao.save(
             Executor(executor_uuid, address=address, port=port, validator=validator)
         )
@@ -49,6 +44,10 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
         logger.error("Failed in adding an executor: %s", str(e))
     else:
         logger.info("Added an executor(id=%s)", str(executor.uuid))
+
+    if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
+        logger.error("Error: Minimum deposit amount is %f TAO.", REQUIRED_TAO_COLLATERAL)
+        return
 
     try:
         network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
@@ -92,6 +91,72 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
         logger.error("Failed in depositing collateral: %s", str(e))
     else:
         logger.info("Deposited collateral successfully.")
+
+
+@cli.command()
+@click.option("--address", prompt="IP Address", help="IP address of executor")
+@click.option("--port", type=int, prompt="Port", help="Port of executor")
+@click.option(
+    "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
+)
+@click.option(
+    "--deposit_amount", type=float, prompt="Deposit Amount", help="Amount of TAO to deposit as collateral"
+)
+@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
+def deposit_collateral(address: str, port: int, validator: str, deposit_amount: float, eth_private_key: str):
+    """You can deposit collateral for an existing executor on database"""
+    if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
+        logger.error("Error: Minimum deposit amount is %f TAO.", REQUIRED_TAO_COLLATERAL)
+        return
+
+    executor_dao = ExecutorDao(session=next(get_db()))
+
+    try:
+        executor = executor_dao.findOne(address, port)
+        executor_uuid = executor.uuid
+        executor_uuid = "4ccc966d-b699-435f-981f-790a57e53805"
+        network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
+        # Check if executor is eligible using collateral contract
+        collateral_contract = CollateralContract(
+            network,
+            settings.COLLATERAL_CONTRACT_ADDRESS,
+            "",
+            eth_private_key
+        )
+
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+
+        collateral_contract.map_hotkey_to_ethereum(
+            account=collateral_contract.miner_account,
+            hotkey=my_key.ss58_address
+        )
+
+        logger.info("Hotkey mapped to Ethereum address successfully.")
+
+        collateral_contract.validator_address = collateral_contract.get_eth_address_from_hotkey(validator)
+        logger.info(f"Validator address: {collateral_contract.validator_address} mapped to {validator}")
+        balance = collateral_contract.get_balance(collateral_contract.miner_address)
+
+        logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
+
+        if balance < deposit_amount:
+            logger.error("Error: Insufficient balance in miner's address.")
+            return
+
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+
+        message = (
+            f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid}"
+            f" since miner {my_key.ss58_address} is going to add this executor"
+        )
+        logger.info(message)
+
+        collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
+    except Exception as e:
+        logger.error("Failed in depositing collateral: %s", str(e))
+    else:
+        logger.info("Deposited collateral successfully.")
+
 
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
