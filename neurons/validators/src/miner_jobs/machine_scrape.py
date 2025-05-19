@@ -649,17 +649,10 @@ def netmeasure_output():
         data["network_speed_error"] = repr(exc)
     return data
 
-def path_of_speedcheck():
-    try:
-        speedcheck_cmd = run_cmd("which netmeasure")
-        return speedcheck_cmd.strip()
-    except Exception as exc:
-        return None
-
 def benchmark_network_speed():
     """Benchmark network speed using different methods"""
     data = get_network_speed()
-    if data.get("upload_speed") or data.get("download_speed"):
+    if data.get("download_speed") or data.get("upload_speed"):
         return data
     
     data = speedcheck_output()
@@ -669,7 +662,6 @@ def benchmark_network_speed():
     data = netmeasure_output()
     if data.get("download_speed") or data.get("upload_speed"):
         return data
-    
     
     return {"upload_speed": None, "download_speed": None}
 
