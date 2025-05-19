@@ -19,6 +19,7 @@ RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
+NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 
 logger = logging.getLogger(__name__)
 
