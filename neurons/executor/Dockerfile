@@ -33,9 +33,10 @@ COPY . .
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 RUN mv /root/app/libdmcompverify.so /usr/lib/
 
-# alembic fix
+# cli fix
 RUN sed -i '1s|.*|#!/usr/bin/env python3|' /opt/pypackages/bin/alembic
-
+RUN sed -i '1s|.*|#!/usr/bin/env python3|' /opt/pypackages/bin/speedcheck
+RUN sed -i '1s|.*|#!/usr/bin/env python3|' /opt/pypackages/bin/netmeasure
 # Remove existing SSH host keys
 RUN rm -f /etc/ssh/ssh_host_*
 
