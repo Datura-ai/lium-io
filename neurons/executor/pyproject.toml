@@ -108,6 +108,7 @@ dependencies = [
     "psutil==6.1.1",
     "docker>=7.1.0",
     "netmeasure>=1.4.0",
+    "speedcheck>=0.0.5",
 ]
 requires-python = "==3.11.11"
 readme = "README.md"
