@@ -323,6 +323,10 @@ def get_miner_collateral(eth_private_key: str):
 def get_eligible_executors():
     """Get eligible executors from the collateral contract"""
     try:
+        executor_dao = ExecutorDao(session=next(get_db()))
+        executors = executor_dao.get_all_executors()
+        executor_uuids = [str(executor.uuid) for executor in executors]  # Convert to list of UUID strings
+
         network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
         # Check if executor is eligible using collateral contract
         collateral_contract = CollateralContract(
@@ -334,7 +338,8 @@ def get_eligible_executors():
 
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
-        eligible_executors = collateral_contract.get_eligible_executors()
+        eligible_executors = collateral_contract.get_eligible_executors(executor_uuids)
+
         for executor in eligible_executors:
             logger.info("Eligible executor: %s", executor)
 
