@@ -618,19 +618,6 @@ def get_network_speed():
         data["network_speed_error"] = repr(exc)
     return data
 
-def speedcheck_output():
-    data = {"upload_speed": None, "download_speed": None}
-    try:
-        speedtest_cmd = run_cmd("PYTHONPATH=/opt/pypackages/lib python3 /opt/pypackages/bin/speedcheck run --type ookla")
-        json_start = speedtest_cmd.find('{')
-        json_str = speedtest_cmd[json_start:]
-        speedtest_data = json.loads(json_str)
-        data["download_speed"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
-        data["upload_speed"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
-    except Exception as exc:
-        data["network_speed_error"] = repr(exc)
-    return data
-
 def netmeasure_output():
     data = {"upload_speed": None, "download_speed": None}
     try:
@@ -652,10 +639,6 @@ def netmeasure_output():
 def benchmark_network_speed():
     """Benchmark network speed using different methods"""
     data = get_network_speed()
-    if data.get("download_speed") or data.get("upload_speed"):
-        return data
-    
-    data = speedcheck_output()
     if data.get("download_speed") or data.get("upload_speed"):
         return data
     

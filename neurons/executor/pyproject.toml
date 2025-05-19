@@ -107,7 +107,6 @@ dependencies = [
     "pynvml==12.0.0",
     "psutil==6.1.1",
     "docker>=7.1.0",
-    "speedcheck>=0.0.5",
     "netmeasure>=1.4.0",
 ]
 requires-python = "==3.11.11"
