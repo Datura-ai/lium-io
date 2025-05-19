@@ -163,7 +163,8 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
 @click.option(
     "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
 )
-def switch_validator(address: str, port: int, validator: str):
+@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
+def switch_validator(address: str, port: int, validator: str, eth_private_key: str):
     """Switch validator"""
     if click.confirm('Are you sure you want to switch validator? This may lead to unexpected results'):
         logger.info("Switching validator(%s) of an executor (%s:%d)", validator, address, port)
@@ -172,6 +173,43 @@ def switch_validator(address: str, port: int, validator: str):
             executor_dao.update(
                 Executor(uuid=uuid.uuid4(), address=address, port=port, validator=validator)
             )
+
+            try:
+                network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
+                # Check if executor is eligible using collateral contract
+                collateral_contract = CollateralContract(
+                    network,
+                    settings.COLLATERAL_CONTRACT_ADDRESS,
+                    "",
+                    eth_private_key
+                )
+
+                my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+
+                eth_address_from_hotkey = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
+                logger.info(f"Miner address: {eth_address_from_hotkey} mapped to {my_key.ss58_address}")
+
+                if eth_address_from_hotkey != collateral_contract.miner_address:
+                    logger.error(
+                        "Error: The Ethereum address used for reclaiming collateral does not match the Ethereum address originally used for depositing collateral. "
+                        "Please ensure you are using the correct Ethereum key associated with the deposit."
+                    )
+                    return
+
+                new_validator_address = collateral_contract.get_eth_address_from_hotkey(validator)
+
+                collateral_contract.update_validator_for_miner(
+                    new_validator=new_validator_address
+                )
+
+                logger.info("Switched validator on collateral contract successfully.")
+
+                validator_of_miner = collateral_contract.get_validator_of_miner()
+                
+                logger.info(f"Updated validator of miner from collateral contract: {validator_of_miner}")
+            except Exception as e:
+                logger.error("Failed in switching validator on collateral contract: %s", str(e))
+
         except Exception as e:
             logger.error("Failed in switching validator: %s", str(e))
         else:
