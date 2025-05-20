@@ -616,7 +616,6 @@ class TaskService:
                 settings.ETHEREUM_VALIDATOR_KEY,
                 ""
             )
-            print("collateral_contract.validator_account", collateral_contract.validator_account.address)
 
             rented_machine = await self.redis_service.get_rented_machine(executor_info)
             reclaim_requests = collateral_contract.get_reclaim_requests()
@@ -627,8 +626,18 @@ class TaskService:
             logger.info(message)
 
             for request in reclaim_requests:
-                print("request id", request.reclaim_request_id)
-                print("request executor uuid", request.executor_uuid)
+                logger.info(
+                    _m(
+                        "Reclaim request",
+                        extra={
+                            "validator_hotkey": validator_hotkey,
+                            "executor_uuid": executor_info.uuid,
+                            "request_id": request.reclaim_request_id,
+                            "request_executor_uuid": request.executor_uuid,
+                        },
+                    )
+                )
+
                 if request.executor_uuid == executor_info.uuid.replace("-", ""):
                     if rented_machine:
                         message = (
