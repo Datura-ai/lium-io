@@ -162,7 +162,12 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
 
             if len(eligible_executors) == 0:
                 executor_dao.delete_by_address_port(address, port)
-            logger.info("Removed executor (%s:%d) and initiated reclaim", address, port)
+                logger.info("Removed executor (%s:%d)", address, port)
+            else:
+                logger.info(
+                    "Need to reclaim deposited collateral from the collateral contract before removing the executor. "
+                    "This ensures that any TAO collateral associated with the executor is properly reclaimed to avoid loss."
+                )
         except Exception as e:
             logger.error("Failed to remove executor: %s", str(e))
             return
