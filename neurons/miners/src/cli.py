@@ -149,17 +149,25 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
         logger.info("Removing executor (%s:%d)", address, port)
         executor_dao = ExecutorDao(session=next(get_db()))
+
+        collateral_contract, my_key = initialize_collateral_contract(eth_private_key)
+
         try:
             executor = executor_dao.findOne(address, port)
             executor_uuid = executor.uuid
-            executor_dao.delete_by_address_port(address, port)
+
+            eligible_executors = collateral_contract.get_eligible_executors(
+                [executor_uuid]
+            )
+
+            if len(eligible_executors) == 0:
+                executor_dao.delete_by_address_port(address, port)
             logger.info("Removed executor (%s:%d) and initiated reclaim", address, port)
         except Exception as e:
             logger.error("Failed to remove executor: %s", str(e))
             return
 
         try:
-            collateral_contract, my_key = initialize_collateral_contract(eth_private_key)
             eth_address_from_hotkey = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
             logger.info(f"Miner address: {eth_address_from_hotkey} mapped to {my_key.ss58_address}")
 
