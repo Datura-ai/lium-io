@@ -55,7 +55,7 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
     executor_uuid = uuid.uuid4()
     try:
         executor = executor_dao.save(
-            Executor(executor_uuid, address=address, port=port, validator=validator)
+            Executor(uuid=executor_uuid, address=address, port=port, validator=validator)
         )
     except Exception as e:
         logger.error("Failed to add executor: %s", str(e))
@@ -146,44 +146,42 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
 @click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
 def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str, eth_private_key: str):
     """Remove executor machine to the database"""
-    if not click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
-        logger.info("Executor removal cancelled.")
-        return
-
-    logger.info("Removing executor (%s:%d)", address, port)
-    executor_dao = ExecutorDao(session=next(get_db()))
-    try:
-        executor = executor_dao.findOne(address, port)
-        executor_uuid = executor.uuid
-        executor_dao.delete_by_address_port(address, port)
-        logger.info("Removed executor (%s:%d) and initiated reclaim", address, port)
-    except Exception as e:
-        logger.error("Failed to remove executor: %s", str(e))
-        return
-
-    try:
-        collateral_contract, my_key = initialize_collateral_contract(eth_private_key)
-        eth_address_from_hotkey = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
-        logger.info(f"Miner address: {eth_address_from_hotkey} mapped to {my_key.ss58_address}")
-
-        if eth_address_from_hotkey != collateral_contract.miner_address:
-            logger.error(
-                "Error: The Ethereum address used for reclaiming collateral does not match the Ethereum address originally used for depositing collateral."
-            )
+    if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
+        logger.info("Removing executor (%s:%d)", address, port)
+        executor_dao = ExecutorDao(session=next(get_db()))
+        try:
+            executor = executor_dao.findOne(address, port)
+            executor_uuid = executor.uuid
+            executor_dao.delete_by_address_port(address, port)
+            logger.info("Removed executor (%s:%d) and initiated reclaim", address, port)
+        except Exception as e:
+            logger.error("Failed to remove executor: %s", str(e))
             return
 
-        balance = collateral_contract.get_balance(collateral_contract.miner_address)
-        logger.info("Miner balance: %f TAO", balance)
+        try:
+            collateral_contract, my_key = initialize_collateral_contract(eth_private_key)
+            eth_address_from_hotkey = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
+            logger.info(f"Miner address: {eth_address_from_hotkey} mapped to {my_key.ss58_address}")
 
-        message = (
-            f"Reclaim amount {reclaim_amount} for this executor UUID: {executor_uuid}"
-            f" since miner {my_key.ss58_address} is removing this executor"
-        )
-        logger.info(message)
-        collateral_contract.reclaim_collateral(reclaim_amount, reclaim_description, str(executor_uuid))
-    except Exception as e:
-        logger.error("Failed to reclaim collateral: %s", str(e))
+            if eth_address_from_hotkey != collateral_contract.miner_address:
+                logger.error(
+                    "Error: The Ethereum address used for reclaiming collateral does not match the Ethereum address originally used for depositing collateral."
+                )
+                return
 
+            balance = collateral_contract.get_balance(collateral_contract.miner_address)
+            logger.info("Miner balance: %f TAO", balance)
+
+            message = (
+                f"Reclaim amount {reclaim_amount} for this executor UUID: {executor_uuid}"
+                f" since miner {my_key.ss58_address} is removing this executor"
+            )
+            logger.info(message)
+            collateral_contract.reclaim_collateral(reclaim_amount, reclaim_description, str(executor_uuid))
+        except Exception as e:
+            logger.error("Failed to reclaim collateral: %s", str(e))
+    else:
+        logger.info("Executor removal cancelled.")
 
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
