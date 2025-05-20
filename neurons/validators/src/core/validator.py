@@ -152,11 +152,23 @@ class Validator:
 
             my_hotkey = self.wallet.get_hotkey().ss58_address
 
+            collateral_contract.map_hotkey_to_ethereum(
+                account=collateral_contract.validator_account,
+                hotkey=my_hotkey,
+            )
+
+            logger.info(
+                _m(
+                    f"[map_hotkey_to_ethereum] Validator address <{collateral_contract.validator_account.address}> is mapped to bittensor hotkey <{my_hotkey}> on collateral contract successfully.",
+                    extra=get_extra_info(self.default_extra),
+                ),
+            )
+
             validator_address_on_contract = collateral_contract.get_eth_address_from_hotkey(my_hotkey)
             if validator_address_on_contract:
                 logger.info(
                     _m(
-                        f"[map_hotkey_to_ethereum] Validator address <{validator_address_on_contract}> is already mapped to bittensor hotkey <{my_hotkey}> on collateral contract.",
+                        f"[map_hotkey_to_ethereum] Validator address <{validator_address_on_contract}> is mapped to bittensor hotkey <{my_hotkey}> on collateral contract.",
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
@@ -164,22 +176,11 @@ class Validator:
             else:
                 logger.info(
                     _m(
-                        f"[map_hotkey_to_ethereum] Validator address <{collateral_contract.validator_account.address}> is not mapped to bittensor hotkey <{my_hotkey}> on collateral contract. Registering it now...",
+                        f"[map_hotkey_to_ethereum] Validator address <{collateral_contract.validator_account.address}> is not mapped to bittensor hotkey <{my_hotkey}> on collateral contract.",
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
-
-                collateral_contract.map_hotkey_to_ethereum(
-                    account=collateral_contract.miner_account,
-                    hotkey=self.wallet.get_hotkey().ss58_address,
-                )
-
-                logger.info(
-                    _m(
-                        f"[map_hotkey_to_ethereum] Validator address <{collateral_contract.validator_account.address}> is mapped to bittensor hotkey <{my_hotkey}> on collateral contract successfully.",
-                        extra=get_extra_info(self.default_extra),
-                    ),
-                )
+ 
         except Exception as e:
             logger.error(
                 _m(
