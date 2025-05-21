@@ -46,8 +46,7 @@ class Settings(BaseSettings):
 
     DEBUG_COLLATERAL_CONTRACT: bool = True
     
-    MINER_KEY: str = "259e0eded00353f71eb6be89d8749ad12bf693cbd8aeb6b80cd3a343c0dc8faf"
-    VALIDATOR_KEY: str = "434469242ece0d04889fdfa54470c3685ac226fb3756f5eaf5ddb6991e1698a3"
+    ETHEREUM_MINER_KEY: str = Field(env="ETHEREUM_MINER_KEY", default=None)
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

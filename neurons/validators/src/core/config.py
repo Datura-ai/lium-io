@@ -64,7 +64,7 @@ class Settings(BaseSettings):
         "5ECBM9caBAyJPBjVtfw4WGwdytacrZWvvt6i3T8GnqtByRFM"
     ]
     
-    ETHEREUM_VALIDATOR_KEY: str =  Field(env="ETHEREUM_VALIDATOR_KEY", default=None)
+    ETHEREUM_VALIDATOR_KEY: str = Field(env="ETHEREUM_VALIDATOR_KEY", default=None)
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
