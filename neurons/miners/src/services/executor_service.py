@@ -11,6 +11,7 @@ from fastapi import Depends
 from core.config import settings
 from daos.executor import ExecutorDao
 from models.executor import Executor
+from celium_collateral_contracts import CollateralContract
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,7 +60,9 @@ class ExecutorService:
                     response_obj["uuid"] = str(executor.uuid)
                     response_obj["address"] = executor.address
                     response_obj["port"] = executor.port
-                    response_obj["ethereum_address"] = settings.ETHEREUM_MINER_KEY 
+                    network = "local" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
+                    collateral_contract = CollateralContract(network, settings.COLLATERAL_CONTRACT_ADDRESS, "", settings.ETHEREUM_MINER_KEY)
+                    response_obj["ethereum_address"] = collateral_contract.miner_address
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(
