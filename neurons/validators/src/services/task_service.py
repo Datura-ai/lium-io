@@ -550,7 +550,10 @@ class TaskService:
 
             # Log the miner's balance
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
-            logger.info("Miner balance: %f TAO", balance)
+            logger.info(f"Miner balance: {balance} TAO")
+
+            executor_collateral = await collateral_contract.get_executor_collateral(executor_info.uuid)
+            logger.info(f"Collateral amount: {executor_collateral} TAO for this executor {executor_info.uuid}")
 
             default_extra = {
                 "collateral_contract_address": collateral_contract.contract_address,
@@ -558,6 +561,8 @@ class TaskService:
                 "miner_address": collateral_contract.miner_address,
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_info.uuid,
+                "miner_balance": balance,
+                "executor_collateral": executor_collateral,
             }
 
             # Log and perform the collateral slashing
@@ -568,7 +573,7 @@ class TaskService:
                 )
             )
 
-            await collateral_contract.slash_collateral(settings.REQUIRED_TAO_COLLATERAL, "slashit", executor_info.uuid)
+            await collateral_contract.slash_collateral(executor_collateral, "slashit", executor_info.uuid)
             logger.info(
                 _m(
                     f"Validator {validator_hotkey} slashed collateral of this executor UUID: {executor_info.uuid}",
