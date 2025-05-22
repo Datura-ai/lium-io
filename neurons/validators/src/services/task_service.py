@@ -483,7 +483,7 @@ class TaskService:
         job_score = score if not is_rented or not is_rental_check_passed else 0
         return actual_score, job_score
 
-    def is_eligible_executor(self, miner_hotkey: str, executor_info: ExecutorSSHInfo):
+    async def is_eligible_executor(self, miner_hotkey: str, executor_info: ExecutorSSHInfo):
         try:
             """
             Check if it is eligible for a specific executor.
@@ -514,7 +514,7 @@ class TaskService:
                 )
             )
 
-            eligible_executors = collateral_contract.get_eligible_executors(
+            eligible_executors = await collateral_contract.get_eligible_executors(
                 [executor_info.uuid]
             )
             print("eligible executors: ", eligible_executors)
@@ -541,7 +541,7 @@ class TaskService:
             )
             return False
 
-    def slash_collateral(self, validator_hotkey: str, miner_hotkey: str, executor_info: ExecutorSSHInfo):
+    async def slash_collateral(self, validator_hotkey: str, miner_hotkey: str, executor_info: ExecutorSSHInfo):
         try:
             """
             Slash collateral for a specific executor.
@@ -575,7 +575,7 @@ class TaskService:
             )
 
             # Log the miner's balance
-            balance = collateral_contract.get_balance(collateral_contract.miner_address)
+            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
             logger.info("Miner balance: %f TAO", balance)
 
             # Log and perform the collateral slashing
@@ -584,7 +584,7 @@ class TaskService:
                 f"since there is no pod running."
             )
             logger.info(message)
-            collateral_contract.slash_collateral(settings.REQUIRED_TAO_COLLATERAL, "slashit", executor_info.uuid)
+            await collateral_contract.slash_collateral(settings.REQUIRED_TAO_COLLATERAL, "slashit", executor_info.uuid)
         except Exception as e:
             logger.error(
                 _m(
@@ -618,7 +618,7 @@ class TaskService:
             )
 
             rented_machine = await self.redis_service.get_rented_machine(executor_info)
-            reclaim_requests = collateral_contract.get_reclaim_requests()
+            reclaim_requests = await collateral_contract.get_reclaim_requests()
 
             message = (
                 f"Total reclaim requests count: {len(reclaim_requests)} "
@@ -645,7 +645,7 @@ class TaskService:
                             f"since executor is rented for this executor UUID: {executor_info.uuid}"
                         )
                         logger.info(message)
-                        collateral_contract.deny_reclaim_request(
+                        await collateral_contract.deny_reclaim_request(
                             request.reclaim_request_id, message
                         )
                     else:
@@ -654,7 +654,7 @@ class TaskService:
                             f"since there is no rented machine for this executor UUID: {executor_info.uuid}"
                         )
                         logger.info(message)
-                        collateral_contract.finalize_reclaim(request.reclaim_request_id)
+                        await collateral_contract.finalize_reclaim(request.reclaim_request_id)
         except Exception as e:
             logger.error(
                 _m(
@@ -704,9 +704,11 @@ class TaskService:
 
             if miner_info.miner_hotkey in settings.DEBUG_CONTRACT_MINERS:
                 await self.handle_reclaim_requests(keypair.ss58_address, executor_info)
-                # self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
+                # await self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
 
-                # if not self.is_eligible_executor(miner_info.miner_hotkey, executor_info) and not settings.DEBUG_COLLATERAL_CONTRACT:
+                # is_eligible_executor = await self.is_eligible_executor(miner_info.miner_hotkey, executor_info)
+
+                # if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
                 #     return await self._handle_task_result(
                 #         miner_info=miner_info,
                 #         executor_info=executor_info,
@@ -1047,7 +1049,7 @@ class TaskService:
                             ),
                         )
 
-                        self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
+                        await self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
 
                         return await self._handle_task_result(
                             miner_info=miner_info,
@@ -1094,8 +1096,10 @@ class TaskService:
                             success=False,
                             clear_verified_job_info=False,
                         )
+                    
+                    is_eligible_executor = await self.is_eligible_executor(miner_info.miner_hotkey, executor_info)
 
-                    if not self.is_eligible_executor(miner_info.miner_hotkey, executor_info) and not settings.DEBUG_COLLATERAL_CONTRACT:
+                    if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
                         return await self._handle_task_result(
                             miner_info=miner_info,
                             executor_info=executor_info,

@@ -64,28 +64,30 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
         logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
         return
 
-    try:
-        collateral_contract = initialize_collateral_contract()
-        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
-        
-        balance = collateral_contract.get_balance(collateral_contract.miner_address)
-        logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
+    async def async_add_executor():
+        try:
+            collateral_contract = initialize_collateral_contract()
+            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+            collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
+            
+            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
+            logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
 
-        if balance < deposit_amount:
-            logger.error("Error: Insufficient balance in miner's address.")
-            return
+            if balance < deposit_amount:
+                logger.error("Error: Insufficient balance in miner's address.")
+                return
 
-        message = (
-            f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid}"
-            f" since miner {my_key.ss58_address} is adding this executor"
-        )
-        logger.info(message)
-        collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
-    except Exception as e:
-        logger.error("Failed to deposit collateral: %s", str(e))
-    else:
-        logger.info("Deposited collateral successfully.")
+            message = (
+                f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid}"
+                f" since miner {my_key.ss58_address} is adding this executor"
+            )
+            logger.info(message)
+            await collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
+        except Exception as e:
+            logger.error("Failed to deposit collateral: %s", str(e))
+        else:
+            logger.info("Deposited collateral successfully.")
+    asyncio.run(async_add_executor())
 
 
 @cli.command()
@@ -105,32 +107,34 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
 
     executor_dao = ExecutorDao(session=next(get_db()))
 
-    try:
-        executor = executor_dao.findOne(address, port)
-        executor_uuid = executor.uuid
+    async def async_deposit_collateral():
+        try:
+            executor = executor_dao.findOne(address, port)
+            executor_uuid = executor.uuid
 
-        collateral_contract = initialize_collateral_contract()
-        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
-        balance = collateral_contract.get_balance(collateral_contract.miner_address)
+            collateral_contract = initialize_collateral_contract()
+            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+            collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
+            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
 
-        logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
+            logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
 
-        if balance < deposit_amount:
-            logger.error("Error: Insufficient balance in miner's address.")
-            return
+            if balance < deposit_amount:
+                logger.error("Error: Insufficient balance in miner's address.")
+                return
 
-        message = (
-            f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid}"
-            f" since miner {my_key.ss58_address} is going to add this executor"
-        )
-        logger.info(message)
+            message = (
+                f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid}"
+                f" since miner {my_key.ss58_address} is going to add this executor"
+            )
+            logger.info(message)
 
-        collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
-    except Exception as e:
-        logger.error("Failed to deposit collateral: %s", str(e))
-    else:
-        logger.info("Deposited collateral successfully.")
+            await collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
+        except Exception as e:
+            logger.error("Failed to deposit collateral: %s", str(e))
+        else:
+            logger.info("Deposited collateral successfully.")
+    asyncio.run(async_deposit_collateral())
 
 
 @cli.command()
@@ -146,40 +150,42 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
         logger.info("Removing executor (%s:%d)", address, port)
         executor_dao = ExecutorDao(session=next(get_db()))
 
-        collateral_contract = initialize_collateral_contract()
-        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        try:
-            executor = executor_dao.findOne(address, port)
-            executor_uuid = executor.uuid
+        async def async_remove_executor():
+            collateral_contract = initialize_collateral_contract()
+            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+            try:
+                executor = executor_dao.findOne(address, port)
+                executor_uuid = executor.uuid
 
-            eligible_executors = collateral_contract.get_eligible_executors(
-                [executor_uuid]
-            )
-
-            if len(eligible_executors) == 0:
-                executor_dao.delete_by_address_port(address, port)
-                logger.info("Removed executor (%s:%d)", address, port)
-            else:
-                logger.info(
-                    "Need to reclaim deposited collateral from the collateral contract before removing the executor. "
-                    "This ensures that any TAO collateral associated with the executor is properly reclaimed to avoid loss."
+                eligible_executors = await collateral_contract.get_eligible_executors(
+                    [executor_uuid]
                 )
-        except Exception as e:
-            logger.error("Failed to remove executor: %s", str(e))
-            return
 
-        try:
-            balance = collateral_contract.get_balance(collateral_contract.miner_address)
-            logger.info("Miner balance: %f TAO", balance)
+                if len(eligible_executors) == 0:
+                    executor_dao.delete_by_address_port(address, port)
+                    logger.info("Removed executor (%s:%d)", address, port)
+                else:
+                    logger.info(
+                        "Need to reclaim deposited collateral from the collateral contract before removing the executor. "
+                        "This ensures that any TAO collateral associated with the executor is properly reclaimed to avoid loss."
+                    )
+            except Exception as e:
+                logger.error("Failed to remove executor: %s", str(e))
+                return
 
-            message = (
-                f"Reclaim amount {reclaim_amount} for this executor UUID: {executor_uuid}"
-                f" since miner {my_key.ss58_address} is removing this executor"
-            )
-            logger.info(message)
-            collateral_contract.reclaim_collateral(reclaim_amount, reclaim_description, str(executor_uuid))
-        except Exception as e:
-            logger.error("Failed to reclaim collateral: %s", str(e))
+            try:
+                balance = await collateral_contract.get_balance(collateral_contract.miner_address)
+                logger.info("Miner balance: %f TAO", balance)
+
+                message = (
+                    f"Reclaim amount {reclaim_amount} for this executor UUID: {executor_uuid}"
+                    f" since miner {my_key.ss58_address} is removing this executor"
+                )
+                logger.info(message)
+                await collateral_contract.reclaim_collateral(reclaim_amount, reclaim_description, str(executor_uuid))
+            except Exception as e:
+                logger.error("Failed to reclaim collateral: %s", str(e))
+        asyncio.run(async_remove_executor())
     else:
         logger.info("Executor removal cancelled.")
 
@@ -199,23 +205,24 @@ def switch_validator(address: str, port: int, validator: str):
                 Executor(uuid=uuid.uuid4(), address=address, port=port, validator=validator)
             )
 
-            try:
-                collateral_contract = initialize_collateral_contract()
-                my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-                new_validator_address = get_eth_address_from_hotkey(validator)
+            async def async_switch_validator():
+                try:
+                    collateral_contract = initialize_collateral_contract()
+                    my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+                    new_validator_address = get_eth_address_from_hotkey(validator)
 
-                collateral_contract.update_validator_for_miner(
-                    new_validator=new_validator_address
-                )
+                    await collateral_contract.update_validator_for_miner(
+                        new_validator=new_validator_address
+                    )
 
-                logger.info("Switched validator on collateral contract successfully.")
+                    logger.info("Switched validator on collateral contract successfully.")
 
-                validator_of_miner = collateral_contract.get_validator_of_miner()
-                
-                logger.info(f"Updated validator of miner from collateral contract: {validator_of_miner}")
-            except Exception as e:
-                logger.error("Failed in switching validator on collateral contract: %s", str(e))
-
+                    validator_of_miner = await collateral_contract.get_validator_of_miner()
+                    
+                    logger.info(f"Updated validator of miner from collateral contract: {validator_of_miner}")
+                except Exception as e:
+                    logger.error("Failed in switching validator on collateral contract: %s", str(e))
+            asyncio.run(async_switch_validator())
         except Exception as e:
             logger.error("Failed in switching validator: %s", str(e))
         else:
@@ -239,53 +246,43 @@ def show_executors():
 def get_miner_collateral():
     """Get miner collateral from the collateral contract"""
 
-    try:
-        collateral_contract = initialize_collateral_contract()
+    async def async_get_miner_collateral():
+        try:
+            collateral_contract = initialize_collateral_contract()
 
-        final_collateral = collateral_contract.get_miner_collateral()
+            final_collateral = await collateral_contract.get_miner_collateral()
 
-        final_collateral_in_tao = collateral_contract.w3.from_wei(final_collateral, "ether")
+            final_collateral_in_tao = collateral_contract.w3.from_wei(final_collateral, "ether")
 
-        logger.info("Miner collateral: %f TAO", final_collateral_in_tao)
+            logger.info("Miner collateral: %f TAO", final_collateral_in_tao)
 
-    except Exception as e:
-        logger.error("Failed in getting miner collateral: %s", str(e))
+        except Exception as e:
+            logger.error("Failed in getting miner collateral: %s", str(e))
+    asyncio.run(async_get_miner_collateral())
 
 
 @cli.command()
 def get_eligible_executors():
     """Get eligible executors from the collateral contract"""
-    try:
-        executor_dao = ExecutorDao(session=next(get_db()))
-        executors = executor_dao.get_all_executors()
-        executor_uuids = [str(executor.uuid) for executor in executors]  # Convert to list of UUID strings
+    async def async_get_eligible_executors():
+        try:
+            executor_dao = ExecutorDao(session=next(get_db()))
+            executors = executor_dao.get_all_executors()
+            executor_uuids = [str(executor.uuid) for executor in executors]  # Convert to list of UUID strings
 
-        collateral_contract = initialize_collateral_contract()
+            collateral_contract = initialize_collateral_contract()
 
-        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        collateral_contract.miner_address = get_eth_address_from_hotkey(my_key.ss58_address)
+            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
 
-        eligible_executors = collateral_contract.get_eligible_executors(executor_uuids)
+            eligible_executors = await collateral_contract.get_eligible_executors(executor_uuids)
 
-        for executor in eligible_executors:
-            logger.info("Eligible executor: %s", executor)
+            for executor in eligible_executors:
+                logger.info("Eligible executor: %s", executor)
 
-    except Exception as e:
-        logger.error("Failed in getting eligible executors: %s", str(e))
+        except Exception as e:
+            logger.error("Failed in getting eligible executors: %s", str(e))
+    asyncio.run(async_get_eligible_executors())
 
-
-@cli.command()
-def get_eth_address_from_hotkey():
-    """Get ethereum address from bittensor hotkey from the collateral contract"""
-    try:
-        collateral_contract = initialize_collateral_contract()
-
-        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
-        logger.info(f"Ethereum address: {collateral_contract.miner_address} mapped to hotkey {my_key.ss58_address}")
-
-    except Exception as e:
-        logger.error("Failed in getting ethereum address mapped to hotkey: %s", str(e))
 
 if __name__ == "__main__":
     cli()
