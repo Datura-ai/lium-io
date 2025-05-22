@@ -501,7 +501,7 @@ class TaskService:
                 ""
             )
 
-            collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(miner_hotkey)
+            collateral_contract.miner_address = executor_info.ethereum_address
             logger.info(
                 _m(
                     f"miner ethereum address mapped to hotkey from collateral contract: {collateral_contract.miner_address}",
@@ -561,29 +561,26 @@ class TaskService:
                 ""
             )
 
-            collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(miner_hotkey)
-            logger.info(
-                _m(
-                    f"miner ethereum address mapped to hotkey from collateral contract: {collateral_contract.miner_address}",
-                    extra={
-                        "collateral_contract_address": collateral_contract.contract_address,
-                        "validator_address": collateral_contract.validator_address,
-                        "miner_hotkey": miner_hotkey,
-                        "executor_uuid": executor_info.uuid,
-                    },
-                )
-            )
+            collateral_contract.miner_address = executor_info.ethereum_address
 
             # Log the miner's balance
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
             logger.info("Miner balance: %f TAO", balance)
 
             # Log and perform the collateral slashing
-            message = (
-                f"Validator {validator_hotkey} slashed this executor UUID: {executor_info.uuid} "
-                f"since there is no pod running."
+            logger.info(
+                _m(
+                    f"Validator {validator_hotkey} is slashing this executor UUID: {executor_info.uuid}",
+                    extra={
+                        "collateral_contract_address": collateral_contract.contract_address,
+                        "validator_address": collateral_contract.validator_address,
+                        "miner_address": collateral_contract.miner_address,
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": executor_info.uuid,
+                    },
+                )
             )
-            logger.info(message)
+
             await collateral_contract.slash_collateral(settings.REQUIRED_TAO_COLLATERAL, "slashit", executor_info.uuid)
         except Exception as e:
             logger.error(
