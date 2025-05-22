@@ -59,6 +59,7 @@ class ExecutorService:
                     response_obj["uuid"] = str(executor.uuid)
                     response_obj["address"] = executor.address
                     response_obj["port"] = executor.port
+                    response_obj["ethereum_address"] = settings.ETHEREUM_MINER_KEY 
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(
