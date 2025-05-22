@@ -20,23 +20,21 @@ def cli():
     pass
 
 
-def initialize_collateral_contract(eth_private_key: str):
+def initialize_collateral_contract():
     """Helper function to initialize CollateralContract and map hotkey."""
     network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
     collateral_contract = CollateralContract(
         network,
         settings.COLLATERAL_CONTRACT_ADDRESS,
         "",
-        eth_private_key
+        settings.ETHEREUM_MINER_KEY
     )
-    my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-    collateral_contract.map_hotkey_to_ethereum(
-        account=collateral_contract.miner_account,
-        hotkey=my_key.ss58_address
-    )
-    logger.info("Hotkey mapped to Ethereum address successfully.")
-    return collateral_contract, my_key
+    
+    return collateral_contract
 
+def get_eth_address_from_hotkey(hotkey: str):
+    # logger.info(f"Ethereum address for {hotkey}: {ethereum_address})
+    return ""
 
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
@@ -47,8 +45,7 @@ def initialize_collateral_contract(eth_private_key: str):
 @click.option(
     "--deposit_amount", type=float, prompt="Deposit Amount", help="Amount of TAO to deposit as collateral"
 )
-@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
-def add_executor(address: str, port: int, validator: str, deposit_amount: float, eth_private_key: str):
+def add_executor(address: str, port: int, validator: str, deposit_amount: float):
     """Add executor machine to the database"""
     logger.info("Adding a new executor (%s:%d) that opens to validator(%s)", address, port, validator)
     executor_dao = ExecutorDao(session=next(get_db()))
@@ -68,9 +65,10 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
         return
 
     try:
-        collateral_contract, my_key = initialize_collateral_contract(eth_private_key)
-        collateral_contract.validator_address = collateral_contract.get_eth_address_from_hotkey(validator)
-        logger.info(f"Validator address: {collateral_contract.validator_address} mapped to {validator}")
+        collateral_contract = initialize_collateral_contract()
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
+        
         balance = collateral_contract.get_balance(collateral_contract.miner_address)
         logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
 
@@ -99,8 +97,7 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
 @click.option(
     "--deposit_amount", type=float, prompt="Deposit Amount", help="Amount of TAO to deposit as collateral"
 )
-@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
-def deposit_collateral(address: str, port: int, validator: str, deposit_amount: float, eth_private_key: str):
+def deposit_collateral(address: str, port: int, validator: str, deposit_amount: float):
     """You can deposit collateral for an existing executor on database"""
     if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
         logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
@@ -112,9 +109,9 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
         executor = executor_dao.findOne(address, port)
         executor_uuid = executor.uuid
 
-        collateral_contract, my_key = initialize_collateral_contract(eth_private_key)
-        collateral_contract.validator_address = collateral_contract.get_eth_address_from_hotkey(validator)
-        logger.info(f"Validator address: {collateral_contract.validator_address} mapped to {validator}")
+        collateral_contract = initialize_collateral_contract()
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
         balance = collateral_contract.get_balance(collateral_contract.miner_address)
 
         logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
@@ -143,15 +140,14 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
     "--reclaim_amount", type=float, prompt="Reclaim Amount", help="Amount of TAO to reclaim collateral"
 )
 @click.option("--reclaim_description", type=str, prompt="Reclaim Description", help="Reclaim Description")
-@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
 def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str, eth_private_key: str):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
         logger.info("Removing executor (%s:%d)", address, port)
         executor_dao = ExecutorDao(session=next(get_db()))
 
-        collateral_contract, my_key = initialize_collateral_contract(eth_private_key)
-
+        collateral_contract = initialize_collateral_contract()
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         try:
             executor = executor_dao.findOne(address, port)
             executor_uuid = executor.uuid
@@ -173,15 +169,6 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
             return
 
         try:
-            eth_address_from_hotkey = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
-            logger.info(f"Miner address: {eth_address_from_hotkey} mapped to {my_key.ss58_address}")
-
-            if eth_address_from_hotkey != collateral_contract.miner_address:
-                logger.error(
-                    "Error: The Ethereum address used for reclaiming collateral does not match the Ethereum address originally used for depositing collateral."
-                )
-                return
-
             balance = collateral_contract.get_balance(collateral_contract.miner_address)
             logger.info("Miner balance: %f TAO", balance)
 
@@ -202,8 +189,7 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
 @click.option(
     "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
 )
-@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
-def switch_validator(address: str, port: int, validator: str, eth_private_key: str):
+def switch_validator(address: str, port: int, validator: str):
     """Switch validator"""
     if click.confirm('Are you sure you want to switch validator? This may lead to unexpected results'):
         logger.info("Switching validator(%s) of an executor (%s:%d)", validator, address, port)
@@ -214,8 +200,9 @@ def switch_validator(address: str, port: int, validator: str, eth_private_key: s
             )
 
             try:
-                collateral_contract, my_key = initialize_collateral_contract(eth_private_key)
-                new_validator_address = collateral_contract.get_eth_address_from_hotkey(validator)
+                collateral_contract = initialize_collateral_contract()
+                my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+                new_validator_address = get_eth_address_from_hotkey(validator)
 
                 collateral_contract.update_validator_for_miner(
                     new_validator=new_validator_address
@@ -249,19 +236,11 @@ def show_executors():
 
 
 @cli.command()
-@click.option("--eth_private_key", type=str, prompt="Ethereum Private Key", help="Ethereum private key of the miner")
-def get_miner_collateral(eth_private_key: str):
+def get_miner_collateral():
     """Get miner collateral from the collateral contract"""
 
     try:
-        network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
-        # Check if executor is eligible using collateral contract
-        collateral_contract = CollateralContract(
-            network,
-            settings.COLLATERAL_CONTRACT_ADDRESS,
-            "",
-            eth_private_key
-        )
+        collateral_contract = initialize_collateral_contract()
 
         final_collateral = collateral_contract.get_miner_collateral()
 
@@ -281,17 +260,11 @@ def get_eligible_executors():
         executors = executor_dao.get_all_executors()
         executor_uuids = [str(executor.uuid) for executor in executors]  # Convert to list of UUID strings
 
-        network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
-        # Check if executor is eligible using collateral contract
-        collateral_contract = CollateralContract(
-            network,
-            settings.COLLATERAL_CONTRACT_ADDRESS,
-            "",
-            ""
-        )
+        collateral_contract = initialize_collateral_contract()
 
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
+        collateral_contract.miner_address = get_eth_address_from_hotkey(my_key.ss58_address)
+
         eligible_executors = collateral_contract.get_eligible_executors(executor_uuids)
 
         for executor in eligible_executors:
@@ -305,13 +278,7 @@ def get_eligible_executors():
 def get_eth_address_from_hotkey():
     """Get ethereum address from bittensor hotkey from the collateral contract"""
     try:
-        network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
-        collateral_contract = CollateralContract(
-            network,
-            settings.COLLATERAL_CONTRACT_ADDRESS,
-            "",
-            ""
-        )
+        collateral_contract = initialize_collateral_contract()
 
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         collateral_contract.miner_address = collateral_contract.get_eth_address_from_hotkey(my_key.ss58_address)
