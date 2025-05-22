@@ -561,8 +561,6 @@ class TaskService:
                 "miner_address": collateral_contract.miner_address,
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_info.uuid,
-                "miner_balance": balance,
-                "executor_collateral": executor_collateral,
             }
 
             # Log and perform the collateral slashing
@@ -688,10 +686,9 @@ class TaskService:
         }
         if miner_info.miner_hotkey in settings.DEBUG_CONTRACT_MINERS:
             await self.handle_reclaim_requests(keypair.ss58_address, executor_info)
-            # await self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
-
             # is_eligible_executor = await self.is_eligible_executor(miner_info.miner_hotkey, executor_info)
-
+            
+            # await self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
             # if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
             #     return await self._handle_task_result(
             #         miner_info=miner_info,
