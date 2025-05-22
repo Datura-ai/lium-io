@@ -12,7 +12,7 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
 from core.config import settings
-from core.utils import _m, context, get_extra_info
+from core.utils import _m, context, get_extra_info, get_collateral_contract
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
     GPU_MAX_SCORES,
@@ -34,9 +34,6 @@ from services.ssh_service import SSHService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.file_encrypt_service import ORIGINAL_KEYS
-
-# Add the project path for celium_collateral_contracts
-from celium_collateral_contracts import CollateralContract
 
 logger = logging.getLogger(__name__)
 
@@ -493,13 +490,7 @@ class TaskService:
                 executor_info: The executor information.
             """
 
-            network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
-            collateral_contract = CollateralContract(
-                network,
-                settings.COLLATERAL_CONTRACT_ADDRESS,
-                settings.ETHEREUM_VALIDATOR_KEY,
-                ""
-            )
+            collateral_contract = get_collateral_contract()
 
             collateral_contract.miner_address = executor_info.ethereum_address
             logger.info(
@@ -552,14 +543,7 @@ class TaskService:
                 executor_info: The executor information.
             """
 
-            # Initialize the collateral contract
-            network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
-            collateral_contract = CollateralContract(
-                network,
-                settings.COLLATERAL_CONTRACT_ADDRESS,
-                settings.ETHEREUM_VALIDATOR_KEY,
-                ""
-            )
+            collateral_contract = get_collateral_contract()
 
             collateral_contract.miner_address = executor_info.ethereum_address
 
@@ -606,13 +590,7 @@ class TaskService:
                 executor_info: Information about the executor.
             """
 
-            network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
-            collateral_contract = CollateralContract(
-                network,
-                settings.COLLATERAL_CONTRACT_ADDRESS,
-                settings.ETHEREUM_VALIDATOR_KEY,
-                ""
-            )
+            collateral_contract = get_collateral_contract()
 
             rented_machine = await self.redis_service.get_rented_machine(executor_info)
             reclaim_requests = await collateral_contract.get_reclaim_requests()

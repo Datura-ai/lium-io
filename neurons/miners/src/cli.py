@@ -21,7 +21,7 @@ def cli():
 
 
 def initialize_collateral_contract():
-    """Helper function to initialize CollateralContract and map hotkey."""
+    """Helper function to initialize CollateralContract"""
     network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
     collateral_contract = CollateralContract(
         network,
