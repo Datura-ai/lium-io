@@ -22,7 +22,7 @@ def cli():
 
 def initialize_collateral_contract():
     """Helper function to initialize CollateralContract"""
-    network = "test" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
+    network = "local" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
     collateral_contract = CollateralContract(
         network,
         settings.COLLATERAL_CONTRACT_ADDRESS,
@@ -34,7 +34,7 @@ def initialize_collateral_contract():
 
 def get_eth_address_from_hotkey(hotkey: str):
     # logger.info(f"Ethereum address for {hotkey}: {ethereum_address})
-    return ""
+    return "0xE1A07A44ac6f8423bA3b734F0cAfC6F87fd385Fc"
 
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
@@ -56,7 +56,6 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
         )
     except Exception as e:
         logger.error("Failed to add executor: %s", str(e))
-        return
     else:
         logger.info("Added executor (id=%s)", str(executor.uuid))
 
@@ -144,7 +143,7 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
     "--reclaim_amount", type=float, prompt="Reclaim Amount", help="Amount of TAO to reclaim collateral"
 )
 @click.option("--reclaim_description", type=str, prompt="Reclaim Description", help="Reclaim Description")
-def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str, eth_private_key: str):
+def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
         logger.info("Removing executor (%s:%d)", address, port)
@@ -252,9 +251,7 @@ def get_miner_collateral():
 
             final_collateral = await collateral_contract.get_miner_collateral()
 
-            final_collateral_in_tao = collateral_contract.w3.from_wei(final_collateral, "ether")
-
-            logger.info("Miner collateral: %f TAO", final_collateral_in_tao)
+            logger.info("Miner collateral: %f TAO", final_collateral)
 
         except Exception as e:
             logger.error("Failed in getting miner collateral: %s", str(e))
