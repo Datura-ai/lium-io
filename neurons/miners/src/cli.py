@@ -280,6 +280,28 @@ def get_eligible_executors():
             logger.error("Failed in getting eligible executors: %s", str(e))
     asyncio.run(async_get_eligible_executors())
 
+@cli.command()
+@click.option("--address", prompt="IP Address", help="IP address of executor")
+@click.option("--port", type=int, prompt="Port", help="Port of executor")
+def get_executor_collateral(address: str, port: int):
+    """Get collateral amount for a specific executor by address and port"""
+    executor_dao = ExecutorDao(session=next(get_db()))
+    try:
+        executor = executor_dao.findOne(address, port)
+        executor_uuid = str(executor.uuid)
+    except Exception as e:
+        logger.error("Failed to find executor: %s", str(e))
+        return
+
+    async def async_get_executor_collateral():
+        try:
+            collateral_contract = initialize_collateral_contract()
+            collateral = await collateral_contract.get_executor_collateral(executor_uuid)
+            logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
+        except Exception as e:
+            logger.error("Failed to get executor collateral: %s", str(e))
+    asyncio.run(async_get_executor_collateral())
+
 
 if __name__ == "__main__":
     cli()
