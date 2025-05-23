@@ -75,6 +75,7 @@ class MinerService:
 
         try:
             logger.info(_m("Requesting job to miner", extra=get_extra_info(default_extra)))
+
             miner_client = MinerClient(
                 loop=loop,
                 miner_address=payload.miner_address,
@@ -536,6 +537,7 @@ class MinerService:
             log_text = _m(
                 "Resulted in an exception",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
+                exc_info=True,
             )
 
             return self._handle_container_error(
