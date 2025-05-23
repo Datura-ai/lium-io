@@ -5,7 +5,7 @@ import time
 import bittensor
 import pydantic
 from datura.requests.base import BaseRequest
-
+from core.utils import get_collateral_contract
 
 class RequestType(enum.Enum):
     AuthenticateRequest = "AuthenticateRequest"
@@ -23,6 +23,7 @@ class BaseValidatorRequest(BaseRequest):
 
 class AuthenticationPayload(pydantic.BaseModel):
     validator_hotkey: str
+    validator_ethereum_address: str
     timestamp: int
 
     def blob_for_signing(self):
@@ -40,7 +41,10 @@ class AuthenticateRequest(BaseValidatorRequest):
 
     @classmethod
     def from_keypair(cls, keypair: bittensor.Keypair):
+        collateral_contract = get_collateral_contract()
+        validator_ethereum_address = collateral_contract.validator_address
         payload = AuthenticationPayload(
+            validator_ethereum_address=validator_ethereum_address,
             validator_hotkey=keypair.ss58_address,
             timestamp=int(time.time()),
         )
