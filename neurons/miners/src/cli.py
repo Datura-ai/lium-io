@@ -8,8 +8,8 @@ import sqlalchemy
 from core.db import get_db
 from daos.executor import ExecutorDao
 from models.executor import Executor
-from celium_collateral_contracts import CollateralContract
 from core.config import settings
+from core.utils import get_collateral_contract
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,18 +19,6 @@ logger = logging.getLogger(__name__)
 def cli():
     pass
 
-
-def initialize_collateral_contract():
-    """Helper function to initialize CollateralContract"""
-    network = "local" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
-    collateral_contract = CollateralContract(
-        network,
-        settings.COLLATERAL_CONTRACT_ADDRESS,
-        "",
-        settings.ETHEREUM_MINER_KEY
-    )
-    
-    return collateral_contract
 
 def get_eth_address_from_hotkey(hotkey: str):
     # logger.info(f"Ethereum address for {hotkey}: {ethereum_address})
@@ -65,7 +53,7 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
 
     async def async_add_executor():
         try:
-            collateral_contract = initialize_collateral_contract()
+            collateral_contract = get_collateral_contract()
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
             collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
             
@@ -111,7 +99,7 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
             executor = executor_dao.findOne(address, port)
             executor_uuid = executor.uuid
 
-            collateral_contract = initialize_collateral_contract()
+            collateral_contract = get_collateral_contract()
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
             collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
@@ -150,7 +138,7 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
         executor_dao = ExecutorDao(session=next(get_db()))
 
         async def async_remove_executor():
-            collateral_contract = initialize_collateral_contract()
+            collateral_contract = get_collateral_contract()
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
             try:
                 executor = executor_dao.findOne(address, port)
@@ -206,7 +194,7 @@ def switch_validator(address: str, port: int, validator: str):
 
             async def async_switch_validator():
                 try:
-                    collateral_contract = initialize_collateral_contract()
+                    collateral_contract = get_collateral_contract()
                     my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
                     new_validator_address = get_eth_address_from_hotkey(validator)
 
@@ -247,7 +235,7 @@ def get_miner_collateral():
 
     async def async_get_miner_collateral():
         try:
-            collateral_contract = initialize_collateral_contract()
+            collateral_contract = get_collateral_contract()
 
             final_collateral = await collateral_contract.get_miner_collateral()
 
@@ -267,7 +255,7 @@ def get_eligible_executors():
             executors = executor_dao.get_all_executors()
             executor_uuids = [str(executor.uuid) for executor in executors]  # Convert to list of UUID strings
 
-            collateral_contract = initialize_collateral_contract()
+            collateral_contract = get_collateral_contract()
 
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
 
@@ -295,7 +283,7 @@ def get_executor_collateral(address: str, port: int):
 
     async def async_get_executor_collateral():
         try:
-            collateral_contract = initialize_collateral_contract()
+            collateral_contract = get_collateral_contract()
             collateral = await collateral_contract.get_executor_collateral(executor_uuid)
             logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
         except Exception as e:
