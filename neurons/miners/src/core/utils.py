@@ -90,7 +90,6 @@ class StructuredMessage:
 _m = StructuredMessage
 
 def get_collateral_contract(
-    network: str = None,
     contract_address: str = None,
     miner_key: str = None,
     validator_key: str = "",
@@ -100,7 +99,6 @@ def get_collateral_contract(
     Initializes and returns a CollateralContract instance.
 
     Args:
-        network (str): The blockchain network to use ('local', 'test', 'finney', etc.).
         contract_address (str): Address of the collateral contract.
         validator_key (str): Ethereum validator key.
         miner_key (str): Optional miner key required for contract operations.
@@ -108,11 +106,9 @@ def get_collateral_contract(
     Returns:
         CollateralContract: The initialized contract instance.
     """
-    if network is None:
-        network = "local" if settings.DEBUG_COLLATERAL_CONTRACT else "finney"
     if contract_address is None:
         contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
     if miner_key is None:
         miner_key = settings.ETHEREUM_MINER_KEY
 
-    return CollateralContract(network, contract_address, validator_key, miner_key)
+    return CollateralContract(settings.COLLATERAL_CONTRACT_NETWORK, contract_address, validator_key, miner_key)

@@ -16,7 +16,6 @@ from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
-from celium_collateral_contracts import CollateralContract
 from services.docker_service import REPOSITORIES, DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService

@@ -35,8 +35,19 @@ class Settings(BaseSettings):
     MIN_ALPHA_STAKE: int = Field(env="MIN_ALPHA_STAKE", default=10)
     MIN_TOTAL_STAKE: int = Field(env="MIN_TOTAL_STAKE", default=20000)
 
-    COLLATERAL_CONTRACT_ADDRESS: str = "0xc30c6Fefb37c8599aD6e048178BeD4300f067470"
     REQUIRED_TAO_COLLATERAL: float = 0.001
+
+    COLLATERAL_CONTRACT_ADDRESSES: dict[str, str] = {
+        "local": "0xc30c6Fefb37c8599aD6e048178BeD4300f067470",
+        "dev": "0x8911acCB78363B3AD6D955892Ba966eb6869A2e6",
+        "prod": "",
+    }
+
+    COLLATERAL_CONTRACT_NETWORK_MAP: dict[str, str] = {
+        "local": "local",
+        "dev": "test",
+        "prod": "finney",
+    }
 
     DEBUG_CONTRACT_MINERS: [str] = [
         "5Df8qGLMd19BXByefGCZFN57fWv6jDm5hUbnQeUTu2iqNBhT",
@@ -48,6 +59,16 @@ class Settings(BaseSettings):
     
     ETHEREUM_MINER_KEY: str = Field(env="ETHEREUM_MINER_KEY", default=None)
 
+    @property
+    def COLLATERAL_CONTRACT_ADDRESS(self) -> str:
+        """Returns the collateral contract address based on the current environment."""
+        return self.COLLATERAL_CONTRACT_ADDRESSES.get(self.ENV, self.COLLATERAL_CONTRACT_ADDRESSES["prod"])
+
+    @property
+    def COLLATERAL_CONTRACT_NETWORK(self) -> str:
+        """Returns the collateral contract address based on the current environment."""
+        return self.COLLATERAL_CONTRACT_NETWORK_MAP.get(self.ENV, self.COLLATERAL_CONTRACT_NETWORK_MAP["prod"])
+        
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
