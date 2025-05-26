@@ -20,6 +20,7 @@ AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
+GPU_MODEL_COUNT_MAP = "GPU_MODEL_COUNT_MAP"
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,16 @@ class RedisService:
 
     async def get_verified_job_info(self, executor_id: str):
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
+        if not data:
+            return {}
 
+        return json.loads(data)
+
+    async def set_gpu_model_count_map(self, data: dict):
+        await self.set(GPU_MODEL_COUNT_MAP, json.dumps(data))
+
+    async def get_gpu_model_count_map(self):
+        data = await self.get(GPU_MODEL_COUNT_MAP)
         if not data:
             return {}
 

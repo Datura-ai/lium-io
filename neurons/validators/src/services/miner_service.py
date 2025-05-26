@@ -38,7 +38,7 @@ from core.utils import _m, get_extra_info
 from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
-from services.task_service import TaskService
+from services.task_service import TaskService, JobResult
 from services.const import JOB_TIME_OUT
 
 logger = logging.getLogger(__name__)
@@ -161,8 +161,15 @@ class MinerService:
                     await self.publish_machine_specs(results, miner_client.miner_hotkey, payload.miner_coldkey)
 
                     total_score = 0
-                    for _, _, score, _, _, _, _ in results:
-                        total_score += score
+                    gpu_model_count_map = {}
+                    for result in results:
+                        total_score += result.score
+                        if result.gpu_model_count:
+                            gpu_model_count_info = result.gpu_model_count.split(':')
+                            gpu_model = gpu_model_count_info[0]
+                            gpu_count = int(gpu_model_count_info[1])
+                            if gpu_model:
+                                gpu_model_count_map[gpu_model] = gpu_model_count_map.get(gpu_model, 0) + gpu_count
 
                     logger.info(
                         _m(
@@ -174,6 +181,7 @@ class MinerService:
                     return {
                         "miner_hotkey": payload.miner_hotkey,
                         "score": total_score,
+                        "gpu_model_count_map": gpu_model_count_map,
                     }
                 elif isinstance(msg, FailedRequest):
                     logger.warning(
@@ -219,7 +227,7 @@ class MinerService:
             return None
 
     async def publish_machine_specs(
-        self, results: list[tuple[dict, ExecutorSSHInfo]], miner_hotkey: str, miner_coldkey: str
+        self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str
     ):
         """Publish machine specs to compute app connector process"""
         default_extra = {
@@ -232,31 +240,23 @@ class MinerService:
                 extra=get_extra_info({**default_extra, "results": len(results)}),
             ),
         )
-        for (
-            specs,
-            ssh_info,
-            score,
-            synthetic_job_score,
-            job_batch_id,
-            log_status,
-            log_text,
-        ) in results:
+        for result in results:
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL,
                     {
-                        "specs": specs,
+                        "specs": result.spec,
                         "miner_hotkey": miner_hotkey,
                         "miner_coldkey": miner_coldkey,
-                        "executor_uuid": ssh_info.uuid,
-                        "executor_ip": ssh_info.address,
-                        "executor_port": ssh_info.port,
-                        "executor_price": ssh_info.price,
-                        "score": score,
-                        "synthetic_job_score": synthetic_job_score,
-                        "job_batch_id": job_batch_id,
-                        "log_status": log_status,
-                        "log_text": str(log_text),
+                        "executor_uuid": result.executor_info.uuid,
+                        "executor_ip": result.executor_info.address,
+                        "executor_port": result.executor_info.port,
+                        "executor_price": result.executor_info.price,
+                        "score": result.score,
+                        "synthetic_job_score": result.score,
+                        "job_batch_id": result.job_batch_id,
+                        "log_status": result.log_status,
+                        "log_text": result.log_text,
                     },
                 )
             except Exception as e:

@@ -158,7 +158,7 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
     docker_hub_digests = await docker_service.get_docker_hub_digests(REPOSITORIES)
     encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
 
-    await miner_service.request_job_to_miner(
+    result = await miner_service.request_job_to_miner(
         MinerJobRequestPayload(
             job_batch_id='job_batch_id',
             miner_hotkey=miner_hotkey,
@@ -169,6 +169,7 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
         encrypted_files=encrypted_files,
         docker_hub_digests=docker_hub_digests,
     )
+    print('job_result:', result)
 
 
 @cli.command()

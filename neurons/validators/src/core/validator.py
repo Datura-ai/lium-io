@@ -563,6 +563,8 @@ class Validator:
                     }
 
                 try:
+                    total_gpu_model_count_map = {}
+
                     # Run all jobs with asyncio.wait and set a timeout
                     done, pending = await asyncio.wait(jobs, timeout=JOB_TIME_OUT - 50)
 
@@ -584,11 +586,15 @@ class Validator:
                                 )
                                 miner_hotkey = result.get("miner_hotkey")
                                 job_score = result.get("score")
+                                gpu_model_count_map: dict = result.get("gpu_model_count_map", {})
 
                                 if miner_hotkey in self.miner_scores:
                                     self.miner_scores[miner_hotkey] += job_score
                                 else:
                                     self.miner_scores[miner_hotkey] = job_score
+
+                                for gpu_model, gpu_count in gpu_model_count_map.items():
+                                    total_gpu_model_count_map[gpu_model] = total_gpu_model_count_map.get(gpu_model, 0) + gpu_count
                             else:
                                 info = task_info.get(task, {})
                                 miner_hotkey = info.get("miner_hotkey", "unknown")
@@ -642,6 +648,21 @@ class Validator:
                             task.cancel()
 
                     open_fd_count = len(os.listdir(f'/proc/self/fd'))
+
+                    # Set gpu model count
+                    logger.error(
+                        _m(
+                            "Set GPU model count map on redis",
+                            extra=get_extra_info(
+                                {
+                                    **self.default_extra,
+                                    "job_batch_id": job_batch_id,
+                                    "data": total_gpu_model_count_map,
+                                }
+                            ),
+                        ),
+                    )
+                    await self.redis_service.set_gpu_model_count_map(total_gpu_model_count_map)
 
                     logger.info(
                         _m(
