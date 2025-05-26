@@ -650,7 +650,7 @@ class Validator:
                     open_fd_count = len(os.listdir(f'/proc/self/fd'))
 
                     # Set gpu model count
-                    logger.error(
+                    logger.info(
                         _m(
                             "Set GPU model count map on redis",
                             extra=get_extra_info(
