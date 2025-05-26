@@ -481,8 +481,11 @@ class TaskService:
 
         logger.info(_m("Debug: calculating score", {
             "executor_id": str(executor_info.uuid),
-            "single_gpu_score": single_gpu_score,
+            "gpu_model": gpu_model,
+            "gpu_model_score_portion": gpu_model_score_portion,
             "gpu_count": gpu_count,
+            "total_gpu_count": total_gpu_count,
+            "single_gpu_score": single_gpu_score,
             "score": score,
             "sysbox_runtime": sysbox_runtime,
         }))
