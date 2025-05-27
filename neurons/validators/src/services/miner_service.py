@@ -62,7 +62,6 @@ class MinerService:
         self,
         payload: MinerJobRequestPayload,
         encrypted_files: MinerJobEnryptedFiles,
-        docker_hub_digests: dict[str, str],
     ):
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -135,7 +134,6 @@ class MinerService:
                                     private_key=private_key.decode("utf-8"),
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
-                                    docker_hub_digests=docker_hub_digests,
                                 ),
                                 timeout=JOB_TIME_OUT - 60
                             )
@@ -146,7 +144,7 @@ class MinerService:
                     results = [
                         result
                         for result in await asyncio.gather(*tasks, return_exceptions=True)
-                        if result and not isinstance(result, Exception)
+                        if result and not isinstance(result, Exception) and not isinstance(result, BaseException)
                     ]
 
                     logger.info(
@@ -160,28 +158,9 @@ class MinerService:
 
                     await self.publish_machine_specs(results, miner_client.miner_hotkey, payload.miner_coldkey)
 
-                    total_score = 0
-                    gpu_model_count_map = {}
-                    for result in results:
-                        total_score += result.score
-                        if result.gpu_model_count:
-                            gpu_model_count_info = result.gpu_model_count.split(':')
-                            gpu_model = gpu_model_count_info[0]
-                            gpu_count = int(gpu_model_count_info[1])
-                            if gpu_model:
-                                gpu_model_count_map[gpu_model] = gpu_model_count_map.get(gpu_model, 0) + gpu_count
-
-                    logger.info(
-                        _m(
-                            f"total score: {total_score}",
-                            extra=get_extra_info(default_extra),
-                        )
-                    )
-
                     return {
                         "miner_hotkey": payload.miner_hotkey,
-                        "score": total_score,
-                        "gpu_model_count_map": gpu_model_count_map,
+                        "results": [result for result in results if result.gpu_model is not None and result.gpu_count > 0],
                     }
                 elif isinstance(msg, FailedRequest):
                     logger.warning(
