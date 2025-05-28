@@ -442,7 +442,7 @@ class ComputeClient:
         start_time = time.time()
         async with aiohttp.ClientSession() as session:
             try:
-                url = f"{self.compute_app_rest_api_uri}/validator/{validator_hotkey}/register-eth"
+                url = f"{self.compute_app_rest_api_uri}/register-eth"
                 headers = {
                     'X-Validator-Signature': f"0x{self.keypair.sign(self.my_hotkey()).hex()}",
                     'Content-Type': 'application/json'
