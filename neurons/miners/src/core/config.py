@@ -43,6 +43,11 @@ class Settings(BaseSettings):
         "prod": "",
     }
 
+    COMPUTE_APP_URI: str = "wss://celiumcompute.ai"
+    COMPUTE_REST_API_URL: str | None = Field(
+        env="COMPUTE_REST_API_URL", default="https://celiumcompute.ai/api"
+    )
+
     COLLATERAL_CONTRACT_NETWORK_MAP: dict[str, str] = {
         "local": "local",
         "dev": "test",

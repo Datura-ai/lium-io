@@ -4,6 +4,7 @@ import uuid
 
 import click
 import sqlalchemy
+import aiohttp
 
 from core.db import get_db
 from daos.executor import ExecutorDao
@@ -21,8 +22,27 @@ def cli():
 
 
 def get_eth_address_from_hotkey(hotkey: str):
-    # logger.info(f"Ethereum address for {hotkey}: {ethereum_address})
-    return "0xE1A07A44ac6f8423bA3b734F0cAfC6F87fd385Fc"
+    """Get Ethereum address for a given hotkey"""
+    async def _get_eth_address():
+        url = f"{settings.COMPUTE_APP_URI}/validator/{hotkey}/eth-address"
+        compute_app_rest_api_uri = url.replace("wss", "https").replace("ws", "http")
+        # keypair = settings.get_bittensor_wallet().get_hotkey()
+        # headers = {
+        #     'X-Validator-Signature': f"0x{keypair.sign(hotkey).hex()}"
+        # }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(compute_app_rest_api_uri, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                if response.status != 200:
+                    error_msg = await response.text()
+                    logger.error(f"Error {response.status}: Unable to retrieve Ethereum address for hotkey. Details: {error_msg}")
+                    return None
+                data = await response.json()
+                return data.get("ethereum_address")
+    
+    result = asyncio.run(_get_eth_address())
+    if result:
+        logger.info(f"Ethereum address for {hotkey}: {result}")
+    return result
 
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
