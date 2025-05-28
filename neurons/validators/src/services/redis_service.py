@@ -234,7 +234,6 @@ class RedisService:
 
     async def get_verified_job_info(self, executor_id: str):
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
-
         if not data:
             return {}
 
