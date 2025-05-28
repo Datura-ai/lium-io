@@ -15,6 +15,7 @@ class RequestType(enum.Enum):
     LogStreamRequest = "LogStreamRequest"
     ResetVerifiedJobRequest = "ResetVerifiedJobRequest"
     DuplicateExecutorsRequest = "DuplicateExecutorsRequest"
+    NormalizedScoreRequest = "NormalizedScoreRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -94,3 +95,7 @@ class ResetVerifiedJobRequest(BaseValidatorRequest):
 
 class DuplicateExecutorsRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.DuplicateExecutorsRequest
+
+class NormalizedScoreRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.NormalizedScoreRequest
+    normalized_scores: list[dict]

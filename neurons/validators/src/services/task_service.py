@@ -890,7 +890,7 @@ class TaskService:
                     if gpu_model:
                         extra_info["gpu_model"] = gpu_model
                         extra_info["help_text"] = (
-                            "If you have the gpu machine and encountering this issue consistantly, "
+                            "If you have the gpu machine and encountering this issue consistently, "
                             "then please pull the latest version of github repository and follow the installation guide here: "
                             "https://github.com/Datura-ai/compute-subnet/tree/main/neurons/executor. "
                             "Also, please configure the nvidia-container-runtime correctly. Check out here: "
@@ -1025,7 +1025,7 @@ class TaskService:
 
                 # check rented status
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
-                if rented_machine:
+                if rented_machine and rented_machine.get("container_name", ""):
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running = await self.check_pod_running(
                         ssh_client=shell.ssh_client,
@@ -1167,7 +1167,7 @@ class TaskService:
                         )
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
-                if not renting_in_progress:
+                if not renting_in_progress and not rented_machine:
                     success, log_text, log_status = await self.docker_connection_check(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
