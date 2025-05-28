@@ -271,15 +271,9 @@ def get_eligible_executors():
     """Get eligible executors from the collateral contract"""
     async def async_get_eligible_executors():
         try:
-            executor_dao = ExecutorDao(session=next(get_db()))
-            executors = executor_dao.get_all_executors()
-            executor_uuids = [str(executor.uuid) for executor in executors]  # Convert to list of UUID strings
-
             collateral_contract = get_collateral_contract()
 
-            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-
-            eligible_executors = await collateral_contract.get_eligible_executors(executor_uuids)
+            eligible_executors = await collateral_contract.get_eligible_executors()
 
             for executor in eligible_executors:
                 logger.info("Eligible executor: %s", executor)

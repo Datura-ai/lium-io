@@ -57,10 +57,11 @@ class Settings(BaseSettings):
     REQUIRED_TAO_COLLATERAL: float = 0.001
 
     COLLATERAL_CONTRACT_ADDRESSES: dict[str, str] = {
-        "local": "0xc30c6Fefb37c8599aD6e048178BeD4300f067470",
-        "dev": "0x8911acCB78363B3AD6D955892Ba966eb6869A2e6",
+        "local": "0x8b6A0598898255C48Cb73B21271bB47f2EEEE7c1",
+        "dev": "0x6d4168e6D1660EA268DC1814BEd7dF7C038d4D01",
         "prod": "",
     }
+
 
     COLLATERAL_CONTRACT_NETWORK_MAP: dict[str, str] = {
         "local": "local",
