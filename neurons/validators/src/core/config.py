@@ -51,42 +51,23 @@ class Settings(BaseSettings):
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     BURNERS: list[int] = [4, 206, 207, 208]
-    
+
     DEBUG_COLLATERAL_CONTRACT: bool = True
 
     REQUIRED_TAO_COLLATERAL: float = 0.001
 
-    COLLATERAL_CONTRACT_ADDRESSES: dict[str, str] = {
-        "local": "0x8b6A0598898255C48Cb73B21271bB47f2EEEE7c1",
-        "dev": "0x6d4168e6D1660EA268DC1814BEd7dF7C038d4D01",
-        "prod": "",
-    }
+    COLLATERAL_CONTRACT_ADDRESS: str = Field(
+        env='COLLATERAL_CONTRACT_ADDRESS', default='0x6d4168e6D1660EA268DC1814BEd7dF7C038d4D01'
+    )
 
-
-    COLLATERAL_CONTRACT_NETWORK_MAP: dict[str, str] = {
-        "local": "local",
-        "dev": "test",
-        "prod": "finney",
-    }
-
-    DEBUG_CONTRACT_MINERS: [str] = [
+    DEBUG_CONTRACT_MINERS: list[str] = [
         "5Df8qGLMd19BXByefGCZFN57fWv6jDm5hUbnQeUTu2iqNBhT",
         "5Dtbwfafi4cyiDwH5HBFEAWJA913EB6G1rX7wBnfcXwiPssR",
         "5ECBM9caBAyJPBjVtfw4WGwdytacrZWvvt6i3T8GnqtByRFM"
     ]
-    
-    ETHEREUM_VALIDATOR_KEY: str = Field(env="ETHEREUM_VALIDATOR_KEY", default=None)
 
-    @property
-    def COLLATERAL_CONTRACT_ADDRESS(self) -> str:
-        """Returns the collateral contract address based on the current environment."""
-        return self.COLLATERAL_CONTRACT_ADDRESSES.get(self.ENV, self.COLLATERAL_CONTRACT_ADDRESSES["prod"])
+    ETHEREUM_VALIDATOR_KEY: str | None = Field(env="ETHEREUM_VALIDATOR_KEY", default=None)
 
-    @property
-    def COLLATERAL_CONTRACT_NETWORK(self) -> str:
-        """Returns the collateral contract address based on the current environment."""
-        return self.COLLATERAL_CONTRACT_NETWORK_MAP.get(self.ENV, self.COLLATERAL_CONTRACT_NETWORK_MAP["prod"])
-    
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")

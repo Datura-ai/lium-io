@@ -215,4 +215,4 @@ def get_collateral_contract(
     if validator_key is None:
         validator_key = settings.ETHEREUM_VALIDATOR_KEY
 
-    return CollateralContract(settings.COLLATERAL_CONTRACT_NETWORK, contract_address, validator_key, miner_key)
+    return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, validator_key, miner_key)

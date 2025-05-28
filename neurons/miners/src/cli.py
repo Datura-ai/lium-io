@@ -3,7 +3,7 @@ import logging
 import uuid
 
 import click
-import sqlalchemy
+import bittensor
 import aiohttp
 
 from core.db import get_db
@@ -22,6 +22,9 @@ def cli():
 
 
 async def get_eth_address_from_hotkey(hotkey: str):
+    if settings.DEBUG_VALIDATOR_ETH_ADDRESS:
+        return settings.DEBUG_VALIDATOR_ETH_ADDRESS
+
     """Get Ethereum address for a given hotkey"""
     url = f"{settings.COMPUTE_REST_API_URL}/validator/{hotkey}/eth-address"
 

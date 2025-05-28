@@ -89,11 +89,12 @@ class StructuredMessage:
 
 _m = StructuredMessage
 
+
 def get_collateral_contract(
     contract_address: str = None,
     miner_key: str = None,
     validator_key: str = "",
-    
+
 ) -> CollateralContract:
     """
     Initializes and returns a CollateralContract instance.
@@ -111,4 +112,4 @@ def get_collateral_contract(
     if miner_key is None:
         miner_key = settings.ETHEREUM_MINER_KEY
 
-    return CollateralContract(settings.COLLATERAL_CONTRACT_NETWORK, contract_address, validator_key, miner_key)
+    return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, validator_key, miner_key)

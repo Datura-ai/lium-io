@@ -452,59 +452,6 @@ class TaskService:
             sysbox_runtime=sysbox_runtime,
         )
 
-    async def _calc_score(
-        self,
-        executor_info: ExecutorSSHInfo,
-        max_score: float,
-        gpu_count: int,
-        is_rental_check_passed: bool,
-        is_rented: bool,
-        sysbox_runtime: bool,
-    ) -> tuple[float, float]:
-        """
-        Calculate the score for the executor.
-
-        :param executor_info: The executor info.
-        :param max_score: The max score for the executor.
-        :param gpu_count: The number of GPUs in the executor.
-        :param is_rental_check_passed: Whether the executor has passed the rental check.
-        :param is_rented: Whether the executor is rented.
-
-        formula: 
-        job_score = max_score * gpu_count * (0.5 + min(0.5, uptime_in_minutes / 5 days))
-
-        :return: A tuple of the actual score and the job score.
-        """
-        # get uptime of the executor
-        uptime_in_minutes = await self.redis_service.get_executor_uptime(executor_info)
-        # if uptime in the subnet is exceed 5 days, then it'll get max score
-        # if uptime is less than 5 days, then it'll get score based on the uptime
-        # give 50% of max still to avoid 0 score all miners at deployment
-        # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX per cent.
-        five_days_in_minutes = 60 * 24 * 5
-        score = max_score * gpu_count * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / five_days_in_minutes))
-
-        logger.info(_m("Debug: calculating score", {
-            "executor_id": str(executor_info.uuid),
-            "max_score": max_score,
-            "gpu_count": gpu_count,
-            "score": score,
-            "sysbox_runtime": sysbox_runtime,
-        }))
-
-        if sysbox_runtime:
-            score = score * (1 + settings.PORTION_FOR_SYSBOX)
-
-        # actual score is the score which executor gets for incentive
-        # only give actual score if executor passed the rental check
-        actual_score = score if is_rental_check_passed else 0
-        # job score is the score which executor gets when matrix multiply is finished.
-        # executor won't have job score if it didn't run the synthetic job(matrix multiply)
-        # we give job score if executor is rented but rental check is not passed, because this is in progress of rental check
-        # this is because if either job score or actual score is 0, backend will flag this executor as invalid.
-        job_score = score if not is_rented or not is_rental_check_passed else 0
-        return actual_score, job_score
-
     async def is_eligible_executor(self, miner_hotkey: str, executor_info: ExecutorSSHInfo):
         try:
             """
