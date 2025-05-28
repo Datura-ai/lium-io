@@ -21,28 +21,24 @@ def cli():
     pass
 
 
-def get_eth_address_from_hotkey(hotkey: str):
+async def get_eth_address_from_hotkey(hotkey: str):
     """Get Ethereum address for a given hotkey"""
-    async def _get_eth_address():
-        url = f"{settings.COMPUTE_APP_URI}/validator/{hotkey}/eth-address"
-        compute_app_rest_api_uri = url.replace("wss", "https").replace("ws", "http")
-        # keypair = settings.get_bittensor_wallet().get_hotkey()
-        # headers = {
-        #     'X-Validator-Signature': f"0x{keypair.sign(hotkey).hex()}"
-        # }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(compute_app_rest_api_uri, timeout=aiohttp.ClientTimeout(total=60)) as response:
-                if response.status != 200:
-                    error_msg = await response.text()
-                    logger.error(f"Error {response.status}: Unable to retrieve Ethereum address for hotkey. Details: {error_msg}")
-                    return None
-                data = await response.json()
-                return data.get("ethereum_address")
-    
-    result = asyncio.run(_get_eth_address())
-    if result:
-        logger.info(f"Ethereum address for {hotkey}: {result}")
-    return result
+    url = f"{settings.COMPUTE_REST_API_URL}/validator/{hotkey}/eth-address"
+
+    compute_app_rest_api_uri = url.replace("wss", "https").replace("ws", "http")
+    # keypair = settings.get_bittensor_wallet().get_hotkey()
+    # headers = {
+    #     'X-Validator-Signature': f"0x{keypair.sign(hotkey).hex()}"
+    # }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(compute_app_rest_api_uri, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            if response.status != 200:
+                error_msg = await response.text()
+                logger.error(f"Error {response.status}: Unable to retrieve Ethereum address for hotkey. Details: {error_msg}")
+                return None
+            data = await response.json()
+            return data.get("ethereum_address")
+
 
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
@@ -75,8 +71,8 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
         try:
             collateral_contract = get_collateral_contract()
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-            collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
-            
+            collateral_contract.validator_address = await get_eth_address_from_hotkey(validator)
+
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
             logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
 
@@ -121,7 +117,7 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
 
             collateral_contract = get_collateral_contract()
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-            collateral_contract.validator_address = get_eth_address_from_hotkey(validator)
+            collateral_contract.validator_address = await get_eth_address_from_hotkey(validator)
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
 
             logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
@@ -216,7 +212,7 @@ def switch_validator(address: str, port: int, validator: str):
                 try:
                     collateral_contract = get_collateral_contract()
                     my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-                    new_validator_address = get_eth_address_from_hotkey(validator)
+                    new_validator_address = await get_eth_address_from_hotkey(validator)
 
                     await collateral_contract.update_validator_for_miner(
                         new_validator=new_validator_address
