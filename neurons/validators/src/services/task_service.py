@@ -4,6 +4,7 @@ import logging
 import random
 import uuid
 from typing import Annotated
+from pydantic import BaseModel
 
 import asyncssh
 import bittensor
@@ -15,7 +16,7 @@ from core.config import settings
 from core.utils import _m, context, get_extra_info, get_collateral_contract
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
-    GPU_MAX_SCORES,
+    GPU_MODEL_RATES,
     MAX_GPU_COUNT,
     UNRENTED_MULTIPLIER,
     LIB_NVIDIA_ML_DIGESTS,
@@ -38,6 +39,19 @@ from services.file_encrypt_service import ORIGINAL_KEYS
 logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
+
+
+class JobResult(BaseModel):
+    spec: dict | None = None
+    executor_info: ExecutorSSHInfo
+    score: float
+    job_score: float
+    job_batch_id: str
+    log_status: str
+    log_text: str
+    gpu_model: str | None = None
+    gpu_count: int = 0
+    sysbox_runtime: bool = False
 
 
 class TaskService:
@@ -376,6 +390,7 @@ class TaskService:
         clear_verified_job_info: bool = False,
         gpu_model_count: str = '',
         gpu_uuids: str = '',
+        sysbox_runtime: bool = False,
         clear_verified_job_reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
     ):
         logger.info(_m("Handle task result: ", extra={
@@ -417,14 +432,24 @@ class TaskService:
                     success=success,
                 )
 
-        return (
-            spec,
-            executor_info,
-            score,
-            job_score,
-            miner_info.job_batch_id,
-            log_status,
-            log_text,
+        gpu_model = None
+        gpu_count = 0
+        if gpu_model_count and ':' in gpu_model_count:
+            gpu_model_count_info = gpu_model_count.split(':')
+            gpu_model = gpu_model_count_info[0]
+            gpu_count = int(gpu_model_count_info[1])
+
+        return JobResult(
+            spec=spec,
+            executor_info=executor_info,
+            score=score,
+            job_score=job_score,
+            job_batch_id=miner_info.job_batch_id,
+            log_status=log_status,
+            log_text=str(log_text),
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+            sysbox_runtime=sysbox_runtime,
         )
 
     async def _calc_score(
@@ -672,7 +697,6 @@ class TaskService:
         private_key: str,
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
-        docker_hub_digests: dict[str, str],
     ):
         default_extra = {
             "job_batch_id": miner_info.job_batch_id,
@@ -815,10 +839,6 @@ class TaskService:
                     if len(details) > 0:
                         gpu_model = details[0].get("name", None)
 
-                max_score = 0
-                if gpu_model:
-                    max_score = GPU_MAX_SCORES.get(gpu_model, 0)
-
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
                 gpu_details = machine_spec.get("gpu", {}).get("details", [])
                 gpu_model_count = f'{gpu_model}:{gpu_count}'
@@ -875,7 +895,7 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                if max_score == 0 or gpu_count == 0 or len(gpu_details) != gpu_count:
+                if not GPU_MODEL_RATES.get(gpu_model) or gpu_count == 0 or len(gpu_details) != gpu_count:
                     extra_info = {
                         **default_extra,
                         "os_version": machine_spec.get("os", ""),
@@ -899,7 +919,7 @@ class TaskService:
                         )
 
                     log_text = _m(
-                        f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
+                        f"No GPU in list or GPU count({gpu_count}) is 0. No need to run job.",
                         extra=get_extra_info(
                             {
                                 **default_extra,
@@ -996,7 +1016,7 @@ class TaskService:
 
                 logger.info(
                     _m(
-                        f"Got GPU specs: {gpu_model} with max score: {max_score}",
+                        f"Got GPU Model: {gpu_model}, count: {gpu_count}",
                         extra=get_extra_info(default_extra),
                     ),
                 )
@@ -1054,6 +1074,7 @@ class TaskService:
                             log_text=log_text,
                             verified_job_info=verified_job_info,
                             success=False,
+                            gpu_model_count=gpu_model_count,
                             clear_verified_job_info=True,
                             clear_verified_job_reason=ResetVerifiedJobReason.POD_NOT_RUNNING,
                         )
@@ -1088,6 +1109,7 @@ class TaskService:
                             log_text=log_text,
                             verified_job_info=verified_job_info,
                             success=False,
+                            gpu_model_count=gpu_model_count,
                             clear_verified_job_info=False,
                         )
                     
@@ -1106,37 +1128,34 @@ class TaskService:
                             clear_verified_job_info=True,
                         )
                     # In backend, there are 2 scores. actual score and job score.
-                    # job score is the score which executor gets when hashcat/matrix multiply is finished.
+                    # job score is the score which executor gets when matrix multiply is finished.
                     # actual score is the score which executor gets for incentive
                     # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
                     # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and max_score * gpu_count for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    score, job_score = await self._calc_score(
-                        executor_info=executor_info,
-                        max_score=max_score,
-                        gpu_count=gpu_count,
-                        is_rental_check_passed=is_rental_succeed,
-                        is_rented=True,
-                        sysbox_runtime=sysbox_runtime,
-                    )
+                    job_score = 0
+                    actual_score = 1 if is_rental_succeed else 0
+
                     log_msg = (
                         "Executor is already rented."
                         if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so."
                     )
                     log_text = _m(
                         log_msg,
-                        extra=get_extra_info({**default_extra, "score": score, "is_rental_succeed": is_rental_succeed}),
+                        extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed}),
                     )
 
                     return await self._handle_task_result(
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
-                        score=score,
+                        score=actual_score,
                         job_score=job_score,
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=True,
+                        gpu_model_count=gpu_model_count,
                         clear_verified_job_info=False,
+                        sysbox_runtime=sysbox_runtime,
                     )
 
                 # check gpu usages
@@ -1163,6 +1182,7 @@ class TaskService:
                             log_text=log_text,
                             verified_job_info=verified_job_info,
                             success=False,
+                            gpu_model_count=gpu_model_count,
                             clear_verified_job_info=False,
                         )
 
@@ -1186,6 +1206,7 @@ class TaskService:
                             log_text=log_text,
                             verified_job_info=verified_job_info,
                             success=False,
+                            gpu_model_count=gpu_model_count,
                             clear_verified_job_info=False,
                         )
 
@@ -1218,17 +1239,12 @@ class TaskService:
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=False,
+                        gpu_model_count=gpu_model_count,
                         clear_verified_job_info=False,
                     )
 
-                actual_score, job_score = await self._calc_score(
-                    executor_info=executor_info,
-                    max_score=max_score,
-                    gpu_count=gpu_count,
-                    is_rental_check_passed=is_rental_succeed,
-                    is_rented=False,
-                    sysbox_runtime=sysbox_runtime,
-                )
+                job_score = 1
+                actual_score = 1 if is_rental_succeed else 0
 
                 log_text = _m(
                     message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
@@ -1264,6 +1280,7 @@ class TaskService:
                     clear_verified_job_info=False,
                     gpu_model_count=gpu_model_count,
                     gpu_uuids=gpu_uuids,
+                    sysbox_runtime=sysbox_runtime,
                 )
         except Exception as e:
             log_status = "error"
@@ -1287,14 +1304,17 @@ class TaskService:
                 exc_info=True,
             )
 
-            return (
-                None,
-                executor_info,
-                0,
-                0,
-                miner_info.job_batch_id,
-                log_status,
-                log_text,
+            return JobResult(
+                spec=None,
+                executor_info=executor_info,
+                score=0,
+                job_score=0,
+                job_batch_id=miner_info.job_batch_id,
+                log_status=log_status,
+                log_text=str(log_text),
+                gpu_model=None,
+                gpu_count=0,
+                sysbox_runtime=False,
             )
 
     async def _run_task(
