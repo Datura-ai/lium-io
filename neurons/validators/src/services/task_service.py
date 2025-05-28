@@ -434,7 +434,7 @@ class TaskService:
 
         gpu_model = None
         gpu_count = 0
-        if gpu_model_count:
+        if gpu_model_count and ':' in gpu_model_count:
             gpu_model_count_info = gpu_model_count.split(':')
             gpu_model = gpu_model_count_info[0]
             gpu_count = int(gpu_model_count_info[1])
