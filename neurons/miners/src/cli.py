@@ -160,9 +160,7 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
                 executor = executor_dao.findOne(address, port)
                 executor_uuid = executor.uuid
 
-                eligible_executors = await collateral_contract.get_eligible_executors(
-                    []
-                )
+                eligible_executors = await collateral_contract.get_eligible_executors()
 
                 if len(eligible_executors) == 0:
                     executor_dao.delete_by_address_port(address, port)
