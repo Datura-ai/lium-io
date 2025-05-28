@@ -161,7 +161,7 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
                 executor_uuid = executor.uuid
 
                 eligible_executors = await collateral_contract.get_eligible_executors(
-                    [executor_uuid]
+                    []
                 )
 
                 if len(eligible_executors) == 0:
