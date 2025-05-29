@@ -232,7 +232,7 @@ class MinerService:
                         "executor_port": result.executor_info.port,
                         "executor_price": result.executor_info.price,
                         "score": result.score,
-                        "synthetic_job_score": result.score,
+                        "synthetic_job_score": result.job_score,
                         "job_batch_id": result.job_batch_id,
                         "log_status": result.log_status,
                         "log_text": result.log_text,
