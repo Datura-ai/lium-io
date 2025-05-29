@@ -474,9 +474,7 @@ class TaskService:
                 "executor_uuid": executor_info.uuid,
             }
 
-            eligible_executors = await collateral_contract.get_eligible_executors(
-                [executor_info.uuid]
-            )
+            eligible_executors = await collateral_contract.get_eligible_executors()
             
             if executor_info.uuid not in eligible_executors:
                 logger.error(_m(
