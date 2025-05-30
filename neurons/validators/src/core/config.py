@@ -60,12 +60,6 @@ class Settings(BaseSettings):
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x6d4168e6D1660EA268DC1814BEd7dF7C038d4D01'
     )
 
-    DEBUG_CONTRACT_MINERS: list[str] = [
-        "5Df8qGLMd19BXByefGCZFN57fWv6jDm5hUbnQeUTu2iqNBhT",
-        "5Dtbwfafi4cyiDwH5HBFEAWJA913EB6G1rX7wBnfcXwiPssR",
-        "5ECBM9caBAyJPBjVtfw4WGwdytacrZWvvt6i3T8GnqtByRFM"
-    ]
-
     ETHEREUM_VALIDATOR_KEY: str | None = Field(env="ETHEREUM_VALIDATOR_KEY", default=None)
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":

@@ -46,12 +46,6 @@ class Settings(BaseSettings):
         env="COMPUTE_REST_API_URL", default="https://celiumcompute.ai/api"
     )
 
-    DEBUG_CONTRACT_MINERS: list[str] = [
-        "5Df8qGLMd19BXByefGCZFN57fWv6jDm5hUbnQeUTu2iqNBhT",
-        "5Dtbwfafi4cyiDwH5HBFEAWJA913EB6G1rX7wBnfcXwiPssR",
-        "5ECBM9caBAyJPBjVtfw4WGwdytacrZWvvt6i3T8GnqtByRFM"
-    ]
-
     DEBUG_COLLATERAL_CONTRACT: bool = True
 
     ETHEREUM_MINER_KEY: str | None = Field(env="ETHEREUM_MINER_KEY", default=None)

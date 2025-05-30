@@ -34,6 +34,7 @@ from services.redis_service import (
 from services.ssh_service import SSHService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
+from services.collateral_contract_service import CollateralContractService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -60,10 +61,12 @@ class TaskService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
+        collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.validation_service = validation_service
+        self.collateral_contract_service = collateral_contract_service
         self.wallet = settings.get_bittensor_wallet()
 
     async def is_script_running(
@@ -418,6 +421,11 @@ class TaskService:
             logger.warning(log_text)
 
             if clear_verified_job_info:
+                await self.collateral_contract_service.slash_collateral(
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_info=executor_info,
+                )
+
                 await self.redis_service.clear_verified_job_info(
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_id=executor_info.uuid,
@@ -452,188 +460,6 @@ class TaskService:
             sysbox_runtime=sysbox_runtime,
         )
 
-    async def is_eligible_executor(self, miner_hotkey: str, executor_info: ExecutorSSHInfo):
-        try:
-            """
-            Check if it is eligible for a specific executor.
-
-            Args:
-                miner_hotkey: The hotkey of the hotkey.
-                executor_info: The executor information.
-            """
-
-            collateral_contract = get_collateral_contract()
-
-            collateral_contract.miner_address = executor_info.ethereum_address
-
-            default_extra = {
-                "collateral_contract_address": collateral_contract.contract_address,
-                "validator_address": collateral_contract.validator_address,
-                "miner_address": collateral_contract.miner_address,
-                "miner_hotkey": miner_hotkey,
-                "executor_uuid": executor_info.uuid,
-            }
-
-            eligible_executors = await collateral_contract.get_eligible_executors()
-            
-            if executor_info.uuid not in eligible_executors:
-                logger.error(_m(
-                    "Executor is not eligible based on collateral contract and can't calculate score",
-                    extra=get_extra_info(default_extra),
-                ))
-                return False
-            else:
-                logger.info(_m(
-                    "Executor is eligible based on collateral contract",
-                    extra=get_extra_info(default_extra),
-                ))
-            return True
-        except Exception as e:
-            logger.error(
-                _m(
-                    "Error checking executor eligibility",
-                    extra=get_extra_info(
-                        {
-                            **default_extra,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-                exc_info=True,
-            )
-            return False
-
-    async def slash_collateral(self, validator_hotkey: str, miner_hotkey: str, executor_info: ExecutorSSHInfo):
-        try:
-            """
-            Slash collateral for a specific executor.
-
-            Args:
-                validator_hotkey: The hotkey of the validator.
-                miner_hotkey: The hotkey of the hotkey.
-                executor_info: The executor information.
-            """
-
-            collateral_contract = get_collateral_contract()
-
-            collateral_contract.miner_address = executor_info.ethereum_address
-
-            # Log the miner's balance
-            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
-            logger.info(f"Miner balance: {balance} TAO")
-
-            executor_collateral = await collateral_contract.get_executor_collateral(executor_info.uuid)
-            logger.info(f"Collateral amount: {executor_collateral} TAO for this executor {executor_info.uuid}")
-
-            default_extra = {
-                "collateral_contract_address": collateral_contract.contract_address,
-                "validator_address": collateral_contract.validator_address,
-                "miner_address": collateral_contract.miner_address,
-                "miner_hotkey": miner_hotkey,
-                "executor_uuid": executor_info.uuid,
-            }
-
-            # Log and perform the collateral slashing
-            logger.info(
-                _m(
-                    f"Validator {validator_hotkey} is slashing collateral of this executor UUID: {executor_info.uuid}",
-                    extra=get_extra_info(default_extra),
-                )
-            )
-
-            await collateral_contract.slash_collateral(executor_collateral, "slashit", executor_info.uuid)
-            logger.info(
-                _m(
-                    f"Validator {validator_hotkey} slashed collateral of this executor UUID: {executor_info.uuid}",
-                    extra=get_extra_info(default_extra),
-                )
-            )
-        except Exception as e:
-            logger.error(
-                _m(
-                    "Error slashing collateral",
-                    extra=get_extra_info(
-                        {
-                            **default_extra,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-                exc_info=True,
-            )
-
-    async def handle_reclaim_requests(self, validator_hotkey: str, executor_info: ExecutorSSHInfo):
-        try:
-            """
-            Handle reclaim requests for a specific executor.
-
-            Args:
-                validator_hotkey: The hotkey of the validator.
-                executor_info: Information about the executor.
-            """
-
-            collateral_contract = get_collateral_contract()
-
-            reclaim_requests = await collateral_contract.get_reclaim_requests()
-
-            message = (
-                f"Total reclaim requests count: {len(reclaim_requests)} "
-            )
-            logger.info(message)
-
-            for request in reclaim_requests:
-                default_extra = {
-                    "collateral_contract_address": collateral_contract.contract_address,
-                    "validator_hotkey": validator_hotkey,
-                    "executor_uuid": executor_info.uuid,
-                    "request_id": request.reclaim_request_id,
-                    "request_executor_uuid": request.executor_uuid,
-                }
-
-                logger.info(
-                    _m(
-                        "Reclaim request",
-                        extra={
-                            "validator_hotkey": validator_hotkey,
-                            "executor_uuid": executor_info.uuid,
-                            "request_id": request.reclaim_request_id,
-                            "request_executor_uuid": request.executor_uuid,
-                        },
-                    )
-                )
-
-                if request.executor_uuid == executor_info.uuid.replace("-", ""):
-                    rented_machine = await self.redis_service.get_rented_machine(executor_info)
-                    if rented_machine:
-                        message = (
-                            f"Validator {validator_hotkey} denied this reclaim request "
-                            f"since executor is rented for this executor UUID: {executor_info.uuid}"
-                        )
-                        logger.info(message)
-                        await collateral_contract.deny_reclaim_request(
-                            request.reclaim_request_id, message
-                        )
-                    else:
-                        message = (
-                            f"Validator {validator_hotkey} finalized this reclaim request "
-                            f"since there is no rented machine for this executor UUID: {executor_info.uuid}"
-                        )
-                        logger.info(message)
-                        await collateral_contract.finalize_reclaim(request.reclaim_request_id)
-        except Exception as e:
-            logger.error(
-                _m(
-                    "Error handling reclaim requests",
-                    extra=get_extra_info(
-                        {
-                            **default_extra,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-                exc_info=True,
-            )
-
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -643,34 +469,6 @@ class TaskService:
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
     ):
-        default_extra = {
-            "job_batch_id": miner_info.job_batch_id,
-            "miner_hotkey": miner_info.miner_hotkey,
-            "executor_uuid": executor_info.uuid,
-            "executor_ip_address": executor_info.address,
-            "executor_port": executor_info.port,
-            "executor_ssh_username": executor_info.ssh_username,
-            "executor_ssh_port": executor_info.ssh_port,
-            "version": settings.VERSION,
-        }
-        if miner_info.miner_hotkey in settings.DEBUG_CONTRACT_MINERS:
-            await self.handle_reclaim_requests(keypair.ss58_address, executor_info)
-            # is_eligible_executor = await self.is_eligible_executor(miner_info.miner_hotkey, executor_info)
-            
-            # await self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
-            # if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
-            #     return await self._handle_task_result(
-            #         miner_info=miner_info,
-            #         executor_info=executor_info,
-            #         spec=None,
-            #         score=0,
-            #         job_score=0,
-            #         log_text=log_text,
-            #         verified_job_info=verified_job_info,
-            #         success=False,
-            #         clear_verified_job_info=True,
-            #     )
-
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
         prev_spec = verified_job_info.get('spec', '')
         prev_uuids = verified_job_info.get('uuids', '')
@@ -679,11 +477,36 @@ class TaskService:
             RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
         )
 
+        rented_machine = await self.redis_service.get_rented_machine(executor_info)
+        is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
+            miner_hotkey=miner_info.miner_hotkey,
+            executor_info=executor_info,
+        )
+        if is_eligible_executor:
+            await self.collateral_contract_service.handle_reclaim_requests(
+                executor_info=executor_info,
+                is_rented=rented_machine is not None,
+            )
+
+        default_extra = {
+            "job_batch_id": miner_info.job_batch_id,
+            "miner_hotkey": miner_info.miner_hotkey,
+            "executor_uuid": executor_info.uuid,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "executor_ssh_username": executor_info.ssh_username,
+            "executor_ssh_port": executor_info.ssh_port,
+            "is_rental_succeed": is_rental_succeed,
+            "is_eligible_executor": is_eligible_executor,
+            "is_rented": rented_machine is not None,
+            "version": settings.VERSION,
+        }
+
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-          
+
             async with InteractiveShellService(
                 host=executor_info.address,
                 username=executor_info.ssh_username,
@@ -908,7 +731,7 @@ class TaskService:
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=False,
-                        clear_verified_job_info=True,
+                        clear_verified_job_info=False,
                     )
 
                 if prev_spec and prev_spec != gpu_model_count:
@@ -988,8 +811,25 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
+                if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
+                    log_text = _m(
+                        f"Executor is not eligible for collateral contract",
+                        extra=get_extra_info(default_extra),
+                    ),
+
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=None,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        clear_verified_job_info=False,
+                    )
+
                 # check rented status
-                rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running = await self.check_pod_running(
@@ -1007,8 +847,6 @@ class TaskService:
                                 }
                             ),
                         )
-
-                        await self.slash_collateral(keypair.ss58_address, miner_info.miner_hotkey, executor_info)
 
                         return await self._handle_task_result(
                             miner_info=miner_info,
@@ -1057,21 +895,7 @@ class TaskService:
                             gpu_model_count=gpu_model_count,
                             clear_verified_job_info=False,
                         )
-                    
-                    is_eligible_executor = await self.is_eligible_executor(miner_info.miner_hotkey, executor_info)
 
-                    if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=None,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=True,
-                        )
                     # In backend, there are 2 scores. actual score and job score.
                     # job score is the score which executor gets when matrix multiply is finished.
                     # actual score is the score which executor gets for incentive
@@ -1086,7 +910,7 @@ class TaskService:
                     )
                     log_text = _m(
                         log_msg,
-                        extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed}),
+                        extra=get_extra_info({**default_extra, job_score: job_score, "actual_score": actual_score}),
                     )
 
                     return await self._handle_task_result(
