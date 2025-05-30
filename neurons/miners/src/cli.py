@@ -146,11 +146,8 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option(
-    "--reclaim_amount", type=float, prompt="Reclaim Amount", help="Amount of TAO to reclaim collateral"
-)
 @click.option("--reclaim_description", type=str, prompt="Reclaim Description", help="Reclaim Description")
-def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_description: str):
+def remove_executor(address: str, port: int, reclaim_description: str):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
         logger.info("Removing executor (%s:%d)", address, port)
@@ -182,11 +179,13 @@ def remove_executor(address: str, port: int, reclaim_amount:float, reclaim_descr
                 balance = await collateral_contract.get_balance(collateral_contract.miner_address)
                 logger.info("Miner balance: %f TAO", balance)
 
-                message = (
-                    f"Reclaim amount {reclaim_amount} for this executor UUID: {executor_uuid}"
-                    f" since miner {my_key.ss58_address} is removing this executor"
+                reclaim_amount = await collateral_contract.get_executor_collateral(executor_uuid)
+
+                logger.info(
+                    f"Executor {executor_uuid} is being removed by miner {my_key.ss58_address}. "
+                    f"The total collateral of {reclaim_amount} TAO will be reclaimed from the collateral contract."
                 )
-                logger.info(message)
+
                 await collateral_contract.reclaim_collateral(reclaim_amount, reclaim_description, str(executor_uuid))
             except Exception as e:
                 logger.error("Failed to reclaim collateral: %s", str(e))
