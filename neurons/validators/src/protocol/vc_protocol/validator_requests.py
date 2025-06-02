@@ -16,6 +16,7 @@ class RequestType(enum.Enum):
     ResetVerifiedJobRequest = "ResetVerifiedJobRequest"
     DuplicateExecutorsRequest = "DuplicateExecutorsRequest"
     NormalizedScoreRequest = "NormalizedScoreRequest"
+    RevenuePerGpuTypeRequest = "RevenuePerGpuTypeRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -78,8 +79,8 @@ class LogStreamRequest(BaseValidatorRequest):
 
 
 class ResetVerifiedJobReason(int, enum.Enum):
-    DEFAULT                             = 0
-    POD_NOT_RUNNING                     = 1         # container for pod is not running
+    DEFAULT = 0
+    POD_NOT_RUNNING = 1         # container for pod is not running
 
 
 class ResetVerifiedJobRequest(BaseValidatorRequest):
@@ -89,9 +90,15 @@ class ResetVerifiedJobRequest(BaseValidatorRequest):
     executor_uuid: str
     reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
 
+
 class DuplicateExecutorsRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.DuplicateExecutorsRequest
+
 
 class NormalizedScoreRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.NormalizedScoreRequest
     normalized_scores: list[dict]
+
+
+class RevenuePerGpuTypeRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.RevenuePerGpuTypeRequest

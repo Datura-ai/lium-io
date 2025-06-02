@@ -29,7 +29,13 @@ from payload_models.payloads import (
     PodLogsResponseToServer,
     FailedGetPodLogs,
 )
-from protocol.vc_protocol.compute_requests import Error, ExecutorUptimeResponse, RentedMachineResponse, Response
+from protocol.vc_protocol.compute_requests import (
+    Error,
+    ExecutorUptimeResponse,
+    RentedMachineResponse,
+    Response,
+    RevenuePerGpuTypeResponse,
+)
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     DuplicateExecutorsRequest,
@@ -38,6 +44,7 @@ from protocol.vc_protocol.validator_requests import (
     RentedMachineRequest,
     ResetVerifiedJobRequest,
     NormalizedScoreRequest,
+    RevenuePerGpuTypeRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
@@ -137,6 +144,7 @@ class ComputeClient:
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
         asyncio.create_task(self.poll_executors_uptime())
+        asyncio.create_task(self.poll_revenue_per_gpu_type())
 
         try:
             while True:
@@ -374,6 +382,19 @@ class ComputeClient:
             finally:
                 await asyncio.sleep(20 * 60)
 
+    async def poll_revenue_per_gpu_type(self):
+        while True:
+            async with self.lock:
+                logger.info(
+                    _m(
+                        "Request revenue per gpu type",
+                        extra=get_extra_info(self.logging_extra),
+                    )
+                )
+                self.message_queue.append(RevenuePerGpuTypeRequest())
+
+            await asyncio.sleep(60 * 60) ## poll every hour
+
     async def get_executors_uptime(self):
         """Get executors uptime from compute app."""
         default_log_info = get_extra_info(self.logging_extra)
@@ -423,7 +444,7 @@ class ComputeClient:
             if response.status != "success":
                 logger.error(
                     _m(
-                        "received error response from facilitator",
+                        "received error response from compute app",
                         extra=get_extra_info({
                             **self.logging_extra,
                             "response": str(response)
@@ -488,6 +509,25 @@ class ComputeClient:
                         RENTAL_SUCCEED_MACHINE_SET, executor_uuid
                     )
 
+            return
+
+        try:
+            response = pydantic.TypeAdapter(RevenuePerGpuTypeResponse).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            logger.info(
+                _m(
+                    "RevenuePerGpuTypeResponse",
+                    extra=get_extra_info({
+                        **self.logging_extra,
+                        "revenues": response.revenues
+                    }),
+                )
+            )
+            redis_service = self.miner_service.redis_service
+            for gpu_type, revenue in response.revenues.items():
+                await redis_service.set_revenue_per_gpu_type(gpu_type, revenue)
             return
 
         try:
