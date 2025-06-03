@@ -17,6 +17,7 @@ class RequestType(enum.Enum):
     DuplicateExecutorsRequest = "DuplicateExecutorsRequest"
     NormalizedScoreRequest = "NormalizedScoreRequest"
     RevenuePerGpuTypeRequest = "RevenuePerGpuTypeRequest"
+    ScorePortionPerGpuTypeRequest = "ScorePortionPerGpuTypeRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -102,3 +103,8 @@ class NormalizedScoreRequest(BaseValidatorRequest):
 
 class RevenuePerGpuTypeRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.RevenuePerGpuTypeRequest
+
+
+class ScorePortionPerGpuTypeRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.ScorePortionPerGpuTypeRequest
+    portions: dict[str, float]

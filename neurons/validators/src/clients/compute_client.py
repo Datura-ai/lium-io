@@ -45,12 +45,15 @@ from protocol.vc_protocol.validator_requests import (
     ResetVerifiedJobRequest,
     NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
+    ScorePortionPerGpuTypeRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
+from core.config import settings
 from core.validator import Validator
 from core.utils import _m, get_extra_info
+from services.const import GPU_MODEL_RATES
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
@@ -393,7 +396,7 @@ class ComputeClient:
                 )
                 self.message_queue.append(RevenuePerGpuTypeRequest())
 
-            await asyncio.sleep(60 * 60) ## poll every hour
+            await asyncio.sleep(60 * 60)  # poll every hour
 
     async def get_executors_uptime(self):
         """Get executors uptime from compute app."""
@@ -525,9 +528,17 @@ class ComputeClient:
                     }),
                 )
             )
+
+            portions = {}
             redis_service = self.miner_service.redis_service
             for gpu_type, revenue in response.revenues.items():
+                gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
+                portion = gpu_model_rate + settings.TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
+                portions[gpu_type] = portion
                 await redis_service.set_revenue_per_gpu_type(gpu_type, revenue)
+
+            async with self.lock:
+                self.message_queue.append(ScorePortionPerGpuTypeRequest(portions=portions))
             return
 
         try:

@@ -471,6 +471,19 @@ class Validator:
 
     async def calc_job_score(self, total_gpu_model_count_map: dict, job_result: JobResult):
         if job_result.score == 0:
+            logger.info(
+                _m(
+                    "Debug: No need to calc score, score is 0",
+                    extra=get_extra_info({
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "job_batch_id": job_result.job_batch_id,
+                        "gpu_model": job_result.gpu_model,
+                        "gpu_count": job_result.gpu_count,
+                        "score": 0,
+                        "sysbox_runtime": job_result.sysbox_runtime,
+                    })
+                )
+            )
             return 0
 
         gpu_model_rate = GPU_MODEL_RATES.get(job_result.gpu_model, 0)
@@ -480,8 +493,8 @@ class Validator:
             return 0
 
         revenue_per_gpu_type = await self.redis_service.get_revenue_per_gpu_type(job_result.gpu_model)
-
-        score = (gpu_model_rate + settings.TIME_DELTA_FOR_EMISSION * (revenue_per_gpu_type - gpu_model_rate)) * job_result.gpu_count / total_gpu_count
+        score_portion = gpu_model_rate + settings.TIME_DELTA_FOR_EMISSION * (revenue_per_gpu_type - gpu_model_rate)
+        score = score_portion * job_result.gpu_count / total_gpu_count
 
         # get uptime of the executor
         uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
@@ -500,11 +513,13 @@ class Validator:
                 "Debug: calculating score",
                 extra=get_extra_info({
                     "executor_id": str(job_result.executor_info.uuid),
+                    "job_batch_id": job_result.job_batch_id,
                     "gpu_model": job_result.gpu_model,
                     "total_gpu_count": total_gpu_count,
                     "gpu_count": job_result.gpu_count,
                     "gpu_model_rate": gpu_model_rate,
                     "revenue_per_gpu_type": revenue_per_gpu_type,
+                    "score_portion": score_portion,
                     "score": score,
                     "sysbox_runtime": job_result.sysbox_runtime,
                 })
