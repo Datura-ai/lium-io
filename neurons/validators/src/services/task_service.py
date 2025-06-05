@@ -276,7 +276,7 @@ class TaskService:
             logger.info(log_text)
 
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"/usr/bin/docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
+            command = f"/usr/bin/docker run -d --name {container_name} --gpus all -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
             result = await ssh_client.run(command)
             if result.exit_status != 0:
