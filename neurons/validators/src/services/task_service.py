@@ -892,7 +892,7 @@ class TaskService:
                     )
                     log_text = _m(
                         log_msg,
-                        extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed}),
+                        extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed, "job_score": job_score}),
                     )
 
                     return await self._handle_task_result(
