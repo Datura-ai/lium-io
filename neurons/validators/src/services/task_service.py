@@ -279,7 +279,7 @@ class TaskService:
             logger.info(log_text)
 
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"/usr/bin/docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
+            command = f"/usr/bin/docker run -d --name {container_name} --gpus all -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
             result = await ssh_client.run(command)
             if result.exit_status != 0:
@@ -459,6 +459,31 @@ class TaskService:
             gpu_count=gpu_count,
             sysbox_runtime=sysbox_runtime,
         )
+
+    def check_gpu_usage(
+        self,
+        gpu_details: list[dict],
+        gpu_processes: list[dict],
+        default_extra: dict,
+        rented: bool = False,
+    ) -> tuple[bool, str | None]:
+        # check gpu usages
+        for detail in gpu_details:
+            gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
+            gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
+            if len(gpu_processes) > 0 and (gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT):
+                log_text = _m(
+                    "High gpu utilization detected" if not rented else "GPU is using in some other places on the rented machine",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "gpu_utilization": gpu_utilization,
+                        "gpu_memory_utilization": gpu_memory_utilization,
+                        "gpu_processes": gpu_processes,
+                    }),
+                )
+                return False, log_text
+
+        return True, None
 
     async def create_task(
         self,
@@ -871,37 +896,33 @@ class TaskService:
                             break
 
                     if not rented_machine.get("owner_flag", False) and gpu_running_outside:
-                        log_text = _m(
-                            "GPU is using in some other places on the rented machine",
-                            extra=get_extra_info(
-                                {
-                                    **default_extra,
-                                    "gpu_model": gpu_model,
-                                    "gpu_count": gpu_count,
-                                    **process,
-                                }
-                            ),
+                        # check gpu usages
+                        is_gpu_usage_ok, log_text = self.check_gpu_usage(
+                            gpu_details=gpu_details,
+                            gpu_processes=gpu_processes,
+                            default_extra=default_extra,
+                            rented=True,
                         )
-
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            gpu_model_count=gpu_model_count,
-                            clear_verified_job_info=False,
-                        )
+                        if not is_gpu_usage_ok:
+                            return await self._handle_task_result(
+                                miner_info=miner_info,
+                                executor_info=executor_info,
+                                spec=machine_spec,
+                                score=0,
+                                job_score=0,
+                                log_text=log_text,
+                                verified_job_info=verified_job_info,
+                                success=False,
+                                gpu_model_count=gpu_model_count,
+                                clear_verified_job_info=False,
+                            )
 
                     # In backend, there are 2 scores. actual score and job score.
                     # job score is the score which executor gets when matrix multiply is finished.
                     # actual score is the score which executor gets for incentive
                     # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
-                    # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and max_score * gpu_count for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    job_score = 0
+                    # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and 1 for job score, because if both scores are 0, executor will be flagged as invalid in backend.
+                    job_score = 0 if is_rental_succeed else 1
                     actual_score = 1 if is_rental_succeed else 0
 
                     log_msg = (
@@ -910,7 +931,7 @@ class TaskService:
                     )
                     log_text = _m(
                         log_msg,
-                        extra=get_extra_info({**default_extra, job_score: job_score, "actual_score": actual_score}),
+                        extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed, "job_score": job_score}),
                     )
 
                     return await self._handle_task_result(
@@ -928,32 +949,25 @@ class TaskService:
                     )
 
                 # check gpu usages
-                for detail in gpu_details:
-                    gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
-                    gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
-                    if len(gpu_processes) > 0 and (gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT):
-                        log_text = _m(
-                            "High gpu utilization detected",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "gpu_utilization": gpu_utilization,
-                                "gpu_memory_utilization": gpu_memory_utilization,
-                                "gpu_processes": gpu_processes,
-                            }),
-                        )
-
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            gpu_model_count=gpu_model_count,
-                            clear_verified_job_info=False,
-                        )
+                is_gpu_usage_ok, log_text = self.check_gpu_usage(
+                    gpu_details=gpu_details,
+                    gpu_processes=gpu_processes,
+                    default_extra=default_extra,
+                    rented=False,
+                )
+                if not is_gpu_usage_ok:
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=machine_spec,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        gpu_model_count=gpu_model_count,
+                        clear_verified_job_info=False,
+                    )
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress and not rented_machine:

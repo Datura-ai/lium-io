@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     PORTION_FOR_UPTIME: float = 0.05
 
     PORTION_FOR_SYSBOX: float = 0.2
+
+    TIME_DELTA_FOR_EMISSION: float = 0.001
+
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
