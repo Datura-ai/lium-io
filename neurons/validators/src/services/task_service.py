@@ -882,8 +882,8 @@ class TaskService:
                     # job score is the score which executor gets when matrix multiply is finished.
                     # actual score is the score which executor gets for incentive
                     # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
-                    # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and max_score * gpu_count for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    job_score = 0
+                    # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and 1 for job score, because if both scores are 0, executor will be flagged as invalid in backend.
+                    job_score = 0 if is_rental_succeed else 1
                     actual_score = 1 if is_rental_succeed else 0
 
                     log_msg = (
