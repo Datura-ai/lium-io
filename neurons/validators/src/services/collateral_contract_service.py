@@ -1,6 +1,6 @@
 from celium_collateral_contracts import CollateralContract
 import logging
-
+from core.utils import get_collateral_contract
 from core.config import settings
 from core.utils import _m, context, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -12,11 +12,7 @@ class CollateralContractService:
     collateral_contract: CollateralContract
 
     def __init__(self):
-        self.collateral_contract = CollateralContract(
-            network=settings.BITTENSOR_NETWORK,
-            contract_address=settings.COLLATERAL_CONTRACT_ADDRESS,
-            validator_key=settings.ETHEREUM_VALIDATOR_KEY,
-        )
+        self.collateral_contract = get_collateral_contract()
         self.validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
 
     async def is_eligible_executor(self, miner_hotkey: str, executor_info: ExecutorSSHInfo):
@@ -32,7 +28,7 @@ class CollateralContractService:
 
             default_extra = {
                 "collateral_contract_address": self.collateral_contract.contract_address,
-                "validator_address": self.collateral_contract.validator_address,
+                "owner_address": self.collateral_contract.owner_address,
                 "miner_address": self.collateral_contract.miner_address,
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_info.uuid,
@@ -114,13 +110,6 @@ class CollateralContractService:
                         await self.collateral_contract.deny_reclaim_request(
                             request.reclaim_request_id, message
                         )
-                    else:
-                        message = (
-                            f"Validator {self.validator_hotkey} finalized this reclaim request "
-                            f"since there is no rented machine for this executor UUID: {executor_info.uuid}"
-                        )
-                        logger.info(message)
-                        await self.collateral_contract.finalize_reclaim(request.reclaim_request_id)
         except Exception as e:
             logger.error(
                 _m(
@@ -156,7 +145,7 @@ class CollateralContractService:
 
             default_extra = {
                 "collateral_contract_address": self.collateral_contract.contract_address,
-                "validator_address": self.collateral_contract.validator_address,
+                "owner_address": self.collateral_contract.owner_address,
                 "miner_address": self.collateral_contract.miner_address,
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_info.uuid,

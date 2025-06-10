@@ -21,28 +21,6 @@ def cli():
     pass
 
 
-async def get_eth_address_from_hotkey(hotkey: str):
-    if settings.DEBUG_VALIDATOR_ETH_ADDRESS:
-        return settings.DEBUG_VALIDATOR_ETH_ADDRESS
-
-    """Get Ethereum address for a given hotkey"""
-    url = f"{settings.COMPUTE_REST_API_URL}/validator/{hotkey}/eth-address"
-
-    compute_app_rest_api_uri = url.replace("wss", "https").replace("ws", "http")
-    # keypair = settings.get_bittensor_wallet().get_hotkey()
-    # headers = {
-    #     'X-Validator-Signature': f"0x{keypair.sign(hotkey).hex()}"
-    # }
-    async with aiohttp.ClientSession() as session:
-        async with session.get(compute_app_rest_api_uri, timeout=aiohttp.ClientTimeout(total=60)) as response:
-            if response.status != 200:
-                error_msg = await response.text()
-                logger.error(f"Error {response.status}: Unable to retrieve Ethereum address for hotkey. Details: {error_msg}")
-                return None
-            data = await response.json()
-            return data.get("ethereum_address")
-
-
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
@@ -74,7 +52,6 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
         try:
             collateral_contract = get_collateral_contract()
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-            collateral_contract.validator_address = await get_eth_address_from_hotkey(validator)
 
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
             logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
@@ -100,12 +77,9 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float)
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 @click.option(
-    "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
-)
-@click.option(
     "--deposit_amount", type=float, prompt="Deposit Amount", help="Amount of TAO to deposit as collateral"
 )
-def deposit_collateral(address: str, port: int, validator: str, deposit_amount: float):
+def deposit_collateral(address: str, port: int, deposit_amount: float):
     """You can deposit collateral for an existing executor on database"""
     if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
         logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
@@ -117,10 +91,8 @@ def deposit_collateral(address: str, port: int, validator: str, deposit_amount: 
         try:
             executor = executor_dao.findOne(address, port)
             executor_uuid = executor.uuid
-
             collateral_contract = get_collateral_contract()
             my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-            collateral_contract.validator_address = await get_eth_address_from_hotkey(validator)
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
 
             logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
@@ -193,47 +165,6 @@ def remove_executor(address: str, port: int, reclaim_description: str):
     else:
         logger.info("Executor removal cancelled.")
 
-@cli.command()
-@click.option("--address", prompt="IP Address", help="IP address of executor")
-@click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option(
-    "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
-)
-def switch_validator(address: str, port: int, validator: str):
-    """Switch validator"""
-    if click.confirm('Are you sure you want to switch validator? This may lead to unexpected results'):
-        logger.info("Switching validator(%s) of an executor (%s:%d)", validator, address, port)
-        executor_dao = ExecutorDao(session=next(get_db()))
-        try:
-            executor_dao.update(
-                Executor(uuid=uuid.uuid4(), address=address, port=port, validator=validator)
-            )
-
-            async def async_switch_validator():
-                try:
-                    collateral_contract = get_collateral_contract()
-                    my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-                    new_validator_address = await get_eth_address_from_hotkey(validator)
-
-                    await collateral_contract.update_validator_for_miner(
-                        new_validator=new_validator_address
-                    )
-
-                    logger.info("Switched validator on collateral contract successfully.")
-
-                    validator_of_miner = await collateral_contract.get_validator_of_miner()
-                    
-                    logger.info(f"Updated validator of miner from collateral contract: {validator_of_miner}")
-                except Exception as e:
-                    logger.error("Failed in switching validator on collateral contract: %s", str(e))
-            asyncio.run(async_switch_validator())
-        except Exception as e:
-            logger.error("Failed in switching validator: %s", str(e))
-        else:
-            logger.info("Validator switched")
-    else:
-        logger.info("Cancelled.")
-
 
 @cli.command()
 def show_executors():
@@ -271,6 +202,10 @@ def get_eligible_executors():
             collateral_contract = get_collateral_contract()
 
             eligible_executors = await collateral_contract.get_eligible_executors()
+
+            if not eligible_executors:
+                logger.info("No eligible executors found.")
+                return
 
             for executor in eligible_executors:
                 logger.info("Eligible executor: %s", executor)

@@ -93,7 +93,6 @@ _m = StructuredMessage
 def get_collateral_contract(
     contract_address: str = None,
     miner_key: str = None,
-    validator_key: str = "",
 
 ) -> CollateralContract:
     """
@@ -101,7 +100,6 @@ def get_collateral_contract(
 
     Args:
         contract_address (str): Address of the collateral contract.
-        validator_key (str): Ethereum validator key.
         miner_key (str): Optional miner key required for contract operations.
 
     Returns:
@@ -112,4 +110,4 @@ def get_collateral_contract(
     if miner_key is None:
         miner_key = settings.ETHEREUM_MINER_KEY
 
-    return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, validator_key, miner_key)
+    return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, settings.OWNER_ETHEREUM_KEY, miner_key)

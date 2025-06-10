@@ -50,7 +50,7 @@ class Settings(BaseSettings):
 
     ETHEREUM_MINER_KEY: str | None = Field(env="ETHEREUM_MINER_KEY", default=None)
 
-    DEBUG_VALIDATOR_ETH_ADDRESS: str | None = Field(env="DEBUG_VALIDATOR_ETH_ADDRESS", default=None)
+    OWNER_ETHEREUM_KEY: str | None = Field(env="OWNER_ETHEREUM_KEY", default=None)
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

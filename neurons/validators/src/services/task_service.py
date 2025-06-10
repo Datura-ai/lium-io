@@ -13,7 +13,7 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
 from core.config import settings
-from core.utils import _m, context, get_extra_info, get_collateral_contract
+from core.utils import _m, context, get_extra_info
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
     GPU_MODEL_RATES,

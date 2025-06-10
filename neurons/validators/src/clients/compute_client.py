@@ -65,7 +65,6 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
 )
-from core.utils import get_collateral_contract
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +147,6 @@ class ComputeClient:
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
         asyncio.create_task(self.poll_executors_uptime())
-        asyncio.create_task(self.poll_register_ethereum_address())
         asyncio.create_task(self.poll_revenue_per_gpu_type())
 
         try:
@@ -439,54 +437,6 @@ class ComputeClient:
                     exc_info=True
                 )
 
-    async def poll_register_ethereum_address(self):
-        while True:
-            try:
-                await self.register_ethereum_address()
-            except Exception as exc:
-                logger.error(
-                    _m("Exception during get executors uptime from compute app", extra={**self.logging_extra, "error": str(exc)}),
-                    exc_info=True
-                )
-            finally:
-                await asyncio.sleep(200 * 60)
-
-
-    async def register_ethereum_address(self):
-        """Registers an Ethereum address for a validator hotkey with the compute app."""
-        validator_hotkey = self.my_hotkey()
-        collateral_contract = get_collateral_contract()
-        ethereum_address = collateral_contract.validator_address
-        logging_extra = {
-            **self.logging_extra,
-            "validator_hotkey": validator_hotkey,
-            "ethereum_address": ethereum_address,
-        }
-        default_log_info = get_extra_info(logging_extra)
-        start_time = time.time()
-        async with aiohttp.ClientSession() as session:
-            try:
-                url = f"{self.compute_app_rest_api_uri}/register-eth"
-                headers = {
-                    'X-Validator-Signature': f"0x{self.keypair.sign(self.my_hotkey()).hex()}",
-                    'Content-Type': 'application/json'
-                }
-                payload = {"ethereum_address": ethereum_address}
-                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
-                    if response.status == 200:
-                        logger.info(
-                            _m("Successfully registered Ethereum address", extra={**default_log_info, "time_cost": time.time() - start_time}),
-                        )
-                    else:
-                        error_msg = await response.text()
-                        logger.error(
-                            _m("Failed to register Ethereum address with compute app", extra={**default_log_info, "status": response.status, "response": error_msg}),
-                        )
-            except Exception as exc:
-                logger.error(
-                    _m("Exception during registration of Ethereum address with compute app", extra={**default_log_info, "error": str(exc)}),
-                    exc_info=True
-                )
 
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
