@@ -237,5 +237,31 @@ def get_executor_collateral(address: str, port: int):
     asyncio.run(async_get_executor_collateral())
 
 
+@cli.command()
+def get_miner_reclaim_requests():
+    """Get reclaim requests for the current miner from the collateral contract"""
+    import json
+    async def async_get_miner_reclaim_requests():
+        try:
+            collateral_contract = get_collateral_contract()
+            reclaim_requests = await collateral_contract.get_miner_reclaim_requests()
+            if not reclaim_requests:
+                print(json.dumps([]))
+                return
+            # Convert each reclaim request to dict if possible
+            def to_dict(obj):
+                if hasattr(obj, "__dict__"):
+                    return dict(obj.__dict__)
+                elif hasattr(obj, "_asdict"):  # namedtuple
+                    return obj._asdict()
+                else:
+                    return dict(obj)
+            json_output = [to_dict(req) for req in reclaim_requests]
+            print(json.dumps(json_output, indent=4))
+        except Exception as e:
+            logger.error("Failed to get miner reclaim requests: %s", str(e))
+    asyncio.run(async_get_miner_reclaim_requests())
+
+
 if __name__ == "__main__":
     cli()
