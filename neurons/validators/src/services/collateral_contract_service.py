@@ -1,5 +1,6 @@
 from celium_collateral_contracts import CollateralContract
 import logging
+import aiohttp
 from core.utils import get_collateral_contract
 from core.config import settings
 from core.utils import _m, context, get_extra_info
@@ -10,11 +11,9 @@ logger = logging.getLogger(__name__)
 async def get_available_machines():
     """Get Ethereum address for a given hotkey"""
     url = f"{settings.COMPUTE_REST_API_URL}/machines"
-
-    compute_app_rest_api_uri = url.replace("wss", "https").replace("ws", "http")
  
     async with aiohttp.ClientSession() as session:
-        async with session.get(compute_app_rest_api_uri, timeout=aiohttp.ClientTimeout(total=60)) as response:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
             if response.status != 200:
                 error_msg = await response.text()
                 logger.error(f"Error {response.status}: Unable to retrieve available machines. Details: {error_msg}")
@@ -30,29 +29,31 @@ class CollateralContractService:
         self.validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
 
     async def is_eligible_executor(self, miner_hotkey: str, executor_info: ExecutorSSHInfo, gpu_model: str):
-        try:
-            """
+        """
             Check if it is eligible for a specific executor.
 
             Args:
                 miner_hotkey: The hotkey of the hotkey.
                 executor_info: The executor information.
-            """
-            self.collateral_contract.miner_address = executor_info.ethereum_address
+                gpu_model: The gpu model name
+        """
 
-            default_extra = {
-                "collateral_contract_address": self.collateral_contract.contract_address,
-                "owner_address": self.collateral_contract.owner_address,
-                "miner_address": self.collateral_contract.miner_address,
-                "miner_hotkey": miner_hotkey,
-                "executor_uuid": executor_info.uuid,
-            }
+        default_extra = {
+            "collateral_contract_address": self.collateral_contract.contract_address,
+            "owner_address": self.collateral_contract.owner_address,
+            "miner_address": executor_info.ethereum_address,
+            "miner_hotkey": miner_hotkey,
+            "executor_uuid": executor_info.uuid,
+        }
+
+        try:
+            self.collateral_contract.miner_address = executor_info.ethereum_address
 
             eligible_executors = await self.collateral_contract.get_eligible_executors()
 
             if executor_info.uuid not in eligible_executors:
                 logger.error(_m(
-                    "Executor is not eligible based on collateral contract and can't calculate score",
+                    "Executor is not eligible based on collateral contract",
                     extra=get_extra_info(default_extra),
                 ))
                 return False
@@ -65,25 +66,25 @@ class CollateralContractService:
             machines = await get_available_machines()
             if not machines:
                 logger.error("Could not fetch available machines for GPU pricing.")
-                return
+                return False
+
             gpu_entry = next((g for g in machines if g.get("name") == gpu_model), None)
+
             if not gpu_entry:
                 logger.error(f"GPU '{gpu_model}' not found in available machines.")
-                return
-            deposit_amount = gpu_entry.get("base_price")
+                return False
 
+            deposit_amount = gpu_entry.get("base_price")
             executor_collateral = await self.collateral_contract.get_executor_collateral(executor_info.uuid)
             if executor_collateral < deposit_amount:
                 logger.error(
                     _m(
                         "Executor collateral is less than required deposit amount",
-                        extra=get_extra_info(
-                            {
-                                **default_extra,
-                                "executor_collateral": executor_collateral,
-                                "required_deposit_amount": deposit_amount,
-                            }
-                        ),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "executor_collateral": str(executor_collateral),
+                            "required_deposit_amount": str(deposit_amount),
+                        })
                     )
                 )
                 return False
@@ -105,14 +106,13 @@ class CollateralContractService:
             return False
 
     async def handle_reclaim_requests(self, executor_info: ExecutorSSHInfo, is_rented: bool):
-        try:
-            """
+        """
             Handle reclaim requests for a specific executor.
 
             Args:
                 executor_info: Information about the executor.
-            """
-
+        """
+        try:
             reclaim_requests = await self.collateral_contract.get_reclaim_requests()
 
             message = (
@@ -166,15 +166,21 @@ class CollateralContractService:
             )
 
     async def slash_collateral(self, miner_hotkey: str, executor_info: ExecutorSSHInfo):
-        try:
-            """
+        """
             Slash collateral for a specific executor.
 
             Args:
                 miner_hotkey: The hotkey of the hotkey.
                 executor_info: The executor information.
-            """
-
+        """
+        default_extra = {
+            "collateral_contract_address": self.collateral_contract.contract_address,
+            "owner_address": self.collateral_contract.owner_address,
+            "miner_address": self.collateral_contract.miner_address,
+            "miner_hotkey": miner_hotkey,
+            "executor_uuid": executor_info.uuid,
+        }
+        try:
             self.collateral_contract.miner_address = executor_info.ethereum_address
 
             # Log the miner's balance
@@ -183,14 +189,6 @@ class CollateralContractService:
 
             executor_collateral = await self.collateral_contract.get_executor_collateral(executor_info.uuid)
             logger.info(f"Collateral amount: {executor_collateral} TAO for this executor {executor_info.uuid}")
-
-            default_extra = {
-                "collateral_contract_address": self.collateral_contract.contract_address,
-                "owner_address": self.collateral_contract.owner_address,
-                "miner_address": self.collateral_contract.miner_address,
-                "miner_hotkey": miner_hotkey,
-                "executor_uuid": executor_info.uuid,
-            }
 
             # Log and perform the collateral slashing
             logger.info(

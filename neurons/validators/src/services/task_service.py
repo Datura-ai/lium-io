@@ -505,18 +505,17 @@ class TaskService:
         rented_machine = await self.redis_service.get_rented_machine(executor_info)
         
         default_extra = {
-            "job_batch_id": miner_info.job_batch_id,
-            "miner_hotkey": miner_info.miner_hotkey,
-            "executor_uuid": executor_info.uuid,
-            "executor_ip_address": executor_info.address,
-            "executor_port": executor_info.port,
-            "executor_ssh_username": executor_info.ssh_username,
-            "executor_ssh_port": executor_info.ssh_port,
-            "is_rental_succeed": is_rental_succeed,
-            "is_eligible_executor": is_eligible_executor,
-            "is_rented": rented_machine is not None,
-            "version": settings.VERSION,
-        }
+                "job_batch_id": miner_info.job_batch_id,
+                "miner_hotkey": miner_info.miner_hotkey,
+                "executor_uuid": executor_info.uuid,
+                "executor_ip_address": executor_info.address,
+                "executor_port": executor_info.port,
+                "executor_ssh_username": executor_info.ssh_username,
+                "executor_ssh_port": executor_info.ssh_port,
+                "is_rental_succeed": is_rental_succeed,
+                "is_rented": rented_machine is not None,
+                "version": settings.VERSION,
+            }
 
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
@@ -1039,7 +1038,7 @@ class TaskService:
                 
                 if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
                     log_text = _m(
-                        f"Executor is not eligible for collateral contract",
+                        f"Executor is not eligible for collateral contract and cannot set scores for this executor",
                         extra=get_extra_info(default_extra),
                     )
 
