@@ -213,6 +213,6 @@ def get_collateral_contract(
     if contract_address is None:
         contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
     if owner_key is None:
-        owner_key = settings.OWNER_ETHEREUM_KEY
+        owner_key = settings.ETHEREUM_OWNER_KEY
 
     return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, owner_key, miner_key)

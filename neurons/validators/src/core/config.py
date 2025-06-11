@@ -57,13 +57,11 @@ class Settings(BaseSettings):
 
     DEBUG_COLLATERAL_CONTRACT: bool = True
 
-    REQUIRED_TAO_COLLATERAL: float = 0.001
-
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x6d4168e6D1660EA268DC1814BEd7dF7C038d4D01'
     )
 
-    ETHEREUM_VALIDATOR_KEY: str | None = Field(env="ETHEREUM_VALIDATOR_KEY", default=None)
+    ETHEREUM_OWNER_KEY: str | None = Field(env="ETHEREUM_OWNER_KEY", default=None)
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

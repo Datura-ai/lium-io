@@ -110,4 +110,4 @@ def get_collateral_contract(
     if miner_key is None:
         miner_key = settings.ETHEREUM_MINER_KEY
 
-    return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, settings.OWNER_ETHEREUM_KEY, miner_key)
+    return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, settings.ETHEREUM_OWNER_KEY, miner_key)

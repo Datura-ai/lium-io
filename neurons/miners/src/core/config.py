@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     MIN_ALPHA_STAKE: int = Field(env="MIN_ALPHA_STAKE", default=10)
     MIN_TOTAL_STAKE: int = Field(env="MIN_TOTAL_STAKE", default=20000)
 
-    REQUIRED_TAO_COLLATERAL: float = 0.001
+    REQUIRED_TAO_COLLATERAL: float = 0.07
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x6d4168e6D1660EA268DC1814BEd7dF7C038d4D01'
@@ -50,7 +50,7 @@ class Settings(BaseSettings):
 
     ETHEREUM_MINER_KEY: str | None = Field(env="ETHEREUM_MINER_KEY", default=None)
 
-    OWNER_ETHEREUM_KEY: str | None = Field(env="OWNER_ETHEREUM_KEY", default=None)
+    ETHEREUM_OWNER_KEY: str | None = Field(env="ETHEREUM_OWNER_KEY", default=None)
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
