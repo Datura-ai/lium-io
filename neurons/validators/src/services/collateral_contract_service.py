@@ -7,7 +7,21 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 logger = logging.getLogger(__name__)
 
+async def get_available_machines():
+    """Get Ethereum address for a given hotkey"""
+    url = f"{settings.COMPUTE_REST_API_URL}/machines"
 
+    compute_app_rest_api_uri = url.replace("wss", "https").replace("ws", "http")
+ 
+    async with aiohttp.ClientSession() as session:
+        async with session.get(compute_app_rest_api_uri, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            if response.status != 200:
+                error_msg = await response.text()
+                logger.error(f"Error {response.status}: Unable to retrieve available machines. Details: {error_msg}")
+                return None
+            data = await response.json()
+            return data
+            
 class CollateralContractService:
     collateral_contract: CollateralContract
 
@@ -15,7 +29,7 @@ class CollateralContractService:
         self.collateral_contract = get_collateral_contract()
         self.validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
 
-    async def is_eligible_executor(self, miner_hotkey: str, executor_info: ExecutorSSHInfo):
+    async def is_eligible_executor(self, miner_hotkey: str, executor_info: ExecutorSSHInfo, gpu_model: str):
         try:
             """
             Check if it is eligible for a specific executor.
@@ -47,6 +61,33 @@ class CollateralContractService:
                     "Executor is eligible based on collateral contract",
                     extra=get_extra_info(default_extra),
                 ))
+            
+            machines = await get_available_machines()
+            if not machines:
+                logger.error("Could not fetch available machines for GPU pricing.")
+                return
+            gpu_entry = next((g for g in machines if g.get("name") == gpu_model), None)
+            if not gpu_entry:
+                logger.error(f"GPU '{gpu_model}' not found in available machines.")
+                return
+            deposit_amount = gpu_entry.get("base_price")
+
+            executor_collateral = await self.collateral_contract.get_executor_collateral(executor_info.uuid)
+            if executor_collateral < deposit_amount:
+                logger.error(
+                    _m(
+                        "Executor collateral is less than required deposit amount",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "executor_collateral": executor_collateral,
+                                "required_deposit_amount": deposit_amount,
+                            }
+                        ),
+                    )
+                )
+                return False
+                
             return True
         except Exception as e:
             logger.error(

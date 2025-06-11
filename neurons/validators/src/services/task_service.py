@@ -503,16 +503,7 @@ class TaskService:
         )
 
         rented_machine = await self.redis_service.get_rented_machine(executor_info)
-        is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
-            miner_hotkey=miner_info.miner_hotkey,
-            executor_info=executor_info,
-        )
-        if is_eligible_executor:
-            await self.collateral_contract_service.handle_reclaim_requests(
-                executor_info=executor_info,
-                is_rented=rented_machine is not None,
-            )
-
+        
         default_extra = {
             "job_batch_id": miner_info.job_batch_id,
             "miner_hotkey": miner_info.miner_hotkey,
@@ -669,6 +660,19 @@ class TaskService:
                         ),
                     ),
                 )
+
+                is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_info=executor_info,
+                    gpu_model=gpu_model
+                )
+
+                if is_eligible_executor:
+                    await self.collateral_contract_service.handle_reclaim_requests(
+                        executor_info=executor_info,
+                        is_rented=rented_machine is not None,
+                    )
+
 
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
@@ -834,24 +838,6 @@ class TaskService:
                         verified_job_info=verified_job_info,
                         success=False,
                         clear_verified_job_info=True,
-                    )
-
-                if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
-                    log_text = _m(
-                        f"Executor is not eligible for collateral contract",
-                        extra=get_extra_info(default_extra),
-                    ),
-
-                    return await self._handle_task_result(
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
                     )
 
                 # check rented status
@@ -1050,6 +1036,24 @@ class TaskService:
                         extra=get_extra_info(default_extra),
                     ),
                 )
+                
+                if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
+                    log_text = _m(
+                        f"Executor is not eligible for collateral contract",
+                        extra=get_extra_info(default_extra),
+                    )
+
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=None,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        clear_verified_job_info=False,
+                    )
 
                 return await self._handle_task_result(
                     miner_info=miner_info,
