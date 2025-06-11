@@ -263,5 +263,20 @@ def get_miner_reclaim_requests():
     asyncio.run(async_get_miner_reclaim_requests())
 
 
+@cli.command()
+@click.option("--reclaim_request_id", prompt="Reclaim Request ID", type=int, help="ID of the reclaim request to finalize")
+def finalize_reclaim_request(reclaim_request_id: int):
+    """Finalize a reclaim request by its ID"""
+    async def async_finalize_reclaim_request():
+        try:
+            collateral_contract = get_collateral_contract()
+            result = await collateral_contract.finalize_reclaim(reclaim_request_id)
+            logger.info("Successfully finalized reclaim request: %s", reclaim_request_id)
+            print(result)
+        except Exception as e:
+            logger.error("Failed to finalize reclaim request: %s", str(e))
+    asyncio.run(async_finalize_reclaim_request())
+
+
 if __name__ == "__main__":
     cli()
