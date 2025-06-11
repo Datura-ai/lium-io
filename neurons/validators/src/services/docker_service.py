@@ -518,8 +518,6 @@ class DockerService:
                 # Network permission flags (permission to create a network interface inside the container)
                 net_perm_flags = (
                     "--cap-add=NET_ADMIN "
-                    "--cap-add=NET_ADMIN "
-                    "--cap-add=SYS_MODULE "
                     "--sysctl net.ipv4.conf.all.src_valid_mark=1 "
                     "--device /dev/net/tun "
                 )
