@@ -421,11 +421,6 @@ class TaskService:
             logger.warning(log_text)
 
             if clear_verified_job_info:
-                await self.collateral_contract_service.slash_collateral(
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_info=executor_info,
-                )
-
                 await self.redis_service.clear_verified_job_info(
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_id=executor_info.uuid,
@@ -659,19 +654,6 @@ class TaskService:
                         ),
                     ),
                 )
-
-                is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_info=executor_info,
-                    gpu_model=gpu_model
-                )
-
-                if is_eligible_executor:
-                    await self.collateral_contract_service.handle_reclaim_requests(
-                        executor_info=executor_info,
-                        is_rented=rented_machine is not None,
-                    )
-
 
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
@@ -1036,6 +1018,12 @@ class TaskService:
                     ),
                 )
                 
+                is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_info=executor_info,
+                    gpu_model=gpu_model
+                )
+
                 if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
                     log_text = _m(
                         f"Executor is not eligible for collateral contract and cannot set scores for this executor",
