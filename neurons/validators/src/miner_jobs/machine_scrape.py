@@ -786,11 +786,7 @@ def get_gpu_processes(pids: set, containers: list[dict]):
                 "processes_container_name": container_name
             })
         except:
-            processes.append({
-                "processes_pid": pid,
-                "processes_info": None,
-                "processes_container_name": None,
-            })
+            pass
 
     return processes
 
