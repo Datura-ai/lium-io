@@ -417,8 +417,8 @@ class DockerService:
                             extra=get_extra_info(
                                 {
                                     **default_extra,
-                                    "container_name": payload.old_pod_container_delete_request.container_name,
-                                    "volume_name": payload.old_pod_container_delete_request.volume_name,
+                                    "container_name": payload.internal_member_pod_container_delete_request.container_name,
+                                    "volume_name": payload.internal_member_pod_container_delete_request.volume_name,
                                 }
                             ),
                         ),
@@ -429,7 +429,7 @@ class DockerService:
                     logger.info(
                         _m(
                             "Deleted Docker Container",
-                            extra=get_extra_info({**default_extra, "payload": str(payload.old_pod_container_delete_request)}),
+                            extra=get_extra_info({**default_extra, "payload": str(payload.internal_member_pod_container_delete_request)}),
                         ),
                     )
                 # set real-time logging
