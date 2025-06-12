@@ -106,7 +106,7 @@ class CollateralContractService:
                 return False
 
             executor_collateral = await self.collateral_contract.get_executor_collateral(executor_info.uuid)
-            if executor_collateral is None or not isinstance(executor_collateral, (int, float)):
+            if executor_collateral is None:
                 logger.error(
                     _m(
                         "Executor collateral is invalid or missing",
@@ -118,7 +118,7 @@ class CollateralContractService:
                 )
                 return False
 
-            if executor_collateral < deposit_amount:
+            if float(executor_collateral) < float(deposit_amount):
                 logger.error(
                     _m(
                         "Executor collateral is less than required deposit amount",
