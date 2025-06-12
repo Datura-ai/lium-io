@@ -497,10 +497,8 @@ class TaskService:
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
-            "is_rental_succeed": is_rental_succeed,
             "version": settings.VERSION,
         }
-        
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
         prev_spec = verified_job_info.get('spec', '')
         prev_uuids = verified_job_info.get('uuids', '')
@@ -817,8 +815,8 @@ class TaskService:
                         success=False,
                         clear_verified_job_info=True,
                     )
-                rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 # check rented status
+                rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running = await self.check_pod_running(
