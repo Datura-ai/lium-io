@@ -143,14 +143,20 @@ class CollateralContractService:
 
                 if request.executor_uuid == executor_info.uuid.replace("-", ""):
                     if is_rented:
-                        message = (
-                            f"Validator {self.validator_hotkey} denied this reclaim request "
-                            f"since executor is rented for this executor UUID: {executor_info.uuid}"
-                        )
-                        logger.info(message)
-                        await self.collateral_contract.deny_reclaim_request(
-                            request.reclaim_request_id, message
-                        )
+                        # Call backend endpoint instead of contract method
+                        url = f"{settings.COMPUTE_REST_API_URL}/validator/deny-reclaim/{request.reclaim_request_id}"
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                                if response.status != 200:
+                                    logger.error(f"Failed to deny reclaim request {request.reclaim_request_id}: {await response.text()}")
+                                else:
+                                    logger.info(
+                                        _m(
+                                            f"Validator {self.validator_hotkey} denied this reclaim request "
+                                            f"since executor is rented for this executor UUID: {executor_info.uuid}",
+                                            extra=get_extra_info(default_extra),
+                                        )
+                                    )
         except Exception as e:
             logger.error(
                 _m(
@@ -198,13 +204,23 @@ class CollateralContractService:
                 )
             )
 
-            await self.collateral_contract.slash_collateral(executor_collateral, "slashit", executor_info.uuid)
-            logger.info(
-                _m(
-                    f"Validator {self.validator_hotkey} slashed collateral of this executor UUID: {executor_info.uuid}",
-                    extra=get_extra_info(default_extra),
-                )
-            )
+            # Call backend endpoint instead of contract method
+            url = f"{settings.COMPUTE_REST_API_URL}/validator/slash"
+            payload = {
+                "executor_uuid": executor_info.uuid,
+                "miner_address": executor_info.ethereum_address,
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to slash collateral for executor {executor_info.uuid}: {await response.text()}")
+                    else:
+                        logger.info(
+                            _m(
+                                f"Validator {self.validator_hotkey} slashed collateral of this executor UUID: {executor_info.uuid}",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
         except Exception as e:
             logger.error(
                 _m(

@@ -50,8 +50,6 @@ class Settings(BaseSettings):
 
     ETHEREUM_MINER_KEY: str | None = Field(env="ETHEREUM_MINER_KEY", default=None)
 
-    ETHEREUM_OWNER_KEY: str | None = Field(env="ETHEREUM_OWNER_KEY", default=None)
-
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
