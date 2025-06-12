@@ -437,7 +437,6 @@ class ComputeClient:
                     exc_info=True
                 )
 
-
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
         try:

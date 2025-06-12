@@ -489,6 +489,18 @@ class TaskService:
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
     ):
+        default_extra = {
+            "job_batch_id": miner_info.job_batch_id,
+            "miner_hotkey": miner_info.miner_hotkey,
+            "executor_uuid": executor_info.uuid,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "executor_ssh_username": executor_info.ssh_username,
+            "executor_ssh_port": executor_info.ssh_port,
+            "is_rental_succeed": is_rental_succeed,
+            "version": settings.VERSION,
+        }
+        
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
         prev_spec = verified_job_info.get('spec', '')
         prev_uuids = verified_job_info.get('uuids', '')
@@ -496,21 +508,6 @@ class TaskService:
         is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
             RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
         )
-
-        rented_machine = await self.redis_service.get_rented_machine(executor_info)
-        
-        default_extra = {
-                "job_batch_id": miner_info.job_batch_id,
-                "miner_hotkey": miner_info.miner_hotkey,
-                "executor_uuid": executor_info.uuid,
-                "executor_ip_address": executor_info.address,
-                "executor_port": executor_info.port,
-                "executor_ssh_username": executor_info.ssh_username,
-                "executor_ssh_port": executor_info.ssh_port,
-                "is_rental_succeed": is_rental_succeed,
-                "is_rented": rented_machine is not None,
-                "version": settings.VERSION,
-            }
 
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
@@ -820,7 +817,7 @@ class TaskService:
                         success=False,
                         clear_verified_job_info=True,
                     )
-
+                rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 # check rented status
                 if rented_machine and rented_machine.get("container_name", ""):
                     container_name = rented_machine.get("container_name", "")
