@@ -68,10 +68,17 @@ class ContainerBaseRequest(BaseRequest):
     executor_id: str
 
 
+class ContainerDeleteRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteRequest
+    container_name: str
+    volume_name: str
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_keys: list[str] = []
+    internal_member_pod_container_delete_request: ContainerDeleteRequest | None = None
     custom_options: CustomOptions | None = None
     debug: bool | None = None
     volume_name: str | None = None  # when edit pod, volume_name is required
@@ -99,11 +106,6 @@ class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
 
-
-class ContainerDeleteRequest(ContainerBaseRequest):
-    message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteRequest
-    container_name: str
-    volume_name: str
 
 
 class GetPodLogsRequestFromServer(ContainerBaseRequest):

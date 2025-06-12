@@ -401,6 +401,37 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
+                if payload.internal_member_pod_container_delete_request:
+                    command = f"/usr/bin/docker rm {payload.internal_member_pod_container_delete_request.container_name} -f"
+                    await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+
+                    command = f"/usr/bin/docker volume rm {payload.internal_member_pod_container_delete_request.volume_name} -f"
+                    await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+
+                    command = f"/usr/bin/docker image prune -af"
+                    await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+
+                    logger.info(
+                        _m(
+                            "Remove rented machine from redis",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "container_name": payload.old_pod_container_delete_request.container_name,
+                                    "volume_name": payload.old_pod_container_delete_request.volume_name,
+                                }
+                            ),
+                        ),
+                    )
+
+                    # await self.redis_service.remove_rented_machine(executor_info)
+
+                    logger.info(
+                        _m(
+                            "Deleted Docker Container",
+                            extra=get_extra_info({**default_extra, "payload": str(payload.old_pod_container_delete_request)}),
+                        ),
+                    )
                 # set real-time logging
                 self.log_task = asyncio.create_task(
                     self.handle_stream_logs(
