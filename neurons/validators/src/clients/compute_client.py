@@ -588,8 +588,8 @@ class ComputeClient:
                 )
             )
 
-            for gpu_name, templates_json in response.usage_stats.items():
-                await redis_service.add_cache_default_docker_image(gpu_name, templates_json)
+            for gpu_name, templates in response.usage_stats.items():
+                await redis_service.add_cache_default_docker_image(gpu_name, templates)
             return
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:

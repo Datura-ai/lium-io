@@ -142,8 +142,8 @@ class RedisService:
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
 
-    async def add_cache_default_docker_image(self, gpu_name: str, templates_json: list[CacheTemplate]):
-        await self.hset(CACHE_DEFAULT_DOCKER_IMAGE_SET, gpu_name, json.dumps(templates_json))
+    async def add_cache_default_docker_image(self, gpu_name: str, templates: list[CacheTemplate]):
+        await self.hset(CACHE_DEFAULT_DOCKER_IMAGE_SET, gpu_name, json.dumps(templates))
 
     async def get_cache_default_docker_image(self, gpu_name: str):
         return await self.hget(CACHE_DEFAULT_DOCKER_IMAGE_SET, gpu_name)

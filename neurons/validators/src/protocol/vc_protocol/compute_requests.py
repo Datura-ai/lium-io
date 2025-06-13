@@ -39,12 +39,11 @@ class RevenuePerGpuTypeResponse(BaseModel):
     revenues: dict[str, float]
 
 
-class CacheDefaultDockerImageResponse(BaseModel):
-    usage_stats: dict
-
-
 class CacheTemplate(BaseModel):
     docker_image: str
     docker_image_tag: str
     usage_count: int
 
+
+class CacheDefaultDockerImageResponse(BaseModel):
+    usage_stats: dict[str, list[CacheTemplate]]
