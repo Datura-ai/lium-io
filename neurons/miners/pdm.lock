@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:c91cc4826b1bdf54cb651d7390b8f7e47dcb8e521b796da61d1f69c28f20bcea"
+content_hash = "sha256:cb7e85a6f40d4f09d90fc3f34e70b9aedc3c96f4cbbeaeaca62227b495576c11"
 
 [[metadata.targets]]
 requires_python = "==3.11.11"
@@ -391,7 +391,7 @@ files = [
 
 [[package]]
 name = "celium-collateral-contracts"
-version = "1.0.43"
+version = "1.0.44"
 requires_python = "==3.11.11"
 summary = "Collateral Smart Contract for Bittensor"
 groups = ["default"]
@@ -404,8 +404,8 @@ dependencies = [
     "web3>=6.0.0",
 ]
 files = [
-    {file = "celium_collateral_contracts-1.0.43-py3-none-any.whl", hash = "sha256:03dae348d3ee867ed929a6feb8b693040d10c0ee56a1f19eb0a41421495c90b0"},
-    {file = "celium_collateral_contracts-1.0.43.tar.gz", hash = "sha256:cb73eede9841f199848dec8a9ecaa1d7db11a01165a7c79a6eabc1bd7960d1a4"},
+    {file = "celium_collateral_contracts-1.0.44-py3-none-any.whl", hash = "sha256:2ade58042d547b82968fcec2b62efa53da50c455aeced277a396c5b6db8ba4b2"},
+    {file = "celium_collateral_contracts-1.0.44.tar.gz", hash = "sha256:bc62092b00140a7f3f4eb9fe94f81d02286ed568c4966c8e86ac73cef1632be3"},
 ]
 
 [[package]]
