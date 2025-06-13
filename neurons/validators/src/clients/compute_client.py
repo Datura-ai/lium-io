@@ -35,6 +35,7 @@ from protocol.vc_protocol.compute_requests import (
     RentedMachineResponse,
     Response,
     RevenuePerGpuTypeResponse,
+    CacheDefaultDockerImageResponse
 )
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
@@ -46,6 +47,7 @@ from protocol.vc_protocol.validator_requests import (
     NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
     ScorePortionPerGpuTypeRequest,
+    CacheDefaultDockerImageRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
@@ -64,6 +66,7 @@ from services.redis_service import (
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
+    CACHE_DEFAULT_DOCKER_IMAGE_SET,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,6 +151,7 @@ class ComputeClient:
         asyncio.create_task(self.poll_rented_machines())
         asyncio.create_task(self.poll_executors_uptime())
         asyncio.create_task(self.poll_revenue_per_gpu_type())
+        asyncio.create_task(self.poll_cache_default_docker_image())
 
         try:
             while True:
@@ -398,6 +402,19 @@ class ComputeClient:
 
             await asyncio.sleep(60 * 60)  # poll every hour
 
+    async def poll_cache_default_docker_image(self):
+        while True:
+            async with self.lock:
+                logger.info(
+                    _m(
+                        "Request cache default docker image",
+                        extra=get_extra_info(self.logging_extra),
+                    )
+                )
+                self.message_queue.append(CacheDefaultDockerImageRequest())
+
+            await asyncio.sleep(60 * 60)  # poll every hour
+
     async def get_executors_uptime(self):
         """Get executors uptime from compute app."""
         default_log_info = get_extra_info(self.logging_extra)
@@ -555,6 +572,24 @@ class ComputeClient:
         else:
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
+            return
+        
+        try:
+            response = pydantic.TypeAdapter(CacheDefaultDockerImageResponse).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            redis_service = self.miner_service.redis_service
+
+            logger.info(
+                _m(
+                    "Cache default docker image",
+                    extra=get_extra_info({**self.logging_extra, "usage_stats": response.usage_stats}),
+                )
+            )
+
+            for gpu_name, templates_json in response.usage_stats.items():
+                await redis_service.add_cache_default_docker_image(gpu_name, templates_json)
             return
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:

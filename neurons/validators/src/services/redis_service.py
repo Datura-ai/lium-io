@@ -5,7 +5,7 @@ import time
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 from datura.requests.miner_requests import ExecutorSSHInfo
-from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
+from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine, CacheTemplate
 from core.config import settings
 from core.utils import _m
 
@@ -21,6 +21,7 @@ VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
+CACHE_DEFAULT_DOCKER_IMAGE_SET = "cache_default_docker_image"
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,12 @@ class RedisService:
 
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
+
+    async def add_cache_default_docker_image(self, gpu_name: str, templates_json: list[CacheTemplate]):
+        await self.hset(CACHE_DEFAULT_DOCKER_IMAGE_SET, gpu_name, json.dumps(templates_json))
+
+    async def get_cache_default_docker_image(self, gpu_name: str):
+        return await self.hget(CACHE_DEFAULT_DOCKER_IMAGE_SET, gpu_name)
 
     async def get_executor_uptime(self, executor: ExecutorSSHInfo) -> int:
         try:
