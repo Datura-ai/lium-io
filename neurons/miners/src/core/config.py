@@ -41,13 +41,6 @@ class Settings(BaseSettings):
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x6d4168e6D1660EA268DC1814BEd7dF7C038d4D01'
     )
 
-    COMPUTE_APP_URI: str = "wss://celiumcompute.ai"
-    COMPUTE_REST_API_URL: str | None = Field(
-        env="COMPUTE_REST_API_URL", default="https://celiumcompute.ai/api"
-    )
-
-    DEBUG_COLLATERAL_CONTRACT: bool = True
-
     ETHEREUM_MINER_KEY: str | None = Field(env="ETHEREUM_MINER_KEY", default=None)
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
