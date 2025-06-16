@@ -46,6 +46,10 @@ REPOSITORIES = [
 
 LOG_STREAM_INTERVAL = 5  # 5 seconds
 
+DOCKER_VOLUME_PLUGINS = {
+    "s3fs": "mochoa/s3fs-volume-plugin"
+}
+
 
 class DockerService:
     def __init__(
@@ -315,6 +319,50 @@ class DockerService:
             raise_exception=False
         )
 
+    async def create_s3fs_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        log_extra: dict,
+        volume_name: str,
+        access_key: str,
+        secret_key: str,
+        log_tag: str,
+    ):
+        # install docker volume plugin
+        command = f"/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
+        await ssh_client.run(command)
+
+        # disable volume plugin
+        command = f"/usr/bin/docker plugin disable s3fs -f"
+        await ssh_client.run(command)
+
+        # set credentials
+        command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={access_key} AWSSECRETACCESSKEY={secret_key}"
+        await ssh_client.run(command)
+
+        # enable volume plugin
+        command = f"/usr/bin/docker plugin enable s3fs"
+        await ssh_client.run(command)
+
+        # create volume
+        command = f"/usr/bin/docker volume create -d s3fs {volume_name}"
+        return await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Creating docker volume",
+            log_extra=log_extra,
+            raise_exception=True
+        )
+
+    async def clean_s3fs_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+    ):
+        # disable volume plugin
+        command = f"/usr/bin/docker plugin disable s3fs -f"
+        await ssh_client.run(command)
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -526,7 +574,7 @@ class DockerService:
                     command = (
                         f'/usr/bin/docker run -d '
                         f'{("--runtime=sysbox-runc" if payload.is_sysbox else "")} '
-                        f'{net_perm_flags} ' # Network permission flags
+                        f'{net_perm_flags} '  # Network permission flags
                         f'{port_flags} '
                         f'-v "/var/run/docker.sock:/var/run/docker.sock" '
                         f'{volume_flag} '
@@ -542,7 +590,7 @@ class DockerService:
                     command = (
                         f'/usr/bin/docker run -d '
                         f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
-                        f'{net_perm_flags} ' # Network permission flags
+                        f'{net_perm_flags} '  # Network permission flags
                         f'{port_flags} '
                         f'{volume_flag} '
                         f'{entrypoint_flag} '
