@@ -169,15 +169,22 @@ def show_executors():
 
 @cli.command()
 def get_miner_collateral():
-    """Get miner collateral from the collateral contract"""
+    """Get miner collateral by summing up collateral from all registered executors"""
 
     async def async_get_miner_collateral():
         try:
+            executor_dao = ExecutorDao(session=next(get_db()))
+            executors = executor_dao.get_all_executors()
             collateral_contract = get_collateral_contract()
+            total_collateral = 0.0
 
-            final_collateral = await collateral_contract.get_miner_collateral()
+            for executor in executors:
+                executor_uuid = str(executor.uuid)
+                collateral = await collateral_contract.get_executor_collateral(executor_uuid)
+                total_collateral += collateral
+                logger.info("Executor %s collateral: %f TAO", executor_uuid, collateral)
 
-            logger.info("Miner collateral: %f TAO", final_collateral)
+            logger.info("Total miner collateral from all executors: %f TAO", total_collateral)
 
         except Exception as e:
             logger.error("Failed in getting miner collateral: %s", str(e))
