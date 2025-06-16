@@ -736,7 +736,7 @@ class TaskService:
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=False,
-                        clear_verified_job_info=False,
+                        clear_verified_job_info=True,
                     )
 
                 if prev_spec and prev_spec != gpu_model_count:
