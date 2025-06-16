@@ -18,7 +18,6 @@ class RequestType(enum.Enum):
     NormalizedScoreRequest = "NormalizedScoreRequest"
     RevenuePerGpuTypeRequest = "RevenuePerGpuTypeRequest"
     ScorePortionPerGpuTypeRequest = "ScorePortionPerGpuTypeRequest"
-    CacheDefaultDockerImageRequest = "CacheDefaultDockerImageRequest"   
 
 class BaseValidatorRequest(BaseRequest):
     message_type: RequestType
@@ -108,7 +107,3 @@ class RevenuePerGpuTypeRequest(BaseValidatorRequest):
 class ScorePortionPerGpuTypeRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ScorePortionPerGpuTypeRequest
     portions: dict[str, float]
-
-
-class CacheDefaultDockerImageRequest(BaseValidatorRequest):
-    message_type: RequestType = RequestType.CacheDefaultDockerImageRequest

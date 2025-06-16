@@ -647,16 +647,6 @@ class TaskService:
                         ),
                     ),
                 )
-                # pre-pull the mostly used docker images
-                templates_json = await self.redis_service.get_cache_default_docker_image(gpu_model)
-                if templates_json:
-                    templates = json.loads(templates_json)
-                    # Find the template with highest usage count
-                    best_template = max(templates, key=lambda x: x.get('usage_count', 0))
-                    # Log the best template details
-                    logger.info(f"mostly used template selected for GPU '{gpu_model}': {best_template}")
-                    command = f"docker pull {best_template.get('docker_image')}:{best_template.get('docker_image_tag')}"
-                    await shell.ssh_client.run(command)
 
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
