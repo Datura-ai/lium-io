@@ -145,10 +145,11 @@ async def scrape_gpu_metrics(
 async def manage_docker_images(
     compute_rest_app_url: str,
     validator_hotkey: str,
-    executor_id: str,
     program_id: str,
     signature: str,
     min_disk_space_multiplier: float = 3.0,  # Minimum disk space required (3x image size)
+    first_interval: int = 60 * 5,  # Wait before retrying
+    success_interval: int = 2 * 60 * 60,  # Wait before retrying
 ):
     """
     Manages Docker images on the executor by:
@@ -165,6 +166,7 @@ async def manage_docker_images(
         min_disk_space_multiplier (float): Minimum disk space required as multiple of image size
     """
     # Get GPU name using NVML
+    gpu_name = "unknown"
     try:
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Get first GPU
@@ -174,96 +176,104 @@ async def manage_docker_images(
         pynvml.nvmlShutdown()
     except Exception as e:
         logger.error(f"Failed to get GPU name: {e}")
-        gpu_name = "unknown"
 
     backend_url = f"{compute_rest_app_url}/validator/{validator_hotkey}/cache-default-docker-image"
 
     async with aiohttp.ClientSession() as session:
-        try:
-            # Get disk space info
-            disk = psutil.disk_usage('/')
-            available_space = disk.free
+        while True:
+            try:
+                # Get disk space info
+                disk = psutil.disk_usage('/')
+                available_space = disk.free
 
-            # Get templates from backend with GPU name and signature
-            payload = {
-                "gpu_name": gpu_name,
-                "program_id": program_id,
-                "signature": signature,
-                "executor_id": executor_id
-            }
-            
-            async with session.post(backend_url, json=payload) as response:
-                if response.status == 200:
+                # Get templates from backend with GPU name and signature
+                payload = {
+                    "gpu_name": gpu_name,
+                    "program_id": program_id,
+                    "signature": signature
+                }
+                
+                async with session.post(backend_url, json=payload) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to get template. Status: {response.status}")
+                        await asyncio.sleep(first_interval)
+                        continue
+
                     data = await response.json()
                     
                     # Check if no templates were found for the GPU
                     if "message" in data and "No templates found for GPU" in data["message"]:
                         logger.warning(f"No templates found for GPU {gpu_name}")
-                        # Skip Docker pull process and continue to cleanup
-                    else:
-                        # Clean up unused images
-                        try:
-                            # Get all local images
-                            result = subprocess.run(
-                                ['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}'],
-                                capture_output=True,
-                                text=True
-                            )
-                            if result.returncode == 0:
-                                local_images = result.stdout.strip().split('\n')
-                                
-                                # Get repository names from current templates
-                                current_repository = data['docker_image']
-                                
-                                for image in local_images:
-                                    if image and image.split(':')[0] == current_repository and image.split(':')[1] != data['docker_image_tag']:
-                                        try:
-                                            remove_result = subprocess.run(
-                                                ['docker', 'rmi', image],
-                                                capture_output=True,
-                                                text=True
-                                            )
-                                            if remove_result.returncode == 0:
-                                                logger.info(f"Removed unused image: {image}")
-                                            else:
-                                                logger.warning(f"Failed to remove image {image}: {remove_result.stderr}")
-                                        except Exception as e:
-                                            logger.error(f"Error removing image {image}: {e}")
-                        except Exception as e:
-                            logger.error(f"Error during cleanup: {e}")
+                        await asyncio.sleep(first_interval)
+                        continue
 
-                        template = f"{data['docker_image']}:{data['docker_image_tag']}"
-                        logger.info(f"Received most used template: {template} (usage count: {data['usage_count']})")
+                    template = f"{data['docker_image']}:{data['docker_image_tag']}"
+                    logger.info(f"Received most used template: {template}")
+
+                    # Clean up unused images
+                    result = subprocess.run(
+                        ['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}'],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if result.returncode == 0:
+                        local_images = result.stdout.strip().split('\n')
+                        current_repository = data['docker_image']
                         
-                        try:
-                            image_size = data['docker_image_size']
-                            
-                            # Check if we have enough space (3x image size)
-                            if available_space < (image_size * min_disk_space_multiplier):
-                                logger.warning(
-                                    f"Skipping pull of {template} - insufficient disk space. "
-                                    f"Required: {image_size * min_disk_space_multiplier}, "
-                                    f"Available: {available_space}"
-                                )
-                            else:
-                                # Pull the image
-                                pull_result = subprocess.run(
-                                    ['docker', 'pull', template],
+                        for image in local_images:
+                            if not image:
+                                continue
+                                
+                            repo, tag = image.split(':')
+                            if repo == current_repository and tag != data['docker_image_tag']:
+                                remove_result = subprocess.run(
+                                    ['docker', 'rmi', image],
                                     capture_output=True,
                                     text=True
                                 )
-                                if pull_result.returncode == 0:
-                                    logger.info(f"Successfully pulled {template}")
+                                if remove_result.returncode == 0:
+                                    logger.info(f"Removed unused image: {image}")
                                 else:
-                                    logger.error(f"Failed to pull {template}: {pull_result.stderr}")
-                        except Exception as e:
-                            logger.error(f"Error processing template {template}: {e}")
-                else:
-                    logger.error(f"Failed to get template. Status: {response.status}")
-            
-        except Exception as e:
-            logger.error(f"Error in Docker management loop: {e}")
-            await asyncio.sleep(60)  # Wait before retrying
+                                    logger.warning(f"Failed to remove image {image}: {remove_result.stderr}")
+                    else:
+                        logger.warning(f"Failed to list Docker images: {result.stderr}")
+
+                    # Process template and pull image
+                    image_size = data['docker_image_size']
+                    required_space = int(image_size * min_disk_space_multiplier)
+                    
+                    if available_space < required_space:
+                        logger.warning(
+                            f"Skipping pull of {template} - insufficient disk space. "
+                            f"Required: {required_space}, Available: {available_space}"
+                        )
+                        await asyncio.sleep(first_interval)
+                        continue
+
+                    # Pull the image
+                    pull_result = subprocess.run(
+                        ['docker', 'pull', template],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if pull_result.returncode == 0:
+                        logger.info(f"Successfully pulled {template}")
+                        await asyncio.sleep(success_interval)
+                    else:
+                        logger.error(f"Failed to pull {template}: {pull_result.stderr}")
+                        await asyncio.sleep(first_interval)
+
+            except aiohttp.ClientError as e:
+                logger.error(f"Network error: {e}")
+                await asyncio.sleep(first_interval)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Docker command failed: {e.stderr}")
+                await asyncio.sleep(first_interval)
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                await asyncio.sleep(first_interval)
 
 
 @click.command()
@@ -287,7 +297,7 @@ def main(
             #     interval, program_id, signature, executor_id, validator_hotkey, compute_rest_app_url
             # ),
             manage_docker_images(
-                compute_rest_app_url, validator_hotkey, executor_id, program_id, signature
+                compute_rest_app_url, validator_hotkey, program_id, signature
             )
         )
 

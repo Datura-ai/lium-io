@@ -19,6 +19,7 @@ class RequestType(enum.Enum):
     RevenuePerGpuTypeRequest = "RevenuePerGpuTypeRequest"
     ScorePortionPerGpuTypeRequest = "ScorePortionPerGpuTypeRequest"
 
+
 class BaseValidatorRequest(BaseRequest):
     message_type: RequestType
 
