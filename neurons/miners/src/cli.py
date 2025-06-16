@@ -4,7 +4,6 @@ import uuid
 
 import click
 import bittensor
-import aiohttp
 
 from core.db import get_db
 from daos.executor import ExecutorDao
