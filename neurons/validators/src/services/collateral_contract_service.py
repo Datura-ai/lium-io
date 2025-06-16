@@ -1,5 +1,7 @@
 import logging
 import aiohttp
+import requests
+
 from typing import Optional, List, Dict, Any
 
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -38,7 +40,8 @@ class CollateralContractService:
         self, 
         miner_hotkey: str,
         executor_info: ExecutorSSHInfo, 
-        gpu_model: str
+        gpu_model: str,
+        gpu_count: int
     ) -> bool:
         """Check if a specific executor is eligible."""
         self.collateral_contract.miner_address = executor_info.ethereum_address
@@ -52,7 +55,7 @@ class CollateralContractService:
 
         try:
             # Get deposit requirement for GPU model
-            required_deposit_amount = await self._get_gpu_required_deposit(gpu_model, default_extra)
+            required_deposit_amount = await self._get_gpu_required_deposit(gpu_model, gpu_count, default_extra)
             if required_deposit_amount is None:
                 return False
 
@@ -85,7 +88,7 @@ class CollateralContractService:
             return False
 
 
-    async def _get_gpu_required_deposit(self, gpu_model: str, extra: Dict[str, Any]) -> Optional[float]:
+    async def _get_gpu_required_deposit(self, gpu_model: str, gpu_count:int, extra: Dict[str, Any]) -> Optional[float]:
         machines = await get_available_machines()
         if machines is None:
             logger.error("Could not fetch available machines for GPU pricing.")
@@ -96,13 +99,27 @@ class CollateralContractService:
             logger.error(f"GPU '{gpu_model}' not found in available machines.")
             return None
 
-        required_deposit_amount = gpu_entry.get("base_price")
+        gpu_base_price = gpu_entry.get("base_price")
+        rate_float = self.get_tao_price_in_usd()
+        required_deposit_amount = float(gpu_base_price) / rate_float * settings.COLLATERAL_HOURS * gpu_count
+
+        self._log_error(
+            "GPU required deposit amount calculated",
+            extra,
+            gpu_model=gpu_model,
+            required_deposit_amount=required_deposit_amount,
+            gpu_base_price=gpu_base_price,
+            rate_float=rate_float
+        )
+        
         if required_deposit_amount is None or not isinstance(required_deposit_amount, (int, float)):
             self._log_error(
                 "Deposit amount for GPU is invalid or missing",
                 extra,
                 gpu_model=gpu_model,
-                deposit_amount=required_deposit_amount
+                required_deposit_amount=required_deposit_amount,
+                gpu_base_price=gpu_base_price,
+                rate_float=rate_float
             )
             return None
 
@@ -111,3 +128,9 @@ class CollateralContractService:
     def _log_error(self, message: str, extra: Dict[str, Any], exc_info: bool = False, **kwargs):
         full_extra = get_extra_info({**extra, **kwargs})
         logger.error(_m(message, extra=full_extra), exc_info=exc_info)
+
+    def get_tao_price_in_usd(self) -> float:
+        """Get tao price in usd."""
+        response = requests.get(settings.TAO_PRICE_API_URL)
+        rate_float = response.json()["market_data"]["current_price"]["usd"]
+        return rate_float

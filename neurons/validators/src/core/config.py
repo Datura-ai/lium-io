@@ -41,7 +41,8 @@ class Settings(BaseSettings):
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://celiumcompute.ai/api"
     )
-
+    TAO_PRICE_API_URL: str = Field(env="TAO_PRICE_API_URL", default="https://api.coingecko.com/api/v3/coins/bittensor")
+    COLLATERAL_HOURS: int = Field(env="COLLATERAL_HOURS", default=24)
     ENV: str = Field(env="ENV", default="dev")
 
     PORTION_FOR_UPTIME: float = 0.05

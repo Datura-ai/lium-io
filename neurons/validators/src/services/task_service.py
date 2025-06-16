@@ -1016,7 +1016,8 @@ class TaskService:
                 is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
-                    gpu_model=gpu_model
+                    gpu_model=gpu_model,
+                    gpu_count=gpu_count
                 )
 
                 if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
