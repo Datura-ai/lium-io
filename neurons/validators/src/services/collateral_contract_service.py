@@ -3,9 +3,8 @@ import aiohttp
 from typing import Optional, List, Dict, Any
 
 from datura.requests.miner_requests import ExecutorSSHInfo
-from core.utils import _m, context, get_extra_info, get_collateral_contract
+from core.utils import _m, get_extra_info, get_collateral_contract
 from core.config import settings
-from celium_collateral_contracts import CollateralContract
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +51,6 @@ class CollateralContractService:
         }
 
         try:
-            # Check executor eligibility in contract
-            eligible = await self._is_executor_in_contract(executor_info, default_extra)
-            if not eligible:
-                return False
-
             # Get deposit requirement for GPU model
             required_deposit_amount = await self._get_gpu_required_deposit(gpu_model, default_extra)
             if required_deposit_amount is None:
@@ -90,19 +84,6 @@ class CollateralContractService:
             self._log_error("Error checking executor eligibility", default_extra, error=str(e), exc_info=True)
             return False
 
-    async def _is_executor_in_contract(self, executor_info: ExecutorSSHInfo, extra: Dict[str, Any]) -> bool:
-        # Avoid shared mutable state by not assigning miner_address on the shared contract
-        eligible_executors = await self.collateral_contract.get_eligible_executors()
-        if not isinstance(eligible_executors, list):
-            self._log_error("Eligible executors response is not a list", extra)
-            return False
-
-        if executor_info.uuid not in eligible_executors:
-            self._log_error("Executor is not eligible based on collateral contract", extra)
-            return False
-
-        logger.info(_m("Executor is eligible based on collateral contract", extra=get_extra_info(extra)))
-        return True
 
     async def _get_gpu_required_deposit(self, gpu_model: str, extra: Dict[str, Any]) -> Optional[float]:
         machines = await get_available_machines()

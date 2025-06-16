@@ -132,17 +132,7 @@ def remove_executor(address: str, port: int, reclaim_description: str):
                 executor = executor_dao.findOne(address, port)
                 executor_uuid = executor.uuid
 
-                eligible_executors = await collateral_contract.get_eligible_executors()
-                logger.info(f"All eligible executors: {eligible_executors}")
-                logger.info(f"Current executor is eligible: {str(executor_uuid) in eligible_executors}")
-                if not str(executor_uuid) in eligible_executors:
-                    executor_dao.delete_by_address_port(address, port)
-                    logger.info("Removed executor (%s:%d)", address, port)
-                else:
-                    logger.info(
-                        "Need to reclaim deposited collateral from the collateral contract before removing the executor. "
-                        "This ensures that any TAO collateral associated with the executor is properly reclaimed to avoid loss."
-                    )
+                executor_dao.delete_by_address_port(address, port)
             except Exception as e:
                 logger.error("Failed to remove executor: %s", str(e))
                 return
@@ -158,7 +148,7 @@ def remove_executor(address: str, port: int, reclaim_description: str):
                     f"The total collateral of {reclaim_amount} TAO will be reclaimed from the collateral contract."
                 )
 
-                await collateral_contract.reclaim_collateral(reclaim_amount, reclaim_description, str(executor_uuid))
+                await collateral_contract.reclaim_collateral(reclaim_description, str(executor_uuid))
             except Exception as e:
                 logger.error("Failed to reclaim collateral: %s", str(e))
         asyncio.run(async_remove_executor())
@@ -195,26 +185,6 @@ def get_miner_collateral():
 
 
 @cli.command()
-def get_eligible_executors():
-    """Get eligible executors from the collateral contract"""
-    async def async_get_eligible_executors():
-        try:
-            collateral_contract = get_collateral_contract()
-
-            eligible_executors = await collateral_contract.get_eligible_executors()
-
-            if not eligible_executors:
-                logger.info("No eligible executors found.")
-                return
-
-            for executor in eligible_executors:
-                logger.info("Eligible executor: %s", executor)
-
-        except Exception as e:
-            logger.error("Failed in getting eligible executors: %s", str(e))
-    asyncio.run(async_get_eligible_executors())
-
-@cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 def get_executor_collateral(address: str, port: int):
@@ -238,13 +208,13 @@ def get_executor_collateral(address: str, port: int):
 
 
 @cli.command()
-def get_miner_reclaim_requests():
+def get_reclaim_requests():
     """Get reclaim requests for the current miner from the collateral contract"""
     import json
-    async def async_get_miner_reclaim_requests():
+    async def async_get_reclaim_requests():
         try:
             collateral_contract = get_collateral_contract()
-            reclaim_requests = await collateral_contract.get_miner_reclaim_requests()
+            reclaim_requests = await collateral_contract.get_reclaim_events()
             if not reclaim_requests:
                 print(json.dumps([]))
                 return
@@ -260,7 +230,7 @@ def get_miner_reclaim_requests():
             print(json.dumps(json_output, indent=4))
         except Exception as e:
             logger.error("Failed to get miner reclaim requests: %s", str(e))
-    asyncio.run(async_get_miner_reclaim_requests())
+    asyncio.run(async_get_reclaim_requests())
 
 
 @cli.command()
