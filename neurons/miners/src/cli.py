@@ -180,7 +180,7 @@ def get_miner_collateral():
             for executor in executors:
                 executor_uuid = str(executor.uuid)
                 collateral = await collateral_contract.get_executor_collateral(executor_uuid)
-                total_collateral += collateral
+                total_collateral += float(collateral)
                 logger.info("Executor %s collateral: %f TAO", executor_uuid, collateral)
 
             logger.info("Total miner collateral from all executors: %f TAO", total_collateral)
