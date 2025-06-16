@@ -117,42 +117,43 @@ def deposit_collateral(address: str, port: int, deposit_amount: float):
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option("--reclaim_description", type=str, prompt="Reclaim Description", help="Reclaim Description")
-def remove_executor(address: str, port: int, reclaim_description: str):
+def remove_executor(address: str, port: int):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
         logger.info("Removing executor (%s:%d)", address, port)
         executor_dao = ExecutorDao(session=next(get_db()))
-
-        async def async_remove_executor():
-            collateral_contract = get_collateral_contract()
-            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-            try:
-                executor = executor_dao.findOne(address, port)
-                executor_uuid = executor.uuid
-
-                executor_dao.delete_by_address_port(address, port)
-            except Exception as e:
-                logger.error("Failed to remove executor: %s", str(e))
-                return
-
-            try:
-                balance = await collateral_contract.get_balance(collateral_contract.miner_address)
-                logger.info("Miner balance: %f TAO", balance)
-
-                reclaim_amount = await collateral_contract.get_executor_collateral(executor_uuid)
-
-                logger.info(
-                    f"Executor {executor_uuid} is being removed by miner {my_key.ss58_address}. "
-                    f"The total collateral of {reclaim_amount} TAO will be reclaimed from the collateral contract."
-                )
-
-                await collateral_contract.reclaim_collateral(reclaim_description, str(executor_uuid))
-            except Exception as e:
-                logger.error("Failed to reclaim collateral: %s", str(e))
-        asyncio.run(async_remove_executor())
+        try:
+            executor_dao.delete_by_address_port(address, port)
+        except Exception as e:
+            logger.error("Failed in removing an executor: %s", str(e))
+        else:
+            logger.info("Removed an executor(%s:%d)", address, port)
     else:
         logger.info("Executor removal cancelled.")
+
+
+@cli.command()
+@click.option("--executor_uuid", prompt="Executor UUID", help="UUID of the executor to reclaim collateral from")
+def reclaim_collateral(executor_uuid: str):
+    """Reclaim collateral for a specific executor from the contract"""
+    async def async_reclaim_collateral():
+        collateral_contract = get_collateral_contract()
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        try:
+            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
+            logger.info("Miner balance: %f TAO", balance)
+
+            reclaim_amount = await collateral_contract.get_executor_collateral(executor_uuid)
+
+            logger.info(
+                f"Executor {executor_uuid} is being removed by miner {my_key.ss58_address}. "
+                f"The total collateral of {reclaim_amount} TAO will be reclaimed from the collateral contract."
+            )
+
+            await collateral_contract.reclaim_collateral("Manual reclaim", executor_uuid)
+        except Exception as e:
+            logger.error("Failed to reclaim collateral: %s", str(e))
+    asyncio.run(async_reclaim_collateral())
 
 
 @cli.command()
