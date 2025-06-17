@@ -75,7 +75,7 @@ class CollateralContractService:
                 return False
             else:
                 self._log_error(
-                    "Executor collateral meets or exceeds required deposit amount",
+                    f"This executor {executor_info.uuid} is eligible from collateral contract and therefore can have scores",
                     default_extra,
                     executor_collateral=str(executor_collateral),
                     required_deposit_amount=str(required_deposit_amount),

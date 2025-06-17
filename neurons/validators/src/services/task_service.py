@@ -1022,7 +1022,7 @@ class TaskService:
 
                 if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
                     log_text = _m(
-                        f"Executor is not eligible for collateral contract and cannot set scores for this executor",
+                        f"The executor is not eligible according to the collateral contract and therefore cannot have scores set for them.",
                         extra=get_extra_info(default_extra),
                     )
 
