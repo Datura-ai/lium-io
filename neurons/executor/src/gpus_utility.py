@@ -144,12 +144,10 @@ async def scrape_gpu_metrics(
 
 async def manage_docker_images(
     compute_rest_app_url: str,
-    validator_hotkey: str,
-    program_id: str,
-    signature: str,
+    executor_id: str,
     min_disk_space_multiplier: float = 3.0,  # Minimum disk space required (3x image size)
-    first_interval: int = 60 * 5,  # Wait before retrying
-    success_interval: int = 2 * 60 * 60,  # Wait before retrying
+    first_interval: int = 60 * 5,  # Retry interval when errors occur (network, Docker commands, etc.)
+    success_interval: int = 2 * 60 * 60,  # Wait interval after successful Docker pull
 ):
     """
     Manages Docker images on the executor by:
@@ -159,10 +157,7 @@ async def manage_docker_images(
 
     Args:
         compute_rest_app_url (str): URL of the compute REST application
-        validator_hotkey (str): Validator's hotkey
         executor_id (str): Executor ID
-        program_id (str): Program ID
-        signature (str): Signature for verification
         min_disk_space_multiplier (float): Minimum disk space required as multiple of image size
     """
     # Get GPU name using NVML
@@ -177,7 +172,7 @@ async def manage_docker_images(
     except Exception as e:
         logger.error(f"Failed to get GPU name: {e}")
 
-    backend_url = f"{compute_rest_app_url}/validator/{validator_hotkey}/cache-default-docker-image"
+    backend_url = f"{compute_rest_app_url}/executors/{executor_id}/default-docker-image"
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -186,14 +181,7 @@ async def manage_docker_images(
                 disk = psutil.disk_usage('/')
                 available_space = disk.free
 
-                # Get templates from backend with GPU name and signature
-                payload = {
-                    "gpu_name": gpu_name,
-                    "program_id": program_id,
-                    "signature": signature
-                }
-                
-                async with session.post(backend_url, json=payload) as response:
+                async with session.get(backend_url) as response:
                     if response.status != 200:
                         logger.error(f"Failed to get template. Status: {response.status}")
                         await asyncio.sleep(first_interval)
@@ -202,7 +190,7 @@ async def manage_docker_images(
                     data = await response.json()
                     
                     # Check if no templates were found for the GPU
-                    if "message" in data and "No templates found for GPU" in data["message"]:
+                    if not data['docker_image'] or not data['docker_image_tag']:
                         logger.warning(f"No templates found for GPU {gpu_name}")
                         await asyncio.sleep(first_interval)
                         continue
@@ -219,14 +207,13 @@ async def manage_docker_images(
                     
                     if result.returncode == 0:
                         local_images = result.stdout.strip().split('\n')
-                        current_repository = data['docker_image']
                         
                         for image in local_images:
                             if not image:
                                 continue
                                 
                             repo, tag = image.split(':')
-                            if repo == current_repository and tag != data['docker_image_tag']:
+                            if repo == data['docker_image'] and tag != data['docker_image_tag']:
                                 remove_result = subprocess.run(
                                     ['docker', 'rmi', image],
                                     capture_output=True,
@@ -297,7 +284,7 @@ def main(
             #     interval, program_id, signature, executor_id, validator_hotkey, compute_rest_app_url
             # ),
             manage_docker_images(
-                compute_rest_app_url, validator_hotkey, program_id, signature
+                compute_rest_app_url, executor_id
             )
         )
 
