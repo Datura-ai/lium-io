@@ -173,9 +173,13 @@ def get_miner_collateral():
 
     async def async_get_miner_collateral():
         try:
+            collateral_contract = get_collateral_contract()
+            
+            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
+            logger.info("Miner balance: %f TAO", balance)
+
             executor_dao = ExecutorDao(session=next(get_db()))
             executors = executor_dao.get_all_executors()
-            collateral_contract = get_collateral_contract()
             total_collateral = 0.0
 
             for executor in executors:
@@ -218,6 +222,7 @@ def get_executor_collateral(address: str, port: int):
 def get_reclaim_requests():
     """Get reclaim requests for the current miner from the collateral contract"""
     import json
+
     async def async_get_reclaim_requests():
         try:
             collateral_contract = get_collateral_contract()
@@ -226,6 +231,7 @@ def get_reclaim_requests():
                 print(json.dumps([]))
                 return
             # Convert each reclaim request to dict if possible
+
             def to_dict(obj):
                 if hasattr(obj, "__dict__"):
                     return dict(obj.__dict__)
