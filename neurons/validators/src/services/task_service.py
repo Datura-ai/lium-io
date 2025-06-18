@@ -479,6 +479,15 @@ class TaskService:
                 return False, log_text
 
         return True, None
+    
+    def update_task_log_msg(self, log_text: str, is_eligible_executor: bool = False) -> str:
+        """Update the log text based on extra info"""
+        additional_msg = (
+            "The executor is not eligible according to the collateral contract and therefore will not have score very soon. "
+            "Please deposit more collateral to get scores."
+            if not is_eligible_executor else ""
+        )
+        return f"{log_text} {additional_msg}"
 
     async def create_task(
         self,
@@ -912,9 +921,10 @@ class TaskService:
                     job_score = 0 if is_rental_succeed else 1
                     actual_score = 1 if is_rental_succeed else 0
 
-                    log_msg = (
-                        "Executor is already rented."
-                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so."
+                    log_msg = self.update_task_log_msg(
+                        "Executor is already rented." 
+                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so. ",
+                        is_eligible_executor=is_eligible_executor,
                     )
                     log_text = _m(
                         log_msg,
@@ -1017,7 +1027,10 @@ class TaskService:
                 actual_score = 1 if is_rental_succeed else 0
 
                 log_text = _m(
-                    message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
+                    message=self.update_task_log_msg(
+                        "Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
+                        is_eligible_executor=is_eligible_executor,
+                    ),
                     extra=get_extra_info(
                         {
                             **default_extra,
