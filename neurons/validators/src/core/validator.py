@@ -202,9 +202,16 @@ class Validator:
         return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
 
     def get_associated_evm_address(self):
+        if self.subtensor is None:
+            self.set_subtensor()
         node = self.get_node()
         uid = self.get_my_uid()
-        return node.query("SubtensorModule", "AssociatedEvmAddress", [self.netuid, uid]).value
+        associated_evm = node.query("SubtensorModule", "AssociatedEvmAddress", [self.netuid, uid])
+
+        if associated_evm is None:
+            return None
+        else:
+            return associated_evm.value
 
     def get_my_uid(self):
         metagraph = self.get_metagraph()
