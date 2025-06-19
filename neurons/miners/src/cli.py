@@ -144,6 +144,9 @@ def reclaim_collateral(executor_uuid: str):
             logger.info("Miner balance: %f TAO", balance)
 
             reclaim_amount = await collateral_contract.get_executor_collateral(executor_uuid)
+            if float(reclaim_amount) == 0:
+                logger.error(f"Executor {executor_uuid} has no collateral to reclaim")
+                return
 
             logger.info(
                 f"Executor {executor_uuid} is being removed by miner {my_key.ss58_address}. "
@@ -174,7 +177,7 @@ def get_miner_collateral():
     async def async_get_miner_collateral():
         try:
             collateral_contract = get_collateral_contract()
-            
+
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
             logger.info("Miner balance: %f TAO", balance)
 
