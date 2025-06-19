@@ -144,7 +144,6 @@ async def scrape_gpu_metrics(
 
 async def manage_docker_images(
     compute_rest_app_url: str,
-    executor_id: str,
     min_disk_space_multiplier: float = 3.0,  # Minimum disk space required (3x image size)
     first_interval: int = 60 * 5,  # Retry interval when errors occur (network, Docker commands, etc.)
     success_interval: int = 2 * 60 * 60,  # Wait interval after successful Docker pull
@@ -157,7 +156,6 @@ async def manage_docker_images(
 
     Args:
         compute_rest_app_url (str): URL of the compute REST application
-        executor_id (str): Executor ID
         min_disk_space_multiplier (float): Minimum disk space required as multiple of image size
     """
     # Get GPU name using NVML
@@ -166,13 +164,14 @@ async def manage_docker_images(
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Get first GPU
         gpu_name = pynvml.nvmlDeviceGetName(handle)
+        driver_version = pynvml.nvmlSystemGetDriverVersion()
         if isinstance(gpu_name, bytes):
             gpu_name = gpu_name.decode("utf-8")
         pynvml.nvmlShutdown()
     except Exception as e:
         logger.error(f"Failed to get GPU name: {e}")
 
-    backend_url = f"{compute_rest_app_url}/executors/{executor_id}/default-docker-image"
+    backend_url = f"{compute_rest_app_url}/executors/default-docker-image?gpu_model={gpu_name}&driver_version={driver_version}"
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -283,9 +282,7 @@ def main(
             # scrape_gpu_metrics(
             #     interval, program_id, signature, executor_id, validator_hotkey, compute_rest_app_url
             # ),
-            manage_docker_images(
-                compute_rest_app_url, executor_id
-            )
+            manage_docker_images(compute_rest_app_url)
         )
 
     asyncio.run(run_all())
