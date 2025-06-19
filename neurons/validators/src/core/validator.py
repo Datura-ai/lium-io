@@ -201,6 +201,11 @@ class Validator:
         node = self.get_node()
         return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
 
+    def get_associated_evm_address(self):
+        node = self.get_node()
+        uid = self.get_my_uid()
+        return node.query("SubtensorModule", "AssociatedEvmAddress", [self.netuid, uid]).value
+
     def get_my_uid(self):
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
