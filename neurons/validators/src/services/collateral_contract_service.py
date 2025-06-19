@@ -33,7 +33,7 @@ class CollateralContractService:
         try:
             from core.validator import Validator
             validator = Validator()
-            evm_address = validator.get_associated_evm_address()
+            evm_address = validator.get_associated_evm_address(miner_hotkey)
 
             if evm_address is None:
                 self._log_error(

@@ -201,11 +201,15 @@ class Validator:
         node = self.get_node()
         return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
 
-    def get_associated_evm_address(self):
+    def get_uid_for_hotkey(self, hotkey):
+        metagraph = self.get_metagraph()
+        return metagraph.hotkeys.index(hotkey)
+    
+    def get_associated_evm_address(self, hotkey):
         if self.subtensor is None:
             self.set_subtensor()
         node = self.get_node()
-        uid = self.get_my_uid()
+        uid = self.get_uid_for_hotkey(hotkey)
         associated_evm = node.query("SubtensorModule", "AssociatedEvmAddress", [self.netuid, uid])
 
         if associated_evm is None:
