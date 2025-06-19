@@ -2,7 +2,6 @@ import logging
 import requests
 
 from typing import Optional, List, Dict, Any
-from core.validator import Validator
 from datura.requests.miner_requests import ExecutorSSHInfo
 from core.utils import _m, get_extra_info, get_collateral_contract
 from core.config import settings
@@ -15,7 +14,6 @@ class CollateralContractService:
     def __init__(self):
         self.collateral_contract = get_collateral_contract()
         self.validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
-        self.validator = Validator()
 
     async def is_eligible_executor(
         self,
@@ -33,7 +31,9 @@ class CollateralContractService:
         }
 
         try:
-            evm_address = self.validator.get_associated_evm_address()
+            from core.validator import Validator
+            validator = Validator()
+            evm_address = validator.get_associated_evm_address()
 
             if evm_address is None:
                 self._log_error(
