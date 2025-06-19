@@ -5,7 +5,7 @@ from clients.compute_client import ComputeClient
 
 from core.config import settings
 from core.utils import get_logger, wait_for_services_sync
-from services.ioc import ioc
+from services.ioc import initiate_services, ioc
 
 logger = get_logger(__name__)
 wait_for_services_sync()
@@ -13,6 +13,7 @@ wait_for_services_sync()
 
 async def run_forever():
     logger.info("Compute app connector started")
+    await initiate_services()
     keypair = settings.get_bittensor_wallet().get_hotkey()
     compute_app_client = ComputeClient(
         keypair, f"{settings.COMPUTE_APP_URI}/validator/{keypair.ss58_address}", ioc["MinerService"]

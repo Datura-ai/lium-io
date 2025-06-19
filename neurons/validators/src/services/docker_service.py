@@ -515,10 +515,45 @@ class DockerService:
                 volume_flag = f"-v {volume_name}:{container_path}"
                 container_name = f"container_{uuid}"
 
+                # Network permission flags (permission to create a network interface inside the container)
+                net_perm_flags = (
+                    "--cap-add=NET_ADMIN "
+                    "--sysctl net.ipv4.conf.all.src_valid_mark=1 "
+                    "--device /dev/net/tun "
+                )
+
                 if payload.debug:
-                    command = f'/usr/bin/docker run -d {("--runtime=sysbox-runc" if payload.is_sysbox else "")} {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = (
+                        f'/usr/bin/docker run -d '
+                        f'{("--runtime=sysbox-runc" if payload.is_sysbox else "")} '
+                        f'{net_perm_flags} ' # Network permission flags
+                        f'{port_flags} '
+                        f'-v "/var/run/docker.sock:/var/run/docker.sock" '
+                        f'{volume_flag} '
+                        f'{entrypoint_flag} '
+                        f'{env_flags} '
+                        f'{shm_size_flag} '
+                        f'--restart unless-stopped '
+                        f'--name {container_name} '
+                        f'{payload.docker_image} '
+                        f'{startup_commands}'
+                    )
                 else:
-                    command = f'/usr/bin/docker run -d {("--runtime=sysbox-runc" if payload.is_sysbox else "")} {port_flags} {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = (
+                        f'/usr/bin/docker run -d '
+                        f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
+                        f'{net_perm_flags} ' # Network permission flags
+                        f'{port_flags} '
+                        f'{volume_flag} '
+                        f'{entrypoint_flag} '
+                        f'{env_flags} '
+                        f'{shm_size_flag} '
+                        f'--gpus all '
+                        f'--restart unless-stopped '
+                        f'--name {container_name} '
+                        f'{payload.docker_image} '
+                        f'{startup_commands}'
+                    )
 
                 logger.info(f"Running command: {command}")
 
@@ -735,7 +770,7 @@ class DockerService:
                 command = f"/usr/bin/docker volume rm {payload.volume_name} -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
-                command = f"/usr/bin/docker image prune -af"
+                command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
                 logger.info(

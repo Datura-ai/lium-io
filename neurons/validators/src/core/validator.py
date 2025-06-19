@@ -16,14 +16,14 @@ from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
-from services.docker_service import REPOSITORIES, DockerService
+from services.docker_service import DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
 from services.redis_service import PENDING_PODS_PREFIX, NORMALIZED_SCORE_CHANNEL, RedisService
 from services.ssh_service import SSHService
-from services.task_service import TaskService
+from services.task_service import TaskService, JobResult
 from services.matrix_validation_service import ValidationService
-from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION, JOB_TIME_OUT
+from services.const import GPU_MODEL_RATES, TOTAL_BURN_EMISSION, BURNER_EMISSION, JOB_TIME_OUT
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -469,6 +469,65 @@ class Validator:
                 retries += 1
         return "Unknown"
 
+    async def calc_job_score(self, total_gpu_model_count_map: dict, job_result: JobResult):
+        if job_result.score == 0:
+            logger.info(
+                _m(
+                    "Debug: No need to calc score, score is 0",
+                    extra=get_extra_info({
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "job_batch_id": job_result.job_batch_id,
+                        "gpu_model": job_result.gpu_model,
+                        "gpu_count": job_result.gpu_count,
+                        "score": 0,
+                        "sysbox_runtime": job_result.sysbox_runtime,
+                    })
+                )
+            )
+            return 0
+
+        gpu_model_rate = GPU_MODEL_RATES.get(job_result.gpu_model, 0)
+        total_gpu_count = total_gpu_model_count_map.get(job_result.gpu_model, 0)
+
+        if total_gpu_count == 0:
+            return 0
+
+        revenue_per_gpu_type = await self.redis_service.get_revenue_per_gpu_type(job_result.gpu_model)
+        score_portion = gpu_model_rate + settings.TIME_DELTA_FOR_EMISSION * (revenue_per_gpu_type - gpu_model_rate)
+        score = score_portion * job_result.gpu_count / total_gpu_count
+
+        # get uptime of the executor
+        uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
+        # if uptime in the subnet is exceed 5 days, then it'll get max score
+        # if uptime is less than 5 days, then it'll get score based on the uptime
+        # give 50% of max still to avoid 0 score all miners at deployment
+        # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX per cent.
+        five_days_in_minutes = 60 * 24 * 5
+        score = score * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / five_days_in_minutes))
+
+        if job_result.sysbox_runtime:
+            score = score * (1 + settings.PORTION_FOR_SYSBOX)
+
+        logger.info(
+            _m(
+                "Debug: calculating score",
+                extra=get_extra_info({
+                    "executor_id": str(job_result.executor_info.uuid),
+                    "job_batch_id": job_result.job_batch_id,
+                    "gpu_model": job_result.gpu_model,
+                    "total_gpu_count": total_gpu_count,
+                    "gpu_count": job_result.gpu_count,
+                    "gpu_model_rate": gpu_model_rate,
+                    "revenue_per_gpu_type": revenue_per_gpu_type,
+                    "score_portion": score_portion,
+                    "score": score,
+                    "sysbox_runtime": job_result.sysbox_runtime,
+                })
+            )
+        )
+
+        return score
+
     async def sync(self):
         try:
             self.set_subtensor()
@@ -519,19 +578,6 @@ class Validator:
 
                 self.last_job_run_blocks = current_block
 
-                docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORIES)
-                logger.info(
-                    _m(
-                        "Docker Hub Digests: get docker hub digests",
-                        extra=get_extra_info(
-                            {
-                                "job_batch_id": job_batch_id,
-                                "docker_hub_digests": len(docker_hub_digests),
-                            }
-                        ),
-                    ),
-                )
-
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
 
                 task_info = {}
@@ -548,7 +594,6 @@ class Validator:
                                 miner_port=miner.axon_info.port,
                             ),
                             encrypted_files=encrypted_files,
-                            docker_hub_digests=docker_hub_digests,
                         )
                     )
                     for miner in miners
@@ -563,6 +608,9 @@ class Validator:
                     }
 
                 try:
+                    total_gpu_model_count_map = {}
+                    all_job_results = {}
+
                     # Run all jobs with asyncio.wait and set a timeout
                     done, pending = await asyncio.wait(jobs, timeout=JOB_TIME_OUT - 50)
 
@@ -571,24 +619,27 @@ class Validator:
                         try:
                             result = task.result()
                             if result:
+                                miner_hotkey = result.get("miner_hotkey")
+                                job_results: list[JobResult] = result.get("results", [])
+
                                 logger.info(
                                     _m(
                                         "[sync] Job_Result",
                                         extra=get_extra_info(
                                             {
                                                 **self.default_extra,
-                                                "result": result,
+                                                "miner_hotkey": miner_hotkey,
+                                                "results": len(job_results)
                                             }
                                         ),
                                     ),
                                 )
-                                miner_hotkey = result.get("miner_hotkey")
-                                job_score = result.get("score")
 
-                                if miner_hotkey in self.miner_scores:
-                                    self.miner_scores[miner_hotkey] += job_score
-                                else:
-                                    self.miner_scores[miner_hotkey] = job_score
+                                all_job_results[miner_hotkey] = job_results
+
+                                for job_result in job_results:
+                                    total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
+
                             else:
                                 info = task_info.get(task, {})
                                 miner_hotkey = info.get("miner_hotkey", "unknown")
@@ -642,6 +693,24 @@ class Validator:
                             task.cancel()
 
                     open_fd_count = len(os.listdir(f'/proc/self/fd'))
+
+                    logger.info(
+                        _m(
+                            "Total GPU model count",
+                            extra=get_extra_info(
+                                {
+                                    **self.default_extra,
+                                    "job_batch_id": job_batch_id,
+                                    "data": total_gpu_model_count_map,
+                                }
+                            ),
+                        ),
+                    )
+
+                    for miner_hotkey, results in all_job_results.items():
+                        for result in results:
+                            score = await self.calc_job_score(total_gpu_model_count_map, result)
+                            self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
 
                     logger.info(
                         _m(

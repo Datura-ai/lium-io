@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-
+import subprocess
 import aiohttp
 import click
 import pynvml
@@ -142,6 +142,126 @@ async def scrape_gpu_metrics(
             pynvml.nvmlShutdown()
 
 
+async def manage_docker_images(
+    compute_rest_app_url: str,
+    min_disk_space_multiplier: float = 3.0,  # Minimum disk space required (3x image size)
+    first_interval: int = 60 * 5,  # Retry interval when errors occur (network, Docker commands, etc.)
+    success_interval: int = 2 * 60 * 60,  # Wait interval after successful Docker pull
+):
+    """
+    Manages Docker images on the executor by:
+    1. Syncing with backend for most used templates
+    2. Cleaning up unused images
+    3. Ensuring sufficient disk space
+
+    Args:
+        compute_rest_app_url (str): URL of the compute REST application
+        min_disk_space_multiplier (float): Minimum disk space required as multiple of image size
+    """
+    # Get GPU name using NVML
+    gpu_name = "unknown"
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Get first GPU
+        gpu_name = pynvml.nvmlDeviceGetName(handle)
+        driver_version = pynvml.nvmlSystemGetDriverVersion()
+        if isinstance(gpu_name, bytes):
+            gpu_name = gpu_name.decode("utf-8")
+        pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.error(f"Failed to get GPU name: {e}")
+
+    backend_url = f"{compute_rest_app_url}/executors/default-docker-image?gpu_model={gpu_name}&driver_version={driver_version}"
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                # Get disk space info
+                disk = psutil.disk_usage('/')
+                available_space = disk.free
+
+                async with session.get(backend_url) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to get template. Status: {response.status}")
+                        await asyncio.sleep(first_interval)
+                        continue
+
+                    data = await response.json()
+                    
+                    # Check if no templates were found for the GPU
+                    if not data['docker_image'] or not data['docker_image_tag']:
+                        logger.warning(f"No templates found for GPU {gpu_name}")
+                        await asyncio.sleep(first_interval)
+                        continue
+
+                    template = f"{data['docker_image']}:{data['docker_image_tag']}"
+                    logger.info(f"Received most used template: {template}")
+
+                    # Clean up unused images
+                    result = subprocess.run(
+                        ['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}'],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if result.returncode == 0:
+                        local_images = result.stdout.strip().split('\n')
+                        
+                        for image in local_images:
+                            if not image:
+                                continue
+                                
+                            repo, tag = image.split(':')
+                            if repo == data['docker_image'] and tag != data['docker_image_tag']:
+                                remove_result = subprocess.run(
+                                    ['docker', 'rmi', image],
+                                    capture_output=True,
+                                    text=True
+                                )
+                                if remove_result.returncode == 0:
+                                    logger.info(f"Removed unused image: {image}")
+                                else:
+                                    logger.warning(f"Failed to remove image {image}: {remove_result.stderr}")
+                    else:
+                        logger.warning(f"Failed to list Docker images: {result.stderr}")
+
+                    # Process template and pull image
+                    image_size = data['docker_image_size']
+                    required_space = int(image_size * min_disk_space_multiplier)
+                    
+                    if available_space < required_space:
+                        logger.warning(
+                            f"Skipping pull of {template} - insufficient disk space. "
+                            f"Required: {required_space}, Available: {available_space}"
+                        )
+                        await asyncio.sleep(first_interval)
+                        continue
+
+                    # Pull the image
+                    pull_result = subprocess.run(
+                        ['docker', 'pull', template],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if pull_result.returncode == 0:
+                        logger.info(f"Successfully pulled {template}")
+                        await asyncio.sleep(success_interval)
+                    else:
+                        logger.error(f"Failed to pull {template}: {pull_result.stderr}")
+                        await asyncio.sleep(first_interval)
+
+            except aiohttp.ClientError as e:
+                logger.error(f"Network error: {e}")
+                await asyncio.sleep(first_interval)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Docker command failed: {e.stderr}")
+                await asyncio.sleep(first_interval)
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                await asyncio.sleep(first_interval)
+
+
 @click.command()
 @click.option("--program_id", prompt="Program ID", help="Program ID for monitoring")
 @click.option("--signature", prompt="Signature", help="Signature for verification")
@@ -157,11 +277,15 @@ def main(
     validator_hotkey: str,
     compute_rest_app_url: str,
 ):
-    asyncio.run(
-        scrape_gpu_metrics(
-            interval, program_id, signature, executor_id, validator_hotkey, compute_rest_app_url
+    async def run_all():
+        await asyncio.gather(
+            # scrape_gpu_metrics(
+            #     interval, program_id, signature, executor_id, validator_hotkey, compute_rest_app_url
+            # ),
+            manage_docker_images(compute_rest_app_url)
         )
-    )
+
+    asyncio.run(run_all())
 
 
 if __name__ == "__main__":
