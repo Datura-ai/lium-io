@@ -10,6 +10,7 @@ from daos.executor import ExecutorDao
 from models.executor import Executor
 from core.config import settings
 from core.utils import get_collateral_contract
+from services.cli_service import CliService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,6 +19,29 @@ logger = logging.getLogger(__name__)
 @click.group()
 def cli():
     pass
+
+
+@cli.command()
+@click.option("--wallet-name", prompt="Wallet Name", help="Name of the bittensor wallet")
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def associate_eth(wallet_name: str, private_key: str):
+    """Associate a miner's ethereum address with their hotkey."""
+    logger.info("Please enter your Bittensor wallet password to unlock the hotkey for Ethereum association.")
+    from celium_collateral_contracts.common import get_web3_connection
+    w3 = get_web3_connection(settings.BITTENSOR_NETWORK)
+    my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+    cli_service = CliService()
+    success, error, summary = cli_service.associate_miner_ethereum_address(
+        w3=w3,
+        wallet_name=wallet_name,
+        eth_private_key=private_key,
+        hotkey=my_key.ss58_address
+    )
+    logger.info(summary)
+    if success:
+        logger.info("✅ Successfully associated ethereum address with hotkey")
+    else:
+        logger.info(f"❌ Failed to associate: {error}")
 
 
 @cli.command()
@@ -254,11 +278,12 @@ def get_reclaim_requests(private_key: str):
 
 @cli.command()
 @click.option("--reclaim_request_id", prompt="Reclaim Request ID", type=int, help="ID of the reclaim request to finalize")
-def finalize_reclaim_request(reclaim_request_id: int):
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
     """Finalize a reclaim request by its ID"""
     async def async_finalize_reclaim_request():
         try:
-            collateral_contract = get_collateral_contract()
+            collateral_contract = get_collateral_contract(private_key)
             result = await collateral_contract.finalize_reclaim(reclaim_request_id)
             logger.info("Successfully finalized reclaim request: %s", reclaim_request_id)
             print(result)
