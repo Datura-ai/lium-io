@@ -18,18 +18,16 @@ class CollateralContractService:
         self.validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
 
     async def is_eligible_executor(
-        self, 
+        self,
         miner_hotkey: str,
-        executor_info: ExecutorSSHInfo, 
+        executor_info: ExecutorSSHInfo,
         gpu_model: str,
         gpu_count: int
     ) -> bool:
         """Check if a specific executor is eligible."""
-        self.collateral_contract.miner_address = executor_info.ethereum_address
         default_extra = {
             "collateral_contract_address": self.collateral_contract.contract_address,
             "owner_address": self.collateral_contract.owner_address,
-            "miner_address": executor_info.ethereum_address,
             "miner_hotkey": miner_hotkey,
             "executor_uuid": executor_info.uuid,
         }
