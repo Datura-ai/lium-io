@@ -484,11 +484,14 @@ class SubtensorClient:
         while True:
             try:
                 self.set_subtensor()
-                
-                count += 1
-                if count >= 10:
+
+                if count == 0:
                     await self.update_evm_address_map()
-                    count = 0
+
+                count += 1
+                if count > 10:
+                    await self.update_evm_address_map()
+                    count = 1
 
                 # sync every 12 seconds
                 await asyncio.sleep(SYNC_CYCLE)
