@@ -649,24 +649,6 @@ class TaskService:
                     ),
                 )
 
-                if len(port_maps) < MIN_PORT_COUNT:
-                    log_text = _m(
-                        f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}.",
-                        extra=get_extra_info(default_extra),
-                    )
-
-                    return await self._handle_task_result(
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=machine_spec,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
-                )
-
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
                         f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
@@ -1004,6 +986,24 @@ class TaskService:
                         success=False,
                         gpu_model_count=gpu_model_count,
                         clear_verified_job_info=False,
+                    )
+
+                if len(port_maps) < MIN_PORT_COUNT:
+                    log_text = _m(
+                        f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}.",
+                        extra=get_extra_info(default_extra),
+                    )
+
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=machine_spec,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        clear_verified_job_info=False
                     )
 
                 job_score = 1
