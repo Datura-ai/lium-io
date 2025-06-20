@@ -46,6 +46,31 @@ class CollateralContractService:
                 f"Evm address {evm_address} found that is associated to this miner hotkey {miner_hotkey}",
                 default_extra,
             )
+
+            miner_address_on_contract = await self.collateral_contract.get_miner_address_of_executor(executor_info.uuid)
+
+            if miner_address_on_contract is None:
+                self._log_error(
+                    f"No miner address found on contract for executor {executor_info.uuid}",
+                    default_extra,
+                )
+                return False
+            elif miner_address_on_contract == evm_address:
+                self._log_error(
+                    f"Miner has deposited with EVM address {evm_address} on contract for executor {executor_info.uuid}",
+                    default_extra,
+                    miner_address_on_contract=miner_address_on_contract,
+                    evm_address=evm_address,
+                )
+            else:
+                self._log_error(
+                    f"Miner address on contract ({miner_address_on_contract}) does not match EVM address ({evm_address}) for executor {executor_info.uuid}",
+                    default_extra,
+                    miner_address_on_contract=miner_address_on_contract,
+                    evm_address=evm_address,
+                )
+                return False
+
             # Get deposit requirement for GPU model
             required_deposit_amount = await self._get_gpu_required_deposit(gpu_model, gpu_count)
             if required_deposit_amount is None:

@@ -217,11 +217,10 @@ class Validator:
         # associated_evm.value is expected to be a tuple: ((address_bytes,), block_number)
         value = associated_evm.value
         address_bytes_tuple = value[0][0]  # value[0] is a tuple with one element: the address bytes
-        block_number = value[1]
         # Convert bytes tuple to bytes, then to hex string
         address_bytes = bytes(address_bytes_tuple)
         evm_address_hex = '0x' + address_bytes.hex()
-        return (evm_address_hex, block_number)
+        return evm_address_hex
 
     def get_my_uid(self):
         metagraph = self.get_metagraph()
