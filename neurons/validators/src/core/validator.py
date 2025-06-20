@@ -54,6 +54,7 @@ class Validator:
         self.subtensor = None
         self.debug_miner = debug_miner
         self.miner_scores = {}
+        self.evm_address_map = {}  # Map: miner_hotkey -> evm_address
 
         major, minor, patch = map(int, settings.VERSION.split('.'))
         self.version_key = major * 1000 + minor * 100 + patch
@@ -228,6 +229,27 @@ class Validator:
 
     def get_tempo(self):
         return self.subtensor.tempo(self.netuid)
+
+    async def update_evm_address_map(self, miners=None):
+        """Update the map of miner_hotkey -> evm_address for all miners."""
+        if miners is None:
+            miners = self.fetch_miners()
+        for miner in miners:
+            try:
+                evm_address = self.get_associated_evm_address(miner.hotkey)
+                self.evm_address_map[miner.hotkey] = evm_address
+            except Exception as e:
+                logger.error(_m(
+                    f"[update_evm_address_map] Error getting EVM address for miner {miner.hotkey}",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)})
+                ))
+
+        logger.info(
+            _m(
+                "[update_evm_address_map] Updated ethereum addresses map",
+                extra=get_extra_info({**self.default_extra, "evm_address_map": self.evm_address_map})
+            ),
+        )
 
     def fetch_miners(self):
         logger.info(
@@ -582,6 +604,15 @@ class Validator:
                     ),
                 )
             
+            # Update EVM address map for all miners
+            try:
+                asyncio.create_task(self.update_evm_address_map(miners))
+            except Exception as e:
+                logger.error(_m(
+                    "[fetch_miners] Error updating EVM address map",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)})
+                ))
+                    
             current_block = self.get_current_block()
             logger.info(
                 _m(
