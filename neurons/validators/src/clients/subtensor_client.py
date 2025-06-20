@@ -31,6 +31,7 @@ class SubtensorClient:
     _subtensor = None
 
     wallet: "bittensor_wallet"
+    evm_address_map: dict[str, str] = {}
 
     @classmethod
     def get_instance(cls):
@@ -179,6 +180,27 @@ class SubtensorClient:
         address_bytes = bytes(address_bytes_tuple)
         evm_address_hex = '0x' + address_bytes.hex()
         return evm_address_hex
+
+    async def update_evm_address_map(self, miners=None):
+        """Update the map of miner_hotkey -> evm_address for all miners."""
+        if miners is None:
+            miners = self.fetch_miners()
+        for miner in miners:
+            try:
+                evm_address = self.get_associated_evm_address(miner.hotkey)
+                self.evm_address_map[miner.hotkey] = evm_address
+            except Exception as e:
+                logger.error(_m(
+                    f"[update_evm_address_map] Error getting EVM address for miner {miner.hotkey}",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)})
+                ))
+
+        logger.info(
+            _m(
+                "[update_evm_address_map] Updated ethereum addresses map",
+                extra=get_extra_info({**self.default_extra, "evm_address_map": self.evm_address_map})
+            ),
+        )
 
     def get_my_uid(self):
         return self.get_uid_for_hotkey(self.wallet.hotkey.ss58_address)
@@ -458,9 +480,15 @@ class SubtensorClient:
         return "Unknown"
 
     async def _warm_up_subtensor(self):
+        count = 0
         while True:
             try:
                 self.set_subtensor()
+                
+                count += 1
+                if count >= 10:
+                    await self.update_evm_address_map()
+                    count = 0
 
                 # sync every 12 seconds
                 await asyncio.sleep(SYNC_CYCLE)
