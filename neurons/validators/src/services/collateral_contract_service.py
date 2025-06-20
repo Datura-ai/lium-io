@@ -47,7 +47,7 @@ class CollateralContractService:
                 default_extra,
             )
             # Get deposit requirement for GPU model
-            required_deposit_amount = await self._get_gpu_required_deposit(gpu_model, gpu_count, default_extra)
+            required_deposit_amount = await self._get_gpu_required_deposit(gpu_model, gpu_count)
             if required_deposit_amount is None:
                 return False
 
@@ -80,7 +80,7 @@ class CollateralContractService:
             return False
 
 
-    async def _get_gpu_required_deposit(self, gpu_model: str, gpu_count:int, extra: Dict[str, Any]) -> Optional[float]:
+    async def _get_gpu_required_deposit(self, gpu_model: str, gpu_count:int) -> Optional[float]:
         unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT[gpu_model]
         required_deposit_amount = unit_tao_amount * gpu_count * settings.COLLATERAL_DAYS
         return float(required_deposit_amount)
