@@ -1,33 +1,21 @@
 import asyncio
 import json
 import os
-from datetime import datetime
-from typing import TYPE_CHECKING
-import random
-
-import bittensor
-import numpy as np
-from bittensor.utils.weight_utils import (
-    convert_weights_and_uids_for_emit,
-    process_weights_for_netuid,
-)
 from payload_models.payloads import MinerJobRequestPayload
-from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
+from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import PENDING_PODS_PREFIX, NORMALIZED_SCORE_CHANNEL, RedisService
+from services.redis_service import PENDING_PODS_PREFIX, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService, JobResult
 from services.matrix_validation_service import ValidationService
 from services.collateral_contract_service import CollateralContractService
-from services.const import GPU_MODEL_RATES, TOTAL_BURN_EMISSION, BURNER_EMISSION, JOB_TIME_OUT
+from services.const import GPU_MODEL_RATES, JOB_TIME_OUT
 
-if TYPE_CHECKING:
-    from bittensor_wallet import bittensor_wallet
 
 logger = get_logger(__name__)
 
@@ -37,28 +25,18 @@ MINER_SCORES_KEY = "miner_scores"
 
 
 class Validator:
-    wallet: "bittensor_wallet"
-    netuid: int
-    subtensor: bittensor.Subtensor
-
-    def __init__(self, debug_miner=None):
-        self.config = settings.get_bittensor_config()
-
-        self.wallet = settings.get_bittensor_wallet()
-        self.netuid = settings.BITTENSOR_NETUID
+    def __init__(self):
 
         self.should_exit = False
         self.last_job_run_blocks = 0
         self.default_extra = {}
 
-        self.subtensor = None
-        self.debug_miner = debug_miner
         self.miner_scores = {}
 
-        major, minor, patch = map(int, settings.VERSION.split('.'))
-        self.version_key = major * 1000 + minor * 100 + patch
-
     async def initiate_services(self):
+        # initiate subtensor client
+        self.subtensor_client = SubtensorClient.get_instance()
+
         ssh_service = SSHService()
         self.redis_service = RedisService()
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
@@ -82,7 +60,7 @@ class Validator:
 
         # init miner_scores
         try:
-            if await self.should_set_weights():
+            if await self.subtensor_client.should_set_weights():
                 self.miner_scores = {}
             else:
                 miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
@@ -119,379 +97,6 @@ class Validator:
                 ),
             ),
         )
-        
-    def set_subtensor(self):
-        try:
-            if (
-                self.subtensor
-                and self.subtensor.substrate
-                and self.subtensor.substrate.ws
-                and self.subtensor.substrate.ws.state is WebSocketClientState.OPEN
-            ):
-                return
-
-            logger.info(
-                _m(
-                    "Getting subtensor",
-                    extra=get_extra_info(self.default_extra),
-                ),
-            )
-            subtensor = bittensor.subtensor(config=self.config)
-
-            # check registered
-            self.check_registered(subtensor)
-
-            self.subtensor = subtensor
-        except Exception as e:
-            logger.info(
-                _m(
-                    "[Error] Getting subtensor",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-            )
-
-    def check_registered(self, subtensor: bittensor.subtensor):
-        try:
-            if not subtensor.is_hotkey_registered(
-                netuid=self.netuid,
-                hotkey_ss58=self.wallet.get_hotkey().ss58_address,
-            ):
-                logger.error(
-                    _m(
-                        f"[check_registered] Wallet: {self.wallet} is not registered on netuid {self.netuid}.",
-                        extra=get_extra_info(self.default_extra),
-                    ),
-                )
-                exit()
-            logger.info(
-                _m(
-                    "[check_registered] Validator is registered",
-                    extra=get_extra_info(self.default_extra),
-                ),
-            )
-        except Exception as e:
-            logger.error(
-                _m(
-                    "[check_registered] Checking validator registered failed",
-                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
-                ),
-            )
-
-    def get_metagraph(self):
-        return self.subtensor.metagraph(netuid=self.netuid)
-
-    def get_node(self):
-        # return SubstrateInterface(url=self.config.subtensor.chain_endpoint)
-        return self.subtensor.substrate
-
-    def get_current_block(self):
-        node = self.get_node()
-        return node.query("System", "Number", []).value
-
-    def get_weights_rate_limit(self):
-        node = self.get_node()
-        return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
-
-    def get_last_mechansim_step_block(self):
-        node = self.get_node()
-        return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
-
-    def get_uid_for_hotkey(self, hotkey):
-        metagraph = self.get_metagraph()
-        return metagraph.hotkeys.index(hotkey)
-    
-    def get_associated_evm_address(self, hotkey):
-        if self.subtensor is None:
-            self.set_subtensor()
-        node = self.get_node()
-        uid = self.get_uid_for_hotkey(hotkey)
-        associated_evm = node.query("SubtensorModule", "AssociatedEvmAddress", [self.netuid, uid])
-
-        if associated_evm is None or associated_evm.value is None:
-            return None
-        # associated_evm.value is expected to be a tuple: ((address_bytes,), block_number)
-        value = associated_evm.value
-        address_bytes_tuple = value[0][0]  # value[0] is a tuple with one element: the address bytes
-        # Convert bytes tuple to bytes, then to hex string
-        address_bytes = bytes(address_bytes_tuple)
-        evm_address_hex = '0x' + address_bytes.hex()
-        return evm_address_hex
-
-    def get_my_uid(self):
-        metagraph = self.get_metagraph()
-        return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
-
-    def get_tempo(self):
-        return self.subtensor.tempo(self.netuid)
-
-    def fetch_miners(self):
-        logger.info(
-            _m(
-                "[fetch_miners] Fetching miners",
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
-
-        if self.debug_miner:
-            miners = [self.debug_miner]
-        else:
-            metagraph = self.get_metagraph()
-            miners = [
-                neuron
-                for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
-            ]
-        logger.info(
-            _m(
-                f"[fetch_miners] Found {len(miners)} miners",
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
-        return miners
-
-    async def set_weights(self, miners):
-        logger.info(
-            _m(
-                "[set_weights] scores",
-                extra=get_extra_info(
-                    {
-                        **self.default_extra,
-                        **self.miner_scores,
-                    }
-                ),
-            ),
-        )
-
-        if not self.miner_scores:
-            logger.info(
-                _m(
-                    "[set_weights] No miner scores available, skipping set_weights.",
-                    extra=get_extra_info(self.default_extra),
-                ),
-            )
-            return
-
-        uids = np.zeros(len(miners), dtype=np.int64)
-        weights = np.zeros(len(miners), dtype=np.float32)
-
-        last_mechansim_step_block = self.get_last_mechansim_step_block()
-        main_burner = random.Random(last_mechansim_step_block).choice(settings.BURNERS)
-        logger.info(
-            _m(
-                "[set_weights] main burner",
-                extra=get_extra_info({
-                    "last_mechansim_step_block": last_mechansim_step_block,
-                    "main_burner": main_burner,
-                }),
-            ),
-        )
-        other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
-
-        metagraph = self.get_metagraph()
-        miner_hotkeys = []
-        total_score = sum(self.miner_scores.values())
-        if total_score <= 0:
-            uids[0] = main_burner
-            weights[0] = 1 - (len(settings.BURNERS) - 1) * BURNER_EMISSION
-            miner_hotkeys.append(metagraph.hotkeys[main_burner])
-            for ind, uid in enumerate(other_burners):
-                uids[ind + 1] = uid
-                weights[ind + 1] = BURNER_EMISSION
-                miner_hotkeys.append(metagraph.hotkeys[uid])
-        else:
-            for ind, miner in enumerate(miners):
-                uids[ind] = miner.uid
-                miner_hotkeys.append(metagraph.hotkeys[miner.uid])
-                if miner.uid == main_burner:
-                    weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
-                elif miner.uid in other_burners:
-                    weights[ind] = BURNER_EMISSION
-                else:
-                    weights[ind] = (1 - TOTAL_BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
-
-            # uids[ind] = miner.uid
-            # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
-
-        logger.debug(
-            _m(
-                f"[set_weights] uids: {uids} weights: {weights}",
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
-        normalized_scores = [
-            {"uid": int(uid), "weight": float(weight), "miner_hotkey": miner_hotkey}
-            for uid, weight, miner_hotkey in zip(uids, weights, miner_hotkeys)
-        ]
-        message = {
-            "normalized_scores": normalized_scores,
-        }
-        await self.redis_service.publish(NORMALIZED_SCORE_CHANNEL, message)
-
-        processed_uids, processed_weights = process_weights_for_netuid(
-            uids=uids,
-            weights=weights,
-            netuid=self.netuid,
-            subtensor=self.subtensor,
-            metagraph=metagraph,
-        )
-
-        logger.info(
-            _m(
-                f"[set_weights] processed_uids: {processed_uids} processed_weights: {processed_weights}",
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
-
-        uint_uids, uint_weights = convert_weights_and_uids_for_emit(
-            uids=processed_uids, weights=processed_weights
-        )
-
-        logger.info(
-            _m(
-                f"[set_weights] uint_uids: {uint_uids} uint_weights: {uint_weights}",
-                extra=get_extra_info({
-                    **self.default_extra,
-                    "version_key": self.version_key,
-                }),
-            ),
-        )
-
-        result, msg = self.subtensor.set_weights(
-            wallet=self.wallet,
-            netuid=self.netuid,
-            uids=uint_uids,
-            weights=uint_weights,
-            version_key=self.version_key,
-            wait_for_finalization=False,
-            wait_for_inclusion=False,
-        )
-        if result is True:
-            logger.info(
-                _m(
-                    "[set_weights] set weights successfully",
-                    extra=get_extra_info(self.default_extra),
-                ),
-            )
-        else:
-            logger.error(
-                _m(
-                    "[set_weights] set weights failed",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "msg": msg,
-                        }
-                    ),
-                ),
-            )
-
-        self.miner_scores = {}
-
-    def get_last_update(self, block):
-        try:
-            node = self.get_node()
-            last_update_blocks = (
-                block
-                - node.query("SubtensorModule", "LastUpdate", [self.netuid]).value[
-                    self.get_my_uid()
-                ]
-            )
-        except Exception as e:
-            logger.error(
-                _m(
-                    "[get_last_update] Error getting last update",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-            )
-            # means that the validator is not registered yet. The validator should break if this is the case anyways
-            last_update_blocks = 1000
-
-        logger.info(
-            _m(
-                f"[get_last_update] last set weights successfully {last_update_blocks} blocks ago",
-                extra=get_extra_info(self.default_extra),
-            ),
-        )
-        return last_update_blocks
-
-    async def should_set_weights(self) -> bool:
-        """Check if current block is for setting weights."""
-        try:
-            current_block = self.get_current_block()
-            last_update = self.get_last_update(current_block)
-            tempo = self.get_tempo()
-            weights_rate_limit = self.get_weights_rate_limit()
-
-            blocks_till_epoch = tempo - (current_block + self.netuid + 1) % (tempo + 1)
-
-            should_set_weights = last_update >= tempo
-
-            logger.info(
-                _m(
-                    "[should_set_weights] Checking should set weights",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "weights_rate_limit": weights_rate_limit,
-                            "tempo": tempo,
-                            "current_block": current_block,
-                            "last_update": last_update,
-                            "blocks_till_epoch": blocks_till_epoch,
-                            "should_set_weights": should_set_weights,
-                        }
-                    ),
-                ),
-            )
-            return should_set_weights
-        except Exception as e:
-            logger.error(
-                _m(
-                    "[should_set_weights] Checking set weights failed",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-            )
-            return False
-
-    async def get_time_from_block(self, block: int):
-        max_retries = 3
-        retries = 0
-        while retries < max_retries:
-            try:
-                node = self.get_node()
-                block_hash = node.get_block_hash(block)
-                return datetime.fromtimestamp(
-                    node.query("Timestamp", "Now", block_hash=block_hash).value / 1000
-                ).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception as e:
-                logger.error(
-                    _m(
-                        "[get_time_from_block] Error getting time from block",
-                        extra=get_extra_info(
-                            {
-                                **self.default_extra,
-                                "retries": retries,
-                                "error": str(e),
-                            }
-                        ),
-                    ),
-                )
-                retries += 1
-        return "Unknown"
 
     async def calc_job_score(self, total_gpu_model_count_map: dict, job_result: JobResult):
         if job_result.score == 0:
@@ -554,8 +159,6 @@ class Validator:
 
     async def sync(self):
         try:
-            self.set_subtensor()
-
             logger.info(
                 _m(
                     "[sync] Syncing at subtensor",
@@ -564,11 +167,11 @@ class Validator:
             )
 
             # fetch miners
-            miners = self.fetch_miners()
+            miners = self.subtensor_client.fetch_miners()
 
             try:
-                if await self.should_set_weights():
-                    await self.set_weights(miners=miners)
+                if await self.subtensor_client.should_set_weights():
+                    await self.subtensor_client.set_weights(miners=miners, miner_scores=self.miner_scores)
             except Exception as e:
                 logger.error(
                     _m(
@@ -581,8 +184,8 @@ class Validator:
                         ),
                     ),
                 )
-            
-            current_block = self.get_current_block()
+
+            current_block = self.subtensor_client.get_current_block()
             logger.info(
                 _m(
                     "[sync] Current block",
@@ -597,7 +200,7 @@ class Validator:
 
             if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
-                job_batch_id = await self.get_time_from_block(job_block)
+                job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
 
                 logger.info(
                     _m(
@@ -816,7 +419,6 @@ class Validator:
             ),
         )
         try:
-            self.set_subtensor()
             await self.initiate_services()
             self.should_exit = False
 
@@ -861,19 +463,3 @@ class Validator:
             )
 
         self.should_exit = True
-
-    async def warm_up_subtensor(self):
-        while True:
-            try:
-                self.set_subtensor()
-
-                # sync every 12 seconds
-                await asyncio.sleep(SYNC_CYCLE)
-            except Exception as e:
-                logger.error(
-                    _m(
-                        "[stop] Failed to connect into subtensor",
-                        extra=get_extra_info({**self.default_extra, "error": str(e)}),
-                    ),
-                )
-                await asyncio.sleep(SYNC_CYCLE)

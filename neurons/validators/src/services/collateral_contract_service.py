@@ -6,6 +6,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from core.utils import _m, get_extra_info, get_collateral_contract
 from core.config import settings
 from services.const import REQUIRED_DEPOSIT_AMOUNT
+from clients.subtensor_client import SubtensorClient
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 class CollateralContractService:
     def __init__(self):
         self.collateral_contract = get_collateral_contract()
+        self.subtensor_client = SubtensorClient.get_instance()
         self.validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
 
     async def is_eligible_executor(
@@ -31,9 +33,7 @@ class CollateralContractService:
         }
 
         try:
-            from core.validator import Validator
-            validator = Validator()
-            evm_address = validator.get_associated_evm_address(miner_hotkey)
+            evm_address = self.subtensor_client.get_associated_evm_address(miner_hotkey)
 
             if evm_address is None:
                 self._log_error(
