@@ -31,7 +31,10 @@ class CollateralContractService:
         }
 
         try:
-            evm_address_map = self.subtensor_client.evm_address_map
+            evm_address_map = getattr(self.subtensor_client, "evm_address_map", {})
+            if not isinstance(evm_address_map, dict):
+                self._log_error("evm_address_map is not a dictionary", default_extra)
+                return False
 
             self._log_info(
                 "Evm Address Map Information of Miner Hotkeys",
