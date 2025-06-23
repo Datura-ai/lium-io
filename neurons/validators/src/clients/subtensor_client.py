@@ -282,7 +282,7 @@ class SubtensorClient:
             elif miner.uid in other_burners:
                 weights[ind] = BURNER_EMISSION
             else:
-                weights[ind] = 0 if total_score == 0 else (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_score
+                weights[ind] = 0 if total_score <= 0 else (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_score
 
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
