@@ -1,5 +1,4 @@
 import logging
-import requests
 
 from typing import Optional, Dict, Any
 from core.utils import _m, get_extra_info, get_collateral_contract
@@ -123,9 +122,3 @@ class CollateralContractService:
     def _log_info(self, message: str, extra: Dict[str, Any], exc_info: bool = False, **kwargs):
         full_extra = get_extra_info({**extra, **kwargs})
         logger.info(_m(message, extra=full_extra), exc_info=exc_info)
-
-    def get_tao_price_in_usd(self) -> float:
-        """Get tao price in usd."""
-        response = requests.get(settings.TAO_PRICE_API_URL)
-        rate_float = response.json()["market_data"]["current_price"]["usd"]
-        return rate_float
