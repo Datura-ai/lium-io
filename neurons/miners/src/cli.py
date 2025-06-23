@@ -22,7 +22,7 @@ def cli():
 
 
 @cli.command()
-@click.option("--private_key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def associate_eth(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
     logger.info("Please enter your Bittensor wallet password to unlock the hotkey for Ethereum association.")

@@ -29,8 +29,7 @@ class CliService:
         if hasattr(receipt, "triggered_events") and receipt.triggered_events:
             for event in receipt.triggered_events:
                 summary["events"].append({
-                    "event_id": event.value.get("event_id"),
-                    "module_id": event.value.get("module_id")
+                    "attributes": event['event']
                 })
         return summary
 
