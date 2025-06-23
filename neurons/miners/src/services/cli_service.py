@@ -4,8 +4,19 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 from eth_utils import to_hex, keccak
 from typing import Tuple, Optional, Any
+from core.config import settings
 
 class CliService:
+    def __init__(self):
+        self.wallet = settings.get_bittensor_wallet()
+        self.netuid = settings.BITTENSOR_NETUID
+        self.config = settings.get_bittensor_config()
+        self.hotkey = self.wallet.get_hotkey().ss58_address
+
+    def get_node(self) -> SubstrateInterface:
+        subtensor = bt.subtensor(config=self.config)
+        return subtensor.substrate
+
     def print_extrinsic_receipt(self, receipt) -> dict:
         """Returns a summary of the extrinsic receipt as a dict."""
         summary = {
@@ -23,18 +34,21 @@ class CliService:
                 })
         return summary
 
-    def try_associate_hotkey(self, node: SubstrateInterface, hotkey_ss58: str) -> Any:
+    def try_associate_hotkey(self, node: SubstrateInterface) -> Any:
         return node.compose_call(
             call_module="SubtensorModule",
             call_function="try_associate_hotkey",
-            call_params={"hotkey": hotkey_ss58}
+            call_params={"hotkey": self.hotkey}
         )
 
-    def make_associate_evm_key_extrinsic(self, node: SubstrateInterface, hotkey_ss58: str, evm_address: str, evm_private_key: str, netuid: int) -> Any:
+    def make_associate_evm_key_extrinsic(self, node: SubstrateInterface, evm_private_key: str) -> Any:
+        account = Account.from_key(evm_private_key)
+        evm_address = account.address
+
         block_number = node.query("System", "Number").value
         block_number_bytes = block_number.to_bytes(8, 'little')
         block_number_hash = keccak(block_number_bytes)
-        hotkey_bytes = bytes.fromhex(node.ss58_decode(hotkey_ss58))
+        hotkey_bytes = bytes.fromhex(node.ss58_decode(self.hotkey))
         message_to_sign_bytes = hotkey_bytes + block_number_hash
         account = Account.from_key(evm_private_key)
         if account.address.lower() != evm_address.lower():
@@ -44,9 +58,9 @@ class CliService:
         signature_hex = to_hex(signature.signature)
 
         print("\n--- Preparing associate_evm_key extrinsic ---")
-        print(f"  Hotkey (ss58): {hotkey_ss58}")
+        print(f"  Hotkey (ss58): {self.hotkey}")
         print(f"  EVM Address: {evm_address}")
-        print(f"  Netuid: {netuid}")
+        print(f"  Netuid: {self.netuid}")
         print(f"  Block number: {block_number}")
         print(f"  Signature: {signature_hex}")
         print("---------------------------------------------")
@@ -55,52 +69,37 @@ class CliService:
             call_module="SubtensorModule",
             call_function="associate_evm_key",
             call_params={
-                "netuid": netuid,
-                "hotkey": hotkey_ss58,
+                "netuid": self.netuid,
+                "hotkey": self.hotkey,
                 "evm_key": evm_address,
                 "block_number": block_number,
                 "signature": signature_hex
             }
         )
 
-    def submit_extrinsic(self, node: SubstrateInterface, wallet: bt.wallet, call: Any) -> Any:
+    def submit_extrinsic(self, node: SubstrateInterface, call: Any) -> Any:
         extrinsic = node.create_signed_extrinsic(
             call=call,
-            keypair=wallet.coldkey,
+            keypair=self.wallet.coldkey,
         )
         response = node.submit_extrinsic(extrinsic, wait_for_inclusion=True, wait_for_finalization=True)
         return response
 
-    def associate_miner_ethereum_address(self, w3, wallet_name: str, eth_private_key: str, hotkey: str) -> Tuple[bool, Optional[str], Optional[dict]]:
+    def associate_miner_ethereum_address(self, eth_private_key: str) -> Tuple[bool, Optional[str], Optional[dict]]:
         try:
-            network_url = w3.provider.endpoint_uri.lower()
-            if "127.0.0.1" in network_url or "localhost" in network_url:
-                netuid = 1
-                subtensor_network = "ws://127.0.0.1:9944"
-            elif "test" in network_url:
-                netuid = 37
-                subtensor_network = "wss://test.finney.opentensor.ai:443"
-            else:
-                netuid = 51
-                subtensor_network = "wss://entrypoint-finney.opentensor.ai:443"
-            node = SubstrateInterface(url=subtensor_network)
-            wallet = bt.wallet(name=wallet_name)
-            account = Account.from_key(eth_private_key)
-            evm_address = account.address
-            hotkey_call = self.try_associate_hotkey(node, hotkey)
+            node = self.get_node()
+
+            hotkey_call = self.try_associate_hotkey(node)
             if hotkey_call:
-                self.submit_extrinsic(node, wallet, hotkey_call)
+                self.submit_extrinsic(node, hotkey_call)
             evm_call = self.make_associate_evm_key_extrinsic(
                 node=node,
-                hotkey_ss58=hotkey,
-                evm_address=evm_address,
                 evm_private_key=eth_private_key,
-                netuid=netuid
             )
             if evm_call:
-                response = self.submit_extrinsic(node, wallet, evm_call)
+                response = self.submit_extrinsic(node, evm_call)
                 summary = self.print_extrinsic_receipt(response)
                 return (response.is_success, None if response.is_success else response.error_message, summary)
             return (False, "Failed to create EVM association call", None)
         except Exception as e:
-            return (False, str(e), None) 
+            return (False, str(e), None)

@@ -22,20 +22,14 @@ def cli():
 
 
 @cli.command()
-@click.option("--wallet-name", prompt="Wallet Name", help="Name of the bittensor wallet")
-@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def associate_eth(wallet_name: str, private_key: str):
+@click.option("--private_key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def associate_eth(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
     logger.info("Please enter your Bittensor wallet password to unlock the hotkey for Ethereum association.")
-    from celium_collateral_contracts.common import get_web3_connection
-    w3 = get_web3_connection(settings.BITTENSOR_NETWORK)
-    my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+
     cli_service = CliService()
     success, error, summary = cli_service.associate_miner_ethereum_address(
-        w3=w3,
-        wallet_name=wallet_name,
         eth_private_key=private_key,
-        hotkey=my_key.ss58_address
     )
     logger.info(summary)
     if success:
@@ -202,7 +196,7 @@ def get_miner_collateral(private_key: str):
     async def async_get_miner_collateral():
         try:
             collateral_contract = get_collateral_contract(miner_key=private_key)
-            
+
             balance = await collateral_contract.get_balance(collateral_contract.miner_address)
             logger.info("Miner balance: %f TAO", balance)
 
