@@ -31,6 +31,7 @@ class SubtensorClient:
     _subtensor = None
 
     wallet: "bittensor_wallet"
+    miners: list[bittensor.NeuronInfo] = []
     evm_address_map: dict[str, str] = {}
 
     @classmethod
@@ -181,11 +182,9 @@ class SubtensorClient:
         evm_address_hex = '0x' + address_bytes.hex()
         return evm_address_hex
 
-    async def update_evm_address_map(self, miners=None):
+    def update_evm_address_map(self):
         """Update the map of miner_hotkey -> evm_address for all miners."""
-        if miners is None:
-            miners = self.fetch_miners()
-        for miner in miners:
+        for miner in self.miners:
             try:
                 evm_address = self.get_associated_evm_address(miner.hotkey)
                 self.evm_address_map[miner.hotkey] = evm_address
@@ -231,7 +230,23 @@ class SubtensorClient:
                 extra=get_extra_info(self.default_extra),
             ),
         )
+
+        self.miners = miners
         return miners
+
+    def get_miner(self, hotkey: str) -> bittensor.NeuronInfo:
+        if not self.miners:
+            self.fetch_miners()
+
+        neurons = [n for n in self.miners if n.hotkey == hotkey]
+        if not neurons:
+            raise ValueError(f"Miner with {hotkey=} not present in this subnetwork")
+        return neurons[0]
+
+    def get_miners(self) -> list[bittensor.NeuronInfo]:
+        if not self.miners:
+            self.fetch_miners()
+        return self.miners
 
     async def set_weights(self, miners, miner_scores: dict[str, float]):
         logger.info(
@@ -468,11 +483,13 @@ class SubtensorClient:
                 self.set_subtensor()
 
                 if count == 0:
-                    await self.update_evm_address_map()
+                    self.fetch_miners()
+                    self.update_evm_address_map()
 
                 count += 1
                 if count > 10:
-                    await self.update_evm_address_map()
+                    self.fetch_miners()
+                    self.update_evm_address_map()
                     count = 1
 
                 # sync every 12 seconds

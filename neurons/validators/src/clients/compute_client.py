@@ -557,11 +557,7 @@ class ComputeClient:
             return
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
-        miners = self.subtensor_client.fetch_miners()
-        neurons = [n for n in miners if n.hotkey == hotkey]
-        if not neurons:
-            raise ValueError(f"Miner with {hotkey=} not present in this subnetwork")
-        return neurons[0].axon_info
+        return self.subtensor_client.get_miner(hotkey).axon_info
 
     async def miner_driver(
         self,

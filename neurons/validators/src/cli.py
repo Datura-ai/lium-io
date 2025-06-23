@@ -158,7 +158,7 @@ async def _debug_validator(count: int):
     validator = Validator()
 
     # fetch miners
-    miners = validator.subtensor_client.fetch_miners()
+    miners = validator.subtensor_client.get_miners()
 
     miner_service: MinerService = ioc["MinerService"]
     docker_service: DockerService = ioc["DockerService"]
