@@ -27,7 +27,7 @@ dependencies = [
     "bittensor-commit-reveal==0.2.0",
     "bittensor-wallet==3.0.3",
     "bt-decode==0.5.0a2",
-    "celium-collateral-contracts==1.0.50",
+    "celium-collateral-contracts==1.0.57",
     "certifi==2025.1.31",
     "cffi==1.17.1",
     "charset-normalizer==3.4.1",

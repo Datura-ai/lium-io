@@ -33,22 +33,6 @@ def cli():
     pass
 
 
-@cli.command()
-@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
-@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
-@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
-def debug_send_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
-    """Debug sending job to miner"""
-    miner = type("Miner", (object,), {})()
-    miner.hotkey = miner_hotkey
-    miner.coldkey = miner_hotkey
-    miner.axon_info = type("AxonInfo", (object,), {})()
-    miner.axon_info.ip = miner_address
-    miner.axon_info.port = miner_port
-    validator = Validator(debug_miner=miner)
-    asyncio.run(validator.start())
-
-
 def generate_random_ip():
     return ".".join(str(random.randint(0, 255)) for _ in range(4))
 
@@ -133,16 +117,6 @@ def debug_send_machine_specs_to_connector():
 
 
 @cli.command()
-def debug_set_weights():
-    """Debug setting weights"""
-    validator = Validator()
-    subtensor = validator.get_subtensor()
-    # fetch miners
-    miners = validator.fetch_miners(subtensor)
-    asyncio.run(validator.set_weights(miners=miners, subtensor=subtensor))
-
-
-@cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
 @click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
 @click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
@@ -182,10 +156,9 @@ async def _debug_validator(count: int):
     resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
 
     validator = Validator()
-    validator.set_subtensor()
 
     # fetch miners
-    miners = validator.fetch_miners()
+    miners = validator.subtensor_client.get_miners()
 
     miner_service: MinerService = ioc["MinerService"]
     docker_service: DockerService = ioc["DockerService"]
