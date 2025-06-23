@@ -9,6 +9,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import configure_logs_of_other_modules, _m, get_extra_info, get_logger
 from core.validator import Validator
+from clients.subtensor_client import SubtensorClient
 from services.ioc import ioc
 from services.miner_service import MinerService
 from services.docker_service import DockerService
@@ -118,15 +119,17 @@ def debug_send_machine_specs_to_connector():
 
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
-@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
-@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
-def request_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
-    asyncio.run(_request_job_to_miner(miner_hotkey, miner_address, miner_port))
+def request_job_to_miner(miner_hotkey: str):
+    asyncio.run(_request_job_to_miner(miner_hotkey))
 
 
-async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
+async def _request_job_to_miner(miner_hotkey: str):
+    subtensor_client = SubtensorClient.get_instance()
+    miner = subtensor_client.get_miner(miner_hotkey)
+    if not miner:
+        raise ValueError(f"Miner with hotkey {miner_hotkey} not found")
+
     miner_service: MinerService = ioc["MinerService"]
-    docker_service: DockerService = ioc["DockerService"]
     file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
 
     encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
@@ -135,9 +138,9 @@ async def _request_job_to_miner(miner_hotkey: str, miner_address: str, miner_por
         MinerJobRequestPayload(
             job_batch_id='job_batch_id',
             miner_hotkey=miner_hotkey,
-            miner_coldkey='miner_coldkey',
-            miner_address=miner_address,
-            miner_port=miner_port,
+            miner_coldkey=miner.coldkey,
+            miner_address=miner.axon_info.ip,
+            miner_port=miner.axon_info.port,
         ),
         encrypted_files=encrypted_files,
     )
@@ -155,13 +158,11 @@ async def _debug_validator(count: int):
     soft_limit = 1024
     resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, hard_limit))
 
-    validator = Validator()
-
     # fetch miners
-    miners = validator.subtensor_client.get_miners()
+    subtensor_client = SubtensorClient.get_instance()
+    miners = subtensor_client.get_miners()
 
     miner_service: MinerService = ioc["MinerService"]
-    docker_service: DockerService = ioc["DockerService"]
     file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
 
     encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
