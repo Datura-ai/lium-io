@@ -41,24 +41,20 @@ class CliService:
         )
 
     def make_associate_evm_key_extrinsic(self, node: SubstrateInterface, evm_private_key: str) -> Any:
-        account = Account.from_key(evm_private_key)
-        evm_address = account.address
-
         block_number = node.query("System", "Number").value
         block_number_bytes = block_number.to_bytes(8, 'little')
         block_number_hash = keccak(block_number_bytes)
         hotkey_bytes = bytes.fromhex(node.ss58_decode(self.hotkey))
         message_to_sign_bytes = hotkey_bytes + block_number_hash
-        account = Account.from_key(evm_private_key)
-        if account.address.lower() != evm_address.lower():
-            raise ValueError("Provided EVM private key does not correspond to the provided EVM address.")
         signable_message = encode_defunct(primitive=message_to_sign_bytes)
+
+        account = Account.from_key(evm_private_key)
         signature = account.sign_message(signable_message)
         signature_hex = to_hex(signature.signature)
 
         print("\n--- Preparing associate_evm_key extrinsic ---")
         print(f"  Hotkey (ss58): {self.hotkey}")
-        print(f"  EVM Address: {evm_address}")
+        print(f"  EVM Address: {account.address}")
         print(f"  Netuid: {self.netuid}")
         print(f"  Block number: {block_number}")
         print(f"  Signature: {signature_hex}")
@@ -70,7 +66,7 @@ class CliService:
             call_params={
                 "netuid": self.netuid,
                 "hotkey": self.hotkey,
-                "evm_key": evm_address,
+                "evm_key": account.address,
                 "block_number": block_number,
                 "signature": signature_hex
             }
