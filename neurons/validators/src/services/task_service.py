@@ -666,23 +666,25 @@ class TaskService:
                     gpu_count=gpu_count
                 )
 
-                if not is_eligible_executor and not settings.DEBUG_COLLATERAL_CONTRACT:
+                if not is_eligible_executor:
+                    # if debug mode, we don't need to check collateral contract
                     log_text = _m(
                         f"The executor is not eligible according to the collateral contract and therefore cannot have scores set for them.",
                         extra=get_extra_info(default_extra),
                     )
-
-                    return await self._handle_task_result(
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
-                    )
+                    logger.warning(log_text)
+                    if not settings.DEBUG_COLLATERAL_CONTRACT:
+                        return await self._handle_task_result(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            spec=None,
+                            score=0,
+                            job_score=0,
+                            log_text=log_text,
+                            verified_job_info=verified_job_info,
+                            success=False,
+                            clear_verified_job_info=False,
+                        )
                 
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
