@@ -169,39 +169,52 @@ class SubtensorClient:
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(hotkey)
 
-    def get_associated_evm_address(self, hotkey):
-        node = self.get_node()
-        uid = self.get_uid_for_hotkey(hotkey)
-        associated_evm = node.query("SubtensorModule", "AssociatedEvmAddress", [self.netuid, uid])
-
-        if associated_evm is None or associated_evm.value is None:
-            return None
-        # associated_evm.value is expected to be a tuple: ((address_bytes,), block_number)
-        value = associated_evm.value
-        address_bytes_tuple = value[0][0]  # value[0] is a tuple with one element: the address bytes
-        # Convert bytes tuple to bytes, then to hex string
-        address_bytes = bytes(address_bytes_tuple)
-        evm_address_hex = '0x' + address_bytes.hex()
-        return evm_address_hex
-
-    def update_evm_address_map(self):
-        """Update the map of miner_hotkey -> evm_address for all miners."""
-        for miner in self.miners:
-            try:
-                evm_address = self.get_associated_evm_address(miner.hotkey)
-                self.evm_address_map[miner.hotkey] = evm_address
-            except Exception as e:
+    def update_evm_address_map_for_miners(self):
+        """Update the map of miner_hotkey -> evm_address for all current miners using a single bulk chain query."""
+        try:
+            node = self.get_node()
+            # Use query_map to fetch all (uid, value) pairs for the given netuid
+            associated_evms = node.query_map(
+                module="SubtensorModule",
+                storage_function="AssociatedEvmAddress",
+                params=[self.netuid]
+            )
+            metagraph = self.get_metagraph()
+            hotkeys = metagraph.hotkeys
+            miner_hotkeys = set(miner.hotkey for miner in self.miners)
+            self.evm_address_map = {}
+            if associated_evms is None:
                 logger.error(_m(
-                    f"[update_evm_address_map] Error getting EVM address for miner {miner.hotkey}",
-                    extra=get_extra_info({**self.default_extra, "error": str(e)})
+                    "[update_evm_address_map_for_miners] No associated EVM addresses returned",
+                    extra=get_extra_info(self.default_extra)
                 ))
-
-        logger.info(
-            _m(
-                "[update_evm_address_map] Updated ethereum addresses map",
+                return
+            for uid, value in associated_evms:
+                if uid >= len(hotkeys):
+                    continue
+                hotkey = hotkeys[uid]
+                if hotkey not in miner_hotkeys:
+                    continue
+                try:
+                    address_bytes_tuple = value[0][0]
+                    address_bytes = bytes(address_bytes_tuple)
+                    evm_address_hex = '0x' + address_bytes.hex()
+                except Exception as e:
+                    logger.error(_m(
+                        f"[update_evm_address_map_for_miners] Error decoding EVM address for uid {uid}",
+                        extra=get_extra_info({**self.default_extra, "error": str(e)})
+                    ))
+                    evm_address_hex = None
+                self.evm_address_map[hotkey] = evm_address_hex
+            logger.info(_m(
+                "[update_evm_address_map_for_miners] Updated ethereum addresses map for miners only",
                 extra=get_extra_info({**self.default_extra, "evm_address_map": self.evm_address_map})
-            ),
-        )
+            ))
+        except Exception as e:
+            logger.error(_m(
+                "[update_evm_address_map_for_miners] Error in update",
+                extra=get_extra_info({**self.default_extra, "error": str(e)})
+            ))
 
     def get_my_uid(self):
         return self.get_uid_for_hotkey(self.wallet.hotkey.ss58_address)
@@ -485,12 +498,12 @@ class SubtensorClient:
 
                 if count == 0:
                     self.fetch_miners()
-                    self.update_evm_address_map()
+                    self.update_evm_address_map_for_miners()
 
                 count += 1
                 if count > 10:
                     self.fetch_miners()
-                    self.update_evm_address_map()
+                    self.update_evm_address_map_for_miners()
                     count = 1
 
                 # sync every 12 seconds
