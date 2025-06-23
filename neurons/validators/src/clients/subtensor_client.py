@@ -232,13 +232,11 @@ class SubtensorClient:
         )
 
         self.miners = miners
-        return miners
 
     def get_miner(self, hotkey: str) -> bittensor.NeuronInfo:
-        if not self.miners:
-            self.fetch_miners()
+        miners = self.get_miners()
 
-        neurons = [n for n in self.miners if n.hotkey == hotkey]
+        neurons = [n for n in miners if n.hotkey == hotkey]
         if not neurons:
             raise ValueError(f"Miner with {hotkey=} not present in this subnetwork")
         return neurons[0]
