@@ -11,9 +11,9 @@ logger = logging.getLogger(__name__)
 
 class CollateralContractService:
     def __init__(self):
+        # Check for settings misconfiguration and handle gracefully
         self.collateral_contract = get_collateral_contract()
         self.subtensor_client = SubtensorClient.get_instance()
-        self.validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
 
     async def is_eligible_executor(
         self,
@@ -85,6 +85,10 @@ class CollateralContractService:
             # Get deposit requirement for GPU model
             required_deposit_amount = await self._get_gpu_required_deposit(gpu_model, gpu_count)
             if required_deposit_amount is None:
+                self._log_info(
+                    f"No required deposit amount found for GPU model {gpu_model}",
+                    default_extra,
+                )
                 return False
 
             # Check executor's actual collateral
@@ -93,7 +97,19 @@ class CollateralContractService:
                 self._log_info("Executor collateral is invalid or missing", default_extra)
                 return False
 
-            if float(executor_collateral) < float(required_deposit_amount):
+            # Type check and conversion for collateral values
+            try:
+                executor_collateral_float = float(executor_collateral)
+                required_deposit_amount_float = float(required_deposit_amount)
+            except (TypeError, ValueError) as e:
+                self._log_error(
+                    "Error converting collateral values to float",
+                    default_extra,
+                    error=str(e),
+                )
+                return False
+
+            if executor_collateral_float < required_deposit_amount_float:
                 self._log_info(
                     "Executor collateral is less than required deposit amount",
                     default_extra,
@@ -111,13 +127,18 @@ class CollateralContractService:
 
             return True
 
+        except KeyError as e:
+            self._log_error("KeyError encountered during eligibility check", default_extra, error=str(e), exc_info=True)
+            return False
         except Exception as e:
             self._log_error("❌ Error checking executor eligibility", default_extra, error=str(e), exc_info=True)
             return False
 
-
     async def _get_gpu_required_deposit(self, gpu_model: str, gpu_count:int) -> Optional[float]:
-        unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT[gpu_model]
+        # Handle missing GPU model gracefully
+        unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT.get(gpu_model)
+        if unit_tao_amount is None:
+            return None
         required_deposit_amount = unit_tao_amount * gpu_count * settings.COLLATERAL_DAYS
         return float(required_deposit_amount)
 
