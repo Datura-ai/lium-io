@@ -246,7 +246,7 @@ class SubtensorClient:
             self.fetch_miners()
         return self.miners
 
-    async def set_weights(self, miners, miner_scores: dict[str, float]):
+    async def set_weights(self, miner_scores: dict[str, float]):
         logger.info(
             _m(
                 "[set_weights] scores",
@@ -268,8 +268,8 @@ class SubtensorClient:
             )
             return
 
-        uids = np.zeros(len(miners), dtype=np.int64)
-        weights = np.zeros(len(miners), dtype=np.float32)
+        uids = np.zeros(len(self.miners), dtype=np.int64)
+        weights = np.zeros(len(self.miners), dtype=np.float32)
 
         last_mechansim_step_block = self.get_last_mechansim_step_block()
         main_burner = random.Random(last_mechansim_step_block).choice(settings.BURNERS)
@@ -287,7 +287,7 @@ class SubtensorClient:
         metagraph = self.get_metagraph()
         miner_hotkeys = []
         total_score = sum(miner_scores.values())
-        for ind, miner in enumerate(miners):
+        for ind, miner in enumerate(self.miners):
             uids[ind] = miner.uid
             miner_hotkeys.append(metagraph.hotkeys[miner.uid])
             if miner.uid == main_burner:

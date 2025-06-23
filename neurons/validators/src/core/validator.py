@@ -171,7 +171,8 @@ class Validator:
 
             try:
                 if await self.subtensor_client.should_set_weights():
-                    await self.subtensor_client.set_weights(miners=miners, miner_scores=self.miner_scores)
+                    await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
+                    self.miner_scores = {}
             except Exception as e:
                 logger.error(
                     _m(
