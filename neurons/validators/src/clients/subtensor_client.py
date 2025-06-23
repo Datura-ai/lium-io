@@ -65,6 +65,8 @@ class SubtensorClient:
         if settings.DEBUG:
             self.debug_miner = settings.get_debug_miner()
 
+        self.set_subtensor()
+
         # Start warm-up task only once (static)
         asyncio.create_task(self._warm_up_subtensor())
 
