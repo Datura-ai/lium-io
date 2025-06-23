@@ -48,7 +48,13 @@ class CollateralContractService:
 
                 miner_address_on_contract = await self.collateral_contract.get_miner_address_of_executor(executor_uuid)
 
-                if miner_address_on_contract is None:
+                if evm_address is None:
+                    self._log_info(
+                        f"No evm address found in this subnet for this miner {miner_hotkey}",
+                        default_extra,
+                    )
+                    return False
+                elif miner_address_on_contract is None:
                     self._log_info(
                         f"No miner address found on contract for executor {executor_uuid}",
                         default_extra,
