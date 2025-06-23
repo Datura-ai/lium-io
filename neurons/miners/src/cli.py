@@ -64,7 +64,7 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
             Executor(uuid=executor_uuid, address=address, port=port, validator=validator)
         )
     except Exception as e:
-        logger.error("Failed to add executor: %s", str(e))
+        logger.error("❌ Failed to add executor: %s", str(e))
     else:
         logger.info("Added executor (id=%s)", str(executor.uuid))
 
@@ -91,9 +91,9 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
             logger.info(message)
             await collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
         except Exception as e:
-            logger.error("Failed to deposit collateral: %s", str(e))
+            logger.error("❌ Failed to deposit collateral: %s", str(e))
         else:
-            logger.info("Deposited collateral successfully.")
+            logger.info("✅ Deposited collateral successfully.")
     asyncio.run(async_add_executor())
 
 
@@ -134,9 +134,9 @@ def deposit_collateral(address: str, port: int, deposit_amount: float, private_k
 
             await collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
         except Exception as e:
-            logger.error("Failed to deposit collateral: %s", str(e))
+            logger.error("❌ Failed to deposit collateral: %s", str(e))
         else:
-            logger.info("Deposited collateral successfully.")
+            logger.info("✅ Deposited collateral successfully.")
     asyncio.run(async_deposit_collateral())
 
 
@@ -179,7 +179,7 @@ def reclaim_collateral(executor_uuid: str, private_key: str):
 
             await collateral_contract.reclaim_collateral("Manual reclaim", executor_uuid)
         except Exception as e:
-            logger.error("Failed to reclaim collateral: %s", str(e))
+            logger.error("❌ Failed to reclaim collateral: %s", str(e))
     asyncio.run(async_reclaim_collateral())
 
 
@@ -219,7 +219,7 @@ def get_miner_collateral(private_key: str):
             logger.info("Total miner collateral from all executors: %f TAO", total_collateral)
 
         except Exception as e:
-            logger.error("Failed in getting miner collateral: %s", str(e))
+            logger.error("❌ Failed in getting miner collateral: %s", str(e))
     asyncio.run(async_get_miner_collateral())
 
 
@@ -234,7 +234,7 @@ def get_executor_collateral(address: str, port: int, private_key: str):
         executor = executor_dao.findOne(address, port)
         executor_uuid = str(executor.uuid)
     except Exception as e:
-        logger.error("Failed to find executor: %s", str(e))
+        logger.error("❌ Failed to find executor: %s", str(e))
         return
 
     async def async_get_executor_collateral():
@@ -243,7 +243,7 @@ def get_executor_collateral(address: str, port: int, private_key: str):
             collateral = await collateral_contract.get_executor_collateral(executor_uuid)
             logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
         except Exception as e:
-            logger.error("Failed to get executor collateral: %s", str(e))
+            logger.error("❌ Failed to get executor collateral: %s", str(e))
     asyncio.run(async_get_executor_collateral())
 
 
@@ -272,7 +272,7 @@ def get_reclaim_requests(private_key: str):
             json_output = [to_dict(req) for req in reclaim_requests]
             print(json.dumps(json_output, indent=4))
         except Exception as e:
-            logger.error("Failed to get miner reclaim requests: %s", str(e))
+            logger.error("❌ Failed to get miner reclaim requests: %s", str(e))
     asyncio.run(async_get_reclaim_requests())
 
 
@@ -285,10 +285,10 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
         try:
             collateral_contract = get_collateral_contract(miner_key=private_key)
             result = await collateral_contract.finalize_reclaim(reclaim_request_id)
-            logger.info("Successfully finalized reclaim request: %s", reclaim_request_id)
+            logger.info("✅ Successfully finalized reclaim request: %s", reclaim_request_id)
             print(result)
         except Exception as e:
-            logger.error("Failed to finalize reclaim request: %s", str(e))
+            logger.error("❌ Failed to finalize reclaim request: %s", str(e))
     asyncio.run(async_finalize_reclaim_request())
 
 
