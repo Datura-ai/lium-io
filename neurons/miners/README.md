@@ -189,7 +189,7 @@ This will print a JSON list of all reclaim requests made by the miner, including
 To finalize a reclaim request and reclaim your collateral, use the following command:
 
 ```bash
-docker exec <container-id or name> pdm run /root/app/src/cli.py finalize-reclaim-request --reclaim_request_id <reclaim-request-id> --private-key <ethereum-private-key>
+docker exec <container-id or name> pdm run /root/app/src/cli.py finalize-reclaim-request --reclaim-request-id <reclaim-request-id> --private-key <ethereum-private-key>
 ```
 
 - `<reclaim-request-id>`: The ID of the reclaim request you wish to finalize.

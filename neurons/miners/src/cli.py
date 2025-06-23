@@ -277,13 +277,13 @@ def get_reclaim_requests(private_key: str):
 
 
 @cli.command()
-@click.option("--reclaim_request_id", prompt="Reclaim Request ID", type=int, help="ID of the reclaim request to finalize")
+@click.option("--reclaim-request-id", prompt="Reclaim Request ID", type=int, help="ID of the reclaim request to finalize")
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
     """Finalize a reclaim request by its ID"""
     async def async_finalize_reclaim_request():
         try:
-            collateral_contract = get_collateral_contract(private_key)
+            collateral_contract = get_collateral_contract(miner_key=private_key)
             result = await collateral_contract.finalize_reclaim(reclaim_request_id)
             logger.info("Successfully finalized reclaim request: %s", reclaim_request_id)
             print(result)
