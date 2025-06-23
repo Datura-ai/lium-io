@@ -4,6 +4,8 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 from eth_utils import to_hex, keccak
 from typing import Tuple, Optional, Any
+import bittensor
+from core.config import settings
 
 class CliService:
     def print_extrinsic_receipt(self, receipt) -> dict:
@@ -71,7 +73,7 @@ class CliService:
         response = node.submit_extrinsic(extrinsic, wait_for_inclusion=True, wait_for_finalization=True)
         return response
 
-    def associate_miner_ethereum_address(self, w3, wallet_name: str, eth_private_key: str, hotkey: str) -> Tuple[bool, Optional[str], Optional[dict]]:
+    def associate_miner_ethereum_address(self, w3, eth_private_key: str) -> Tuple[bool, Optional[str], Optional[dict]]:
         try:
             network_url = w3.provider.endpoint_uri.lower()
             if "127.0.0.1" in network_url or "localhost" in network_url:
@@ -84,15 +86,16 @@ class CliService:
                 netuid = 51
                 subtensor_network = "wss://entrypoint-finney.opentensor.ai:443"
             node = SubstrateInterface(url=subtensor_network)
-            wallet = bt.wallet(name=wallet_name)
+            wallet = settings.get_bittensor_wallet()
+            hotkey: bittensor.Keypair = wallet.get_hotkey()
             account = Account.from_key(eth_private_key)
             evm_address = account.address
-            hotkey_call = self.try_associate_hotkey(node, hotkey)
+            hotkey_call = self.try_associate_hotkey(node, hotkey.ss58_address)
             if hotkey_call:
                 self.submit_extrinsic(node, wallet, hotkey_call)
             evm_call = self.make_associate_evm_key_extrinsic(
                 node=node,
-                hotkey_ss58=hotkey,
+                hotkey_ss58=hotkey.ss58_address,
                 evm_address=evm_address,
                 evm_private_key=eth_private_key,
                 netuid=netuid

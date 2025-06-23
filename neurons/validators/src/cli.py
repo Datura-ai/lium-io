@@ -398,20 +398,5 @@ async def _get_pod_logs(miner_hotkey: str, miner_address: str, miner_port: int, 
     print('response ==>', response)
 
 
-@cli.command()
-@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
-@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
-@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
-def debug_send_job_to_miner(miner_hotkey: str, miner_address: str, miner_port: int):
-    """Debug sending job to miner"""
-    miner = type("Miner", (object,), {})()
-    miner.hotkey = miner_hotkey
-    miner.coldkey = miner_hotkey
-    miner.axon_info = type("AxonInfo", (object,), {})()
-    miner.axon_info.ip = miner_address
-    miner.axon_info.port = miner_port
-    validator = Validator()
-    asyncio.run(validator.start())
-
 if __name__ == "__main__":
     cli()
