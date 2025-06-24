@@ -169,6 +169,12 @@ class SubtensorClient:
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(hotkey)
 
+    def get_evm_address_for_hotkey(self, hotkey):
+        if not isinstance(self.evm_address_map, dict):
+            return {}
+
+        return self.evm_address_map[hotkey]
+
     def update_evm_address_map_for_miners(self):
         """Update the map of miner_hotkey -> evm_address for all current miners using a single bulk chain query."""
         try:

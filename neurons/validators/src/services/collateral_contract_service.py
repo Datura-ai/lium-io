@@ -31,60 +31,39 @@ class CollateralContractService:
         }
 
         try:
-            evm_address_map = getattr(self.subtensor_client, "evm_address_map", {})
-            if not isinstance(evm_address_map, dict):
-                self._log_error("evm_address_map is not a dictionary", default_extra)
-                return False
-
-            self._log_info(
-                "Evm Address Map Information of Miner Hotkeys",
-                default_extra,
-                evm_address_map=evm_address_map,
-            )
-
-            if miner_hotkey in evm_address_map:
-                evm_address = evm_address_map[miner_hotkey]
-                self._log_info(
-                    f"Evm address {evm_address} found that is associated to this miner hotkey {miner_hotkey}",
-                    default_extra,
-                )
-
-                miner_address_on_contract = await self.collateral_contract.get_miner_address_of_executor(executor_uuid)
-
-                if evm_address is None:
-                    self._log_info(
-                        f"No evm address found in this subnet for this miner {miner_hotkey}",
-                        default_extra,
-                    )
-                    return False
-                elif miner_address_on_contract is None:
-                    self._log_info(
-                        f"No miner address found on contract for executor {executor_uuid}",
-                        default_extra,
-                    )
-                    return False
-                elif miner_address_on_contract.lower() == evm_address.lower():
-                    self._log_info(
-                        f"Miner has deposited with EVM address {evm_address} on contract for executor {executor_uuid}",
-                        default_extra,
-                        miner_address_on_contract=miner_address_on_contract,
-                        evm_address=evm_address,
-                    )
-                else:
-                    self._log_info(
-                        f"Miner address on contract ({miner_address_on_contract}) does not match EVM address ({evm_address}) for executor {executor_uuid}",
-                        default_extra,
-                        miner_address_on_contract=miner_address_on_contract,
-                        evm_address=evm_address,
-                    )
-                    return False
-            else:
+            evm_address = self.subtensor_client.get_evm_address_for_hotkey(miner_hotkey)
+            
+            if evm_address is None:
                 self._log_info(
                     f"No evm address found that is associated to this miner hotkey {miner_hotkey} in subnet",
                     default_extra,
                 )
                 return False
 
+            miner_address_on_contract = await self.collateral_contract.get_miner_address_of_executor(executor_uuid)
+
+            if miner_address_on_contract is None:
+                self._log_info(
+                    f"No miner address found on contract for executor {executor_uuid}",
+                    default_extra,
+                )
+                return False
+            elif miner_address_on_contract.lower() != evm_address.lower():
+                self._log_info(
+                    f"Miner address on contract ({miner_address_on_contract}) does not match EVM address ({evm_address}) for executor {executor_uuid}",
+                    default_extra,
+                    miner_address_on_contract=miner_address_on_contract,
+                    evm_address=evm_address,
+                )
+                return False
+
+            self._log_info(
+                f"Miner has deposited with EVM address {evm_address} on contract for executor {executor_uuid}",
+                default_extra,
+                miner_address_on_contract=miner_address_on_contract,
+                evm_address=evm_address,
+            )
+                
             # Get deposit requirement for GPU model
             required_deposit_amount = await self._get_gpu_required_deposit(gpu_model, gpu_count)
             if required_deposit_amount is None:
