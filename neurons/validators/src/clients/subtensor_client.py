@@ -29,6 +29,7 @@ class SubtensorClient:
     _instance = None
     _initialized = False
     _subtensor = None
+    _warm_up_task = None
 
     wallet: "bittensor_wallet"
     miners: list[bittensor.NeuronInfo] = []
@@ -67,9 +68,6 @@ class SubtensorClient:
             self.debug_miner = settings.get_debug_miner()
 
         self.set_subtensor()
-
-        # Start warm-up task only once (static)
-        asyncio.create_task(self._warm_up_subtensor())
 
         SubtensorClient._initialized = True
 
@@ -497,11 +495,28 @@ class SubtensorClient:
                 await asyncio.sleep(SYNC_CYCLE)
 
     @classmethod
-    def initialize(cls):
+    async def initialize(cls):
         """Initialize the singleton instance asynchronously."""
         instance = cls.get_instance()
-        # The warm-up task is already started in __init__
+
+        # Start warm-up task only once (static)
+        if cls._warm_up_task is None or cls._warm_up_task.done():
+            cls._warm_up_task = asyncio.create_task(instance._warm_up_subtensor())
+
         return instance
+
+    @classmethod
+    async def shutdown(cls):
+        """Shutdown the singleton instance and cancel the warm-up task."""
+        if cls._warm_up_task and not cls._warm_up_task.done():
+            cls._warm_up_task.cancel()
+            try:
+                await cls._warm_up_task
+            except asyncio.CancelledError:
+                pass
+        cls._warm_up_task = None
+        cls._instance = None
+        cls._initialized = False
 
     @classmethod
     def get_subtensor(cls):

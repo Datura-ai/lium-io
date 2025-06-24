@@ -124,27 +124,31 @@ def request_job_to_miner(miner_hotkey: str):
 
 
 async def _request_job_to_miner(miner_hotkey: str):
-    subtensor_client = SubtensorClient.get_instance()
-    miner = subtensor_client.get_miner(miner_hotkey)
-    if not miner:
-        raise ValueError(f"Miner with hotkey {miner_hotkey} not found")
+    try:
+        subtensor_client = await SubtensorClient.initialize()
+        miner = subtensor_client.get_miner(miner_hotkey)
+        if not miner:
+            raise ValueError(f"Miner with hotkey {miner_hotkey} not found")
 
-    miner_service: MinerService = ioc["MinerService"]
-    file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
+        miner_service: MinerService = ioc["MinerService"]
+        file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
 
-    encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
+        encrypted_files = file_encrypt_service.ecrypt_miner_job_files()
 
-    result = await miner_service.request_job_to_miner(
-        MinerJobRequestPayload(
-            job_batch_id='job_batch_id',
-            miner_hotkey=miner_hotkey,
-            miner_coldkey=miner.coldkey,
-            miner_address=miner.axon_info.ip,
-            miner_port=miner.axon_info.port,
-        ),
-        encrypted_files=encrypted_files,
-    )
-    print('job_result:', result)
+        result = await miner_service.request_job_to_miner(
+            MinerJobRequestPayload(
+                job_batch_id='job_batch_id',
+                miner_hotkey=miner_hotkey,
+                miner_coldkey=miner.coldkey,
+                miner_address=miner.axon_info.ip,
+                miner_port=miner.axon_info.port,
+            ),
+            encrypted_files=encrypted_files,
+        )
+        print('job_result:', result)
+    finally:
+        logger.info("Shutting down subtensor client")
+        await SubtensorClient.shutdown()
 
 
 @cli.command()

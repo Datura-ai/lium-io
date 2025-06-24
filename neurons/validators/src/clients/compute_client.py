@@ -89,7 +89,6 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.subtensor_client = SubtensorClient.get_instance()
         self.message_queue = []
         self.lock = asyncio.Lock()
 
@@ -138,10 +137,16 @@ class ComputeClient:
         await self.miner_drivers.put(None)
         await self.miner_driver_awaiter_task
 
+        # Cleanup subtensor client
+        if hasattr(self, 'subtensor_client'):
+            await SubtensorClient.shutdown()
+
     def my_hotkey(self) -> str:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
+        self.subtensor_client = await SubtensorClient.initialize()
+
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())

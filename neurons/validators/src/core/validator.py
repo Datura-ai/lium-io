@@ -35,7 +35,7 @@ class Validator:
 
     async def initiate_services(self):
         # initiate subtensor client
-        self.subtensor_client = SubtensorClient.get_instance()
+        self.subtensor_client = await SubtensorClient.initialize()
 
         ssh_service = SSHService()
         self.redis_service = RedisService()
@@ -455,6 +455,12 @@ class Validator:
             ),
         )
 
+        self.should_exit = True
+
+        # Cleanup subtensor client
+        if hasattr(self, 'subtensor_client'):
+            await SubtensorClient.shutdown()
+
         try:
             await self.redis_service.set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
         except Exception as e:
@@ -464,5 +470,3 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 ),
             )
-
-        self.should_exit = True
