@@ -248,8 +248,13 @@ def get_reclaim_requests():
             if not reclaim_requests:
                 print(json.dumps([]))
                 return
-            # Convert each reclaim request to dict if possible
 
+            # Get all executor UUIDs for this miner
+            executor_dao = ExecutorDao(session=next(get_db()))
+            executors = executor_dao.get_all_executors()
+            executor_uuids = set(str(executor.uuid) for executor in executors)
+
+            # Convert each reclaim request to dict if possible
             def to_dict(obj):
                 if hasattr(obj, "__dict__"):
                     return dict(obj.__dict__)
@@ -257,7 +262,13 @@ def get_reclaim_requests():
                     return obj._asdict()
                 else:
                     return dict(obj)
-            json_output = [to_dict(req) for req in reclaim_requests]
+
+            # Filter: amount != 0 and executor_uuid in miner's executor UUIDs
+            filtered_requests = [
+                req for req in reclaim_requests
+                if getattr(req, "amount", 0) != 0 and str(getattr(req, "executor_uuid", "")) in executor_uuids
+            ]
+            json_output = [to_dict(req) for req in filtered_requests]
             print(json.dumps(json_output, indent=4))
         except Exception as e:
             logger.error("❌ Failed to get miner reclaim requests: %s", str(e))
