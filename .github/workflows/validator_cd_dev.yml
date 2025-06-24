@@ -1,9 +1,10 @@
-name: "CD: validator (dev)"
+name: "CD: Deploying Validator (dev) with Manual Trigger"
 
 on:
   push:
     branches:
       - 'dev_validator'
+  workflow_dispatch:
 
 jobs:
   deploy:
