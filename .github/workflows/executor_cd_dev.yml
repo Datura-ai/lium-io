@@ -1,9 +1,10 @@
-name: "CD: executor (dev)"
+name: "CD: Deploying Executor (dev) with Manual Trigger"
 
 on:
   push:
     branches:
       - 'dev_executor'
+  workflow_dispatch:
 
 jobs:
   deploy:
