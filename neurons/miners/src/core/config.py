@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     REQUIRED_TAO_COLLATERAL: float = 0.005
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
-        env='COLLATERAL_CONTRACT_ADDRESS', default='0x6d4168e6D1660EA268DC1814BEd7dF7C038d4D01'
+        env='COLLATERAL_CONTRACT_ADDRESS', default='0x7DCCb5659c70Ce2104A9bb79E9E257473ECbe628'
     )
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":

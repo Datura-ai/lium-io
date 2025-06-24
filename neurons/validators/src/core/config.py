@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     DEBUG_COLLATERAL_CONTRACT: bool = True
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
-        env='COLLATERAL_CONTRACT_ADDRESS', default='0x0Bd3e88CE0F2303718Ac335868a3BAd8B5c19891'
+        env='COLLATERAL_CONTRACT_ADDRESS', default='0x7DCCb5659c70Ce2104A9bb79E9E257473ECbe628'
     )
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
