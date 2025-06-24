@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - 'dev_validator'
-      - 'master'
+  workflow_dispatch:
 
 jobs:
   deploy:
