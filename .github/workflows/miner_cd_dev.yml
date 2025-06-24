@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'dev_miner'
+      - 'feature/DAH-1286-subnet-integrate-collateral-contracts'
 
 jobs:
   deploy:
