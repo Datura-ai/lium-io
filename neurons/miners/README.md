@@ -72,6 +72,18 @@ Fill in your information for:
 cd neurons/miners && docker compose up -d
 ```
 
+### Associating Your Ethereum Address
+
+Before managing executors, you need to associate your Ethereum address with your Bittensor hotkey. This is a one-time setup requirement. Use the following command:
+
+```bash
+docker exec <container-id or name> pdm run /root/app/src/cli.py associate_eth --private-key <ethereum-private-key>
+```
+
+- `<ethereum-private-key>`: Your Ethereum private key that will be associated with your Bittensor hotkey.
+
+You will be prompted to enter your Bittensor wallet password to complete the association.
+
 ## Managing Executors
 
 ### What is a Validator Hotkey?
@@ -133,15 +145,6 @@ docker exec <container-id or name> pdm run /root/app/src/cli.py get-miner-collat
 
 This will display the total TAO collateral associated with the miner's Ethereum key.
 
-### Getting Eligible Executors
-
-To retrieve a list of executors eligible for mining, use the following command:
-
-```bash
-docker exec <container-id or name> pdm run /root/app/src/cli.py get-eligible-executors
-```
-
-This will display all executors that meet the eligibility criteria for mining as per the collateral contract.
 
 ### Depositing Collateral for an Executor
 
