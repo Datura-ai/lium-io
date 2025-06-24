@@ -138,12 +138,10 @@ To remove an executor from the central miner, follow these steps:
 To check the total collateral deposited by the miner, use the following command:
 
 ```bash
-docker exec <container-id or name> pdm run /root/app/src/cli.py get-miner-collateral --private-key <ethereum-private-key>
+docker exec <container-id or name> pdm run /root/app/src/cli.py get-miner-collateral
 ```
 
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract queries).
-
-This will display the total TAO collateral associated with the miner's Ethereum key.
+This will display the total TAO collateral that miner has deposited.
 
 
 ### Depositing Collateral for an Executor
@@ -166,12 +164,11 @@ This command allows you to increase the collateral for an executor already regis
 To check the collateral amount for a specific executor, use the following command:
 
 ```bash
-docker exec <container-id or name> pdm run /root/app/src/cli.py get-executor-collateral --address <executor-ip-address> --port <executor-port> --private-key <ethereum-private-key>
+docker exec <container-id or name> pdm run /root/app/src/cli.py get-executor-collateral --address <executor-ip-address> --port <executor-port>
 ```
 
 - `<executor-ip-address>`: The IP address of the executor machine.
 - `<executor-port>`: The port number used for the executor.
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract queries).
 
 This will display the TAO collateral associated with the specified executor.
 
@@ -180,10 +177,8 @@ This will display the TAO collateral associated with the specified executor.
 To view all reclaim requests for the current miner, use the following command:
 
 ```bash
-docker exec <container-id or name> pdm run /root/app/src/cli.py get-reclaim-requests --private-key <ethereum-private-key>
+docker exec <container-id or name> pdm run /root/app/src/cli.py get-reclaim-requests
 ```
-
-- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract queries).
 
 This will print a JSON list of all reclaim requests made by the miner, including their status and details.
 
