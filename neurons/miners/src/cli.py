@@ -189,17 +189,13 @@ def show_executors():
 
 
 @cli.command()
-@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def get_miner_collateral(private_key: str):
+def get_miner_collateral():
     """Get miner collateral by summing up collateral from all registered executors"""
 
     async def async_get_miner_collateral():
         try:
-            collateral_contract = get_collateral_contract(miner_key=private_key)
-
-            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
-            logger.info("Miner balance: %f TAO", balance)
-
+            collateral_contract = get_collateral_contract()
+            
             executor_dao = ExecutorDao(session=next(get_db()))
             executors = executor_dao.get_all_executors()
             total_collateral = 0.0
@@ -220,8 +216,7 @@ def get_miner_collateral(private_key: str):
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def get_executor_collateral(address: str, port: int, private_key: str):
+def get_executor_collateral(address: str, port: int):
     """Get collateral amount for a specific executor by address and port"""
     executor_dao = ExecutorDao(session=next(get_db()))
     try:
@@ -233,7 +228,7 @@ def get_executor_collateral(address: str, port: int, private_key: str):
 
     async def async_get_executor_collateral():
         try:
-            collateral_contract = get_collateral_contract(miner_key=private_key)
+            collateral_contract = get_collateral_contract()
             collateral = await collateral_contract.get_executor_collateral(executor_uuid)
             logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
         except Exception as e:
@@ -242,14 +237,13 @@ def get_executor_collateral(address: str, port: int, private_key: str):
 
 
 @cli.command()
-@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def get_reclaim_requests(private_key: str):
+def get_reclaim_requests():
     """Get reclaim requests for the current miner from the collateral contract"""
     import json
 
     async def async_get_reclaim_requests():
         try:
-            collateral_contract = get_collateral_contract(miner_key=private_key)
+            collateral_contract = get_collateral_contract()
             reclaim_requests = await collateral_contract.get_reclaim_events()
             if not reclaim_requests:
                 print(json.dumps([]))
