@@ -174,8 +174,6 @@ class SubtensorClient:
         return self.hotkey_to_evm_address.get(hotkey, None)
 
     def update_evm_address_map(self):
-        miners = self.get_miners()
-
         node = self.get_node()
         associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
         for uid, evm_address in associated_evms:
@@ -184,7 +182,7 @@ class SubtensorClient:
             self.uid_to_evm_address[uid] = evm_address_hex
 
         """Update the map of miner_hotkey -> evm_address for all miners."""
-        for miner in miners:
+        for miner in self.miners:
             self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
 
         logger.info(
@@ -478,10 +476,12 @@ class SubtensorClient:
                 self.set_subtensor()
 
                 if count == 0:
+                    self.fetch_miners()
                     self.update_evm_address_map()
 
                 count += 1
                 if count > 10:
+                    self.fetch_miners()
                     self.update_evm_address_map()
                     count = 1
 
