@@ -5,6 +5,7 @@ on:
     branches:
       - 'dev_executor'
       - 'feature/DAH-1286-subnet-integrate-collateral-contracts'
+      - 'master'
 
 jobs:
   deploy:
