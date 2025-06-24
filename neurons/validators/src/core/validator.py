@@ -1,7 +1,9 @@
 import asyncio
 import json
+import os
 from datetime import datetime
 from typing import TYPE_CHECKING
+import random
 
 import bittensor
 import numpy as np
@@ -14,13 +16,14 @@ from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
-from services.docker_service import REPOSITORIES, DockerService
+from services.docker_service import DockerService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import EXECUTOR_COUNT_PREFIX, PENDING_PODS_SET, RedisService
+from services.redis_service import PENDING_PODS_PREFIX, NORMALIZED_SCORE_CHANNEL, RedisService
 from services.ssh_service import SSHService
-from services.task_service import TaskService
-from services.const import BURN_EMISSION
+from services.task_service import TaskService, JobResult
+from services.matrix_validation_service import ValidationService
+from services.const import GPU_MODEL_RATES, TOTAL_BURN_EMISSION, BURNER_EMISSION, JOB_TIME_OUT
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -58,9 +61,11 @@ class Validator:
         ssh_service = SSHService()
         self.redis_service = RedisService()
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
+        self.validation_service = ValidationService()
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
+            validation_service=self.validation_service
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
@@ -76,23 +81,6 @@ class Validator:
         try:
             if await self.should_set_weights():
                 self.miner_scores = {}
-
-                # clear executor_counts
-                try:
-                    await self.redis_service.clear_all_executor_counts()
-                    logger.info(
-                        _m(
-                            "[initiate_services] Cleared executor_counts",
-                            extra=get_extra_info(self.default_extra),
-                        ),
-                    )
-                except Exception as e:
-                    logger.error(
-                        _m(
-                            "[initiate_services] Failed to clear executor_counts",
-                            extra=get_extra_info({**self.default_extra, "error": str(e)}),
-                        ),
-                    )
             else:
                 miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
                 if miner_scores_json is None:
@@ -107,7 +95,7 @@ class Validator:
                     self.miner_scores = json.loads(miner_scores_json)
 
             # remove pod renting-in-progress status
-            await self.redis_service.delete(PENDING_PODS_SET)
+            await self.redis_service.delete(PENDING_PODS_PREFIX)
         except Exception as e:
             logger.error(
                 _m(
@@ -206,6 +194,10 @@ class Validator:
         node = self.get_node()
         return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
 
+    def get_last_mechansim_step_block(self):
+        node = self.get_node()
+        return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
+
     def get_my_uid(self):
         metagraph = self.get_metagraph()
         return metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
@@ -228,12 +220,7 @@ class Validator:
             miners = [
                 neuron
                 for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving
-                and (
-                    not settings.DEBUG
-                    or not settings.DEBUG_MINER_HOTKEY
-                    or settings.DEBUG_MINER_HOTKEY == neuron.axon_info.hotkey
-                )
+                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
             ]
         logger.info(
             _m(
@@ -268,17 +255,40 @@ class Validator:
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
 
+        last_mechansim_step_block = self.get_last_mechansim_step_block()
+        main_burner = random.Random(last_mechansim_step_block).choice(settings.BURNERS)
+        logger.info(
+            _m(
+                "[set_weights] main burner",
+                extra=get_extra_info({
+                    "last_mechansim_step_block": last_mechansim_step_block,
+                    "main_burner": main_burner,
+                }),
+            ),
+        )
+        other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
+
+        metagraph = self.get_metagraph()
+        miner_hotkeys = []
         total_score = sum(self.miner_scores.values())
         if total_score <= 0:
-            uids[0] = 4
-            weights[0] = 1
+            uids[0] = main_burner
+            weights[0] = 1 - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+            miner_hotkeys.append(metagraph.hotkeys[main_burner])
+            for ind, uid in enumerate(other_burners):
+                uids[ind + 1] = uid
+                weights[ind + 1] = BURNER_EMISSION
+                miner_hotkeys.append(metagraph.hotkeys[uid])
         else:
             for ind, miner in enumerate(miners):
                 uids[ind] = miner.uid
-                if miner.uid == 4:
-                    weights[ind] = BURN_EMISSION
+                miner_hotkeys.append(metagraph.hotkeys[miner.uid])
+                if miner.uid == main_burner:
+                    weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+                elif miner.uid in other_burners:
+                    weights[ind] = BURNER_EMISSION
                 else:
-                    weights[ind] = (1 - BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
+                    weights[ind] = (1 - TOTAL_BURN_EMISSION) * self.miner_scores.get(miner.hotkey, 0.0) / total_score
 
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
@@ -289,8 +299,15 @@ class Validator:
                 extra=get_extra_info(self.default_extra),
             ),
         )
+        normalized_scores = [
+            {"uid": int(uid), "weight": float(weight), "miner_hotkey": miner_hotkey}
+            for uid, weight, miner_hotkey in zip(uids, weights, miner_hotkeys)
+        ]
+        message = {
+            "normalized_scores": normalized_scores,
+        }
+        await self.redis_service.publish(NORMALIZED_SCORE_CHANNEL, message)
 
-        metagraph = self.get_metagraph()
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
             weights=weights,
@@ -350,28 +367,6 @@ class Validator:
             )
 
         self.miner_scores = {}
-
-        # clear executor_counts
-        try:
-            await self.redis_service.clear_all_executor_counts()
-            logger.info(
-                _m(
-                    "[set_weights] Cleared executor_counts",
-                    extra=get_extra_info(self.default_extra),
-                ),
-            )
-        except Exception as e:
-            logger.error(
-                _m(
-                    "[set_weights] Failed to clear executor_counts",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
-                ),
-            )
 
     def get_last_update(self, block):
         try:
@@ -474,6 +469,65 @@ class Validator:
                 retries += 1
         return "Unknown"
 
+    async def calc_job_score(self, total_gpu_model_count_map: dict, job_result: JobResult):
+        if job_result.score == 0:
+            logger.info(
+                _m(
+                    "Debug: No need to calc score, score is 0",
+                    extra=get_extra_info({
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "job_batch_id": job_result.job_batch_id,
+                        "gpu_model": job_result.gpu_model,
+                        "gpu_count": job_result.gpu_count,
+                        "score": 0,
+                        "sysbox_runtime": job_result.sysbox_runtime,
+                    })
+                )
+            )
+            return 0
+
+        gpu_model_rate = GPU_MODEL_RATES.get(job_result.gpu_model, 0)
+        total_gpu_count = total_gpu_model_count_map.get(job_result.gpu_model, 0)
+
+        if total_gpu_count == 0:
+            return 0
+
+        revenue_per_gpu_type = await self.redis_service.get_revenue_per_gpu_type(job_result.gpu_model)
+        score_portion = gpu_model_rate + settings.TIME_DELTA_FOR_EMISSION * (revenue_per_gpu_type - gpu_model_rate)
+        score = score_portion * job_result.gpu_count / total_gpu_count
+
+        # get uptime of the executor
+        uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
+        # if uptime in the subnet is exceed 5 days, then it'll get max score
+        # if uptime is less than 5 days, then it'll get score based on the uptime
+        # give 50% of max still to avoid 0 score all miners at deployment
+        # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX per cent.
+        five_days_in_minutes = 60 * 24 * 5
+        score = score * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / five_days_in_minutes))
+
+        if job_result.sysbox_runtime:
+            score = score * (1 + settings.PORTION_FOR_SYSBOX)
+
+        logger.info(
+            _m(
+                "Debug: calculating score",
+                extra=get_extra_info({
+                    "executor_id": str(job_result.executor_info.uuid),
+                    "job_batch_id": job_result.job_batch_id,
+                    "gpu_model": job_result.gpu_model,
+                    "total_gpu_count": total_gpu_count,
+                    "gpu_count": job_result.gpu_count,
+                    "gpu_model_rate": gpu_model_rate,
+                    "revenue_per_gpu_type": revenue_per_gpu_type,
+                    "score_portion": score_portion,
+                    "score": score,
+                    "sysbox_runtime": job_result.sysbox_runtime,
+                })
+            )
+        )
+
+        return score
+
     async def sync(self):
         try:
             self.set_subtensor()
@@ -524,19 +578,6 @@ class Validator:
 
                 self.last_job_run_blocks = current_block
 
-                docker_hub_digests = await self.docker_service.get_docker_hub_digests(REPOSITORIES)
-                logger.info(
-                    _m(
-                        "Docker Hub Digests: get docker hub digests",
-                        extra=get_extra_info(
-                            {
-                                "job_batch_id": job_batch_id,
-                                "docker_hub_digests": len(docker_hub_digests),
-                            }
-                        ),
-                    ),
-                )
-
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files()
 
                 task_info = {}
@@ -548,11 +589,11 @@ class Validator:
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
+                                miner_coldkey=miner.coldkey,
                                 miner_address=miner.axon_info.ip,
                                 miner_port=miner.axon_info.port,
                             ),
                             encrypted_files=encrypted_files,
-                            docker_hub_digests=docker_hub_digests,
                         )
                     )
                     for miner in miners
@@ -567,95 +608,38 @@ class Validator:
                     }
 
                 try:
+                    total_gpu_model_count_map = {}
+                    all_job_results = {}
+
                     # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=60 * 10 - 100)
+                    done, pending = await asyncio.wait(jobs, timeout=JOB_TIME_OUT - 50)
 
                     # Process completed jobs
                     for task in done:
                         try:
                             result = task.result()
                             if result:
+                                miner_hotkey = result.get("miner_hotkey")
+                                job_results: list[JobResult] = result.get("results", [])
+
                                 logger.info(
                                     _m(
                                         "[sync] Job_Result",
                                         extra=get_extra_info(
                                             {
                                                 **self.default_extra,
-                                                "result": result,
+                                                "miner_hotkey": miner_hotkey,
+                                                "results": len(job_results)
                                             }
                                         ),
                                     ),
                                 )
-                                miner_hotkey = result.get("miner_hotkey")
-                                job_score = result.get("score")
 
-                                key = f"{EXECUTOR_COUNT_PREFIX}:{miner_hotkey}"
+                                all_job_results[miner_hotkey] = job_results
 
-                                try:
-                                    executor_counts = await self.redis_service.hgetall(key)
-                                    parsed_counts = [
-                                        {
-                                            "job_batch_id": job_id.decode("utf-8"),
-                                            **json.loads(data.decode("utf-8")),
-                                        }
-                                        for job_id, data in executor_counts.items()
-                                    ]
+                                for job_result in job_results:
+                                    total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
 
-                                    if parsed_counts:
-                                        logger.info(
-                                            _m(
-                                                "[sync] executor counts list",
-                                                extra=get_extra_info(
-                                                    {
-                                                        **self.default_extra,
-                                                        "miner_hotkey": miner_hotkey,
-                                                        "parsed_counts": parsed_counts,
-                                                    }
-                                                ),
-                                            ),
-                                        )
-
-                                        max_executors = max(
-                                            parsed_counts, key=lambda x: x["total"]
-                                        )["total"]
-                                        min_executors = min(
-                                            parsed_counts, key=lambda x: x["total"]
-                                        )["total"]
-
-                                        logger.info(
-                                            _m(
-                                                "[sync] executor counts",
-                                                extra=get_extra_info(
-                                                    {
-                                                        **self.default_extra,
-                                                        "miner_hotkey": miner_hotkey,
-                                                        "job_batch_id": job_batch_id,
-                                                        "max_executors": max_executors,
-                                                        "min_executors": min_executors,
-                                                    }
-                                                ),
-                                            ),
-                                        )
-
-                                except Exception as e:
-                                    logger.error(
-                                        _m(
-                                            "[sync] Get executor counts error",
-                                            extra=get_extra_info(
-                                                {
-                                                    **self.default_extra,
-                                                    "miner_hotkey": miner_hotkey,
-                                                    "job_batch_id": job_batch_id,
-                                                    "error": str(e),
-                                                }
-                                            ),
-                                        ),
-                                    )
-
-                                if miner_hotkey in self.miner_scores:
-                                    self.miner_scores[miner_hotkey] += job_score
-                                else:
-                                    self.miner_scores[miner_hotkey] = job_score
                             else:
                                 info = task_info.get(task, {})
                                 miner_hotkey = info.get("miner_hotkey", "unknown")
@@ -708,6 +692,26 @@ class Validator:
                             )
                             task.cancel()
 
+                    open_fd_count = len(os.listdir(f'/proc/self/fd'))
+
+                    logger.info(
+                        _m(
+                            "Total GPU model count",
+                            extra=get_extra_info(
+                                {
+                                    **self.default_extra,
+                                    "job_batch_id": job_batch_id,
+                                    "data": total_gpu_model_count_map,
+                                }
+                            ),
+                        ),
+                    )
+
+                    for miner_hotkey, results in all_job_results.items():
+                        for result in results:
+                            score = await self.calc_job_score(total_gpu_model_count_map, result)
+                            self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+
                     logger.info(
                         _m(
                             "[sync] All Jobs finished",
@@ -716,6 +720,7 @@ class Validator:
                                     **self.default_extra,
                                     "job_batch_id": job_batch_id,
                                     "miner_scores": self.miner_scores,
+                                    "open_fd_count": open_fd_count,
                                 }
                             ),
                         ),

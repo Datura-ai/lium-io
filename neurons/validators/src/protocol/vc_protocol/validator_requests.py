@@ -15,6 +15,9 @@ class RequestType(enum.Enum):
     LogStreamRequest = "LogStreamRequest"
     ResetVerifiedJobRequest = "ResetVerifiedJobRequest"
     DuplicateExecutorsRequest = "DuplicateExecutorsRequest"
+    NormalizedScoreRequest = "NormalizedScoreRequest"
+    RevenuePerGpuTypeRequest = "RevenuePerGpuTypeRequest"
+    ScorePortionPerGpuTypeRequest = "ScorePortionPerGpuTypeRequest"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -50,10 +53,12 @@ class AuthenticateRequest(BaseValidatorRequest):
 class ExecutorSpecRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ExecutorSpecRequest
     miner_hotkey: str
+    miner_coldkey: str
     validator_hotkey: str
     executor_uuid: str
     executor_ip: str
     executor_port: int
+    executor_price: float | None = None
     specs: dict | None
     score: float | None
     synthetic_job_score: float | None
@@ -74,12 +79,32 @@ class LogStreamRequest(BaseValidatorRequest):
     logs: list[dict]
 
 
+class ResetVerifiedJobReason(int, enum.Enum):
+    DEFAULT = 0
+    POD_NOT_RUNNING = 1         # container for pod is not running
+
+
 class ResetVerifiedJobRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ResetVerifiedJobRequest
     validator_hotkey: str
     miner_hotkey: str
     executor_uuid: str
+    reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
 
 
 class DuplicateExecutorsRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.DuplicateExecutorsRequest
+
+
+class NormalizedScoreRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.NormalizedScoreRequest
+    normalized_scores: list[dict]
+
+
+class RevenuePerGpuTypeRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.RevenuePerGpuTypeRequest
+
+
+class ScorePortionPerGpuTypeRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.ScorePortionPerGpuTypeRequest
+    portions: dict[str, float]

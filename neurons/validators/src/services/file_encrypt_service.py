@@ -54,6 +54,7 @@ ORIGINAL_KEYS = {
     'upload_speed': "upload_speed",
     'download_speed': "download_speed",
     'network_speed_error': "network_speed_error",
+    'net_speed_error': "net_speed_error",
     'gpu_count': "count",
     'gpu_driver': "driver",
     'gpu_cuda_driver': "cuda_driver",
@@ -106,6 +107,8 @@ ORIGINAL_KEYS = {
     'each_container_id': "container_id",
     'each_digest': "digest",
     'each_name': "name",
+    'data_sysbox_runtime': "sysbox_runtime",
+    'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
 }
 
 
@@ -213,6 +216,7 @@ class FileEncryptService:
             'upload_speed': "",
             'download_speed': "",
             'network_speed_error': "",
+            'net_speed_error': "",
             'hard_disk_total': "",
             'hard_disk_used': "",
             'hard_disk_free': "",
@@ -245,7 +249,9 @@ class FileEncryptService:
             'each_container_id': "",
             'each_digest': "",
             'each_name': "",
-            'machine_specs': ""
+            'machine_specs': "",
+            'data_sysbox_runtime': "",
+            'data_sysbox_runtime_scrape_error': "",
         }
 
         # Generate dictionary key mapping on validator side
@@ -301,32 +307,35 @@ class FileEncryptService:
             machine_scrape_file.write(obfuscated_content.encode("utf-8"))
             machine_scrape_file.flush()
             os.fsync(machine_scrape_file.fileno())
+            
+            machine_scrape_file_name = self.make_binary_file(
+                str(tmp_directory), machine_scrape_file.name
+            )
 
-            if random.choice([True, False]):
-                machine_scrape_file_name = self.make_binary_file_with_nuitka(
-                    str(tmp_directory), machine_scrape_file.name
-                )
-            else:
-                machine_scrape_file_name = self.make_binary_file(
-                    str(tmp_directory), machine_scrape_file.name
-                )
+            # if random.choice([True, False]):
+            #     machine_scrape_file_name = self.make_binary_file_with_nuitka(
+            #         str(tmp_directory), machine_scrape_file.name
+            #     )
+            # else:
+            #     machine_scrape_file_name = self.make_binary_file(
+            #         str(tmp_directory), machine_scrape_file.name
+            #     )
 
-        # generate score_script file
-        score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
-        with open(score_script_file_path) as file:
-            content = file.read()
-        modified_content = content
+        # # generate score_script file
+        # score_script_file_path = str(Path(__file__).parent / ".." / "miner_jobs/score.py")
+        # with open(score_script_file_path) as file:
+        #     content = file.read()
+        # modified_content = content
 
-        with tempfile.NamedTemporaryFile(delete=True, suffix=".py") as score_file:
-            score_file.write(modified_content.encode("utf-8"))
-            score_file.flush()
-            os.fsync(score_file.fileno())
-            score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
+        # with tempfile.NamedTemporaryFile(delete=True, suffix=".py") as score_file:
+        #     score_file.write(modified_content.encode("utf-8"))
+        #     score_file.flush()
+        #     os.fsync(score_file.fileno())
+        #     score_file_name = self.make_obfuscated_file(str(tmp_directory), score_file.name)
 
         return MinerJobEnryptedFiles(
             encrypt_key=encryption_key,
             all_keys=all_keys,
             tmp_directory=str(tmp_directory),
             machine_scrape_file_name=machine_scrape_file_name,
-            score_file_name=score_file_name,
         )

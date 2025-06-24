@@ -1,19 +1,28 @@
 import json
 import asyncio
+import logging
+import time
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
-from protocol.vc_protocol.compute_requests import RentedMachine
+from datura.requests.miner_requests import ExecutorSSHInfo
+from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
+from core.utils import _m
 
 MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
-PENDING_PODS_SET = "pending_pods"
+PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
-EXECUTOR_COUNT_PREFIX = "executor_counts"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
+EXECUTORS_UPTIME_PREFIX = "executors_uptime"
+NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
+REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
+
+logger = logging.getLogger(__name__)
 
 
 class RedisService:
@@ -117,35 +126,50 @@ class RedisService:
                 await self.redis.delete(key.decode())
 
     async def add_rented_machine(self, machine: RentedMachine):
-        await self.hset(RENTED_MACHINE_PREFIX, f"{machine.miner_hotkey}:{machine.executor_id}", machine.model_dump_json())
+        await self.hset(RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json())
 
-    async def remove_rented_machine(self, miner_hotkey: str, executor_id: str):
-        await self.hdel(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+    async def remove_rented_machine(self, executor: ExecutorSSHInfo):
+        await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
 
-    async def get_rented_machine(self, miner_hotkey: str, executor_id: str):
-        data = await self.hget(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+    async def get_rented_machine(self, executor: ExecutorSSHInfo):
+        data = await self.hget(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
         if not data:
             return None
 
         return json.loads(data)
 
+    async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
+        await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
+
+    async def get_executor_uptime(self, executor: ExecutorSSHInfo) -> int:
+        try:
+            data = await self.hget(EXECUTORS_UPTIME_PREFIX, f"{executor.address}:{executor.port}")
+            if not data:
+                return 0
+            return int(data)
+        except Exception as e:
+            logger.error(_m("Error getting executor uptime: {e}", extra={"error": e}), exc_info=True)
+            return 0
+
     async def add_pending_pod(self, miner_hotkey: str, executor_id: str):
-        await self.sadd(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+        now = int(time.time())
+        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps({"time": now}))
 
     async def remove_pending_pod(self, miner_hotkey: str, executor_id: str):
-        await self.srem(PENDING_PODS_SET, f"{miner_hotkey}:{executor_id}")
+        await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
 
-    async def clear_all_executor_counts(self):
-        pattern = f"{EXECUTOR_COUNT_PREFIX}:*"
-        cursor = 0
+    async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
+        data = await self.hget(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+        if not data:
+            return False
 
-        async with self.lock:
-            while True:
-                cursor, keys = await self.redis.scan(cursor, match=pattern, count=100)
-                if keys:
-                    await self.redis.delete(*keys)
-                if cursor == 0:
-                    break
+        now = int(time.time())
+        data = json.loads(data)
+        if now - data.get('time', 0) >= 30 * 60:  # 30 mins
+            await self.remove_pending_pod(miner_hotkey, executor_id)
+            return False
+
+        return True
 
     async def set_verified_job_info(
         self,
@@ -186,7 +210,8 @@ class RedisService:
         self,
         miner_hotkey: str,
         executor_id,
-        prev_info: dict = {}
+        prev_info: dict = {},
+        reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT
     ):
         spec = prev_info.get('spec', '')
         uuids = prev_info.get('uuids', '')
@@ -199,22 +224,28 @@ class RedisService:
         }
         await self.hset(VERIFIED_JOB_COUNT_KEY, executor_id, json.dumps(data))
 
-        # remove available port maps for the executor
-        port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
-        await self.delete(port_map_key)
-
         await self.publish(
             RESET_VERIFIED_JOB_CHANNEL,
             {
                 "miner_hotkey": miner_hotkey,
                 "executor_uuid": executor_id,
+                "reason": reason.value,
             },
         )
 
     async def get_verified_job_info(self, executor_id: str):
         data = await self.hget(VERIFIED_JOB_COUNT_KEY, executor_id)
-
         if not data:
             return {}
 
         return json.loads(data)
+
+    async def set_revenue_per_gpu_type(self, gpu_type: str, revenue: float):
+        await self.hset(REVENUE_PER_GPU_TYPE_SET, gpu_type, str(revenue))
+
+    async def get_revenue_per_gpu_type(self, gpu_type: str):
+        revenue = await self.hget(REVENUE_PER_GPU_TYPE_SET, gpu_type)
+        if not revenue:
+            return 0.0
+
+        return float(revenue)

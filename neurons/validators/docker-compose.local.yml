@@ -7,6 +7,7 @@ services:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    restart: unless-stopped
     env_file: ./.env
     volumes:
       - db_data:/var/lib/postgresql/data
@@ -14,10 +15,13 @@ services:
       - ${POSTGRES_PORT}:5432
 
   redis:
-    image: redis:6-alpine
-    command: redis-server --appendonly yes
+    image: daturaai/redis:7.4.2
+    environment:
+      - REDIS_MODE=master
+      - REDIS_REPLICATION_MODE=master
     healthcheck:
       test: redis-cli ping
+    restart: unless-stopped
     volumes:
       - redis_data:/data
     ports:

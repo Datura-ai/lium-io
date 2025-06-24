@@ -1,12 +1,10 @@
 import asyncio
 import json
 import logging
-import os
 import random
-import time
 import uuid
-import hashlib
 from typing import Annotated
+from pydantic import BaseModel
 
 import asyncssh
 import bittensor
@@ -16,32 +14,27 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 
 from core.config import settings
 from core.utils import _m, context, get_extra_info
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
-    DOWNLOAD_SPEED_WEIGHT,
-    GPU_MAX_SCORES,
-    JOB_TAKEN_TIME_WEIGHT,
-    MAX_DOWNLOAD_SPEED,
-    MAX_UPLOAD_SPEED,
-    UPLOAD_SPEED_WEIGHT,
+    GPU_MODEL_RATES,
     MAX_GPU_COUNT,
     UNRENTED_MULTIPLIER,
-    HASHCAT_CONFIGS,
     LIB_NVIDIA_ML_DIGESTS,
     DOCKER_DIGEST,
     PYTHON_DIGEST,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
-    VERIFY_JOB_REQUIRED_COUNT,
+    MIN_PORT_COUNT,
 )
 from services.redis_service import (
     RedisService,
-    PENDING_PODS_SET,
     DUPLICATED_MACHINE_SET,
     RENTAL_SUCCEED_MACHINE_SET,
     AVAILABLE_PORT_MAPS_PREFIX,
 )
 from services.ssh_service import SSHService
-from services.hash_service import HashService
+from services.interactive_shell_service import InteractiveShellService
+from services.matrix_validation_service import ValidationService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -49,39 +42,30 @@ logger = logging.getLogger(__name__)
 JOB_LENGTH = 300
 
 
+class JobResult(BaseModel):
+    spec: dict | None = None
+    executor_info: ExecutorSSHInfo
+    score: float
+    job_score: float
+    job_batch_id: str
+    log_status: str
+    log_text: str
+    gpu_model: str | None = None
+    gpu_count: int = 0
+    sysbox_runtime: bool = False
+
+
 class TaskService:
     def __init__(
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        validation_service: Annotated[ValidationService, Depends(ValidationService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.validation_service = validation_service
         self.wallet = settings.get_bittensor_wallet()
-
-    async def upload_directory(
-        self, ssh_client: asyncssh.SSHClientConnection, local_dir: str, remote_dir: str
-    ):
-        """Uploads a directory recursively to a remote server using AsyncSSH."""
-        async with ssh_client.start_sftp_client() as sftp_client:
-            for root, dirs, files in os.walk(local_dir):
-                relative_dir = os.path.relpath(root, local_dir)
-                remote_path = os.path.join(remote_dir, relative_dir)
-
-                # Create remote directory if it doesn't exist
-                result = await ssh_client.run(f"mkdir -p {remote_path}")
-                if result.exit_status != 0:
-                    raise Exception(f"Failed to create directory {remote_path}: {result.stderr}")
-
-                # Upload files
-                upload_tasks = []
-                for file in files:
-                    local_file = os.path.join(root, file)
-                    remote_file = os.path.join(remote_path, file)
-                    upload_tasks.append(sftp_client.put(local_file, remote_file))
-
-                # Await all upload tasks for the current directory
-                await asyncio.gather(*upload_tasks)
 
     async def is_script_running(
         self, ssh_client: asyncssh.SSHClientConnection, script_path: str
@@ -160,14 +144,6 @@ class TaskService:
 
         return True
 
-    async def clear_remote_directory(
-        self, ssh_client: asyncssh.SSHClientConnection, remote_dir: str
-    ):
-        try:
-            await ssh_client.run(f"rm -rf {remote_dir}", timeout=10)
-        except Exception as e:
-            logger.error(f"Error clearing remote directory: {e}")
-
     def get_available_port_map(
         self,
         executor_info: ExecutorSSHInfo,
@@ -208,6 +184,18 @@ class TaskService:
         internal_port = random.choice(ports)
 
         return internal_port, internal_port
+
+    def check_fingerprints_changed(self, prev_uuids, gpu_uuids):
+        try:
+            if not prev_uuids:
+                return False
+            prev_uuids = sorted(prev_uuids.split(','))
+            gpu_uuids = sorted(gpu_uuids.split(','))
+
+            return ",".join(prev_uuids) != ",".join(gpu_uuids)
+        except Exception as e:
+            logger.error(f"Error checking fingerprints changed: {e}")
+            return False
 
     async def docker_connection_check(
         self,
@@ -260,11 +248,22 @@ class TaskService:
 
         try:
             # remove all containers that has conatiner_ prefix in its name, since it's unrented
-            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.ID}}"'
+            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
             result = await ssh_client.run(command)
             if result.stdout.strip():
-                ids = " ".join(result.stdout.strip().split("\n"))
-                command = f'/usr/bin/docker rm {ids} -f'
+                container_names = " ".join(result.stdout.strip().split("\n"))
+
+                logger.info(
+                    _m(
+                        "Cleaning existing docker containers",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_names": container_names,
+                        }),
+                    ),
+                )
+
+                command = f'/usr/bin/docker rm {container_names} -f'
                 await ssh_client.run(command)
 
                 command = f'/usr/bin/docker volume prune -af'
@@ -278,7 +277,7 @@ class TaskService:
             logger.info(log_text)
 
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"/usr/bin/docker run -d --name {container_name} -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
+            command = f"/usr/bin/docker run -d --name {container_name} --gpus all -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
             result = await ssh_client.run(command)
             if result.exit_status != 0:
@@ -355,7 +354,6 @@ class TaskService:
     async def check_pod_running(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-        miner_hotkey: str,
         container_name: str,
         executor_info: ExecutorSSHInfo,
     ):
@@ -364,36 +362,24 @@ class TaskService:
         if result.stdout.strip():
             return True
 
-        # remove pod in redis
-        await self.redis_service.remove_rented_machine(miner_hotkey, executor_info.uuid)
+        # # remove pod in redis
+        # await self.redis_service.remove_rented_machine(executor_info)
+        logger.error(
+            _m(
+                "Pod not found, but redis is saying it's rented",
+                extra={
+                    "container_name": container_name,
+                    "executor_id": executor_info.uuid,
+                    "address": executor_info.address,
+                    "port": executor_info.port,
+                }
+            )
+        )
 
         return False
 
-    async def read_file_content_over_scp(self, ssh_client: asyncssh.SSHClientConnection, file_path: str) -> bytes:
-        async with ssh_client.start_sftp_client() as sftp_client:
-            async with sftp_client.open(file_path, 'rb') as file:
-                file_content = await file.read()
-
-        return file_content
-
-    def get_md5_checksum_from_file_content(self, file_content: bytes):
-        md5_hash = hashlib.md5()
-        md5_hash.update(file_content)
-        return md5_hash.hexdigest()
-
-    def get_sha256_checksum_from_file_content(self, file_content: bytes):
-        sha256_hash = hashlib.sha256()
-        sha256_hash.update(file_content)
-        return sha256_hash.hexdigest()
-
-    async def get_checksums_over_scp(self, ssh_client: asyncssh.SSHClientConnection, file_path: str):
-        file_content = await self.read_file_content_over_scp(ssh_client, file_path)
-        return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
-
     async def _handle_task_result(
         self,
-        ssh_client: asyncssh.SSHClientConnection,
-        remote_dir: str,
         miner_info: MinerJobRequestPayload,
         executor_info: ExecutorSSHInfo,
         spec: dict | None,
@@ -405,9 +391,16 @@ class TaskService:
         clear_verified_job_info: bool = False,
         gpu_model_count: str = '',
         gpu_uuids: str = '',
+        sysbox_runtime: bool = False,
+        clear_verified_job_reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
     ):
-        await self.clear_remote_directory(ssh_client, remote_dir)
-
+        logger.info(_m("Handle task result: ", extra={
+            "miner_hotkey": miner_info.miner_hotkey,
+            "executor_id": executor_info.uuid,
+            "success": success,
+            "score": score,
+            "job_score": job_score,
+        }))
         if success:
             log_status = "info"
             logger.info(log_text)
@@ -430,6 +423,7 @@ class TaskService:
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_id=executor_info.uuid,
                     prev_info=verified_job_info,
+                    reason=clear_verified_job_reason,
                 )
             else:
                 await self.redis_service.set_verified_job_info(
@@ -439,15 +433,50 @@ class TaskService:
                     success=success,
                 )
 
-        return (
-            spec,
-            executor_info,
-            score,
-            job_score,
-            miner_info.job_batch_id,
-            log_status,
-            log_text,
+        gpu_model = None
+        gpu_count = 0
+        if gpu_model_count and ':' in gpu_model_count:
+            gpu_model_count_info = gpu_model_count.split(':')
+            gpu_model = gpu_model_count_info[0]
+            gpu_count = int(gpu_model_count_info[1])
+
+        return JobResult(
+            spec=spec,
+            executor_info=executor_info,
+            score=score,
+            job_score=job_score,
+            job_batch_id=miner_info.job_batch_id,
+            log_status=log_status,
+            log_text=str(log_text),
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+            sysbox_runtime=sysbox_runtime,
         )
+
+    def check_gpu_usage(
+        self,
+        gpu_details: list[dict],
+        gpu_processes: list[dict],
+        default_extra: dict,
+        rented: bool = False,
+    ) -> tuple[bool, str | None]:
+        # check gpu usages
+        for detail in gpu_details:
+            gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
+            gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
+            if len(gpu_processes) > 0 and (gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT):
+                log_text = _m(
+                    "High gpu utilization detected" if not rented else "GPU is using in some other places on the rented machine",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "gpu_utilization": gpu_utilization,
+                        "gpu_memory_utilization": gpu_memory_utilization,
+                        "gpu_processes": gpu_processes,
+                    }),
+                )
+                return False, log_text
+
+        return True, None
 
     async def create_task(
         self,
@@ -457,7 +486,6 @@ class TaskService:
         private_key: str,
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
-        docker_hub_digests: dict[str, str],
     ):
         default_extra = {
             "job_batch_id": miner_info.job_batch_id,
@@ -474,65 +502,48 @@ class TaskService:
         prev_spec = verified_job_info.get('spec', '')
         prev_uuids = verified_job_info.get('uuids', '')
 
+        is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
+            RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
+        )
+
         try:
             logger.info(_m("Start job on an executor", extra=get_extra_info(default_extra)))
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-            pkey = asyncssh.import_private_key(private_key)
 
-            async with asyncssh.connect(
+            async with InteractiveShellService(
                 host=executor_info.address,
-                port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
-            ) as ssh_client:
-                random_length = random.randint(5, 15)
-                remote_dir = f"{executor_info.root_dir}/{self.ssh_service.generate_random_string(length=random_length, string_only=True)}"
-                await ssh_client.run(f"rm -rf {remote_dir}")
-                await ssh_client.run(f"mkdir -p {remote_dir}")
-
-                docker_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/docker')
+                private_key=private_key,
+                port=executor_info.ssh_port,
+            ) as shell:
+                docker_checksums = await shell.get_checksums_over_scp('/usr/bin/docker')
                 if docker_checksums != DOCKER_DIGEST:
-                    log_text = _m(
-                        "Docker is altered",
-                        extra=get_extra_info(default_extra),
+                    logger.info(
+                        _m(
+                            "Docker checksum",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "checksum": docker_checksums,
+                                "DOCKER_DIGEST": DOCKER_DIGEST
+                            }),
+                        )
                     )
+                    # raise Exception("Docker is altered")
 
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=True,
-                    )
-
-                python_checksums = await self.get_checksums_over_scp(ssh_client, '/usr/bin/python')
+                python_checksums = await shell.get_checksums_over_scp('/usr/bin/python')
                 if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
-                    log_text = _m(
-                        "Python is altered",
-                        extra=get_extra_info(default_extra),
+                    logger.info(
+                        _m(
+                            "Python checksum",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "checksum": python_checksums,
+                                "PYTHON_DIGEST": PYTHON_DIGEST
+                            }),
+                        )
                     )
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=True,
-                    )
+                    # raise Exception("Python is altered")
 
                 # start gpus_utility.py
                 program_id = str(uuid.uuid4())
@@ -544,47 +555,34 @@ class TaskService:
                     "compute_rest_app_url": settings.COMPUTE_REST_API_URL,
                 }
                 script_path = f"{executor_info.root_dir}/src/gpus_utility.py"
-                if not await self.is_script_running(ssh_client, script_path):
-                    await self.start_script(ssh_client, script_path, command_args, executor_info)
+                if not await self.is_script_running(shell.ssh_client, script_path):
+                    await self.start_script(shell.ssh_client, script_path, command_args, executor_info)
 
                 # upload temp directory
-                await self.upload_directory(ssh_client, encrypted_files.tmp_directory, remote_dir)
+                random_length = random.randint(5, 15)
+                remote_dir = f"{executor_info.root_dir}/{self.ssh_service.generate_random_string(length=random_length, string_only=True)}"
+                await shell.upload_directory(encrypted_files.tmp_directory, remote_dir)
 
                 remote_machine_scrape_file_path = (
                     f"{remote_dir}/{encrypted_files.machine_scrape_file_name}"
                 )
-                remote_score_file_path = f"{remote_dir}/{encrypted_files.score_file_name}"
 
                 logger.info(
                     _m(
                         "Uploaded files to run job",
                         extra=get_extra_info(default_extra),
-                    ),
+                    )
                 )
 
-                await ssh_client.run(f"chmod +x {remote_machine_scrape_file_path}")
+                await shell.ssh_client.run(f"chmod +x {remote_machine_scrape_file_path}")
                 machine_specs, _ = await self._run_task(
-                    ssh_client=ssh_client,
+                    ssh_client=shell.ssh_client,
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_info=executor_info,
                     command=f"{remote_machine_scrape_file_path}",
                 )
                 if not machine_specs:
-                    log_text = _m("No machine specs found", extra=get_extra_info(default_extra))
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=None,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
-                    )
+                    raise Exception("No machine specs found")
 
                 machine_spec = json.loads(
                     self.ssh_service.decrypt_payload(
@@ -613,10 +611,6 @@ class TaskService:
                     if len(details) > 0:
                         gpu_model = details[0].get("name", None)
 
-                max_score = 0
-                if gpu_model:
-                    max_score = GPU_MAX_SCORES.get(gpu_model, 0)
-
                 gpu_count = machine_spec.get("gpu", {}).get("count", 0)
                 gpu_details = machine_spec.get("gpu", {}).get("details", [])
                 gpu_model_count = f'{gpu_model}:{gpu_count}'
@@ -632,6 +626,7 @@ class TaskService:
 
                 gpu_processes = machine_spec.get("gpu_processes", [])
 
+                sysbox_runtime = machine_spec.get("sysbox_runtime", False)
                 vram = 0
                 for detail in gpu_details:
                     vram += detail.get("capacity", 0) * 1024
@@ -661,8 +656,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -674,7 +667,7 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                if max_score == 0 or gpu_count == 0 or len(gpu_details) != gpu_count:
+                if not GPU_MODEL_RATES.get(gpu_model) or gpu_count == 0 or len(gpu_details) != gpu_count:
                     extra_info = {
                         **default_extra,
                         "os_version": machine_spec.get("os", ""),
@@ -689,7 +682,7 @@ class TaskService:
                     if gpu_model:
                         extra_info["gpu_model"] = gpu_model
                         extra_info["help_text"] = (
-                            "If you have the gpu machine and encountering this issue consistantly, "
+                            "If you have the gpu machine and encountering this issue consistently, "
                             "then please pull the latest version of github repository and follow the installation guide here: "
                             "https://github.com/Datura-ai/compute-subnet/tree/main/neurons/executor. "
                             "Also, please configure the nvidia-container-runtime correctly. Check out here: "
@@ -698,7 +691,7 @@ class TaskService:
                         )
 
                     log_text = _m(
-                        f"Max Score({max_score}) or GPU count({gpu_count}) is 0. No need to run job.",
+                        f"No GPU in list or GPU count({gpu_count}) is 0. No need to run job.",
                         extra=get_extra_info(
                             {
                                 **default_extra,
@@ -708,8 +701,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -736,8 +727,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -762,8 +751,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -775,7 +762,7 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                if prev_uuids and prev_uuids != gpu_uuids:
+                if self.check_fingerprints_changed(prev_uuids, gpu_uuids):
                     log_text = _m(
                         "GPUs are changed",
                         extra=get_extra_info(
@@ -788,8 +775,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -801,38 +786,9 @@ class TaskService:
                         clear_verified_job_info=True,
                     )
 
-                for process in gpu_processes:
-                    container_name = process.get('container_name', None)
-                    if not container_name:
-                        log_text = _m(
-                            "GPU is using in some other places",
-                            extra=get_extra_info(
-                                {
-                                    **default_extra,
-                                    "gpu_model": gpu_model,
-                                    "gpu_count": gpu_count,
-                                    **process,
-                                }
-                            ),
-                        )
-
-                        return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-
                 logger.info(
                     _m(
-                        f"Got GPU specs: {gpu_model} with max score: {max_score}",
+                        f"Got GPU Model: {gpu_model}, count: {gpu_count}",
                         extra=get_extra_info(default_extra),
                     ),
                 )
@@ -848,8 +804,6 @@ class TaskService:
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -862,12 +816,11 @@ class TaskService:
                     )
 
                 # check rented status
-                rented_machine = await self.redis_service.get_rented_machine(miner_info.miner_hotkey, executor_info.uuid)
-                if rented_machine:
+                rented_machine = await self.redis_service.get_rented_machine(executor_info)
+                if rented_machine and rented_machine.get("container_name", ""):
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running = await self.check_pod_running(
-                        ssh_client=ssh_client,
-                        miner_hotkey=miner_info.miner_hotkey,
+                        ssh_client=shell.ssh_client,
                         container_name=container_name,
                         executor_info=executor_info,
                     )
@@ -883,8 +836,6 @@ class TaskService:
                         )
 
                         return await self._handle_task_result(
-                            ssh_client=ssh_client,
-                            remote_dir=remote_dir,
                             miner_info=miner_info,
                             executor_info=executor_info,
                             spec=machine_spec,
@@ -893,301 +844,59 @@ class TaskService:
                             log_text=log_text,
                             verified_job_info=verified_job_info,
                             success=False,
+                            gpu_model_count=gpu_model_count,
                             clear_verified_job_info=True,
+                            clear_verified_job_reason=ResetVerifiedJobReason.POD_NOT_RUNNING,
                         )
 
-                    # In backend, there are 2 scores. actual score and job score. 
-                    # job score is the score which executor gets when hashcat/matrix multiply is finished.
+                    # check gpu running out side of containers
+                    gpu_running_outside = False
+                    for process in gpu_processes:
+                        gpu_process_container = process.get('container_name', None)
+                        if not gpu_process_container or gpu_process_container != container_name:
+                            gpu_running_outside = True
+                            break
+
+                    if not rented_machine.get("owner_flag", False) and gpu_running_outside:
+                        # check gpu usages
+                        is_gpu_usage_ok, log_text = self.check_gpu_usage(
+                            gpu_details=gpu_details,
+                            gpu_processes=gpu_processes,
+                            default_extra=default_extra,
+                            rented=True,
+                        )
+                        if not is_gpu_usage_ok:
+                            return await self._handle_task_result(
+                                miner_info=miner_info,
+                                executor_info=executor_info,
+                                spec=machine_spec,
+                                score=0,
+                                job_score=0,
+                                log_text=log_text,
+                                verified_job_info=verified_job_info,
+                                success=False,
+                                gpu_model_count=gpu_model_count,
+                                clear_verified_job_info=False,
+                            )
+
+                    # In backend, there are 2 scores. actual score and job score.
+                    # job score is the score which executor gets when matrix multiply is finished.
                     # actual score is the score which executor gets for incentive
-                    # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check. 
-                    # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and max_score * gpu_count for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    score = max_score * gpu_count
-                    job_score = 0
-                    log_msg = "Executor is already rented."
+                    # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
+                    # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and 1 for job score, because if both scores are 0, executor will be flagged as invalid in backend.
+                    job_score = 0 if is_rental_succeed else 1
+                    actual_score = 1 if is_rental_succeed else 0
 
-                    # check rental success
-                    is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
-                        RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
+                    log_msg = (
+                        "Executor is already rented."
+                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so."
                     )
-                    if not is_rental_succeed:
-                        score = 0
-                        job_score = max_score * gpu_count
-                        log_msg = "Executor is rented but in progress of rental check. This can be finished in an hour or so."
-
                     log_text = _m(
                         log_msg,
-                        extra=get_extra_info({**default_extra, "score": score, "is_rental_succeed": is_rental_succeed}),
+                        extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed, "job_score": job_score}),
                     )
 
                     return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=machine_spec,
-                        score=score,
-                        job_score=job_score,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=True,
-                        clear_verified_job_info=False,
-                    )
-                else:
-                    # check gpu usages
-                    for detail in gpu_details:
-                        gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
-                        gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
-                        if gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT:
-                            log_text = _m(
-                                f"High gpu utilization detected:",
-                                extra=get_extra_info({
-                                    **default_extra,
-                                    "gpu_utilization": gpu_utilization,
-                                    "gpu_memory_utilization": gpu_memory_utilization,
-                                }),
-                            )
-
-                            return await self._handle_task_result(
-                                ssh_client=ssh_client,
-                                remote_dir=remote_dir,
-                                miner_info=miner_info,
-                                executor_info=executor_info,
-                                spec=machine_spec,
-                                score=0,
-                                job_score=0,
-                                log_text=log_text,
-                                verified_job_info=verified_job_info,
-                                success=False,
-                                clear_verified_job_info=False,
-                            )
-
-                    renting_in_progress = await self.redis_service.is_elem_exists_in_set(
-                        PENDING_PODS_SET, f"{miner_info.miner_hotkey}:{executor_info.uuid}"
-                    )
-                    if not renting_in_progress:
-                        success, log_text, log_status = await self.docker_connection_check(
-                            ssh_client=ssh_client,
-                            job_batch_id=miner_info.job_batch_id,
-                            miner_hotkey=miner_info.miner_hotkey,
-                            executor_info=executor_info,
-                            private_key=private_key,
-                            public_key=public_key,
-                        )
-                        if not success:
-                            return await self._handle_task_result(
-                                ssh_client=ssh_client,
-                                remote_dir=remote_dir,
-                                miner_info=miner_info,
-                                executor_info=executor_info,
-                                spec=machine_spec,
-                                score=0,
-                                job_score=0,
-                                log_text=log_text,
-                                verified_job_info=verified_job_info,
-                                success=False,
-                                clear_verified_job_info=False,
-                            )
-
-                        # if not rented, check docker digests
-                        docker_digests = machine_spec.get("docker", {}).get("containers", [])
-                        is_docker_valid = self.validate_docker_image_digests(docker_digests, docker_hub_digests)
-                        if not is_docker_valid:
-                            log_text = _m(
-                                "Docker digests are not valid",
-                                extra=get_extra_info(
-                                    {**default_extra, "docker_digests": docker_digests}
-                                ),
-                            )
-
-                            return await self._handle_task_result(
-                                ssh_client=ssh_client,
-                                remote_dir=remote_dir,
-                                miner_info=miner_info,
-                                executor_info=executor_info,
-                                spec=machine_spec,
-                                score=0,
-                                job_score=0,
-                                log_text=log_text,
-                                verified_job_info=verified_job_info,
-                                success=False,
-                                clear_verified_job_info=False,
-                            )
-
-                # scoring
-                hashcat_config = HASHCAT_CONFIGS[gpu_model]
-                if not hashcat_config:
-                    log_text = _m(
-                        "No config for hashcat",
-                        extra=get_extra_info(default_extra),
-                    )
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=machine_spec,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
-                    )
-
-                num_digits = hashcat_config.get("digits", 11)
-                avg_job_time = (
-                    hashcat_config.get("average_time")[gpu_count - 1 if gpu_count <= 8 else 7]
-                    if hashcat_config.get("average_time")
-                    else 60
-                )
-                hash_service = HashService.generate(
-                    gpu_count=gpu_count, num_digits=num_digits, timeout=int(avg_job_time * 2.5)
-                )
-
-                start_time = time.time()
-
-                results, err = await self._run_task(
-                    ssh_client=ssh_client,
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_info=executor_info,
-                    command=f"export PYTHONPATH={executor_info.root_dir}:$PYTHONPATH && {executor_info.python_path} {remote_score_file_path} '{hash_service.payload}'",
-                )
-
-                end_time = time.time()
-                job_taken_time = end_time - start_time
-
-                result = json.loads(results[0])
-                answer = result["answer"]
-
-                logger.info(
-                    _m(
-                        f"Results from training job task: {str(result)}",
-                        extra=get_extra_info(default_extra),
-                    ),
-                )
-
-                if err is not None:
-                    log_text = _m(
-                        f"Error executing task on executor: {err}",
-                        extra=get_extra_info(default_extra),
-                    )
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=machine_spec,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
-                    )
-
-                elif answer != hash_service.answer:
-                    log_text = _m(
-                        "Hashcat incorrect Answer",
-                        extra=get_extra_info({**default_extra, "answer": answer, "hash_service_answer": hash_service.answer}),
-                    )
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=machine_spec,
-                        score=0,
-                        job_score=0,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False,
-                    )
-
-                # elif job_taken_time > avg_job_time * 2:
-                #     log_status = "error"
-                #     log_text = _m(
-                #         f"Incorrect Answer",
-                #         extra=get_extra_info(default_extra),
-                #     )
-                #     logger.error(log_text)
-
-                else:
-                    logger.info(
-                        _m(
-                            "Job taken time for executor",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "job_taken_time": job_taken_time,
-                            }),
-                        ),
-                    )
-
-                    upload_speed = machine_spec.get("network", {}).get("upload_speed", 0)
-                    download_speed = machine_spec.get("network", {}).get("download_speed", 0)
-
-                    # Ensure upload_speed and download_speed are not None
-                    upload_speed = upload_speed if upload_speed is not None else 0
-                    download_speed = download_speed if download_speed is not None else 0
-
-                    job_taken_score = (
-                        min(avg_job_time * 0.7 / job_taken_time, 1) if job_taken_time > 0 else 0
-                    )
-                    upload_speed_score = min(upload_speed / MAX_UPLOAD_SPEED, 1)
-                    download_speed_score = min(download_speed / MAX_DOWNLOAD_SPEED, 1)
-
-                    job_score = (
-                        max_score
-                        * gpu_count
-                        * UNRENTED_MULTIPLIER
-                        * (
-                            job_taken_score * JOB_TAKEN_TIME_WEIGHT
-                            + upload_speed_score * UPLOAD_SPEED_WEIGHT
-                            + download_speed_score * DOWNLOAD_SPEED_WEIGHT
-                        )
-                    )
-
-                    actual_score = 0
-
-                    # check rental success
-                    is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
-                        RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
-                    )
-                    if is_rental_succeed:
-                        actual_score = job_score
-                    else:
-                        actual_score = 0
-
-                    log_text = _m(
-                        message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
-                        extra=get_extra_info(
-                            {
-                                **default_extra,
-                                "job_score": job_score,
-                                "acutal_score": actual_score,
-                                "job_taken_time": job_taken_time,
-                                "upload_speed": upload_speed,
-                                "download_speed": download_speed,
-                                "gpu_model": gpu_model,
-                                "gpu_count": gpu_count,
-                                "unrented_multiplier": UNRENTED_MULTIPLIER,
-                            }
-                        ),
-                    )
-
-                    logger.debug(
-                        _m(
-                            "SSH connection closed for executor",
-                            extra=get_extra_info(default_extra),
-                        ),
-                    )
-
-                    return await self._handle_task_result(
-                        ssh_client=ssh_client,
-                        remote_dir=remote_dir,
                         miner_info=miner_info,
                         executor_info=executor_info,
                         spec=machine_spec,
@@ -1196,10 +905,146 @@ class TaskService:
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=True,
-                        clear_verified_job_info=False,
                         gpu_model_count=gpu_model_count,
-                        gpu_uuids=gpu_uuids,
+                        clear_verified_job_info=False,
+                        sysbox_runtime=sysbox_runtime,
                     )
+
+                # check gpu usages
+                is_gpu_usage_ok, log_text = self.check_gpu_usage(
+                    gpu_details=gpu_details,
+                    gpu_processes=gpu_processes,
+                    default_extra=default_extra,
+                    rented=False,
+                )
+                if not is_gpu_usage_ok:
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=machine_spec,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        gpu_model_count=gpu_model_count,
+                        clear_verified_job_info=False,
+                    )
+
+                renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
+                if not renting_in_progress and not rented_machine:
+                    success, log_text, log_status = await self.docker_connection_check(
+                        ssh_client=shell.ssh_client,
+                        job_batch_id=miner_info.job_batch_id,
+                        miner_hotkey=miner_info.miner_hotkey,
+                        executor_info=executor_info,
+                        private_key=private_key,
+                        public_key=public_key,
+                    )
+                    if not success:
+                        return await self._handle_task_result(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            spec=machine_spec,
+                            score=0,
+                            job_score=0,
+                            log_text=log_text,
+                            verified_job_info=verified_job_info,
+                            success=False,
+                            gpu_model_count=gpu_model_count,
+                            clear_verified_job_info=False,
+                        )
+
+                # docker_digests = machine_spec.get("docker", {}).get("containers", [])
+                # is_docker_valid = self.validate_docker_image_digests(docker_digests, docker_hub_digests)
+                # if not is_docker_valid:
+                #     return await self.handle_task_failure(
+                #         ssh_client, remote_dir, miner_info, executor_info, machine_spec,
+                #         "Docker digests are not valid", verified_job_info, {**default_extra, "docker_digests": docker_digests}, True
+                #     )
+
+                is_valid = await self.validation_service.validate_gpu_model_and_process_job(
+                    ssh_client=shell.ssh_client,
+                    executor_info=executor_info,
+                    default_extra=default_extra,
+                    machine_spec=machine_spec
+                )
+
+                if not is_valid:
+                    log_text = _m(
+                        "GPU Verification failed",
+                        extra=get_extra_info(default_extra),
+                    )
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=machine_spec,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        gpu_model_count=gpu_model_count,
+                        clear_verified_job_info=False,
+                    )
+
+                if len(port_maps) < MIN_PORT_COUNT:
+                    log_text = _m(
+                        f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}.",
+                        extra=get_extra_info(default_extra),
+                    )
+
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=machine_spec,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        clear_verified_job_info=False
+                    )
+
+                job_score = 1
+                actual_score = 1 if is_rental_succeed else 0
+
+                log_text = _m(
+                    message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "job_score": job_score,
+                            "acutal_score": actual_score,
+                            "gpu_model": gpu_model,
+                            "gpu_count": gpu_count,
+                            "is_rental_succeed": is_rental_succeed,
+                            "unrented_multiplier": UNRENTED_MULTIPLIER,
+                        }
+                    ),
+                )
+
+                logger.debug(
+                    _m(
+                        "SSH connection closed for executor",
+                        extra=get_extra_info(default_extra),
+                    ),
+                )
+
+                return await self._handle_task_result(
+                    miner_info=miner_info,
+                    executor_info=executor_info,
+                    spec=machine_spec,
+                    score=actual_score,
+                    job_score=job_score,
+                    log_text=log_text,
+                    verified_job_info=verified_job_info,
+                    success=True,
+                    clear_verified_job_info=False,
+                    gpu_model_count=gpu_model_count,
+                    gpu_uuids=gpu_uuids,
+                    sysbox_runtime=sysbox_runtime,
+                )
         except Exception as e:
             log_status = "error"
             log_text = _m(
@@ -1214,32 +1059,25 @@ class TaskService:
                     prev_info=verified_job_info,
                     success=False,
                 )
-
-            except Exception as redis_error:
-                log_text = _m(
-                    "Error creating task redis_reset_error",
-                    extra=get_extra_info(
-                        {
-                            **default_extra,
-                            "error": str(e),
-                            "redis_reset_error": str(redis_error),
-                        }
-                    ),
-                )
+            except:
+                pass
 
             logger.error(
                 log_text,
                 exc_info=True,
             )
 
-            return (
-                None,
-                executor_info,
-                0,
-                0,
-                miner_info.job_batch_id,
-                log_status,
-                log_text,
+            return JobResult(
+                spec=None,
+                executor_info=executor_info,
+                score=0,
+                job_score=0,
+                job_batch_id=miner_info.job_batch_id,
+                log_status=log_status,
+                log_text=str(log_text),
+                gpu_model=None,
+                gpu_count=0,
+                sysbox_runtime=False,
             )
 
     async def _run_task(
@@ -1275,7 +1113,11 @@ class TaskService:
 
             if len(results) == 0 and len(actual_errors) > 0:
                 logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "errors": actual_errors})))
-                raise Exception("Failed to execute command!")
+                return None, str(actual_errors)
+
+            if len(results) == 0:
+                logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "error": "No results"})))
+                return None, "No results"
 
             return results, None
         except Exception as e:

@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import time
 from typing import NoReturn
 
+import aiohttp
 import bittensor
 import pydantic
 import tenacity
@@ -22,8 +24,18 @@ from payload_models.payloads import (
     ContainerDeleted,
     DuplicateExecutorsResponse,
     FailedContainerRequest,
+    ExecutorRentFinishedRequest,
+    GetPodLogsRequestFromServer,
+    PodLogsResponseToServer,
+    FailedGetPodLogs,
 )
-from protocol.vc_protocol.compute_requests import Error, RentedMachineResponse, Response
+from protocol.vc_protocol.compute_requests import (
+    Error,
+    ExecutorUptimeResponse,
+    RentedMachineResponse,
+    Response,
+    RevenuePerGpuTypeResponse,
+)
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     DuplicateExecutorsRequest,
@@ -31,20 +43,27 @@ from protocol.vc_protocol.validator_requests import (
     LogStreamRequest,
     RentedMachineRequest,
     ResetVerifiedJobRequest,
+    NormalizedScoreRequest,
+    RevenuePerGpuTypeRequest,
+    ScorePortionPerGpuTypeRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
+from core.config import settings
 from core.validator import Validator
 from core.utils import _m, get_extra_info
+from services.const import GPU_MODEL_RATES
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
+    EXECUTORS_UPTIME_PREFIX,
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
+    NORMALIZED_SCORE_CHANNEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,6 +84,7 @@ class ComputeClient:
         self.keypair = keypair
         self.ws: ClientConnection | None = None
         self.compute_app_uri = compute_app_uri
+        self.compute_app_rest_api_uri = compute_app_uri.replace("wss", "https").replace("ws", "http")
         self.miner_drivers = asyncio.Queue()
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
@@ -126,6 +146,8 @@ class ComputeClient:
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
+        asyncio.create_task(self.poll_executors_uptime())
+        asyncio.create_task(self.poll_revenue_per_gpu_type())
 
         try:
             while True:
@@ -204,6 +226,7 @@ class ComputeClient:
                     MACHINE_SPEC_CHANNEL,
                     STREAMING_LOG_CHANNEL,
                     RESET_VERIFIED_JOB_CHANNEL,
+                    NORMALIZED_SCORE_CHANNEL,
                 )
                 async for message in pubsub.listen():
                     try:
@@ -231,10 +254,12 @@ class ComputeClient:
                             job_batch_id=data['job_batch_id'],
                             log_text=data["log_text"],
                             miner_hotkey=data["miner_hotkey"],
+                            miner_coldkey=data["miner_coldkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
                             executor_ip=data["executor_ip"],
                             executor_port=data["executor_port"],
+                            executor_price=data["executor_price"]
                         )
 
                         async with self.lock:
@@ -254,10 +279,18 @@ class ComputeClient:
                             miner_hotkey=data["miner_hotkey"],
                             validator_hotkey=validator_hotkey,
                             executor_uuid=data["executor_uuid"],
+                            reason=data["reason"]
                         )
 
                         async with self.lock:
                             self.message_queue.append(reset_request)
+                    elif channel == NORMALIZED_SCORE_CHANNEL:
+                        normalized_score = NormalizedScoreRequest(
+                            normalized_scores=data["normalized_scores"],
+                        )
+
+                        async with self.lock:
+                            self.message_queue.append(normalized_score)
 
             except Exception as exc:
                 logger.error(
@@ -340,6 +373,70 @@ class ComputeClient:
 
             await asyncio.sleep(10 * 60)
 
+    async def poll_executors_uptime(self):
+        while True:
+            try:
+                await self.get_executors_uptime()
+            except Exception as exc:
+                logger.error(
+                    _m("Exception during get executors uptime from compute app", extra={**self.logging_extra, "error": str(exc)}),
+                    exc_info=True
+                )
+            finally:
+                await asyncio.sleep(20 * 60)
+
+    async def poll_revenue_per_gpu_type(self):
+        while True:
+            async with self.lock:
+                logger.info(
+                    _m(
+                        "Request revenue per gpu type",
+                        extra=get_extra_info(self.logging_extra),
+                    )
+                )
+                self.message_queue.append(RevenuePerGpuTypeRequest())
+
+            await asyncio.sleep(60 * 60)  # poll every hour
+
+    async def get_executors_uptime(self):
+        """Get executors uptime from compute app."""
+        default_log_info = get_extra_info(self.logging_extra)
+        start_time = time.time()
+        async with aiohttp.ClientSession() as session:
+            try:
+                url = f"{self.compute_app_rest_api_uri}/executors"
+                headers = {
+                    'X-Validator-Signature': f"0x{self.keypair.sign(self.my_hotkey()).hex()}"
+                }
+                async with session.post(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    if response.status != 200:
+                        error_msg = await response.text()
+                        logger.error(
+                            _m("Failed to get executors uptime from compute app", extra={**default_log_info, "status": response.status, "response": error_msg}),
+                        )
+                        return
+
+                    executors_json = await response.json()
+                    executors = [ExecutorUptimeResponse(**executor) for executor in executors_json]
+                    logger.info(
+                        _m("Successfully got response from compute app", extra={**default_log_info, "status": len(executors), "time_cost": time.time() - start_time}),
+                    )
+                    # clean up old redis data
+                    redis_service = self.miner_service.redis_service
+                    await redis_service.delete(EXECUTORS_UPTIME_PREFIX)
+                    # need to store them into redis db.
+                    for executor in executors:
+                        await redis_service.add_executor_uptime(executor)
+
+                    logger.info(
+                        _m("Successfully stored executors uptime into redis", extra={**default_log_info, "time_cost": time.time() - start_time}),
+                    )
+            except Exception as exc:
+                logger.error(
+                    _m("Exception during get executors uptime from compute app", extra={**default_log_info, "error": str(exc)}),
+                    exc_info=True
+                )
+
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from facilitator"""
         try:
@@ -350,7 +447,7 @@ class ComputeClient:
             if response.status != "success":
                 logger.error(
                     _m(
-                        "received error response from facilitator",
+                        "received error response from compute app",
                         extra=get_extra_info({
                             **self.logging_extra,
                             "response": str(response)
@@ -373,13 +470,10 @@ class ComputeClient:
                     }),
                 )
             )
-
             redis_service = self.miner_service.redis_service
             await redis_service.delete(RENTED_MACHINE_PREFIX)
-
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
-
             return
 
         try:
@@ -421,6 +515,33 @@ class ComputeClient:
             return
 
         try:
+            response = pydantic.TypeAdapter(RevenuePerGpuTypeResponse).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            logger.info(
+                _m(
+                    "RevenuePerGpuTypeResponse",
+                    extra=get_extra_info({
+                        **self.logging_extra,
+                        "revenues": response.revenues
+                    }),
+                )
+            )
+
+            portions = {}
+            redis_service = self.miner_service.redis_service
+            for gpu_type, revenue in response.revenues.items():
+                gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
+                portion = gpu_model_rate + settings.TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
+                portions[gpu_type] = portion
+                await redis_service.set_revenue_per_gpu_type(gpu_type, revenue)
+
+            async with self.lock:
+                self.message_queue.append(ScorePortionPerGpuTypeRequest(portions=portions))
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = f"Invalid message received from celium backend: {str(ex)}"
@@ -449,7 +570,9 @@ class ComputeClient:
         | ContainerDeleteRequest
         | ContainerStopRequest
         | ContainerStartRequest
-        | AddSshPublicKeyRequest,
+        | AddSshPublicKeyRequest
+        | ExecutorRentFinishedRequest
+        | GetPodLogsRequestFromServer
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -557,6 +680,22 @@ class ComputeClient:
                     extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, ExecutorRentFinishedRequest):
+            logger.info(
+                _m(
+                    "Rent finished. Clear Pending flag",
+                    extra=get_extra_info(logging_extra),
+                )
+            )
+
+            await self.miner_service.redis_service.remove_pending_pod(job_request.miner_hotkey, job_request.executor_id)
+        elif isinstance(job_request, GetPodLogsRequestFromServer):
+            response: (
+                PodLogsResponseToServer | FailedGetPodLogs
+            ) = await self.miner_service.get_pod_logs(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)

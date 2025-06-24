@@ -22,7 +22,18 @@ class RentedMachine(BaseModel):
     executor_ip_address: str
     executor_ip_port: str
     container_name: str
+    owner_flag: bool = False
 
 
 class RentedMachineResponse(BaseModel):
     machines: list[RentedMachine]
+
+
+class ExecutorUptimeResponse(BaseModel):
+    executor_ip_address: str
+    executor_ip_port: str
+    uptime_in_minutes: int
+
+
+class RevenuePerGpuTypeResponse(BaseModel):
+    revenues: dict[str, float]

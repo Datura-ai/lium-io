@@ -3,6 +3,7 @@ services:
     image: postgres:14.0-alpine
     healthcheck:
       test: pg_isready -U postgres || exit 1
+    restart: unless-stopped
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -12,10 +13,13 @@ services:
       - db_data:/var/lib/postgresql/data
 
   redis:
-    image: redis:6-alpine
-    command: redis-server --appendonly yes
+    image: daturaai/redis:7.4.2
     healthcheck:
       test: redis-cli ping
+    environment:
+      - REDIS_MODE=master
+      - REDIS_REPLICATION_MODE=master
+    restart: unless-stopped
     volumes:
       - redis_data:/data
 
@@ -46,7 +50,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - COMPUTE_APP_URI=wss://celiumcompute.ai
-    command: python src/connector.py
+    command: pdm run src/connector.py
     volumes:
       - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:

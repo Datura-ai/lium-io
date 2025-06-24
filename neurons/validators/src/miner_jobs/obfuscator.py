@@ -26,7 +26,7 @@ python_keywords = [
     'NVML_ERROR_MEMORY', 'NVML_ERROR_UNKNOWN', 'Exception', 'wrapper', 'args', 'kwargs', 'wraps', 'sys',
     'c_char_p', 'AttributeError', '_nvmlLib_refcount', 'nvmlLib', 'CDLL', 'os', 'tempfile', 'NVMLError',
     'OSError', 'c_uint', 'byref', 'create_string_buffer', 'c_int',  'setattr', 'subprocess', 'RuntimeError', 'hashlib',
-    'iter', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'machine_specs'
+    'iter', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'machine_specs', 'hasattr', 'bool'
 ]
 
 
