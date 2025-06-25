@@ -1,4 +1,4 @@
-name: "CD: miner (dev)"
+name: "CD: Deploying Miner (dev) with Manual Trigger"
 
 on:
   push:

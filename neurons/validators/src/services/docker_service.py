@@ -770,7 +770,7 @@ class DockerService:
                 command = f"/usr/bin/docker volume rm {payload.volume_name} -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
-                command = f"/usr/bin/docker image prune -af"
+                command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
                 logger.info(

@@ -24,6 +24,7 @@ from services.const import (
     PYTHON_DIGEST,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
+    MIN_PORT_COUNT,
 )
 from services.redis_service import (
     RedisService,
@@ -1023,6 +1024,24 @@ class TaskService:
                         success=False,
                         gpu_model_count=gpu_model_count,
                         clear_verified_job_info=False,
+                    )
+
+                if len(port_maps) < MIN_PORT_COUNT:
+                    log_text = _m(
+                        f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}.",
+                        extra=get_extra_info(default_extra),
+                    )
+
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=machine_spec,
+                        score=0,
+                        job_score=0,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        clear_verified_job_info=False
                     )
 
                 job_score = 1
