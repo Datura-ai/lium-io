@@ -13,6 +13,8 @@ from daos.executor import ExecutorDao
 from models.executor import Executor
 from core.utils import get_collateral_contract
 
+logging.basicConfig(level=logging.INFO)
+
 def require_executor_dao(func):
     def wrapper(self, *args, **kwargs):
         if not self.executor_dao:
@@ -314,7 +316,7 @@ class CliService:
                 req for req in reclaim_requests
                 if getattr(req, "amount", 0) != 0 and str(getattr(req, "executor_uuid", "")) in executor_uuids
             ]
-            json_output = [to_dict(req) for req in reclaim_requests]
+            json_output = [to_dict(req) for req in filtered_requests]
             self.logger.info(json.dumps(json_output, indent=4))
             return True
         except Exception as e:
