@@ -279,7 +279,7 @@ class CliService:
         """
         try:
             executor = self.executor_dao.findOne(address, port)
-            executor_uuid = executor.uuid
+            executor_uuid = str(executor.uuid)
         except Exception as e:
             self.logger.error("❌ Failed to find executor: %s", str(e))
             return False
