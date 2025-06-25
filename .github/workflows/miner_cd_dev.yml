@@ -1,9 +1,10 @@
-name: "CD: miner (dev)"
+name: "CD: Deploying Miner (dev) with Manual Trigger"
 
 on:
   push:
     branches:
       - 'dev_miner'
+  workflow_dispatch:
 
 jobs:
   deploy:
