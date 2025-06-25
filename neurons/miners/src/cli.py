@@ -1,15 +1,6 @@
 import asyncio
 import logging
-import uuid
-
 import click
-import bittensor
-
-from core.db import get_db
-from daos.executor import ExecutorDao
-from models.executor import Executor
-from core.config import settings
-from core.utils import get_collateral_contract
 from services.cli_service import CliService
 
 logging.basicConfig(level=logging.INFO)
@@ -26,16 +17,12 @@ def cli():
 def associate_eth(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
     logger.info("Please enter your Bittensor wallet password to unlock the hotkey for Ethereum association.")
-
-    cli_service = CliService()
-    success, error, summary = cli_service.associate_miner_ethereum_address(
-        eth_private_key=private_key,
-    )
-    logger.info(summary)
+    cli_service = CliService(private_key=private_key)
+    success = cli_service.associate_ethereum_address()
     if success:
         logger.info("✅ Successfully associated ethereum address with hotkey")
     else:
-        logger.info(f"❌ Failed to associate: {error}")
+        logger.error("❌ Failed to associate ethereum address with hotkey")
 
 
 @cli.command()
@@ -50,45 +37,14 @@ def associate_eth(private_key: str):
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def add_executor(address: str, port: int, validator: str, deposit_amount: float, private_key: str):
     """Add executor machine to the database"""
-    logger.info("Adding a new executor (%s:%d) that opens to validator(%s)", address, port, validator)
-    executor_dao = ExecutorDao(session=next(get_db()))
-    executor_uuid = uuid.uuid4()
-    try:
-        executor = executor_dao.save(
-            Executor(uuid=executor_uuid, address=address, port=port, validator=validator)
-        )
-    except Exception as e:
-        logger.error("❌ Failed to add executor: %s", str(e))
+    cli_service = CliService(private_key=private_key, with_executor_db=True)
+    success = asyncio.run(
+        cli_service.add_executor(address, port, validator, deposit_amount)
+    )
+    if success:
+        logger.info("✅ Added executor and deposited collateral successfully.")
     else:
-        logger.info("Added executor (id=%s)", str(executor.uuid))
-
-    if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
-        logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
-        return
-
-    async def async_add_executor():
-        try:
-            collateral_contract = get_collateral_contract(miner_key=private_key)
-            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-
-            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
-            logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
-
-            if balance < deposit_amount:
-                logger.error("Error: Insufficient balance in miner's address.")
-                return
-
-            message = (
-                f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid}"
-                f" since miner {my_key.ss58_address} is adding this executor"
-            )
-            logger.info(message)
-            await collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
-        except Exception as e:
-            logger.error("❌ Failed to deposit collateral: %s", str(e))
-        else:
-            logger.info("✅ Deposited collateral successfully.")
-    asyncio.run(async_add_executor())
+        logger.error("❌ Failed to add executor or deposit collateral.")
 
 
 @cli.command()
@@ -100,38 +56,14 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def deposit_collateral(address: str, port: int, deposit_amount: float, private_key: str):
     """You can deposit collateral for an existing executor on database"""
-    if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
-        logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
-        return
-
-    executor_dao = ExecutorDao(session=next(get_db()))
-
-    async def async_deposit_collateral():
-        try:
-            executor = executor_dao.findOne(address, port)
-            executor_uuid = executor.uuid
-            collateral_contract = get_collateral_contract(miner_key=private_key)
-            my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
-
-            logger.info(f"Miner balance: {balance} TAO for miner hotkey {my_key.ss58_address}")
-
-            if balance < deposit_amount:
-                logger.error("Error: Insufficient balance in miner's address.")
-                return
-
-            message = (
-                f"Deposit amount {deposit_amount} for this executor UUID: {executor_uuid}"
-                f" since miner {my_key.ss58_address} is going to add this executor"
-            )
-            logger.info(message)
-
-            await collateral_contract.deposit_collateral(deposit_amount, str(executor_uuid))
-        except Exception as e:
-            logger.error("❌ Failed to deposit collateral: %s", str(e))
-        else:
-            logger.info("✅ Deposited collateral successfully.")
-    asyncio.run(async_deposit_collateral())
+    cli_service = CliService(private_key=private_key, with_executor_db=True)
+    success = asyncio.run(
+        cli_service.deposit_collateral(address, port, deposit_amount)
+    )
+    if success:
+        logger.info("✅ Deposited collateral successfully.")
+    else:
+        logger.error("❌ Failed to deposit collateral.")
 
 
 @cli.command()
@@ -140,14 +72,12 @@ def deposit_collateral(address: str, port: int, deposit_amount: float, private_k
 def remove_executor(address: str, port: int):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
-        logger.info("Removing executor (%s:%d)", address, port)
-        executor_dao = ExecutorDao(session=next(get_db()))
-        try:
-            executor_dao.delete_by_address_port(address, port)
-        except Exception as e:
-            logger.error("Failed in removing an executor: %s", str(e))
+        cli_service = CliService(with_executor_db=True)
+        success = asyncio.run(cli_service.remove_executor(address, port))
+        if success:
+            logger.info(f"✅ Removed executor ({address}:{port})")
         else:
-            logger.info("Removed an executor(%s:%d)", address, port)
+            logger.error(f"❌ Failed in removing an executor.")
     else:
         logger.info("Executor removal cancelled.")
 
@@ -157,60 +87,32 @@ def remove_executor(address: str, port: int):
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def reclaim_collateral(executor_uuid: str, private_key: str):
     """Reclaim collateral for a specific executor from the contract"""
-    async def async_reclaim_collateral():
-        collateral_contract = get_collateral_contract(miner_key=private_key)
-        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
-        try:
-            balance = await collateral_contract.get_balance(collateral_contract.miner_address)
-            logger.info("Miner balance: %f TAO", balance)
-
-            reclaim_amount = await collateral_contract.get_executor_collateral(executor_uuid)
-
-            logger.info(
-                f"Executor {executor_uuid} is being removed by miner {my_key.ss58_address}. "
-                f"The total collateral of {reclaim_amount} TAO will be reclaimed from the collateral contract."
-            )
-
-            await collateral_contract.reclaim_collateral("Manual reclaim", executor_uuid)
-        except Exception as e:
-            logger.error("❌ Failed to reclaim collateral: %s", str(e))
-    asyncio.run(async_reclaim_collateral())
+    cli_service = CliService(private_key=private_key)
+    success = asyncio.run(
+        cli_service.reclaim_collateral(executor_uuid)
+    )
+    if success:
+        logger.info("✅ Reclaimed collateral successfully.")
+    else:
+        logger.error("❌ Failed to reclaim collateral.")
 
 
 @cli.command()
 def show_executors():
     """Show executors to the database"""
-    executor_dao = ExecutorDao(session=next(get_db()))
-    try:
-        for executor in executor_dao.get_all_executors():
-            logger.info("%s %s:%d -> %s", executor.uuid, executor.address, executor.port, executor.validator)
-    except Exception as e:
-        logger.error("Failed in showing an executor: %s", str(e))
+    cli_service = CliService(with_executor_db=True)
+    success = asyncio.run(cli_service.show_executors())
+    if not success:
+        logger.error("Failed in showing executors.")
 
 
 @cli.command()
 def get_miner_collateral():
     """Get miner collateral by summing up collateral from all registered executors"""
-
-    async def async_get_miner_collateral():
-        try:
-            collateral_contract = get_collateral_contract()
-            
-            executor_dao = ExecutorDao(session=next(get_db()))
-            executors = executor_dao.get_all_executors()
-            total_collateral = 0.0
-
-            for executor in executors:
-                executor_uuid = str(executor.uuid)
-                collateral = await collateral_contract.get_executor_collateral(executor_uuid)
-                total_collateral += float(collateral)
-                logger.info("Executor %s collateral: %f TAO", executor_uuid, collateral)
-
-            logger.info("Total miner collateral from all executors: %f TAO", total_collateral)
-
-        except Exception as e:
-            logger.error("❌ Failed in getting miner collateral: %s", str(e))
-    asyncio.run(async_get_miner_collateral())
+    cli_service = CliService(with_executor_db=True)
+    success = asyncio.run(cli_service.get_miner_collateral())
+    if not success:
+        logger.error("❌ Failed in getting miner collateral.")
 
 
 @cli.command()
@@ -218,61 +120,19 @@ def get_miner_collateral():
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 def get_executor_collateral(address: str, port: int):
     """Get collateral amount for a specific executor by address and port"""
-    executor_dao = ExecutorDao(session=next(get_db()))
-    try:
-        executor = executor_dao.findOne(address, port)
-        executor_uuid = str(executor.uuid)
-    except Exception as e:
-        logger.error("❌ Failed to find executor: %s", str(e))
-        return
-
-    async def async_get_executor_collateral():
-        try:
-            collateral_contract = get_collateral_contract()
-            collateral = await collateral_contract.get_executor_collateral(executor_uuid)
-            logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
-        except Exception as e:
-            logger.error("❌ Failed to get executor collateral: %s", str(e))
-    asyncio.run(async_get_executor_collateral())
+    cli_service = CliService(with_executor_db=True)
+    success = asyncio.run(cli_service.get_executor_collateral(address, port))
+    if not success:
+        logger.error("❌ Failed to get executor collateral.")
 
 
 @cli.command()
 def get_reclaim_requests():
     """Get reclaim requests for the current miner from the collateral contract"""
-    import json
-
-    async def async_get_reclaim_requests():
-        try:
-            collateral_contract = get_collateral_contract()
-            reclaim_requests = await collateral_contract.get_reclaim_events()
-            if not reclaim_requests:
-                print(json.dumps([]))
-                return
-
-            # Get all executor UUIDs for this miner
-            executor_dao = ExecutorDao(session=next(get_db()))
-            executors = executor_dao.get_all_executors()
-            executor_uuids = set(str(executor.uuid) for executor in executors)
-
-            # Convert each reclaim request to dict if possible
-            def to_dict(obj):
-                if hasattr(obj, "__dict__"):
-                    return dict(obj.__dict__)
-                elif hasattr(obj, "_asdict"):  # namedtuple
-                    return obj._asdict()
-                else:
-                    return dict(obj)
-
-            # Filter: amount != 0 and executor_uuid in miner's executor UUIDs
-            filtered_requests = [
-                req for req in reclaim_requests
-                if getattr(req, "amount", 0) != 0 and str(getattr(req, "executor_uuid", "")) in executor_uuids
-            ]
-            json_output = [to_dict(req) for req in filtered_requests]
-            print(json.dumps(json_output, indent=4))
-        except Exception as e:
-            logger.error("❌ Failed to get miner reclaim requests: %s", str(e))
-    asyncio.run(async_get_reclaim_requests())
+    cli_service = CliService(with_executor_db=True)
+    success = asyncio.run(cli_service.get_reclaim_requests())
+    if not success:
+        logger.error("❌ Failed to get miner reclaim requests.")
 
 
 @cli.command()
@@ -280,15 +140,10 @@ def get_reclaim_requests():
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
     """Finalize a reclaim request by its ID"""
-    async def async_finalize_reclaim_request():
-        try:
-            collateral_contract = get_collateral_contract(miner_key=private_key)
-            result = await collateral_contract.finalize_reclaim(reclaim_request_id)
-            logger.info("✅ Successfully finalized reclaim request: %s", reclaim_request_id)
-            print(result)
-        except Exception as e:
-            logger.error("❌ Failed to finalize reclaim request: %s", str(e))
-    asyncio.run(async_finalize_reclaim_request())
+    cli_service = CliService(private_key=private_key)
+    success = asyncio.run(cli_service.finalize_reclaim_request(reclaim_request_id))
+    if not success:
+        logger.error("❌ Failed to finalize reclaim request.")
 
 
 if __name__ == "__main__":
