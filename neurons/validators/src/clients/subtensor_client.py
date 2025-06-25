@@ -171,7 +171,7 @@ class SubtensorClient:
     def get_evm_address_for_hotkey(self, hotkey):
         return self.hotkey_to_evm_address.get(hotkey, None)
 
-    def update_evm_address_map(self):
+    def sync_evm_address_maps(self):
         node = self.get_node()
         associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
         for uid, evm_address in associated_evms:
@@ -185,7 +185,7 @@ class SubtensorClient:
 
         logger.info(
             _m(
-                "Updated ethereum addresses map",
+                "Synced ethereum addresses map",
                 extra=get_extra_info({
                     **self.default_extra,
                     "uid_to_evm_address": len(self.uid_to_evm_address),
@@ -475,12 +475,12 @@ class SubtensorClient:
 
                 if count == 0:
                     self.fetch_miners()
-                    self.update_evm_address_map()
+                    self.sync_evm_address_maps()
 
                 count += 1
                 if count > 10:
                     self.fetch_miners()
-                    self.update_evm_address_map()
+                    self.sync_evm_address_maps()
                     count = 1
 
                 # sync every 12 seconds
