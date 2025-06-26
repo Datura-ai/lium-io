@@ -567,9 +567,11 @@ class DockerService:
                 )
 
                 # check if the container is running correctly
-                if not await self.check_container_running(ssh_client, container_name):
-                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
-                    raise Exception("Run docker run command but container is not running")
+                # skip checking container running for daturaai images
+                if not payload.docker_image.startswith("daturaai/"):
+                    if not await self.check_container_running(ssh_client, container_name):
+                        await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                        raise Exception("Run docker run command but container is not running")
 
                 logger.info(
                     _m(
@@ -587,12 +589,14 @@ class DockerService:
                         }
                     )
 
-                await self.install_open_ssh_server_and_start_ssh_service(
-                    ssh_client=ssh_client,
-                    container_name=container_name,
-                    log_tag=log_tag,
-                    log_extra=default_extra,
-                )
+                # skip installing ssh service for daturaai images
+                if not payload.docker_image.startswith("daturaai/"):
+                    await self.install_open_ssh_server_and_start_ssh_service(
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
 
                 # add rest of public keys
                 for public_key in payload.user_public_keys:
