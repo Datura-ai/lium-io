@@ -240,7 +240,7 @@ class DockerService:
             await asyncio.sleep(1)
         return False
 
-    async def clean_exisiting_containers(
+    async def clean_existing_containers(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
@@ -266,11 +266,11 @@ class DockerService:
             )
 
             command = f'/usr/bin/docker rm {container_names} -f'
-            await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
+            await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
                 command = f'/usr/bin/docker volume prune -af'
-                await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
+                await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
     async def install_open_ssh_server_and_start_ssh_service(
         self,
@@ -491,7 +491,7 @@ class DockerService:
 
                 uuid = uuid4()
 
-                await self.clean_exisiting_containers(
+                await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     sleep=10,
@@ -568,7 +568,7 @@ class DockerService:
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
-                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra)
                     raise Exception("Run docker run command but container is not running")
 
                 logger.info(
@@ -587,12 +587,21 @@ class DockerService:
                         }
                     )
 
-                await self.install_open_ssh_server_and_start_ssh_service(
-                    ssh_client=ssh_client,
-                    container_name=container_name,
-                    log_tag=log_tag,
-                    log_extra=default_extra,
-                )
+                # skip installing ssh service for daturaai images
+                if payload.docker_image.startswith("daturaai/"):
+                    logger.info(
+                        _m(
+                            "Skipping checking install and start ssh service for daturaai images",
+                            extra=get_extra_info({**default_extra, "container_name": container_name}),
+                        ),
+                    )
+                else:
+                    await self.install_open_ssh_server_and_start_ssh_service(
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
 
                 # add rest of public keys
                 for public_key in payload.user_public_keys:
