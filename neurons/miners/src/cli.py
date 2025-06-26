@@ -32,14 +32,20 @@ def associate_eth(private_key: str):
     "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
 )
 @click.option(
-    "--deposit_amount", type=float, prompt="Deposit Amount", help="Amount of TAO to deposit as collateral"
+    "--gpu-type", prompt="GPU Type", help="Type of GPU"
+)
+@click.option(
+    "--gpu-count", type=int, prompt="GPU Count", help="Number of GPUs"
+)
+@click.option(
+    "--deposit-amount", type=float, required=False, help="Amount of TAO to deposit as collateral (optional)"
 )
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def add_executor(address: str, port: int, validator: str, deposit_amount: float, private_key: str):
+def add_executor(address: str, port: int, validator: str, gpu_type: str, gpu_count: int, private_key: str, deposit_amount: float = None):
     """Add executor machine to the database"""
     cli_service = CliService(private_key=private_key, with_executor_db=True)
     success = asyncio.run(
-        cli_service.add_executor(address, port, validator, deposit_amount)
+        cli_service.add_executor(address, port, validator, deposit_amount, gpu_type, gpu_count)
     )
     if success:
         logger.info("✅ Added executor and deposited collateral successfully.")
@@ -51,14 +57,20 @@ def add_executor(address: str, port: int, validator: str, deposit_amount: float,
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 @click.option(
-    "--deposit_amount", type=float, prompt="Deposit Amount", help="Amount of TAO to deposit as collateral"
+    "--gpu-type", prompt="GPU Type", help="Type of GPU"
+)
+@click.option(
+    "--gpu-count", type=int, prompt="GPU Count", help="Number of GPUs"
+)
+@click.option(
+    "--deposit-amount", type=float, required=False, help="Amount of TAO to deposit as collateral (optional)"
 )
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def deposit_collateral(address: str, port: int, deposit_amount: float, private_key: str):
+def deposit_collateral(address: str, port: int, gpu_type: str, gpu_count: int, private_key: str, deposit_amount: float = None):
     """You can deposit collateral for an existing executor on database"""
     cli_service = CliService(private_key=private_key, with_executor_db=True)
     success = asyncio.run(
-        cli_service.deposit_collateral(address, port, deposit_amount)
+        cli_service.deposit_collateral(address, port, deposit_amount, gpu_type, gpu_count)
     )
     if success:
         logger.info("✅ Deposited collateral successfully.")

@@ -12,6 +12,7 @@ from core.db import get_db
 from daos.executor import ExecutorDao
 from models.executor import Executor
 from core.utils import get_collateral_contract
+from core.const import REQUIRED_DEPOSIT_AMOUNT
 
 logging.basicConfig(level=logging.INFO)
 
@@ -159,13 +160,15 @@ class CliService:
             return False
 
     @require_executor_dao
-    async def add_executor(self, address: str, port: int, validator: str, deposit_amount: float) -> bool:
+    async def add_executor(self, address: str, port: int, validator: str, deposit_amount: float = None, gpu_type: str = None, gpu_count: int = None) -> bool:
         """
         Add an executor to the database and deposit collateral.
         :param address: Executor IP address
         :param port: Executor port
         :param validator: Validator hotkey
-        :param deposit_amount: Amount of TAO to deposit
+        :param deposit_amount: Amount of TAO to deposit (optional)
+        :param gpu_type: Type of GPU (optional)
+        :param gpu_count: Number of GPUs (optional)
         :return: True if successful, False otherwise
         """
         executor_uuid = uuid.uuid4()
@@ -176,6 +179,15 @@ class CliService:
             self.logger.error("❌ Failed to add executor: %s", str(e))
             return False
 
+        if deposit_amount is None:
+            if gpu_type is None or gpu_count is None:
+                self.logger.error("gpu_type and gpu_count must be specified if deposit_amount is not provided.")
+                return False
+            if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
+                self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
+                return False
+            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
+            self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
         if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
             self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
             return False
@@ -198,14 +210,25 @@ class CliService:
             return False
 
     @require_executor_dao
-    async def deposit_collateral(self, address: str, port: int, deposit_amount: float):
+    async def deposit_collateral(self, address: str, port: int, deposit_amount: float = None, gpu_type: str = None, gpu_count: int = None):
         """
         Deposit collateral for an existing executor in the database.
         :param address: Executor IP address
         :param port: Executor port
-        :param deposit_amount: Amount of TAO to deposit
+        :param deposit_amount: Amount of TAO to deposit (optional)
+        :param gpu_type: Type of GPU (optional)
+        :param gpu_count: Number of GPUs (optional)
         :return: True if successful, False otherwise
         """
+        if deposit_amount is None:
+            if gpu_type is None or gpu_count is None:
+                self.logger.error("gpu_type and gpu_count must be specified if deposit_amount is not provided.")
+                return False
+            if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
+                self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
+                return False
+            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
+            self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
         if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
             self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
             return False
