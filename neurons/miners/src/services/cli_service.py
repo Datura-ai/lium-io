@@ -12,8 +12,6 @@ from core.db import get_db
 from daos.executor import ExecutorDao
 from models.executor import Executor
 from core.utils import get_collateral_contract
-from rich.console import Console
-from rich.table import Table
 
 logging.basicConfig(level=logging.INFO)
 
@@ -302,7 +300,7 @@ class CliService:
         try:
             reclaim_requests = await self.collateral_contract.get_reclaim_events()
             if not reclaim_requests:
-                self.logger.info("No reclaim requests found.")
+                self.logger.info(json.dumps([]))
                 return True
             executors = self.executor_dao.get_all_executors()
             executor_uuids = set(str(executor.uuid) for executor in executors)
@@ -321,15 +319,8 @@ class CliService:
                 self.logger.info("No reclaim requests found for your executors.")
                 return True
             # Use rich to print as a table
-            console = Console()
-            rows = [to_dict(req) for req in filtered_requests]
-            headers = list(rows[0].keys()) if rows else []
-            table = Table(show_header=True, header_style="bold green")
-            for header in headers:
-                table.add_column(header)
-            for row in rows:
-                table.add_row(*(str(row.get(h, '')) for h in headers))
-            console.print(table)
+            json_output = [to_dict(req) for req in filtered_requests]
+            self.logger.info(json.dumps(json_output, indent=4))
             return True
         except Exception as e:
             self.logger.error("❌ Failed to get miner reclaim requests: %s", str(e))
