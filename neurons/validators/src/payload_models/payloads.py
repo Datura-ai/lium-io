@@ -78,6 +78,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
     docker_password: str | None = None  # when edit pod, docker_password is required
+    timestamp: int | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -133,6 +134,7 @@ class ContainerCreated(ContainerBaseResponse):
     container_name: str
     volume_name: str
     port_maps: list[tuple[int, int]]
+    profilers: list[dict] = []
 
 
 class ContainerStarted(ContainerBaseResponse):
