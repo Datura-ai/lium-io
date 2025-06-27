@@ -343,9 +343,9 @@ class DockerService:
             profilers.append({"name": "Requested from backend", "timestamp": payload.timestamp})
             prev_timestamp = payload.timestamp
         else:
-            prev_timestamp = int(datetime.utcnow().timestamp())
-        profilers.append({"name": "Started in subnet", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-        prev_timestamp = int(datetime.utcnow().timestamp())
+            prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+        profilers.append({"name": "Started in subnet", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
         logger.info(
             _m(
@@ -369,8 +369,8 @@ class DockerService:
                 )
 
             # Add profiler for port mappings generation
-            profilers.append({"name": "Port mappings generated", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-            prev_timestamp = int(datetime.utcnow().timestamp())
+            profilers.append({"name": "Port mappings generated", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+            prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
             if not port_maps:
                 log_text = _m(
@@ -416,8 +416,8 @@ class DockerService:
                 known_hosts=None,
             ) as ssh_client:
                 # Add profiler for ssh connection
-                profilers.append({"name": "SSH connection established", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp())
+                profilers.append({"name": "SSH connection established", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # set real-time logging
                 self.log_task = asyncio.create_task(
@@ -446,8 +446,8 @@ class DockerService:
                     )
 
                 # Add profiler for docker login
-                profilers.append({"name": "Docker login step finished", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp())
+                profilers.append({"name": "Docker login step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 command = f"/usr/bin/docker pull {payload.docker_image}"
                 await self.execute_and_stream_logs(
@@ -459,8 +459,8 @@ class DockerService:
                 )
 
                 # Add profiler for docker pull
-                profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp())
+                profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 port_flags = " ".join(
                     [
@@ -525,8 +525,8 @@ class DockerService:
                 )
 
                 # Add profiler for docker volume creation
-                profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp())
+                profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 if not volume_name:
                     # create docker volume
@@ -542,8 +542,8 @@ class DockerService:
                     )
 
                 # Add profiler for docker volume creation
-                profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp())
+                profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # Create a volume flag for the Docker run command from the first element's container path
                 volume_flag = f"-v {volume_name}:{container_path}"
@@ -606,8 +606,8 @@ class DockerService:
                     raise Exception("Run docker run command but container is not running")
 
                 # Add profiler for docker container creation
-                profilers.append({"name": "Docker container creation step finished", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp())
+                profilers.append({"name": "Docker container creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 logger.info(
                     _m(
@@ -642,8 +642,8 @@ class DockerService:
                     )
 
                 # Add profiler for ssh service installation
-                profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp())
+                profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # add rest of public keys
                 for public_key in payload.user_public_keys:
@@ -651,8 +651,8 @@ class DockerService:
                     await ssh_client.run(command)
 
                 # Add profiler for adding public keys
-                profilers.append({"name": "Adding public keys step finished", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp())
+                profilers.append({"name": "Adding public keys step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 await self.finish_stream_logs()
 
@@ -672,7 +672,7 @@ class DockerService:
                     ))
 
                 # Add profiler for ssh service installation
-                profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp()) - prev_timestamp})
+                profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
 
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
