@@ -265,7 +265,18 @@ class CliService:
                 f"Executor {executor_uuid} is being removed by miner {self.hotkey}. "
                 f"The total collateral of {reclaim_amount} TAO will be reclaimed from the collateral contract."
             )
-            await self.collateral_contract.reclaim_collateral("Manual reclaim", executor_uuid)
+            _, event = await self.collateral_contract.reclaim_collateral("Manual reclaim", executor_uuid)
+            import binascii
+            json_payload = {
+                "reclaim_request_id": event['args']['reclaimRequestId'],
+                "amount": event['args']['amount'],  # If you want to convert from wei to TAO, do it here
+                "expiration_time": event['args']['expirationTime'],
+                "url": event['args']['url'],
+                "url_content_md5_checksum": binascii.hexlify(event['args']['urlContentMd5Checksum']).decode(),
+                "block_number": event['blockNumber'],
+                "executor_uuid": event['args']['executorId'].hex()  # or decode as needed
+            }
+
             self.logger.info("✅ Reclaimed collateral successfully.")
             return True
         except Exception as e:
