@@ -626,20 +626,20 @@ class DockerService:
                     )
 
                 # skip installing ssh service for daturaai images
-                if payload.docker_image.startswith("daturaai/"):
-                    logger.info(
-                        _m(
-                            "Skipping checking install and start ssh service for daturaai images",
-                            extra=get_extra_info({**default_extra, "container_name": container_name}),
-                        ),
-                    )
-                else:
-                    await self.install_open_ssh_server_and_start_ssh_service(
-                        ssh_client=ssh_client,
-                        container_name=container_name,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                    )
+                # if payload.docker_image.startswith("daturaai/"):
+                #     logger.info(
+                #         _m(
+                #             "Skipping checking install and start ssh service for daturaai images",
+                #             extra=get_extra_info({**default_extra, "container_name": container_name}),
+                #         ),
+                #     )
+                # else:
+                await self.install_open_ssh_server_and_start_ssh_service(
+                    ssh_client=ssh_client,
+                    container_name=container_name,
+                    log_tag=log_tag,
+                    log_extra=default_extra,
+                )
 
                 # Add profiler for ssh service installation
                 profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
