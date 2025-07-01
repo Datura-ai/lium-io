@@ -29,9 +29,10 @@ class Settings(BaseSettings):
     DEBUG: bool = Field(env="DEBUG", default=False)
     DEBUG_MINER_HOTKEY: str | None = Field(env="DEBUG_MINER_HOTKEY", default=None)
     DEBUG_MINER_COLDKEY: str | None = Field(env="DEBUG_MINER_COLDKEY", default=None)
+    DEBUG_MINER_UID: int | None = Field(env="DEBUG_MINER_UID", default=None)
     DEBUG_MINER_ADDRESS: str | None = Field(env="DEBUG_MINER_ADDRESS", default=None)
     DEBUG_MINER_PORT: int | None = Field(env="DEBUG_MINER_PORT", default=None)
-
+    
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     BLOCKS_FOR_JOB: int = 50
 
@@ -119,11 +120,12 @@ class Settings(BaseSettings):
             raise RuntimeError("Debug miner not configured")
 
         miner = type("Miner", (object,), {})()
-        miner.hotkey = self.DEBUG_MINER_HOTKEY
-        miner.coldkey = self.DEBUG_MINER_COLDKEY
-        miner.axon_info = type("AxonInfo", (object,), {})()
-        miner.axon_info.ip = self.DEBUG_MINER_ADDRESS
-        miner.axon_info.port = self.DEBUG_MINER_PORT
+        miner.hotkey            = self.DEBUG_MINER_HOTKEY
+        miner.coldkey           = self.DEBUG_MINER_COLDKEY
+        miner.uid               = self.DEBUG_MINER_UID
+        miner.axon_info         = type("AxonInfo", (object,), {})()
+        miner.axon_info.ip      = self.DEBUG_MINER_ADDRESS
+        miner.axon_info.port    = self.DEBUG_MINER_PORT
         return miner
 
 
