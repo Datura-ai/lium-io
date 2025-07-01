@@ -250,7 +250,6 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         sleep: int = 0,
-        clear_volume: bool = True
     ):
         command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
         result = await ssh_client.run(command)
@@ -273,9 +272,7 @@ class DockerService:
             command = f'/usr/bin/docker rm {container_names} -f'
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
-            if clear_volume:
-                command = f'/usr/bin/docker volume prune -af'
-                await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            await self.clean_s3fs_volume(ssh_client)
 
     async def install_open_ssh_server_and_start_ssh_service(
         self,
@@ -381,7 +378,6 @@ class DockerService:
             "executor_ssh_port": executor_info.ssh_port,
             "docker_image": payload.docker_image,
             "volume_name": volume_name,
-            "edit_pod": True if volume_name else False,
             "debug": payload.debug,
         }
 
@@ -397,7 +393,7 @@ class DockerService:
 
         logger.info(
             _m(
-                "Edit Docker Container" if volume_name else "Create Docker Container",
+                "Create Docker Container",
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
@@ -569,25 +565,20 @@ class DockerService:
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     sleep=10,
-                    clear_volume=False if volume_name else True
                 )
 
                 # Add profiler for docker volume creation
                 profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
-                if not volume_name:
-                    # create docker volume
-                    volume_name = f"volume_{uuid}"
-                    command = f"/usr/bin/docker volume create {volume_name}"
-                    await self.execute_and_stream_logs(
-                        ssh_client=ssh_client,
-                        command=command,
-                        log_tag=log_tag,
-                        log_text=f"Creating docker volume ${volume_name}",
-                        log_extra=default_extra,
-                        timeout=10,
-                    )
+                await self.create_s3fs_volume(
+                    ssh_client=ssh_client,
+                    log_extra=default_extra,
+                    volume_name=volume_name,
+                    access_key=payload.volume_iam_user_access_key,
+                    secret_key=payload.volume_iam_user_secret_key,
+                    log_tag=log_tag,
+                )
 
                 # Add profiler for docker volume creation
                 profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -874,11 +865,10 @@ class DockerService:
                 command = f"/usr/bin/docker rm {payload.container_name} -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
-                command = f"/usr/bin/docker volume rm {payload.volume_name} -f"
-                await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
-
                 command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+
+                await self.clean_s3fs_volume(ssh_client)
 
                 logger.info(
                     _m(
@@ -907,6 +897,7 @@ class DockerService:
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
                     volume_name=payload.volume_name,
+                    keep_volume=payload.keep_volume,
                 )
         except Exception as e:
             log_text = _m(

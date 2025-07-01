@@ -74,7 +74,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
     custom_options: CustomOptions | None = None
     debug: bool | None = None
-    volume_name: str | None = None  # when edit pod, volume_name is required
+    volume_name: str
+    volume_plugin: str
+    volume_iam_user_access_key: str
+    volume_iam_user_secret_key: str
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
     docker_password: str | None = None  # when edit pod, docker_password is required
@@ -105,6 +108,7 @@ class ContainerDeleteRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteRequest
     container_name: str
     volume_name: str
+    keep_volume: bool = False
 
 
 class GetPodLogsRequestFromServer(ContainerBaseRequest):
@@ -151,6 +155,7 @@ class ContainerDeleted(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
     container_name: str
     volume_name: str
+    keep_volume: bool = False
 
 
 class SshPubKeyAdded(ContainerBaseResponse):
