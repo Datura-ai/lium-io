@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Annotated
 from uuid import uuid4
+import shlex
 
 import aiohttp
 import asyncssh
@@ -543,7 +544,7 @@ class DockerService:
                 env_flags = (
                     " ".join(
                         [
-                            f"-e {key}={value}"
+                            f"-e '{key}={value}'"
                             for key, value in custom_options.environment.items()
                             if key and value and key.strip() and value.strip()
                         ]
@@ -688,6 +689,19 @@ class DockerService:
                 for public_key in payload.user_public_keys:
                     command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
                     await ssh_client.run(command)
+
+                # add environment variables 
+                if custom_options and custom_options.environment:
+                    for k, v in custom_options.environment.items():
+                        if k and v and k.strip() and str(v).strip():
+                            env_line = f"{k}={v}"
+                            # Execute each variable addition separately for better error handling
+                            script = f'printf "%s\\n" {shlex.quote(env_line)} >> /etc/environment'
+                            command = f"/usr/bin/docker exec {container_name} sh -c {shlex.quote(script)}"
+                            try:
+                                await ssh_client.run(command)
+                            except Exception as e:
+                                print(f"Failed to set environment variable {k}: {e}")
 
                 # Add profiler for adding public keys
                 profilers.append({"name": "Adding public keys step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
