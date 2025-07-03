@@ -25,6 +25,7 @@ from payload_models.payloads import (
     FailedContainerErrorCodes,
     FailedContainerRequest,
     FailedContainerErrorTypes,
+    VolumeInfo,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -322,9 +323,7 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         log_extra: dict,
-        volume_name: str,
-        access_key: str,
-        secret_key: str,
+        volume_info: VolumeInfo,
         log_tag: str,
     ):
         # install docker volume plugin
@@ -336,7 +335,7 @@ class DockerService:
         await ssh_client.run(command)
 
         # set credentials
-        command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={access_key} AWSSECRETACCESSKEY={secret_key}"
+        command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
         await ssh_client.run(command)
 
         # enable volume plugin
@@ -344,7 +343,7 @@ class DockerService:
         await ssh_client.run(command)
 
         # create volume
-        command = f"/usr/bin/docker volume create -d s3fs {volume_name}"
+        command = f"/usr/bin/docker volume create -d s3fs {volume_info.name}"
         return await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
@@ -369,7 +368,7 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
-        volume_name = payload.volume_name
+        volume_name = payload.volume_info.name if payload.volume_info else "None"
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
@@ -572,21 +571,19 @@ class DockerService:
                 profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
-                await self.create_s3fs_volume(
-                    ssh_client=ssh_client,
-                    log_extra=default_extra,
-                    volume_name=volume_name,
-                    access_key=payload.volume_iam_user_access_key,
-                    secret_key=payload.volume_iam_user_secret_key,
-                    log_tag=log_tag,
-                )
-
-                # Add profiler for docker volume creation
-                profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                if payload.volume_info:
+                    await self.create_s3fs_volume(
+                        ssh_client=ssh_client,
+                        log_extra=default_extra,
+                        volume_info=payload.volume_info,
+                        log_tag=log_tag,
+                    )
+                    # Add profiler for docker volume creation
+                    profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # Create a volume flag for the Docker run command from the first element's container path
-                volume_flag = f"-v {volume_name}:{container_path}"
+                volume_flag = f"-v {volume_name}:{container_path}" if payload.volume_info else ""
                 container_name = f"container_{uuid}"
 
                 # Network permission flags (permission to create a network interface inside the container)
@@ -690,7 +687,7 @@ class DockerService:
                     command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
                     await ssh_client.run(command)
 
-                # add environment variables 
+                # add environment variables
                 if custom_options and custom_options.environment:
                     for k, v in custom_options.environment.items():
                         if k and v and k.strip() and str(v).strip():
@@ -911,7 +908,6 @@ class DockerService:
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
                     volume_name=payload.volume_name,
-                    keep_volume=payload.keep_volume,
                 )
         except Exception as e:
             log_text = _m(
