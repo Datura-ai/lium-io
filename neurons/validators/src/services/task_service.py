@@ -36,6 +36,7 @@ from services.redis_service import (
 from services.ssh_service import SSHService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
+from services.collateral_contract_service import CollateralContractService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -62,10 +63,12 @@ class TaskService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
+        collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.validation_service = validation_service
+        self.collateral_contract_service = collateral_contract_service
         self.wallet = settings.get_bittensor_wallet()
 
     async def is_script_running(
@@ -561,6 +564,15 @@ class TaskService:
                 return False, log_text
 
         return True, None
+    
+    def update_task_log_msg(self, log_text: str, is_eligible_executor: bool = False) -> str:
+        """Update the log text based on extra info"""
+        additional_msg = (
+            "The executor is not eligible according to the collateral contract and therefore will not have score very soon. "
+            "Please deposit more collateral to get scores."
+            if not is_eligible_executor else ""
+        )
+        return f"{log_text} {additional_msg}"
 
     async def create_task(
         self,
@@ -581,7 +593,6 @@ class TaskService:
             "executor_ssh_port": executor_info.ssh_port,
             "version": settings.VERSION,
         }
-
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
         prev_spec = verified_job_info.get('spec', '')
         prev_uuids = verified_job_info.get('uuids', '')
@@ -733,6 +744,33 @@ class TaskService:
                     ),
                 )
 
+                is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_uuid=executor_info.uuid,
+                    gpu_model=gpu_model,
+                    gpu_count=gpu_count
+                )
+
+                if not is_eligible_executor:
+                    # if debug mode, we don't need to check collateral contract
+                    log_text = _m(
+                        f"The executor is not eligible according to the collateral contract and therefore cannot have scores set for them.",
+                        extra=get_extra_info(default_extra),
+                    )
+                    logger.warning(log_text)
+                    if not settings.DEBUG_COLLATERAL_CONTRACT:
+                        return await self._handle_task_result(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            spec=None,
+                            score=0,
+                            job_score=0,
+                            log_text=log_text,
+                            verified_job_info=verified_job_info,
+                            success=False,
+                            clear_verified_job_info=False,
+                        )
+                
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
                         f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
@@ -898,7 +936,6 @@ class TaskService:
                         success=False,
                         clear_verified_job_info=True,
                     )
-
                 # check rented status
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
@@ -971,9 +1008,10 @@ class TaskService:
                     job_score = 0 if is_rental_succeed else 1
                     actual_score = 1 if is_rental_succeed else 0
 
-                    log_msg = (
-                        "Executor is already rented."
-                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so."
+                    log_msg = self.update_task_log_msg(
+                        "Executor is already rented." 
+                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so. ",
+                        is_eligible_executor=is_eligible_executor,
                     )
                     log_text = _m(
                         log_msg,
@@ -1083,7 +1121,7 @@ class TaskService:
                         executor_info=executor_info,
                         spec=machine_spec,
                         score=0,
-                        job_score=0,
+                        job_score=1,
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=False,
@@ -1094,7 +1132,10 @@ class TaskService:
                 actual_score = 1 if is_rental_succeed else 0
 
                 log_text = _m(
-                    message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
+                    message=self.update_task_log_msg(
+                        "Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
+                        is_eligible_executor=is_eligible_executor,
+                    ),
                     extra=get_extra_info(
                         {
                             **default_extra,
