@@ -1037,7 +1037,7 @@ class TaskService:
                         executor_info=executor_info,
                         spec=machine_spec,
                         score=0,
-                        job_score=0,
+                        job_score=1,
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=False,
