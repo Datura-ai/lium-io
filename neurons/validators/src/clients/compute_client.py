@@ -29,7 +29,13 @@ from payload_models.payloads import (
     PodLogsResponseToServer,
     FailedGetPodLogs,
 )
-from protocol.vc_protocol.compute_requests import Error, ExecutorUptimeResponse, RentedMachineResponse, Response
+from protocol.vc_protocol.compute_requests import (
+    Error,
+    ExecutorUptimeResponse,
+    RentedMachineResponse,
+    Response,
+    RevenuePerGpuTypeResponse,
+)
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     DuplicateExecutorsRequest,
@@ -38,12 +44,16 @@ from protocol.vc_protocol.validator_requests import (
     RentedMachineRequest,
     ResetVerifiedJobRequest,
     NormalizedScoreRequest,
+    RevenuePerGpuTypeRequest,
+    ScorePortionPerGpuTypeRequest,
 )
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
-from core.validator import Validator
+from core.config import settings
 from core.utils import _m, get_extra_info
+from clients.subtensor_client import SubtensorClient
+from services.const import GPU_MODEL_RATES
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
@@ -79,7 +89,6 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.validator = Validator()
         self.message_queue = []
         self.lock = asyncio.Lock()
 
@@ -128,15 +137,21 @@ class ComputeClient:
         await self.miner_drivers.put(None)
         await self.miner_driver_awaiter_task
 
+        # Cleanup subtensor client
+        if hasattr(self, 'subtensor_client'):
+            await SubtensorClient.shutdown()
+
     def my_hotkey(self) -> str:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        asyncio.create_task(self.validator.warm_up_subtensor())
+        self.subtensor_client = await SubtensorClient.initialize()
+
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
         asyncio.create_task(self.poll_executors_uptime())
+        asyncio.create_task(self.poll_revenue_per_gpu_type())
 
         try:
             while True:
@@ -374,6 +389,19 @@ class ComputeClient:
             finally:
                 await asyncio.sleep(20 * 60)
 
+    async def poll_revenue_per_gpu_type(self):
+        while True:
+            async with self.lock:
+                logger.info(
+                    _m(
+                        "Request revenue per gpu type",
+                        extra=get_extra_info(self.logging_extra),
+                    )
+                )
+                self.message_queue.append(RevenuePerGpuTypeRequest())
+
+            await asyncio.sleep(60 * 60)  # poll every hour
+
     async def get_executors_uptime(self):
         """Get executors uptime from compute app."""
         default_log_info = get_extra_info(self.logging_extra)
@@ -423,7 +451,7 @@ class ComputeClient:
             if response.status != "success":
                 logger.error(
                     _m(
-                        "received error response from facilitator",
+                        "received error response from compute app",
                         extra=get_extra_info({
                             **self.logging_extra,
                             "response": str(response)
@@ -491,6 +519,33 @@ class ComputeClient:
             return
 
         try:
+            response = pydantic.TypeAdapter(RevenuePerGpuTypeResponse).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            logger.info(
+                _m(
+                    "RevenuePerGpuTypeResponse",
+                    extra=get_extra_info({
+                        **self.logging_extra,
+                        "revenues": response.revenues
+                    }),
+                )
+            )
+
+            portions = {}
+            redis_service = self.miner_service.redis_service
+            for gpu_type, revenue in response.revenues.items():
+                gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
+                portion = gpu_model_rate + settings.TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
+                portions[gpu_type] = portion
+                await redis_service.set_revenue_per_gpu_type(gpu_type, revenue)
+
+            async with self.lock:
+                self.message_queue.append(ScorePortionPerGpuTypeRequest(portions=portions))
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = f"Invalid message received from celium backend: {str(ex)}"
@@ -507,11 +562,7 @@ class ComputeClient:
             return
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
-        miners = self.validator.fetch_miners()
-        neurons = [n for n in miners if n.hotkey == hotkey]
-        if not neurons:
-            raise ValueError(f"Miner with {hotkey=} not present in this subnetwork")
-        return neurons[0].axon_info
+        return self.subtensor_client.get_miner(hotkey).axon_info
 
     async def miner_driver(
         self,

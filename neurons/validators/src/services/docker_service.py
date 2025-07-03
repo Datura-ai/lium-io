@@ -1,8 +1,10 @@
 import asyncio
+from datetime import datetime
 import logging
 import time
 from typing import Annotated
 from uuid import uuid4
+import shlex
 
 import aiohttp
 import asyncssh
@@ -240,7 +242,7 @@ class DockerService:
             await asyncio.sleep(1)
         return False
 
-    async def clean_exisiting_containers(
+    async def clean_existing_containers(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
@@ -266,11 +268,11 @@ class DockerService:
             )
 
             command = f'/usr/bin/docker rm {container_names} -f'
-            await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
+            await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
                 command = f'/usr/bin/docker volume prune -af'
-                await retry_ssh_command(ssh_client, command, 'clean_exisiting_containers')
+                await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
     async def install_open_ssh_server_and_start_ssh_service(
         self,
@@ -323,7 +325,6 @@ class DockerService:
         private_key: str,
     ):
         volume_name = payload.volume_name
-
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
@@ -336,6 +337,16 @@ class DockerService:
             "edit_pod": True if volume_name else False,
             "debug": payload.debug,
         }
+
+        # Deploy container profiler
+        profilers = []
+        if payload.timestamp:
+            profilers.append({"name": "Requested from backend", "timestamp": payload.timestamp})
+            prev_timestamp = payload.timestamp
+        else:
+            prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+        profilers.append({"name": "Started in subnet", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
         logger.info(
             _m(
@@ -357,6 +368,10 @@ class DockerService:
                 port_maps = await self.generate_portMappings(
                     payload.miner_hotkey, payload.executor_id
                 )
+
+            # Add profiler for port mappings generation
+            profilers.append({"name": "Port mappings generated", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+            prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
             if not port_maps:
                 log_text = _m(
@@ -401,6 +416,10 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=None,
             ) as ssh_client:
+                # Add profiler for ssh connection
+                profilers.append({"name": "SSH connection established", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+
                 # set real-time logging
                 self.log_task = asyncio.create_task(
                     self.handle_stream_logs(
@@ -427,6 +446,10 @@ class DockerService:
                         raise_exception=False
                     )
 
+                # Add profiler for docker login
+                profilers.append({"name": "Docker login step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+
                 command = f"/usr/bin/docker pull {payload.docker_image}"
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -435,6 +458,10 @@ class DockerService:
                     log_text=f"Pulling docker image {payload.docker_image}",
                     log_extra=default_extra,
                 )
+
+                # Add profiler for docker pull
+                profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 port_flags = " ".join(
                     [
@@ -473,7 +500,7 @@ class DockerService:
                 env_flags = (
                     " ".join(
                         [
-                            f"-e {key}={value}"
+                            f"-e '{key}={value}'"
                             for key, value in custom_options.environment.items()
                             if key and value and key.strip() and value.strip()
                         ]
@@ -491,12 +518,16 @@ class DockerService:
 
                 uuid = uuid4()
 
-                await self.clean_exisiting_containers(
+                await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     sleep=10,
                     clear_volume=False if volume_name else True
                 )
+
+                # Add profiler for docker volume creation
+                profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 if not volume_name:
                     # create docker volume
@@ -511,14 +542,53 @@ class DockerService:
                         timeout=10,
                     )
 
+                # Add profiler for docker volume creation
+                profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+
                 # Create a volume flag for the Docker run command from the first element's container path
                 volume_flag = f"-v {volume_name}:{container_path}"
                 container_name = f"container_{uuid}"
 
+                # Network permission flags (permission to create a network interface inside the container)
+                net_perm_flags = (
+                    "--cap-add=NET_ADMIN "
+                    "--sysctl net.ipv4.conf.all.src_valid_mark=1 "
+                    "--device /dev/net/tun "
+                )
+
                 if payload.debug:
-                    command = f'/usr/bin/docker run -d {("--runtime=sysbox-runc" if payload.is_sysbox else "")} {port_flags} -v "/var/run/docker.sock:/var/run/docker.sock" {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --restart unless-stopped --name {container_name} {payload.docker_image} {startup_commands}'
+                    command = (
+                        f'/usr/bin/docker run -d '
+                        f'{("--runtime=sysbox-runc" if payload.is_sysbox else "")} '
+                        f'{net_perm_flags} ' # Network permission flags
+                        f'{port_flags} '
+                        f'-v "/var/run/docker.sock:/var/run/docker.sock" '
+                        f'{volume_flag} '
+                        f'{entrypoint_flag} '
+                        f'{env_flags} '
+                        f'{shm_size_flag} '
+                        f'--restart unless-stopped '
+                        f'--name {container_name} '
+                        f'{payload.docker_image} '
+                        f'{startup_commands}'
+                    )
                 else:
-                    command = f'/usr/bin/docker run -d {("--runtime=sysbox-runc" if payload.is_sysbox else "")} {port_flags} {volume_flag} {entrypoint_flag} {env_flags} {shm_size_flag} --gpus all --restart unless-stopped --name {container_name}  {payload.docker_image} {startup_commands}'
+                    command = (
+                        f'/usr/bin/docker run -d '
+                        f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
+                        f'{net_perm_flags} ' # Network permission flags
+                        f'{port_flags} '
+                        f'{volume_flag} '
+                        f'{entrypoint_flag} '
+                        f'{env_flags} '
+                        f'{shm_size_flag} '
+                        f'--gpus all '
+                        f'--restart unless-stopped '
+                        f'--name {container_name} '
+                        f'{payload.docker_image} '
+                        f'{startup_commands}'
+                    )
 
                 logger.info(f"Running command: {command}")
 
@@ -533,8 +603,12 @@ class DockerService:
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
-                    await self.clean_exisiting_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra)
                     raise Exception("Run docker run command but container is not running")
+
+                # Add profiler for docker container creation
+                profilers.append({"name": "Docker container creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 logger.info(
                     _m(
@@ -552,6 +626,15 @@ class DockerService:
                         }
                     )
 
+                # skip installing ssh service for daturaai images
+                # if payload.docker_image.startswith("daturaai/"):
+                #     logger.info(
+                #         _m(
+                #             "Skipping checking install and start ssh service for daturaai images",
+                #             extra=get_extra_info({**default_extra, "container_name": container_name}),
+                #         ),
+                #     )
+                # else:
                 await self.install_open_ssh_server_and_start_ssh_service(
                     ssh_client=ssh_client,
                     container_name=container_name,
@@ -559,10 +642,31 @@ class DockerService:
                     log_extra=default_extra,
                 )
 
+                # Add profiler for ssh service installation
+                profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+
                 # add rest of public keys
                 for public_key in payload.user_public_keys:
                     command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
                     await ssh_client.run(command)
+
+                # add environment variables 
+                if custom_options and custom_options.environment:
+                    for k, v in custom_options.environment.items():
+                        if k and v and k.strip() and str(v).strip():
+                            env_line = f"{k}={v}"
+                            # Execute each variable addition separately for better error handling
+                            script = f'printf "%s\\n" {shlex.quote(env_line)} >> /etc/environment'
+                            command = f"/usr/bin/docker exec {container_name} sh -c {shlex.quote(script)}"
+                            try:
+                                await ssh_client.run(command)
+                            except Exception as e:
+                                print(f"Failed to set environment variable {k}: {e}")
+
+                # Add profiler for adding public keys
+                profilers.append({"name": "Adding public keys step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 await self.finish_stream_logs()
 
@@ -581,6 +685,9 @@ class DockerService:
                         extra=get_extra_info(default_extra),
                     ))
 
+                # Add profiler for ssh service installation
+                profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
@@ -589,6 +696,7 @@ class DockerService:
                     port_maps=[
                         (docker_port, external_port) for docker_port, _, external_port in port_maps
                     ],
+                    profilers=profilers,
                 )
         except Exception as e:
             log_text = _m(
@@ -735,7 +843,7 @@ class DockerService:
                 command = f"/usr/bin/docker volume rm {payload.volume_name} -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
-                command = f"/usr/bin/docker image prune -af"
+                command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
                 logger.info(
