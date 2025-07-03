@@ -1036,7 +1036,7 @@ class TaskService:
                         if len(port_maps) < MIN_PORT_COUNT
                         else "Train task is finished. Set score 0 until it's verified by rental check."
                         if not is_rental_succeed
-                        else "Train task finished",
+                        else "Train task finished.",
                         is_eligible_executor=is_eligible_executor,
                     ),
                     extra=get_extra_info(
