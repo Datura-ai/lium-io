@@ -1026,30 +1026,17 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                if len(port_maps) < MIN_PORT_COUNT:
-                    log_text = _m(
-                        f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}.",
-                        extra=get_extra_info(default_extra),
-                    )
-
-                    return await self._handle_task_result(
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=machine_spec,
-                        score=0,
-                        job_score=1,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False
-                    )
-
                 job_score = 1
-                actual_score = 1 if is_rental_succeed else 0
+                actual_score = 1 if is_rental_succeed and len(port_maps) >= MIN_PORT_COUNT else 0
+                success = True if actual_score > 0 else False
 
                 log_text = _m(
                     message=self.update_task_log_msg(
-                        "Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
+                        f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}."
+                        if len(port_maps) < MIN_PORT_COUNT
+                        else "Train task is finished. Set score 0 until it's verified by rental check."
+                        if not is_rental_succeed
+                        else "Train task finished.",
                         is_eligible_executor=is_eligible_executor,
                     ),
                     extra=get_extra_info(
@@ -1080,7 +1067,7 @@ class TaskService:
                     job_score=job_score,
                     log_text=log_text,
                     verified_job_info=verified_job_info,
-                    success=True,
+                    success=success,
                     clear_verified_job_info=False,
                     gpu_model_count=gpu_model_count,
                     gpu_uuids=gpu_uuids,
