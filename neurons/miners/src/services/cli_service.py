@@ -160,7 +160,15 @@ class CliService:
             return False
 
     @require_executor_dao
-    async def add_executor(self, address: str, port: int, validator: str, deposit_amount: float = None, gpu_type: str = None, gpu_count: int = None) -> bool:
+    async def add_executor(
+        self,
+        address: str,
+        port: int,
+        validator: str,
+        deposit_amount: float | None = None,
+        gpu_type: str | None = None,
+        gpu_count: int | None = None
+    ) -> bool:
         """
         Add an executor to the database and deposit collateral.
         :param address: Executor IP address
@@ -178,6 +186,10 @@ class CliService:
         except Exception as e:
             self.logger.error("❌ Failed to add executor: %s", str(e))
             return False
+        
+        if deposit_amount is None and gpu_type is None and gpu_count is None:
+            self.logger.info("No deposit amount provided, skipping deposit.")
+            return True
 
         if deposit_amount is None:
             if gpu_type is None or gpu_count is None:
@@ -188,6 +200,7 @@ class CliService:
                 return False
             deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
+
         if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
             self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
             return False
@@ -210,7 +223,7 @@ class CliService:
             return False
 
     @require_executor_dao
-    async def deposit_collateral(self, address: str, port: int, deposit_amount: float = None, gpu_type: str = None, gpu_count: int = None):
+    async def deposit_collateral(self, address: str, port: int, deposit_amount: float | None = None, gpu_type: str | None = None, gpu_count: int | None = None):
         """
         Deposit collateral for an existing executor in the database.
         :param address: Executor IP address
@@ -229,6 +242,7 @@ class CliService:
                 return False
             deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
+            
         if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
             self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
             return False
