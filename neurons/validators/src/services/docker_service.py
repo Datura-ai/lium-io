@@ -274,8 +274,6 @@ class DockerService:
             command = f'/usr/bin/docker rm {container_names} -f'
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
-            await self.clean_s3fs_volume(ssh_client)
-
     async def install_open_ssh_server_and_start_ssh_service(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -353,7 +351,7 @@ class DockerService:
             raise_exception=True
         )
 
-    async def clean_s3fs_volume(
+    async def disable_s3fs_volume_plugin(
         self,
         ssh_client: asyncssh.SSHClientConnection,
     ):
@@ -879,7 +877,10 @@ class DockerService:
                 command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
-                await self.clean_s3fs_volume(ssh_client)
+                command = f"/usr/bin/docker volume rm {payload.volume_name}"
+                await ssh_client.run(command)
+
+                await self.disable_s3fs_volume_plugin(ssh_client)
 
                 logger.info(
                     _m(
