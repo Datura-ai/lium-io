@@ -581,7 +581,7 @@ class DockerService:
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # Create a volume flag for the Docker run command from the first element's container path
-                volume_flag = f"-v {volume_name}:{container_path}" if payload.volume_info else ""
+                volume_flag = f"-v {volume_name}:{container_path}" if payload.volume_info and payload.is_sysbox and container_path else ""
                 container_name = f"container_{uuid}"
 
                 # Network permission flags (permission to create a network interface inside the container)
