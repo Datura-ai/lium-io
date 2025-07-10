@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:57b2a681f45f857efd4d5a419fcfb3c8157233b450506799b1db9f4fc2277fe6"
+content_hash = "sha256:a9c8fc2c77a690bfd3985c0acaa53b87db15372b0915059b9493b8e72254ff62"
 
 [[metadata.targets]]
 requires_python = "==3.11.11"
@@ -416,7 +416,7 @@ files = [
 
 [[package]]
 name = "celium-collateral"
-version = "1.1.0"
+version = "1.1.2"
 requires_python = "<3.13,>=3.11"
 summary = "Collateral Smart Contract for Celium"
 groups = ["default"]
@@ -429,8 +429,8 @@ dependencies = [
     "web3>=6.0.0",
 ]
 files = [
-    {file = "celium_collateral-1.1.0-py3-none-any.whl", hash = "sha256:66902747044a1649a045ad78cb38a0c279e382fb175e123494c17982fade5dad"},
-    {file = "celium_collateral-1.1.0.tar.gz", hash = "sha256:164c535891708c435fa381aaae9989990757d0e078a787c2fece62a835e64c35"},
+    {file = "celium_collateral-1.1.2-py3-none-any.whl", hash = "sha256:9cb15698ad7a7087bac7dafc436b80e8efbb326384c68d3ebba73a0ff32923f4"},
+    {file = "celium_collateral-1.1.2.tar.gz", hash = "sha256:9689b8daeaf68832e256c8581b4be2b29f37929905088d6105236363fa71c14f"},
 ]
 
 [[package]]
