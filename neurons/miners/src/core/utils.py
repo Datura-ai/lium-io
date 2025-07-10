@@ -91,9 +91,7 @@ _m = StructuredMessage
 
 
 def get_collateral_contract(
-    contract_address: str = None,
     miner_key: str = None,
-
 ) -> CollateralContract:
     """
     Initializes and returns a CollateralContract instance.
@@ -105,7 +103,13 @@ def get_collateral_contract(
     Returns:
         CollateralContract: The initialized contract instance.
     """
-    if contract_address is None:
-        contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
+    network = settings.BITTENSOR_NETWORK
+    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
+    rpc_url = settings.SUBTENSOR_EVM_RPC_URL
 
-    return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, "", miner_key)
+    return CollateralContract(
+        network=network,
+        contract_address=contract_address,
+        rpc_url=rpc_url,
+        miner_key=miner_key,
+    )

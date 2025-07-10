@@ -193,11 +193,7 @@ async def retry_ssh_command(
     await execute_command()
 
 
-def get_collateral_contract(
-    contract_address: str = None,
-    owner_key: str = "",
-    miner_key: str = ""
-) -> CollateralContract:
+def get_collateral_contract() -> CollateralContract:
     """
     Initializes and returns a CollateralContract instance.
 
@@ -210,7 +206,12 @@ def get_collateral_contract(
     Returns:
         CollateralContract: The initialized contract instance.
     """
-    if contract_address is None:
-        contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
+    network = settings.BITTENSOR_NETWORK
+    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
+    rpc_url = settings.SUBTENSOR_EVM_RPC_URL
 
-    return CollateralContract(settings.BITTENSOR_NETWORK, contract_address, owner_key, miner_key)
+    return CollateralContract(
+        network=network,
+        contract_address=contract_address,
+        rpc_url=rpc_url,
+    )
