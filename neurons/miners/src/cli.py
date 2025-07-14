@@ -16,13 +16,18 @@ def cli():
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def associate_eth(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
-    logger.info("Please enter your Bittensor wallet password to unlock the hotkey for Ethereum association.")
     cli_service = CliService(private_key=private_key)
     success = cli_service.associate_ethereum_address()
     if success:
         logger.info("✅ Successfully associated ethereum address with hotkey")
     else:
         logger.error("❌ Failed to associate ethereum address with hotkey")
+        
+@cli.command()
+def get_associated_evm_address():
+    """Get the associated EVM address for the Bittensor hotkey."""
+    cli_service = CliService()
+    cli_service.get_associated_evm_address()
 
 
 @cli.command()
