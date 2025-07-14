@@ -77,12 +77,18 @@ cd neurons/miners && docker compose up -d
 Before managing executors, you need to associate your Ethereum address with your Bittensor hotkey. This is a one-time setup requirement. Use the following command:
 
 ```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py associate_eth --private-key <ethereum-private-key>
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py associate-eth --private-key <ethereum-private-key>
 ```
 
 - `<ethereum-private-key>`: Your Ethereum private key that will be associated with your Bittensor hotkey.
 
 You will be prompted to enter your Bittensor wallet password to complete the association.
+
+### Get the associated Ethereum Address
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-associated-evm-address
+```
 
 ## Managing Executors
 
