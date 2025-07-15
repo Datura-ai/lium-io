@@ -16,6 +16,7 @@ from core.const import REQUIRED_DEPOSIT_AMOUNT
 
 logging.basicConfig(level=logging.INFO)
 
+
 def require_executor_dao(func):
     def wrapper(self, *args, **kwargs):
         if not self.executor_dao:
@@ -23,6 +24,7 @@ def require_executor_dao(func):
             return False
         return func(self, *args, **kwargs)
     return wrapper
+
 
 class CliService:
     def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False):
@@ -45,8 +47,8 @@ class CliService:
         Get a SubstrateInterface node connection using the current config.
         :return: SubstrateInterface instance
         """
-        subtensor = bt.subtensor(config=self.config)
-        return subtensor.substrate
+        self.subtensor = bt.subtensor(config=self.config)
+        return self.subtensor.substrate
 
     def print_extrinsic_receipt(self, receipt) -> dict:
         """
@@ -68,18 +70,6 @@ class CliService:
                 })
         return summary
 
-    def try_associate_hotkey(self, node: SubstrateInterface) -> Any:
-        """
-        Compose a call to try to associate the hotkey on the chain.
-        :param node: SubstrateInterface instance
-        :return: Composed call object
-        """
-        return node.compose_call(
-            call_module="SubtensorModule",
-            call_function="try_associate_hotkey",
-            call_params={"hotkey": self.hotkey}
-        )
-
     def make_associate_evm_key_extrinsic(self, node: SubstrateInterface) -> Any:
         """
         Create an extrinsic to associate the EVM key with the hotkey.
@@ -89,11 +79,18 @@ class CliService:
         if not self.private_key:
             self.logger.error("No private key provided for EVM association.")
             return None
+        # 1. Encode block number to bytes (SCALE encoded u64, which is little-endian)
         block_number = node.query("System", "Number").value
         block_number_bytes = block_number.to_bytes(8, 'little')
         block_number_hash = keccak(block_number_bytes)
+
+        # 2. Decode hotkey ss58 address to its public key bytes
         hotkey_bytes = bytes.fromhex(node.ss58_decode(self.hotkey))
+
+        # 3. Construct message
         message_to_sign_bytes = hotkey_bytes + block_number_hash
+
+        # 4. Sign the message with the EVM private key
         signable_message = encode_defunct(primitive=message_to_sign_bytes)
         account = Account.from_key(self.private_key)
         signature = account.sign_message(signable_message)
@@ -110,7 +107,6 @@ class CliService:
             call_function="associate_evm_key",
             call_params={
                 "netuid": self.netuid,
-                "hotkey": self.hotkey,
                 "evm_key": account.address,
                 "block_number": block_number,
                 "signature": signature_hex
@@ -126,7 +122,7 @@ class CliService:
         """
         extrinsic = node.create_signed_extrinsic(
             call=call,
-            keypair=self.wallet.coldkey,
+            keypair=self.wallet.hotkey,
         )
         response = node.submit_extrinsic(extrinsic, wait_for_inclusion=True, wait_for_finalization=True)
         return response
@@ -138,9 +134,7 @@ class CliService:
         """
         try:
             node = self.get_node()
-            hotkey_call = self.try_associate_hotkey(node)
-            if hotkey_call:
-                self.submit_extrinsic(node, hotkey_call)
+
             evm_call = self.make_associate_evm_key_extrinsic(
                 node=node
             )
@@ -159,8 +153,36 @@ class CliService:
             self.logger.error(f"❌ Failed to associate: {e}")
             return False
 
+    def get_uid_for_hotkey(self, hotkey):
+        metagraph = self.subtensor.metagraph(netuid=self.netuid)
+        return metagraph.hotkeys.index(hotkey)
+
+    def get_associated_evm_address(self) -> str:
+        """
+        Get the EVM address for the Bittensor hotkey.
+        :return: EVM address
+        """
+        node = self.get_node()
+        uid = self.get_uid_for_hotkey(self.hotkey)
+        self.logger.info(f"UID for hotkey {self.hotkey}: {uid}")
+        associated_evm = node.query(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid, uid])
+        address_bytes = associated_evm.value[0][0]
+        evm_address_hex = "0x" + bytes(address_bytes).hex()
+
+        self.logger.info(f"EVM address for hotkey {self.hotkey}: {evm_address_hex}")
+
+        return evm_address_hex
+
     @require_executor_dao
-    async def add_executor(self, address: str, port: int, validator: str, deposit_amount: float = None, gpu_type: str = None, gpu_count: int = None) -> bool:
+    async def add_executor(
+        self,
+        address: str,
+        port: int,
+        validator: str,
+        deposit_amount: float | None = None,
+        gpu_type: str | None = None,
+        gpu_count: int | None = None
+    ) -> bool:
         """
         Add an executor to the database and deposit collateral.
         :param address: Executor IP address
@@ -179,6 +201,10 @@ class CliService:
             self.logger.error("❌ Failed to add executor: %s", str(e))
             return False
 
+        if deposit_amount is None and gpu_type is None and gpu_count is None:
+            self.logger.info("No deposit amount provided, skipping deposit.")
+            return True
+
         if deposit_amount is None:
             if gpu_type is None or gpu_count is None:
                 self.logger.error("gpu_type and gpu_count must be specified if deposit_amount is not provided.")
@@ -188,6 +214,7 @@ class CliService:
                 return False
             deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
+
         if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
             self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
             return False
@@ -210,7 +237,7 @@ class CliService:
             return False
 
     @require_executor_dao
-    async def deposit_collateral(self, address: str, port: int, deposit_amount: float = None, gpu_type: str = None, gpu_count: int = None):
+    async def deposit_collateral(self, address: str, port: int, deposit_amount: float | None = None, gpu_type: str | None = None, gpu_count: int | None = None):
         """
         Deposit collateral for an existing executor in the database.
         :param address: Executor IP address
@@ -229,6 +256,7 @@ class CliService:
                 return False
             deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
+
         if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
             self.logger.error("Error: Minimum deposit amount is %f TAO.", settings.REQUIRED_TAO_COLLATERAL)
             return False
@@ -338,6 +366,7 @@ class CliService:
                 return True
             executors = self.executor_dao.get_all_executors()
             executor_uuids = set(str(executor.uuid) for executor in executors)
+
             def to_dict(obj):
                 if hasattr(obj, "__dict__"):
                     return dict(obj.__dict__)

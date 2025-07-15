@@ -16,13 +16,18 @@ def cli():
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 def associate_eth(private_key: str):
     """Associate a miner's ethereum address with their hotkey."""
-    logger.info("Please enter your Bittensor wallet password to unlock the hotkey for Ethereum association.")
     cli_service = CliService(private_key=private_key)
     success = cli_service.associate_ethereum_address()
     if success:
         logger.info("✅ Successfully associated ethereum address with hotkey")
     else:
         logger.error("❌ Failed to associate ethereum address with hotkey")
+        
+@cli.command()
+def get_associated_evm_address():
+    """Get the associated EVM address for the Bittensor hotkey."""
+    cli_service = CliService()
+    cli_service.get_associated_evm_address()
 
 
 @cli.command()
@@ -32,17 +37,30 @@ def associate_eth(private_key: str):
     "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
 )
 @click.option(
-    "--gpu-type", prompt="GPU Type", help="Type of GPU"
+    "--gpu-type", help="Type of GPU", required=False
 )
 @click.option(
-    "--gpu-count", type=int, prompt="GPU Count", help="Number of GPUs"
+    "--gpu-count", type=int, help="Number of GPUs", required=False
 )
 @click.option(
     "--deposit-amount", type=float, required=False, help="Amount of TAO to deposit as collateral (optional)"
 )
-@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def add_executor(address: str, port: int, validator: str, gpu_type: str, gpu_count: int, private_key: str, deposit_amount: float = None):
+@click.option("--private-key", required=False, hide_input=True, help="Ethereum private key")
+def add_executor(
+    address: str,
+    port: int,
+    validator: str,
+    gpu_type: str | None = None,
+    gpu_count: int | None = None,
+    private_key: str | None = None,
+    deposit_amount: float | None = None,
+):
     """Add executor machine to the database"""
+    if gpu_type is not None or gpu_count is not None or deposit_amount is not None:
+        if not private_key:
+            logger.error("Private key is required to deposit collateral.")
+            return
+
     cli_service = CliService(private_key=private_key, with_executor_db=True)
     success = asyncio.run(
         cli_service.add_executor(address, port, validator, deposit_amount, gpu_type, gpu_count)
