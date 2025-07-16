@@ -480,12 +480,13 @@ class TaskService:
                 return False, log_text
 
         return True, None
-    
-    def update_task_log_msg(self, log_text: str, is_eligible_executor: bool = False) -> str:
+
+    def update_task_log_msg(self, log_text: str, is_eligible_executor: bool = False, collateral_contract_error_message: str | None = None) -> str:
         """Update the log text based on extra info"""
         additional_msg = (
             "The executor is not eligible according to the collateral contract and therefore will not have score very soon. "
-            "Please deposit more collateral to get scores."
+            "Please deposit more collateral to get scores. "
+            f"Collateral contract error message: {collateral_contract_error_message}"
             if not is_eligible_executor else ""
         )
         return f"{log_text} {additional_msg}"
@@ -660,7 +661,7 @@ class TaskService:
                     ),
                 )
 
-                is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
+                is_eligible_executor, collateral_contract_error_message = await self.collateral_contract_service.is_eligible_executor(
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_uuid=executor_info.uuid,
                     gpu_model=gpu_model,
@@ -671,7 +672,7 @@ class TaskService:
                     # if debug mode, we don't need to check collateral contract
                     log_text = _m(
                         f"The executor is not eligible according to the collateral contract and therefore cannot have scores set for them.",
-                        extra=get_extra_info(default_extra),
+                        extra=get_extra_info({**default_extra, "error_message": collateral_contract_error_message}),
                     )
                     logger.warning(log_text)
                     if not settings.DEBUG_COLLATERAL_CONTRACT:
@@ -686,7 +687,7 @@ class TaskService:
                             success=False,
                             clear_verified_job_info=False,
                         )
-                
+
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
                         f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
@@ -925,9 +926,10 @@ class TaskService:
                     actual_score = 1 if is_rental_succeed else 0
 
                     log_msg = self.update_task_log_msg(
-                        "Executor is already rented." 
+                        "Executor is already rented."
                         if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so. ",
                         is_eligible_executor=is_eligible_executor,
+                        collateral_contract_error_message=collateral_contract_error_message,
                     )
                     log_text = _m(
                         log_msg,
@@ -1038,6 +1040,7 @@ class TaskService:
                         if not is_rental_succeed
                         else "Train task finished.",
                         is_eligible_executor=is_eligible_executor,
+                        collateral_contract_error_message=collateral_contract_error_message,
                     ),
                     extra=get_extra_info(
                         {
