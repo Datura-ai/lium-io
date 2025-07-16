@@ -27,13 +27,7 @@ class Settings(BaseSettings):
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
-    DEBUG: bool = Field(env="DEBUG", default=False)
-    DEBUG_MINER_HOTKEY: str | None = Field(env="DEBUG_MINER_HOTKEY", default=None)
-    DEBUG_MINER_COLDKEY: str | None = Field(env="DEBUG_MINER_COLDKEY", default=None)
-    DEBUG_MINER_UID: int | None = Field(env="DEBUG_MINER_UID", default=None)
-    DEBUG_MINER_ADDRESS: str | None = Field(env="DEBUG_MINER_ADDRESS", default=None)
-    DEBUG_MINER_PORT: int | None = Field(env="DEBUG_MINER_PORT", default=None)
-    
+
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     BLOCKS_FOR_JOB: int = 50
 
@@ -58,11 +52,14 @@ class Settings(BaseSettings):
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    DEBUG_COLLATERAL_CONTRACT: bool = True
-
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
     )
+
+    # Debug mode
+    DEBUG_MINER_HOTKEY: str | None = Field(env="DEBUG_MINER_HOTKEY", default=None)
+
+    DEBUG_COLLATERAL_CONTRACT: bool = True
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
@@ -115,19 +112,6 @@ class Settings(BaseSettings):
             )
 
         return bittensor.config(parser)
-
-    def get_debug_miner(self) -> dict:
-        if not self.DEBUG_MINER_ADDRESS or not self.DEBUG_MINER_PORT:
-            raise RuntimeError("Debug miner not configured")
-
-        miner = type("Miner", (object,), {})()
-        miner.hotkey            = self.DEBUG_MINER_HOTKEY
-        miner.coldkey           = self.DEBUG_MINER_COLDKEY
-        miner.uid               = self.DEBUG_MINER_UID
-        miner.axon_info         = type("AxonInfo", (object,), {})()
-        miner.axon_info.ip      = self.DEBUG_MINER_ADDRESS
-        miner.axon_info.port    = self.DEBUG_MINER_PORT
-        return miner
 
 
 settings = Settings()

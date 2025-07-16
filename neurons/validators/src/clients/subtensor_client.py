@@ -62,11 +62,6 @@ class SubtensorClient:
             "version_key": self.version_key,
         }
 
-        # Set debug miner if configured
-        self.debug_miner = None
-        if settings.DEBUG:
-            self.debug_miner = settings.get_debug_miner()
-
         self.set_subtensor()
 
         SubtensorClient._initialized = True
@@ -207,23 +202,21 @@ class SubtensorClient:
             ),
         )
 
-        if self.debug_miner:
-            miners = [self.debug_miner]
-        else:
-            metagraph = self.get_metagraph()
-            miners = [
-                neuron
-                for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
-            ]
+        metagraph = self.get_metagraph()
+        miners = [
+            neuron
+            for neuron in metagraph.neurons
+            if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
+        ]
+
+        self.miners = miners if settings.DEBUG_MINER_HOTKEY is None else [n for n in miners if n.hotkey == settings.DEBUG_MINER_HOTKEY]
+
         logger.info(
             _m(
-                f"[fetch_miners] Found {len(miners)} miners",
+                f"[fetch_miners] Found {len(self.miners)} miners",
                 extra=get_extra_info(self.default_extra),
             ),
         )
-
-        self.miners = miners
 
     def get_miner(self, hotkey: str) -> bittensor.NeuronInfo:
         miners = self.get_miners()
