@@ -11,7 +11,7 @@ from core.config import settings
 from core.db import get_db
 from daos.executor import ExecutorDao
 from models.executor import Executor
-from core.utils import get_collateral_contract
+from core.utils import get_collateral_contract, _m
 from core.const import REQUIRED_DEPOSIT_AMOUNT
 
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +41,14 @@ class CliService:
         self.collateral_contract = get_collateral_contract(miner_key=private_key) if private_key else get_collateral_contract()
         self.executor_dao = ExecutorDao(session=next(get_db())) if with_executor_db else None
         self.logger = logging.getLogger()
+
+        self.default_extra = {
+            "hotkey": self.hotkey,
+            "netuid": self.netuid,
+            "contract_address": settings.COLLATERAL_CONTRACT_ADDRESS,
+            "network": settings.BITTENSOR_NETWORK,
+            "rpc_url": settings.SUBTENSOR_EVM_RPC_URL,
+        }
 
     def get_node(self) -> SubstrateInterface:
         """
@@ -141,16 +149,28 @@ class CliService:
             if evm_call:
                 response = self.submit_extrinsic(node, evm_call)
                 summary = self.print_extrinsic_receipt(response)
-                self.logger.info(summary)
                 if response.is_success:
+                    self.logger.info(_m(
+                        "Associate EVM address successfully",
+                        extra={**self.default_extra, "summary": summary}
+                    ))
                     return True
                 else:
-                    self.logger.error(f"❌ Failed to associate: {response.error_message}")
+                    self.logger.error(_m(
+                        "❌ Failed to associate",
+                        extra={**self.default_extra, "error": str(response.error_message)}
+                    ))
                     return False
-            self.logger.error("Failed to create EVM association call")
+            self.logger.error(_m(
+                "Failed to create EVM association call",
+                extra=self.default_extra
+            ))
             return False
         except Exception as e:
-            self.logger.error(f"❌ Failed to associate: {e}")
+            self.logger.error(_m(
+                "❌ Failed to associate",
+                extra={**self.default_extra, "error": str(e)}
+            ))
             return False
 
     def get_uid_for_hotkey(self, hotkey):
@@ -169,7 +189,10 @@ class CliService:
         address_bytes = associated_evm.value[0][0]
         evm_address_hex = "0x" + bytes(address_bytes).hex()
 
-        self.logger.info(f"EVM address for hotkey {self.hotkey}: {evm_address_hex}")
+        self.logger.info(_m(
+            f"EVM address for hotkey {self.hotkey}: {evm_address_hex}",
+            extra=self.default_extra
+        ))
 
         return evm_address_hex
 
@@ -233,7 +256,10 @@ class CliService:
             self.logger.info("✅ Deposited collateral successfully.")
             return True
         except Exception as e:
-            self.logger.error("❌ Failed to deposit collateral: %s", str(e))
+            self.logger.error(_m(
+                "❌ Failed to deposit collateral",
+                extra={**self.default_extra, "error": str(e)}
+            ))
             return False
 
     @require_executor_dao
@@ -276,7 +302,10 @@ class CliService:
             self.logger.info("✅ Deposited collateral successfully.")
             return True
         except Exception as e:
-            self.logger.error("❌ Failed to deposit collateral: %s", str(e))
+            self.logger.error(_m(
+                "❌ Failed to deposit collateral",
+                extra={**self.default_extra, "error": str(e)}
+            ))
             return False
 
     async def reclaim_collateral(self, executor_uuid: str):
@@ -305,10 +334,16 @@ class CliService:
                 "executor_uuid": event['args']['executorId'].hex()  # or decode as needed
             }
 
-            self.logger.info("✅ Reclaimed collateral successfully.")
+            self.logger.info(_m(
+                "✅ Reclaimed collateral successfully.",
+                extra={**self.default_extra, "reclaim_info": json_payload}
+            ))
             return True
         except Exception as e:
-            self.logger.error("❌ Failed to reclaim collateral: %s", str(e))
+            self.logger.error(_m(
+                "❌ Failed to reclaim collateral",
+                extra={**self.default_extra, "error": str(e)}
+            ))
             return False
 
     @require_executor_dao
@@ -328,7 +363,10 @@ class CliService:
             self.logger.info("Total miner collateral from all executors: %f TAO", total_collateral)
             return True
         except Exception as e:
-            self.logger.error("❌ Failed in getting miner collateral: %s", str(e))
+            self.logger.error(_m(
+                "❌ Failed in getting miner collateral",
+                extra={**self.default_extra, "error": str(e)}
+            ))
             return False
 
     @require_executor_dao
@@ -350,7 +388,10 @@ class CliService:
             self.logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
             return True
         except Exception as e:
-            self.logger.error("❌ Failed to get executor collateral: %s", str(e))
+            self.logger.error(_m(
+                "❌ Failed to get executor collateral",
+                extra={**self.default_extra, "error": str(e)}
+            ))
             return False
 
     @require_executor_dao
@@ -379,14 +420,20 @@ class CliService:
                 if getattr(req, "amount", 0) != 0 and str(getattr(req, "executor_uuid", "")) in executor_uuids
             ]
             if not filtered_requests:
-                self.logger.info("No reclaim requests found for your executors.")
+                self.logger.info(_m(
+                    "No reclaim requests found for your executors.",
+                    extra=self.default_extra
+                ))
                 return True
             # Use rich to print as a table
             json_output = [to_dict(req) for req in filtered_requests]
             self.logger.info(json.dumps(json_output, indent=4))
             return True
         except Exception as e:
-            self.logger.error("❌ Failed to get miner reclaim requests: %s", str(e))
+            self.logger.error(_m(
+                "❌ Failed to get miner reclaim requests",
+                extra={**self.default_extra, "error": str(e)}
+            ))
             return False
 
     async def finalize_reclaim_request(self, reclaim_request_id: int):
@@ -401,7 +448,10 @@ class CliService:
             self.logger.info(result)
             return True
         except Exception as e:
-            self.logger.error("❌ Failed to finalize reclaim request: %s", str(e))
+            self.logger.error(_m(
+                "❌ Failed to finalize reclaim request",
+                extra={**self.default_extra, "error": str(e)}
+            ))
             return False
 
     @require_executor_dao
