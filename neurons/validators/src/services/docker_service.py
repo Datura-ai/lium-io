@@ -579,9 +579,11 @@ class DockerService:
                     # Add profiler for docker volume creation
                     profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
+                    payload.is_sysbox = False
 
                 # Create a volume flag for the Docker run command from the first element's container path
-                volume_flag = f"-v {volume_name}:{container_path}" if payload.volume_info and payload.is_sysbox and container_path else ""
+                volume_flag = f"-v {volume_name}:{container_path}" if payload.volume_info and not payload.is_sysbox and container_path else ""
                 container_name = f"container_{uuid}"
 
                 # Network permission flags (permission to create a network interface inside the container)
