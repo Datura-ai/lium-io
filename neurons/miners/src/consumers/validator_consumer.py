@@ -115,6 +115,22 @@ class ValidatorConsumer(BaseConsumer):
             await self.send_message(DeclineJobRequest())
             await self.disconnect()
 
+    async def invoke_rental_request_hook(self, payload: dict):
+       if settings.RENTAL_REQUEST_HOOK:
+           import aiohttp
+           try:
+               async with aiohttp.ClientSession() as session:
+                   resp = await asyncio.wait_for(
+                       session.post(settings.RENTAL_REQUEST_HOOK, json=payload),
+                       timeout=5
+                   )
+                   if resp.status != 200:
+                       logger.error(f"RENTAL_REQUEST_HOOK returned status {resp.status}: {await resp.text()}")
+           except asyncio.TimeoutError:
+               logger.error("RENTAL_REQUEST_HOOK timed out after 5 seconds")
+           except Exception as e:
+               logger.error(f"Exception in RENTAL_REQUEST_HOOK: {e}")
+
     async def handle_message(self, msg: BaseValidatorRequest):
         if isinstance(msg, AuthenticateRequest):
             await self.handle_authentication(msg)
@@ -139,6 +155,15 @@ class ValidatorConsumer(BaseConsumer):
                 executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
                     self.validator_key, msg.public_key, msg.executor_id
                 )
+                if msg.is_rental_request and len(executors) == 1:
+                    await self.invoke_rental_request_hook(
+                        {
+                            "executor_address": executors[0].address,
+                            "executor_port": executors[0].port,
+                            "uuid": str(executors[0].uuid),
+                        }
+                    )
+    
                 await self.send_message(AcceptSSHKeyRequest(executors=executors))
                 logger.info("Sent AcceptSSHKeyRequest to validator %s", self.validator_key)
             except Exception as e:
