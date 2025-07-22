@@ -160,6 +160,7 @@ async def manage_docker_images(
     """
     # Get GPU name using NVML
     gpu_name = "unknown"
+    driver_version = "unknown"
     try:
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Get first GPU
@@ -186,70 +187,81 @@ async def manage_docker_images(
                         await asyncio.sleep(first_interval)
                         continue
 
-                    data = await response.json()
+                    docker_images_data = await response.json()
+                    logger.info(f"Received {len(docker_images_data)} docker image templates")
                     
-                    # Check if no templates were found for the GPU
-                    if not data['docker_image'] or not data['docker_image_tag']:
+                    # Check if no templates were returned
+                    if not docker_images_data:
                         logger.warning(f"No templates found for GPU {gpu_name}")
                         await asyncio.sleep(first_interval)
                         continue
-
-                    template = f"{data['docker_image']}:{data['docker_image_tag']}"
-                    logger.info(f"Received most used template: {template}")
-
-                    # Clean up unused images
-                    result = subprocess.run(
-                        ['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}'],
-                        capture_output=True,
-                        text=True
-                    )
                     
-                    if result.returncode == 0:
-                        local_images = result.stdout.strip().split('\n')
+                    for data in docker_images_data:
+                        docker_image = data['docker_image']
+                        docker_image_tag = data['docker_image_tag']
+                        docker_image_size = data['docker_image_size']
                         
-                        for image in local_images:
-                            if not image:
-                                continue
-                                
-                            repo, tag = image.split(':')
-                            if repo == data['docker_image'] and tag != data['docker_image_tag']:
-                                remove_result = subprocess.run(
-                                    ['docker', 'rmi', image],
-                                    capture_output=True,
-                                    text=True
-                                )
-                                if remove_result.returncode == 0:
-                                    logger.info(f"Removed unused image: {image}")
-                                else:
-                                    logger.warning(f"Failed to remove image {image}: {remove_result.stderr}")
-                    else:
-                        logger.warning(f"Failed to list Docker images: {result.stderr}")
+                        # Check if no templates were found for the GPU
+                        if not docker_image or not docker_image_tag:
+                            logger.warning(f"No templates found for GPU {gpu_name}")
+                            await asyncio.sleep(first_interval)
+                            continue
 
-                    # Process template and pull image
-                    image_size = data['docker_image_size']
-                    required_space = int(image_size * min_disk_space_multiplier)
-                    
-                    if available_space < required_space:
-                        logger.warning(
-                            f"Skipping pull of {template} - insufficient disk space. "
-                            f"Required: {required_space}, Available: {available_space}"
+                        template = f"{docker_image}:{docker_image_tag}"
+                        logger.info(f"Processing template: {template}")
+
+                        # Clean up unused images
+                        docker_list_result = subprocess.run(
+                            ['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}'],
+                            capture_output=True,
+                            text=True
                         )
-                        await asyncio.sleep(first_interval)
-                        continue
+                        
+                        if docker_list_result.returncode == 0:
+                            local_images = docker_list_result.stdout.strip().split('\n')
+                            
+                            for image in local_images:
+                                if not image:
+                                    continue
+                                    
+                                repo, tag = image.split(':')
+                                if repo == docker_image and tag != docker_image_tag:
+                                    remove_result = subprocess.run(
+                                        ['docker', 'rmi', image],
+                                        capture_output=True,
+                                        text=True
+                                    )
+                                    if remove_result.returncode == 0:
+                                        logger.info(f"Removed unused image: {image}")
+                                    else:
+                                        logger.warning(f"Failed to remove image {image}: {remove_result.stderr}")
+                        else:
+                            logger.warning(f"Failed to list Docker images: {docker_list_result.stderr}")
 
-                    # Pull the image
-                    pull_result = subprocess.run(
-                        ['docker', 'pull', template],
-                        capture_output=True,
-                        text=True
-                    )
-                    
-                    if pull_result.returncode == 0:
-                        logger.info(f"Successfully pulled {template}")
-                        await asyncio.sleep(success_interval)
-                    else:
-                        logger.error(f"Failed to pull {template}: {pull_result.stderr}")
-                        await asyncio.sleep(first_interval)
+                        # Process template and pull image
+                        required_space = int(docker_image_size * min_disk_space_multiplier)
+                        
+                        if available_space < required_space:
+                            logger.warning(
+                                f"Skipping pull of {template} - insufficient disk space. "
+                                f"Required: {required_space}, Available: {available_space}"
+                            )
+                            await asyncio.sleep(first_interval)
+                            continue
+
+                        # Pull the image
+                        pull_result = subprocess.run(
+                            ['docker', 'pull', template],
+                            capture_output=True,
+                            text=True
+                        )
+                        
+                        if pull_result.returncode == 0:
+                            logger.info(f"Successfully pulled {template}")
+                            await asyncio.sleep(success_interval)
+                        else:
+                            logger.error(f"Failed to pull {template}: {pull_result.stderr}")
+                            await asyncio.sleep(first_interval)
 
             except aiohttp.ClientError as e:
                 logger.error(f"Network error: {e}")
