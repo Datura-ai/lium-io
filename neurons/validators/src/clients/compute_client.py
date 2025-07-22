@@ -51,8 +51,8 @@ from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
 from core.config import settings
-from core.validator import Validator
 from core.utils import _m, get_extra_info
+from clients.subtensor_client import SubtensorClient
 from services.const import GPU_MODEL_RATES
 from services.miner_service import MinerService
 from services.redis_service import (
@@ -89,7 +89,6 @@ class ComputeClient:
         self.miner_driver_awaiter_task = asyncio.create_task(self.miner_driver_awaiter())
         # self.heartbeat_task = asyncio.create_task(self.heartbeat())
         self.miner_service = miner_service
-        self.validator = Validator()
         self.message_queue = []
         self.lock = asyncio.Lock()
 
@@ -138,11 +137,16 @@ class ComputeClient:
         await self.miner_drivers.put(None)
         await self.miner_driver_awaiter_task
 
+        # Cleanup subtensor client
+        if hasattr(self, 'subtensor_client'):
+            await SubtensorClient.shutdown()
+
     def my_hotkey(self) -> str:
         return self.keypair.ss58_address
 
     async def run_forever(self) -> NoReturn:
-        asyncio.create_task(self.validator.warm_up_subtensor())
+        self.subtensor_client = await SubtensorClient.initialize()
+
         asyncio.create_task(self.handle_send_messages())
         asyncio.create_task(self.subscribe_mesages_from_redis())
         asyncio.create_task(self.poll_rented_machines())
@@ -558,11 +562,7 @@ class ComputeClient:
             return
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
-        miners = self.validator.fetch_miners()
-        neurons = [n for n in miners if n.hotkey == hotkey]
-        if not neurons:
-            raise ValueError(f"Miner with {hotkey=} not present in this subnetwork")
-        return neurons[0].axon_info
+        return self.subtensor_client.get_miner(hotkey).axon_info
 
     async def miner_driver(
         self,

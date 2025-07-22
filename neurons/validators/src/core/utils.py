@@ -7,6 +7,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 import asyncssh
 
 from core.config import settings
+from celium_collateral_contracts import CollateralContract
 
 logger = logging.getLogger(__name__)
 
@@ -190,3 +191,27 @@ async def retry_ssh_command(
             raise Exception(f"[{tag}] command: {command} exit_code {result.exit_status}, stderr: {result.stderr.strip()}")
 
     await execute_command()
+
+
+def get_collateral_contract() -> CollateralContract:
+    """
+    Initializes and returns a CollateralContract instance.
+
+    Args:
+        network (str): The blockchain network to use ('local', 'test', 'finney', etc.).
+        contract_address (str): Address of the collateral contract.
+        owner_key (str): Ethereum owner key.
+        miner_key (str): Optional miner key required for contract operations.
+
+    Returns:
+        CollateralContract: The initialized contract instance.
+    """
+    network = settings.BITTENSOR_NETWORK
+    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS
+    rpc_url = settings.SUBTENSOR_EVM_RPC_URL
+
+    return CollateralContract(
+        network=network,
+        contract_address=contract_address,
+        rpc_url=rpc_url,
+    )

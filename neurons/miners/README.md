@@ -72,6 +72,24 @@ Fill in your information for:
 cd neurons/miners && docker compose up -d
 ```
 
+### Associating Your Ethereum Address
+
+Before managing executors, you need to associate your Ethereum address with your Bittensor hotkey. This is a one-time setup requirement. Use the following command:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py associate-eth --private-key <ethereum-private-key>
+```
+
+- `<ethereum-private-key>`: Your Ethereum private key that will be associated with your Bittensor hotkey.
+
+You will be prompted to enter your Bittensor wallet password to complete the association.
+
+### Get the associated Ethereum Address
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-associated-evm-address
+```
+
 ## Managing Executors
 
 ### What is a Validator Hotkey?
@@ -88,12 +106,14 @@ Executors are machines running on GPUs that you can add to your central miner. T
 2. Use the following command to add an executor to the central miner:
 
     ```bash
-    docker exec <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey>
+    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey> --deposit_amount <deposit-amount> --private-key <ethereum-private-key>
     ```
 
     - `<executor-ip-address>`: The IP address of the executor machine.
     - `<executor-port>`: The port number used for the executor (default: `8001`).
-    - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. Which validator hotkey should you pick? Follow [this guide](assigning_validator_hotkeys.md)
+    - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. Which validator hotkey should you pick? Follow [this guide](assigning_validator_hotkeys.md).
+    - `<deposit-amount>`: The amount of TAO to deposit as collateral for this executor (must meet minimum required collateral).
+    - `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral transactions).
 
 ### List Executors
 
@@ -102,30 +122,84 @@ To list added executors from the central miner, follow these steps:
 1. run following command:
 
     ```bash
-    docker exec <docker instance> pdm run /root/app/src/cli.py show-executors
+    docker exec -it <docker instance> pdm run /root/app/src/cli.py show-executors
     ```
 
 ### Removing an Executor
 
 To remove an executor from the central miner, follow these steps:
- 1. Run the following command to remove the executor:
+1. Run the following command to remove the executor:
 
     ```bash
-    docker exec -i <docker instance> pdm run /root/app/src/cli.py remove-executor --address <executor public ip> --port <executor external port>
+    docker exec -it <container-id or name> pdm run /root/app/src/cli.py remove-executor --address <executor public ip> --port <executor external port>
     ```
-2. Type "y" and click enter in the interactive shell
 
-### Switch Validator
+    - `<executor public ip>`: The public IP address of the executor machine.
+    - `<executor external port>`: The external port number used for the executor.
 
-If you need to change validator hotkey of an executor, follow these steps:
-1. run following command to switch validator hotkey:
+2. Type "y" and click enter in the interactive shell.
 
-    ```bash
-    docker exec -i <docker instance> pdm run /root/app/src/cli.py switch-validator --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey>
-    ```
-2. Type "y" and click enter in the interactive shell
+### Getting Miner Collateral
 
-Note: We are not recommending to switch validator hotkey and this may lead to unexpected results.
+To check the total collateral deposited by the miner, use the following command:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-miner-collateral
+```
+
+This will display the total TAO collateral that miner has deposited.
+
+
+### Depositing Collateral for an Executor
+
+To deposit additional collateral for an existing executor, use the following command:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py deposit-collateral --address <executor-ip-address> --port <executor-port> --deposit_amount <deposit-amount> --private-key <ethereum-private-key>
+```
+
+- `<executor-ip-address>`: The IP address of the executor machine.
+- `<executor-port>`: The port number used for the executor.
+- `<deposit-amount>`: The amount of TAO to deposit as additional collateral for this executor.
+- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral transactions).
+
+This command allows you to increase the collateral for an executor already registered in the database.
+
+### Getting Executor Collateral
+
+To check the collateral amount for a specific executor, use the following command:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-executor-collateral --address <executor-ip-address> --port <executor-port>
+```
+
+- `<executor-ip-address>`: The IP address of the executor machine.
+- `<executor-port>`: The port number used for the executor.
+
+This will display the TAO collateral associated with the specified executor.
+
+### Getting Miner Reclaim Requests
+
+To view all reclaim requests for the current miner, use the following command:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-reclaim-requests
+```
+
+This will print a JSON list of all reclaim requests made by the miner, including their status and details.
+
+### Finalizing a Reclaim Request
+
+To finalize a reclaim request and reclaim your collateral, use the following command:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py finalize-reclaim-request --reclaim-request-id <reclaim-request-id> --private-key <ethereum-private-key>
+```
+
+- `<reclaim-request-id>`: The ID of the reclaim request you wish to finalize.
+- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract transactions).
+
+This command will finalize the reclaim request and return the collateral to your account.
 
 ### Monitoring earnings
 

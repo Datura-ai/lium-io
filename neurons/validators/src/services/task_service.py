@@ -24,6 +24,8 @@ from services.const import (
     PYTHON_DIGEST,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
+    MIN_PORT_COUNT,
+    DOCKER_DIND_IMAGE,
 )
 from services.redis_service import (
     RedisService,
@@ -34,6 +36,7 @@ from services.redis_service import (
 from services.ssh_service import SSHService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
+from services.collateral_contract_service import CollateralContractService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
@@ -54,16 +57,24 @@ class JobResult(BaseModel):
     sysbox_runtime: bool = False
 
 
+class DockerConnectionCheckResult(BaseModel):
+    success: bool
+    log_text: str
+    sysbox_runtime: bool
+
+
 class TaskService:
     def __init__(
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
+        collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.validation_service = validation_service
+        self.collateral_contract_service = collateral_contract_service
         self.wallet = settings.get_bittensor_wallet()
 
     async def is_script_running(
@@ -204,31 +215,8 @@ class TaskService:
         executor_info: ExecutorSSHInfo,
         private_key: str,
         public_key: str,
-    ):
-        port_map = self.get_available_port_map(executor_info)
-        if port_map is None:
-            log_text = _m(
-                "No port available for docker container",
-                extra=get_extra_info(
-                    {
-                        "job_batch_id": job_batch_id,
-                        "miner_hotkey": miner_hotkey,
-                        "executor_uuid": executor_info.uuid,
-                        "executor_ip_address": executor_info.address,
-                        "executor_port": executor_info.port,
-                        "ssh_username": executor_info.ssh_username,
-                        "ssh_port": executor_info.ssh_port,
-                        "version": settings.VERSION
-                    }
-                ),
-            )
-            log_status = "error"
-            logger.error(log_text, exc_info=True)
-
-            return False, log_text, log_status
-
-        internal_port, external_port = port_map
-        executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+        sysbox_runtime: bool = False,
+    ) -> DockerConnectionCheckResult:
         default_extra = {
             "job_batch_id": job_batch_id,
             "miner_hotkey": miner_hotkey,
@@ -237,9 +225,29 @@ class TaskService:
             "executor_port": executor_info.port,
             "ssh_username": executor_info.ssh_username,
             "ssh_port": executor_info.ssh_port,
+            "version": settings.VERSION,
+            "sysbox_runtime": sysbox_runtime,
+        }
+        port_map = self.get_available_port_map(executor_info)
+        if port_map is None:
+            log_text = _m(
+                "No port available for docker container",
+                extra=get_extra_info(default_extra),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return DockerConnectionCheckResult(
+                success=False,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
+            )
+
+        internal_port, external_port = port_map
+        executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+        default_extra = {
+            **default_extra,
             "internal_port": internal_port,
             "external_port": external_port,
-            "version": settings.VERSION,
         }
         context.set(f"[_docker_connection_check][{executor_name}]")
 
@@ -268,15 +276,24 @@ class TaskService:
                 command = f'/usr/bin/docker volume prune -af'
                 await ssh_client.run(command)
 
+            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
+            command = (
+                f'/usr/bin/docker run -d '
+                f'{"--runtime=sysbox-runc " if sysbox_runtime else ""}'
+                f'--name {container_name} --gpus all '
+                f'-p {internal_port}:22 '
+                f'{DOCKER_DIND_IMAGE} '
+                f'{docker_cmd}'
+            )
+            
             log_text = _m(
                 "Creating docker container",
-                extra=default_extra,
+                extra=get_extra_info({
+                    **default_extra,
+                    "command": command,
+                }),
             )
-            log_status = "info"
             logger.info(log_text)
-
-            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"/usr/bin/docker run -d --name {container_name} --gpus all -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
             result = await ssh_client.run(command)
             if result.exit_status != 0:
@@ -288,7 +305,6 @@ class TaskService:
                         "error": error_message
                     }),
                 )
-                log_status = "error"
                 logger.error(log_text, exc_info=True)
 
                 try:
@@ -297,7 +313,11 @@ class TaskService:
                 except Exception as e:
                     logger.error(f"Error removing docker container: {e}")
 
-                return False, log_text, log_status
+                return DockerConnectionCheckResult(
+                    success=False,
+                    log_text=str(log_text),
+                    sysbox_runtime=sysbox_runtime,
+                )
 
             await asyncio.sleep(5)
 
@@ -314,6 +334,20 @@ class TaskService:
                     extra=default_extra,
                 )
                 logger.info(log_text)
+
+                if sysbox_runtime:
+                    command = f"/usr/bin/docker ps -a"
+                    result = await ssh_client.run(command)
+                    if result.exit_status != 0:
+                        error_message = result.stderr.strip() if result.stderr else "No error message available"
+                        logger.error(
+                            _m(
+                                "Error docker dind not working",
+                                extra=get_extra_info({**default_extra, "error": error_message}),
+                            ),
+                            exc_info=True,
+                        )
+                        sysbox_runtime = False
 
                 # set port on redis
                 key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
@@ -333,13 +367,16 @@ class TaskService:
             command = f"/usr/bin/docker rm {container_name} -f"
             await ssh_client.run(command)
 
-            return True, log_text, log_status
+            return DockerConnectionCheckResult(
+                success=True,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
+            )
         except Exception as e:
             log_text = _m(
                 "Error connection docker container",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
-            log_status = "error"
             logger.error(log_text, exc_info=True)
 
             try:
@@ -348,7 +385,11 @@ class TaskService:
             except Exception as e:
                 logger.error(f"Error removing docker container: {e}")
 
-            return False, log_text, log_status
+            return DockerConnectionCheckResult(
+                success=False,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
+            )
 
     async def check_pod_running(
         self,
@@ -477,6 +518,16 @@ class TaskService:
 
         return True, None
 
+    def update_task_log_msg(self, log_text: str, is_eligible_executor: bool = False, collateral_contract_error_message: str | None = None) -> str:
+        """Update the log text based on extra info"""
+        additional_msg = (
+            "The executor is not eligible according to the collateral contract and therefore will not have score very soon. "
+            "Please deposit more collateral to get scores. "
+            f"Collateral contract error message: {collateral_contract_error_message}"
+            if not is_eligible_executor else ""
+        )
+        return f"{log_text} {additional_msg}"
+
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -496,7 +547,6 @@ class TaskService:
             "executor_ssh_port": executor_info.ssh_port,
             "version": settings.VERSION,
         }
-
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
         prev_spec = verified_job_info.get('spec', '')
         prev_uuids = verified_job_info.get('uuids', '')
@@ -647,6 +697,33 @@ class TaskService:
                         ),
                     ),
                 )
+
+                is_eligible_executor, collateral_contract_error_message = await self.collateral_contract_service.is_eligible_executor(
+                    miner_hotkey=miner_info.miner_hotkey,
+                    executor_uuid=executor_info.uuid,
+                    gpu_model=gpu_model,
+                    gpu_count=gpu_count
+                )
+
+                if not is_eligible_executor:
+                    # if debug mode, we don't need to check collateral contract
+                    log_text = _m(
+                        f"The executor is not eligible according to the collateral contract and therefore cannot have scores set for them.",
+                        extra=get_extra_info({**default_extra, "error_message": collateral_contract_error_message}),
+                    )
+                    logger.warning(log_text)
+                    if not settings.DEBUG_COLLATERAL_CONTRACT:
+                        return await self._handle_task_result(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            spec=None,
+                            score=0,
+                            job_score=0,
+                            log_text=log_text,
+                            verified_job_info=verified_job_info,
+                            success=False,
+                            clear_verified_job_info=False,
+                        )
 
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
@@ -813,7 +890,6 @@ class TaskService:
                         success=False,
                         clear_verified_job_info=True,
                     )
-
                 # check rented status
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
@@ -886,9 +962,11 @@ class TaskService:
                     job_score = 0 if is_rental_succeed else 1
                     actual_score = 1 if is_rental_succeed else 0
 
-                    log_msg = (
+                    log_msg = self.update_task_log_msg(
                         "Executor is already rented."
-                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so."
+                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so. ",
+                        is_eligible_executor=is_eligible_executor,
+                        collateral_contract_error_message=collateral_contract_error_message,
                     )
                     log_text = _m(
                         log_msg,
@@ -932,15 +1010,22 @@ class TaskService:
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress and not rented_machine:
-                    success, log_text, log_status = await self.docker_connection_check(
+                    docker_connection_check_result = await self.docker_connection_check(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
                         executor_info=executor_info,
                         private_key=private_key,
                         public_key=public_key,
+                        sysbox_runtime=sysbox_runtime,
                     )
-                    if not success:
+
+                    sysbox_runtime = docker_connection_check_result.sysbox_runtime
+                    machine_spec = {
+                        **machine_spec,
+                        "sysbox_runtime": sysbox_runtime,
+                    }
+                    if not docker_connection_check_result.success:
                         return await self._handle_task_result(
                             miner_info=miner_info,
                             executor_info=executor_info,
@@ -987,11 +1072,27 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
+                # get available port maps
+                port_maps = await self.redis_service.lrange(port_map_key)
+                machine_spec = {
+                    **machine_spec,
+                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                }
+
                 job_score = 1
-                actual_score = 1 if is_rental_succeed else 0
+                actual_score = 1 if is_rental_succeed and len(port_maps) >= MIN_PORT_COUNT else 0
+                success = True if actual_score > 0 else False
 
                 log_text = _m(
-                    message="Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
+                    message=self.update_task_log_msg(
+                        f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}."
+                        if len(port_maps) < MIN_PORT_COUNT
+                        else "Train task is finished. Set score 0 until it's verified by rental check."
+                        if not is_rental_succeed
+                        else "Train task finished.",
+                        is_eligible_executor=is_eligible_executor,
+                        collateral_contract_error_message=collateral_contract_error_message,
+                    ),
                     extra=get_extra_info(
                         {
                             **default_extra,
@@ -1020,7 +1121,7 @@ class TaskService:
                     job_score=job_score,
                     log_text=log_text,
                     verified_job_info=verified_job_info,
-                    success=True,
+                    success=success,
                     clear_verified_job_info=False,
                     gpu_model_count=gpu_model_count,
                     gpu_uuids=gpu_uuids,
