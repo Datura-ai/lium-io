@@ -68,13 +68,20 @@ class ContainerBaseRequest(BaseRequest):
     executor_id: str
 
 
+class VolumeInfo(BaseModel):
+    name: str
+    plugin: str
+    iam_user_access_key: str
+    iam_user_secret_key: str
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_keys: list[str] = []
     custom_options: CustomOptions | None = None
     debug: bool | None = None
-    volume_name: str | None = None  # when edit pod, volume_name is required
+    volume_info: VolumeInfo | None = None
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
     docker_password: str | None = None  # when edit pod, docker_password is required
