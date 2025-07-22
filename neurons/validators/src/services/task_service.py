@@ -25,6 +25,7 @@ from services.const import (
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     MIN_PORT_COUNT,
+    DOCKER_DIND_IMAGE,
 )
 from services.redis_service import (
     RedisService,
@@ -54,6 +55,12 @@ class JobResult(BaseModel):
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False
+
+
+class DockerConnectionCheckResult(BaseModel):
+    success: bool
+    log_text: str
+    sysbox_runtime: bool
 
 
 class TaskService:
@@ -208,31 +215,8 @@ class TaskService:
         executor_info: ExecutorSSHInfo,
         private_key: str,
         public_key: str,
-    ):
-        port_map = self.get_available_port_map(executor_info)
-        if port_map is None:
-            log_text = _m(
-                "No port available for docker container",
-                extra=get_extra_info(
-                    {
-                        "job_batch_id": job_batch_id,
-                        "miner_hotkey": miner_hotkey,
-                        "executor_uuid": executor_info.uuid,
-                        "executor_ip_address": executor_info.address,
-                        "executor_port": executor_info.port,
-                        "ssh_username": executor_info.ssh_username,
-                        "ssh_port": executor_info.ssh_port,
-                        "version": settings.VERSION
-                    }
-                ),
-            )
-            log_status = "error"
-            logger.error(log_text, exc_info=True)
-
-            return False, log_text, log_status
-
-        internal_port, external_port = port_map
-        executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+        sysbox_runtime: bool = False,
+    ) -> DockerConnectionCheckResult:
         default_extra = {
             "job_batch_id": job_batch_id,
             "miner_hotkey": miner_hotkey,
@@ -241,9 +225,29 @@ class TaskService:
             "executor_port": executor_info.port,
             "ssh_username": executor_info.ssh_username,
             "ssh_port": executor_info.ssh_port,
+            "version": settings.VERSION,
+            "sysbox_runtime": sysbox_runtime,
+        }
+        port_map = self.get_available_port_map(executor_info)
+        if port_map is None:
+            log_text = _m(
+                "No port available for docker container",
+                extra=get_extra_info(default_extra),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return DockerConnectionCheckResult(
+                success=False,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
+            )
+
+        internal_port, external_port = port_map
+        executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+        default_extra = {
+            **default_extra,
             "internal_port": internal_port,
             "external_port": external_port,
-            "version": settings.VERSION,
         }
         context.set(f"[_docker_connection_check][{executor_name}]")
 
@@ -272,15 +276,24 @@ class TaskService:
                 command = f'/usr/bin/docker volume prune -af'
                 await ssh_client.run(command)
 
+            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
+            command = (
+                f'/usr/bin/docker run -d '
+                f'{"--runtime=sysbox-runc " if sysbox_runtime else ""}'
+                f'--name {container_name} --gpus all '
+                f'-p {internal_port}:22 '
+                f'{DOCKER_DIND_IMAGE} '
+                f'{docker_cmd}'
+            )
+            
             log_text = _m(
                 "Creating docker container",
-                extra=default_extra,
+                extra=get_extra_info({
+                    **default_extra,
+                    "command": command,
+                }),
             )
-            log_status = "info"
             logger.info(log_text)
-
-            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"/usr/bin/docker run -d --name {container_name} --gpus all -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
 
             result = await ssh_client.run(command)
             if result.exit_status != 0:
@@ -292,7 +305,6 @@ class TaskService:
                         "error": error_message
                     }),
                 )
-                log_status = "error"
                 logger.error(log_text, exc_info=True)
 
                 try:
@@ -301,7 +313,11 @@ class TaskService:
                 except Exception as e:
                     logger.error(f"Error removing docker container: {e}")
 
-                return False, log_text, log_status
+                return DockerConnectionCheckResult(
+                    success=False,
+                    log_text=str(log_text),
+                    sysbox_runtime=sysbox_runtime,
+                )
 
             await asyncio.sleep(5)
 
@@ -318,6 +334,20 @@ class TaskService:
                     extra=default_extra,
                 )
                 logger.info(log_text)
+
+                if sysbox_runtime:
+                    command = f"/usr/bin/docker ps -a"
+                    result = await ssh_client.run(command)
+                    if result.exit_status != 0:
+                        error_message = result.stderr.strip() if result.stderr else "No error message available"
+                        logger.error(
+                            _m(
+                                "Error docker dind not working",
+                                extra=get_extra_info({**default_extra, "error": error_message}),
+                            ),
+                            exc_info=True,
+                        )
+                        sysbox_runtime = False
 
                 # set port on redis
                 key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
@@ -337,13 +367,16 @@ class TaskService:
             command = f"/usr/bin/docker rm {container_name} -f"
             await ssh_client.run(command)
 
-            return True, log_text, log_status
+            return DockerConnectionCheckResult(
+                success=True,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
+            )
         except Exception as e:
             log_text = _m(
                 "Error connection docker container",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
             )
-            log_status = "error"
             logger.error(log_text, exc_info=True)
 
             try:
@@ -352,7 +385,11 @@ class TaskService:
             except Exception as e:
                 logger.error(f"Error removing docker container: {e}")
 
-            return False, log_text, log_status
+            return DockerConnectionCheckResult(
+                success=False,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
+            )
 
     async def check_pod_running(
         self,
@@ -973,15 +1010,22 @@ class TaskService:
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress and not rented_machine:
-                    success, log_text, log_status = await self.docker_connection_check(
+                    docker_connection_check_result = await self.docker_connection_check(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
                         executor_info=executor_info,
                         private_key=private_key,
                         public_key=public_key,
+                        sysbox_runtime=sysbox_runtime,
                     )
-                    if not success:
+
+                    sysbox_runtime = docker_connection_check_result.sysbox_runtime
+                    machine_spec = {
+                        **machine_spec,
+                        "sysbox_runtime": sysbox_runtime,
+                    }
+                    if not docker_connection_check_result.success:
                         return await self._handle_task_result(
                             miner_info=miner_info,
                             executor_info=executor_info,
@@ -1027,6 +1071,13 @@ class TaskService:
                         gpu_model_count=gpu_model_count,
                         clear_verified_job_info=False,
                     )
+
+                # get available port maps
+                port_maps = await self.redis_service.lrange(port_map_key)
+                machine_spec = {
+                    **machine_spec,
+                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                }
 
                 job_score = 1
                 actual_score = 1 if is_rental_succeed and len(port_maps) >= MIN_PORT_COUNT else 0
