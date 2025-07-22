@@ -58,8 +58,6 @@ class Settings(BaseSettings):
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    DEBUG_COLLATERAL_CONTRACT: bool = True
-
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
     )
