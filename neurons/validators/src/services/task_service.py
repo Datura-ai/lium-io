@@ -688,7 +688,7 @@ class TaskService:
                     ),
                 )
 
-                callateral_deposited, collateral_contract_error_message = await self.collateral_contract_service.is_eligible_executor(
+                collateral_deposited, collateral_contract_error_message = await self.collateral_contract_service.is_eligible_executor(
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_uuid=executor_info.uuid,
                     gpu_model=gpu_model,
@@ -696,7 +696,7 @@ class TaskService:
                 )
                 default_extra = {
                     **default_extra,
-                    "callateral_deposited": callateral_deposited,
+                    "collateral_deposited": collateral_deposited,
                     "collateral_contract_error_message": collateral_contract_error_message,
                 }
 
@@ -935,16 +935,21 @@ class TaskService:
                     # actual score is the score which executor gets for incentive
                     # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
                     # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and 1 for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    job_score = 0 if is_rental_succeed and callateral_deposited else 1
-                    actual_score = 1 if is_rental_succeed and callateral_deposited else 0
+                    job_score = 0
+                    actual_score = 1
+                    log_msg = "Executor is already rented."
 
-                    log_msg = (
-                        "Executor is rented, but not eligible from collateral contract."
-                        if not callateral_deposited
-                        else "Executor is rented but in progress of rental check. This can be finished in an hour or so. " 
-                        if not is_rental_succeed
-                        else "Executor is already rented."
-                    )
+                    if not collateral_deposited and not settings.DEBUG_COLLATERAL_CONTRACT:
+                        job_score = 1
+                        actual_score = 0
+                        log_msg = "Executor is rented. But not eligible from collateral contract."
+                    elif not is_rental_succeed:
+                        job_score = 1
+                        actual_score = 0
+                        log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
+                    elif not collateral_deposited and settings.DEBUG_COLLATERAL_CONTRACT:
+                        log_msg = "Executor is rented. But not eligible from collateral contract. Will not have score very soon."
+
                     log_text = _m(
                         log_msg,
                         extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed, "job_score": job_score}),
@@ -1057,18 +1062,22 @@ class TaskService:
                 }
 
                 job_score = 1
-                actual_score = 1 if is_rental_succeed and len(port_maps) >= MIN_PORT_COUNT and callateral_deposited else 0
+                actual_score = 1
+                log_msg = "Train task is finished."
+
+                if not collateral_deposited and not settings.DEBUG_COLLATERAL_CONTRACT:
+                    actual_score = 0
+                    log_msg = "Train task is finished. But not eligible from collateral contract."
+                elif len(port_maps) < MIN_PORT_COUNT:
+                    actual_score = 0
+                    log_msg = f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}."
+                elif not is_rental_succeed:
+                    actual_score = 0
+                    log_msg = "Train task is finished. Set score 0 until it's verified by rental check"
+                elif not collateral_deposited and settings.DEBUG_COLLATERAL_CONTRACT:
+                    log_msg = "Train task is finished. But not eligible from collateral contract. Will not have score very soon."
+
                 success = True if actual_score > 0 else False
-                
-                log_msg = (
-                    "Train task is finished. But not eligible from collateral contract."
-                    if not callateral_deposited
-                    else f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}."
-                    if len(port_maps) < MIN_PORT_COUNT
-                    else "Train task is finished. Set score 0 until it's verified by rental check."
-                    if not is_rental_succeed
-                    else "Train task finished."
-                )
 
                 log_text = _m(
                     log_msg,
