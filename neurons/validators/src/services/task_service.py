@@ -25,7 +25,7 @@ from services.const import (
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     MIN_PORT_COUNT,
-    BATCH_PORT_VERIFICATION_SIZE,
+    DOCKER_DIND_IMAGE,
 )
 from services.redis_service import (
     RedisService,
@@ -55,6 +55,12 @@ class JobResult(BaseModel):
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False
+
+
+class DockerConnectionCheckResult(BaseModel):
+    success: bool
+    log_text: str
+    sysbox_runtime: bool
 
 
 class TaskService:
@@ -148,160 +154,6 @@ class TaskService:
 
         return True
 
-    def get_available_port_maps(
-        self,
-        executor_info: ExecutorSSHInfo,
-        batch_size: int = 10,
-    ) -> list[tuple[int, int]]:
-        """Get a list of available port maps for batch verification."""
-        port_maps = []
-        
-        if executor_info.port_mappings:
-            port_mappings: list[tuple[int, int]] = json.loads(executor_info.port_mappings)
-            port_mappings = [
-                (internal_port, external_port)
-                for internal_port, external_port in port_mappings
-                if internal_port != executor_info.ssh_port
-                and external_port != executor_info.ssh_port
-            ]
-            
-            # Return up to batch_size port mappings
-            return port_mappings[:batch_size]
-
-        # Generate ports from range
-        if executor_info.port_range:
-            if "-" in executor_info.port_range:
-                min_port, max_port = map(
-                    int, (part.strip() for part in executor_info.port_range.split("-"))
-                )
-                ports = list(range(min_port, max_port + 1))
-            else:
-                ports = list(
-                    map(int, (part.strip() for part in executor_info.port_range.split(",")))
-                )
-        else:
-            # Default range if port_range is empty
-            ports = list(range(40000, 65536))
-
-        ports = [port for port in ports if port != executor_info.ssh_port]
-
-        if not ports:
-            return []
-
-        # Select random ports for batch verification
-        selected_ports = random.sample(ports, min(batch_size, len(ports)))
-        return [(port, port) for port in selected_ports]
-
-    async def batch_verify_ports(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        job_batch_id: str,
-        miner_hotkey: str,
-        executor_info: ExecutorSSHInfo,
-        private_key: str,
-        public_key: str,
-        port_maps: list[tuple[int, int]],
-    ) -> list[tuple[int, int]]:
-        """Verify multiple ports concurrently."""
-        tasks = []
-        
-        for internal_port, external_port in port_maps:
-            task = self.verify_single_port(
-                ssh_client, job_batch_id, miner_hotkey, executor_info,
-                private_key, public_key, internal_port, external_port
-            )
-            tasks.append(task)
-        
-        # Execute all port verification tasks concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Filter successful port verifications
-        successful_ports = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.warning(f"Port verification failed for {port_maps[i]}: {result}")
-                continue
-            
-            if result:  # result is True if port verification succeeded
-                successful_ports.append(port_maps[i])
-        
-        return successful_ports
-
-    async def verify_single_port(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        job_batch_id: str,
-        miner_hotkey: str,
-        executor_info: ExecutorSSHInfo,
-        private_key: str,
-        public_key: str,
-        internal_port: int,
-        external_port: int,
-    ) -> bool:
-        """Verify a single port by creating a container and testing SSH connection."""
-        container_name = f"container_{miner_hotkey}_{internal_port}"
-        
-        try:
-            # Create docker container
-            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = f"/usr/bin/docker run -d --name {container_name} --gpus all -p {internal_port}:22 daturaai/compute-subnet-executor:latest {docker_cmd}"
-            
-            result = await ssh_client.run(command)
-            if result.exit_status != 0:
-                return False
-            
-            # Wait for container to start
-            await asyncio.sleep(3)
-            
-            # Test SSH connection
-            pkey = asyncssh.import_private_key(private_key)
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=external_port,
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
-            ) as _:
-                # Connection successful
-                pass
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Port verification failed for {internal_port}:{external_port}: {e}")
-            return False
-        finally:
-            # Clean up container
-            try:
-                command = f"/usr/bin/docker rm {container_name} -f"
-                await ssh_client.run(command)
-            except Exception as e:
-                logger.error(f"Error removing container {container_name}: {e}")
-
-    async def store_successful_ports(
-        self,
-        miner_hotkey: str,
-        executor_uuid: str,
-        successful_ports: list[tuple[int, int]],
-    ):
-        """Store successful port mappings in Redis."""
-        key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_uuid}"
-        
-        for internal_port, external_port in successful_ports:
-            port_map = f"{internal_port},{external_port}"
-            
-            # Remove duplicate port_maps
-            await self.redis_service.lrem(key=key, element=port_map)
-            
-            # Insert port_map at the beginning of the list
-            await self.redis_service.lpush(key, port_map)
-        
-        # Keep only the latest 10 port maps
-        port_maps = await self.redis_service.lrange(key)
-        if len(port_maps) > 10:
-            for _ in range(len(port_maps) - 10):
-                await self.redis_service.rpop(key)
-
     def get_available_port_map(
         self,
         executor_info: ExecutorSSHInfo,
@@ -363,80 +215,181 @@ class TaskService:
         executor_info: ExecutorSSHInfo,
         private_key: str,
         public_key: str,
-    ):
-        # Use batch port verification instead of single port
-        port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE)
-        if not port_maps:
+        sysbox_runtime: bool = False,
+    ) -> DockerConnectionCheckResult:
+        default_extra = {
+            "job_batch_id": job_batch_id,
+            "miner_hotkey": miner_hotkey,
+            "executor_uuid": executor_info.uuid,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "ssh_username": executor_info.ssh_username,
+            "ssh_port": executor_info.ssh_port,
+            "version": settings.VERSION,
+            "sysbox_runtime": sysbox_runtime,
+        }
+        port_map = self.get_available_port_map(executor_info)
+        if port_map is None:
             log_text = _m(
-                "No ports available for docker container",
-                extra=get_extra_info(
-                    {
-                        "job_batch_id": job_batch_id,
-                        "miner_hotkey": miner_hotkey,
-                        "executor_uuid": executor_info.uuid,
-                        "executor_ip_address": executor_info.address,
-                        "executor_port": executor_info.port,
-                        "ssh_username": executor_info.ssh_username,
-                        "ssh_port": executor_info.ssh_port,
-                        "version": settings.VERSION
-                    }
-                ),
+                "No port available for docker container",
+                extra=get_extra_info(default_extra),
             )
-            log_status = "error"
             logger.error(log_text, exc_info=True)
 
-            return False, log_text, log_status
-
-        # Batch verify all ports concurrently
-        successful_ports = await self.batch_verify_ports(
-            ssh_client, job_batch_id, miner_hotkey, executor_info, 
-            private_key, public_key, port_maps
-        )
-        
-        if not successful_ports:
-            log_text = _m(
-                "No ports could be verified for docker container",
-                extra=get_extra_info(
-                    {
-                        "job_batch_id": job_batch_id,
-                        "miner_hotkey": miner_hotkey,
-                        "executor_uuid": executor_info.uuid,
-                        "executor_ip_address": executor_info.address,
-                        "executor_port": executor_info.port,
-                        "ssh_username": executor_info.ssh_username,
-                        "ssh_port": executor_info.ssh_port,
-                        "version": settings.VERSION,
-                        "attempted_ports": len(port_maps)
-                    }
-                ),
+            return DockerConnectionCheckResult(
+                success=False,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
             )
-            log_status = "error"
+
+        internal_port, external_port = port_map
+        executor_name = f"{executor_info.uuid}_{executor_info.address}_{executor_info.port}"
+        default_extra = {
+            **default_extra,
+            "internal_port": internal_port,
+            "external_port": external_port,
+        }
+        context.set(f"[_docker_connection_check][{executor_name}]")
+
+        container_name = f"container_{miner_hotkey}"
+
+        try:
+            # remove all containers that has conatiner_ prefix in its name, since it's unrented
+            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
+            result = await ssh_client.run(command)
+            if result.stdout.strip():
+                container_names = " ".join(result.stdout.strip().split("\n"))
+
+                logger.info(
+                    _m(
+                        "Cleaning existing docker containers",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_names": container_names,
+                        }),
+                    ),
+                )
+
+                command = f'/usr/bin/docker rm {container_names} -f'
+                await ssh_client.run(command)
+
+                command = f'/usr/bin/docker volume prune -af'
+                await ssh_client.run(command)
+
+            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
+            command = (
+                f'/usr/bin/docker run -d '
+                f'{"--runtime=sysbox-runc " if sysbox_runtime else ""}'
+                f'--name {container_name} --gpus all '
+                f'-p {internal_port}:22 '
+                f'{DOCKER_DIND_IMAGE} '
+                f'{docker_cmd}'
+            )
+
+            log_text = _m(
+                "Creating docker container",
+                extra=get_extra_info({
+                    **default_extra,
+                    "command": command,
+                }),
+            )
+            logger.info(log_text)
+
+            result = await ssh_client.run(command)
+            if result.exit_status != 0:
+                error_message = result.stderr.strip() if result.stderr else "No error message available"
+                log_text = _m(
+                    "Error creating docker connection",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error": error_message
+                    }),
+                )
+                logger.error(log_text, exc_info=True)
+
+                try:
+                    command = f"/usr/bin/docker rm {container_name} -f"
+                    await ssh_client.run(command)
+                except Exception as e:
+                    logger.error(f"Error removing docker container: {e}")
+
+                return DockerConnectionCheckResult(
+                    success=False,
+                    log_text=str(log_text),
+                    sysbox_runtime=sysbox_runtime,
+                )
+
+            await asyncio.sleep(5)
+
+            pkey = asyncssh.import_private_key(private_key)
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=external_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as _:
+                log_text = _m(
+                    "Connected into docker container",
+                    extra=default_extra,
+                )
+                logger.info(log_text)
+
+                if sysbox_runtime:
+                    command = f"/usr/bin/docker ps -a"
+                    result = await ssh_client.run(command)
+                    if result.exit_status != 0:
+                        error_message = result.stderr.strip() if result.stderr else "No error message available"
+                        logger.error(
+                            _m(
+                                "Error docker dind not working",
+                                extra=get_extra_info({**default_extra, "error": error_message}),
+                            ),
+                            exc_info=True,
+                        )
+                        sysbox_runtime = False
+
+                # set port on redis
+                key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
+                port_map = f"{internal_port},{external_port}"
+
+                # delete all the same port_maps in the list
+                await self.redis_service.lrem(key=key, element=port_map)
+
+                # insert port_map in the list
+                await self.redis_service.lpush(key, port_map)
+
+                # keep the latest 10 port maps
+                port_maps = await self.redis_service.lrange(key)
+                if len(port_maps) > 10:
+                    await self.redis_service.rpop(key)
+
+            command = f"/usr/bin/docker rm {container_name} -f"
+            await ssh_client.run(command)
+
+            return DockerConnectionCheckResult(
+                success=True,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
+            )
+        except Exception as e:
+            log_text = _m(
+                "Error connection docker container",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
             logger.error(log_text, exc_info=True)
 
-            return False, log_text, log_status
+            try:
+                command = f"/usr/bin/docker rm {container_name} -f"
+                await ssh_client.run(command)
+            except Exception as e:
+                logger.error(f"Error removing docker container: {e}")
 
-        # Store successful ports in Redis
-        await self.store_successful_ports(miner_hotkey, executor_info.uuid, successful_ports)
-
-        log_text = _m(
-            "Batch port verification completed successfully",
-            extra=get_extra_info({
-                "job_batch_id": job_batch_id,
-                "miner_hotkey": miner_hotkey,
-                "executor_uuid": executor_info.uuid,
-                "executor_ip_address": executor_info.address,
-                "executor_port": executor_info.port,
-                "ssh_username": executor_info.ssh_username,
-                "ssh_port": executor_info.ssh_port,
-                "version": settings.VERSION,
-                "verified_ports": len(successful_ports),
-                "attempted_ports": len(port_maps)
-            }),
-        )
-        log_status = "info"
-        logger.info(log_text)
-
-        return True, log_text, log_status
+            return DockerConnectionCheckResult(
+                success=False,
+                log_text=str(log_text),
+                sysbox_runtime=sysbox_runtime,
+            )
 
     async def check_pod_running(
         self,
@@ -564,15 +517,6 @@ class TaskService:
                 return False, log_text
 
         return True, None
-    
-    def update_task_log_msg(self, log_text: str, is_eligible_executor: bool = False) -> str:
-        """Update the log text based on extra info"""
-        additional_msg = (
-            "The executor is not eligible according to the collateral contract and therefore will not have score very soon. "
-            "Please deposit more collateral to get scores."
-            if not is_eligible_executor else ""
-        )
-        return f"{log_text} {additional_msg}"
 
     async def create_task(
         self,
@@ -744,33 +688,18 @@ class TaskService:
                     ),
                 )
 
-                is_eligible_executor = await self.collateral_contract_service.is_eligible_executor(
+                collateral_deposited, collateral_contract_error_message = await self.collateral_contract_service.is_eligible_executor(
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_uuid=executor_info.uuid,
                     gpu_model=gpu_model,
                     gpu_count=gpu_count
                 )
+                default_extra = {
+                    **default_extra,
+                    "collateral_deposited": collateral_deposited,
+                    "collateral_contract_error_message": collateral_contract_error_message,
+                }
 
-                if not is_eligible_executor:
-                    # if debug mode, we don't need to check collateral contract
-                    log_text = _m(
-                        f"The executor is not eligible according to the collateral contract and therefore cannot have scores set for them.",
-                        extra=get_extra_info(default_extra),
-                    )
-                    logger.warning(log_text)
-                    if not settings.DEBUG_COLLATERAL_CONTRACT:
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=None,
-                            score=0,
-                            job_score=0,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            clear_verified_job_info=False,
-                        )
-                
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
                         f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
@@ -936,6 +865,7 @@ class TaskService:
                         success=False,
                         clear_verified_job_info=True,
                     )
+
                 # check rented status
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
@@ -1005,14 +935,21 @@ class TaskService:
                     # actual score is the score which executor gets for incentive
                     # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
                     # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and 1 for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    job_score = 0 if is_rental_succeed else 1
-                    actual_score = 1 if is_rental_succeed else 0
+                    job_score = 0
+                    actual_score = 1
+                    log_msg = "Executor is already rented."
 
-                    log_msg = self.update_task_log_msg(
-                        "Executor is already rented." 
-                        if is_rental_succeed else "Executor is rented but in progress of rental check. This can be finished in an hour or so. ",
-                        is_eligible_executor=is_eligible_executor,
-                    )
+                    if not collateral_deposited and not settings.DEBUG_COLLATERAL_CONTRACT:
+                        job_score = 1
+                        actual_score = 0
+                        log_msg = "Executor is rented. But not eligible from collateral contract."
+                    elif not is_rental_succeed:
+                        job_score = 1
+                        actual_score = 0
+                        log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
+                    elif not collateral_deposited and settings.DEBUG_COLLATERAL_CONTRACT:
+                        log_msg = "Executor is rented. But not eligible from collateral contract. Will not have score very soon."
+
                     log_text = _m(
                         log_msg,
                         extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed, "job_score": job_score}),
@@ -1055,15 +992,22 @@ class TaskService:
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress and not rented_machine:
-                    success, log_text, log_status = await self.docker_connection_check(
+                    docker_connection_check_result = await self.docker_connection_check(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
                         executor_info=executor_info,
                         private_key=private_key,
                         public_key=public_key,
+                        sysbox_runtime=sysbox_runtime,
                     )
-                    if not success:
+
+                    sysbox_runtime = docker_connection_check_result.sysbox_runtime
+                    machine_spec = {
+                        **machine_spec,
+                        "sysbox_runtime": sysbox_runtime,
+                    }
+                    if not docker_connection_check_result.success:
                         return await self._handle_task_result(
                             miner_info=miner_info,
                             executor_info=executor_info,
@@ -1110,32 +1054,33 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                if len(port_maps) < MIN_PORT_COUNT:
-                    log_text = _m(
-                        f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}.",
-                        extra=get_extra_info(default_extra),
-                    )
-
-                    return await self._handle_task_result(
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=machine_spec,
-                        score=0,
-                        job_score=1,
-                        log_text=log_text,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=False
-                    )
+                # get available port maps
+                port_maps = await self.redis_service.lrange(port_map_key)
+                machine_spec = {
+                    **machine_spec,
+                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                }
 
                 job_score = 1
-                actual_score = 1 if is_rental_succeed else 0
+                actual_score = 1
+                log_msg = "Train task is finished."
+
+                if not collateral_deposited and not settings.DEBUG_COLLATERAL_CONTRACT:
+                    actual_score = 0
+                    log_msg = "Train task is finished. But not eligible from collateral contract."
+                elif len(port_maps) < MIN_PORT_COUNT:
+                    actual_score = 0
+                    log_msg = f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}."
+                elif not is_rental_succeed:
+                    actual_score = 0
+                    log_msg = "Train task is finished. Set score 0 until it's verified by rental check"
+                elif not collateral_deposited and settings.DEBUG_COLLATERAL_CONTRACT:
+                    log_msg = "Train task is finished. But not eligible from collateral contract. Will not have score very soon."
+
+                success = True if actual_score > 0 else False
 
                 log_text = _m(
-                    message=self.update_task_log_msg(
-                        "Train task finished" if is_rental_succeed else "Train task finished. Set score 0 until it's verified by rental check",
-                        is_eligible_executor=is_eligible_executor,
-                    ),
+                    log_msg,
                     extra=get_extra_info(
                         {
                             **default_extra,
@@ -1164,7 +1109,7 @@ class TaskService:
                     job_score=job_score,
                     log_text=log_text,
                     verified_job_info=verified_job_info,
-                    success=True,
+                    success=success,
                     clear_verified_job_info=False,
                     gpu_model_count=gpu_model_count,
                     gpu_uuids=gpu_uuids,

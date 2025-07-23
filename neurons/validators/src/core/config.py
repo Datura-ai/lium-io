@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     BITTENSOR_NETUID: int = Field(env="BITTENSOR_NETUID", default=51)
     BITTENSOR_CHAIN_ENDPOINT: str | None = Field(env="BITTENSOR_CHAIN_ENDPOINT", default=None)
     BITTENSOR_NETWORK: str = Field(env="BITTENSOR_NETWORK", default="finney")
+    SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
@@ -57,7 +58,7 @@ class Settings(BaseSettings):
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    DEBUG_COLLATERAL_CONTRACT: bool = True
+    DEBUG_COLLATERAL_CONTRACT: bool = False
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
