@@ -225,8 +225,22 @@ class MinerService:
         for result in results:
             try:
                 # Check if the executor has deposited collateral in the contract
-                deposited_amount = await self.collateral_contract_service.collateral_contract.get_executor_collateral(result.executor_info.uuid)
-                is_deposited = deposited_amount is not None
+                try:
+                    deposited_amount = await self.collateral_contract_service.collateral_contract.get_executor_collateral(result.executor_info.uuid)
+                    is_deposited = deposited_amount is not None
+                except Exception as e:
+                    logger.warning(
+                        _m(
+                            "Failed to get executor collateral from contract",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "executor_uuid": result.executor_info.uuid,
+                                "error": str(e)
+                            })
+                        )
+                    )
+                    deposited_amount = None
+                    is_deposited = False
 
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL,
