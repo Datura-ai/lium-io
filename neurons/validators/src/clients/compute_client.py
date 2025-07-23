@@ -263,7 +263,8 @@ class ComputeClient:
                             executor_uuid=data["executor_uuid"],
                             executor_ip=data["executor_ip"],
                             executor_port=data["executor_port"],
-                            executor_price=data["executor_price"]
+                            executor_price=data["executor_price"],
+                            is_deposited=data["is_deposited"]
                         )
 
                         async with self.lock:

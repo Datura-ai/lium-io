@@ -14,7 +14,7 @@ from services.ssh_service import SSHService
 from services.task_service import TaskService, JobResult
 from services.matrix_validation_service import ValidationService
 from services.collateral_contract_service import CollateralContractService
-from services.const import GPU_MODEL_RATES, JOB_TIME_OUT
+from services.const import GPU_MODEL_RATES, JOB_TIME_OUT, IS_NOT_DEPOSITED_SCORE_MULTIPLIER
 
 
 logger = get_logger(__name__)
@@ -137,6 +137,12 @@ class Validator:
         if job_result.sysbox_runtime:
             score = score * (1 + settings.PORTION_FOR_SYSBOX)
 
+        #check if the executor is deposited or undeposited collateral contract
+        #if the executor is not deposited, then it'll get hale of score than deposited
+        deposited_amount = await self.collateral_contract_service.collateral_contract.get_executor_collateral(str(job_result.executor_info.uuid))
+        if deposited_amount is None:
+            score = score * IS_NOT_DEPOSITED_SCORE_MULTIPLIER
+
         logger.info(
             _m(
                 "Debug: calculating score",
@@ -151,6 +157,7 @@ class Validator:
                     "score_portion": score_portion,
                     "score": score,
                     "sysbox_runtime": job_result.sysbox_runtime,
+                    "deposited_amount": deposited_amount,
                 })
             )
         )

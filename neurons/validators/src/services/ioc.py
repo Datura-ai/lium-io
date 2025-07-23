@@ -33,7 +33,8 @@ async def initiate_services():
     ioc["MinerService"] = MinerService(
         ssh_service=ioc["SSHService"],
         task_service=ioc["TaskService"],
-        redis_service=ioc["RedisService"]
+        redis_service=ioc["RedisService"],
+        collateral_contract_service=ioc["CollateralContractService"]
     )
 
 
