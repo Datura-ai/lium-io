@@ -13,6 +13,8 @@ from daos.executor import ExecutorDao
 from models.executor import Executor
 from core.utils import get_collateral_contract, _m
 from core.const import REQUIRED_DEPOSIT_AMOUNT
+from celium_collateral_contracts.address_conversion import h160_to_ss58
+from bittensor.utils.balance import Balance
 
 logging.basicConfig(level=logging.INFO)
 
@@ -172,6 +174,43 @@ class CliService:
                 extra={**self.default_extra, "error": str(e)}
             ))
             return False
+
+    def get_eth_ss58_address(self) -> str:
+        """
+        Get the Ethereum SS58 address for the Bittensor hotkey.
+        :return: Ethereum SS58 address
+        """
+        account = Account.from_key(self.private_key)
+        ss58_address = h160_to_ss58(account.address)
+        return ss58_address
+
+    def transfer_tao_to_eth_address(self, amount: float) -> bool:
+        """
+        Transfer TAO to the Ethereum SS58 address.
+        :param amount: Amount of TAO to transfer
+        :return: True if successful, False otherwise
+        """
+        try:
+            ss58_address = self.get_eth_ss58_address()
+            self.get_node()
+            print(f'Transferring {amount} TAO to Ethereum SS58 address {ss58_address}.')
+            print('Please enter your bittensor wallet password:')
+            self.subtensor.transfer(
+                wallet=self.wallet,
+                dest=ss58_address,
+                amount=Balance.from_tao(amount, self.netuid),
+                wait_for_inclusion=True,
+                wait_for_finalization=True
+            )
+            self.logger.info(_m(
+                "✅ Transferred TAO to Ethereum SS58 address successfully",
+                extra={**self.default_extra, "amount": amount, "to_address": ss58_address}
+            ))
+        except Exception as e:
+            self.logger.error(_m(
+                "❌ Failed to transfer TAO to Ethereum SS58 address",
+                extra={**self.default_extra, "amount": amount, "to_address": ss58_address, "error": str(e)}
+            ))
 
     def get_uid_for_hotkey(self, hotkey):
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
