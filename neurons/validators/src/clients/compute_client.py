@@ -548,7 +548,7 @@ class ComputeClient:
         try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
-            error_msg = f"Invalid message received from celium backend: {str(ex)}"
+            error_msg = f"Invalid message received from backend: {str(ex)}"
             logger.error(
                 _m(
                     error_msg,
