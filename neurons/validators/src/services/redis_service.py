@@ -159,7 +159,7 @@ class RedisService:
         await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
 
     async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
-        data = await self.hget(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+        data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
             return False
 
