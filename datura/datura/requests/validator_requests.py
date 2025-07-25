@@ -40,7 +40,7 @@ class SSHPubKeySubmitRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeySubmitRequest
     public_key: bytes
     executor_id: Optional[str] = None
-    is_rental_request: bool = True
+    is_rental_request: bool = False
 
 
 class SSHPubKeyRemoveRequest(BaseValidatorRequest):
