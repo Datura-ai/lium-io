@@ -56,7 +56,6 @@ class Validator:
             ssh_service=ssh_service,
             task_service=task_service,
             redis_service=self.redis_service,
-            collateral_contract_service=self.collateral_contract_service
         )
 
         # init miner_scores
@@ -138,24 +137,7 @@ class Validator:
         if job_result.sysbox_runtime:
             score = score * (1 + settings.PORTION_FOR_SYSBOX)
 
-        #check if the executor is deposited or undeposited collateral contract
-        #if the executor is not deposited, then it'll get hale of score than deposited
-        try:
-            deposited_amount = await self.collateral_contract_service.collateral_contract.get_executor_collateral(job_result.executor_info.uuid)
-        except Exception as e:
-            logger.warning(
-                _m(
-                    "Failed to get executor collateral from contract",
-                    extra=get_extra_info({
-                        **self.default_extra,
-                        "executor_uuid": job_result.executor_info.uuid,
-                        "error": str(e)
-                    })
-                )
-            )
-            deposited_amount = None
-        
-        if deposited_amount is None:
+        if not job_result.collateral_deposited:
             score = score * IS_NOT_DEPOSITED_SCORE_MULTIPLIER
 
         logger.info(
@@ -172,7 +154,6 @@ class Validator:
                     "score_portion": score_portion,
                     "score": score,
                     "sysbox_runtime": job_result.sysbox_runtime,
-                    "deposited_amount": deposited_amount,
                 })
             )
         )

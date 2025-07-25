@@ -40,7 +40,6 @@ from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService, JobResult
 from services.const import JOB_TIME_OUT
-from services.collateral_contract_service import CollateralContractService
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +53,10 @@ class MinerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
-        collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.redis_service = redis_service
-        self.collateral_contract_service = collateral_contract_service
 
     async def request_job_to_miner(
         self,
@@ -224,24 +221,6 @@ class MinerService:
         )
         for result in results:
             try:
-                # Check if the executor has deposited collateral in the contract
-                try:
-                    deposited_amount = await self.collateral_contract_service.collateral_contract.get_executor_collateral(result.executor_info.uuid)
-                    is_deposited = deposited_amount is not None
-                except Exception as e:
-                    logger.warning(
-                        _m(
-                            "Failed to get executor collateral from contract",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "executor_uuid": result.executor_info.uuid,
-                                "error": str(e)
-                            })
-                        )
-                    )
-                    deposited_amount = None
-                    is_deposited = False
-
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL,
                     {
@@ -257,7 +236,7 @@ class MinerService:
                         "job_batch_id": result.job_batch_id,
                         "log_status": result.log_status,
                         "log_text": result.log_text,
-                        "is_deposited": is_deposited,
+                        "is_deposited": result.collateral_deposited,
                     },
                 )
             except Exception as e:
