@@ -1,8 +1,7 @@
-# Datura Compute Subnet
+# lium.io
+<img width="469" height="468" alt="image" src="https://github.com/user-attachments/assets/69550b83-91a9-492a-bd7a-09d35c6106d3" />
 
-# Compute Subnet on Bittensor
-
-Welcome to the **Compute Subnet on Bittensor**! This project enables a decentralized, peer-to-peer GPU rental marketplace, connecting miners who contribute GPU resources with users who need computational power. Our frontend interface is available at [celiumcompute.ai](https://celiumcompute.ai), where you can easily rent machines from the subnet.
+Welcome to **Lium.io powered by Bittensor Subnet 51**! This project enables a decentralized, peer-to-peer GPU rental marketplace, connecting miners who contribute GPU resources with users who need computational power. Our frontend interface is available at [lium.io](https://lium.io), where you can easily rent machines from the subnet.
 
 ## Table of Contents
 
@@ -24,7 +23,7 @@ The Compute Subnet on Bittensor is a decentralized network that allows miners to
 - **Miners**: Provide GPU resources to the network, evaluated and scored by validators.
 - **Validators**: Securely connect to miner machines to verify hardware specs and performance. They maintain the network's integrity.
 - **Renters**: Rent computational resources from the network to run their tasks.
-- **Frontend (celiumcompute.ai)**: The web interface facilitating easy interaction between miners and renters.
+- **Frontend (lium.io)**: The web interface facilitating easy interaction between miners and renters.
 - **Bittensor Network**: The decentralized blockchain in which the compensation is managed and paid out by the validators to the miners through its native token, $TAO.
 
 ## Getting Started
@@ -33,12 +32,12 @@ The Compute Subnet on Bittensor is a decentralized network that allows miners to
 
 If you are looking to rent computational resources, you can easily do so through the Compute Subnet. Renters can:
 
-1. Visit [celiumcompute.ai](https://celiumcompute.ai) and sign up.
+1. Visit [lium.io](https://lium.io) and sign up.
 2. **Browse** available GPU resources.
 3. **Select** machines based on GPU type, performance, and price.
 4. **Deploy** and monitor your computational tasks using the platform's tools.
 
-To start renting machines, visit [celiumcompute.ai](https://celiumcompute.ai) and access the resources you need.
+To start renting machines, visit [lium.io](https://lium.io) and access the resources you need.
 
 ### For Miners
 
