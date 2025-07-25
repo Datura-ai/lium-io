@@ -1147,6 +1147,7 @@ class TaskService:
                             "gpu_count": gpu_count,
                             "is_rental_succeed": is_rental_succeed,
                             "unrented_multiplier": UNRENTED_MULTIPLIER,
+                            "sysbox_runtime": sysbox_runtime,
                         }
                     ),
                 )
