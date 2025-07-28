@@ -39,9 +39,9 @@ class Settings(BaseSettings):
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
-    COMPUTE_APP_URI: str = "wss://celiumcompute.ai"
+    COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io")
     COMPUTE_REST_API_URL: str | None = Field(
-        env="COMPUTE_REST_API_URL", default="https://celiumcompute.ai/api"
+        env="COMPUTE_REST_API_URL", default="https://lium.io/api"
     )
     TAO_PRICE_API_URL: str = Field(env="TAO_PRICE_API_URL", default="https://api.coingecko.com/api/v3/coins/bittensor")
     COLLATERAL_DAYS: int = Field(env="COLLATERAL_DAYS", default=1)
@@ -58,7 +58,7 @@ class Settings(BaseSettings):
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    DEBUG_COLLATERAL_CONTRACT: bool = True
+    DEBUG_COLLATERAL_CONTRACT: bool = False
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
