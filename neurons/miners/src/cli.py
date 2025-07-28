@@ -22,12 +22,33 @@ def associate_eth(private_key: str):
         logger.info("✅ Successfully associated ethereum address with hotkey")
     else:
         logger.error("❌ Failed to associate ethereum address with hotkey")
-        
+
+
 @cli.command()
 def get_associated_evm_address():
     """Get the associated EVM address for the Bittensor hotkey."""
     cli_service = CliService()
     cli_service.get_associated_evm_address()
+
+
+@cli.command()
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def get_eth_ss58_address(private_key: str):
+    """Associate a miner's ethereum address with their hotkey."""
+    cli_service = CliService(private_key=private_key)
+    ss58_address = cli_service.get_eth_ss58_address()
+    print(ss58_address)
+
+
+@cli.command()
+@click.option(
+    "--amount", type=float, required=False, help="Amount of TAO to transfer"
+)
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def transfer_tao_to_eth_address(private_key: str, amount: float):
+    """Associate a miner's ethereum address with their hotkey."""
+    cli_service = CliService(private_key=private_key)
+    cli_service.transfer_tao_to_eth_address(amount)
 
 
 @cli.command()
