@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     MIN_TOTAL_STAKE: int = Field(env="MIN_TOTAL_STAKE", default=20000)
 
     REQUIRED_TAO_COLLATERAL: float = 0.01
+    RENTAL_REQUEST_HOOK: str | None = Field(env="RENTAL_REQUEST_HOOK", default=None)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
