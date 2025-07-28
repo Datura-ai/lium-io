@@ -1124,6 +1124,7 @@ class TaskService:
 
                 if not collateral_deposited and not settings.DEBUG_COLLATERAL_CONTRACT:
                     actual_score = 0
+                    job_score = 0
                     log_msg = "Train task is finished. But not eligible from collateral contract."
                 elif len(port_maps) < MIN_PORT_COUNT:
                     actual_score = 0
