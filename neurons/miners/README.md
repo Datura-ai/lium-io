@@ -61,6 +61,8 @@ Fill in your information for:
 
 `EXTERNAL_IP_ADDRESS`: The external IP address of your central miner server. Make sure it is open to external connections on the `EXTERNAL PORT`
 
+`RENTAL_REQUEST_HOOK`: The URL for the call hook. Miners will terminate chute programs within seconds using this hook.
+
 `HOST_WALLET_DIR`: The directory path of your wallet on the machine.
 
 `INTERNAL_PORT` and `EXTERNAL_PORT`: Optionally customize these ports. Make sure the `EXTERNAL PORT` is open for external connections to connect to the validators.
