@@ -50,7 +50,7 @@ class JobResult(BaseModel):
     executor_info: ExecutorSSHInfo
     score: float
     job_score: float
-    collateral_deposited: bool
+    collateral_deposited: bool = False
     job_batch_id: str
     log_status: str
     log_text: str
