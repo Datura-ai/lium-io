@@ -236,6 +236,7 @@ class MinerService:
                         "job_batch_id": result.job_batch_id,
                         "log_status": result.log_status,
                         "log_text": result.log_text,
+                        "collateral_deposited": result.collateral_deposited,
                     },
                 )
             except Exception as e:

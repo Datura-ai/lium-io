@@ -14,7 +14,7 @@ from services.ssh_service import SSHService
 from services.task_service import TaskService, JobResult
 from services.matrix_validation_service import ValidationService
 from services.collateral_contract_service import CollateralContractService
-from services.const import GPU_MODEL_RATES, JOB_TIME_OUT
+from services.const import GPU_MODEL_RATES, JOB_TIME_OUT, IS_NOT_DEPOSITED_SCORE_MULTIPLIER
 
 
 logger = get_logger(__name__)
@@ -136,6 +136,9 @@ class Validator:
 
         if job_result.sysbox_runtime:
             score = score * (1 + settings.PORTION_FOR_SYSBOX)
+
+        if not job_result.collateral_deposited:
+            score = score * IS_NOT_DEPOSITED_SCORE_MULTIPLIER
 
         logger.info(
             _m(
