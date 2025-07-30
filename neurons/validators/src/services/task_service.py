@@ -1131,7 +1131,11 @@ class TaskService:
                 actual_score = 1
                 log_msg = "Train task is finished."
 
-                if len(port_maps) < MIN_PORT_COUNT:
+                if not collateral_deposited and not settings.DEBUG_COLLATERAL_CONTRACT:
+                    actual_score = 0
+                    job_score = 0
+                    log_msg = "Train task is finished. But not eligible from collateral contract."
+                elif len(port_maps) < MIN_PORT_COUNT:
                     actual_score = 0
                     log_msg = f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}."
                 elif not is_rental_succeed:

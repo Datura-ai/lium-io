@@ -315,9 +315,14 @@ class MinerService:
             async with miner_client:
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+                
                 await miner_client.send_model(
-                    SSHPubKeySubmitRequest(public_key=public_key, executor_id=payload.executor_id)
-                )
+                    SSHPubKeySubmitRequest(
+                        public_key=public_key,
+                        executor_id=payload.executor_id,
+                        is_rental_request=isinstance(payload, ContainerCreateRequest),
+                    )
+                 )
 
                 logger.info(
                     _m("Sent SSH key to miner.", extra=get_extra_info(default_extra)),
