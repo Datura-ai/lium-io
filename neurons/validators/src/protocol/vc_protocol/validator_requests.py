@@ -65,7 +65,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     log_text: str | None
     log_status: str | None
     job_batch_id: str
-    is_deposited: bool
+    collateral_deposited: bool
 
 
 class RentedMachineRequest(BaseValidatorRequest):

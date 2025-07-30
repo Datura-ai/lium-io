@@ -1007,10 +1007,17 @@ class TaskService:
                     actual_score = 1
                     log_msg = "Executor is already rented."
 
-                    if not is_rental_succeed:
+                    if not collateral_deposited and settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
+                        job_score = 1
+                        actual_score = 0
+                        log_msg = "Executor is rented. But not eligible from collateral contract."
+                    elif not is_rental_succeed:
                         job_score = 1
                         actual_score = 0
                         log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
+                    elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
+                        log_msg = "Executor is rented. But not eligible from collateral contract. Will not have score very soon."
+                    
 
                     log_text = _m(
                         log_msg,
@@ -1131,7 +1138,7 @@ class TaskService:
                 actual_score = 1
                 log_msg = "Train task is finished."
 
-                if not collateral_deposited and not settings.DEBUG_COLLATERAL_CONTRACT:
+                if not collateral_deposited and settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
                     actual_score = 0
                     job_score = 0
                     log_msg = "Train task is finished. But not eligible from collateral contract."
@@ -1141,6 +1148,8 @@ class TaskService:
                 elif not is_rental_succeed:
                     actual_score = 0
                     log_msg = "Train task is finished. Set score 0 until it's verified by rental check"
+                elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
+                    log_msg = "Train task is finished. But not eligible from collateral contract. Will not have score very soon."
 
                 success = True if actual_score > 0 else False
 
