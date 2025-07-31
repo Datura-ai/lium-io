@@ -212,6 +212,11 @@ class CliService:
                 extra={**self.default_extra, "amount": amount, "to_address": ss58_address, "error": str(e)}
             ))
 
+    async def get_balance_of_eth_address(self) -> str:
+        balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
+        self.logger.info(f"Balance of Eth address: {balance} TAO")
+        return balance
+
     def get_uid_for_hotkey(self, hotkey):
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
         return metagraph.hotkeys.index(hotkey)

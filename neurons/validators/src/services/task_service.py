@@ -409,7 +409,7 @@ class TaskService:
                 logger.info(log_text)
 
                 if sysbox_runtime:
-                    command = f"/usr/bin/docker pull hello-world"
+                    command = f"docker pull hello-world"
                     result = await ssh_client.run(command)
                     if result.exit_status != 0:
                         error_message = result.stderr.strip() if result.stderr else "No error message available"
