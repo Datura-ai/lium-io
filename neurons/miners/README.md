@@ -121,7 +121,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-eth-ss58
 
 ### Get Balance of Ethereum Address
 ```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-balance-of-evm-address --private-key <ethereum-private-key>
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-balance-of-eth-address --private-key <ethereum-private-key>
 ```
 
 - `<ethereum-private-key>`: Your Ethereum private key that is used for association.
