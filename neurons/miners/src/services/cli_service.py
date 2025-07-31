@@ -212,6 +212,15 @@ class CliService:
                 extra={**self.default_extra, "amount": amount, "to_address": ss58_address, "error": str(e)}
             ))
 
+    async def get_balance_of_evm_address(self) -> str:
+        """
+        Get the Ethereum SS58 address for the Bittensor hotkey.
+        :return: Ethereum SS58 address
+        """
+        balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
+        self.logger.info(f"Balance of EVM address: {balance} TAO")
+        return balance
+
     def get_uid_for_hotkey(self, hotkey):
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
         return metagraph.hotkeys.index(hotkey)

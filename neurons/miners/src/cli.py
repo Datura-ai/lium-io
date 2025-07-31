@@ -52,6 +52,14 @@ def transfer_tao_to_eth_address(private_key: str, amount: float):
 
 
 @cli.command()
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def get_balance_of_evm_address(private_key: str):
+    """Get the balance of the EVM address for the Bittensor hotkey."""
+    cli_service = CliService(private_key=private_key)
+    asyncio.run(cli_service.get_balance_of_evm_address())
+
+
+@cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 @click.option(
