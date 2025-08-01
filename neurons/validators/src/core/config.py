@@ -44,7 +44,7 @@ class Settings(BaseSettings):
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
     )
     TAO_PRICE_API_URL: str = Field(env="TAO_PRICE_API_URL", default="https://api.coingecko.com/api/v3/coins/bittensor")
-    COLLATERAL_DAYS: int = Field(env="COLLATERAL_DAYS", default=1)
+    COLLATERAL_DAYS: int = 14
     ENV: str = Field(env="ENV", default="dev")
 
     PORTION_FOR_UPTIME: float = 0.05
