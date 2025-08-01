@@ -4,7 +4,7 @@ JOB_TIME_OUT = 60 * 10
 
 GPU_MODEL_RATES = {
     "NVIDIA B200": .05,
-    "NVIDIA H200": .55,
+    "NVIDIA H200": .56,
     "NVIDIA H100 80GB HBM3": .10,
     "NVIDIA H100 NVL": .01,
     "NVIDIA H100 PCIe": .01,
@@ -14,20 +14,20 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce RTX 5090": 0.025,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
-    "NVIDIA RTX 4000 Ada Generation": 0.005,
+    # "NVIDIA RTX 4000 Ada Generation": 0.005,
     "NVIDIA RTX 6000 Ada Generation": 0.01,
     "NVIDIA L4": 0.01,
     "NVIDIA L40S": 0.01,
     "NVIDIA L40": 0.01,
-    "NVIDIA RTX 2000 Ada Generation": 0.001,
+    # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     "NVIDIA A100-SXM4-80GB": 0.05,
     "NVIDIA RTX A6000": 0.009,
     "NVIDIA RTX A5000": 0.002,
     "NVIDIA RTX A4500": 0.002,
     "NVIDIA RTX A4000": 0.002,
-    "NVIDIA A40": 0.002,
-    "NVIDIA A30": 0.002,
+    # "NVIDIA A40": 0.002,
+    # "NVIDIA A30": 0.002,
     "NVIDIA GeForce RTX 3090": 0.02,
 }
 
@@ -44,20 +44,20 @@ REQUIRED_DEPOSIT_AMOUNT = {
     'NVIDIA GeForce RTX 5090': 0.014,
     'NVIDIA GeForce RTX 4090': 0.010,
     'NVIDIA GeForce RTX 4090 D': 0.008,
-    'NVIDIA RTX 4000 Ada Generation': 0.009,
+    # 'NVIDIA RTX 4000 Ada Generation': 0.009,
     'NVIDIA RTX 6000 Ada Generation': 0.017,
     'NVIDIA L4': 0.008,
     'NVIDIA L40S': 0.027,
     'NVIDIA L40': 0.024,
-    'NVIDIA RTX 2000 Ada Generation': 0.005,
+    # 'NVIDIA RTX 2000 Ada Generation': 0.005,
     'NVIDIA A100 80GB PCIe': 0.027,
     'NVIDIA A100-SXM4-80GB': 0.031,
     'NVIDIA RTX A6000': 0.018,
     'NVIDIA RTX A5000': 0.009,
     'NVIDIA RTX A4500': 0.008,
     'NVIDIA RTX A4000': 0.008,
-    'NVIDIA A40': 0.008,
-    'NVIDIA A30': 0.005,
+    # 'NVIDIA A40': 0.008,
+    # 'NVIDIA A30': 0.005,
     'NVIDIA GeForce RTX 3090': 0.008
 }
 
@@ -82,6 +82,7 @@ VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 TOTAL_BURN_EMISSION = 0.8
 BURNER_EMISSION = 0.01
 
+IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
 DOCKER_DIND_IMAGE = "daturaai/dind:0.0.0"
 
 HASHCAT_CONFIGS = {

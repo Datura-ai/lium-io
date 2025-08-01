@@ -51,14 +51,15 @@ class Settings(BaseSettings):
 
     PORTION_FOR_SYSBOX: float = 0.2
 
-    TIME_DELTA_FOR_EMISSION: float = 0.5
+    TIME_DELTA_FOR_EMISSION: float = 0.01
 
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    DEBUG_COLLATERAL_CONTRACT: bool = False
+    ENABLE_COLLATERAL_CONTRACT: bool = True
+    ENABLE_NEW_INCENTIVE_ALGO: bool = False
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
@@ -127,6 +128,7 @@ class Settings(BaseSettings):
         miner.axon_info         = type("AxonInfo", (object,), {})()
         miner.axon_info.ip      = self.DEBUG_MINER_ADDRESS
         miner.axon_info.port    = self.DEBUG_MINER_PORT
+        miner.axon_info.is_serving = True
         return miner
 
 

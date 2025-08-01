@@ -53,7 +53,6 @@ from websockets.asyncio.client import ClientConnection
 from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
-from services.const import GPU_MODEL_RATES
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
@@ -263,7 +262,8 @@ class ComputeClient:
                             executor_uuid=data["executor_uuid"],
                             executor_ip=data["executor_ip"],
                             executor_port=data["executor_port"],
-                            executor_price=data["executor_price"]
+                            executor_price=data["executor_price"],
+                            collateral_deposited=data["collateral_deposited"],
                         )
 
                         async with self.lock:
@@ -400,7 +400,7 @@ class ComputeClient:
                 )
                 self.message_queue.append(RevenuePerGpuTypeRequest())
 
-            await asyncio.sleep(60 * 60)  # poll every hour
+            await asyncio.sleep(10 * 60)  # poll every 10 mins
 
     async def get_executors_uptime(self):
         """Get executors uptime from compute app."""
@@ -536,10 +536,10 @@ class ComputeClient:
             portions = {}
             redis_service = self.miner_service.redis_service
             for gpu_type, revenue in response.revenues.items():
-                gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
-                portion = gpu_model_rate + settings.TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
+                prev_portion = await redis_service.get_portion_per_gpu_type(gpu_type)
+                portion = prev_portion + settings.TIME_DELTA_FOR_EMISSION * (revenue - prev_portion)
                 portions[gpu_type] = portion
-                await redis_service.set_revenue_per_gpu_type(gpu_type, revenue)
+                await redis_service.set_portion_per_gpu_type(gpu_type, portion)
 
             async with self.lock:
                 self.message_queue.append(ScorePortionPerGpuTypeRequest(portions=portions))

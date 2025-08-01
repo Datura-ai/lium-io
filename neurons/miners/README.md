@@ -74,7 +74,9 @@ Fill in your information for:
 cd neurons/miners && docker compose up -d
 ```
 
-### Associating Your Ethereum Address
+## Managing Ethereum Address
+
+### Associating Your Ethereum Address into Subnet
 
 Before managing executors, you need to associate your Ethereum address with your Bittensor hotkey. This is a one-time setup requirement. Use the following command:
 
@@ -84,13 +86,46 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py associate-et
 
 - `<ethereum-private-key>`: Your Ethereum private key that will be associated with your Bittensor hotkey.
 
-You will be prompted to enter your Bittensor wallet password to complete the association.
-
 ### Get the associated Ethereum Address
 
 ```bash
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-associated-evm-address
 ```
+
+### Transfer TAO to Ethereum Address from your Miner Wallet
+
+You need to fund/transfer TAO into your Ethereum Address to deposit collateral (TAO) for your executors.
+
+To transfer TAO from your miner wallet (the wallet in your env config), you can use the following command 
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py transfer-tao-to-eth-address --amount <tao-amount> --private-key <ethereum-private-key>
+```
+- `<tao-amount>`: TAO amount you are going to transfer.
+- `<ethereum-private-key>`: Your Ethereum private key that is used for association.
+
+You will be prompted to enter your Bittensor wallet password to proceed the transfer.
+
+### Convert Ethereum Address to SS58 format
+You can transfer TAO to the Ethereum Address manually with btcli.
+
+To do so, you need to have SS58 format address of your Ethereum Address.
+
+You can transfer TAO to this address from any wallet.
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-eth-ss58-address --private-key <ethereum-private-key>
+```
+
+- `<ethereum-private-key>`: Your Ethereum private key that is used for association.
+
+### Get Balance of Ethereum Address
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-balance-of-eth-address --private-key <ethereum-private-key>
+```
+
+- `<ethereum-private-key>`: Your Ethereum private key that is used for association.
+
 
 ## Managing Executors
 
