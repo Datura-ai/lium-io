@@ -22,6 +22,7 @@ VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
+BANNED_GUIDS = "banned_guids"
 PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
 
 logger = logging.getLogger(__name__)
@@ -269,3 +270,28 @@ class RedisService:
             return gpu_model_rate + PREV_TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
 
         return float(portion)
+
+    async def set_portion_per_gpu_type(self, gpu_type: str, portion: float):
+        await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
+
+    async def get_portion_per_gpu_type(self, gpu_type: str):
+        portion = await self.hget(PORTION_PER_GPU_TYPE_SET, gpu_type)
+        if not portion:
+            gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
+            if gpu_model_rate == 0:
+                return 0.0
+
+            # for initial portion
+            revenue = await self.get_revenue_per_gpu_type(gpu_type)
+            return gpu_model_rate + PREV_TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
+
+        return float(portion)
+
+    async def set_banned_guids(self, guids: list[str]):
+        await self.redis.set(BANNED_GUIDS, json.dumps(guids))
+
+    async def get_banned_guids(self) -> list[str]:
+        data = await self.redis.get(BANNED_GUIDS)
+        if not data:
+            return []
+        return json.loads(data)

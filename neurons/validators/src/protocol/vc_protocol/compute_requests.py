@@ -27,6 +27,7 @@ class RentedMachine(BaseModel):
 
 class RentedMachineResponse(BaseModel):
     machines: list[RentedMachine]
+    banned_guids: list[str] = []
 
 
 class ExecutorUptimeResponse(BaseModel):

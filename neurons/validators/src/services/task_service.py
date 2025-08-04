@@ -167,6 +167,10 @@ class TaskService:
         except Exception as e:
             logger.error(f"Error checking fingerprints changed: {e}")
             return False
+        
+    async def check_banned_guids(self, guids: list[str]):
+        banned_guids = await self.redis_service.get_banned_guids()
+        return any(guid in banned_guids for guid in guids)
 
     def get_available_port_maps(
         self,
@@ -896,6 +900,30 @@ class TaskService:
                         score=0,
                         job_score=0,
                         collateral_deposited=collateral_deposited,
+                        log_text=log_text,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        clear_verified_job_info=True,
+                    )
+                
+                if await self.check_banned_guids(gpu_uuids.split(',')):
+                    log_text = _m(
+                        "Your GPUs are banned due to low rental-rate in the site.",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "prev_uuids": prev_uuids,
+                                "gpu_uuids": gpu_uuids,
+                            }
+                        ),
+                    )
+
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        spec=machine_spec,
+                        score=0,
+                        job_score=0,
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=False,
