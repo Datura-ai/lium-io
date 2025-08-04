@@ -279,7 +279,7 @@ class CliService:
             if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
                 self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
                 return False
-            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
+            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type] * settings.COLLATERAL_DAYS
             if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
                 deposit_amount = settings.REQUIRED_TAO_COLLATERAL
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
@@ -326,7 +326,7 @@ class CliService:
             if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
                 self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
                 return False
-            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
+            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type] * settings.COLLATERAL_DAYS
             if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
                 deposit_amount = settings.REQUIRED_TAO_COLLATERAL
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
