@@ -101,7 +101,7 @@ class CollateralContractService:
         if unit_tao_amount is None:
             return None
         required_deposit_amount = unit_tao_amount * gpu_count * settings.COLLATERAL_DAYS
-        return float(required_deposit_amount)
+        return round(required_deposit_amount, 6)
 
     def _log_error(self, message: str, extra: Dict[str, Any], exc_info: bool = False, **kwargs):
         full_extra = get_extra_info({**extra, **kwargs})
