@@ -45,7 +45,7 @@ docker --version
 ```
 
 If one of them isn't installed properly, install using following link:     
-For bittensor, use [This Link](https://github.com/opentensor/bittensor/blob/master/README.md#install-bittensor-sdk)
+For bittensor, use [This Link](https://github.com/opentensor/bittensor/blob/master/README.md#install-bittensor-sdk) \
 For docker, use [This Link](https://docs.docker.com/engine/install/)
 
 #### Step 3: Setup ENV
@@ -61,7 +61,7 @@ Fill in your information for:
 
 `EXTERNAL_IP_ADDRESS`: The external IP address of your central miner server. Make sure it is open to external connections on the `EXTERNAL PORT`
 
-`RENTAL_REQUEST_HOOK`: The URL for the call hook. Miners will terminate chute programs within seconds using this hook.
+`RENTAL_REQUEST_HOOK`: (Optional) The URL for the call hook. Miners will terminate chute programs within seconds using this hook.
 
 `HOST_WALLET_DIR`: The directory path of your wallet on the machine.
 
