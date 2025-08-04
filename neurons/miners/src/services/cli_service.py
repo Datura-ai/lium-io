@@ -542,7 +542,7 @@ class CliService:
             self.logger.error("Failed in removing an executor: %s", str(e))
             return False
 
-    def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> Optional[float]:
+    def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> float:
         # Handle missing GPU model gracefully
         unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT.get(gpu_type)
         if unit_tao_amount is None:
