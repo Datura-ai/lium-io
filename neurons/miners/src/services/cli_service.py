@@ -279,7 +279,7 @@ class CliService:
             if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
                 self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
                 return False
-            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type] * settings.COLLATERAL_DAYS
+            deposit_amount = self._get_required_deposit_amount(gpu_type, gpu_count)
             if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
                 deposit_amount = settings.REQUIRED_TAO_COLLATERAL
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
@@ -326,7 +326,7 @@ class CliService:
             if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
                 self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
                 return False
-            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type] * settings.COLLATERAL_DAYS
+            deposit_amount = self._get_required_deposit_amount(gpu_type, gpu_count)
             if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
                 deposit_amount = settings.REQUIRED_TAO_COLLATERAL
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
@@ -541,3 +541,12 @@ class CliService:
         except Exception as e:
             self.logger.error("Failed in removing an executor: %s", str(e))
             return False
+
+    def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> Optional[float]:
+        # Handle missing GPU model gracefully
+        unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT.get(gpu_type)
+        if unit_tao_amount is None:
+            raise ValueError(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
+
+        required_deposit_amount = unit_tao_amount * gpu_count * settings.COLLATERAL_DAYS
+        return round(required_deposit_amount, 6)
