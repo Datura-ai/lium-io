@@ -271,22 +271,6 @@ class RedisService:
 
         return float(portion)
 
-    async def set_portion_per_gpu_type(self, gpu_type: str, portion: float):
-        await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
-
-    async def get_portion_per_gpu_type(self, gpu_type: str):
-        portion = await self.hget(PORTION_PER_GPU_TYPE_SET, gpu_type)
-        if not portion:
-            gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
-            if gpu_model_rate == 0:
-                return 0.0
-
-            # for initial portion
-            revenue = await self.get_revenue_per_gpu_type(gpu_type)
-            return gpu_model_rate + PREV_TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
-
-        return float(portion)
-
     async def set_banned_guids(self, guids: list[str]):
         await self.redis.set(BANNED_GUIDS, json.dumps(guids))
 
