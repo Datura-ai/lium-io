@@ -924,6 +924,7 @@ class TaskService:
                         spec=machine_spec,
                         score=0,
                         job_score=0,
+                        collateral_deposited=collateral_deposited,
                         log_text=log_text,
                         verified_job_info=verified_job_info,
                         success=False,
