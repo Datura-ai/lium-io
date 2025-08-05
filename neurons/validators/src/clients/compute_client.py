@@ -461,7 +461,7 @@ class ComputeClient:
             return
 
         try:
-            response = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
+            response: RentedMachineResponse = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
         else:
@@ -470,7 +470,8 @@ class ComputeClient:
                     "Rented machines",
                     extra=get_extra_info({
                         **self.logging_extra,
-                        "machines": len(response.machines)
+                        "machines": len(response.machines),
+                        "banned_guids": len(response.banned_guids)
                     }),
                 )
             )
@@ -478,6 +479,7 @@ class ComputeClient:
             await redis_service.delete(RENTED_MACHINE_PREFIX)
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
+            await redis_service.set_banned_guids(response.banned_guids)
             return
 
         try:
