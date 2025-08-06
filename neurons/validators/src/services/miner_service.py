@@ -728,9 +728,8 @@ class MinerService:
             log_text = _m(
                 "Resulted in an exception",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
-                exc_info=True,
             )
-            logger.error(log_text)
+            logger.error(log_text, exc_info=True)
 
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,

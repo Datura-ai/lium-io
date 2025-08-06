@@ -33,7 +33,7 @@ class RentedMachineResponse(BaseModel):
 class ExecutorUptimeResponse(BaseModel):
     executor_ip_address: str
     executor_ip_port: str
-    uptime_in_minutes: int
+    uptime_in_minutes: int | None = None
 
 
 class RevenuePerGpuTypeResponse(BaseModel):
