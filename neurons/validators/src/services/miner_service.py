@@ -31,6 +31,9 @@ from payload_models.payloads import (
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
     FailedGetPodLogs,
+    AddDebugSshKeyRequest,
+    DebugSshKeyAdded,
+    FailedAddDebugSshKey,
 )
 
 from core.config import settings
@@ -315,14 +318,14 @@ class MinerService:
             async with miner_client:
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
-                
+
                 await miner_client.send_model(
                     SSHPubKeySubmitRequest(
                         public_key=public_key,
                         executor_id=payload.executor_id,
                         is_rental_request=isinstance(payload, ContainerCreateRequest),
                     )
-                 )
+                )
 
                 logger.info(
                     _m("Sent SSH key to miner.", extra=get_extra_info(default_extra)),
@@ -621,6 +624,117 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
+                msg=str(log_text),
+            )
+
+    async def add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
+        loop = asyncio.get_event_loop()
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_id": payload.executor_id,
+            "executor_ip": payload.miner_address,
+            "executor_port": payload.miner_port,
+        }
+
+        try:
+            miner_client = MinerClient(
+                loop=loop,
+                miner_address=payload.miner_address,
+                miner_port=payload.miner_port,
+                miner_hotkey=payload.miner_hotkey,
+                my_hotkey=my_key.ss58_address,
+                keypair=my_key,
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
+            )
+
+            async with miner_client:
+                await miner_client.send_model(
+                    SSHPubKeySubmitRequest(
+                        public_key=payload.public_key,
+                        executor_id=payload.executor_id,
+                        is_rental_request=False,
+                    )
+                )
+
+                logger.info(
+                    _m("Sent SSH key to miner.", extra=get_extra_info(default_extra)),
+                )
+
+                msg = await asyncio.wait_for(
+                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future,
+                    timeout=JOB_LENGTH,
+                )
+
+                if isinstance(msg, AcceptSSHKeyRequest):
+                    logger.info(
+                        _m(
+                            "Received AcceptSSHKeyRequest",
+                            extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                        ),
+                    )
+
+                    try:
+                        executor = msg.executors[0]
+                    except Exception as e:
+                        executor = None
+
+                    if executor is None or executor.uuid != payload.executor_id:
+                        log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+                        logger.error(log_text)
+
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=payload.public_key, executor_id=payload.executor_id
+                            )
+                        )
+
+                        return FailedAddDebugSshKey(
+                            miner_hotkey=payload.miner_hotkey,
+                            executor_id=payload.executor_id,
+                            msg=str(log_text),
+                        )
+
+                    logger.info(
+                        _m(
+                            "Added debug public key",
+                            extra=get_extra_info(default_extra),
+                        ),
+                    )
+
+                    return DebugSshKeyAdded(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        address=executor.address,
+                        port=executor.port,
+                        ssh_username=executor.ssh_username,
+                        ssh_port=executor.ssh_port,
+                    )
+
+                else:
+                    log_text = _m(
+                        "Error: Failed to add debug public key",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                    )
+                    logger.error(log_text)
+
+                    return FailedAddDebugSshKey(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        msg=str(log_text),
+                    )
+
+        except Exception as e:
+            log_text = _m(
+                "Resulted in an exception",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+                exc_info=True,
+            )
+            logger.error(log_text)
+
+            return FailedAddDebugSshKey(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
                 msg=str(log_text),
             )
 
