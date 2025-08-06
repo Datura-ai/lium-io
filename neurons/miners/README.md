@@ -162,6 +162,18 @@ To list added executors from the central miner, follow these steps:
     docker exec -it <docker instance> pdm run /root/app/src/cli.py show-executors
     ```
 
+### Switch validator
+
+To switch validator you can use the following command
+
+```bash
+docker exec -it <docker instance> pdm run /root/app/src/cli.py switch-validator --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey>
+```
+
+- `<executor-ip-address>`: The IP address of the executor machine.
+- `<executor-port>`: The port number used for the executor.
+- `<validator-hotkey>`: The validator hotkey you want to switch
+
 ### Removing an Executor
 
 To remove an executor from the central miner, follow these steps:
