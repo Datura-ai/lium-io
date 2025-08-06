@@ -28,6 +28,9 @@ from payload_models.payloads import (
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
     FailedGetPodLogs,
+    AddDebugSshKeyRequest,
+    DebugSshKeyAdded,
+    FailedAddDebugSshKey,
 )
 from protocol.vc_protocol.compute_requests import (
     Error,
@@ -575,6 +578,7 @@ class ComputeClient:
         | AddSshPublicKeyRequest
         | ExecutorRentFinishedRequest
         | GetPodLogsRequestFromServer
+        | AddDebugSshKeyRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -698,6 +702,13 @@ class ComputeClient:
             response: (
                 PodLogsResponseToServer | FailedGetPodLogs
             ) = await self.miner_service.get_pod_logs(job_request)
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, AddDebugSshKeyRequest):
+            response: (
+                DebugSshKeyAdded | FailedAddDebugSshKey
+            ) = await self.miner_service.add_debug_public_key(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)

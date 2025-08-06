@@ -58,6 +58,7 @@ class ContainerRequestType(enum.Enum):
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
     ExecutorRentFinished = "ExecutorRentFinished"
     GetPodLogsRequestFromServer = "GetPodLogsRequestFromServer"
+    AddDebugSshKeyRequest = "AddDebugSshKeyRequest"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -103,6 +104,11 @@ class AddSshPublicKeyRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
 
 
+class AddDebugSshKeyRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.AddDebugSshKeyRequest
+    public_key: str
+
+
 class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
@@ -128,6 +134,8 @@ class ContainerResponseType(enum.Enum):
     FailedRequest = "FailedRequest"
     PodLogsResponseToServer = "PodLogsResponseToServer"
     FailedGetPodLogs = "FailedGetPodLogs"
+    DebugSshKeyAdded = "DebugSshKeyAdded"
+    FailedAddDebugSshKey = "FailedAddDebugSshKey"
 
 
 class ContainerBaseResponse(BaseRequest):
@@ -163,6 +171,14 @@ class ContainerDeleted(ContainerBaseResponse):
 class SshPubKeyAdded(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
     user_public_keys: list[str] = []
+
+
+class DebugSshKeyAdded(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.DebugSshKeyAdded
+    address: str
+    port: int
+    ssh_username: str
+    ssh_port: int
 
 
 class FailedContainerErrorCodes(enum.Enum):
@@ -207,4 +223,9 @@ class PodLogsResponseToServer(ContainerBaseResponse):
 class FailedGetPodLogs(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedGetPodLogs
     container_name: str
+    msg: str
+
+
+class FailedAddDebugSshKey(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.FailedAddDebugSshKey
     msg: str
