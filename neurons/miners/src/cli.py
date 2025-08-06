@@ -166,6 +166,22 @@ def show_executors():
 
 
 @cli.command()
+@click.option("--address", prompt="IP Address", help="IP address of executor")
+@click.option("--port", type=int, prompt="Port", help="Port of executor")
+@click.option(
+    "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
+)
+def switch_validator(address: str, port: int, validator: str):
+    """Switch validator"""
+    if click.confirm('Are you sure you want to switch validator? This may lead to unexpected results'):
+        logger.info("Switching validator(%s) of an executor (%s:%d)", validator, address, port)
+        cli_service = CliService(with_executor_db=True)
+        asyncio.run(cli_service.switch_validator(address, port, validator))
+    else:
+        logger.info("Cancelled.")
+
+
+@cli.command()
 def get_miner_collateral():
     """Get miner collateral by summing up collateral from all registered executors"""
     cli_service = CliService(with_executor_db=True)
