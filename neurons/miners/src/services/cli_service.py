@@ -527,6 +527,23 @@ class CliService:
             return False
 
     @require_executor_dao
+    async def switch_validator(self, address: str, port: int, validator: str):
+        """
+        Switch validator for an executor by address and port.
+        :param address: Executor IP address
+        :param port: Executor port
+        :param validator: Validator hotkey
+        :return: True if successful, False otherwise
+        """
+        try:
+            self.executor_dao.update(Executor(uuid=uuid.uuid4(), address=address, port=port, validator=validator))
+            self.logger.info(f"✅ Successfully switched validator for executor {address}:{port} to {validator}")
+            return True
+        except Exception as e:
+            self.logger.error("Failed in switching validator: %s", str(e))
+            return False
+
+    @require_executor_dao
     async def remove_executor(self, address: str, port: int):
         """
         Remove an executor from the database by address and port.

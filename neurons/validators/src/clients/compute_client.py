@@ -28,6 +28,9 @@ from payload_models.payloads import (
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
     FailedGetPodLogs,
+    AddDebugSshKeyRequest,
+    DebugSshKeyAdded,
+    FailedAddDebugSshKey,
 )
 from protocol.vc_protocol.compute_requests import (
     Error,
@@ -461,7 +464,7 @@ class ComputeClient:
             return
 
         try:
-            response = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
+            response: RentedMachineResponse = pydantic.TypeAdapter(RentedMachineResponse).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
         else:
@@ -470,7 +473,8 @@ class ComputeClient:
                     "Rented machines",
                     extra=get_extra_info({
                         **self.logging_extra,
-                        "machines": len(response.machines)
+                        "machines": len(response.machines),
+                        "banned_guids": len(response.banned_guids)
                     }),
                 )
             )
@@ -478,6 +482,7 @@ class ComputeClient:
             await redis_service.delete(RENTED_MACHINE_PREFIX)
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
+            await redis_service.set_banned_guids(response.banned_guids)
             return
 
         try:
@@ -573,6 +578,7 @@ class ComputeClient:
         | AddSshPublicKeyRequest
         | ExecutorRentFinishedRequest
         | GetPodLogsRequestFromServer
+        | AddDebugSshKeyRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -696,6 +702,13 @@ class ComputeClient:
             response: (
                 PodLogsResponseToServer | FailedGetPodLogs
             ) = await self.miner_service.get_pod_logs(job_request)
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, AddDebugSshKeyRequest):
+            response: (
+                DebugSshKeyAdded | FailedAddDebugSshKey
+            ) = await self.miner_service.add_debug_public_key(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)
