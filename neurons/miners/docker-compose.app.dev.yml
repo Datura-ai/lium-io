@@ -25,5 +25,16 @@ services:
     depends_on:
       - db
 
+  connector:
+    image: daturaai/compute-subnet-miner:dev
+    env_file: ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    command: pdm run src/connector.py
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    depends_on:
+      - db
+
 volumes:
   db_data:
