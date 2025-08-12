@@ -1,0 +1,159 @@
+import asyncio
+import json
+import logging
+from typing import NoReturn
+
+import pydantic
+import tenacity
+import websockets
+from datura.requests.base import BaseRequest
+
+from pydantic import BaseModel
+from websockets.asyncio.client import ClientConnection
+
+from core.config import settings
+from core.utils import _m, get_extra_info
+
+from protocol.miner_request import (
+    AuthenticateRequest,
+)
+from protocol.miner_portal_request import (
+    Response,
+    AuthenticationError,
+)
+
+logger = logging.getLogger(__name__)
+
+CONNECT_INTERVAL = 1
+
+
+class MinerPortalClient:
+    HEARTBEAT_PERIOD = 60
+
+    def __init__(
+        self,
+    ):
+        self.keypair = settings.get_bittensor_wallet().get_hotkey()
+        self.hotkey = self.keypair.ss58_address
+
+        self.ws: ClientConnection | None = None
+        self.miner_portal_uri = f"{settings.MINER_PORTAL_URI}"
+        self.message_queue = []
+        self.lock = asyncio.Lock()
+
+        self.logging_extra = {
+            "miner_hotkey": self.hotkey,
+            "miner_portal_uri": self.miner_portal_uri,
+        }
+
+    def connect(self):
+        logger.info(
+            _m(
+                "Connecting to miner portal backend",
+                extra=get_extra_info(self.logging_extra)
+            )
+        )
+        return websockets.connect(self.miner_portal_uri)
+
+    async def __aenter__(self):
+        pass
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    async def run_forever(self) -> NoReturn:
+        asyncio.create_task(self.handle_send_messages())
+
+        while True:
+            try:
+                async for ws in self.connect():
+                    try:
+                        logger.info(
+                            _m(
+                                "Connected to miner portal",
+                                extra=get_extra_info(self.logging_extra),
+                            )
+                        )
+                        await self.handle_connection(ws)
+                    except Exception as e:
+                        self.ws = None
+                        logger.error(
+                            _m(
+                                "connection closed",
+                                extra=get_extra_info({
+                                    **self.logging_extra,
+                                    "error": str(e),
+                                }),
+                            )
+                        )
+                    finally:
+                        await asyncio.sleep(CONNECT_INTERVAL)
+            except Exception as exc:
+                self.ws = None
+                logger.error(
+                    _m(
+                        "connection failed",
+                        extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
+                    ),
+                    exc_info=True,
+                )
+                await asyncio.sleep(CONNECT_INTERVAL)
+
+    async def handle_connection(self, ws: ClientConnection):
+        """handle a single websocket connection"""
+        await ws.send(AuthenticateRequest.from_keypair(self.keypair).model_dump_json())
+
+        raw_msg = await ws.recv()
+        try:
+            response = Response.model_validate_json(raw_msg)
+        except pydantic.ValidationError as exc:
+            raise AuthenticationError(
+                "did not receive Response for AuthenticationRequest", []
+            ) from exc
+        if response.status != "success":
+            raise AuthenticationError("auth request received failed response", response.errors)
+
+        self.ws = ws
+
+        async for raw_msg in ws:
+            await self.handle_message(raw_msg)
+
+    @tenacity.retry(
+        stop=tenacity.stop_after_attempt(3),
+        wait=tenacity.wait_exponential(multiplier=1, exp_base=2, min=1, max=10),
+        retry=tenacity.retry_if_exception_type(websockets.ConnectionClosed),
+    )
+    async def send_model(self, msg: BaseModel):
+        await self.ws.send(msg.model_dump_json())
+
+    async def handle_send_messages(self):
+        while True:
+            if self.ws is None:
+                await asyncio.sleep(CONNECT_INTERVAL)
+                continue
+
+            if len(self.message_queue) > 0:
+                async with self.lock:
+                    log_to_send = self.message_queue.pop(0)
+
+                if log_to_send:
+                    try:
+                        await self.send_model(log_to_send)
+                    except Exception as exc:
+                        async with self.lock:
+                            self.message_queue.insert(0, log_to_send)
+                        logger.error(
+                            _m(
+                                "Error: message sent error",
+                                extra=get_extra_info({
+                                    **self.logging_extra,
+                                    "error": str(exc),
+                                }),
+                            )
+                        )
+            else:
+                await asyncio.sleep(1)
+
+    async def handle_message(self, raw_msg: str | bytes):
+        """handle message received from miner portal"""
+        pass
