@@ -6,14 +6,6 @@ from pydantic import BaseModel
 from datura.requests.base import BaseRequest
 
 
-class RequestType(enum.Enum):
-    AuthenticateRequest = "AuthenticateRequest"
-
-
-class BaseMinerRequest(BaseRequest):
-    message_type: RequestType
-
-
 class AuthenticationPayload(BaseModel):
     miner_hotkey: str
     timestamp: int
@@ -23,8 +15,7 @@ class AuthenticationPayload(BaseModel):
         return json.dumps(instance_dict, sort_keys=True)
 
 
-class AuthenticateRequest(BaseMinerRequest):
-    message_type: RequestType = RequestType.AuthenticateRequest
+class AuthenticateRequest(BaseModel):
     payload: AuthenticationPayload
     signature: str
 
@@ -38,3 +29,11 @@ class AuthenticateRequest(BaseMinerRequest):
             timestamp=int(time.time()),
         )
         return cls(payload=payload, signature=f"0x{keypair.sign(payload.blob_for_signing()).hex()}")
+
+
+class RequestType(enum.Enum):
+    AuthenticateRequest = "AuthenticateRequest"
+
+
+class BaseMinerRequest(BaseRequest):
+    message_type: RequestType

@@ -37,7 +37,7 @@ class MinerPortalClient:
         self.hotkey = self.keypair.ss58_address
 
         self.ws: ClientConnection | None = None
-        self.miner_portal_uri = f"{settings.MINER_PORTAL_URI}"
+        self.miner_portal_uri = f"{settings.MINER_PORTAL_URI}/miners/{self.hotkey}"
         self.message_queue = []
         self.lock = asyncio.Lock()
 
@@ -53,7 +53,15 @@ class MinerPortalClient:
                 extra=get_extra_info(self.logging_extra)
             )
         )
-        return websockets.connect(self.miner_portal_uri)
+        authRequest = AuthenticateRequest.from_keypair(self.keypair)
+        return websockets.connect(
+            self.miner_portal_uri,
+            additional_headers={
+                "miner_hotkey": authRequest.payload.miner_hotkey,
+                "timestamp": authRequest.payload.timestamp,
+                "signature": authRequest.signature,
+            }
+        )
 
     async def __aenter__(self):
         pass
@@ -74,7 +82,10 @@ class MinerPortalClient:
                                 extra=get_extra_info(self.logging_extra),
                             )
                         )
-                        await self.handle_connection(ws)
+
+                        self.ws = ws
+                        async for raw_msg in ws:
+                            await self.handle_message(raw_msg)
                     except Exception as e:
                         self.ws = None
                         logger.error(
@@ -98,25 +109,6 @@ class MinerPortalClient:
                     exc_info=True,
                 )
                 await asyncio.sleep(CONNECT_INTERVAL)
-
-    async def handle_connection(self, ws: ClientConnection):
-        """handle a single websocket connection"""
-        await ws.send(AuthenticateRequest.from_keypair(self.keypair).model_dump_json())
-
-        raw_msg = await ws.recv()
-        try:
-            response = Response.model_validate_json(raw_msg)
-        except pydantic.ValidationError as exc:
-            raise AuthenticationError(
-                "did not receive Response for AuthenticationRequest", []
-            ) from exc
-        if response.status != "success":
-            raise AuthenticationError("auth request received failed response", response.errors)
-
-        self.ws = ws
-
-        async for raw_msg in ws:
-            await self.handle_message(raw_msg)
 
     @tenacity.retry(
         stop=tenacity.stop_after_attempt(3),
