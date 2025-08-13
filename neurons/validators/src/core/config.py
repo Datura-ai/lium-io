@@ -65,6 +65,11 @@ class Settings(BaseSettings):
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
     )
 
+    # GPU types that will be excluded in collateral checks
+    COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [
+        "NVIDIA B200"
+    ]
+
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
