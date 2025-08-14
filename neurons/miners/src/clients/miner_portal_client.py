@@ -37,7 +37,7 @@ class MinerPortalClient:
         self.hotkey = self.keypair.ss58_address
 
         self.ws: ClientConnection | None = None
-        self.miner_portal_uri = f"{settings.MINER_PORTAL_URI}/miners/{self.hotkey}"
+        self.miner_portal_uri = f"{settings.MINER_PORTAL_URI}/api/miners/{self.hotkey}"
         self.message_queue = []
         self.lock = asyncio.Lock()
 
@@ -57,7 +57,7 @@ class MinerPortalClient:
         return websockets.connect(
             self.miner_portal_uri,
             additional_headers={
-                "miner_hotkey": authRequest.payload.miner_hotkey,
+                "hotkey": authRequest.payload.miner_hotkey,
                 "timestamp": authRequest.payload.timestamp,
                 "signature": authRequest.signature,
             }
