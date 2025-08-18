@@ -699,6 +699,8 @@ class ComputeClient:
 
             await self.miner_service.redis_service.remove_pending_pod(job_request.miner_hotkey, job_request.executor_id)
         elif isinstance(job_request, GetPodLogsRequestFromServer):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
             response: (
                 PodLogsResponseToServer | FailedGetPodLogs
             ) = await self.miner_service.get_pod_logs(job_request)
@@ -706,9 +708,11 @@ class ComputeClient:
             async with self.lock:
                 self.message_queue.append(response)
         elif isinstance(job_request, AddDebugSshKeyRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
             response: (
                 DebugSshKeyAdded | FailedAddDebugSshKey
-            ) = await self.miner_service.add_debug_public_key(job_request)
+            ) = await self.miner_service.add_debug_ssh_key(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)

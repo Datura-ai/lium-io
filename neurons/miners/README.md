@@ -133,8 +133,6 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-balance-
 
 The **validator hotkey** is a unique identifier tied to a validator that authenticates and verifies the performance of your executor machines. When you specify a validator hotkey during executor registration, it ensures that your executor is validated by this specific validator.
 
-To switch to a different validator first follow the instructions for removing an executor. After removing the executor, you need to re-register executors by running the add-executor command again (Step 2 of Adding an Executor).
-
 ### Adding an Executor
 
 Executors are machines running on GPUs that you can add to your central miner. The more executors (GPUs) you have, the greater your compensation will be. Here's how to add them:
