@@ -29,11 +29,3 @@ class AuthenticateRequest(BaseModel):
             timestamp=int(time.time()),
         )
         return cls(payload=payload, signature=f"0x{keypair.sign(payload.blob_for_signing()).hex()}")
-
-
-class RequestType(enum.Enum):
-    AuthenticateRequest = "AuthenticateRequest"
-
-
-class BaseMinerRequest(BaseRequest):
-    message_type: RequestType

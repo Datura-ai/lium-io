@@ -1,22 +1,52 @@
-from typing import Literal
+import enum
+from uuid import UUID
+from typing import Self
+from pydantic import BaseModel, model_validator
 
-from pydantic import BaseModel
-
-
-class Error(BaseModel, extra="allow"):
-    msg: str
-    type: str
-    help: str = ""
+from datura.requests.base import BaseRequest
 
 
-class Response(BaseModel, extra="forbid"):
-    """Message sent from miner portal to miner in response to AuthenticateRequest"""
+class RequestType(enum.Enum):
+    AddExecutorRequest = "AddExecutorRequest"
+    ExecutorAdded = "ExecutorAdded"
+    AddExecutorFailed = "AddExecutorFailed"
 
-    status: Literal["error", "success"]
-    errors: list[Error] = []
+
+class BaseMinerPortalRequest(BaseRequest):
+    message_type: RequestType
 
 
-class AuthenticationError(Exception):
-    def __init__(self, reason: str, errors: list[Error]):
-        self.reason = reason
-        self.errors = errors
+class AddExecutorPayload(BaseModel):
+    validator_hotkey: str
+    gpu_type: str
+    ip_address: str
+    port: int
+    price_per_hour: float
+    collateral_amount: float | None
+    gpu_count: int | None
+
+    @model_validator(mode="after")
+    def check_gpu_count_collateral_amount(self) -> Self:
+        if self.gpu_count is None and self.collateral_amount is None:
+            raise ValueError("gpu_count or collateral_amount is required")
+        return self
+
+
+class AddExecutorRequest(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.AddExecutorRequest
+    validator_hotkey: str
+    payload: AddExecutorPayload
+
+
+class ExecutorAdded(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorAdded
+    executor_id: UUID
+    ip_address: str
+    port: int
+
+
+class AddExecutorFailed(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.AddExecutorFailed
+    ip_address: str
+    port: int
+    error: str

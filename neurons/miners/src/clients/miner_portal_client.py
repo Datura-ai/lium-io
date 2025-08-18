@@ -1,25 +1,31 @@
 import asyncio
-import json
+import uuid
 import logging
 from typing import NoReturn
 
-import pydantic
 import tenacity
 import websockets
-from datura.requests.base import BaseRequest
 
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.ioc import ioc
+
+from models.executor import Executor
+
+from daos.executor import ExecutorDao
 
 from protocol.miner_request import (
     AuthenticateRequest,
 )
+
 from protocol.miner_portal_request import (
-    Response,
-    AuthenticationError,
+    BaseMinerPortalRequest,
+    AddExecutorRequest,
+    ExecutorAdded,
+    AddExecutorFailed,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +46,8 @@ class MinerPortalClient:
         self.miner_portal_uri = f"{settings.MINER_PORTAL_URI}/api/miners/{self.hotkey}"
         self.message_queue = []
         self.lock = asyncio.Lock()
+
+        self.executor_dao: ExecutorDao = ioc["ExecutorDao"]
 
         self.logging_extra = {
             "miner_hotkey": self.hotkey,
@@ -146,6 +154,52 @@ class MinerPortalClient:
             else:
                 await asyncio.sleep(1)
 
+    def accepted_request_type(self) -> type[BaseMinerPortalRequest]:
+        return BaseMinerPortalRequest
+
     async def handle_message(self, raw_msg: str | bytes):
         """handle message received from miner portal"""
-        pass
+        try:
+            request = self.accepted_request_type().parse(raw_msg)
+        except Exception as ex:
+            error_msg = f"Invalid message received from miner portal: {str(ex)}"
+            logger.error(
+                _m(
+                    error_msg,
+                    extra=get_extra_info({**self.logging_extra, "error": str(ex), "raw_msg": raw_msg}),
+                )
+            )
+            return
+
+        if isinstance(request, AddExecutorRequest):
+            try:
+                executor = self.executor_dao.save(Executor(
+                    uuid=uuid.uuid4(),
+                    address=request.payload.ip_address,
+                    port=request.payload.port,
+                    validator=request.payload.validator_hotkey,
+                ))
+                logger.info("Added executor (id=%s)", str(executor.uuid))
+                self.message_queue.append(ExecutorAdded(
+                    executor_id=executor.uuid,
+                    ip_address=executor.address,
+                    port=executor.port,
+                ))
+            except Exception as e:
+                logger.error(_m(
+                    "❌ Failed to add executor",
+                    extra={
+                        **self.logging_extra,
+                        "address": request.payload.ip_address,
+                        "port": request.payload.port,
+                        "validator": request.payload.validator_hotkey,
+                        "error": str(e),
+                    }
+                ))
+                self.message_queue.append((
+                    AddExecutorFailed(
+                        ip_address=executor.address,
+                        port=executor.port,
+                        error=str(e)
+                    )
+                ))
