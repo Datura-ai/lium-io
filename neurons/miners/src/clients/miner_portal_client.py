@@ -1,7 +1,6 @@
 import asyncio
-import uuid
 import logging
-from typing import NoReturn
+from typing import NoReturn, Union
 
 import tenacity
 import websockets
@@ -11,11 +10,11 @@ from websockets.asyncio.client import ClientConnection
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+
 from services.ioc import ioc
+from services.executor_service import ExecutorService
 
 from models.executor import Executor
-
-from daos.executor import ExecutorDao
 
 from protocol.miner_request import (
     AuthenticateRequest,
@@ -47,7 +46,7 @@ class MinerPortalClient:
         self.message_queue = []
         self.lock = asyncio.Lock()
 
-        self.executor_dao: ExecutorDao = ioc["ExecutorDao"]
+        self.executor_service: ExecutorService = ioc["ExecutorService"]
 
         self.logging_extra = {
             "miner_hotkey": self.hotkey,
@@ -172,32 +171,12 @@ class MinerPortalClient:
             return
 
         if isinstance(request, AddExecutorRequest):
-            try:
-                executor = self.executor_dao.save(Executor(
+            result: Union[ExecutorAdded, AddExecutorFailed] = self.executor_service.create(
+                Executor(
                     uuid=request.executor_id,
                     address=request.payload.ip_address,
                     port=request.payload.port,
                     validator=request.payload.validator_hotkey,
-                ))
-                logger.info("Added executor (id=%s)", str(executor.uuid))
-                self.message_queue.append(ExecutorAdded(
-                    executor_id=request.executor_id,
-                ))
-            except Exception as e:
-                logger.error(_m(
-                    "❌ Failed to add executor",
-                    extra={
-                        **self.logging_extra,
-                        "executor_id": str(request.executor_id),
-                        "address": request.payload.ip_address,
-                        "port": request.payload.port,
-                        "validator": request.payload.validator_hotkey,
-                        "error": str(e),
-                    }
-                ))
-                self.message_queue.append((
-                    AddExecutorFailed(
-                        executor_id=request.executor_id,
-                        error=str(e)
-                    )
-                ))
+                )
+            )
+            self.message_queue.append(result)
