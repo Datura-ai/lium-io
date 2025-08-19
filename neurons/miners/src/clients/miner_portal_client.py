@@ -174,22 +174,21 @@ class MinerPortalClient:
         if isinstance(request, AddExecutorRequest):
             try:
                 executor = self.executor_dao.save(Executor(
-                    uuid=uuid.uuid4(),
+                    uuid=request.executor_id,
                     address=request.payload.ip_address,
                     port=request.payload.port,
                     validator=request.payload.validator_hotkey,
                 ))
                 logger.info("Added executor (id=%s)", str(executor.uuid))
                 self.message_queue.append(ExecutorAdded(
-                    executor_id=executor.uuid,
-                    ip_address=executor.address,
-                    port=executor.port,
+                    executor_id=request.executor_id,
                 ))
             except Exception as e:
                 logger.error(_m(
                     "❌ Failed to add executor",
                     extra={
                         **self.logging_extra,
+                        "executor_id": str(request.executor_id),
                         "address": request.payload.ip_address,
                         "port": request.payload.port,
                         "validator": request.payload.validator_hotkey,
@@ -198,8 +197,7 @@ class MinerPortalClient:
                 ))
                 self.message_queue.append((
                     AddExecutorFailed(
-                        ip_address=executor.address,
-                        port=executor.port,
+                        executor_id=request.executor_id,
                         error=str(e)
                     )
                 ))

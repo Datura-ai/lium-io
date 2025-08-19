@@ -34,6 +34,7 @@ class AddExecutorPayload(BaseModel):
 
 class AddExecutorRequest(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.AddExecutorRequest
+    executor_id: UUID
     validator_hotkey: str
     payload: AddExecutorPayload
 
@@ -41,12 +42,9 @@ class AddExecutorRequest(BaseMinerPortalRequest):
 class ExecutorAdded(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.ExecutorAdded
     executor_id: UUID
-    ip_address: str
-    port: int
 
 
 class AddExecutorFailed(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.AddExecutorFailed
-    ip_address: str
-    port: int
+    executor_id: UUID
     error: str
