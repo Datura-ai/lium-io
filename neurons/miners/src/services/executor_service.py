@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Union
 
 import aiohttp
 import bittensor
@@ -9,8 +9,14 @@ from datura.requests.miner_requests import ExecutorSSHInfo, PodLog
 from fastapi import Depends
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 from daos.executor import ExecutorDao
 from models.executor import Executor
+
+from protocol.miner_portal_request import (
+    ExecutorAdded,
+    AddExecutorFailed,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +25,30 @@ logger = logging.getLogger(__name__)
 class ExecutorService:
     def __init__(self, executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)]):
         self.executor_dao = executor_dao
+
+    def create(self, executor: Executor) -> Union[ExecutorAdded, AddExecutorFailed]:
+        try:
+            self.executor_dao.save(executor)
+            logger.info("Added executor (id=%s)", str(executor.uuid))
+            return ExecutorAdded(
+                executor_id=executor.uuid,
+            )
+        except Exception as e:
+            log_text = _m(
+                "❌ Failed to add executor",
+                extra={
+                    "executor_id": str(executor.uuid),
+                    "address": executor.address,
+                    "port": executor.port,
+                    "validator": executor.validator,
+                    "error": str(e),
+                }
+            )
+            logger.error(log_text)
+            return AddExecutorFailed(
+                executor_id=executor.uuid,
+                error=str(log_text),
+            )
 
     def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None):
         return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)

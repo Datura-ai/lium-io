@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     )
     COLLATERAL_DAYS: int = 7
 
+    MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
+
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
