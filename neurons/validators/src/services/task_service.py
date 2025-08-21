@@ -57,6 +57,7 @@ class JobResult(BaseModel):
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False
+    ssh_pub_keys: list[str] | None = None
 
 
 class DockerConnectionCheckResult(BaseModel):
@@ -167,7 +168,7 @@ class TaskService:
         except Exception as e:
             logger.error(f"Error checking fingerprints changed: {e}")
             return False
-        
+
     async def check_banned_guids(self, guids: list[str]):
         banned_guids = await self.redis_service.get_banned_guids()
         return any(guid in banned_guids for guid in guids)
@@ -266,7 +267,7 @@ class TaskService:
                     log_text="No port available for docker container",
                     sysbox_runtime=sysbox_runtime,
                 )
-            
+
             log_text = _m(
                 "Verifying multiple ports",
                 extra=get_extra_info({
@@ -304,7 +305,7 @@ class TaskService:
                     log_text="No port available for docker container",
                     sysbox_runtime=sysbox_runtime,
                 )
-                
+
             # set port on redis
             key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
             for internal_port, external_port in successful_ports:
@@ -460,9 +461,10 @@ class TaskService:
         executor_info: ExecutorSSHInfo,
     ):
         # check container running or not
-        result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name}")
+        command = f"/usr/bin/docker exec -i {container_name} sh -c 'cat ~/.ssh/authorized_keys'"
+        result = await ssh_client.run(command)
         if result.stdout.strip():
-            return True
+            return result.stdout.strip().split('\n')
 
         # # remove pod in redis
         # await self.redis_service.remove_rented_machine(executor_info)
@@ -478,7 +480,7 @@ class TaskService:
             )
         )
 
-        return False
+        return []
 
     async def _handle_task_result(
         self,
@@ -495,6 +497,7 @@ class TaskService:
         gpu_model_count: str = '',
         gpu_uuids: str = '',
         sysbox_runtime: bool = False,
+        ssh_pub_keys: list[str] | None = None,
         clear_verified_job_reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
     ):
         logger.info(_m("Handle task result: ", extra={
@@ -555,6 +558,7 @@ class TaskService:
             gpu_model=gpu_model,
             gpu_count=gpu_count,
             sysbox_runtime=sysbox_runtime,
+            ssh_pub_keys=ssh_pub_keys,
         )
 
     def check_gpu_usage(
@@ -905,7 +909,7 @@ class TaskService:
                         success=False,
                         clear_verified_job_info=True,
                     )
-                
+
                 if await self.check_banned_guids(gpu_uuids.split(',')):
                     log_text = _m(
                         "Your GPUs are banned due to low rental-rate in the site.",
@@ -965,12 +969,12 @@ class TaskService:
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
                     container_name = rented_machine.get("container_name", "")
-                    is_pod_running = await self.check_pod_running(
+                    ssh_pub_keys = await self.check_pod_running(
                         ssh_client=shell.ssh_client,
                         container_name=container_name,
                         executor_info=executor_info,
                     )
-                    if not is_pod_running:
+                    if not ssh_pub_keys:
                         log_text = _m(
                             "Pod is not running",
                             extra=get_extra_info(
@@ -1025,6 +1029,7 @@ class TaskService:
                                 success=False,
                                 gpu_model_count=gpu_model_count,
                                 clear_verified_job_info=False,
+                                ssh_pub_keys=ssh_pub_keys,
                             )
 
                     # In backend, there are 2 scores. actual score and job score.
@@ -1046,7 +1051,6 @@ class TaskService:
                         log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
                     elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
                         log_msg = "Executor is rented. But not eligible from collateral contract. Will not have score very soon."
-                    
 
                     log_text = _m(
                         log_msg,
@@ -1066,6 +1070,7 @@ class TaskService:
                         gpu_model_count=gpu_model_count,
                         clear_verified_job_info=False,
                         sysbox_runtime=sysbox_runtime,
+                        ssh_pub_keys=ssh_pub_keys,
                     )
 
                 # check gpu usages
