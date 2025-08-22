@@ -16,6 +16,12 @@ from models.executor import Executor
 from protocol.miner_portal_request import (
     ExecutorAdded,
     AddExecutorFailed,
+    SyncExecutorMinerPortalRequest,
+    SyncExecutorMinerPortalSuccess,
+    SyncExecutorMinerPortalFailed,
+    SyncExecutorCentralMinerRequest,
+    SyncExecutorCentralMinerSuccess,
+    SyncExecutorCentralMinerFailed,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +53,54 @@ class ExecutorService:
             logger.error(log_text)
             return AddExecutorFailed(
                 executor_id=executor.uuid,
+                error=str(log_text),
+            )
+
+    def sync_executor_miner_portal(self, request: SyncExecutorMinerPortalRequest) -> Union[SyncExecutorMinerPortalSuccess, SyncExecutorMinerPortalFailed]:
+        try:
+            for executor_payload in request.payload:
+                executor = self.executor_dao.find_by_uuid(executor_payload.uuid)
+                if executor:
+                    executor.validator = executor_payload.validator
+                    executor.address = executor_payload.address
+                    executor.port = executor_payload.port
+                    self.executor_dao.update_by_uuid(executor.uuid, executor)
+                    logger.info("Updated executor (id=%s)", str(executor.uuid))
+                else:
+                    logger.warning("Executor not found: %s:%s, adding new executor", executor_payload.address, executor_payload.port)
+                    self.executor_dao.save(
+                        Executor(
+                            uuid=executor_payload.uuid,
+                            validator=executor_payload.validator,
+                            address=executor_payload.address,
+                            port=executor_payload.port,
+                        )
+                    )
+
+            return SyncExecutorMinerPortalSuccess()
+        except Exception as e:
+            log_text = _m(
+                "Failed to sync executor miner portal",
+                extra={
+                    "error": str(e),
+                }
+            )
+            logger.error(log_text)
+            return SyncExecutorMinerPortalFailed(
+                error=str(log_text),
+            )
+
+    def sync_executor_central_miner(self, miner_hotkey: str, request: SyncExecutorCentralMinerRequest) -> Union[SyncExecutorCentralMinerSuccess, SyncExecutorCentralMinerFailed]:
+        try:
+            executors = self.executor_dao.get_all_executors()
+            return SyncExecutorCentralMinerSuccess(
+                miner_hotkey=miner_hotkey,
+                payload=executors,
+            )
+        except Exception as e:
+            log_text = _m("Failed to sync executor central miner", extra={"error": str(e)})
+            logger.error(log_text)
+            return SyncExecutorCentralMinerFailed(
                 error=str(log_text),
             )
 
