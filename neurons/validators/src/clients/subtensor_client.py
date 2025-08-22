@@ -56,7 +56,7 @@ class SubtensorClient:
 
         # Calculate version key
         major, minor, patch = map(int, settings.VERSION.split('.'))
-        self.version_key = major * 1000 + minor * 100 + patch
+        self.version_key = major * 10000 + minor * 100 + patch
 
         self.default_extra = {
             "version_key": self.version_key,
