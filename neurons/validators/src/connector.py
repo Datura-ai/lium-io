@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 
 from clients.compute_client import ComputeClient
@@ -12,8 +13,14 @@ wait_for_services_sync()
 
 
 async def run_forever():
-    logger.info("Compute app connector started")
     await initiate_services()
+    
+    # Silent mode for local testing - no compute app connection, no logs, no errors
+    if os.getenv("DISABLE_COMPUTE_APP", "false").lower() == "true":
+        while True:
+            await asyncio.sleep(3600)  # Just keep alive
+    
+    logger.info("Compute app connector started")
     keypair = settings.get_bittensor_wallet().get_hotkey()
     compute_app_client = ComputeClient(
         keypair, f"{settings.COMPUTE_APP_URI}/validator/{keypair.ss58_address}", ioc["MinerService"]

@@ -1,6 +1,7 @@
 import asyncio
 import time
 import logging
+import os
 
 from clients.miner_portal_client import MinerPortalClient
 
@@ -16,6 +17,11 @@ logger = logging.getLogger(__name__)
 async def run_forever():
     initiate_services()
 
+    # Silent mode for local testing - no portal, no logs, no errors
+    if os.getenv("DISABLE_MINER_PORTAL", "false").lower() == "true":
+        while True:
+            await asyncio.sleep(3600)  # Just keep alive
+    
     logger.info("Miner portal connector started")
     miner_portal_client = MinerPortalClient()
     async with miner_portal_client:
