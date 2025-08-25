@@ -51,3 +51,15 @@ class ExecutorDao(BaseDao):
 
     def get_all_executors(self) -> list[Executor]:
         return list(self.session.query(Executor).all())
+
+    def find_by_uuid(self, uuid: str) -> Executor:
+        return self.session.query(Executor).filter_by(uuid=uuid).first()
+
+    def update_by_uuid(self, uuid: str, executor: Executor) -> Executor:
+        existing_executor = self.find_by_uuid(uuid)
+        existing_executor.validator = executor.validator
+        existing_executor.address = executor.address
+        existing_executor.port = executor.port
+        self.session.commit()
+        self.session.refresh(existing_executor)
+        return existing_executor

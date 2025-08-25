@@ -5,11 +5,19 @@ from pydantic import BaseModel, model_validator
 
 from datura.requests.base import BaseRequest
 
+from models.executor import Executor
+
 
 class RequestType(enum.Enum):
     AddExecutorRequest = "AddExecutorRequest"
     ExecutorAdded = "ExecutorAdded"
     AddExecutorFailed = "AddExecutorFailed"
+    SyncExecutorMinerPortalRequest = "SyncExecutorMinerPortalRequest"
+    SyncExecutorMinerPortalSuccess = "SyncExecutorMinerPortalSuccess"
+    SyncExecutorMinerPortalFailed = "SyncExecutorMinerPortalFailed"
+    SyncExecutorCentralMinerRequest = "SyncExecutorCentralMinerRequest"
+    SyncExecutorCentralMinerSuccess = "SyncExecutorCentralMinerSuccess"
+    SyncExecutorCentralMinerFailed = "SyncExecutorCentralMinerFailed"
 
 
 class BaseMinerPortalRequest(BaseRequest):
@@ -32,6 +40,13 @@ class AddExecutorPayload(BaseModel):
         return self
 
 
+class SyncExecutorPayload(BaseModel):
+    uuid: UUID
+    validator: str
+    address: str
+    port: int
+
+
 class AddExecutorRequest(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.AddExecutorRequest
     executor_id: UUID
@@ -47,4 +62,33 @@ class ExecutorAdded(BaseMinerPortalRequest):
 class AddExecutorFailed(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.AddExecutorFailed
     executor_id: UUID
+    error: str
+
+
+class SyncExecutorMinerPortalRequest(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.SyncExecutorMinerPortalRequest
+    payload: list[SyncExecutorPayload]
+
+
+class SyncExecutorMinerPortalSuccess(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.SyncExecutorMinerPortalSuccess
+
+
+class SyncExecutorMinerPortalFailed(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.SyncExecutorMinerPortalFailed
+    error: str
+
+
+class SyncExecutorCentralMinerRequest(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.SyncExecutorCentralMinerRequest
+
+
+class SyncExecutorCentralMinerSuccess(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.SyncExecutorCentralMinerSuccess
+    miner_hotkey: str
+    payload: list[Executor]
+
+
+class SyncExecutorCentralMinerFailed(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.SyncExecutorCentralMinerFailed
     error: str

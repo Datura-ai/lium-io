@@ -66,6 +66,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     log_status: str | None
     job_batch_id: str
     collateral_deposited: bool
+    ssh_pub_keys: list[str] | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

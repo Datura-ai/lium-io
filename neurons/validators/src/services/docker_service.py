@@ -583,7 +583,7 @@ class DockerService:
                         ssh_client=ssh_client,
                         command=command,
                         log_tag=log_tag,
-                        log_text=f"Creating docker volume ${local_volume}",
+                        log_text=f"Creating docker volume {local_volume}",
                         log_extra=default_extra,
                         timeout=10,
                     )
