@@ -25,6 +25,12 @@ from protocol.miner_portal_request import (
     AddExecutorRequest,
     ExecutorAdded,
     AddExecutorFailed,
+    SyncExecutorMinerPortalRequest,
+    SyncExecutorMinerPortalSuccess,
+    SyncExecutorMinerPortalFailed,
+    SyncExecutorCentralMinerRequest,
+    SyncExecutorCentralMinerSuccess,
+    SyncExecutorCentralMinerFailed,
 )
 
 logger = logging.getLogger(__name__)
@@ -180,3 +186,13 @@ class MinerPortalClient:
                 )
             )
             self.message_queue.append(result)
+
+        if isinstance(request, SyncExecutorMinerPortalRequest):
+            logger.info("Sync executor miner portal request received")
+            result: Union[SyncExecutorMinerPortalSuccess, SyncExecutorMinerPortalFailed] = self.executor_service.sync_executor_miner_portal(request)
+            self.message_queue.append(result)
+
+        if isinstance(request, SyncExecutorCentralMinerRequest):
+            result: Union[SyncExecutorCentralMinerSuccess, SyncExecutorCentralMinerFailed] = self.executor_service.sync_executor_central_miner(self.hotkey, request)
+            self.message_queue.append(result)
+            logger.info("Sync executor central miner response sent")

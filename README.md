@@ -39,6 +39,8 @@ If you are looking to rent computational resources, you can easily do so through
 
 To start renting machines, visit [lium.io](https://lium.io) and access the resources you need.
 
+**Command-Line Alternative**: For renters who prefer working from the terminal, you can also use [lium-cli](https://github.com/Datura-ai/lium-cli) - a command-line interface that allows you to manage GPU pods, SSH into machines, transfer files, and execute commands directly from your terminal. Install it with `pip install lium-cli`.
+
 ### For Miners
 
 Miners can contribute their GPU-equipped machines to the network. The machines are scored and validated based on factors like GPU type, number of GPUs, bandwidth, and overall GPU performance. Higher performance results in better compensation for miners.

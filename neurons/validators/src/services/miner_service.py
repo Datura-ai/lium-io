@@ -240,6 +240,7 @@ class MinerService:
                         "log_status": result.log_status,
                         "log_text": result.log_text,
                         "collateral_deposited": result.collateral_deposited,
+                        "ssh_pub_keys": result.ssh_pub_keys,
                     },
                 )
             except Exception as e:

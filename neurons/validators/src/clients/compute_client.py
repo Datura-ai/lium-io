@@ -267,6 +267,7 @@ class ComputeClient:
                             executor_port=data["executor_port"],
                             executor_price=data["executor_price"],
                             collateral_deposited=data["collateral_deposited"],
+                            ssh_pub_keys=data["ssh_pub_keys"],
                         )
 
                         async with self.lock:
