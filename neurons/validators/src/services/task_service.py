@@ -406,7 +406,7 @@ class TaskService:
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
                 known_hosts=None,
-            ) as _:
+            ) as container_ssh_client:
                 log_text = _m(
                     "Connected into docker container",
                     extra=default_extra,
@@ -415,7 +415,7 @@ class TaskService:
 
                 if sysbox_runtime:
                     command = f"docker pull hello-world"
-                    result = await ssh_client.run(command)
+                    result = await container_ssh_client.run(command)
                     if result.exit_status != 0:
                         error_message = result.stderr.strip() if result.stderr else "No error message available"
                         logger.error(
