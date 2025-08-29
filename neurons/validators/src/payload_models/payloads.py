@@ -69,7 +69,7 @@ class ContainerBaseRequest(BaseRequest):
     executor_id: str
 
 
-class VolumeInfo(BaseModel):
+class ExternalVolumeInfo(BaseModel):
     name: str
     plugin: str
     iam_user_access_key: str
@@ -82,7 +82,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
     custom_options: CustomOptions | None = None
     debug: bool | None = None
-    volume_info: VolumeInfo | None = None
+    local_volume: str | None = None
+    external_volume_info: ExternalVolumeInfo | None = None
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
     docker_password: str | None = None  # when edit pod, docker_password is required
@@ -117,7 +118,8 @@ class ContainerStopRequest(ContainerBaseRequest):
 class ContainerDeleteRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteRequest
     container_name: str
-    volume_name: str
+    local_volume: str | None = None
+    external_volume: str | None = None
 
 
 class GetPodLogsRequestFromServer(ContainerBaseRequest):
@@ -164,8 +166,6 @@ class ContainerStopped(ContainerBaseResponse):
 
 class ContainerDeleted(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
-    container_name: str
-    volume_name: str
 
 
 class SshPubKeyAdded(ContainerBaseResponse):

@@ -31,6 +31,9 @@ class CollateralContractService:
         }
 
         error_message = None
+        if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
+            logger.info(f"GPU model {gpu_model} is excluded from collateral checks")
+            return True, None
 
         try:
             evm_address = self.subtensor_client.get_evm_address_for_hotkey(miner_hotkey)

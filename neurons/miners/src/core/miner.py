@@ -42,26 +42,18 @@ class Miner:
             ip=settings.EXTERNAL_IP_ADDRESS,
         )
         self.subtensor = None
-        self.set_subtensor()
+        self.initialize_subtensor()
 
         self.should_exit = False
         self.session = next(get_db())
         self.validator_dao = ValidatorDao(session=self.session)
         self.last_announced_block = 0
 
-    def set_subtensor(self):
+    def initialize_subtensor(self):
         try:
-            if (
-                self.subtensor
-                and self.subtensor.substrate
-                and self.subtensor.substrate.ws
-                and self.subtensor.substrate.ws.state is WebSocketClientState.OPEN
-            ):
-                return
-
             logger.info(
                 _m(
-                    "Getting subtensor",
+                    "Initializing subtensor",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
@@ -73,13 +65,24 @@ class Miner:
         except Exception as e:
             logger.info(
                 _m(
-                    "[Error] Getting subtensor",
+                    "[Error] failed initializing subtensor",
                     extra=get_extra_info({
                         ** self.default_extra,
                         "error": str(e),
                     }),
                 ),
             )
+
+    def set_subtensor(self):
+        if (
+            self.subtensor
+            and self.subtensor.substrate
+            and self.subtensor.substrate.ws
+            and not self.subtensor.substrate.ws.close_code
+        ):
+            return
+
+        self.initialize_subtensor()
 
     def check_registered(self):
         try:
@@ -197,6 +200,7 @@ class Miner:
                     }),
                 ),
             )
+            self.initialize_subtensor()
 
     async def start(self):
         logger.info(

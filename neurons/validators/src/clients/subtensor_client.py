@@ -56,7 +56,7 @@ class SubtensorClient:
 
         # Calculate version key
         major, minor, patch = map(int, settings.VERSION.split('.'))
-        self.version_key = major * 1000 + minor * 100 + patch
+        self.version_key = major * 10000 + minor * 100 + patch
 
         self.default_extra = {
             "version_key": self.version_key,
@@ -67,7 +67,7 @@ class SubtensorClient:
         if settings.DEBUG:
             self.debug_miner = settings.get_debug_miner()
 
-        self.set_subtensor()
+        self.initialize_subtensor()
 
         SubtensorClient._initialized = True
 
@@ -83,19 +83,11 @@ class SubtensorClient:
     def subtensor(self):
         return SubtensorClient._subtensor
 
-    def set_subtensor(self):
+    def initialize_subtensor(self):
         try:
-            if (
-                SubtensorClient._subtensor
-                and SubtensorClient._subtensor.substrate
-                and SubtensorClient._subtensor.substrate.ws
-                and SubtensorClient._subtensor.substrate.ws.state is WebSocketClientState.OPEN
-            ):
-                return
-
             logger.info(
                 _m(
-                    "Getting subtensor",
+                    "Initializing subtensor",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
@@ -108,7 +100,7 @@ class SubtensorClient:
         except Exception as e:
             logger.info(
                 _m(
-                    "[Error] Getting subtensor",
+                    "[Error] failed initializing subtensor",
                     extra=get_extra_info(
                         {
                             **self.default_extra,
@@ -117,6 +109,17 @@ class SubtensorClient:
                     ),
                 ),
             )
+
+    def set_subtensor(self):
+        if (
+            SubtensorClient._subtensor
+            and SubtensorClient._subtensor.substrate
+            and SubtensorClient._subtensor.substrate.ws
+            and not SubtensorClient._subtensor.substrate.ws.close_code
+        ):
+            return
+
+        self.initialize_subtensor()
 
     def check_registered(self, subtensor: bittensor.subtensor):
         try:
@@ -488,10 +491,11 @@ class SubtensorClient:
             except Exception as e:
                 logger.error(
                     _m(
-                        "[stop] Failed to connect into subtensor",
+                        "[_warm_up_subtensor] Failed to connect into subtensor",
                         extra=get_extra_info({**self.default_extra, "error": str(e)}),
                     ),
                 )
+                self.initialize_subtensor()
                 await asyncio.sleep(SYNC_CYCLE)
 
     @classmethod
