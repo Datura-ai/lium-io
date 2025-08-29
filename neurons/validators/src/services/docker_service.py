@@ -614,38 +614,21 @@ class DockerService:
                     "--device /dev/net/tun "
                 )
 
-                if payload.debug:
-                    command = (
-                        f'/usr/bin/docker run -d '
-                        f'{("--runtime=sysbox-runc" if payload.is_sysbox else "")} '
-                        f'{net_perm_flags} '  # Network permission flags
-                        f'{port_flags} '
-                        f'-v "/var/run/docker.sock:/var/run/docker.sock" '
-                        f'{volume_flag} '
-                        f'{entrypoint_flag} '
-                        f'{env_flags} '
-                        f'{shm_size_flag} '
-                        f'--restart unless-stopped '
-                        f'--name {container_name} '
-                        f'{payload.docker_image} '
-                        f'{startup_commands}'
-                    )
-                else:
-                    command = (
-                        f'/usr/bin/docker run -d '
-                        f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
-                        f'{net_perm_flags} '  # Network permission flags
-                        f'{port_flags} '
-                        f'{volume_flag} '
-                        f'{entrypoint_flag} '
-                        f'{env_flags} '
-                        f'{shm_size_flag} '
-                        f'--gpus all '
-                        f'--restart unless-stopped '
-                        f'--name {container_name} '
-                        f'{payload.docker_image} '
-                        f'{startup_commands}'
-                    )
+                command = (
+                    f'/usr/bin/docker run -d '
+                    f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
+                    f'{net_perm_flags} '  # Network permission flags
+                    f'{port_flags} '
+                    f'{volume_flag} '
+                    f'{entrypoint_flag} '
+                    f'{env_flags} '
+                    f'{shm_size_flag} '
+                    f'--gpus all '
+                    f'--restart unless-stopped '
+                    f'--name {container_name} '
+                    f'{payload.docker_image} '
+                    f'{startup_commands}'
+                )
 
                 logger.info(f"Running command: {command}")
 
