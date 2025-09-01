@@ -21,7 +21,6 @@ def run_command(command):
 
 
 def create_backup_container(args):
-
     # install docker volume plugin
     command = f"/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias {plugin_name} --grant-all-permissions --disable"
     run_command(command)
@@ -30,6 +29,8 @@ def create_backup_container(args):
     command = f"/usr/bin/docker plugin disable {plugin_name} -f"
     run_command(command)
     command = f"/usr/bin/docker plugin set {plugin_name} AWSACCESSKEYID={args.backup_volume_iam_user_access_key} AWSSECRETACCESSKEY={args.backup_volume_iam_user_secret_key}"
+    run_command(command)
+    command = f'/usr/bin/docker plugin set s3fs-backup DEFAULT_S3FSOPTS="url=https://s3-accelerate.amazonaws.com"'
     run_command(command)
     command = f"/usr/bin/docker plugin enable {plugin_name}"
     run_command(command)
@@ -106,6 +107,41 @@ def update_backup_log(
     response.raise_for_status()
 
 
+def pull_aws_cli():
+    run_command("/usr/bin/docker pull amazon/aws-cli")
+
+
+def get_total_size(args):
+    try:
+        comand = (
+            f"docker run --rm -v {args.source_volume}:{args.source_volume_path} "
+            f' ubuntu bash -lc "du -sb {args.source_volume_path}'
+             " | awk '{print \$1}' \" " 
+        )
+        result = run_command(comand)
+        logger.info(f"Total Size: {result.stdout.strip()}")
+        return int(result.stdout.strip())
+    except Exception as e:
+        logger.error(f"Failed to get total size: {e}", exc_info=True)
+        return None
+
+
+
+def aws_cp(args, size: int | None = None):
+    expected_size_flag = f' --expected-size {size} ' if size else ''
+    command = (
+        "docker run --rm "
+        f"-v {args.source_volume}:{args.source_volume_path} "
+        f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
+        f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
+        "--entrypoint sh "
+        "amazon/aws-cli -lc "
+        f'"aws s3 cp {args.backup_path} s3://{args.backup_volume_name}/{args.backup_target_path} '
+        f' --recursive --only-show-errors {expected_size_flag} --endpoint-url https://s3-accelerate.amazonaws.com"'
+    )
+    run_command(command)
+
+
 def backup_storage(args):
     progress = 0
     try:
@@ -121,35 +157,53 @@ def backup_storage(args):
         # logger.info(f"AUTH_TOKEN: {args.auth_token}")
         # logger.info(f"BACKUP_LOG_ID: {args.backup_log_id}")
 
-        logger.info("Step 1: Creating backup container...")
-        container_name = create_backup_container(args)
-        logger.info(f"Backup container created: {container_name}")
-        progress += 10 # 10
-        update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup container created"], "", progress, args.auth_token)
+        # logger.info("Step 1: Creating backup container...")
+        # container_name = create_backup_container(args)
+        # logger.info(f"Backup container created: {container_name}")
+        # progress += 10 # 10
+        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup container created"], "", progress, args.auth_token)
 
-        logger.info("Step 2: Starting backup...")
-        start_backup(args, container_name)
-        logger.info("Backup started")
-        progress += 20 # 30
-        update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup started"], "", progress, args.auth_token)
+        # logger.info("Step 2: Starting backup...")
+        # start_backup(args, container_name)
+        # logger.info("Backup started")
+        # progress += 20 # 30
+        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup started"], "", progress, args.auth_token)
 
-        logger.info("Step 3: Cleanup backup container...")
-        clean_backup_container(container_name)
-        logger.info("Backup container cleaned")
-        progress += 50 # 80
-        update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup container cleaned"], "", progress, args.auth_token)
+        # logger.info("Step 3: Cleanup backup container...")
+        # clean_backup_container(container_name)
+        # logger.info("Backup container cleaned")
+        # progress += 50 # 80
+        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup container cleaned"], "", progress, args.auth_token)
 
-        logger.info("Step 4: Cleanup backup volume...")
-        clean_backup_volume(args.backup_volume_name)
-        logger.info("Backup volume cleaned")
-        progress += 10 # 90
-        update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup volume cleaned"], "", progress, args.auth_token)
+        # logger.info("Step 4: Cleanup backup volume...")
+        # clean_backup_volume(args.backup_volume_name)
+        # logger.info("Backup volume cleaned")
+        # progress += 10 # 90
+        # update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Backup volume cleaned"], "", progress, args.auth_token)
 
-        logger.info("Step 5: Disable backup volume plugin...")
-        disable_backup_volume_plugin()
-        logger.info("Backup volume plugin disabled")
-        progress += 10 # 100
-        update_backup_log(args.api_url, "COMPLETED", [], "", progress, args.auth_token)
+        # logger.info("Step 5: Disable backup volume plugin...")
+        # disable_backup_volume_plugin()
+        # logger.info("Backup volume plugin disabled")
+        # progress += 10 # 100
+        # update_backup_log(args.api_url, "COMPLETED", [], "", progress, args.auth_token)
+
+        logger.info("Step 1: Pulling aws cli...")
+        pull_aws_cli()
+        logger.info("Aws cli pulled")
+        progress += 30 # 30
+        update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Aws cli pulled"], "", progress, args.auth_token)
+
+        logger.info("Step 2: Getting total size...")
+        total_size = get_total_size(args)
+        logger.info(f"Total size: {total_size}")
+        progress += 30 # 60
+        update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Got total size"], "", progress, args.auth_token)
+
+        logger.info("Step 3: Copying to aws s3...")
+        aws_cp(args, total_size)
+        logger.info("Copying to aws s3 completed")
+        progress += 40 # 100
+        update_backup_log(args.api_url, "COMPLETED", ["Info: Copying to aws s3 completed"], "", progress, args.auth_token)
     except Exception as e:
         logger.error(f"Backup failed: {e}", exc_info=True)
         update_backup_log(args.api_url, "FAILED", ["Error: Backup failed"], str(e), progress, args.auth_token)
