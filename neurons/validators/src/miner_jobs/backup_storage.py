@@ -108,36 +108,24 @@ def update_backup_log(
 
 
 def pull_aws_cli():
-    run_command("/usr/bin/docker pull amazon/aws-cli")
+    run_command("/usr/bin/docker pull daturaai/aws-cli")
 
 
-def get_total_size(args):
-    try:
-        comand = (
-            f"docker run --rm -v {args.source_volume}:{args.source_volume_path} "
-            f' ubuntu bash -lc "du -sb {args.source_volume_path}'
-             " | awk '{print \$1}' \" " 
-        )
-        result = run_command(comand)
-        logger.info(f"Total Size: {result.stdout.strip()}")
-        return int(result.stdout.strip())
-    except Exception as e:
-        logger.error(f"Failed to get total size: {e}", exc_info=True)
-        return None
+def aws_cp(args):
+    backup_path = (args.backup_path or '').rstrip('/')
+    backup_path_parent = os.path.dirname(backup_path)
+    backup_path_current = os.path.basename(backup_path)
 
-
-
-def aws_cp(args, size: int | None = None):
-    expected_size_flag = f' --expected-size {size} ' if size else ''
     command = (
         "docker run --rm "
         f"-v {args.source_volume}:{args.source_volume_path} "
         f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
         f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
         "--entrypoint sh "
-        "amazon/aws-cli -lc "
-        f'"aws s3 cp {args.backup_path} s3://{args.backup_volume_name}/{args.backup_target_path} '
-        f' --recursive --only-show-errors {expected_size_flag} --endpoint-url https://s3-accelerate.amazonaws.com"'
+        "daturaai/aws-cli  -lc "
+        f'"tar --xattrs --acls -C {backup_path_parent} -czf - {backup_path_current} '
+        f"| aws s3 cp - s3://{args.backup_volume_name}/{args.backup_target_path} "
+        f'  --sse AES256 --expected-size $(tar -C {backup_path_parent} -cf - {backup_path_current} | wc -c)" '
     )
     run_command(command)
 
@@ -193,16 +181,10 @@ def backup_storage(args):
         progress += 30 # 30
         update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Aws cli pulled"], "", progress, args.auth_token)
 
-        logger.info("Step 2: Getting total size...")
-        total_size = get_total_size(args)
-        logger.info(f"Total size: {total_size}")
-        progress += 30 # 60
-        update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Got total size"], "", progress, args.auth_token)
-
-        logger.info("Step 3: Copying to aws s3...")
-        aws_cp(args, total_size)
+        logger.info("Step 2: Copying to aws s3...")
+        aws_cp(args)
         logger.info("Copying to aws s3 completed")
-        progress += 40 # 100
+        progress += 70 # 100
         update_backup_log(args.api_url, "COMPLETED", ["Info: Copying to aws s3 completed"], "", progress, args.auth_token)
     except Exception as e:
         logger.error(f"Backup failed: {e}", exc_info=True)
