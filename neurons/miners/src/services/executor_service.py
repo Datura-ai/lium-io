@@ -14,17 +14,16 @@ from daos.executor import ExecutorDao
 from models.executor import Executor
 
 from protocol.miner_portal_request import (
-    SwitchValidatorRequest,
     ExecutorAdded,
     AddExecutorFailed,
     SyncExecutorMinerPortalRequest,
     SyncExecutorMinerPortalSuccess,
     SyncExecutorMinerPortalFailed,
-    SyncExecutorCentralMinerRequest,
     SyncExecutorCentralMinerSuccess,
     SyncExecutorCentralMinerFailed,
-    ValidatorSwitched,
-    ValidatorSwitchFailed,
+    UpdateExecutorRequest,
+    ExecutorUpdated,
+    ExecutorUpdateFailed,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -58,18 +57,24 @@ class ExecutorService:
                 executor_id=executor.uuid,
                 error=str(log_text),
             )
-    
-    def switch_validator(self, payload: SwitchValidatorRequest) -> Union[ValidatorSwitched, ValidatorSwitchFailed]:
+
+    def update(self, payload: UpdateExecutorRequest) -> Union[ExecutorUpdated, ExecutorUpdateFailed]:
         try:
-            executor = self.executor_dao.find_by_uuid(str(payload.executor_id))
-            executor.validator = payload.payload.validator_hotkey
-            self.executor_dao.update(executor)
-            logger.info("Switched validator for executor (id=%s)", str(executor.uuid))
-            return ValidatorSwitched(
+            executor = Executor(
+                uuid=payload.executor.uuid,
+                validator=payload.executor.validator,
+                address=payload.executor.address,
+                port=payload.executor.port,
+                price_per_hour=payload.executor.price_per_hour
+            )
+            self.executor_dao.update_by_uuid(executor.uuid, executor)
+
+            logger.info("Updated for executor (id=%s)", str(executor.uuid))
+            return ExecutorUpdated(
                 executor_id=executor.uuid,
             )
         except Exception as e:
-            return ValidatorSwitchFailed(
+            return ExecutorUpdateFailed(
                 executor_id=executor.uuid,
                 error=str(e),
             )

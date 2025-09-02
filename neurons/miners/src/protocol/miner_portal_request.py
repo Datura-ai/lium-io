@@ -10,7 +10,6 @@ from models.executor import Executor
 
 class RequestType(enum.Enum):
     AddExecutorRequest = "AddExecutorRequest"
-    SwitchValidatorRequest = "SwitchValidatorRequest"
     ExecutorAdded = "ExecutorAdded"
     AddExecutorFailed = "AddExecutorFailed"
     SyncExecutorMinerPortalRequest = "SyncExecutorMinerPortalRequest"
@@ -19,8 +18,9 @@ class RequestType(enum.Enum):
     SyncExecutorCentralMinerRequest = "SyncExecutorCentralMinerRequest"
     SyncExecutorCentralMinerSuccess = "SyncExecutorCentralMinerSuccess"
     SyncExecutorCentralMinerFailed = "SyncExecutorCentralMinerFailed"
-    ValidatorSwitched = "ValidatorSwitched"
-    ValidatorSwitchFailed = "ValidatorSwitchFailed"
+    UpdateExecutorRequest = "UpdateExecutorRequest"
+    ExecutorUpdated = "ExecutorUpdated"
+    ExecutorUpdateFailed = "ExecutorUpdateFailed"
 
 
 class BaseMinerPortalRequest(BaseRequest):
@@ -62,12 +62,6 @@ class AddExecutorRequest(BaseMinerPortalRequest):
     payload: AddExecutorPayload
 
 
-class SwitchValidatorRequest(BaseMinerPortalRequest):
-    message_type: RequestType = RequestType.SwitchValidatorRequest
-    executor_id: UUID
-    payload: SwitchValidatorPayload
-
-
 class ExecutorAdded(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.ExecutorAdded
     executor_id: UUID
@@ -107,12 +101,17 @@ class SyncExecutorCentralMinerFailed(BaseMinerPortalRequest):
     error: str
 
 
-class ValidatorSwitched(BaseMinerPortalRequest):
-    message_type: RequestType = RequestType.ValidatorSwitched
+class UpdateExecutorRequest(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.UpdateExecutorRequest
+    executor: SyncExecutorPayload
+
+
+class ExecutorUpdated(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorUpdated
     executor_id: UUID
 
 
-class ValidatorSwitchFailed(BaseMinerPortalRequest):
-    message_type: RequestType = RequestType.ValidatorSwitchFailed
+class ExecutorUpdateFailed(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorUpdateFailed
     executor_id: UUID
     error: str
