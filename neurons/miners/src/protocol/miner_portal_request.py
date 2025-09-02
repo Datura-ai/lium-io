@@ -45,6 +45,7 @@ class SyncExecutorPayload(BaseModel):
     validator: str
     address: str
     port: int
+    price_per_hour: float | None = None
 
 
 class AddExecutorRequest(BaseMinerPortalRequest):
@@ -85,7 +86,6 @@ class SyncExecutorCentralMinerRequest(BaseMinerPortalRequest):
 
 class SyncExecutorCentralMinerSuccess(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.SyncExecutorCentralMinerSuccess
-    miner_hotkey: str
     payload: list[Executor]
 
 
