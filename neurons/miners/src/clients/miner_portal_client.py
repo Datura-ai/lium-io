@@ -31,6 +31,9 @@ from protocol.miner_portal_request import (
     SyncExecutorCentralMinerRequest,
     SyncExecutorCentralMinerSuccess,
     SyncExecutorCentralMinerFailed,
+    UpdateExecutorRequest,
+    ExecutorUpdated,
+    ExecutorUpdateFailed,
 )
 
 logger = logging.getLogger(__name__)
@@ -185,6 +188,12 @@ class MinerPortalClient:
                     validator=request.payload.validator_hotkey,
                     price_per_hour=request.payload.price_per_hour,
                 )
+            )
+            self.message_queue.append(result)
+
+        if isinstance(request, UpdateExecutorRequest):
+            result: Union[ExecutorUpdated, ExecutorUpdateFailed] = self.executor_service.update(
+                request,
             )
             self.message_queue.append(result)
 
