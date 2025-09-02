@@ -14,6 +14,7 @@ from daos.executor import ExecutorDao
 from models.executor import Executor
 
 from protocol.miner_portal_request import (
+    SwitchValidatorRequest,
     ExecutorAdded,
     AddExecutorFailed,
     SyncExecutorMinerPortalRequest,
@@ -22,6 +23,8 @@ from protocol.miner_portal_request import (
     SyncExecutorCentralMinerRequest,
     SyncExecutorCentralMinerSuccess,
     SyncExecutorCentralMinerFailed,
+    ValidatorSwitched,
+    ValidatorSwitchFailed,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +57,21 @@ class ExecutorService:
             return AddExecutorFailed(
                 executor_id=executor.uuid,
                 error=str(log_text),
+            )
+    
+    def switch_validator(self, payload: SwitchValidatorRequest) -> Union[ValidatorSwitched, ValidatorSwitchFailed]:
+        try:
+            executor = self.executor_dao.find_by_uuid(str(payload.executor_id))
+            executor.validator = payload.payload.validator_hotkey
+            self.executor_dao.update(executor)
+            logger.info("Switched validator for executor (id=%s)", str(executor.uuid))
+            return ValidatorSwitched(
+                executor_id=executor.uuid,
+            )
+        except Exception as e:
+            return ValidatorSwitchFailed(
+                executor_id=executor.uuid,
+                error=str(e),
             )
 
     def sync_executor_miner_portal(self, request: SyncExecutorMinerPortalRequest) -> Union[SyncExecutorMinerPortalSuccess, SyncExecutorMinerPortalFailed]:

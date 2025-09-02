@@ -23,6 +23,7 @@ from protocol.miner_request import (
 from protocol.miner_portal_request import (
     BaseMinerPortalRequest,
     AddExecutorRequest,
+    SwitchValidatorRequest,
     ExecutorAdded,
     AddExecutorFailed,
     SyncExecutorMinerPortalRequest,
@@ -31,6 +32,8 @@ from protocol.miner_portal_request import (
     SyncExecutorCentralMinerRequest,
     SyncExecutorCentralMinerSuccess,
     SyncExecutorCentralMinerFailed,
+    ValidatorSwitched,
+    ValidatorSwitchFailed,
 )
 
 logger = logging.getLogger(__name__)
@@ -185,6 +188,12 @@ class MinerPortalClient:
                     validator=request.payload.validator_hotkey,
                     price_per_hour=request.payload.price_per_hour,
                 )
+            )
+            self.message_queue.append(result)
+
+        if isinstance(request, SwitchValidatorRequest):
+            result: Union[ValidatorSwitched, ValidatorSwitchFailed] = self.executor_service.switch_validator(
+                request,
             )
             self.message_queue.append(result)
 

@@ -10,6 +10,7 @@ from models.executor import Executor
 
 class RequestType(enum.Enum):
     AddExecutorRequest = "AddExecutorRequest"
+    SwitchValidatorRequest = "SwitchValidatorRequest"
     ExecutorAdded = "ExecutorAdded"
     AddExecutorFailed = "AddExecutorFailed"
     SyncExecutorMinerPortalRequest = "SyncExecutorMinerPortalRequest"
@@ -18,6 +19,8 @@ class RequestType(enum.Enum):
     SyncExecutorCentralMinerRequest = "SyncExecutorCentralMinerRequest"
     SyncExecutorCentralMinerSuccess = "SyncExecutorCentralMinerSuccess"
     SyncExecutorCentralMinerFailed = "SyncExecutorCentralMinerFailed"
+    ValidatorSwitched = "ValidatorSwitched"
+    ValidatorSwitchFailed = "ValidatorSwitchFailed"
 
 
 class BaseMinerPortalRequest(BaseRequest):
@@ -40,6 +43,10 @@ class AddExecutorPayload(BaseModel):
         return self
 
 
+class SwitchValidatorPayload(BaseModel):
+    validator_hotkey: str
+
+
 class SyncExecutorPayload(BaseModel):
     uuid: UUID
     validator: str
@@ -53,6 +60,12 @@ class AddExecutorRequest(BaseMinerPortalRequest):
     executor_id: UUID
     validator_hotkey: str
     payload: AddExecutorPayload
+
+
+class SwitchValidatorRequest(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.SwitchValidatorRequest
+    executor_id: UUID
+    payload: SwitchValidatorPayload
 
 
 class ExecutorAdded(BaseMinerPortalRequest):
@@ -91,4 +104,15 @@ class SyncExecutorCentralMinerSuccess(BaseMinerPortalRequest):
 
 class SyncExecutorCentralMinerFailed(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.SyncExecutorCentralMinerFailed
+    error: str
+
+
+class ValidatorSwitched(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ValidatorSwitched
+    executor_id: UUID
+
+
+class ValidatorSwitchFailed(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ValidatorSwitchFailed
+    executor_id: UUID
     error: str
