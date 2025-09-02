@@ -13,6 +13,8 @@ from daos.executor import ExecutorDao
 from models.executor import Executor
 from core.utils import get_collateral_contract, _m
 from core.const import REQUIRED_DEPOSIT_AMOUNT
+from celium_collateral_contracts.address_conversion import h160_to_ss58
+from bittensor.utils.balance import Balance
 
 logging.basicConfig(level=logging.INFO)
 
@@ -173,6 +175,48 @@ class CliService:
             ))
             return False
 
+    def get_eth_ss58_address(self) -> str:
+        """
+        Get the Ethereum SS58 address for the Bittensor hotkey.
+        :return: Ethereum SS58 address
+        """
+        account = Account.from_key(self.private_key)
+        ss58_address = h160_to_ss58(account.address)
+        return ss58_address
+
+    def transfer_tao_to_eth_address(self, amount: float) -> bool:
+        """
+        Transfer TAO to the Ethereum SS58 address.
+        :param amount: Amount of TAO to transfer
+        :return: True if successful, False otherwise
+        """
+        try:
+            ss58_address = self.get_eth_ss58_address()
+            self.get_node()
+            print(f'Transferring {amount} TAO to Ethereum SS58 address {ss58_address}.')
+            print('Please enter your bittensor wallet password:')
+            self.subtensor.transfer(
+                wallet=self.wallet,
+                dest=ss58_address,
+                amount=Balance.from_tao(amount, self.netuid),
+                wait_for_inclusion=True,
+                wait_for_finalization=True
+            )
+            self.logger.info(_m(
+                "✅ Transferred TAO to Ethereum SS58 address successfully",
+                extra={**self.default_extra, "amount": amount, "to_address": ss58_address}
+            ))
+        except Exception as e:
+            self.logger.error(_m(
+                "❌ Failed to transfer TAO to Ethereum SS58 address",
+                extra={**self.default_extra, "amount": amount, "to_address": ss58_address, "error": str(e)}
+            ))
+
+    async def get_balance_of_eth_address(self) -> str:
+        balance = await self.collateral_contract.get_balance(self.collateral_contract.miner_address)
+        self.logger.info(f"Balance of Eth address: {balance} TAO")
+        return balance
+
     def get_uid_for_hotkey(self, hotkey):
         metagraph = self.subtensor.metagraph(netuid=self.netuid)
         return metagraph.hotkeys.index(hotkey)
@@ -235,7 +279,7 @@ class CliService:
             if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
                 self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
                 return False
-            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
+            deposit_amount = self._get_required_deposit_amount(gpu_type, gpu_count)
             if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
                 deposit_amount = settings.REQUIRED_TAO_COLLATERAL
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
@@ -282,7 +326,7 @@ class CliService:
             if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
                 self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
                 return False
-            deposit_amount = gpu_count * REQUIRED_DEPOSIT_AMOUNT[gpu_type]
+            deposit_amount = self._get_required_deposit_amount(gpu_type, gpu_count)
             if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
                 deposit_amount = settings.REQUIRED_TAO_COLLATERAL
             self.logger.info(f"Calculated deposit amount: {deposit_amount} TAO for {gpu_count}x {gpu_type}")
@@ -483,6 +527,23 @@ class CliService:
             return False
 
     @require_executor_dao
+    async def switch_validator(self, address: str, port: int, validator: str):
+        """
+        Switch validator for an executor by address and port.
+        :param address: Executor IP address
+        :param port: Executor port
+        :param validator: Validator hotkey
+        :return: True if successful, False otherwise
+        """
+        try:
+            self.executor_dao.update(Executor(uuid=uuid.uuid4(), address=address, port=port, validator=validator))
+            self.logger.info(f"✅ Successfully switched validator for executor {address}:{port} to {validator}")
+            return True
+        except Exception as e:
+            self.logger.error("Failed in switching validator: %s", str(e))
+            return False
+
+    @require_executor_dao
     async def remove_executor(self, address: str, port: int):
         """
         Remove an executor from the database by address and port.
@@ -497,3 +558,12 @@ class CliService:
         except Exception as e:
             self.logger.error("Failed in removing an executor: %s", str(e))
             return False
+
+    def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> float:
+        # Handle missing GPU model gracefully
+        unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT.get(gpu_type)
+        if unit_tao_amount is None:
+            raise ValueError(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
+
+        required_deposit_amount = unit_tao_amount * gpu_count * settings.COLLATERAL_DAYS
+        return round(required_deposit_amount, 6)

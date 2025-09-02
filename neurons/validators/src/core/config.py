@@ -39,30 +39,36 @@ class Settings(BaseSettings):
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
-    COMPUTE_APP_URI: str = "wss://celiumcompute.ai"
+    COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io")
     COMPUTE_REST_API_URL: str | None = Field(
-        env="COMPUTE_REST_API_URL", default="https://celiumcompute.ai/api"
+        env="COMPUTE_REST_API_URL", default="https://lium.io/api"
     )
     TAO_PRICE_API_URL: str = Field(env="TAO_PRICE_API_URL", default="https://api.coingecko.com/api/v3/coins/bittensor")
-    COLLATERAL_DAYS: int = Field(env="COLLATERAL_DAYS", default=1)
+    COLLATERAL_DAYS: int = 7
     ENV: str = Field(env="ENV", default="dev")
 
     PORTION_FOR_UPTIME: float = 0.05
 
     PORTION_FOR_SYSBOX: float = 0.2
 
-    TIME_DELTA_FOR_EMISSION: float = 0.5
+    TIME_DELTA_FOR_EMISSION: float = 0.01
 
     # Read version from version.txt
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    DEBUG_COLLATERAL_CONTRACT: bool = True
+    ENABLE_COLLATERAL_CONTRACT: bool = True
+    ENABLE_NEW_INCENTIVE_ALGO: bool = False
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
     )
+
+    # GPU types that will be excluded in collateral checks
+    COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [
+        "NVIDIA B200"
+    ]
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
@@ -127,6 +133,7 @@ class Settings(BaseSettings):
         miner.axon_info         = type("AxonInfo", (object,), {})()
         miner.axon_info.ip      = self.DEBUG_MINER_ADDRESS
         miner.axon_info.port    = self.DEBUG_MINER_PORT
+        miner.axon_info.is_serving = True
         return miner
 
 

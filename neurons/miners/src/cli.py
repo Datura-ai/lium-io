@@ -22,12 +22,41 @@ def associate_eth(private_key: str):
         logger.info("✅ Successfully associated ethereum address with hotkey")
     else:
         logger.error("❌ Failed to associate ethereum address with hotkey")
-        
+
+
 @cli.command()
 def get_associated_evm_address():
     """Get the associated EVM address for the Bittensor hotkey."""
     cli_service = CliService()
     cli_service.get_associated_evm_address()
+
+
+@cli.command()
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def get_eth_ss58_address(private_key: str):
+    """Associate a miner's ethereum address with their hotkey."""
+    cli_service = CliService(private_key=private_key)
+    ss58_address = cli_service.get_eth_ss58_address()
+    print(ss58_address)
+
+
+@cli.command()
+@click.option(
+    "--amount", type=float, required=False, help="Amount of TAO to transfer"
+)
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def transfer_tao_to_eth_address(private_key: str, amount: float):
+    """Associate a miner's ethereum address with their hotkey."""
+    cli_service = CliService(private_key=private_key)
+    cli_service.transfer_tao_to_eth_address(amount)
+
+
+@cli.command()
+@click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
+def get_balance_of_eth_address(private_key: str):
+    """Get the balance of the Eth address for the Bittensor hotkey."""
+    cli_service = CliService(private_key=private_key)
+    asyncio.run(cli_service.get_balance_of_eth_address())
 
 
 @cli.command()
@@ -134,6 +163,22 @@ def show_executors():
     success = asyncio.run(cli_service.show_executors())
     if not success:
         logger.error("Failed in showing executors.")
+
+
+@cli.command()
+@click.option("--address", prompt="IP Address", help="IP address of executor")
+@click.option("--port", type=int, prompt="Port", help="Port of executor")
+@click.option(
+    "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
+)
+def switch_validator(address: str, port: int, validator: str):
+    """Switch validator"""
+    if click.confirm('Are you sure you want to switch validator? This may lead to unexpected results'):
+        logger.info("Switching validator(%s) of an executor (%s:%d)", validator, address, port)
+        cli_service = CliService(with_executor_db=True)
+        asyncio.run(cli_service.switch_validator(address, port, validator))
+    else:
+        logger.info("Cancelled.")
 
 
 @cli.command()

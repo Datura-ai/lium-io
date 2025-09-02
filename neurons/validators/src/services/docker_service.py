@@ -25,6 +25,7 @@ from payload_models.payloads import (
     FailedContainerErrorCodes,
     FailedContainerRequest,
     FailedContainerErrorTypes,
+    ExternalVolumeInfo,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -47,6 +48,10 @@ REPOSITORIES = [
 ]
 
 LOG_STREAM_INTERVAL = 5  # 5 seconds
+
+DOCKER_VOLUME_PLUGINS = {
+    "s3fs": "mochoa/s3fs-volume-plugin"
+}
 
 
 class DockerService:
@@ -317,6 +322,48 @@ class DockerService:
             raise_exception=False
         )
 
+    async def create_s3fs_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        log_extra: dict,
+        volume_info: ExternalVolumeInfo,
+        log_tag: str,
+    ):
+        # install docker volume plugin
+        command = f"/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
+        await ssh_client.run(command)
+
+        # disable volume plugin
+        command = f"/usr/bin/docker plugin disable s3fs -f"
+        await ssh_client.run(command)
+
+        # set credentials
+        command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
+        await ssh_client.run(command)
+
+        # enable volume plugin
+        command = f"/usr/bin/docker plugin enable s3fs"
+        await ssh_client.run(command)
+
+        # create volume
+        command = f"/usr/bin/docker volume create -d s3fs {volume_info.name}"
+        return await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Creating docker volume",
+            log_extra=log_extra,
+            raise_exception=True
+        )
+
+    async def disable_s3fs_volume_plugin(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+    ):
+        # disable volume plugin
+        command = f"/usr/bin/docker plugin disable s3fs -f"
+        await ssh_client.run(command)
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -324,7 +371,9 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
-        volume_name = payload.volume_name
+        local_volume = payload.local_volume
+        external_volume_info = payload.external_volume_info
+
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
@@ -333,8 +382,9 @@ class DockerService:
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
             "docker_image": payload.docker_image,
-            "volume_name": volume_name,
-            "edit_pod": True if volume_name else False,
+            "local_volume": local_volume,
+            "edit_pod": True if local_volume else False,
+            "external_volume": external_volume_info.name if external_volume_info else None,
             "debug": payload.debug,
         }
 
@@ -350,7 +400,7 @@ class DockerService:
 
         logger.info(
             _m(
-                "Edit Docker Container" if volume_name else "Create Docker Container",
+                "Edit Docker Container" if local_volume else "Create Docker Container",
                 extra=get_extra_info({**default_extra, "payload": str(payload)}),
             ),
         )
@@ -360,14 +410,10 @@ class DockerService:
 
         try:
             # generate port maps
-            if custom_options and custom_options.internal_ports:
-                port_maps = await self.generate_portMappings(
-                    payload.miner_hotkey, payload.executor_id, custom_options.internal_ports
-                )
-            else:
-                port_maps = await self.generate_portMappings(
-                    payload.miner_hotkey, payload.executor_id
-                )
+            custom_internal_ports = custom_options.internal_ports if custom_options and custom_options.internal_ports else None
+            port_maps = await self.generate_portMappings(
+                payload.miner_hotkey, payload.executor_id, custom_internal_ports
+            )
 
             # Add profiler for port mappings generation
             profilers.append({"name": "Port mappings generated", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -484,7 +530,7 @@ class DockerService:
                 # )
 
                 # Get the container path from the first volume
-                container_path = sanitized_volumes[0].split(':')[-1] if sanitized_volumes else '/root'
+                local_volume_path = sanitized_volumes[0].split(':')[-1] if sanitized_volumes else '/root'
                 entrypoint_flag = (
                     f"--entrypoint {custom_options.entrypoint}"
                     if custom_options
@@ -522,32 +568,43 @@ class DockerService:
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     sleep=10,
-                    clear_volume=False if volume_name else True
+                    clear_volume=False if local_volume else True,
                 )
 
                 # Add profiler for docker volume creation
                 profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
-                if not volume_name:
+                if not local_volume:
                     # create docker volume
-                    volume_name = f"volume_{uuid}"
-                    command = f"/usr/bin/docker volume create {volume_name}"
+                    local_volume = f"volume_{uuid}"
+                    command = f"/usr/bin/docker volume create {local_volume}"
                     await self.execute_and_stream_logs(
                         ssh_client=ssh_client,
                         command=command,
                         log_tag=log_tag,
-                        log_text=f"Creating docker volume ${volume_name}",
+                        log_text=f"Creating docker volume {local_volume}",
                         log_extra=default_extra,
                         timeout=10,
                     )
 
-                # Add profiler for docker volume creation
-                profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                volume_flag = f"-v {local_volume}:{local_volume_path}"
 
-                # Create a volume flag for the Docker run command from the first element's container path
-                volume_flag = f"-v {volume_name}:{container_path}"
+                if external_volume_info:
+                    await self.create_s3fs_volume(
+                        ssh_client=ssh_client,
+                        log_extra=default_extra,
+                        volume_info=external_volume_info,
+                        log_tag=log_tag,
+                    )
+                    # Add profiler for docker volume creation
+                    profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
+                    payload.is_sysbox = False
+
+                    volume_flag += f" -v {external_volume_info.name}:/mnt"
+
                 container_name = f"container_{uuid}"
 
                 # Network permission flags (permission to create a network interface inside the container)
@@ -557,38 +614,21 @@ class DockerService:
                     "--device /dev/net/tun "
                 )
 
-                if payload.debug:
-                    command = (
-                        f'/usr/bin/docker run -d '
-                        f'{("--runtime=sysbox-runc" if payload.is_sysbox else "")} '
-                        f'{net_perm_flags} ' # Network permission flags
-                        f'{port_flags} '
-                        f'-v "/var/run/docker.sock:/var/run/docker.sock" '
-                        f'{volume_flag} '
-                        f'{entrypoint_flag} '
-                        f'{env_flags} '
-                        f'{shm_size_flag} '
-                        f'--restart unless-stopped '
-                        f'--name {container_name} '
-                        f'{payload.docker_image} '
-                        f'{startup_commands}'
-                    )
-                else:
-                    command = (
-                        f'/usr/bin/docker run -d '
-                        f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
-                        f'{net_perm_flags} ' # Network permission flags
-                        f'{port_flags} '
-                        f'{volume_flag} '
-                        f'{entrypoint_flag} '
-                        f'{env_flags} '
-                        f'{shm_size_flag} '
-                        f'--gpus all '
-                        f'--restart unless-stopped '
-                        f'--name {container_name} '
-                        f'{payload.docker_image} '
-                        f'{startup_commands}'
-                    )
+                command = (
+                    f'/usr/bin/docker run -d '
+                    f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
+                    f'{net_perm_flags} '  # Network permission flags
+                    f'{port_flags} '
+                    f'{volume_flag} '
+                    f'{entrypoint_flag} '
+                    f'{env_flags} '
+                    f'{shm_size_flag} '
+                    f'--gpus all '
+                    f'--restart unless-stopped '
+                    f'--name {container_name} '
+                    f'{payload.docker_image} '
+                    f'{startup_commands}'
+                )
 
                 logger.info(f"Running command: {command}")
 
@@ -651,7 +691,7 @@ class DockerService:
                     command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
                     await ssh_client.run(command)
 
-                # add environment variables 
+                # add environment variables
                 if custom_options and custom_options.environment:
                     for k, v in custom_options.environment.items():
                         if k and v and k.strip() and str(v).strip():
@@ -692,7 +732,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     container_name=container_name,
-                    volume_name=volume_name,
+                    volume_name=local_volume,
                     port_maps=[
                         (docker_port, external_port) for docker_port, _, external_port in port_maps
                     ],
@@ -840,11 +880,17 @@ class DockerService:
                 command = f"/usr/bin/docker rm {payload.container_name} -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
-                command = f"/usr/bin/docker volume rm {payload.volume_name} -f"
-                await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
-
                 command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+
+                if payload.local_volume:
+                    command = f"/usr/bin/docker volume rm {payload.local_volume}"
+                    await ssh_client.run(command)
+
+                if payload.external_volume:
+                    command = f"/usr/bin/docker volume rm {payload.external_volume}"
+                    await ssh_client.run(command)
+                    await self.disable_s3fs_volume_plugin(ssh_client)
 
                 logger.info(
                     _m(
@@ -853,7 +899,8 @@ class DockerService:
                             {
                                 **default_extra,
                                 "container_name": payload.container_name,
-                                "volume_name": payload.volume_name,
+                                "local_volume": payload.local_volume,
+                                "external_volume": payload.external_volume,
                             }
                         ),
                     ),
@@ -871,8 +918,6 @@ class DockerService:
                 return ContainerDeleted(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    container_name=payload.container_name,
-                    volume_name=payload.volume_name,
                 )
         except Exception as e:
             log_text = _m(

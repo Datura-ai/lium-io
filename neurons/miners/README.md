@@ -45,7 +45,7 @@ docker --version
 ```
 
 If one of them isn't installed properly, install using following link:     
-For bittensor, use [This Link](https://github.com/opentensor/bittensor/blob/master/README.md#install-bittensor-sdk)
+For bittensor, use [This Link](https://github.com/opentensor/bittensor/blob/master/README.md#install-bittensor-sdk) \
 For docker, use [This Link](https://docs.docker.com/engine/install/)
 
 #### Step 3: Setup ENV
@@ -61,6 +61,8 @@ Fill in your information for:
 
 `EXTERNAL_IP_ADDRESS`: The external IP address of your central miner server. Make sure it is open to external connections on the `EXTERNAL PORT`
 
+`RENTAL_REQUEST_HOOK`: (Optional) The URL for the call hook. Miners will terminate chute programs within seconds using this hook.
+
 `HOST_WALLET_DIR`: The directory path of your wallet on the machine.
 
 `INTERNAL_PORT` and `EXTERNAL_PORT`: Optionally customize these ports. Make sure the `EXTERNAL PORT` is open for external connections to connect to the validators.
@@ -72,7 +74,9 @@ Fill in your information for:
 cd neurons/miners && docker compose up -d
 ```
 
-### Associating Your Ethereum Address
+## Managing Ethereum Address
+
+### Associating Your Ethereum Address into Subnet
 
 Before managing executors, you need to associate your Ethereum address with your Bittensor hotkey. This is a one-time setup requirement. Use the following command:
 
@@ -82,21 +86,52 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py associate-et
 
 - `<ethereum-private-key>`: Your Ethereum private key that will be associated with your Bittensor hotkey.
 
-You will be prompted to enter your Bittensor wallet password to complete the association.
-
 ### Get the associated Ethereum Address
 
 ```bash
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-associated-evm-address
 ```
 
+### Transfer TAO to Ethereum Address from your Miner Wallet
+
+You need to fund/transfer TAO into your Ethereum Address to deposit collateral (TAO) for your executors.
+
+To transfer TAO from your miner wallet (the wallet in your env config), you can use the following command 
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py transfer-tao-to-eth-address --amount <tao-amount> --private-key <ethereum-private-key>
+```
+- `<tao-amount>`: TAO amount you are going to transfer.
+- `<ethereum-private-key>`: Your Ethereum private key that is used for association.
+
+You will be prompted to enter your Bittensor wallet password to proceed the transfer.
+
+### Convert Ethereum Address to SS58 format
+You can transfer TAO to the Ethereum Address manually with btcli.
+
+To do so, you need to have SS58 format address of your Ethereum Address.
+
+You can transfer TAO to this address from any wallet.
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-eth-ss58-address --private-key <ethereum-private-key>
+```
+
+- `<ethereum-private-key>`: Your Ethereum private key that is used for association.
+
+### Get Balance of Ethereum Address
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-balance-of-eth-address --private-key <ethereum-private-key>
+```
+
+- `<ethereum-private-key>`: Your Ethereum private key that is used for association.
+
+
 ## Managing Executors
 
 ### What is a Validator Hotkey?
 
 The **validator hotkey** is a unique identifier tied to a validator that authenticates and verifies the performance of your executor machines. When you specify a validator hotkey during executor registration, it ensures that your executor is validated by this specific validator.
-
-To switch to a different validator first follow the instructions for removing an executor. After removing the executor, you need to re-register executors by running the add-executor command again (Step 2 of Adding an Executor).
 
 ### Adding an Executor
 
@@ -124,6 +159,18 @@ To list added executors from the central miner, follow these steps:
     ```bash
     docker exec -it <docker instance> pdm run /root/app/src/cli.py show-executors
     ```
+
+### Switch validator
+
+To switch validator you can use the following command
+
+```bash
+docker exec -it <docker instance> pdm run /root/app/src/cli.py switch-validator --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey>
+```
+
+- `<executor-ip-address>`: The IP address of the executor machine.
+- `<executor-port>`: The port number used for the executor.
+- `<validator-hotkey>`: The validator hotkey you want to switch
 
 ### Removing an Executor
 

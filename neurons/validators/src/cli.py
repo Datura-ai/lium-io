@@ -21,7 +21,7 @@ from payload_models.payloads import (
     AddSshPublicKeyRequest,
     CustomOptions,
     GetPodLogsRequestFromServer,
-    PodLogsResponseToServer,
+    AddDebugSshKeyRequest,
 )
 
 configure_logs_of_other_modules()
@@ -269,138 +269,191 @@ async def _debug_validator(count: int):
 
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
-@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
-@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--docker_image", prompt="Docker Image", help="Docker Image")
-@click.option("--volume_name", required=False, help="Volume name when editing pod")
-def create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str, volume_name: str):
-    asyncio.run(_create_container_to_miner(miner_hotkey, miner_address, miner_port, executor_id, docker_image, volume_name))
+def create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
+    asyncio.run(_create_container_to_miner(miner_hotkey, executor_id, docker_image))
 
 
-async def _create_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str, volume_name: str):
-    miner_service: MinerService = ioc["MinerService"]
+async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
+    try:
+        subtensor_client = await SubtensorClient.initialize()
+        miner = subtensor_client.get_miner(miner_hotkey)
 
-    payload = ContainerCreateRequest(
-        docker_image=docker_image,
-        user_public_keys=["user_public_key"],
-        executor_id=executor_id,
-        miner_hotkey=miner_hotkey,
-        miner_address=miner_address,
-        miner_port=miner_port,
-        volume_name=volume_name,
-    )
-    response = await miner_service.handle_container(payload)
-    print('response ==>', response)
+        miner_service: MinerService = ioc["MinerService"]
+
+        payload = ContainerCreateRequest(
+            docker_image=docker_image,
+            user_public_keys=["user_public_key"],
+            executor_id=executor_id,
+            miner_hotkey=miner_hotkey,
+            miner_address=miner.axon_info.ip,
+            miner_port=miner.axon_info.port,
+        )
+        response = await miner_service.handle_container(payload)
+        print('response ==>', response)
+    finally:
+        logger.info("Shutting down subtensor client")
+        await SubtensorClient.shutdown()
 
 
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
-@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
-@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--container_name", prompt="Container name", help="Container name")
 @click.option("--volume_name", required=False, help="Volume name when editing pod")
-def delete_pod(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str, volume_name: str):
-    asyncio.run(_delete_pod(miner_hotkey, miner_address, miner_port, executor_id, container_name, volume_name))
+def delete_pod(miner_hotkey: str, executor_id: str, container_name: str, volume_name: str):
+    asyncio.run(_delete_pod(miner_hotkey, executor_id, container_name, volume_name))
 
 
-async def _delete_pod(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str, volume_name: str):
-    miner_service: MinerService = ioc["MinerService"]
+async def _delete_pod(miner_hotkey: str, executor_id: str, container_name: str, volume_name: str):
+    try:
+        subtensor_client = await SubtensorClient.initialize()
+        miner = subtensor_client.get_miner(miner_hotkey)
 
-    payload = ContainerDeleteRequest(
-        miner_hotkey=miner_hotkey,
-        miner_address=miner_address,
-        miner_port=miner_port,
-        executor_id=executor_id,
-        container_name=container_name,
-        volume_name=volume_name,
-    )
-    response = await miner_service.handle_container(payload)
-    print('response ==>', response)
+        miner_service: MinerService = ioc["MinerService"]
+
+        payload = ContainerDeleteRequest(
+            miner_hotkey=miner_hotkey,
+            miner_address=miner.axon_info.ip,
+            miner_port=miner.axon_info.port,
+            executor_id=executor_id,
+            container_name=container_name,
+            volume_name=volume_name,
+        )
+        response = await miner_service.handle_container(payload)
+        print('response ==>', response)
+    finally:
+        logger.info("Shutting down subtensor client")
+        await SubtensorClient.shutdown()
 
 
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
-@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
-@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--docker_image", prompt="Docker Image", help="Docker Image")
-def create_custom_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
-    asyncio.run(_create_custom_container_to_miner(miner_hotkey, miner_address, miner_port, executor_id, docker_image))
+def create_custom_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
+    asyncio.run(_create_custom_container_to_miner(miner_hotkey, executor_id, docker_image))
 
 
-async def _create_custom_container_to_miner(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, docker_image: str):
-    miner_service: MinerService = ioc["MinerService"]
-    # mock custom options
-    custom_options = CustomOptions(
-        volumes=["/var/runer/docker.sock:/var/runer/docker.sock"],
-        environment={"UPDATED_PUBLIC_KEY": "user_public_key"},
-        entrypoint="",
-        internal_ports=[22, 8002],
-        startup_commands="/bin/bash -c 'apt-get update && apt-get install -y ffmpeg && pip install opencv-python'",
-    )
-    payload = ContainerCreateRequest(
-        docker_image=docker_image,
-        user_public_keys=["user_public_key"],
-        executor_id=executor_id,
-        miner_hotkey=miner_hotkey,
-        miner_address=miner_address,
-        miner_port=miner_port,
-        custom_options=custom_options
-    )
-    await miner_service.handle_container(payload)
+async def _create_custom_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
+    try:
+        subtensor_client = await SubtensorClient.initialize()
+        miner = subtensor_client.get_miner(miner_hotkey)
+
+        miner_service: MinerService = ioc["MinerService"]
+        # mock custom options
+        custom_options = CustomOptions(
+            volumes=["/var/runer/docker.sock:/var/runer/docker.sock"],
+            environment={"UPDATED_PUBLIC_KEY": "user_public_key"},
+            entrypoint="",
+            internal_ports=[22, 8002],
+            startup_commands="/bin/bash -c 'apt-get update && apt-get install -y ffmpeg && pip install opencv-python'",
+        )
+        payload = ContainerCreateRequest(
+            docker_image=docker_image,
+            user_public_keys=["user_public_key"],
+            executor_id=executor_id,
+            miner_hotkey=miner_hotkey,
+            miner_address=miner.axon_info.ip,
+            miner_port=miner.axon_info.port,
+            custom_options=custom_options
+        )
+        response = await miner_service.handle_container(payload)
+        print('response ==>', response)
+    finally:
+        logger.info("Shutting down subtensor client")
+        await SubtensorClient.shutdown()
 
 
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
-@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
-@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--container_name", prompt="Container name", help="Docker container name")
 @click.option("--user_public_key", prompt="User Public key", help="public ssh key")
-def add_sshkey_to_container(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str, user_public_key: str):
-    asyncio.run(_add_sshkey_to_container(miner_hotkey, miner_address, miner_port, executor_id, container_name, user_public_key))
+def add_sshkey_to_container(miner_hotkey: str, executor_id: str, container_name: str, user_public_key: str):
+    asyncio.run(_add_sshkey_to_container(miner_hotkey, executor_id, container_name, user_public_key))
 
 
-async def _add_sshkey_to_container(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str, user_public_key: str):
-    miner_service: MinerService = ioc["MinerService"]
+async def _add_sshkey_to_container(miner_hotkey: str, executor_id: str, container_name: str, user_public_key: str):
+    try:
+        subtensor_client = await SubtensorClient.initialize()
+        miner = subtensor_client.get_miner(miner_hotkey)
 
-    payload = AddSshPublicKeyRequest(
-        executor_id=executor_id,
-        miner_hotkey=miner_hotkey,
-        miner_address=miner_address,
-        miner_port=miner_port,
-        container_name=container_name,
-        user_public_keys=[user_public_key],
-    )
-    response = await miner_service.handle_container(payload)
-    print('response ==>', response)
+        miner_service: MinerService = ioc["MinerService"]
+
+        payload = AddSshPublicKeyRequest(
+            executor_id=executor_id,
+            miner_hotkey=miner_hotkey,
+            miner_address=miner.axon_info.ip,
+            miner_port=miner.axon_info.port,
+            container_name=container_name,
+            user_public_keys=[user_public_key],
+        )
+        response = await miner_service.handle_container(payload)
+        print('response ==>', response)
+    finally:
+        logger.info("Shutting down subtensor client")
+        await SubtensorClient.shutdown()
 
 
 @cli.command()
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
-@click.option("--miner_address", prompt="Miner Address", help="Miner IP Address")
-@click.option("--miner_port", type=int, prompt="Miner Port", help="Miner Port")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--container_name", prompt="Container name", help="Docker container name")
-def get_pod_logs(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str):
-    asyncio.run(_get_pod_logs(miner_hotkey, miner_address, miner_port, executor_id, container_name))
+def get_pod_logs(miner_hotkey: str, executor_id: str, container_name: str):
+    asyncio.run(_get_pod_logs(miner_hotkey, executor_id, container_name))
 
 
-async def _get_pod_logs(miner_hotkey: str, miner_address: str, miner_port: int, executor_id: str, container_name: str):
-    miner_service: MinerService = ioc["MinerService"]
+async def _get_pod_logs(miner_hotkey: str, executor_id: str, container_name: str):
+    try:
+        subtensor_client = await SubtensorClient.initialize()
+        miner = subtensor_client.get_miner(miner_hotkey)
 
-    payload = GetPodLogsRequestFromServer(
-        executor_id=executor_id,
-        miner_hotkey=miner_hotkey,
-        miner_address=miner_address,
-        miner_port=miner_port,
-        container_name=container_name,
-    )
-    response = await miner_service.get_pod_logs(payload)
-    print('response ==>', response)
+        miner_service: MinerService = ioc["MinerService"]
 
+        payload = GetPodLogsRequestFromServer(
+            miner_hotkey=miner_hotkey,
+            miner_address=miner.axon_info.ip,
+            miner_port=miner.axon_info.port,
+            executor_id=executor_id,
+            container_name=container_name,
+        )
+        response = await miner_service.get_pod_logs(payload)
+        print('response ==>', response)
+    finally:
+        logger.info("Shutting down subtensor client")
+        await SubtensorClient.shutdown()
+
+
+@cli.command()
+@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
+@click.option("--executor_id", prompt="Executor Id", help="Executor Id")
+@click.option("--public_key", prompt="Public Key", help="Public Key")
+def add_debug_ssh_key(miner_hotkey: str, executor_id: str, public_key: str):
+    asyncio.run(_add_debug_ssh_key(miner_hotkey, executor_id, public_key))
+
+
+async def _add_debug_ssh_key(miner_hotkey: str, executor_id: str, public_key: str):
+    try:
+        subtensor_client = await SubtensorClient.initialize()
+        miner = subtensor_client.get_miner(miner_hotkey)
+
+        miner_service: MinerService = ioc["MinerService"]
+
+        payload = AddDebugSshKeyRequest(
+            miner_hotkey=miner_hotkey,
+            miner_address=miner.axon_info.ip,
+            miner_port=miner.axon_info.port,
+            executor_id=executor_id,
+            public_key=public_key,
+        )
+
+        response = await miner_service.add_debug_ssh_key(payload)
+        print('response:', response)
+    finally:
+        logger.info("Shutting down subtensor client")
+        await SubtensorClient.shutdown()
 
 if __name__ == "__main__":
     cli()

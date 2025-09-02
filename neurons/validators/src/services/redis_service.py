@@ -8,6 +8,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
 from core.utils import _m
+from services.const import GPU_MODEL_RATES
 
 MACHINE_SPEC_CHANNEL = "MACHINE_SPEC_CHANNEL"
 STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
@@ -21,8 +22,12 @@ VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
+BANNED_GUIDS = "banned_guids"
+PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
 
 logger = logging.getLogger(__name__)
+
+PREV_TIME_DELTA_FOR_EMISSION = 0.5
 
 
 class RedisService:
@@ -159,7 +164,7 @@ class RedisService:
         await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
 
     async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
-        data = await self.hget(RENTED_MACHINE_PREFIX, f"{miner_hotkey}:{executor_id}")
+        data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
             return False
 
@@ -249,3 +254,28 @@ class RedisService:
             return 0.0
 
         return float(revenue)
+
+    async def set_portion_per_gpu_type(self, gpu_type: str, portion: float):
+        await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
+
+    async def get_portion_per_gpu_type(self, gpu_type: str):
+        portion = await self.hget(PORTION_PER_GPU_TYPE_SET, gpu_type)
+        if not portion:
+            gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
+            if gpu_model_rate == 0:
+                return 0.0
+
+            # for initial portion
+            revenue = await self.get_revenue_per_gpu_type(gpu_type)
+            return gpu_model_rate + PREV_TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
+
+        return float(portion)
+
+    async def set_banned_guids(self, guids: list[str]):
+        await self.redis.set(BANNED_GUIDS, json.dumps(guids))
+
+    async def get_banned_guids(self) -> list[str]:
+        data = await self.redis.get(BANNED_GUIDS)
+        if not data:
+            return []
+        return json.loads(data)

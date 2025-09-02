@@ -58,6 +58,7 @@ class ContainerRequestType(enum.Enum):
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
     ExecutorRentFinished = "ExecutorRentFinished"
     GetPodLogsRequestFromServer = "GetPodLogsRequestFromServer"
+    AddDebugSshKeyRequest = "AddDebugSshKeyRequest"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -68,13 +69,21 @@ class ContainerBaseRequest(BaseRequest):
     executor_id: str
 
 
+class ExternalVolumeInfo(BaseModel):
+    name: str
+    plugin: str
+    iam_user_access_key: str
+    iam_user_secret_key: str
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_keys: list[str] = []
     custom_options: CustomOptions | None = None
     debug: bool | None = None
-    volume_name: str | None = None  # when edit pod, volume_name is required
+    local_volume: str | None = None
+    external_volume_info: ExternalVolumeInfo | None = None
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
     docker_password: str | None = None  # when edit pod, docker_password is required
@@ -96,6 +105,11 @@ class AddSshPublicKeyRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
 
 
+class AddDebugSshKeyRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.AddDebugSshKeyRequest
+    public_key: str
+
+
 class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
@@ -104,7 +118,8 @@ class ContainerStopRequest(ContainerBaseRequest):
 class ContainerDeleteRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteRequest
     container_name: str
-    volume_name: str
+    local_volume: str | None = None
+    external_volume: str | None = None
 
 
 class GetPodLogsRequestFromServer(ContainerBaseRequest):
@@ -121,6 +136,8 @@ class ContainerResponseType(enum.Enum):
     FailedRequest = "FailedRequest"
     PodLogsResponseToServer = "PodLogsResponseToServer"
     FailedGetPodLogs = "FailedGetPodLogs"
+    DebugSshKeyAdded = "DebugSshKeyAdded"
+    FailedAddDebugSshKey = "FailedAddDebugSshKey"
 
 
 class ContainerBaseResponse(BaseRequest):
@@ -149,13 +166,19 @@ class ContainerStopped(ContainerBaseResponse):
 
 class ContainerDeleted(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
-    container_name: str
-    volume_name: str
 
 
 class SshPubKeyAdded(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
     user_public_keys: list[str] = []
+
+
+class DebugSshKeyAdded(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.DebugSshKeyAdded
+    address: str
+    port: int
+    ssh_username: str
+    ssh_port: int
 
 
 class FailedContainerErrorCodes(enum.Enum):
@@ -200,4 +223,9 @@ class PodLogsResponseToServer(ContainerBaseResponse):
 class FailedGetPodLogs(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedGetPodLogs
     container_name: str
+    msg: str
+
+
+class FailedAddDebugSshKey(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.FailedAddDebugSshKey
     msg: str
