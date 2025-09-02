@@ -64,6 +64,7 @@ class ExecutorService:
                     executor.validator = executor_payload.validator
                     executor.address = executor_payload.address
                     executor.port = executor_payload.port
+                    executor.price_per_hour = executor_payload.price_per_hour
                     self.executor_dao.update_by_uuid(executor.uuid, executor)
                     logger.info("Updated executor (id=%s)", str(executor.uuid))
                 else:
@@ -74,6 +75,7 @@ class ExecutorService:
                             validator=executor_payload.validator,
                             address=executor_payload.address,
                             port=executor_payload.port,
+                            price_per_hour=executor_payload.price_per_hour
                         )
                     )
 
@@ -90,11 +92,10 @@ class ExecutorService:
                 error=str(log_text),
             )
 
-    def sync_executor_central_miner(self, miner_hotkey: str, request: SyncExecutorCentralMinerRequest) -> Union[SyncExecutorCentralMinerSuccess, SyncExecutorCentralMinerFailed]:
+    def sync_executor_central_miner(self) -> Union[SyncExecutorCentralMinerSuccess, SyncExecutorCentralMinerFailed]:
         try:
             executors = self.executor_dao.get_all_executors()
             return SyncExecutorCentralMinerSuccess(
-                miner_hotkey=miner_hotkey,
                 payload=executors,
             )
         except Exception as e:
@@ -143,6 +144,7 @@ class ExecutorService:
                     response_obj["uuid"] = str(executor.uuid)
                     response_obj["address"] = executor.address
                     response_obj["port"] = executor.port
+                    response_obj["price"] = executor.price_per_hour
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(

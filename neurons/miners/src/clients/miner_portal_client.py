@@ -183,6 +183,7 @@ class MinerPortalClient:
                     address=request.payload.ip_address,
                     port=request.payload.port,
                     validator=request.payload.validator_hotkey,
+                    price_per_hour=request.payload.price_per_hour,
                 )
             )
             self.message_queue.append(result)
@@ -193,6 +194,6 @@ class MinerPortalClient:
             self.message_queue.append(result)
 
         if isinstance(request, SyncExecutorCentralMinerRequest):
-            result: Union[SyncExecutorCentralMinerSuccess, SyncExecutorCentralMinerFailed] = self.executor_service.sync_executor_central_miner(self.hotkey, request)
+            result: Union[SyncExecutorCentralMinerSuccess, SyncExecutorCentralMinerFailed] = self.executor_service.sync_executor_central_miner()
             self.message_queue.append(result)
             logger.info("Sync executor central miner response sent")
