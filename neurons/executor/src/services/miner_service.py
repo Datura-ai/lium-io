@@ -31,7 +31,6 @@ class MinerService:
             "root_dir": str(Path(__file__).resolve().parents[2]),
             "port_range": settings.RENTING_PORT_RANGE,
             "port_mappings": settings.RENTING_PORT_MAPPINGS,
-            "price": settings.RENTING_PRICE,
         }
 
     async def remove_ssh_key(self, paylod: UploadSShKeyPayload):
