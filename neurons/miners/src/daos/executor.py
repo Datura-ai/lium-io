@@ -10,7 +10,7 @@ class ExecutorDao(BaseDao):
         self.session.refresh(executor)
         return executor
 
-    def findOne(self, address: str, port: int):
+    def findOne(self, address: str, port: int) -> Executor:
         executor = self.session.query(Executor).filter_by(
             address=address, port=port).first()
         if not executor:
@@ -24,6 +24,7 @@ class ExecutorDao(BaseDao):
         existing_executor.address = executor.address
         existing_executor.port = executor.port
         existing_executor.validator = executor.validator
+        existing_executor.price_per_hour = executor.price_per_hour
 
         self.session.commit()
         self.session.refresh(existing_executor)
@@ -60,6 +61,7 @@ class ExecutorDao(BaseDao):
         existing_executor.validator = executor.validator
         existing_executor.address = executor.address
         existing_executor.port = executor.port
+        existing_executor.price_per_hour = executor.price_per_hour
         self.session.commit()
         self.session.refresh(existing_executor)
         return existing_executor

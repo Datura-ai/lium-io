@@ -15,7 +15,6 @@ class Settings(BaseSettings):
 
     RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
     RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
-    RENTING_PRICE: Optional[float] = Field(env="RENTING_PRICE", default=None)
 
     ENV: str = Field(env="ENV", default="dev")
     
