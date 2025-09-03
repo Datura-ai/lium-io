@@ -18,6 +18,9 @@ class RequestType(enum.Enum):
     SyncExecutorCentralMinerRequest = "SyncExecutorCentralMinerRequest"
     SyncExecutorCentralMinerSuccess = "SyncExecutorCentralMinerSuccess"
     SyncExecutorCentralMinerFailed = "SyncExecutorCentralMinerFailed"
+    UpdateExecutorRequest = "UpdateExecutorRequest"
+    ExecutorUpdated = "ExecutorUpdated"
+    ExecutorUpdateFailed = "ExecutorUpdateFailed"
 
 
 class BaseMinerPortalRequest(BaseRequest):
@@ -40,11 +43,16 @@ class AddExecutorPayload(BaseModel):
         return self
 
 
+class SwitchValidatorPayload(BaseModel):
+    validator_hotkey: str
+
+
 class SyncExecutorPayload(BaseModel):
     uuid: UUID
     validator: str
     address: str
     port: int
+    price_per_hour: float | None = None
 
 
 class AddExecutorRequest(BaseMinerPortalRequest):
@@ -85,10 +93,25 @@ class SyncExecutorCentralMinerRequest(BaseMinerPortalRequest):
 
 class SyncExecutorCentralMinerSuccess(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.SyncExecutorCentralMinerSuccess
-    miner_hotkey: str
     payload: list[Executor]
 
 
 class SyncExecutorCentralMinerFailed(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.SyncExecutorCentralMinerFailed
+    error: str
+
+
+class UpdateExecutorRequest(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.UpdateExecutorRequest
+    executor: SyncExecutorPayload
+
+
+class ExecutorUpdated(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorUpdated
+    executor_id: UUID
+
+
+class ExecutorUpdateFailed(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorUpdateFailed
+    executor_id: UUID
     error: str
