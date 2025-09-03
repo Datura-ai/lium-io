@@ -59,6 +59,7 @@ class ContainerRequestType(enum.Enum):
     ExecutorRentFinished = "ExecutorRentFinished"
     GetPodLogsRequestFromServer = "GetPodLogsRequestFromServer"
     AddDebugSshKeyRequest = "AddDebugSshKeyRequest"
+    BackupContainerRequest = "BackupContainerRequest"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -126,6 +127,21 @@ class GetPodLogsRequestFromServer(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.GetPodLogsRequestFromServer
     container_name: str
 
+
+class BackupContainerRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.BackupContainerRequest
+    source_volume: str
+    backup_volume_info: ExternalVolumeInfo  # S3 backup volume with credentials
+    backup_path: str
+    source_volume_path: str
+    backup_target_path: str
+    auth_token: str  # JWT for progress updates
+    backup_log_id: str
+
+
+##############################################################
+# Response payloads
+##############################################################
 
 class ContainerResponseType(enum.Enum):
     ContainerCreated = "ContainerCreated"

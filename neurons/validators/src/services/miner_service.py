@@ -1,8 +1,11 @@
 import asyncio
 import json
 import logging
+import os
 from typing import Annotated
 
+from asyncssh import SSHKey
+import asyncssh
 import bittensor
 from clients.miner_client import MinerClient
 from datura.requests.miner_requests import (
@@ -19,6 +22,7 @@ from datura.requests.validator_requests import (
 )
 from fastapi import Depends
 from payload_models.payloads import (
+    BackupContainerRequest,
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
@@ -393,6 +397,14 @@ class MinerService:
                             error_code=FailedContainerErrorCodes.RentingInProgress,
                         )
 
+                    # get private key for ssh connection - asyncssh
+                    ssh_pkey = asyncssh.import_private_key(
+                        self.ssh_service.decrypt_payload(
+                            my_key.ss58_address, private_key.decode("utf-8")
+                        )
+                    )
+
+
                     if isinstance(payload, ContainerCreateRequest):
                         logger.info(
                             _m(
@@ -480,6 +492,8 @@ class MinerService:
                         )
 
                         return result
+                    elif isinstance(payload, BackupContainerRequest):
+                        return await self.handle_backup_container_req(executor, payload, ssh_pkey)
                     else:
                         log_text = _m(
                             "Unexpected request",
@@ -738,5 +752,52 @@ class MinerService:
                 msg=str(log_text),
             )
 
+    async def handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey):
+        """Handle backup container request."""
+        async with asyncssh.connect(
+            host=executor_info.address,
+            port=executor_info.ssh_port,
+            username=executor_info.ssh_username,
+            client_keys=[pkey],
+            known_hosts=None,
+        ) as ssh_client:
+
+            # Upload the backup_storage.py script to the remote server before running it
+            # Assume the local script is at './scripts/backup_storage.py'
+            remote_script_path = "/root/app/backup_storage.py"
+            local_script_path = os.path.join(
+                os.path.dirname(__file__), 
+                "..",
+                "miner_jobs", 
+                "backup_storage.py"
+            )
+
+            logger.info(
+                _m(
+                    "Uploading backup_storage.py script to the remote server", 
+                    extra=get_extra_info({ "remote_script_path": remote_script_path, "local_script_path": local_script_path })
+                ),
+            )
+
+            async with ssh_client.start_sftp_client() as sftp:
+                await sftp.put(local_script_path, remote_script_path)
+
+            commands = [
+                "nohup",
+                "/usr/bin/python",
+                "/root/app/backup_storage.py",
+                "--api-url", settings.COMPUTE_REST_API_URL,
+                "--source-volume", payload.source_volume,
+                "--backup-path", payload.backup_path,
+                "--auth-token", payload.auth_token,
+                "--backup-log-id", payload.backup_log_id,
+                "--backup-volume-name", payload.backup_volume_info.name,
+                "--backup-volume-iam_user_access_key", payload.backup_volume_info.iam_user_access_key,
+                "--backup-volume-iam_user_secret_key", payload.backup_volume_info.iam_user_secret_key,
+                "--source-volume-path", payload.source_volume_path,
+                "--backup-target-path", payload.backup_target_path,
+                "> /root/app/backup_storage.log 2>&1 &"
+            ]
+            await ssh_client.run(" ".join(commands), timeout=50, check=True)
 
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]
