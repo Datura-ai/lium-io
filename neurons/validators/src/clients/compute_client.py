@@ -11,6 +11,7 @@ import tenacity
 import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
+    BackupContainerRequest,
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
@@ -67,6 +68,7 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
 )
+from clients.handlers.backup_handler import BackupHandler
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,9 @@ class ComputeClient:
             "validator_hotkey": self.my_hotkey(),
             "compute_app_uri": compute_app_uri,
         }
+
+        # initiate handlers
+        self.backup_handler = BackupHandler(self)
 
     def accepted_request_type(self) -> type[BaseRequest]:
         return ContainerBaseRequest
@@ -580,6 +585,7 @@ class ComputeClient:
         | ExecutorRentFinishedRequest
         | GetPodLogsRequestFromServer
         | AddDebugSshKeyRequest
+        | BackupContainerRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -603,6 +609,9 @@ class ComputeClient:
                 extra=get_extra_info(logging_extra),
             )
         )
+
+        job_request.miner_address = miner_axon_info.ip
+        job_request.miner_port = miner_axon_info.port
 
         if isinstance(job_request, ContainerCreateRequest):
             logger.info(
@@ -717,3 +726,5 @@ class ComputeClient:
 
             async with self.lock:
                 self.message_queue.append(response)
+        elif isinstance(job_request, BackupContainerRequest):
+            await self.backup_handler.handle_backup_container_req(job_request)

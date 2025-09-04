@@ -461,26 +461,34 @@ class TaskService:
         executor_info: ExecutorSSHInfo,
     ):
         # check container running or not
+        is_pod_running = False
+
+        command = f"/usr/bin/docker ps -q -f name={container_name}"
+        result = await ssh_client.run(command)
+        if result.stdout.strip():
+            is_pod_running = True
+        else:
+            # # remove pod in redis
+            # await self.redis_service.remove_rented_machine(executor_info)
+            logger.error(
+                _m(
+                    "Pod not found, but redis is saying it's rented",
+                    extra={
+                        "container_name": container_name,
+                        "executor_id": executor_info.uuid,
+                        "address": executor_info.address,
+                        "port": executor_info.port,
+                    }
+                )
+            )
+
+        # get ssh pub keys
         command = f"/usr/bin/docker exec -i {container_name} sh -c 'cat ~/.ssh/authorized_keys'"
         result = await ssh_client.run(command)
         if result.stdout.strip():
-            return result.stdout.strip().split('\n')
+            return is_pod_running, result.stdout.strip().split('\n')
 
-        # # remove pod in redis
-        # await self.redis_service.remove_rented_machine(executor_info)
-        logger.error(
-            _m(
-                "Pod not found, but redis is saying it's rented",
-                extra={
-                    "container_name": container_name,
-                    "executor_id": executor_info.uuid,
-                    "address": executor_info.address,
-                    "port": executor_info.port,
-                }
-            )
-        )
-
-        return []
+        return is_pod_running, []
 
     async def _handle_task_result(
         self,
@@ -969,12 +977,12 @@ class TaskService:
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
                     container_name = rented_machine.get("container_name", "")
-                    ssh_pub_keys = await self.check_pod_running(
+                    is_pod_running, ssh_pub_keys = await self.check_pod_running(
                         ssh_client=shell.ssh_client,
                         container_name=container_name,
                         executor_info=executor_info,
                     )
-                    if not ssh_pub_keys:
+                    if not is_pod_running:
                         log_text = _m(
                             "Pod is not running",
                             extra=get_extra_info(
