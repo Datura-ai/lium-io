@@ -111,7 +111,7 @@ dependencies = [
     "tenacity>=9.1.2",
     "celium-collateral==1.1.6",
 ]
-requires-python = "==3.11.*"
+requires-python = "==3.11.11"
 readme = "README.md"
 license = {text = "MIT"}
 
