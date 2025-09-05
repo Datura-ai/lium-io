@@ -144,9 +144,10 @@ def remove_executor(address: str, port: int):
 @cli.command()
 @click.option("--executor_uuid", prompt="Executor UUID", help="UUID of the executor to reclaim collateral from")
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def reclaim_collateral(executor_uuid: str, private_key: str):
+@click.option("--require-old-contract", is_flag=True, default=False, help="Require old collateral contract (optional, default: False)")
+def reclaim_collateral(executor_uuid: str, private_key: str, require_old_contract: bool):
     """Reclaim collateral for a specific executor from the contract"""
-    cli_service = CliService(private_key=private_key)
+    cli_service = CliService(private_key=private_key, require_old_contract=require_old_contract)
     success = asyncio.run(
         cli_service.reclaim_collateral(executor_uuid)
     )
@@ -182,9 +183,10 @@ def switch_validator(address: str, port: int, validator: str):
 
 
 @cli.command()
-def get_miner_collateral():
+@click.option("--require-old-contract", is_flag=True, default=False, help="Require old collateral contract (optional, default: False)")
+def get_miner_collateral(require_old_contract: bool):
     """Get miner collateral by summing up collateral from all registered executors"""
-    cli_service = CliService(with_executor_db=True)
+    cli_service = CliService(with_executor_db=True, require_old_contract=require_old_contract)
     success = asyncio.run(cli_service.get_miner_collateral())
     if not success:
         logger.error("❌ Failed in getting miner collateral.")
@@ -193,18 +195,20 @@ def get_miner_collateral():
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-def get_executor_collateral(address: str, port: int):
+@click.option("--require-old-contract", is_flag=True, default=False, help="Require old collateral contract (optional, default: False)")
+def get_executor_collateral(address: str, port: int, require_old_contract: bool):
     """Get collateral amount for a specific executor by address and port"""
-    cli_service = CliService(with_executor_db=True)
+    cli_service = CliService(with_executor_db=True, require_old_contract=require_old_contract)
     success = asyncio.run(cli_service.get_executor_collateral(address, port))
     if not success:
         logger.error("❌ Failed to get executor collateral.")
 
 
 @cli.command()
-def get_reclaim_requests():
+@click.option("--require-old-contract", is_flag=True, default=False, help="Require old collateral contract (optional, default: False)")
+def get_reclaim_requests(require_old_contract: bool):
     """Get reclaim requests for the current miner from the collateral contract"""
-    cli_service = CliService(with_executor_db=True)
+    cli_service = CliService(with_executor_db=True, require_old_contract=require_old_contract)
     success = asyncio.run(cli_service.get_reclaim_requests())
     if not success:
         logger.error("❌ Failed to get miner reclaim requests.")
@@ -213,9 +217,10 @@ def get_reclaim_requests():
 @cli.command()
 @click.option("--reclaim-request-id", prompt="Reclaim Request ID", type=int, help="ID of the reclaim request to finalize")
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
-def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
+@click.option("--require-old-contract", is_flag=True, default=False, help="Require old collateral contract (optional, default: False)")
+def finalize_reclaim_request(reclaim_request_id: int, private_key: str, required_old_contract: bool):
     """Finalize a reclaim request by its ID"""
-    cli_service = CliService(private_key=private_key)
+    cli_service = CliService(private_key=private_key, require_old_contract=required_old_contract)
     success = asyncio.run(cli_service.finalize_reclaim_request(reclaim_request_id))
     if not success:
         logger.error("❌ Failed to finalize reclaim request.")
