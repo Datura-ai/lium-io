@@ -90,18 +90,18 @@ class CollateralContractService:
         gpu_count: int
     ) -> bool:
         """Check if a specific executor is eligible."""
-        default_extra = {
-            "collateral_contract_address": self.collateral_contract.contract_address,
-            "old_collateral_contract_address": self.old_collateral_contract.contract_address,
-            "owner_address": self.collateral_contract.owner_address,
-            "miner_hotkey": miner_hotkey,
-            "executor_uuid": executor_uuid,
-        }
-
         error_message = None
         if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
             logger.info(f"GPU model {gpu_model} is excluded from collateral checks")
             return True, None
+
+        default_extra = {
+            "collateral_contract_address": getattr(self.collateral_contract, "contract_address", None),
+            "old_collateral_contract_address": getattr(self.old_collateral_contract, "contract_address", None),
+            "owner_address": self.collateral_contract.owner_address,
+            "miner_hotkey": miner_hotkey,
+            "executor_uuid": executor_uuid,
+        }
 
         try:
             collateral_deposited, new_collateral_contract_error_message = await self._check_executor_collateral(
