@@ -2,7 +2,6 @@ import uuid
 import logging
 import json
 import bittensor as bt
-from substrateinterface import SubstrateInterface
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from eth_utils import to_hex, keccak
@@ -29,7 +28,7 @@ def require_executor_dao(func):
 
 
 class CliService:
-    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False):
+    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False, require_old_contract: bool = False):
         """
         Initialize the CLI service.
         :param private_key: Ethereum private key for signing (optional).
@@ -40,7 +39,10 @@ class CliService:
         self.config = settings.get_bittensor_config()
         self.hotkey = self.wallet.get_hotkey().ss58_address
         self.private_key = private_key
-        self.collateral_contract = get_collateral_contract(miner_key=private_key) if private_key else get_collateral_contract()
+        self.collateral_contract = (
+            get_collateral_contract(miner_key=private_key, require_old_contract=require_old_contract)
+            if private_key else get_collateral_contract(require_old_contract=require_old_contract)
+        )
         self.executor_dao = ExecutorDao(session=next(get_db())) if with_executor_db else None
         self.logger = logging.getLogger()
 
@@ -52,7 +54,7 @@ class CliService:
             "rpc_url": settings.SUBTENSOR_EVM_RPC_URL,
         }
 
-    def get_node(self) -> SubstrateInterface:
+    def get_node(self):
         """
         Get a SubstrateInterface node connection using the current config.
         :return: SubstrateInterface instance
@@ -80,7 +82,7 @@ class CliService:
                 })
         return summary
 
-    def make_associate_evm_key_extrinsic(self, node: SubstrateInterface) -> Any:
+    def make_associate_evm_key_extrinsic(self, node) -> Any:
         """
         Create an extrinsic to associate the EVM key with the hotkey.
         :param node: SubstrateInterface instance
@@ -123,7 +125,7 @@ class CliService:
             }
         )
 
-    def submit_extrinsic(self, node: SubstrateInterface, call: Any) -> Any:
+    def submit_extrinsic(self, node, call: Any) -> Any:
         """
         Submit a signed extrinsic to the chain.
         :param node: SubstrateInterface instance
