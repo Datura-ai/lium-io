@@ -125,7 +125,7 @@ dependencies = [
     "zstandard==0.23.0",
     "celium-collateral==1.1.6",
 ]
-requires-python = "==3.11.*"
+requires-python = "==3.11.11"
 readme = "README.md"
 license = {text = "MIT"}
 
