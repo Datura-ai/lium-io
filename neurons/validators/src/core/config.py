@@ -62,7 +62,10 @@ class Settings(BaseSettings):
     ENABLE_NEW_INCENTIVE_ALGO: bool = False
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
-        env='COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
+        env='COLLATERAL_CONTRACT_ADDRESS', default='0xfB0FEAf1aB5d3788B40F97076ae0104bFbbdC124'
+    )
+    OLD_COLLATERAL_CONTRACT_ADDRESS: str | None = Field(
+        env='OLD_COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
     )
 
     # GPU types that will be excluded in collateral checks
