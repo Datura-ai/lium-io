@@ -23,6 +23,7 @@ from datura.requests.validator_requests import (
 from fastapi import Depends
 from payload_models.payloads import (
     BackupContainerRequest,
+    RestoreContainerRequest,
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
@@ -494,6 +495,8 @@ class MinerService:
                         return result
                     elif isinstance(payload, BackupContainerRequest):
                         return await self.handle_backup_container_req(executor, payload, ssh_pkey)
+                    elif isinstance(payload, RestoreContainerRequest):
+                        return await self.handle_restore_container_req(executor, payload, ssh_pkey)
                     else:
                         log_text = _m(
                             "Unexpected request",
@@ -797,6 +800,53 @@ class MinerService:
                 "--source-volume-path", payload.source_volume_path,
                 "--backup-target-path", payload.backup_target_path,
                 "> /root/app/backup_storage.log 2>&1 &"
+            ]
+            await ssh_client.run(" ".join(commands), timeout=50, check=True)
+
+    async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey):
+        """Handle restore container request."""
+        async with asyncssh.connect(
+            host=executor_info.address,
+            port=executor_info.ssh_port,
+            username=executor_info.ssh_username,
+            client_keys=[pkey],
+            known_hosts=None,
+        ) as ssh_client:
+
+            # Upload the restore_storage.py script to the remote server before running it
+            remote_script_path = "/root/app/restore_storage.py"
+            local_script_path = os.path.join(
+                os.path.dirname(__file__), 
+                "..",
+                "miner_jobs", 
+                "restore_storage.py"
+            )
+
+            logger.info(
+                _m(
+                    "Uploading restore_storage.py script to the remote server for restore operation", 
+                    extra=get_extra_info({ "remote_script_path": remote_script_path, "local_script_path": local_script_path })
+                ),
+            )
+
+            async with ssh_client.start_sftp_client() as sftp:
+                await sftp.put(local_script_path, remote_script_path)
+
+            commands = [
+                "nohup",
+                "/usr/bin/python",
+                "/root/app/restore_storage.py",
+                "--api-url", settings.COMPUTE_REST_API_URL,
+                "--target-volume", payload.target_volume,
+                "--backup-path", payload.backup_path,
+                "--backup-source-path", payload.backup_source_path,
+                "--auth-token", payload.auth_token,
+                "--restore-log-id", payload.restore_log_id,
+                "--backup-volume-name", payload.backup_volume_info.name,
+                "--backup-volume-iam_user_access_key", payload.backup_volume_info.iam_user_access_key,
+                "--backup-volume-iam_user_secret_key", payload.backup_volume_info.iam_user_secret_key,
+                "--target-volume-path", payload.target_volume_path,
+                "> /root/app/restore_storage.log 2>&1 &"
             ]
             await ssh_client.run(" ".join(commands), timeout=50, check=True)
 
