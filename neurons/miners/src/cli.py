@@ -218,9 +218,9 @@ def get_reclaim_requests(require_old_contract: bool):
 @click.option("--reclaim-request-id", prompt="Reclaim Request ID", type=int, help="ID of the reclaim request to finalize")
 @click.option("--private-key", prompt="Ethereum Private Key", hide_input=True, help="Ethereum private key")
 @click.option("--require-old-contract", is_flag=True, default=False, help="Require old collateral contract (optional, default: False)")
-def finalize_reclaim_request(reclaim_request_id: int, private_key: str, required_old_contract: bool):
+def finalize_reclaim_request(reclaim_request_id: int, private_key: str, require_old_contract: bool):
     """Finalize a reclaim request by its ID"""
-    cli_service = CliService(private_key=private_key, require_old_contract=required_old_contract)
+    cli_service = CliService(private_key=private_key, require_old_contract=require_old_contract)
     success = asyncio.run(cli_service.finalize_reclaim_request(reclaim_request_id))
     if not success:
         logger.error("❌ Failed to finalize reclaim request.")
