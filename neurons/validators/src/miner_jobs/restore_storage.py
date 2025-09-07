@@ -36,9 +36,9 @@ def pull_aws_cli():
 
 
 def aws_restore(args):
-    backup_path = (args.backup_path or '').rstrip('/')
-    backup_path_parent = os.path.dirname(backup_path)
-
+    
+    # aws s3 cp s3://$BUCKET_NAME/backups/my-folder-2025-09-02.tar.gz - \
+    # | tar -xzpf - -C $RESTORE_PATH  
     command = (
         "docker run --rm "
         f"-v {args.target_volume}:{args.target_volume_path} "
@@ -47,7 +47,7 @@ def aws_restore(args):
         "--entrypoint sh "
         "daturaai/aws-cli  -lc "
         f'"aws s3 cp s3://{args.backup_volume_name}/{args.backup_source_path} - '
-        f"| tar --xattrs --acls -C {backup_path_parent} -xzf -\""
+        f"| tar -xzpf - -C {args.restore_path} "
     )
     run_command(command)
 
@@ -87,8 +87,8 @@ if __name__ == "__main__":
     parser.add_argument('--backup-volume-iam_user_access_key', type=str, help='Backup volume IAM user access key')
     parser.add_argument('--backup-volume-iam_user_secret_key', type=str, help='Backup volume IAM user secret key')
     parser.add_argument('--target-volume', type=str, help='Target volume for restore')
-    parser.add_argument('--backup-path', type=str, help='Backup path')
     parser.add_argument('--backup-source-path', type=str, help='Backup source path in S3')
+    parser.add_argument('--restore-path', type=str, help='Restore path')
     parser.add_argument('--target-volume-path', type=str, help='Target volume mounted path')
     parser.add_argument('--restore-log-id', type=str, help='Restore log ID')
 

@@ -144,11 +144,11 @@ class RestoreContainerRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.RestoreContainerRequest
     target_volume: str
     backup_volume_info: ExternalVolumeInfo  # S3 backup volume with credentials
-    backup_path: str
     backup_source_path: str  # path in backup S3 volume
     target_volume_path: str  # local volume mounted path
     auth_token: str  # JWT for progress updates
     restore_log_id: str
+    restore_path: str
 
 
 ##############################################################

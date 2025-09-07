@@ -838,7 +838,7 @@ class MinerService:
                 "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--target-volume", payload.target_volume,
-                "--backup-path", payload.backup_path,
+                "--restore-path", payload.restore_path,
                 "--backup-source-path", payload.backup_source_path,
                 "--auth-token", payload.auth_token,
                 "--restore-log-id", payload.restore_log_id,
