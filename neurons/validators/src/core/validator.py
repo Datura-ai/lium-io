@@ -13,6 +13,7 @@ from services.redis_service import PENDING_PODS_PREFIX, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService, JobResult
 from services.matrix_validation_service import ValidationService
+from services.verifyx_validation_service import VerifyXValidationService
 from services.collateral_contract_service import CollateralContractService
 from services.const import JOB_TIME_OUT, IS_NOT_DEPOSITED_SCORE_MULTIPLIER
 
@@ -41,12 +42,14 @@ class Validator:
         self.redis_service = RedisService()
         self.file_encrypt_service = FileEncryptService(ssh_service=ssh_service)
         self.validation_service = ValidationService()
+        self.verifyx_validation_service = VerifyXValidationService()
         self.collateral_contract_service = CollateralContractService()
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             validation_service=self.validation_service,
-            collateral_contract_service=self.collateral_contract_service
+            verifyx_validation_service=self.verifyx_validation_service,
+            collateral_contract_service=self.collateral_contract_service,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
