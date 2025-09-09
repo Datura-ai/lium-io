@@ -1158,22 +1158,13 @@ class TaskService:
                         machine_spec["hard_disk"] = response.get("hard_disk")
                         machine_spec["network"] = response.get("network")
                     else:
-                        log_text = _m(
-                            "Verifyx validation failed",
-                            extra=get_extra_info({**default_extra, "response": response}),
-                        )
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            collateral_deposited=collateral_deposited,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            gpu_model_count=gpu_model_count,
-                            clear_verified_job_info=False,
+                        logger.error(
+                            _m(
+                                "Verifyx validation failed",
+                                extra=get_extra_info(
+                                    {**default_extra, "response": response}
+                                ),
+                            )
                         )
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
