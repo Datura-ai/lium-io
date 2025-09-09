@@ -32,6 +32,7 @@ WORKDIR /root/app/
 COPY . .
 COPY --from=base-image /opt/pypackages/ /opt/pypackages/
 RUN mv /root/app/libdmcompverify.so /usr/lib/
+RUN mv /root/app/libverifyx.so /usr/lib/
 
 # cli fix
 RUN sed -i '1s|.*|#!/usr/bin/env python3|' /opt/pypackages/bin/alembic
