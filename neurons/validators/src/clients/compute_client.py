@@ -12,6 +12,7 @@ import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
+    RestoreContainerRequest,
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
@@ -586,6 +587,7 @@ class ComputeClient:
         | GetPodLogsRequestFromServer
         | AddDebugSshKeyRequest
         | BackupContainerRequest
+        | RestoreContainerRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -728,3 +730,5 @@ class ComputeClient:
                 self.message_queue.append(response)
         elif isinstance(job_request, BackupContainerRequest):
             await self.backup_handler.handle_backup_container_req(job_request)
+        elif isinstance(job_request, RestoreContainerRequest):
+            await self.backup_handler.handle_restore_container_req(job_request)
