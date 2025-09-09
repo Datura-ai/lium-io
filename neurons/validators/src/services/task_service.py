@@ -37,6 +37,7 @@ from services.redis_service import (
 from services.ssh_service import SSHService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
+from services.verifyx_validation_service import VerifyXValidationService
 from services.collateral_contract_service import CollateralContractService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
@@ -72,11 +73,13 @@ class TaskService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
+        verifyx_validation_service: Annotated[VerifyXValidationService, Depends(VerifyXValidationService)],
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.validation_service = validation_service
+        self.verifyx_validation_service = verifyx_validation_service
         self.collateral_contract_service = collateral_contract_service
         self.wallet = settings.get_bittensor_wallet()
 
@@ -1142,6 +1145,27 @@ class TaskService:
                 #         ssh_client, remote_dir, miner_info, executor_info, machine_spec,
                 #         "Docker digests are not valid", verified_job_info, {**default_extra, "docker_digests": docker_digests}, True
                 #     )
+
+                if settings.ENABLE_VERIFYX:
+                    response = await self.verifyx_validation_service.validate_verifyx_and_process_job(
+                        ssh_client=shell.ssh_client,
+                        executor_info=executor_info,
+                        default_extra=default_extra,
+                        machine_spec=machine_spec,
+                    )
+                    if response and response.get("success"):
+                        machine_spec["ram"] = response.get("ram")
+                        machine_spec["hard_disk"] = response.get("hard_disk")
+                        machine_spec["network"] = response.get("network")
+                    else:
+                        logger.error(
+                            _m(
+                                "Verifyx validation failed",
+                                extra=get_extra_info(
+                                    {**default_extra, "response": response}
+                                ),
+                            )
+                        )
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
                     ssh_client=shell.ssh_client,
