@@ -19,9 +19,11 @@ from protocol.miner_portal_request import (
     SyncExecutorMinerPortalRequest,
     SyncExecutorMinerPortalSuccess,
     SyncExecutorMinerPortalFailed,
-    SyncExecutorCentralMinerRequest,
     SyncExecutorCentralMinerSuccess,
     SyncExecutorCentralMinerFailed,
+    UpdateExecutorRequest,
+    ExecutorUpdated,
+    ExecutorUpdateFailed,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +56,27 @@ class ExecutorService:
             return AddExecutorFailed(
                 executor_id=executor.uuid,
                 error=str(log_text),
+            )
+
+    def update(self, payload: UpdateExecutorRequest) -> Union[ExecutorUpdated, ExecutorUpdateFailed]:
+        try:
+            executor = Executor(
+                uuid=payload.executor.uuid,
+                validator=payload.executor.validator,
+                address=payload.executor.address,
+                port=payload.executor.port,
+                price_per_hour=payload.executor.price_per_hour
+            )
+            self.executor_dao.update_by_uuid(executor.uuid, executor)
+
+            logger.info("Updated for executor (id=%s)", str(executor.uuid))
+            return ExecutorUpdated(
+                executor_id=executor.uuid,
+            )
+        except Exception as e:
+            return ExecutorUpdateFailed(
+                executor_id=executor.uuid,
+                error=str(e),
             )
 
     def sync_executor_miner_portal(self, request: SyncExecutorMinerPortalRequest) -> Union[SyncExecutorMinerPortalSuccess, SyncExecutorMinerPortalFailed]:

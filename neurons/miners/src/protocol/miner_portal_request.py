@@ -18,6 +18,9 @@ class RequestType(enum.Enum):
     SyncExecutorCentralMinerRequest = "SyncExecutorCentralMinerRequest"
     SyncExecutorCentralMinerSuccess = "SyncExecutorCentralMinerSuccess"
     SyncExecutorCentralMinerFailed = "SyncExecutorCentralMinerFailed"
+    UpdateExecutorRequest = "UpdateExecutorRequest"
+    ExecutorUpdated = "ExecutorUpdated"
+    ExecutorUpdateFailed = "ExecutorUpdateFailed"
 
 
 class BaseMinerPortalRequest(BaseRequest):
@@ -38,6 +41,10 @@ class AddExecutorPayload(BaseModel):
         if self.gpu_count is None and self.collateral_amount is None:
             raise ValueError("gpu_count or collateral_amount is required")
         return self
+
+
+class SwitchValidatorPayload(BaseModel):
+    validator_hotkey: str
 
 
 class SyncExecutorPayload(BaseModel):
@@ -91,4 +98,20 @@ class SyncExecutorCentralMinerSuccess(BaseMinerPortalRequest):
 
 class SyncExecutorCentralMinerFailed(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.SyncExecutorCentralMinerFailed
+    error: str
+
+
+class UpdateExecutorRequest(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.UpdateExecutorRequest
+    executor: SyncExecutorPayload
+
+
+class ExecutorUpdated(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorUpdated
+    executor_id: UUID
+
+
+class ExecutorUpdateFailed(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorUpdateFailed
+    executor_id: UUID
     error: str

@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:885263aad45a1f9f960330d02edca682ba489c07a0a0f13baf17287b61a40bc5"
+content_hash = "sha256:e1cf12645bb1967aca71ecba4524d74e4b08dd96cda91eeac6e8fcb575a78aa0"
 
 [[metadata.targets]]
 requires_python = "==3.11.11"
@@ -391,21 +391,19 @@ files = [
 
 [[package]]
 name = "celium-collateral"
-version = "1.1.3"
+version = "1.1.6"
 requires_python = "<3.13,>=3.11"
-summary = "Collateral Smart Contract for Celium"
+summary = "Collateral Smart Contract for Lium"
 groups = ["default"]
 dependencies = [
-    "bittensor-wallet==3.0.3",
-    "bittensor==9.0.0",
     "eth-utils==2.2.2",
     "requests>=2.32.3",
-    "substrate-interface>=1.7.11",
+    "scalecodec>=1.2.11",
     "web3>=6.0.0",
 ]
 files = [
-    {file = "celium_collateral-1.1.3-py3-none-any.whl", hash = "sha256:7f1efe62e413c6f836300c4b6d3077009fc0af6fb85f5e6e23196be8d0448451"},
-    {file = "celium_collateral-1.1.3.tar.gz", hash = "sha256:f846c8ee1cec9851548ec8aa4d36e303fe6b8a94cfad60eb4d2d579e8d7f1220"},
+    {file = "celium_collateral-1.1.6-py3-none-any.whl", hash = "sha256:a7da503b71cf7919700f9c77022424ef1a00bfe0661222319f94dbe443be111d"},
+    {file = "celium_collateral-1.1.6.tar.gz", hash = "sha256:0100a8ebdc2e33ef0ae055555a1ef00581b006d12d6cf968e19a89501df5b507"},
 ]
 
 [[package]]
@@ -601,20 +599,6 @@ groups = ["default"]
 files = [
     {file = "decorator-5.1.1-py3-none-any.whl", hash = "sha256:b8c3f85900b9dc423225913c5aace94729fe1fa9763b38939a95226f02d37186"},
     {file = "decorator-5.1.1.tar.gz", hash = "sha256:637996211036b6385ef91435e4fae22989472f9d571faba8927ba8253acbc330"},
-]
-
-[[package]]
-name = "ecdsa"
-version = "0.19.1"
-requires_python = "!=3.0.*,!=3.1.*,!=3.2.*,!=3.3.*,!=3.4.*,!=3.5.*,>=2.6"
-summary = "ECDSA cryptographic signature library (pure python)"
-groups = ["default"]
-dependencies = [
-    "six>=1.9.0",
-]
-files = [
-    {file = "ecdsa-0.19.1-py2.py3-none-any.whl", hash = "sha256:30638e27cf77b7e15c4c4cc1973720149e1033827cfd00661ca5c8cc0cdb24c3"},
-    {file = "ecdsa-0.19.1.tar.gz", hash = "sha256:478cba7b62555866fcb3bb3fe985e06decbdb68ef55713c4e5ab98c57d508e61"},
 ]
 
 [[package]]
@@ -1389,52 +1373,6 @@ files = [
 ]
 
 [[package]]
-name = "py-ed25519-zebra-bindings"
-version = "1.2.0"
-requires_python = ">=3.9"
-summary = "Python bindings for the ed25519-zebra RUST crate"
-groups = ["default"]
-files = [
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:dbfe655442b73d49c1ac740f87a480cfee4c013fcb0ba2b639290b20f8dc9bb5"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:b03308c3eb2311b5d308c3df22dbf244073e4c014cda5da2609a562adb4121fc"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:1828031f38f246d35c7c7b427c17a3525fc311c0402d3b32572510977b9d0f67"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:f88238cf167ba5681e74a556b1e6ce825cb157825ce40c7f757b7d02a7c47dfb"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:2b25ca1596ae3be7e6ce6e78252ce7efa570000f9ba5b39cfe8dd10e79f73d50"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:68a33b1d8af961d28831caf2d481879bb1592f700da79aa5613d845ae6b8153a"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:41ee171c18852f6db4a86e68c4fbd622f5415f15c0ab9b40ac1fe66a8ddc3844"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:58623ff56bf1da2581a7d52507d9757ec3b03d49879fc8611646faf666bd0120"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-musllinux_1_2_armv7l.whl", hash = "sha256:3fdd9cc305dd88562b9fe4d27762070bfdaa1e88647a1509a22fe252e17148d7"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-musllinux_1_2_i686.whl", hash = "sha256:911f068d15159798309dc1895ce156b1bca2f91e34446be3ac5f54f2d3418979"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:9d0fc9c1afbf4b5ff0bc03accf5f07bf53971839eb373d1139eb3bb5a02b3bd0"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-win32.whl", hash = "sha256:256b96fdf0e264a348bf4176c0fb180a0efc6627ac312cb5e71ec95b347d1ff5"},
-    {file = "py_ed25519_zebra_bindings-1.2.0-cp311-cp311-win_amd64.whl", hash = "sha256:efa06b8a0e11c62c10fdf576679ab3039aa6a7254e6cfa4d2d230941799fef5b"},
-    {file = "py_ed25519_zebra_bindings-1.2.0.tar.gz", hash = "sha256:d9ec63d54b1801d5b5bdef0b3096ed94e2e1a7c870c937682afc7b8b25ffc2fc"},
-]
-
-[[package]]
-name = "py-sr25519-bindings"
-version = "0.2.2"
-requires_python = ">=3.7"
-summary = "Python bindings for schnorrkel RUST crate"
-groups = ["default"]
-files = [
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:4c0931d8fd07e13131e652f3211c1f1c12b7a5153bed9217e4483b195515c76f"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:09657937b8f04c034622691c4753fcef0b3857939dbeff72590b7f5de336302d"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:6ca700354e8cc3d082426ca5cdc7dd34a05988adec4edc0cd42d31c4ba16fbc0"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:ddb490e99d5646ba68f5308fed1b92efbc85470b1171a2b78e555b44a7073570"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:b8a479a7510f30d2912f552335cb83d321c0be83832a71cd0bcd190f6356a7bf"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ab25059d290753202f160bb8a4fd3c789ab9663381ca564338015fd3b7625dde"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:315382f207430143cd748f805f13bf56f36fc66726303b491cd38ce78d8972e9"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:1a65275421f30e3d563c6f3dec552060f1f85b7840ab8ecf1d48ced008d0ba5f"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-musllinux_1_2_armv7l.whl", hash = "sha256:1350c85bdc903105d8fdc7dd369b802bf2821c321fea8aa0929f7a7063437d81"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-musllinux_1_2_i686.whl", hash = "sha256:3a34fa18885345a0102c3ffbaa17a32cd67d28a60376158508d5ed7f96a478f7"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:c63b0966b45870f0b1dfc2a366f1763f4a165f3aec2b02e7464cfb2c6ca09e94"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-win32.whl", hash = "sha256:7bf982a7d34f6eb0c7c42b7f59610a527e9b02654079fb78d7eb757c6bd79d9d"},
-    {file = "py_sr25519_bindings-0.2.2-cp311-cp311-win_amd64.whl", hash = "sha256:d9ee79ec4e722993da24385a8eb85d97878ef67d48d0e706c098c626d798c7bc"},
-    {file = "py_sr25519_bindings-0.2.2.tar.gz", hash = "sha256:192d65d3bc43c6f4121a0732e1f6eb6ad869897ca26368ba032e96a82b3b7606"},
-]
-
-[[package]]
 name = "pycparser"
 version = "2.22"
 requires_python = ">=3.8"
@@ -1532,28 +1470,6 @@ groups = ["default"]
 files = [
     {file = "pygments-2.19.1-py3-none-any.whl", hash = "sha256:9ea1544ad55cecf4b8242fab6dd35a93bbce657034b0611ee383099054ab6d8c"},
     {file = "pygments-2.19.1.tar.gz", hash = "sha256:61c16d2a8576dc0649d9f39e089b5f02bcd27fba10d8fb4dcc28173f7a45151f"},
-]
-
-[[package]]
-name = "pynacl"
-version = "1.5.0"
-requires_python = ">=3.6"
-summary = "Python binding to the Networking and Cryptography (NaCl) library"
-groups = ["default"]
-dependencies = [
-    "cffi>=1.4.1",
-]
-files = [
-    {file = "PyNaCl-1.5.0-cp36-abi3-macosx_10_10_universal2.whl", hash = "sha256:401002a4aaa07c9414132aaed7f6836ff98f59277a234704ff66878c2ee4a0d1"},
-    {file = "PyNaCl-1.5.0-cp36-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.manylinux_2_24_aarch64.whl", hash = "sha256:52cb72a79269189d4e0dc537556f4740f7f0a9ec41c1322598799b0bdad4ef92"},
-    {file = "PyNaCl-1.5.0-cp36-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:a36d4a9dda1f19ce6e03c9a784a2921a4b726b02e1c736600ca9c22029474394"},
-    {file = "PyNaCl-1.5.0-cp36-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.manylinux_2_24_x86_64.whl", hash = "sha256:0c84947a22519e013607c9be43706dd42513f9e6ae5d39d3613ca1e142fba44d"},
-    {file = "PyNaCl-1.5.0-cp36-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:06b8f6fa7f5de8d5d2f7573fe8c863c051225a27b61e6860fd047b1775807858"},
-    {file = "PyNaCl-1.5.0-cp36-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:a422368fc821589c228f4c49438a368831cb5bbc0eab5ebe1d7fac9dded6567b"},
-    {file = "PyNaCl-1.5.0-cp36-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:61f642bf2378713e2c2e1de73444a3778e5f0a38be6fee0fe532fe30060282ff"},
-    {file = "PyNaCl-1.5.0-cp36-abi3-win32.whl", hash = "sha256:e46dae94e34b085175f8abb3b0aaa7da40767865ac82c928eeb9e57e1ea8a543"},
-    {file = "PyNaCl-1.5.0-cp36-abi3-win_amd64.whl", hash = "sha256:20f42270d27e1b6a29f54032090b972d97f0a1b0948cc52392041ef7831fee93"},
-    {file = "PyNaCl-1.5.0.tar.gz", hash = "sha256:8ac7448f09ab85811607bdd21ec2464495ac8b7c66d146bf545b0f08fb9220ba"},
 ]
 
 [[package]]
@@ -1978,34 +1894,6 @@ files = [
 ]
 
 [[package]]
-name = "substrate-interface"
-version = "1.7.11"
-requires_python = "<4,>=3.7"
-summary = "Library for interfacing with a Substrate node"
-groups = ["default"]
-dependencies = [
-    "PyNaCl<2,>=1.0.1",
-    "base58<3,>=1.0.3",
-    "certifi>=2019.3.9",
-    "ecdsa<1,>=0.17.0",
-    "eth-keys<1,>=0.2.1",
-    "eth-utils<6,>=1.3.0",
-    "idna<4,>=2.1.0",
-    "py-bip39-bindings<1,>=0.1.9",
-    "py-ed25519-zebra-bindings<2,>=1.0",
-    "py-sr25519-bindings<1,>=0.2.0",
-    "pycryptodome<4,>=3.11.0",
-    "requests<3,>=2.21.0",
-    "scalecodec<1.3,>=1.2.10",
-    "websocket-client<2,>=0.57.0",
-    "xxhash<4,>=1.3.0",
-]
-files = [
-    {file = "substrate-interface-1.7.11.tar.gz", hash = "sha256:4caa5eacb9996edbe76ad12249521b3542bbd8d9d69b96734087201db1fef8f6"},
-    {file = "substrate_interface-1.7.11-py3-none-any.whl", hash = "sha256:ce19bc97481769238ed23c752db985a3058637918693f2db6aeed2fab3756075"},
-]
-
-[[package]]
 name = "tenacity"
 version = "9.1.2"
 requires_python = ">=3.9"
@@ -2129,17 +2017,6 @@ dependencies = [
 files = [
     {file = "web3-6.20.1-py3-none-any.whl", hash = "sha256:16fe72aeb48bbd5f7e7e64b323a0d3a16522a28eb4f19ef9f9dd6ce7ee813c82"},
     {file = "web3-6.20.1.tar.gz", hash = "sha256:a29bc1863734e1c05f128ddbc56878f299ea71776806e667b581a83b5d5be0ed"},
-]
-
-[[package]]
-name = "websocket-client"
-version = "1.8.0"
-requires_python = ">=3.8"
-summary = "WebSocket client for Python with low level API options"
-groups = ["default"]
-files = [
-    {file = "websocket_client-1.8.0-py3-none-any.whl", hash = "sha256:17b44cc997f5c498e809b22cdf2d9c7a9e71c02c8cc2b6c56e7c2d1239bfa526"},
-    {file = "websocket_client-1.8.0.tar.gz", hash = "sha256:3239df9f44da632f96012472805d40a23281a991027ce11d2f45a6f24ac4c3da"},
 ]
 
 [[package]]

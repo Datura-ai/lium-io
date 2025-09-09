@@ -7,6 +7,7 @@ from services.task_service import TaskService
 from services.redis_service import RedisService
 from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
+from services.verifyx_validation_service import VerifyXValidationService
 from services.collateral_contract_service import CollateralContractService
 
 ioc = {}
@@ -19,12 +20,14 @@ async def initiate_services():
         ssh_service=ioc["SSHService"],
     )
     ioc["ValidationService"] = ValidationService()
+    ioc["VerifyXValidationService"] = VerifyXValidationService()
     ioc["CollateralContractService"] = CollateralContractService()
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
         redis_service=ioc["RedisService"],
         validation_service=ioc["ValidationService"],
-        collateral_contract_service=ioc["CollateralContractService"]
+        verifyx_validation_service=ioc["VerifyXValidationService"],
+        collateral_contract_service=ioc["CollateralContractService"],
     )
     ioc["DockerService"] = DockerService(
         ssh_service=ioc["SSHService"],
