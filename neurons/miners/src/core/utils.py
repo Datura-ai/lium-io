@@ -92,22 +92,25 @@ _m = StructuredMessage
 
 def get_collateral_contract(
     miner_key: str = None,
-    require_old_contract: bool = False,
+    version: str = "1.0.1",
 ) -> CollateralContract:
     """
     Initializes and returns a CollateralContract instance.
 
     Args:
-        contract_address (str): Address of the collateral contract.
+        version (str): Contract version to use (defaults to 1.0.1).
         miner_key (str): Optional miner key required for contract operations.
 
     Returns:
         CollateralContract: The initialized contract instance.
     """
     network = settings.BITTENSOR_NETWORK
-    contract_address =  settings.COLLATERAL_CONTRACT_ADDRESS
-    if require_old_contract and settings.OLD_COLLATERAL_CONTRACT_ADDRESS:
-        contract_address = settings.OLD_COLLATERAL_CONTRACT_ADDRESS
+    contract_address = settings.COLLATERAL_CONTRACT_ADDRESS  # Default address
+    
+    # Use version-specific address if available
+    if version and settings.CONTRACT_VERSIONS.get(version):
+        contract_address = settings.CONTRACT_VERSIONS.get(version)["address"]
+    
     rpc_url = settings.SUBTENSOR_EVM_RPC_URL
 
     return CollateralContract(
