@@ -28,7 +28,7 @@ def require_executor_dao(func):
 
 
 class CliService:
-    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False, require_old_contract: bool = False):
+    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False, version: str = "1.0.0"):
         """
         Initialize the CLI service.
         :param private_key: Ethereum private key for signing (optional).
@@ -40,8 +40,8 @@ class CliService:
         self.hotkey = self.wallet.get_hotkey().ss58_address
         self.private_key = private_key
         self.collateral_contract = (
-            get_collateral_contract(miner_key=private_key, require_old_contract=require_old_contract)
-            if private_key else get_collateral_contract(require_old_contract=require_old_contract)
+            get_collateral_contract(miner_key=private_key, version=version)
+            if private_key else get_collateral_contract(version=version)
         )
         self.executor_dao = ExecutorDao(session=next(get_db())) if with_executor_db else None
         self.logger = logging.getLogger()
