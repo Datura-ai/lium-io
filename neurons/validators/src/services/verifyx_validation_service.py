@@ -108,8 +108,6 @@ class VerifyXValidationService:
                 logger.error(_m("Failed to execute SSH command", extra=get_extra_info(log_extra)))
                 return None
 
-            logger.info(f"{script_path}: {result}")
-
             if result is None:
                 logger.warning(_m("VerifyX validation job failed", extra=get_extra_info(log_extra)))
                 return None
@@ -123,7 +121,7 @@ class VerifyXValidationService:
             # validate the response
             try:
                 response = verifyx_validator.verify_response(stdout)
-                logger.info(_m("VerifyX Verification Succeed", extra=get_extra_info(log_extra)))
+                logger.info(_m("VerifyX Verification Succeed", extra=get_extra_info({**log_extra, "result": response})))
                 return response
             except Exception:
                 logger.error(_m("Error during VerifyX verification", extra=get_extra_info(log_extra)))
