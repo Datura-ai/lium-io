@@ -261,7 +261,7 @@ class SubtensorClient:
             )
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
                 url = f"{api_url}"
-                await session.post(url, json=payload, headers={"Authorization": f"Bearer {signature}"})
+                await session.post(url, json=payload, headers={"Authorization": f"{signature}"})
         except Exception as e:
             logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
