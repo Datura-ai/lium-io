@@ -9,6 +9,8 @@ from bittensor.utils.weight_utils import (
 from websockets.protocol import State as WebSocketClientState
 import random
 from datetime import datetime
+import json
+import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
@@ -30,6 +32,7 @@ class SubtensorClient:
     _initialized = False
     _subtensor = None
     _warm_up_task = None
+    _latest_set_weights_payload = None
 
     wallet: "bittensor_wallet"
     miners: list[bittensor.NeuronInfo] = []
@@ -339,6 +342,28 @@ class SubtensorClient:
                 }),
             ),
         )
+
+        try:
+            current_block = self.get_current_block()
+        except Exception:
+            current_block = None
+        SubtensorClient._latest_set_weights_payload = {
+            "netuid": int(self.netuid),
+            "uids": [int(u) for u in list(uint_uids)],
+            "weights": [int(w) for w in list(uint_weights)],
+            "version_key": int(self.version_key),
+            "wait_for_finalization": False,
+            "wait_for_inclusion": False,
+            "current_block": current_block,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+                url = f"{settings.COMPUTE_REST_API_URL}/validator/latest-set-weights"
+                await session.post(url, json=SubtensorClient._latest_set_weights_payload)
+        except Exception as e:
+            logger.debug(_m("[set_weights] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
         result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
