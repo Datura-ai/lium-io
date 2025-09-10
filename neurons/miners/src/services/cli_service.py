@@ -28,7 +28,7 @@ def require_executor_dao(func):
 
 
 class CliService:
-    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False, version: str = "1.0.0"):
+    def __init__(self, private_key: Optional[str] = None, with_executor_db: bool = False, version: str = "1.0.2"):
         """
         Initialize the CLI service.
         :param private_key: Ethereum private key for signing (optional).
