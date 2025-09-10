@@ -2,11 +2,12 @@ import asyncio
 import logging
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from core.config import settings
 from core.utils import configure_logs_of_other_modules, wait_for_services_sync
 from core.validator import Validator
+from clients.subtensor_client import SubtensorClient
 
 configure_logs_of_other_modules()
 wait_for_services_sync()
@@ -29,6 +30,14 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     lifespan=app_lifespan,
 )
+
+
+@app.get("/latest-set-weights")
+async def get_latest_set_weights():
+    payload = SubtensorClient._latest_set_weights_payload
+    if not payload:
+        raise HTTPException(status_code=404, detail="No payload available")
+    return payload
 
 reload = True if settings.ENV == "dev" else False
 
