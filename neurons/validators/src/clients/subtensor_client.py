@@ -9,6 +9,8 @@ from bittensor.utils.weight_utils import (
 from websockets.protocol import State as WebSocketClientState
 import random
 from datetime import datetime
+import json
+import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
@@ -108,6 +110,7 @@ class SubtensorClient:
                         }
                     ),
                 ),
+                exc_info=True,
             )
 
     def set_subtensor(self):
@@ -240,6 +243,26 @@ class SubtensorClient:
         if not self.miners:
             self.fetch_miners()
         return self.miners
+    
+    async def send_weights_to_lium(self, payload: dict):
+        """Send weights to lium."""
+        try:
+            keypair = settings.get_bittensor_wallet().get_hotkey()
+            validator_hotkey = keypair.ss58_address
+            api_url = f"{settings.COMPUTE_REST_API_URL}/validator/{validator_hotkey}/latest-set-weights"
+            blob_for_signing = json.dumps(payload, sort_keys=True)
+            signature = f"0x{keypair.sign(blob_for_signing).hex()}"
+            logger.info(
+                _m(
+                    "[send_weights_to_lium] Sending weights to lium",
+                    extra=get_extra_info({"api_url": api_url}),
+                ),
+            )
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                url = f"{api_url}"
+                await session.post(url, json=payload, headers={"Authorization": f"{signature}"})
+        except Exception as e:
+            logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
     async def set_weights(self, miner_scores: dict[str, float]):
         miners = self.get_miners()
@@ -339,6 +362,24 @@ class SubtensorClient:
                 }),
             ),
         )
+
+        try:
+            current_block = self.get_current_block()
+        except Exception:
+            current_block = None
+
+        # Send weights to lium
+        payload = {
+            "netuid": int(self.netuid),
+            "uids": [int(u) for u in list(uint_uids)],
+            "weights": [int(w) for w in list(uint_weights)],
+            "version_key": int(self.version_key),
+            "wait_for_finalization": False,
+            "wait_for_inclusion": False,
+            "current_block": current_block,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        await self.send_weights_to_lium(payload)
 
         result, msg = self.subtensor.set_weights(
             wallet=self.wallet,
@@ -494,6 +535,7 @@ class SubtensorClient:
                         "[_warm_up_subtensor] Failed to connect into subtensor",
                         extra=get_extra_info({**self.default_extra, "error": str(e)}),
                     ),
+                    exc_info=True,
                 )
                 self.initialize_subtensor()
                 await asyncio.sleep(SYNC_CYCLE)
