@@ -737,6 +737,8 @@ class DockerService:
                         (docker_port, external_port) for docker_port, _, external_port in port_maps
                     ],
                     profilers=profilers,
+                    backup_log_id=payload.backup_log_id,
+                    restore_path=payload.restore_path,
                 )
         except Exception as e:
             log_text = _m(
