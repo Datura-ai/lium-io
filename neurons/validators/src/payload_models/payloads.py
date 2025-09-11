@@ -90,6 +90,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     docker_username: str | None = None  # when edit pod, docker_username is required
     docker_password: str | None = None  # when edit pod, docker_password is required
     timestamp: int | None = None
+    backup_log_id: str | None = None
+    restore_path: str | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -180,6 +182,8 @@ class ContainerCreated(ContainerBaseResponse):
     volume_name: str
     port_maps: list[tuple[int, int]]
     profilers: list[dict] = []
+    backup_log_id: str | None = None
+    restore_path: str | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
