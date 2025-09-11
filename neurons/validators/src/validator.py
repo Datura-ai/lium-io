@@ -2,12 +2,11 @@ import asyncio
 import logging
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 
 from core.config import settings
 from core.utils import configure_logs_of_other_modules, wait_for_services_sync
 from core.validator import Validator
-from clients.subtensor_client import SubtensorClient
 
 configure_logs_of_other_modules()
 wait_for_services_sync()
