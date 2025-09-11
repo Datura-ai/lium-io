@@ -33,13 +33,15 @@ class AddExecutorPayload(BaseModel):
     ip_address: str
     port: int
     price_per_hour: float
-    collateral_amount: float | None
     gpu_count: int | None
 
     @model_validator(mode="after")
-    def check_gpu_count_collateral_amount(self) -> Self:
-        if self.gpu_count is None and self.collateral_amount is None:
-            raise ValueError("gpu_count or collateral_amount is required")
+    def validate_fields(self) -> Self:
+        if self.gpu_count < 1:
+            raise ValueError("Incorrect gpu_count")
+        if self.price_per_hour and self.price_per_hour < 0:
+            raise ValueError("Incorrect price_per_hour")
+
         return self
 
 
