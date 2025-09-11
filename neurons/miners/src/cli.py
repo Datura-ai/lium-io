@@ -2,6 +2,7 @@ import asyncio
 import logging
 import click
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 from services.cli_service import CliService
 from core.config import settings
@@ -178,6 +179,22 @@ def add_executor(
         logger.info("✅ Added executor and deposited collateral successfully.")
     else:
         logger.error("❌ Failed to add executor or deposit collateral.")
+
+
+@cli.command()
+def current_contract_version():
+    """Get the current contract version"""
+    cli_service = CliService()
+
+    console = Console()
+    contract_address = cli_service.collateral_contract.contract_address
+    console.print(
+        Panel.fit(
+            f"[bold green]Current Contract Address:[/bold green]\n[bold yellow]{contract_address}[/bold yellow]",
+            title="Contract Version Info",
+            border_style="blue"
+        )
+    )
 
 
 @cli.command()
