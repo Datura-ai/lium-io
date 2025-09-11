@@ -32,7 +32,6 @@ class SubtensorClient:
     _initialized = False
     _subtensor = None
     _warm_up_task = None
-    _latest_set_weights_payload = None
 
     wallet: "bittensor_wallet"
     miners: list[bittensor.NeuronInfo] = []

@@ -31,14 +31,6 @@ app = FastAPI(
     lifespan=app_lifespan,
 )
 
-
-@app.get("/latest-set-weights")
-async def get_latest_set_weights():
-    payload = SubtensorClient._latest_set_weights_payload
-    if not payload:
-        raise HTTPException(status_code=404, detail="No payload available")
-    return payload
-
 reload = True if settings.ENV == "dev" else False
 
 if __name__ == "__main__":
