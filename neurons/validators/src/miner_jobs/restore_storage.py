@@ -51,6 +51,7 @@ def aws_restore(args):
         f"-v {args.target_volume}:{args.target_volume_path} "
         f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
         f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
+        f"-e AWS_DEFAULT_REGION=us-east-1 "
         "--entrypoint sh "
         "daturaai/aws-cli  -lc "
         f'"aws s3 cp s3://{args.backup_volume_name}/{args.backup_source_path} - '
