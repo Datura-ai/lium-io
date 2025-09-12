@@ -15,7 +15,7 @@ COPY pyproject.toml pdm.lock README.md ./
 COPY --from=datura . /datura
 
 RUN pdm lock --check
-RUN pdm install --prod --no-editable
+RUN pdm install --prod
 
 COPY . .
 
