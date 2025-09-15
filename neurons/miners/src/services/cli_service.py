@@ -119,6 +119,7 @@ class CliService:
             call_function="associate_evm_key",
             call_params={
                 "netuid": self.netuid,
+                "hotkey": self.hotkey,
                 "evm_key": account.address,
                 "block_number": block_number,
                 "signature": signature_hex
@@ -134,7 +135,7 @@ class CliService:
         """
         extrinsic = node.create_signed_extrinsic(
             call=call,
-            keypair=self.wallet.hotkey,
+            keypair=self.wallet.coldkey,
         )
         response = node.submit_extrinsic(extrinsic, wait_for_inclusion=True, wait_for_finalization=True)
         return response
