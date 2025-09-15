@@ -767,7 +767,7 @@ class TaskService:
                     ),
                 )
 
-                collateral_deposited, collateral_contract_error_message = await self.collateral_contract_service.is_eligible_executor(
+                collateral_deposited, collateral_contract_error_message, contract_version = await self.collateral_contract_service.is_eligible_executor(
                     miner_hotkey=miner_info.miner_hotkey,
                     executor_uuid=executor_info.uuid,
                     gpu_model=gpu_model,
@@ -1062,10 +1062,22 @@ class TaskService:
                         log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
                     elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
                         log_msg = "Executor is rented. But not eligible from collateral contract. Will not have score very soon."
+                    
+                    # apply half score if contract version is not the latest
+                    if contract_version and contract_version != settings.get_latest_contract_version():
+                        actual_score = actual_score * 0.5
+                        job_score = job_score * 0.5
+                        log_msg += f" Your contract version is not the latest. So you'll get half score."
 
                     log_text = _m(
                         log_msg,
-                        extra=get_extra_info({**default_extra, "actual_score": actual_score, "is_rental_succeed": is_rental_succeed, "job_score": job_score}),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "actual_score": actual_score,
+                            "is_rental_succeed": is_rental_succeed,
+                            "job_score": job_score,
+                            "contract_version": contract_version,
+                        }),
                     )
 
                     return await self._handle_task_result(
@@ -1227,6 +1239,11 @@ class TaskService:
 
                 success = True if actual_score > 0 else False
 
+                if contract_version and contract_version != settings.get_latest_contract_version():
+                    actual_score = actual_score * 0.5
+                    job_score = job_score * 0.5
+                    log_msg += f"Your contract version is not the latest. So you'll get half score."
+
                 log_text = _m(
                     log_msg,
                     extra=get_extra_info(
@@ -1239,6 +1256,7 @@ class TaskService:
                             "is_rental_succeed": is_rental_succeed,
                             "unrented_multiplier": UNRENTED_MULTIPLIER,
                             "sysbox_runtime": sysbox_runtime,
+                            "contract_version": contract_version,
                         }
                     ),
                 )
