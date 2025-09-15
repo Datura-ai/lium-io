@@ -24,6 +24,9 @@ from protocol.miner_portal_request import (
     UpdateExecutorRequest,
     ExecutorUpdated,
     ExecutorUpdateFailed,
+    DeleteExecutorRequest,
+    ExecutorDeleted,
+    ExecutorDeleteFailed,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +79,21 @@ class ExecutorService:
         except Exception as e:
             return ExecutorUpdateFailed(
                 executor_id=executor.uuid,
+                error=str(e),
+            )
+
+    def delete(self, payload: DeleteExecutorRequest) -> Union[ExecutorDeleted, ExecutorDeleteFailed]:
+        executor_uuid = payload.executor.uuid
+        try:
+            self.executor_dao.delete_by_address_port(payload.executor.address, payload.executor.port)
+
+            logger.info("delete for executor (id=%s)", str(executor_uuid))
+            return ExecutorDeleted(
+                executor_id=executor_uuid,
+            )
+        except Exception as e:
+            return ExecutorDeleteFailed(
+                executor_id=executor_uuid,
                 error=str(e),
             )
 
