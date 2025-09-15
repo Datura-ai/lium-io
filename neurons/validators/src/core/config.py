@@ -35,7 +35,8 @@ class Settings(BaseSettings):
     DEBUG_MINER_PORT: int | None = Field(env="DEBUG_MINER_PORT", default=None)
     
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
-    BLOCKS_FOR_JOB: int = 75
+    BLOCKS_FOR_JOB: int = 75  # 15 minutes
+    JOB_TIME_OUT: int = 60 * 15  # 15 minutes
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
@@ -61,7 +62,6 @@ class Settings(BaseSettings):
     ENABLE_COLLATERAL_CONTRACT: bool = True
     ENABLE_NEW_INCENTIVE_ALGO: bool = False
     ENABLE_VERIFYX: bool = True
-    JOB_TIME_OUT: int = 60 * 15  # 15 minutes
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0xfB0FEAf1aB5d3788B40F97076ae0104bFbbdC124'
@@ -99,6 +99,9 @@ class Settings(BaseSettings):
         )
         wallet.hotkey_file.get_keypair()  # this raises errors if the keys are inaccessible
         return wallet
+
+    def get_latest_contract_version(self) -> str:
+        return max(self.CONTRACT_VERSIONS.keys())
 
     def get_bittensor_config(self) -> bittensor.config:
         parser = argparse.ArgumentParser()
