@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     DEBUG_MINER_PORT: int | None = Field(env="DEBUG_MINER_PORT", default=None)
     
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
-    BLOCKS_FOR_JOB: int = 50
+    BLOCKS_FOR_JOB: int = 75
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
