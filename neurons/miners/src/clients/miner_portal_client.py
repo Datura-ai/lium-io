@@ -34,6 +34,9 @@ from protocol.miner_portal_request import (
     UpdateExecutorRequest,
     ExecutorUpdated,
     ExecutorUpdateFailed,
+    DeleteExecutorRequest,
+    ExecutorDeleted,
+    ExecutorDeleteFailed,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +196,12 @@ class MinerPortalClient:
 
         if isinstance(request, UpdateExecutorRequest):
             result: Union[ExecutorUpdated, ExecutorUpdateFailed] = self.executor_service.update(
+                request,
+            )
+            self.message_queue.append(result)
+
+        if isinstance(request, DeleteExecutorRequest):
+            result: Union[ExecutorDeleted, ExecutorDeleteFailed] = self.executor_service.delete(
                 request,
             )
             self.message_queue.append(result)

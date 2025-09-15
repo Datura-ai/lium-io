@@ -171,3 +171,4 @@ testing/
 .env
 
 **/.python-version
+notebooks/

@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 class CollateralContractService:
     def __init__(self):
         # Check for settings misconfiguration and handle gracefully
-        self.collateral_contract = get_collateral_contract()
-        self.old_collateral_contract = get_collateral_contract(require_old_contract=True)
+        self.collateral_contracts = {
+            version: get_collateral_contract(version=version) for version in settings.CONTRACT_VERSIONS.keys()
+        }
         self.subtensor_client = SubtensorClient.get_instance()
 
     async def _check_executor_collateral(
@@ -96,38 +97,31 @@ class CollateralContractService:
             return True, None
 
         default_extra = {
-            "collateral_contract_address": getattr(self.collateral_contract, "contract_address", None),
-            "old_collateral_contract_address": getattr(self.old_collateral_contract, "contract_address", None),
-            "owner_address": self.collateral_contract.owner_address,
             "miner_hotkey": miner_hotkey,
             "executor_uuid": executor_uuid,
         }
+        for version in self.collateral_contracts.keys():
+            default_extra[f"collateral_contract_address_{version}"] = getattr(self.collateral_contracts[version], "contract_address", None)
 
         try:
-            collateral_deposited, new_collateral_contract_error_message = await self._check_executor_collateral(
-                collateral_contract=self.collateral_contract,
-                miner_hotkey=miner_hotkey,
-                executor_uuid=executor_uuid,
-                gpu_model=gpu_model,
-                gpu_count=gpu_count,
-                default_extra=default_extra,
-            )
+            error_message = ""
+            for version in self.collateral_contracts.keys():
+                try:
+                    collateral_deposited, collateral_contract_error_message = await self._check_executor_collateral(
+                        collateral_contract=self.collateral_contracts[version],
+                        miner_hotkey=miner_hotkey,
+                        executor_uuid=executor_uuid,
+                        gpu_model=gpu_model,
+                        gpu_count=gpu_count,
+                        default_extra=default_extra,
+                    )
+                    if collateral_deposited:
+                        return True, None
+                    
+                    error_message += f"Version: {version} — {collateral_contract_error_message} \n\n"
+                except Exception as e:
+                    error_message += f"Version: {version} — {str(e)} \n\n"
 
-            if collateral_deposited:
-                return True, None
-            
-            collateral_deposited, old_collateral_contract_error_message = await self._check_executor_collateral(
-                collateral_contract=self.old_collateral_contract,
-                miner_hotkey=miner_hotkey,
-                executor_uuid=executor_uuid,
-                gpu_model=gpu_model,
-                gpu_count=gpu_count,
-                default_extra=default_extra,
-            )
-            if collateral_deposited:
-                return True, None
-            
-            error_message = f"Old Contract: {old_collateral_contract_error_message} \n\n New Contract: {new_collateral_contract_error_message}"
             return False, error_message
         except KeyError as e:
             error_message = f"KeyError encountered during eligibility check: {str(e)}"

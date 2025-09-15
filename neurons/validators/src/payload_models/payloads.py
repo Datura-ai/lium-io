@@ -60,6 +60,7 @@ class ContainerRequestType(enum.Enum):
     GetPodLogsRequestFromServer = "GetPodLogsRequestFromServer"
     AddDebugSshKeyRequest = "AddDebugSshKeyRequest"
     BackupContainerRequest = "BackupContainerRequest"
+    RestoreContainerRequest = "RestoreContainerRequest"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -89,6 +90,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     docker_username: str | None = None  # when edit pod, docker_username is required
     docker_password: str | None = None  # when edit pod, docker_password is required
     timestamp: int | None = None
+    backup_log_id: str | None = None
+    restore_path: str | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -139,6 +142,17 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_log_id: str
 
 
+class RestoreContainerRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.RestoreContainerRequest
+    target_volume: str
+    backup_volume_info: ExternalVolumeInfo  # S3 backup volume with credentials
+    backup_source_path: str  # path in backup S3 volume
+    target_volume_path: str  # local volume mounted path
+    auth_token: str  # JWT for progress updates
+    restore_log_id: str
+    restore_path: str
+
+
 ##############################################################
 # Response payloads
 ##############################################################
@@ -168,6 +182,8 @@ class ContainerCreated(ContainerBaseResponse):
     volume_name: str
     port_maps: list[tuple[int, int]]
     profilers: list[dict] = []
+    backup_log_id: str | None = None
+    restore_path: str | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):

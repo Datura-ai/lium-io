@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     DEBUG_MINER_PORT: int | None = Field(env="DEBUG_MINER_PORT", default=None)
     
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
-    BLOCKS_FOR_JOB: int = 50
+    BLOCKS_FOR_JOB: int = 75
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     ENABLE_COLLATERAL_CONTRACT: bool = True
     ENABLE_NEW_INCENTIVE_ALGO: bool = False
     ENABLE_VERIFYX: bool = True
+    JOB_TIME_OUT: int = 60 * 15  # 15 minutes
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0xfB0FEAf1aB5d3788B40F97076ae0104bFbbdC124'
@@ -68,6 +69,20 @@ class Settings(BaseSettings):
     OLD_COLLATERAL_CONTRACT_ADDRESS: str | None = Field(
         env='OLD_COLLATERAL_CONTRACT_ADDRESS', default='0x999F9A49A85e9D6E981cad42f197349f50172bEB'
     )
+    CONTRACT_VERSIONS: dict = {
+        "1.0.0": {
+            "address": "0x999F9A49A85e9D6E981cad42f197349f50172bEB",
+            "info": "1st Version of the collateral contract",
+        },
+        "1.0.1": {
+            "address": "0xfB0FEAf1aB5d3788B40F97076ae0104bFbbdC124",
+            "info": "2nd version: Implemented partial slashing",
+        },
+        "1.0.2": {
+            "address": "0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6",
+            "info": "3rd version: Fixed 'ExecutorNotOwned' error",
+        },
+    }
 
     # GPU types that will be excluded in collateral checks
     COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [

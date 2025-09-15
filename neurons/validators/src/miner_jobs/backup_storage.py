@@ -121,6 +121,7 @@ def aws_cp(args):
         f"-v {args.source_volume}:{args.source_volume_path} "
         f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
         f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
+        f"-e AWS_DEFAULT_REGION=us-east-1 "
         "--entrypoint sh "
         "daturaai/aws-cli  -lc "
         f'"tar --xattrs --acls -C {backup_path_parent} -czf - {backup_path_current} '
