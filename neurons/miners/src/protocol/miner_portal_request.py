@@ -21,6 +21,9 @@ class RequestType(enum.Enum):
     UpdateExecutorRequest = "UpdateExecutorRequest"
     ExecutorUpdated = "ExecutorUpdated"
     ExecutorUpdateFailed = "ExecutorUpdateFailed"
+    DeleteExecutorRequest = "DeleteExecutorRequest"
+    ExecutorDeleted = "ExecutorDeleted"
+    ExecutorDeleteFailed = "ExecutorDeleteFailed"
 
 
 class BaseMinerPortalRequest(BaseRequest):
@@ -115,5 +118,21 @@ class ExecutorUpdated(BaseMinerPortalRequest):
 
 class ExecutorUpdateFailed(BaseMinerPortalRequest):
     message_type: RequestType = RequestType.ExecutorUpdateFailed
+    executor_id: UUID
+    error: str
+
+
+class DeleteExecutorRequest(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.DeleteExecutorRequest
+    executor: SyncExecutorPayload
+
+
+class ExecutorDeleted(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorDeleted
+    executor_id: UUID
+
+
+class ExecutorDeleteFailed(BaseMinerPortalRequest):
+    message_type: RequestType = RequestType.ExecutorDeleteFailed
     executor_id: UUID
     error: str
