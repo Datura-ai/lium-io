@@ -100,6 +100,9 @@ class Settings(BaseSettings):
         wallet.hotkey_file.get_keypair()  # this raises errors if the keys are inaccessible
         return wallet
 
+    def get_latest_contract_version(self) -> str:
+        return max(self.CONTRACT_VERSIONS.keys())
+
     def get_bittensor_config(self) -> bittensor.config:
         parser = argparse.ArgumentParser()
         # bittensor.wallet.add_args(parser)
