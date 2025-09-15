@@ -1154,6 +1154,14 @@ class TaskService:
                         machine_spec=machine_spec,
                     )
                     if response and response.get("success"):
+                        logger.info(
+                            _m(
+                                "Verifyx validation successful",
+                                extra=get_extra_info(
+                                    {**default_extra, "response": response}
+                                ),
+                            )
+                        )
                         machine_spec["ram"] = response.get("ram")
                         machine_spec["hard_disk"] = response.get("hard_disk")
                         machine_spec["network"] = response.get("network")
