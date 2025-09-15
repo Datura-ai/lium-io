@@ -89,12 +89,19 @@ class CollateralContractService:
         executor_uuid: str,
         gpu_model: str,
         gpu_count: int
-    ) -> bool:
-        """Check if a specific executor is eligible."""
+    ) -> tuple[bool, str | None, str | None]:
+        """
+        Check if a specific executor is eligible.
+        :param miner_hotkey: Miner hotkey
+        :param executor_uuid: Executor UUID
+        :param gpu_model: GPU model
+        :param gpu_count: GPU count
+        :return: Tuple containing eligibility status, error message, and contract version
+        """
         error_message = None
         if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
             logger.info(f"GPU model {gpu_model} is excluded from collateral checks")
-            return True, None
+            return True, None, settings.get_latest_contract_version()
 
         default_extra = {
             "miner_hotkey": miner_hotkey,
@@ -116,19 +123,19 @@ class CollateralContractService:
                         default_extra=default_extra,
                     )
                     if collateral_deposited:
-                        return True, None
+                        return True, None, version
                     
                     error_message += f"Version: {version} — {collateral_contract_error_message} \n\n"
                 except Exception as e:
                     error_message += f"Version: {version} — {str(e)} \n\n"
 
-            return False, error_message
+            return False, error_message, None
         except KeyError as e:
             error_message = f"KeyError encountered during eligibility check: {str(e)}"
-            return False, error_message
+            return False, error_message, None
         except Exception as e:
             error_message = f"❌ Error checking executor eligibility: {str(e)}"
-            return False, error_message
+            return False, error_message, None
 
     async def _get_gpu_required_deposit(self, gpu_model: str, gpu_count: int) -> Optional[float]:
         # Handle missing GPU model gracefully
