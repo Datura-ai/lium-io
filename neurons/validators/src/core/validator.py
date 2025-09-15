@@ -257,7 +257,7 @@ class Validator:
                     all_job_results = {}
 
                     # Run all jobs with asyncio.wait and set a timeout
-                    done, pending = await asyncio.wait(jobs, timeout=JOB_TIME_OUT - 50)
+                    done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
 
                     # Process completed jobs
                     for task in done:

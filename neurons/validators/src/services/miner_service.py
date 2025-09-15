@@ -47,7 +47,6 @@ from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService, JobResult
-from services.const import JOB_TIME_OUT
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +142,7 @@ class MinerService:
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
                                 ),
-                                timeout=JOB_TIME_OUT - 60
+                                timeout=settings.JOB_TIME_OUT - 60
                             )
                         )
                         for executor_info in msg.executors
