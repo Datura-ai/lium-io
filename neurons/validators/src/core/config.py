@@ -60,7 +60,7 @@ class Settings(BaseSettings):
 
     ENABLE_COLLATERAL_CONTRACT: bool = True
     ENABLE_NEW_INCENTIVE_ALGO: bool = False
-    ENABLE_VERIFYX: bool = False
+    ENABLE_VERIFYX: bool = True
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0xfB0FEAf1aB5d3788B40F97076ae0104bFbbdC124'
