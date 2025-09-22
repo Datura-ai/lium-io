@@ -188,7 +188,7 @@ class MinerPortalClient:
                     uuid=request.executor_id,
                     address=request.payload.ip_address,
                     port=request.payload.port,
-                    validator=request.payload.validator_hotkey,
+                    validator=request.validator_hotkey,
                     price_per_hour=request.payload.price_per_hour,
                 )
             )

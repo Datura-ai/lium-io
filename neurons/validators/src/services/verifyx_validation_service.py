@@ -118,6 +118,7 @@ class VerifyXValidationService:
                 logger.error(_m("Result object missing stdout attribute", extra=get_extra_info(log_extra)))
                 return None
 
+            logger.info(_m("Challenge response received", extra=get_extra_info({**log_extra, "stdout": stdout})))
             # validate the response
             try:
                 response = verifyx_validator.verify_response(stdout)
