@@ -80,19 +80,19 @@ class VerifyXValidationService:
         with open(lib_path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
 
-    async def _get_executor_checksum(self, ssh_client, executor_info) -> str:
-        """Get the VerifyX library checksum from executor."""
-        command = f"{executor_info.python_path} {executor_info.root_dir}/src/checksum_executor.py"
-
+    async def _get_executor_checksum(self, shell) -> str:
+        """Get the VerifyX library checksum from executor using SCP."""
         try:
-            result = await ssh_client.run(command)
-            return result.stdout.strip() if result else ""
+            checksums = await shell.get_checksums_over_scp(self.lib_name)
+            # Format is "md5:sha256", we need sha256
+            sha256_checksum = checksums.split(":")[1]
+            return sha256_checksum
         except Exception:
             return ""
 
     async def validate_verifyx_and_process_job(
         self,
-        ssh_client,
+        shell,
         executor_info,
         default_extra: dict,
         machine_spec: dict,
@@ -100,9 +100,7 @@ class VerifyXValidationService:
         try:
             # Verify checksum before proceeding with validation
             local_checksum = self._calculate_lib_checksum(self.lib_name)
-            executor_checksum = await self._get_executor_checksum(ssh_client, executor_info)
-
-            logger.info(f"local_checksum: {local_checksum}, executor_checksum: {executor_checksum}")
+            executor_checksum = await self._get_executor_checksum(shell)
 
             if local_checksum != executor_checksum:
                 return VerifyXResponse(error="executor not using latest VerifyX library (checksum verification failed)")
@@ -131,7 +129,7 @@ class VerifyXValidationService:
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(log_extra)))
 
             try:
-                result = await ssh_client.run(command)
+                result = await shell.ssh_client.run(command)
             except Exception:
                 return VerifyXResponse(error="SSH command execution failed")
 

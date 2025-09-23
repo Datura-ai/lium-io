@@ -1161,7 +1161,7 @@ class TaskService:
 
                 if settings.ENABLE_VERIFYX:
                     verifyx_result = await self.verifyx_validation_service.validate_verifyx_and_process_job(
-                        ssh_client=shell.ssh_client,
+                        shell=shell,
                         executor_info=executor_info,
                         default_extra=default_extra,
                         machine_spec=machine_spec,
