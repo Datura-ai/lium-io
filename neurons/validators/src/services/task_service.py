@@ -1167,55 +1167,31 @@ class TaskService:
                         machine_spec=machine_spec,
                     )
 
-                    if verifyx_result.error:
-                        log_text = _m(
-                            f"VerifyX validation failed: {verifyx_result.error}",
-                            extra=get_extra_info({**default_extra, "verifyx_error": verifyx_result.error}),
-                        )
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            collateral_deposited=False,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            gpu_model_count=gpu_model_count,
-                            clear_verified_job_info=False,
-                        )
-
                     verifyx_data = verifyx_result.data
 
-                    if not verifyx_data.get("success"):
-                        log_text = _m(
-                            f"VerifyX validation failed: {verifyx_data.get('errors', 'Unknown errors')}",
-                            extra=get_extra_info({**default_extra, "verifyx_data": verifyx_data}),
+                    if not verifyx_data:
+                        default_extra = {
+                            **default_extra,
+                            "verifyx_success": False,
+                            "verifyx_error_message": f"VerifyX validation failed: {verifyx_result.error}",
+                        }
+                    elif not verifyx_data.get("success"):
+                        default_extra = {
+                            **default_extra,
+                            "verifyx_success": False,
+                            "verifyx_error_message": f"VerifyX validation failed: {verifyx_data.get('errors', 'Unknown errors')}",
+                        }
+                    else:
+                        logger.info(
+                            _m(
+                                "Verifyx validation successful",
+                                extra=get_extra_info({**default_extra, "verifyx_data": verifyx_data}),
+                            )
                         )
-                        return await self._handle_task_result(
-                            miner_info=miner_info,
-                            executor_info=executor_info,
-                            spec=machine_spec,
-                            score=0,
-                            job_score=0,
-                            collateral_deposited=False,
-                            log_text=log_text,
-                            verified_job_info=verified_job_info,
-                            success=False,
-                            gpu_model_count=gpu_model_count,
-                            clear_verified_job_info=False,
-                        )
-
-                    logger.info(
-                        _m(
-                            "Verifyx validation successful",
-                            extra=get_extra_info({**default_extra, "verifyx_data": verifyx_data}),
-                        )
-                    )
-                    machine_spec["ram"] = verifyx_data.get("ram")
-                    machine_spec["hard_disk"] = verifyx_data.get("hard_disk")
-                    machine_spec["network"] = verifyx_data.get("network")
+                        machine_spec["ram"] = verifyx_data.get("ram")
+                        machine_spec["hard_disk"] = verifyx_data.get("hard_disk")
+                        machine_spec["network"] = verifyx_data.get("network")
+                  
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
                     ssh_client=shell.ssh_client,
