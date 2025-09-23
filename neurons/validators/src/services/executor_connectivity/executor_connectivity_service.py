@@ -120,9 +120,7 @@ class ExecutorConnectivityService:
             dind_status = "ok" if dind_result.success else "failed"
             batch_successful_count = len(successful_ports) - (1 if dind_result.success else 0)
             batch_status = "ok" if batch_successful_count > 0 else "failed"
-            logger.info(
-                _m(f"summary: dind={dind_status}, batch={batch_status}, successful ports: {len(successful_ports)}", extra)
-            )
+
 
             if not successful_ports:
                 failure_msg = "No working ports found"
@@ -147,6 +145,7 @@ class ExecutorConnectivityService:
 
             if failed_ports:
                 success_msg += f", {len(failed_ports)} failed ports: {failed_sample}"
+            logger.info(_m(success_msg, extra))
 
             return DockerConnectionCheckResult(
                 success=True,
