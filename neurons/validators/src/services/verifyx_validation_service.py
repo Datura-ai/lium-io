@@ -1,17 +1,18 @@
 import ctypes
+import hashlib
 import json
 import random
 import os
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from core.utils import _m, get_extra_info
+
 
 logger = logging.getLogger(__name__)
 
 
 class VerifyXValidator:
     def __init__(self, lib_name: str, seed: int):
-        self._initialized = False
         lib_path = os.path.join(os.path.dirname(__file__), lib_name)
         self.lib = ctypes.CDLL(lib_path)
         self._setup_signatures()
@@ -32,7 +33,6 @@ class VerifyXValidator:
         self.lib.verify.restype = ctypes.POINTER(ctypes.c_char)
         self.lib.service_del.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
         self.lib.str_del.argtypes = [ctypes.POINTER(ctypes.c_char)]
-        self._initialized = True
 
     def _create_service(self):
         return self.lib.service_new()
@@ -65,9 +65,30 @@ class VerifyXValidator:
             self.lib.str_del(verify_ptr)
 
 
+class VerifyXResponse:
+    def __init__(self, data: Optional[Dict[str, Any]] = None, error: Optional[str] = None):
+        self.data = data
+        self.error = error
+
+
 class VerifyXValidationService:
     def __init__(self):
         self.lib_name = "/usr/lib/libverifyx.so"
+
+    def _calculate_lib_checksum(self, lib_path: str) -> str:
+        """Calculate SHA256 checksum of the VerifyX shared library."""
+        with open(lib_path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    async def _get_executor_checksum(self, ssh_client, executor_info) -> str:
+        """Get the VerifyX library checksum from executor."""
+        command = f"{executor_info.python_path} {executor_info.root_dir}/src/checksum_executor.py"
+
+        try:
+            result = await ssh_client.run(command)
+            return result.stdout.strip() if result else ""
+        except Exception:
+            return ""
 
     async def validate_verifyx_and_process_job(
         self,
@@ -77,7 +98,14 @@ class VerifyXValidationService:
         machine_spec: dict,
     ):
         try:
-            script_path = f"{executor_info.root_dir}/src/verifyx_executor.py"
+            # Verify checksum before proceeding with validation
+            local_checksum = self._calculate_lib_checksum(self.lib_name)
+            executor_checksum = await self._get_executor_checksum(ssh_client, executor_info)
+
+            logger.info(f"local_checksum: {local_checksum}, executor_checksum: {executor_checksum}")
+
+            if local_checksum != executor_checksum:
+                return VerifyXResponse(error="executor not using latest VerifyX library (checksum verification failed)")
 
             gpu_details = machine_spec.get("gpu", {}).get("details", [])
             gpu_count = machine_spec.get("gpu", {}).get("count", 0)
@@ -91,7 +119,7 @@ class VerifyXValidationService:
             verifyx_validator = VerifyXValidator(self.lib_name, seed)
             cipher_text = verifyx_validator.generate_challenge(machine_info.encode("utf-8"))
 
-            command = f"{executor_info.python_path} {script_path} --seed {seed} --cipher_text {cipher_text}"
+            command = f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py --seed {seed} --cipher_text {cipher_text}"
 
             log_extra = {
                 **default_extra,
@@ -105,29 +133,23 @@ class VerifyXValidationService:
             try:
                 result = await ssh_client.run(command)
             except Exception:
-                logger.error(_m("Failed to execute SSH command", extra=get_extra_info(log_extra)))
-                return None
+                return VerifyXResponse(error="SSH command execution failed")
 
             if result is None:
-                logger.warning(_m("VerifyX validation job failed", extra=get_extra_info(log_extra)))
-                return None
+                return VerifyXResponse(error="SSH command returned no result")
 
             try:
                 stdout = result.stdout.strip()
             except AttributeError:
-                logger.error(_m("Result object missing stdout attribute", extra=get_extra_info(log_extra)))
-                return None
+                return VerifyXResponse(error="SSH result missing stdout")
 
             logger.info(_m("Challenge response received", extra=get_extra_info({**log_extra, "stdout": stdout})))
             # validate the response
             try:
                 response = verifyx_validator.verify_response(stdout)
-                logger.info(_m("VerifyX Verification Succeed", extra=get_extra_info({**log_extra, "result": response})))
-                return response
-            except Exception:
-                logger.error(_m("Error during VerifyX verification", extra=get_extra_info(log_extra)))
-                return None
+                return VerifyXResponse(data=response)
+            except Exception as e:
+                return VerifyXResponse(error=f"challenge verification failed ({str(e)})")
 
-        except Exception:
-            logger.error(_m("Unexpected error in validate_verifyx_and_process_job", extra=default_extra))
-            return None
+        except Exception as e:
+            return VerifyXResponse(error=f"unexpected error ({str(e)})")
