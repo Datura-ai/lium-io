@@ -44,6 +44,7 @@ from services.file_encrypt_service import ORIGINAL_KEYS
 logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
+SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
 
 class JobResult(BaseModel):
@@ -1065,9 +1066,9 @@ class TaskService:
                     
                     # apply half score if contract version is not the latest
                     if contract_version and contract_version != settings.get_latest_contract_version():
-                        actual_score = actual_score * 0.5
-                        job_score = job_score * 0.5
-                        log_msg += f" Your contract version is not the latest. So you'll get half score."
+                        actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                        job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                        log_msg += f" WARNING: Your contract version is not the latest. So you'll get {SCORE_PORTION_FOR_OLD_CONTRACT} score."
 
                     log_text = _m(
                         log_msg,
@@ -1240,9 +1241,9 @@ class TaskService:
                 success = True if actual_score > 0 else False
 
                 if contract_version and contract_version != settings.get_latest_contract_version():
-                    actual_score = actual_score * 0.5
-                    job_score = job_score * 0.5
-                    log_msg += f"Your contract version is not the latest. So you'll get half score."
+                    actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                    job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                    log_msg += f" WARNING: Your contract version is not the latest. So you'll get {SCORE_PORTION_FOR_OLD_CONTRACT} score."
 
                 log_text = _m(
                     log_msg,
