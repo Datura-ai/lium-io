@@ -21,7 +21,7 @@ from services.redis_service import (
 )
 
 # Constants
-BATCH_VERIFIER_CONTAINER_PREFIX = "batch_verifier"
+BATCH_VERIFIER_CONTAINER_PREFIX = "container_batch_verifier"
 BATCH_VERIFIER_IMAGE = "arhangel662/batch-port-verifier:latest"
 
 logger = logging.getLogger(__name__)
@@ -74,41 +74,27 @@ class ExecutorConnectivityService:
             # Debug: show port mappings summary
             logger.debug(_m(f"Checking {len(port_maps)} port mappings", extra))
 
-            # Start dind and batch checks
-            dind_ports = port_maps[0]
-            dind_task = self.verify_single_port(
+            successful_ports, failed_ports = await self.verify_other_ports(ssh_client, port_maps, executor_info, extra)
+            dind_port = successful_ports.pop(0) if successful_ports else port_maps[0]
+            dind_result = await self.verify_single_port(
                 ssh_client,
                 job_batch_id,
                 miner_hotkey,
                 executor_info,
                 private_key,
                 public_key,
-                dind_ports[0],
-                dind_ports[1],
+                dind_port[0],
+                dind_port[1],
                 sysbox_runtime,
                 extra,
             )
-            other_ports_task = self.verify_other_ports(ssh_client, port_maps[1:], executor_info, extra)
-
-            # Wait for both checks to complete
-            dind_result, (batch_successful_ports, batch_failed_ports) = await asyncio.gather(
-                dind_task, other_ports_task
-            )
-
-            # Collect successful and failed port pairs
-            successful_ports = []  # for Redis: list[tuple[int, int]]
-            failed_ports = []  # for statistics: list[tuple[int, int]]
 
             # Add dind port pair
             if dind_result.success:
-                successful_ports.append(dind_ports)
+                successful_ports.append(dind_port)
                 sysbox_runtime = dind_result.sysbox_runtime
             else:
-                failed_ports.append(dind_ports)
-
-            # Add batch results (already processed port pairs)
-            successful_ports.extend(batch_successful_ports)
-            failed_ports.extend(batch_failed_ports)
+                failed_ports.append(dind_port)
 
             # Calculate statistics
             total_checked = len(successful_ports) + len(failed_ports)
@@ -120,7 +106,6 @@ class ExecutorConnectivityService:
             dind_status = "ok" if dind_result.success else "failed"
             batch_successful_count = len(successful_ports) - (1 if dind_result.success else 0)
             batch_status = "ok" if batch_successful_count > 0 else "failed"
-
 
             if not successful_ports:
                 failure_msg = "No working ports found"
@@ -141,7 +126,7 @@ class ExecutorConnectivityService:
             failed_sample = sorted(failed_internal_ports)[:5]
 
             success_msg = f"Port verification completed successfully {success_percentage:.0f}% ports available. "
-            success_msg += f"{len(successful_ports)} success ports: {success_sample}"
+            success_msg += f"{dind_status}, {batch_status}, {len(successful_ports)} success ports: {success_sample}"
 
             if failed_ports:
                 success_msg += f", {len(failed_ports)} failed ports: {failed_sample}"
@@ -346,13 +331,6 @@ class ExecutorConnectivityService:
         command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
         result = await ssh_client.run(command)
         container_names = []
-
-        if result.stdout.strip():
-            container_names.extend(result.stdout.strip().split("\n"))
-
-        # Clean port_checker prefixed containers
-        command = f'/usr/bin/docker ps -a --filter "name=^/{BATCH_VERIFIER_CONTAINER_PREFIX}_" --format "{{.Names}}"'
-        result = await ssh_client.run(command)
 
         if result.stdout.strip():
             container_names.extend(result.stdout.strip().split("\n"))
