@@ -22,7 +22,7 @@ from services.redis_service import (
 
 # Constants
 BATCH_VERIFIER_CONTAINER_PREFIX = "container_batch_verifier"
-BATCH_VERIFIER_IMAGE = "arhangel662/batch-port-verifier:latest"
+BATCH_VERIFIER_IMAGE = "daturaai/batch-port-verifier:latest"
 
 logger = logging.getLogger(__name__)
 
