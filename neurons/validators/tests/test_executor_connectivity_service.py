@@ -151,14 +151,14 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
     """Test cleanup of old Docker containers."""
     mock_ssh_client.run.side_effect = [
         AsyncMock(stdout="container_test1\ncontainer_test2\n"),
-        AsyncMock(stdout="batch_verifier_9000\n"),
+        AsyncMock(stdout="container_batch_verifier_9000\n"),
         AsyncMock(exit_status=0),
         AsyncMock(exit_status=0),
     ]
 
     await executor_service.cleanup_docker_containers(mock_ssh_client)
 
-    assert mock_ssh_client.run.call_count == 4
+    assert mock_ssh_client.run.call_count == 3
     cleanup_calls = [call.args[0] for call in mock_ssh_client.run.call_args_list[-2:]]
     assert any("docker rm" in cmd for cmd in cleanup_calls)
     assert any("docker volume prune" in cmd for cmd in cleanup_calls)
