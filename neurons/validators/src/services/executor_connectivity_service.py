@@ -165,20 +165,20 @@ class ExecutorConnectivityService:
             return [], []
 
         # Use first port as API_PORT for checker container
-        api_port = port_maps[0][1]  # external port
+        api_internal, api_external = port_maps[0]  # external port
         ports_to_check = port_maps[1:]
-        container_name = f"{BATCH_VERIFIER_CONTAINER_PREFIX}_{api_port}"
+        container_name = f"{BATCH_VERIFIER_CONTAINER_PREFIX}_{api_external}"
 
         # Log batch check start
         logger.info(
-            _m(f"batch-check: Starting batch verifier on port {api_port}, checking {len(ports_to_check)} ports...", extra)
+            _m(f"batch-check: Starting batch verifier on port {api_internal}:{api_external}, checking {len(ports_to_check)} ports...", extra)
         )
 
         try:
             # Start Docker container
             command = (
                 f"/usr/bin/docker run -d --name {container_name} --network=host "
-                f"-e API_PORT={api_port} {BATCH_VERIFIER_IMAGE}"
+                f"-e API_PORT={api_internal} {BATCH_VERIFIER_IMAGE}"
             )
 
             # Debug: log command
@@ -188,22 +188,22 @@ class ExecutorConnectivityService:
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr else "Unknown error"
                 logger.error(
-                    _m(f"error: Batch container start failed - {error_msg} (api_port={api_port})", extra), exc_info=True
+                    _m(f"error: Batch container start failed - {error_msg} (api_port={api_external})", extra), exc_info=True
                 )
                 return [], []
 
             # Log container started
-            logger.info(_m(f"batch-check: Container started on port {api_port}, waiting for health...", extra))
+            logger.info(_m(f"batch-check: Container started on port {api_external}, waiting for health...", extra))
 
             # Wait for health endpoint
-            if not await self._wait_for_health(executor_info.address, api_port, extra):
+            if not await self._wait_for_health(executor_info.address, api_external, extra):
                 logger.error(
-                    _m(f"error: Batch service health check failed - Service did not become healthy (api_port={api_port})", extra), exc_info=True
+                    _m(f"error: Batch service health check failed - Service did not become healthy (api_port={api_external})", extra), exc_info=True
                 )
                 return [], []
 
             # Log health ready
-            logger.info(_m(f"batch-check: Service healthy on port {api_port}, sending request...", extra))
+            logger.info(_m(f"batch-check: Service healthy on port {api_external}, sending request...", extra))
 
             # Log request sending
             logger.info(
@@ -212,7 +212,7 @@ class ExecutorConnectivityService:
 
             # Send port check request
             results = await self._send_port_check_request(
-                executor_info.address, api_port, ports_to_check, extra
+                executor_info.address, api_external, ports_to_check, extra
             )
 
             # Process results into port pairs
@@ -237,7 +237,7 @@ class ExecutorConnectivityService:
 
             # Log batch results
             logger.info(
-                _m(f"batch-check: Results received - successful: {successful_count}/{len(ports_to_check)} + api_port", extra)
+                _m(f"batch-check: Results: {successful_count}/{len(ports_to_check)} + api_port", extra)
             )
 
             # Log batch completion
@@ -249,7 +249,7 @@ class ExecutorConnectivityService:
             return successful_ports, failed_ports
 
         except Exception as e:
-            logger.error(_m(f"error: Batch port verification failed - {str(e)} (api_port={api_port})", extra), exc_info=True)
+            logger.error(_m(f"error: Batch port verification failed - {str(e)} (api_port={api_external})", extra), exc_info=True)
             return [], []
         finally:
             # Cleanup container
@@ -285,7 +285,7 @@ class ExecutorConnectivityService:
 
     async def _send_port_check_request(
         self, external_ip: str, api_port: int, port_maps: list[tuple[int, int]], extra: dict = {}
-    ) -> dict[int, bool]:
+    ) -> dict[str, bool]:
         """Send HTTP request to check ports."""
         check_url = f"http://{external_ip}:{api_port}/check-ports"
 
@@ -302,7 +302,7 @@ class ExecutorConnectivityService:
                         return data.get("results", {})
                     else:
                         logger.error(_m(f"Port check request failed with status {response.status}", extra))
-                        return [], []
+                        return {}
         except Exception as e:
             logger.error(_m(f"Error sending port check request: {e}", extra), exc_info=True)
             return {}
@@ -368,7 +368,7 @@ class ExecutorConnectivityService:
             ]
 
             # Return up to batch_size port mappings
-            return random.sample(port_mappings, 1000)
+            return random.sample(port_mappings, min(batch_size, len(port_mappings)))
 
         # Generate ports from range
         if executor_info.port_range:

@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.executor_connectivity.executor_connectivity_service import (
+from services.executor_connectivity_service import (
     ExecutorConnectivityService,
 )
 
@@ -20,8 +20,7 @@ def test_get_available_port_maps_from_mappings(executor_service, sample_executor
     result = executor_service.get_available_port_maps(sample_executor_info, batch_size)
 
     # Implementation currently returns 1000 ports (hardcoded in line 349)
-    # This appears to be a bug but we test the current behavior
-    assert len(result) == 1000
+    assert len(result) == 2
     # All ports should be in the range 9000-10004, excluding SSH port 22
     for internal_port, external_port in result:
         assert 9000 <= internal_port <= 10004

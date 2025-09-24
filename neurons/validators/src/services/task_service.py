@@ -29,7 +29,7 @@ from services.const import (
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
-from services.executor_connectivity.executor_connectivity_service import ExecutorConnectivityService
+from services.executor_connectivity_service import ExecutorConnectivityService
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
     DUPLICATED_MACHINE_SET,
