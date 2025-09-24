@@ -1063,7 +1063,7 @@ class TaskService:
                         log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
                     elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
                         log_msg = "Executor is rented. But not eligible from collateral contract. Will not have score very soon."
-                    
+
                     # apply half score if contract version is not the latest
                     if contract_version and contract_version != settings.get_latest_contract_version():
                         actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
@@ -1182,16 +1182,22 @@ class TaskService:
                             "verifyx_error_message": f"VerifyX validation failed: {verifyx_data.get('errors', 'Unknown errors')}",
                         }
                     else:
-                        logger.info(
-                            _m(
-                                "Verifyx validation successful",
-                                extra=get_extra_info({**default_extra, "verifyx_data": verifyx_data}),
-                            )
-                        )
+                        default_extra = {
+                            **default_extra,
+                            "verifyx_success": True,
+                            "verifyx_data": verifyx_data,
+                        }
+
                         machine_spec["ram"] = verifyx_data.get("ram")
                         machine_spec["hard_disk"] = verifyx_data.get("hard_disk")
                         machine_spec["network"] = verifyx_data.get("network")
-                  
+
+                    logger.info(
+                        _m(
+                            "Verifyx validation processed",
+                            extra=get_extra_info(default_extra),
+                        )
+                    )
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
                     ssh_client=shell.ssh_client,

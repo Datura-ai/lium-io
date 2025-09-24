@@ -141,7 +141,7 @@ class VerifyXValidationService:
             except AttributeError:
                 return VerifyXResponse(error="SSH result missing stdout")
 
-            logger.info(_m("Challenge response received", extra=get_extra_info({**log_extra, "stdout": stdout})))
+            logger.info(_m("Challenge response received", extra=get_extra_info(log_extra)))
             # validate the response
             try:
                 response = verifyx_validator.verify_response(stdout)
