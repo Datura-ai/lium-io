@@ -289,6 +289,9 @@ class ExecutorConnectivityService:
     ) -> dict[str, bool]:
         """Send HTTP request to check ports."""
         check_url = f"http://{external_ip}:{api_port}/check-ports"
+        if not port_maps:
+            logger.info(_m("No ports to check, skipping request...", extra))
+            return {}
 
         # Prepare request payload
         payload = {"external_ip": external_ip, "ports": port_maps}
