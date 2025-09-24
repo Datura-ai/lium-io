@@ -95,6 +95,7 @@ class ExecutorConnectivityService:
                 sysbox_runtime = dind_result.sysbox_runtime
             else:
                 failed_ports.append(dind_port)
+                sysbox_runtime = False
 
             # Calculate statistics
             total_checked = len(successful_ports) + len(failed_ports)
@@ -439,7 +440,7 @@ class ExecutorConnectivityService:
 
                 # Log container creation failure
                 logger.error(
-                    _m(f"error: dind container creation failed - {error_message} (port={internal_port})", extra), exc_info=True
+                    _m(f"error: dind container creation failed - {error_message} (port={internal_port})", extra)
                 )
 
                 try:
