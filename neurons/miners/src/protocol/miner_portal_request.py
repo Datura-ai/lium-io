@@ -31,12 +31,11 @@ class BaseMinerPortalRequest(BaseRequest):
 
 
 class AddExecutorPayload(BaseModel):
-    validator_hotkey: str
     gpu_type: str
     ip_address: str
     port: int
-    price_per_hour: float
-    gpu_count: int | None
+    price_per_hour: float | None = None
+    gpu_count: int
 
     @model_validator(mode="after")
     def validate_fields(self) -> Self:
