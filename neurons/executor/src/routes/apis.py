@@ -28,3 +28,31 @@ async def get_pod_logs(
     payload: GetPodLogsPaylod, pod_log_service: Annotated[PodLogService, Depends(PodLogService)]
 ):
     return await pod_log_service.find_by_continer_name(payload.container_name)
+
+
+@apis_router.post("/hardware_metrics")
+async def get_hardware_metrics():
+    import pynvml
+    import psutil
+    
+    metrics = {
+        "cpu": psutil.cpu_percent(interval=1),
+        "memory": psutil.virtual_memory().percent,
+        "gpu": []
+    }
+    
+    try:
+        pynvml.nvmlInit()
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            metrics["gpu"].append({
+                "utilization": util.gpu,
+                "memory_percent": round(mem.used / mem.total * 100, 2)
+            })
+        pynvml.nvmlShutdown()
+    except:
+        pass
+    
+    return metrics
