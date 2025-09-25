@@ -995,10 +995,16 @@ class DockerService:
                 for pubkey in payload.user_public_keys:
                     # Remove the public key from authorized_keys
                     # Properly escape slashes and pluses in pubkey for sed
-                    escaped_pubkey = pubkey.replace('/', '\\/').replace('+', '\\+')
+                    # Use Python's shlex.quote to safely quote the pubkey for shell usage
+                    import shlex
+
+                    # Remove the public key from authorized_keys by matching the exact line
+                    # This approach is safer and more reliable than trying to escape characters for sed
+                    quoted_pubkey = shlex.quote(pubkey)
                     remove_cmd = (
                         f"/usr/bin/docker exec -i {payload.container_name} "
-                        f"sh -c \"sed -i '/{escaped_pubkey}/d' /root/.ssh/authorized_keys\""
+                        f"sh -c \"grep -vxF {quoted_pubkey} /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp && "
+                        f"mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys\""
                     )
                     await ssh_client.run(remove_cmd)
 
