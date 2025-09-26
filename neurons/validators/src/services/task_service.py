@@ -616,6 +616,8 @@ class TaskService:
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
             "version": settings.VERSION,
+            "rented": False,
+            "renting_in_progress": False,
         }
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
         prev_spec = verified_job_info.get('spec', '')
@@ -980,6 +982,10 @@ class TaskService:
                 # check rented status
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
+                    default_extra = {
+                        **default_extra,
+                        "rented": True,
+                    }
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running, ssh_pub_keys = await self.check_pod_running(
                         ssh_client=shell.ssh_client,
@@ -1121,6 +1127,10 @@ class TaskService:
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress and not rented_machine:
+                    default_extra = {
+                        **default_extra,
+                        "renting_in_progress": True,
+                    }
                     docker_connection_check_result = await self.batch_verify_ports(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
