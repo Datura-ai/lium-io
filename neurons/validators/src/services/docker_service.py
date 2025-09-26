@@ -62,11 +62,10 @@ class DockerService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
-        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-        self.port_mapping_dao = port_mapping_dao
+        self.port_mapping_dao = PortMappingDao()
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
