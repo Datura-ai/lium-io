@@ -3,6 +3,7 @@ import json
 import logging
 import random
 from typing import Any
+from uuid import UUID
 
 import aiohttp
 import asyncssh
@@ -12,17 +13,21 @@ from pydantic import BaseModel
 
 from core.config import settings
 from core.utils import _m
+from daos.port_mapping_dao import PortMappingDao
+from models.port_mapping import PortMapping
 from services.const import (
     BATCH_PORT_VERIFICATION_SIZE,
     DOCKER_DIND_IMAGE,
+    PREFERED_POD_PORTS,
 )
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
+    RedisService,
 )
 
 # Constants
 BATCH_VERIFIER_CONTAINER_PREFIX = "container_batch_verifier"
-BATCH_VERIFIER_IMAGE = "daturaai/batch-port-verifier:latest"
+BATCH_VERIFIER_IMAGE = "daturaai/batch-port-verifier:0.0.0"
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +39,7 @@ class DockerConnectionCheckResult(BaseModel):
 
 
 class ExecutorConnectivityService:
-    def __init__(self, redis_service):
+    def __init__(self, redis_service: "RedisService"):
         self.redis_service = redis_service
 
     async def batch_verify_ports(
@@ -116,8 +121,11 @@ class ExecutorConnectivityService:
                     sysbox_runtime=sysbox_runtime,
                 )
 
-            # Save successful ports to Redis
-            await self.save_to_redis(executor_info, miner_hotkey, successful_ports, extra)
+            # Save successful ports
+            redis_task = self.save_to_redis(executor_info, miner_hotkey, successful_ports, extra)
+            db_task = self.save_to_db(executor_info, miner_hotkey, successful_ports, failed_ports, extra)
+            await asyncio.gather(redis_task, db_task)
+
 
             # Create detailed success message
             successful_internal_ports = [port_pair[0] for port_pair in successful_ports]
@@ -316,6 +324,7 @@ class ExecutorConnectivityService:
     ):
         key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
         MAX_REDIS_SAVE = 10
+        MAX_REDIS_KEEP = 10
         for internal_port, external_port in successful_ports[:MAX_REDIS_SAVE]:
             port_map = f"{internal_port},{external_port}"
 
@@ -327,8 +336,51 @@ class ExecutorConnectivityService:
 
             # keep the latest 10 port maps
             port_maps = await self.redis_service.lrange(key)
-            if len(port_maps) > 10:
+            if len(port_maps) > MAX_REDIS_KEEP:
                 await self.redis_service.rpop(key)
+
+
+    async def save_to_db(
+        self,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        successful_ports: list[tuple[int, int]],
+        failed_ports: list[tuple[int, int]],
+        extra: dict = {}
+    ):
+        """Save successful port verification results to database."""
+        try:
+            # Prepare database records for successful ports only
+            db_records = [
+                PortMapping(
+                    miner_hotkey=miner_hotkey,
+                    executor_id=UUID(executor_info.uuid),
+                    internal_port=internal_port,
+                    external_port=external_port,
+                    is_successful=True
+                )
+                for internal_port, external_port in successful_ports
+            ]
+            for internal_port, external_port in failed_ports:
+                db_records.append(
+                    PortMapping(
+                        miner_hotkey=miner_hotkey,
+                        executor_id=UUID(executor_info.uuid),
+                        internal_port=internal_port,
+                        external_port=external_port,
+                        is_successful=False
+                    )
+                )
+
+            if db_records:
+                port_dao = PortMappingDao()
+                await port_dao.upsert_port_results(db_records)
+                await port_dao.clean_ports(db_records[0].executor_id)
+                logger.info(_m(f"Saved {len(db_records)} successful ports to database", extra))
+
+        except Exception as e:
+            logger.error(_m(f"Error saving ports to database: {e}", extra), exc_info=True)
+            # Redis still works as fallback
 
     async def cleanup_docker_containers(self, ssh_client: SSHClientConnection, extra: dict = {}):
         # Clean container_ prefixed containers
@@ -361,7 +413,7 @@ class ExecutorConnectivityService:
         executor_info: ExecutorSSHInfo,
         batch_size: int = 1000,
     ) -> list[tuple[int, int]]:
-        """Get a list of available port maps for batch verification."""
+        """Get a list of available port maps for batch verification. with priority for PREFERED_POD_PORTS"""
         if executor_info.port_mappings:
             port_mappings: list[tuple[int, int]] = json.loads(executor_info.port_mappings)
             port_mappings = [
@@ -371,8 +423,27 @@ class ExecutorConnectivityService:
                 and external_port != executor_info.ssh_port
             ]
 
-            # Return up to batch_size port mappings
-            return random.sample(port_mappings, min(batch_size, len(port_mappings)))
+            # Prioritize preferred ports from existing port mappings
+            preferred_mappings = [
+                mapping for mapping in port_mappings
+                if mapping[0] in PREFERED_POD_PORTS or mapping[1] in PREFERED_POD_PORTS
+            ]
+            remaining_mappings = [
+                mapping for mapping in port_mappings
+                if mapping not in preferred_mappings
+            ]
+
+            # Combine preferred first, then sample from remaining
+            result = preferred_mappings[:]
+            if len(result) < batch_size and remaining_mappings:
+                additional_needed = batch_size - len(result)
+                additional_ports = random.sample(
+                    remaining_mappings,
+                    min(additional_needed, len(remaining_mappings))
+                )
+                result.extend(additional_ports)
+
+            return result[:batch_size]
 
         # Generate ports from range
         if executor_info.port_range:
@@ -394,9 +465,23 @@ class ExecutorConnectivityService:
         if not ports:
             return []
 
-        # Select random ports for batch verification
-        selected_ports = random.sample(ports, min(batch_size, len(ports)))
-        return [(port, port) for port in selected_ports]
+        # Prioritize preferred ports first
+        preferred_ports = [port for port in PREFERED_POD_PORTS if port in ports]
+        remaining_ports = [port for port in ports if port not in PREFERED_POD_PORTS]
+
+        # Start with preferred ports
+        selected_ports = preferred_ports[:]
+
+        # Add remaining ports if needed
+        if len(selected_ports) < batch_size and remaining_ports:
+            additional_needed = batch_size - len(selected_ports)
+            additional_ports = random.sample(
+                remaining_ports,
+                min(additional_needed, len(remaining_ports))
+            )
+            selected_ports.extend(additional_ports)
+
+        return [(port, port) for port in selected_ports[:batch_size]]
 
     async def verify_single_port(
         self,

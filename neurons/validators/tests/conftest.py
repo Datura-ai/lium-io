@@ -1,7 +1,30 @@
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 from datura.requests.miner_requests import ExecutorSSHInfo
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
+import logging
+import sys
+
+
+@pytest.fixture(scope="session", autouse=True)
+def setup_sql_logging():
+    """Enable SQL query logging for all tests."""
+    # Configure root logging to show INFO level
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
+
+    # Enable SQLAlchemy engine logging - just set level, let basicConfig handle output
+    sql_logger = logging.getLogger('sqlalchemy.engine')
+    sql_logger.setLevel(logging.INFO)
+
+    # Also enable pool logging for connection monitoring
+    pool_logger = logging.getLogger('sqlalchemy.pool')
+    pool_logger.setLevel(logging.DEBUG)
+
+    print("✅ SQL logging enabled for all tests")
 
 
 @pytest.fixture
@@ -56,3 +79,56 @@ def mock_aiohttp_session():
         session.post.return_value.__aenter__.return_value = response
 
         yield session
+
+
+@pytest_asyncio.fixture(scope="session")
+async def test_engine():
+    """Create an async engine for testing with SQLite in-memory database."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        echo=True,  # Enable SQL query logging
+        future=True,
+    )
+
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    yield engine
+
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def test_db_session(test_engine):
+    """Create a test database session for each test."""
+    from sqlalchemy.orm import sessionmaker
+
+    async_session_maker = sessionmaker(
+        bind=test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+    async with async_session_maker() as session:
+        yield session
+        await session.rollback()
+
+
+@pytest.fixture
+def mock_async_session_maker(test_db_session):
+    """Mock the global AsyncSessionMaker to use test database."""
+
+    class MockContextManager:
+        def __init__(self, session):
+            self._session = session
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            if exc_type:
+                await self._session.rollback()
+
+    with patch('daos.base.AsyncSessionMaker') as mock_maker:
+        mock_maker.return_value = MockContextManager(test_db_session)
+        yield mock_maker

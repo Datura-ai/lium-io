@@ -5,6 +5,7 @@ import pytest
 from services.executor_connectivity_service import (
     ExecutorConnectivityService,
 )
+from services.const import PREFERED_POD_PORTS
 
 
 @pytest.fixture
@@ -143,6 +144,85 @@ async def test_batch_verify_ports_invalid_json_mappings(executor_service, mock_s
 
     assert result.success is False
     assert "No port available" in result.log_text or "Expecting value" in result.log_text
+
+
+def test_get_available_port_maps_preferred_ports_priority(executor_service):
+    """Test that preferred ports are prioritized when available."""
+    from datura.requests.miner_requests import ExecutorSSHInfo
+
+    # Create port range that includes some preferred ports
+    executor_info = ExecutorSSHInfo(
+        uuid="test",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        port_mappings=None,
+        port_range="20000-20090",  # Includes preferred ports 20000-20009
+        python_path="/usr/bin/python3",
+        root_dir="/tmp",
+    )
+    batch_size = 15
+
+    result = executor_service.get_available_port_maps(executor_info, batch_size)
+
+    assert len(result) == batch_size
+
+    # Extract the ports that were selected
+    selected_ports = [port_pair[0] for port_pair in result]
+
+    # Check that preferred ports that are in range come first
+    preferred_in_range = [port for port in PREFERED_POD_PORTS
+                         if (20000 <= port <= 20090)]
+
+    # The first ports in result should be from preferred list
+    preferred_selected = [port for port in selected_ports if port in PREFERED_POD_PORTS]
+
+    # We should have some preferred ports selected
+    assert len(preferred_selected) > 0
+
+    # All preferred ports that are available should be included
+    for preferred_port in preferred_in_range:
+        assert preferred_port in selected_ports
+
+
+def test_get_available_port_maps_preferred_mappings_priority(executor_service):
+    """Test that preferred port mappings are prioritized from JSON mappings."""
+    from datura.requests.miner_requests import ExecutorSSHInfo
+    import json
+
+    # Create mappings that include some preferred ports
+    port_mappings = [
+        [20000, 20000],  # Preferred port
+        [20001, 20001],  # Preferred port
+        [9000, 9000],    # Non-preferred
+        [9001, 9001],    # Non-preferred
+        [9002, 9002],    # Non-preferred
+    ]
+
+    executor_info = ExecutorSSHInfo(
+        uuid="test",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        port_mappings=json.dumps(port_mappings),
+        port_range=None,
+        python_path="/usr/bin/python3",
+        root_dir="/tmp",
+    )
+    batch_size = 3
+
+    result = executor_service.get_available_port_maps(executor_info, batch_size)
+
+    assert len(result) == batch_size
+
+    # Extract the ports that were selected
+    selected_ports = [port_pair[0] for port_pair in result]
+
+    # The preferred ports should be included first
+    assert 20000 in selected_ports
+    assert 20001 in selected_ports
 
 
 @pytest.mark.asyncio

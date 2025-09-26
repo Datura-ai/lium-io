@@ -2,8 +2,8 @@ import asyncio
 from datetime import datetime
 import logging
 import time
-from typing import Annotated
-from uuid import uuid4
+from typing import Annotated, Any
+from uuid import uuid4, UUID
 import shlex
 
 import aiohttp
@@ -30,6 +30,8 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
+from daos.port_mapping_dao import PortMappingDao
+from services.const import PREFERED_POD_PORTS
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
@@ -59,17 +61,57 @@ class DockerService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.port_mapping_dao = port_mapping_dao
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
         self.is_realtime_logging = False
 
-    async def generate_portMappings(self, miner_hotkey, executor_id, internal_ports=None):
+    async def generate_portMappings(self, miner_hotkey: str, executor_id: str, internal_ports: list[int] = None) -> list[tuple[int, int, int]]:
         try:
-            docker_internal_ports = [22, 20000, 20001, 20002, 20003]
+            docker_internal_ports = internal_ports or PREFERED_POD_PORTS
+
+            # Get successful ports from database as dict {external_port: PortMapping}
+            available_ports = await self.port_mapping_dao.get_successful_ports_as_dict(UUID(executor_id))
+
+            if not available_ports:
+                logger.warning(f"No successful ports found in database for executor {executor_id}")
+                return []
+
+            mappings = []
+
+            # For each docker port: try exact match first, then random
+            for docker_port in docker_internal_ports:
+                if docker_port in available_ports:
+                    # Exact match - use this external_port
+                    port_mapping = available_ports.pop(docker_port)
+                    mappings.append((docker_port, port_mapping.internal_port, docker_port))
+                elif available_ports:
+                    # Random available external_port
+                    external_port, port_mapping = available_ports.popitem()
+                    mappings.append((docker_port, port_mapping.internal_port, external_port))
+                # If no more available_ports - skip this docker_port
+
+            # Ensure we have mappings for all requested docker ports
+            if len(mappings) != len(docker_internal_ports):
+                missing_ports = len(docker_internal_ports) - len(mappings)
+                raise Exception(f"Could not generate mappings for {missing_ports} docker ports - insufficient available ports in database")
+
+            logger.info(f"Generated {len(mappings)} port mappings from database for executor {executor_id}")
+            return mappings
+
+        except Exception as e:
+            logger.error(f"Error generating port mappings from database: {e}", exc_info=True)
+            return await self.generate_port_mapping_from_redis(executor_id, internal_ports, miner_hotkey)
+
+
+    async def generate_port_mapping_from_redis(self, executor_id, internal_ports, miner_hotkey) -> list[Any]:
+        try:
+            docker_internal_ports = PREFERED_POD_PORTS
             if internal_ports:
                 docker_internal_ports = internal_ports
 
