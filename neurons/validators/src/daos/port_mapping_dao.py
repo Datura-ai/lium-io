@@ -67,7 +67,7 @@ class PortMappingDao(BaseDao):
                 )
                 raise
 
-    async def clean_ports(self, executor_id: UUID, period_minutes: int = 1) -> int:
+    async def clean_ports(self, executor_id: UUID, period_minutes: int = 60) -> int:
         """delete ports older than period_minutes from DB"""
         async with self.get_session() as session:
             try:
@@ -86,7 +86,7 @@ class PortMappingDao(BaseDao):
                 logger.error(f"Error cleaning ports: {e}", exc_info=True)
                 return 0
 
-    async def get_successful_ports_as_dict(self, executor_id: UUID) -> dict[int, PortMapping]:
+    async def get_successful_ports(self, executor_id: UUID) -> dict[int, PortMapping]:
         """Get successful ports as dictionary {external_port: PortMapping} for fast lookup."""
         async with self.get_session() as session:
             try:

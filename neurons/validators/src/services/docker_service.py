@@ -1,4 +1,5 @@
 import asyncio
+import random
 from datetime import datetime
 import logging
 import time
@@ -76,7 +77,8 @@ class DockerService:
             docker_internal_ports = internal_ports or PREFERED_POD_PORTS
 
             # Get successful ports from database as dict {external_port: PortMapping}
-            available_ports = await self.port_mapping_dao.get_successful_ports_as_dict(UUID(executor_id))
+            available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
+
 
             if not available_ports:
                 logger.warning(f"No successful ports found in database for executor {executor_id}")
@@ -92,7 +94,8 @@ class DockerService:
                     mappings.append((docker_port, port_mapping.internal_port, docker_port))
                 elif available_ports:
                     # Random available external_port
-                    external_port, port_mapping = available_ports.popitem()
+                    external_port = random.choice(list(available_ports.keys()))
+                    port_mapping = available_ports.pop(external_port)
                     mappings.append((docker_port, port_mapping.internal_port, external_port))
                 # If no more available_ports - skip this docker_port
 

@@ -15,10 +15,10 @@ def port_mapping_dao():
 
 
 @pytest.mark.asyncio
-async def test_get_successful_ports_as_dict_returns_dict_with_external_port_keys(
+async def test_get_successful_ports_returns_dict_with_external_port_keys(
     port_mapping_dao: PortMappingDao, test_db_session, mock_async_session_maker
 ):
-    """Test that get_successful_ports_as_dict returns dict with external_port as keys."""
+    """Test that get_successful_ports returns dict with external_port as keys."""
     executor_id = uuid4()
 
     successful_ports = create_port_mappings_batch(
@@ -31,7 +31,7 @@ async def test_get_successful_ports_as_dict_returns_dict_with_external_port_keys
     test_db_session.add_all(successful_ports + failed_ports)
     await test_db_session.commit()
 
-    result = await port_mapping_dao.get_successful_ports_as_dict(executor_id)
+    result = await port_mapping_dao.get_successful_ports(executor_id)
 
     # Should return only successful ports as dict
     assert len(result) == 3
@@ -57,8 +57,8 @@ async def test_upsert_port_results_creates_new_ports(
 
     assert len(result) == 3
 
-    # Verify ports are saved in database using get_successful_ports_as_dict
-    ports_dict = await port_mapping_dao.get_successful_ports_as_dict(executor_id)
+    # Verify ports are saved in database using get_successful_ports
+    ports_dict = await port_mapping_dao.get_successful_ports(executor_id)
     assert len(ports_dict) == 3
     assert set(ports_dict.keys()) == {20000, 20001, 20002}
 
@@ -89,7 +89,7 @@ async def test_upsert_port_results_updates_existing_ports(
     await port_mapping_dao.upsert_port_results(updated_ports)
 
     # Verify ports were updated
-    ports_dict = await port_mapping_dao.get_successful_ports_as_dict(executor_id)
+    ports_dict = await port_mapping_dao.get_successful_ports(executor_id)
     assert len(ports_dict) == 2  # Should still be 2 ports
 
     for port in ports_dict.values():
@@ -114,8 +114,8 @@ async def test_upsert_port_results_different_executors_isolated(
     await port_mapping_dao.upsert_port_results(ports2)
 
     # Verify each executor has their own ports
-    dict1 = await port_mapping_dao.get_successful_ports_as_dict(executor_id1)
-    dict2 = await port_mapping_dao.get_successful_ports_as_dict(executor_id2)
+    dict1 = await port_mapping_dao.get_successful_ports(executor_id1)
+    dict2 = await port_mapping_dao.get_successful_ports(executor_id2)
 
     assert len(dict1) == 2
     assert len(dict2) == 2
@@ -129,5 +129,5 @@ async def test_upsert_port_results_different_executors_isolated(
         assert port.executor_id == executor_id2
 
 
-# Note: get_successful_ports_as_dict is tested indirectly through the DockerService tests
+# Note: get_successful_ports is tested indirectly through the DockerService tests
 # which provide comprehensive coverage of the functionality in realistic scenarios.
