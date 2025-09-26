@@ -46,12 +46,10 @@ async def get_hardware_metrics():
         for i in range(pynvml.nvmlDeviceGetCount()):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            
             metrics["gpu"].append({
-                "utilization": util.gpu,
-                "memory_used_mb": round(mem.used / 1024 / 1024, 2),
-                "memory_total_mb": round(mem.total / 1024 / 1024, 2),
-                "memory_percent": round(mem.used / mem.total * 100, 2)
+                "gpu": util.gpu,
+                "memory": util.memory,
             })
         pynvml.nvmlShutdown()
     except:
