@@ -14,7 +14,7 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
 )
 
-app.add_middleware(MinerMiddleware)  # Commented for testing
+app.add_middleware(MinerMiddleware)
 app.include_router(apis_router)
 
 reload = True if settings.ENV == "dev" else False
