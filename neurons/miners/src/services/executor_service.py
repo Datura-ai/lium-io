@@ -192,6 +192,37 @@ class ExecutorService:
                     "API request failed to register SSH key. url=%s, error=%s", url, str(e)
                 )
 
+    async def get_hardware_metrics_from_executor(self, executor: Executor) -> dict | None:
+        """Get hardware metrics from executor.
+
+        Args:
+            executor (Executor): Executor instance
+
+        Return:
+            dict | None: Hardware metrics or None if failed
+        """
+        timeout = aiohttp.ClientTimeout(total=5)
+        url = f"http://{executor.address}:{executor.port}/hardware_metrics"
+        keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        data_to_sign = f"metrics_{executor.address}_{executor.port}"
+        payload = {
+            "data_to_sign": data_to_sign,
+            "signature": f"0x{keypair.sign(data_to_sign).hex()}"
+        }
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.post(url, json=payload) as response:
+                    if response.status != 200:
+                        logger.error("API request failed to get hardware metrics. url=%s", url)
+                        return None
+                    return await response.json()
+            except Exception as e:
+                logger.error(
+                    "API request failed to get hardware metrics. url=%s, error=%s", url, str(e)
+                )
+                return None
+
     async def remove_pubkey_from_executor(self, executor: Executor, pubkey: str):
         """TODO: Send API request to executor to cleanup pubkey
 

@@ -561,6 +561,20 @@ class CliService:
             self.logger.error("Failed in removing an executor: %s", str(e))
             return False
 
+    async def get_hardware_metrics(self, address: str, port: int):
+        """
+        Get hardware utilization metrics from an executor.
+        :param address: Executor IP address
+        :param port: Executor port
+        :return: Metrics dict or None if failed
+        """
+        from services.executor_service import ExecutorService
+        from models.executor import Executor
+        
+        executor = Executor(address=address, port=port)
+        executor_service = ExecutorService(self.executor_dao)
+        return await executor_service.get_hardware_metrics_from_executor(executor)
+
     def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> float:
         # Handle missing GPU model gracefully
         unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT.get(gpu_type)

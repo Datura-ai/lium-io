@@ -311,6 +311,28 @@ def get_executor_collateral(address: str, port: int):
 
 
 @cli.command()
+@click.option("--address", prompt="IP Address", help="IP address of executor")
+@click.option("--port", type=int, prompt="Port", help="Port of executor")
+def get_hardware_metrics(address: str, port: int):
+    """Get hardware utilization metrics from an executor."""
+    cli_service = CliService(with_executor_db=True)
+    metrics = asyncio.run(cli_service.get_hardware_metrics(address, port))
+
+    if metrics:
+        output = f"{address}:{port}"
+        output += f" cpu={metrics.get('cpu', 0):.1f}%"
+        output += f" mem={metrics.get('memory', 0):.1f}%"
+        
+        for i, gpu in enumerate(metrics.get('gpu', [])):
+            output += f" gpu{i}.util={gpu.get('gpu', 0):.1f}%"
+            output += f" gpu{i}.mem={gpu.get('memory', 0):.1f}%"
+        
+        print(output)
+    else:
+        print(f"{address}:{port} [error: unable to fetch metrics]")
+
+
+@cli.command()
 def get_reclaim_requests():
     """Get reclaim requests for the current miner from the collateral contract"""
     
