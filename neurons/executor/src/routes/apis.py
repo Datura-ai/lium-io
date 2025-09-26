@@ -36,7 +36,7 @@ async def get_hardware_metrics():
     import psutil
     
     metrics = {
-        "cpu": psutil.cpu_percent(interval=1),
+        "cpu": psutil.cpu_percent(interval=0.1),  # Reduced from 1 second to 0.1
         "memory": psutil.virtual_memory().percent,
         "gpu": []
     }
