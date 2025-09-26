@@ -1,7 +1,7 @@
 import asyncio
 import bittensor
 import numpy as np
-from typing import TYPE_CHECKING
+from typing import Self, TYPE_CHECKING
 from bittensor.utils.weight_utils import (
     convert_weights_and_uids_for_emit,
     process_weights_for_netuid,
@@ -39,7 +39,7 @@ class SubtensorClient:
     hotkey_to_evm_address: dict[str, str] = {}
 
     @classmethod
-    def get_instance(cls):
+    def get_instance(cls) -> Self:
         """Get the singleton instance of SubtensorClient."""
         if cls._instance is None:
             cls._instance = cls()
@@ -541,7 +541,7 @@ class SubtensorClient:
                 await asyncio.sleep(SYNC_CYCLE)
 
     @classmethod
-    async def initialize(cls):
+    async def initialize(cls) -> Self:
         """Initialize the singleton instance asynchronously."""
         instance = cls.get_instance()
 
@@ -565,7 +565,7 @@ class SubtensorClient:
         cls._initialized = False
 
     @classmethod
-    def get_subtensor(cls):
+    def get_subtensor(cls) -> bittensor.subtensor:
         """Get the subtensor instance directly."""
         if cls._subtensor is None:
             instance = cls.get_instance()
