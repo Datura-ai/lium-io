@@ -19,10 +19,12 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopRequest,
     AddSshPublicKeyRequest,
+    RemoveSshPublicKeysRequest,
     ContainerCreated,
     ContainerStarted,
     ContainerStopped,
     SshPubKeyAdded,
+    SshPubKeyRemoved,
     ContainerDeleted,
     DuplicateExecutorsResponse,
     FailedContainerRequest,
@@ -583,6 +585,7 @@ class ComputeClient:
         | ContainerStopRequest
         | ContainerStartRequest
         | AddSshPublicKeyRequest
+        | RemoveSshPublicKeysRequest
         | ExecutorRentFinishedRequest
         | GetPodLogsRequestFromServer
         | AddDebugSshKeyRequest
@@ -695,6 +698,22 @@ class ComputeClient:
             logger.info(
                 _m(
                     "Sending back ssh key add result to compute app",
+                    extra=get_extra_info({**logging_extra, "response": str(response)}),
+                )
+            )
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, RemoveSshPublicKeysRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                SshPubKeyRemoved | FailedContainerRequest
+            ) = await self.miner_service.handle_container(job_request)
+
+            logger.info(
+                _m(
+                    "Sending back ssh key remove result to compute app",
                     extra=get_extra_info({**logging_extra, "response": str(response)}),
                 )
             )

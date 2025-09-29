@@ -1,48 +1,53 @@
+import asyncio
 import json
 import logging
 import random
 import uuid
 from typing import Annotated
+from pydantic import BaseModel
 
 import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
-from pydantic import BaseModel
 
 from core.config import settings
 from core.utils import _m, context, get_extra_info
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
-from services.collateral_contract_service import CollateralContractService
 from services.const import (
-    DOCKER_DIGEST,
-    GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_MODEL_RATES,
-    GPU_UTILIZATION_LIMIT,
-    LIB_NVIDIA_ML_DIGESTS,
     MAX_GPU_COUNT,
-    MIN_PORT_COUNT,
-    PYTHON_DIGEST,
     UNRENTED_MULTIPLIER,
+    LIB_NVIDIA_ML_DIGESTS,
+    DOCKER_DIGEST,
+    PYTHON_DIGEST,
+    GPU_UTILIZATION_LIMIT,
+    GPU_MEMORY_UTILIZATION_LIMIT,
+    MIN_PORT_COUNT,
+    BATCH_PORT_VERIFICATION_SIZE,
+    DOCKER_DIND_IMAGE,
 )
-from services.file_encrypt_service import ORIGINAL_KEYS
-from services.interactive_shell_service import InteractiveShellService
-from services.matrix_validation_service import ValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.redis_service import (
-    AVAILABLE_PORT_MAPS_PREFIX,
+    RedisService,
     DUPLICATED_MACHINE_SET,
     RENTAL_SUCCEED_MACHINE_SET,
-    RedisService,
+    AVAILABLE_PORT_MAPS_PREFIX,
 )
 from services.ssh_service import SSHService
+from services.interactive_shell_service import InteractiveShellService
+from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
+from services.collateral_contract_service import CollateralContractService
+from services.file_encrypt_service import ORIGINAL_KEYS
 
 logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
+SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
+SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
 class JobResult(BaseModel):
     spec: dict | None = None
@@ -332,6 +337,8 @@ class TaskService:
             "executor_ssh_username": executor_info.ssh_username,
             "executor_ssh_port": executor_info.ssh_port,
             "version": settings.VERSION,
+            "rented": False,
+            "renting_in_progress": False,
         }
         verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
         prev_spec = verified_job_info.get('spec', '')
@@ -696,6 +703,10 @@ class TaskService:
                 # check rented status
                 rented_machine = await self.redis_service.get_rented_machine(executor_info)
                 if rented_machine and rented_machine.get("container_name", ""):
+                    default_extra = {
+                        **default_extra,
+                        "rented": True,
+                    }
                     container_name = rented_machine.get("container_name", "")
                     is_pod_running, ssh_pub_keys = await self.check_pod_running(
                         ssh_client=shell.ssh_client,
@@ -779,12 +790,12 @@ class TaskService:
                         log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
                     elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
                         log_msg = "Executor is rented. But not eligible from collateral contract. Will not have score very soon."
-                    
+
                     # apply half score if contract version is not the latest
                     if contract_version and contract_version != settings.get_latest_contract_version():
-                        actual_score = actual_score * 0.5
-                        job_score = job_score * 0.5
-                        log_msg += " Your contract version is not the latest. So you'll get half score."
+                        actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                        job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                        log_msg += f" WARNING: Your contract version is not the latest. So you'll get {SCORE_PORTION_FOR_OLD_CONTRACT} score."
 
                     log_text = _m(
                         log_msg,
@@ -837,7 +848,11 @@ class TaskService:
 
                 renting_in_progress = await self.redis_service.renting_in_progress(miner_info.miner_hotkey, executor_info.uuid)
                 if not renting_in_progress and not rented_machine:
-                    docker_connection_check_result = await self.executor_connectivity_service.batch_verify_ports(
+                    default_extra = {
+                        **default_extra,
+                        "renting_in_progress": True,
+                    }
+                    docker_connection_check_result = await self.batch_verify_ports(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
@@ -876,33 +891,44 @@ class TaskService:
                 #     )
 
                 if settings.ENABLE_VERIFYX:
-                    response = await self.verifyx_validation_service.validate_verifyx_and_process_job(
-                        ssh_client=shell.ssh_client,
+                    verifyx_result = await self.verifyx_validation_service.validate_verifyx_and_process_job(
+                        shell=shell,
                         executor_info=executor_info,
                         default_extra=default_extra,
                         machine_spec=machine_spec,
                     )
-                    if response and response.get("success"):
-                        logger.info(
-                            _m(
-                                "Verifyx validation successful",
-                                extra=get_extra_info(
-                                    {**default_extra, "response": response}
-                                ),
-                            )
-                        )
-                        machine_spec["ram"] = response.get("ram")
-                        machine_spec["hard_disk"] = response.get("hard_disk")
-                        machine_spec["network"] = response.get("network")
+
+                    verifyx_data = verifyx_result.data
+
+                    if not verifyx_data:
+                        default_extra = {
+                            **default_extra,
+                            "verifyx_success": False,
+                            "verifyx_error_message": f"VerifyX validation failed: {verifyx_result.error}",
+                        }
+                    elif not verifyx_data.get("success"):
+                        default_extra = {
+                            **default_extra,
+                            "verifyx_success": False,
+                            "verifyx_error_message": f"VerifyX validation failed: {verifyx_data.get('errors', 'Unknown errors')}",
+                        }
                     else:
-                        logger.error(
-                            _m(
-                                "Verifyx validation failed",
-                                extra=get_extra_info(
-                                    {**default_extra, "response": response}
-                                ),
-                            )
+                        default_extra = {
+                            **default_extra,
+                            "verifyx_success": True,
+                            "verifyx_data": verifyx_data,
+                        }
+
+                        machine_spec["ram"] = verifyx_data.get("ram")
+                        machine_spec["hard_disk"] = verifyx_data.get("hard_disk")
+                        machine_spec["network"] = verifyx_data.get("network")
+
+                    logger.info(
+                        _m(
+                            "Verifyx validation processed",
+                            extra=get_extra_info(default_extra),
                         )
+                    )
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
                     ssh_client=shell.ssh_client,
@@ -957,9 +983,9 @@ class TaskService:
                 success = True if actual_score > 0 else False
 
                 if contract_version and contract_version != settings.get_latest_contract_version():
-                    actual_score = actual_score * 0.5
-                    job_score = job_score * 0.5
-                    log_msg += "Your contract version is not the latest. So you'll get half score."
+                    actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                    job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                    log_msg += f" WARNING: Your contract version is not the latest. So you'll get {SCORE_PORTION_FOR_OLD_CONTRACT} score."
 
                 log_text = _m(
                     log_msg,

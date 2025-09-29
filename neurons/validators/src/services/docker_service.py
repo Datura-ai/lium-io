@@ -18,11 +18,13 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopRequest,
     AddSshPublicKeyRequest,
+    RemoveSshPublicKeysRequest,
     ContainerCreated,
     ContainerDeleted,
     ContainerStarted,
     ContainerStopped,
     SshPubKeyAdded,
+    SshPubKeyRemoved,
     FailedContainerErrorCodes,
     FailedContainerRequest,
     FailedContainerErrorTypes,
@@ -977,6 +979,107 @@ class DockerService:
                 executor_id=payload.executor_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+    async def remove_ssh_keys(
+        self,
+        payload: RemoveSshPublicKeysRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_uuid": payload.executor_id,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "executor_ssh_username": executor_info.ssh_username,
+            "executor_ssh_port": executor_info.ssh_port,
+        }
+
+        logger.info(
+            _m(
+                "Remove ssh key(s) from pod",
+                extra=get_extra_info({**default_extra}),
+            ),
+        )
+
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
+
+        try:
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client:
+                if not payload.user_public_keys:
+                    log_text = _m(
+                        "ssh key Remove error: no public key",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": payload.container_name,
+                            "error": "No public keys",
+                        }),
+                    )
+                    logger.error(log_text)
+
+                    return FailedContainerRequest(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        msg=str(log_text),
+                        error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                        error_code=FailedContainerErrorCodes.NoSshKeys,
+                    )
+
+                # Remove each public key from authorized_keys
+                for pubkey in payload.user_public_keys:
+                    # Remove the public key from authorized_keys
+                    # Properly escape slashes and pluses in pubkey for sed
+                    # Use Python's shlex.quote to safely quote the pubkey for shell usage
+                    import shlex
+
+                    # Remove the public key from authorized_keys by matching the exact line
+                    # This approach is safer and more reliable than trying to escape characters for sed
+                    quoted_pubkey = shlex.quote(pubkey)
+                    remove_cmd = (
+                        f"/usr/bin/docker exec -i {payload.container_name} "
+                        f"sh -c \"grep -vxF {quoted_pubkey} /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp && "
+                        f"mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys\""
+                    )
+                    await ssh_client.run(remove_cmd)
+
+                logger.info(
+                    _m(
+                        "Removed ssh key(s) from the container",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": payload.container_name,
+                            "removed_keys": payload.user_public_keys,
+                        }),
+                    ),
+                )
+
+                return SshPubKeyRemoved(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    user_public_keys=payload.user_public_keys,
+                )
+        except Exception as e:
+            log_text = _m(
+                "Unknown Error remove_ssh_keys",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
