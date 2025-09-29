@@ -92,7 +92,7 @@ _m = StructuredMessage
 
 def get_collateral_contract(
     miner_key: str = None,
-    version: str = "1.0.1",
+    version: str = "1.0.2",
 ) -> CollateralContract:
     """
     Initializes and returns a CollateralContract instance.
