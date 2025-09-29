@@ -13,7 +13,7 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
 from core.config import settings
-from core.utils import _m, context, get_extra_info
+from core.utils import _m, context, get_extra_info, StructuredMessage
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
     GPU_MODEL_RATES,
@@ -45,8 +45,6 @@ from services.file_encrypt_service import ORIGINAL_KEYS
 logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
-SCORE_PORTION_FOR_OLD_CONTRACT = 0
-
 SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
 class JobResult(BaseModel):
@@ -300,7 +298,7 @@ class TaskService:
         gpu_processes: list[dict],
         default_extra: dict,
         rented: bool = False,
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool, str | None | StructuredMessage]:
         # check gpu usages
         for detail in gpu_details:
             gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
