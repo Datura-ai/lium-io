@@ -27,8 +27,6 @@ PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
 
 logger = logging.getLogger(__name__)
 
-PREV_TIME_DELTA_FOR_EMISSION = 0.5
-
 
 class RedisService:
     def __init__(self):
@@ -245,16 +243,6 @@ class RedisService:
 
         return json.loads(data)
 
-    async def set_revenue_per_gpu_type(self, gpu_type: str, revenue: float):
-        await self.hset(REVENUE_PER_GPU_TYPE_SET, gpu_type, str(revenue))
-
-    async def get_revenue_per_gpu_type(self, gpu_type: str):
-        revenue = await self.hget(REVENUE_PER_GPU_TYPE_SET, gpu_type)
-        if not revenue:
-            return 0.0
-
-        return float(revenue)
-
     async def set_portion_per_gpu_type(self, gpu_type: str, portion: float):
         await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
 
@@ -262,12 +250,7 @@ class RedisService:
         portion = await self.hget(PORTION_PER_GPU_TYPE_SET, gpu_type)
         if not portion:
             gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
-            if gpu_model_rate == 0:
-                return 0.0
-
-            # for initial portion
-            revenue = await self.get_revenue_per_gpu_type(gpu_type)
-            return gpu_model_rate + PREV_TIME_DELTA_FOR_EMISSION * (revenue - gpu_model_rate)
+            return gpu_model_rate
 
         return float(portion)
 

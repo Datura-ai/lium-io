@@ -55,6 +55,7 @@ class ContainerRequestType(enum.Enum):
     ContainerStopRequest = "ContainerStopRequest"
     ContainerDeleteRequest = "ContainerDeleteRequest"
     AddSshPublicKey = "AddSshPublicKey"
+    RemoveSshPublicKeysRequest = "RemoveSshPublicKeysRequest"
     DuplicateExecutorsResponse = "DuplicateExecutorsResponse"
     ExecutorRentFinished = "ExecutorRentFinished"
     GetPodLogsRequestFromServer = "GetPodLogsRequestFromServer"
@@ -105,6 +106,12 @@ class ContainerStartRequest(ContainerBaseRequest):
 
 class AddSshPublicKeyRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.AddSshPublicKey
+    container_name: str
+    user_public_keys: list[str] = []
+
+
+class RemoveSshPublicKeysRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.RemoveSshPublicKeysRequest
     container_name: str
     user_public_keys: list[str] = []
 
@@ -168,6 +175,7 @@ class ContainerResponseType(enum.Enum):
     FailedGetPodLogs = "FailedGetPodLogs"
     DebugSshKeyAdded = "DebugSshKeyAdded"
     FailedAddDebugSshKey = "FailedAddDebugSshKey"
+    SshPubKeyRemoved = "SshPubKeyRemoved"
 
 
 class ContainerBaseResponse(BaseRequest):
@@ -203,6 +211,10 @@ class ContainerDeleted(ContainerBaseResponse):
 class SshPubKeyAdded(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyAdded
     user_public_keys: list[str] = []
+
+
+class SshPubKeyRemoved(SshPubKeyAdded):
+    message_type: ContainerResponseType = ContainerResponseType.SshPubKeyRemoved
 
 
 class DebugSshKeyAdded(ContainerBaseResponse):
