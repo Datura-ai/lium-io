@@ -211,10 +211,10 @@ async def test_generate_portMappings_default_preferred_ports(docker_service):
     miner_hotkey = "test_miner"
 
     # Mock database response with all preferred ports available
-    from services.const import PREFFERED_POD_PORTS
+    from services.const import PREFERRED_POD_PORTS
 
     mock_ports = {}
-    for port in PREFFERED_POD_PORTS:
+    for port in PREFERRED_POD_PORTS:
         mock_ports[port] = PortMapping(
             miner_hotkey=miner_hotkey,
             executor_id=UUID(executor_id),
@@ -230,7 +230,7 @@ async def test_generate_portMappings_default_preferred_ports(docker_service):
     result = await docker_service.generate_portMappings(miner_hotkey, executor_id, None)
 
     # Verify that it used PREFERED_POD_PORTS
-    assert len(result) == len(PREFFERED_POD_PORTS)
-    for port in PREFFERED_POD_PORTS:
+    assert len(result) == len(PREFERRED_POD_PORTS)
+    for port in PREFERRED_POD_PORTS:
         assert (port, port, port) in result
     docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(executor_id))

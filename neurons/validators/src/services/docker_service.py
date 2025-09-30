@@ -34,7 +34,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
 from daos.port_mapping_dao import PortMappingDao
-from services.const import PREFFERED_POD_PORTS
+from services.const import PREFERRED_POD_PORTS
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
@@ -75,7 +75,7 @@ class DockerService:
 
     async def generate_portMappings(self, miner_hotkey: str, executor_id: str, internal_ports: list[int] = None) -> list[tuple[int, int, int]]:
         try:
-            docker_internal_ports = internal_ports or PREFFERED_POD_PORTS
+            docker_internal_ports = internal_ports or PREFERRED_POD_PORTS
 
             # Get successful ports from database as dict {external_port: PortMapping}
             available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
@@ -111,7 +111,7 @@ class DockerService:
 
     async def generate_port_mapping_from_redis(self, executor_id, internal_ports, miner_hotkey) -> list[Any]:
         try:
-            docker_internal_ports = PREFFERED_POD_PORTS
+            docker_internal_ports = PREFERRED_POD_PORTS
             if internal_ports:
                 docker_internal_ports = internal_ports
 

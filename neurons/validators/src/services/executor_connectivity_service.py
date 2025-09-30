@@ -18,7 +18,7 @@ from models.port_mapping import PortMapping
 from services.const import (
     BATCH_PORT_VERIFICATION_SIZE,
     DOCKER_DIND_IMAGE,
-    PREFFERED_POD_PORTS,
+    PREFERRED_POD_PORTS,
 )
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
@@ -426,7 +426,7 @@ class ExecutorConnectivityService:
             # Prioritize preferred ports from existing port mappings
             preferred_mappings = [
                 mapping for mapping in port_mappings
-                if mapping[0] in PREFFERED_POD_PORTS or mapping[1] in PREFFERED_POD_PORTS
+                if mapping[0] in PREFERRED_POD_PORTS or mapping[1] in PREFERRED_POD_PORTS
             ]
             remaining_mappings = [
                 mapping for mapping in port_mappings
@@ -466,8 +466,8 @@ class ExecutorConnectivityService:
             return []
 
         # Prioritize preferred ports first
-        preferred_ports = [port for port in PREFFERED_POD_PORTS if port in ports]
-        remaining_ports = [port for port in ports if port not in PREFFERED_POD_PORTS]
+        preferred_ports = [port for port in PREFERRED_POD_PORTS if port in ports]
+        remaining_ports = [port for port in ports if port not in PREFERRED_POD_PORTS]
 
         # Start with preferred ports
         selected_ports = preferred_ports[:]

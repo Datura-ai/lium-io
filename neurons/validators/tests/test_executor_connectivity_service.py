@@ -5,7 +5,7 @@ import pytest
 from services.executor_connectivity_service import (
     ExecutorConnectivityService,
 )
-from services.const import PREFFERED_POD_PORTS
+from services.const import PREFERRED_POD_PORTS
 
 
 @pytest.fixture
@@ -172,11 +172,11 @@ def test_get_available_port_maps_preferred_ports_priority(executor_service):
     selected_ports = [port_pair[0] for port_pair in result]
 
     # Check that preferred ports that are in range come first
-    preferred_in_range = [port for port in PREFFERED_POD_PORTS
+    preferred_in_range = [port for port in PREFERRED_POD_PORTS
                           if (20000 <= port <= 20090)]
 
     # The first ports in result should be from preferred list
-    preferred_selected = [port for port in selected_ports if port in PREFFERED_POD_PORTS]
+    preferred_selected = [port for port in selected_ports if port in PREFERRED_POD_PORTS]
 
     # We should have some preferred ports selected
     assert len(preferred_selected) > 0
