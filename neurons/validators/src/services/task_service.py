@@ -14,6 +14,7 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 
 from core.config import settings
 from core.utils import _m, context, get_extra_info, StructuredMessage
+from daos.port_mapping_dao import PortMappingDao
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
     GPU_MODEL_RATES,
@@ -81,6 +82,7 @@ class TaskService:
         self.wallet = settings.get_bittensor_wallet()
 
         self.executor_connectivity_service = ExecutorConnectivityService(redis_service=redis_service)
+        self.port_mapping_dao = PortMappingDao()
 
     async def is_script_running(
         self, ssh_client: asyncssh.SSHClientConnection, script_path: str
@@ -175,7 +177,34 @@ class TaskService:
         banned_guids = await self.redis_service.get_banned_guids()
         return any(guid in banned_guids for guid in guids)
 
+    async def get_available_port_maps(
+        self, miner_hotkey: str, executor_id: str
+    ) -> list[tuple[int, int]]:
+        """Get available port mappings from DB (top 10), fallback to Redis if needed.
 
+        Returns:
+            List of tuples (internal_port, external_port)
+        """
+        extra = {"miner_hotkey": miner_hotkey, "executor_id": executor_id}
+
+        try:
+            available_ports = await self.port_mapping_dao.get_successful_ports(
+                UUID(executor_id), limit=10
+            )
+
+            if available_ports:
+                logger.info(_m(f"Retrieved {len(available_ports)} ports from DB", extra=extra))
+                return [(p.internal_port, p.external_port) for p in available_ports.values()]
+
+            logger.warning(_m("No ports in DB, fallback to Redis", extra=extra))
+
+        except Exception as e:
+            logger.error(_m("DB error, fallback to Redis", extra={**extra, "error": str(e)}), exc_info=True)
+
+        # Fallback to Redis
+        port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
+        port_maps_bytes = await self.redis_service.lrange(port_map_key)
+        return [tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes]
 
     async def check_pod_running(
         self,
@@ -437,12 +466,13 @@ class TaskService:
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
                 updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
 
-                # get available port maps
-                port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
-                port_maps = await self.redis_service.lrange(port_map_key)
+                # get available port maps from DB (fallback to Redis)
+                port_maps = await self.get_available_port_maps(
+                    miner_info.miner_hotkey, executor_info.uuid
+                )
                 machine_spec = {
                     **updated_machine_spec,
-                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                    "available_port_maps": port_maps,
                 }
 
                 gpu_model = None
@@ -954,11 +984,13 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                # get available port maps
-                port_maps = await self.redis_service.lrange(port_map_key)
+                # get available port maps from DB (fallback to Redis)
+                port_maps = await self.get_available_port_maps(
+                    miner_info.miner_hotkey, executor_info.uuid
+                )
                 machine_spec = {
                     **machine_spec,
-                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                    "available_port_maps": port_maps,
                 }
 
                 job_score = 1

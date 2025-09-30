@@ -86,7 +86,7 @@ class PortMappingDao(BaseDao):
                 logger.error(f"Error cleaning ports: {e}", exc_info=True)
                 return 0
 
-    async def get_successful_ports(self, executor_id: UUID) -> dict[int, PortMapping]:
+    async def get_successful_ports(self, executor_id: UUID, limit: int | None = None) -> dict[int, PortMapping]:
         """Get successful ports as dictionary {external_port: PortMapping} for fast lookup."""
         async with self.get_session() as session:
             try:
@@ -95,6 +95,8 @@ class PortMappingDao(BaseDao):
                     .where(PortMapping.executor_id == executor_id, PortMapping.is_successful)
                     .order_by(PortMapping.verification_time.desc())
                 )
+                if limit is not None:
+                    stmt = stmt.limit(limit)
                 result = await session.exec(stmt)
                 ports = result.scalars().all()
                 return {port.external_port: port for port in ports}
