@@ -188,7 +188,7 @@ class TaskService:
         extra = {"miner_hotkey": miner_hotkey, "executor_id": executor_id}
 
         try:
-            count_ports = await self.port_mapping_dao.get_successful_ports_count(UUID(executor_id))
+            count_ports = await self.port_mapping_dao.get_successful_ports_count(executor_id)
 
             if count_ports > 0:
                 logger.info(_m(f"Retrieved {count_ports} ports count_ports from DB", extra=extra))
