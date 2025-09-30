@@ -103,3 +103,18 @@ class PortMappingDao(BaseDao):
             except Exception as e:
                 logger.error(f"Error getting successful ports as dict: {e}", exc_info=True)
                 return {}
+
+    async def get_successful_ports_count(self, executor_id: UUID) -> int:
+        """Get count of successful ports for executor."""
+        async with self.get_session() as session:
+            try:
+                from sqlalchemy import func
+
+                stmt = select(func.count(PortMapping.uuid)).where(
+                    PortMapping.executor_id == executor_id, PortMapping.is_successful
+                )
+                result = await session.exec(stmt)
+                return result.one()
+            except Exception as e:
+                logger.error(f"Error counting successful ports: {e}", exc_info=True)
+                return 0

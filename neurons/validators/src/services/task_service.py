@@ -177,24 +177,22 @@ class TaskService:
         banned_guids = await self.redis_service.get_banned_guids()
         return any(guid in banned_guids for guid in guids)
 
-    async def get_available_port_maps(
+    async def get_available_port_count(
         self, miner_hotkey: str, executor_id: str
-    ) -> list[tuple[int, int]]:
-        """Get available port mappings from DB (top 10), fallback to Redis if needed.
+    ) -> int:
+        """Get count_ports of available ports from DB, fallback to Redis if needed.
 
         Returns:
-            List of tuples (internal_port, external_port)
+            Count of available ports
         """
         extra = {"miner_hotkey": miner_hotkey, "executor_id": executor_id}
 
         try:
-            available_ports = await self.port_mapping_dao.get_successful_ports(
-                UUID(executor_id), limit=10
-            )
+            count_ports = await self.port_mapping_dao.get_successful_ports_count(UUID(executor_id))
 
-            if available_ports:
-                logger.info(_m(f"Retrieved {len(available_ports)} ports from DB", extra=extra))
-                return [(p.internal_port, p.external_port) for p in available_ports.values()]
+            if count_ports > 0:
+                logger.info(_m(f"Retrieved {count_ports} ports count_ports from DB", extra=extra))
+                return count_ports
 
             logger.warning(_m("No ports in DB, fallback to Redis", extra=extra))
 
@@ -204,7 +202,7 @@ class TaskService:
         # Fallback to Redis
         port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
         port_maps_bytes = await self.redis_service.lrange(port_map_key)
-        return [tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes]
+        return len([tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes])
 
     async def check_pod_running(
         self,
@@ -466,13 +464,13 @@ class TaskService:
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
                 updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
 
-                # get available port maps from DB (fallback to Redis)
-                port_maps = await self.get_available_port_maps(
+                # get available port count from DB (fallback to Redis)
+                port_count = await self.get_available_port_count(
                     miner_info.miner_hotkey, executor_info.uuid
                 )
                 machine_spec = {
                     **updated_machine_spec,
-                    "available_port_maps": port_maps,
+                    "available_port_count": port_count,
                 }
 
                 gpu_model = None
@@ -984,13 +982,13 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                # get available port maps from DB (fallback to Redis)
-                port_maps = await self.get_available_port_maps(
+                # get available port count from DB (fallback to Redis)
+                port_count = await self.get_available_port_count(
                     miner_info.miner_hotkey, executor_info.uuid
                 )
                 machine_spec = {
                     **machine_spec,
-                    "available_port_maps": port_maps,
+                    "available_port_count": port_count,
                 }
 
                 job_score = 1
@@ -1001,9 +999,9 @@ class TaskService:
                     actual_score = 0
                     job_score = 0
                     log_msg = "Train task is finished. But not eligible from collateral contract."
-                elif len(port_maps) < MIN_PORT_COUNT:
+                elif port_count < MIN_PORT_COUNT:
                     actual_score = 0
-                    log_msg = f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}."
+                    log_msg = f"Current port count: {port_count}. Minimum required: {MIN_PORT_COUNT}."
                 elif not is_rental_succeed:
                     actual_score = 0
                     log_msg = "Train task is finished. Set score 0 until it's verified by rental check"
