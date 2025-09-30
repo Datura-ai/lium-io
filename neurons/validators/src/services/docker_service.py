@@ -34,7 +34,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
 from daos.port_mapping_dao import PortMappingDao
-from services.const import PREFERED_POD_PORTS
+from services.const import PREFFERED_POD_PORTS
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
@@ -75,7 +75,7 @@ class DockerService:
 
     async def generate_portMappings(self, miner_hotkey: str, executor_id: str, internal_ports: list[int] = None) -> list[tuple[int, int, int]]:
         try:
-            docker_internal_ports = internal_ports or PREFERED_POD_PORTS
+            docker_internal_ports = internal_ports or PREFFERED_POD_PORTS
 
             # Get successful ports from database as dict {external_port: PortMapping}
             available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
@@ -83,7 +83,7 @@ class DockerService:
 
             if not available_ports:
                 logger.warning(f"No successful ports found in database for executor {executor_id}")
-                return []
+                raise Exception("")
 
             mappings = []
 
@@ -100,10 +100,6 @@ class DockerService:
                     mappings.append((docker_port, port_mapping.internal_port, external_port))
                 # If no more available_ports - skip this docker_port
 
-            # Ensure we have mappings for all requested docker ports
-            if len(mappings) != len(docker_internal_ports):
-                missing_ports = len(docker_internal_ports) - len(mappings)
-                raise Exception(f"Could not generate mappings for {missing_ports} docker ports - insufficient available ports in database")
 
             logger.info(f"Generated {len(mappings)} port mappings from database for executor {executor_id}")
             return mappings
@@ -115,7 +111,7 @@ class DockerService:
 
     async def generate_port_mapping_from_redis(self, executor_id, internal_ports, miner_hotkey) -> list[Any]:
         try:
-            docker_internal_ports = PREFERED_POD_PORTS
+            docker_internal_ports = PREFFERED_POD_PORTS
             if internal_ports:
                 docker_internal_ports = internal_ports
 
