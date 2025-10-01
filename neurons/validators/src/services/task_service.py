@@ -464,14 +464,7 @@ class TaskService:
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
                 updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
 
-                # get available port count from DB (fallback to Redis)
-                port_count = await self.get_available_port_count(
-                    miner_info.miner_hotkey, executor_info.uuid
-                )
-                machine_spec = {
-                    **updated_machine_spec,
-                    "available_port_count": port_count,
-                }
+                machine_spec = {**updated_machine_spec}
 
                 gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
