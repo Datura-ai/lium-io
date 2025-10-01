@@ -1,8 +1,8 @@
 import logging
+import time
 from uuid import UUID
 
-from sqlalchemy import select
-
+from sqlalchemy import select, update
 from daos.base import BaseDao
 from models.port_mapping import PortMapping
 
@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 class PortMappingDao(BaseDao):
     """DAO for port mapping operations with per-operation sessions."""
 
-    async def upsert_port_results(self, port_results: list[PortMapping]) -> list[PortMapping]:
+    async def upsert_port_results(self, port_results: list[PortMapping]) -> None:
         """Batch upsert port verification results for single executor."""
         if not port_results:
-            return []
+            return
 
         # All ports should be from same executor
         executor_id = port_results[0].executor_id
@@ -24,42 +24,41 @@ class PortMappingDao(BaseDao):
             try:
                 # Process in chunks of 1000 for memory efficiency
                 chunk_size = 1000
-                all_updated = []
 
                 for i in range(0, len(port_results), chunk_size):
                     chunk = port_results[i : i + chunk_size]
                     ports_dict = {p.external_port: p for p in chunk}
-
-                    # Get existing ports for this chunk
-                    stmt = select(PortMapping).where(
+                    stmt = select(PortMapping.uuid, PortMapping.external_port).where(
                         PortMapping.executor_id == executor_id,
                         PortMapping.external_port.in_(list(ports_dict.keys())),
                     )
                     existing_result = await session.exec(stmt)
-                    existing_ports = {
-                        ep.external_port: ep for ep in existing_result.scalars().all()
-                    }
+                    existing_ports = {port: uuid for uuid, port in existing_result.all()}
 
                     new_ports = []
+                    updates = []
                     for port_num, new_port in ports_dict.items():
                         if port_num in existing_ports:
-                            # Update existing
-                            existing_port = existing_ports[port_num]
-                            existing_port.verification_time = new_port.verification_time
-                            existing_port.is_successful = new_port.is_successful
-                            existing_port.miner_hotkey = new_port.miner_hotkey
-                            session.add(existing_port)
-                            all_updated.append(existing_port)
+                            # Prepare bulk update
+                            updates.append({
+                                'uuid': existing_ports[port_num],
+                                'verification_time': new_port.verification_time,
+                                'is_successful': new_port.is_successful,
+                                'miner_hotkey': new_port.miner_hotkey,
+                            })
                         else:
                             # Add new
                             new_ports.append(new_port)
-                            all_updated.append(new_port)
+
+                    # Bulk update existing ports for this chunk
+                    if updates:
+                        stmt = update(PortMapping)
+                        await session.execute(stmt, updates)
 
                     # Bulk insert new ports for this chunk
                     if new_ports:
                         session.add_all(new_ports)
-
-                return all_updated
+                    await session.commit()
 
             except Exception as e:
                 logger.error(
@@ -114,7 +113,7 @@ class PortMappingDao(BaseDao):
                     PortMapping.executor_id == executor_id, PortMapping.is_successful
                 )
                 result = await session.exec(stmt)
-                return result.scalar() or 0 
+                return result.scalar() or 0
             except Exception as e:
                 logger.error(f"Error counting successful ports: {e}", exc_info=True)
                 return 0
