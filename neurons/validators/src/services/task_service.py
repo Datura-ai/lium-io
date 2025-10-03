@@ -1068,7 +1068,7 @@ class TaskService:
                         actual_score = 0
                         log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
                     elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
-                        log_msg = "Executor is rented. But not eligible from collateral contract. Will not have score very soon."
+                        log_msg = "Executor is rented. But not eligible from collateral contract."
 
                     # apply half score if contract version is not the latest
                     if contract_version and contract_version != settings.get_latest_contract_version():
@@ -1257,7 +1257,7 @@ class TaskService:
                     actual_score = 0
                     log_msg = "Train task is finished. Set score 0 until it's verified by rental check"
                 elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
-                    log_msg = "Train task is finished. But not eligible from collateral contract. Will not have score very soon."
+                    log_msg = "Train task is finished. But not eligible from collateral contract."
 
                 success = True if actual_score > 0 else False
 
