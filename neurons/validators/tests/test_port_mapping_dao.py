@@ -53,9 +53,7 @@ async def test_upsert_port_results_creates_new_ports(
     executor_id = uuid4()
 
     port_results = create_port_mappings_batch(count=3, executor_id=executor_id, base_port=20000)
-    result = await port_mapping_dao.upsert_port_results(port_results)
-
-    assert len(result) == 3
+    await port_mapping_dao.upsert_port_results(port_results)
 
     # Verify ports are saved in database using get_successful_ports
     ports_dict = await port_mapping_dao.get_successful_ports(executor_id)

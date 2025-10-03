@@ -39,8 +39,9 @@ class DockerConnectionCheckResult(BaseModel):
 
 
 class ExecutorConnectivityService:
-    def __init__(self, redis_service: "RedisService"):
+    def __init__(self, redis_service: "RedisService", port_mapping_dao: PortMappingDao):
         self.redis_service = redis_service
+        self.port_mapping_dao = port_mapping_dao
 
     async def batch_verify_ports(
         self,
@@ -373,9 +374,8 @@ class ExecutorConnectivityService:
                 )
 
             if db_records:
-                port_dao = PortMappingDao()
-                await port_dao.upsert_port_results(db_records)
-                await port_dao.clean_ports(db_records[0].executor_id)
+                await self.port_mapping_dao.upsert_port_results(db_records)
+                await self.port_mapping_dao.clean_ports(db_records[0].executor_id)
                 logger.info(_m(f"Saved {len(db_records)} successful ports to database", extra))
 
         except Exception as e:

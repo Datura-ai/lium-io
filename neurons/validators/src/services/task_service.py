@@ -73,6 +73,8 @@ class TaskService:
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
         verifyx_validation_service: Annotated[VerifyXValidationService, Depends(VerifyXValidationService)],
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
+        executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
+        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -81,8 +83,8 @@ class TaskService:
         self.collateral_contract_service = collateral_contract_service
         self.wallet = settings.get_bittensor_wallet()
 
-        self.executor_connectivity_service = ExecutorConnectivityService(redis_service=redis_service)
-        self.port_mapping_dao = PortMappingDao()
+        self.executor_connectivity_service = executor_connectivity_service
+        self.port_mapping_dao = port_mapping_dao
 
     async def is_script_running(
         self, ssh_client: asyncssh.SSHClientConnection, script_path: str

@@ -132,3 +132,10 @@ def mock_async_session_maker(test_db_session):
     with patch('daos.base.AsyncSessionMaker') as mock_maker:
         mock_maker.return_value = MockContextManager(test_db_session)
         yield mock_maker
+
+
+@pytest.fixture
+def port_mapping_dao(mock_async_session_maker):
+    """Create PortMappingDao for testing with test database."""
+    from daos.port_mapping_dao import PortMappingDao
+    return PortMappingDao()

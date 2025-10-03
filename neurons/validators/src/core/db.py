@@ -14,6 +14,8 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
+POOL_SIZE = 100
+
 # Create engine with conditional parameters based on environment
 if settings.ENV == "test":
     engine = create_async_engine(
@@ -28,7 +30,7 @@ else:
         echo=settings.ENV == "dev",
         future=True,
         poolclass=AsyncAdaptedQueuePool,
-        pool_size=15,
+        pool_size=POOL_SIZE,
         max_overflow=30
     )
 

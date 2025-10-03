@@ -9,9 +9,9 @@ from services.const import PREFERRED_POD_PORTS
 
 
 @pytest.fixture
-def executor_service(mock_redis_service):
+def executor_service(mock_redis_service, port_mapping_dao):
     """Create ExecutorConnectivityService for testing."""
-    return ExecutorConnectivityService(mock_redis_service)
+    return ExecutorConnectivityService(mock_redis_service, port_mapping_dao)
 
 
 def test_get_available_port_maps_from_mappings(executor_service, sample_executor_info):

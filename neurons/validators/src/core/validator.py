@@ -1,12 +1,15 @@
 import asyncio
 import json
 import os
+
+from daos.port_mapping_dao import PortMappingDao
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
+from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
 from services.redis_service import PENDING_PODS_PREFIX, RedisService
@@ -44,12 +47,20 @@ class Validator:
         self.validation_service = ValidationService()
         self.verifyx_validation_service = VerifyXValidationService()
         self.collateral_contract_service = CollateralContractService()
+        self.port_mapping_dao = PortMappingDao()
+        self.executor_connectivity_service = ExecutorConnectivityService(
+            redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao,
+        )
+
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             validation_service=self.validation_service,
             verifyx_validation_service=self.verifyx_validation_service,
             collateral_contract_service=self.collateral_contract_service,
+            executor_connectivity_service=self.executor_connectivity_service,
+            port_mapping_dao=self.port_mapping_dao,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
