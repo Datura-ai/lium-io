@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     COLLATERAL_DAYS: int = 7
     ENV: str = Field(env="ENV", default="dev")
 
-    PORTION_FOR_UPTIME: float = 0.05
+    PORTION_FOR_UPTIME: float = 1
+    UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
     PORTION_FOR_SYSBOX: float = 0.2
 
