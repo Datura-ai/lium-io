@@ -60,7 +60,7 @@ class Settings(BaseSettings):
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    ENABLE_COLLATERAL_CONTRACT: bool = True
+    ENABLE_COLLATERAL_CONTRACT: bool = False
     ENABLE_NEW_INCENTIVE_ALGO: bool = False
     ENABLE_VERIFYX: bool = True
 
