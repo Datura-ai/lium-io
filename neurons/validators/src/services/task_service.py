@@ -1171,43 +1171,46 @@ class TaskService:
 
                 if settings.ENABLE_VERIFYX:
                     verifyx_result = await self.verifyx_validation_service.validate_verifyx_and_process_job(
-                        shell=shell,
-                        executor_info=executor_info,
-                        default_extra=default_extra,
-                        machine_spec=machine_spec,
+                        shell=shell, executor_info=executor_info,
+                        default_extra=default_extra, machine_spec=machine_spec
                     )
 
-                    verifyx_data = verifyx_result.data
-
-                    if not verifyx_data:
-                        default_extra = {
-                            **default_extra,
-                            "verifyx_success": False,
-                            "verifyx_error_message": f"VerifyX validation failed: {verifyx_result.error}",
-                        }
-                    elif not verifyx_data.get("success"):
-                        default_extra = {
-                            **default_extra,
-                            "verifyx_success": False,
-                            "verifyx_error_message": f"VerifyX validation failed: {verifyx_data.get('errors', 'Unknown errors')}",
-                        }
-                    else:
-                        default_extra = {
-                            **default_extra,
+                    if verifyx_result.data and verifyx_result.data.get("success"):
+                        # Direct update on success
+                        machine_spec.update({
+                            "ram": verifyx_result.data.get("ram"),
+                            "hard_disk": verifyx_result.data.get("hard_disk"),
+                            "network": verifyx_result.data.get("network")
+                        })
+                        default_extra.update({
                             "verifyx_success": True,
-                            "verifyx_data": verifyx_data,
-                        }
-
-                        machine_spec["ram"] = verifyx_data.get("ram")
-                        machine_spec["hard_disk"] = verifyx_data.get("hard_disk")
-                        machine_spec["network"] = verifyx_data.get("network")
-
-                    logger.info(
-                        _m(
-                            "Verifyx validation processed",
-                            extra=get_extra_info(default_extra),
+                            "verifyx_data": verifyx_result.data
+                        })
+                    else:
+                        error_msg = verifyx_result.error or (verifyx_result.data.get('errors') if verifyx_result.data else 'Unknown errors')
+                        log_text = _m(
+                            "VerifyX validation failed",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "verifyx_success": False,
+                                "verifyx_error_message": error_msg
+                            })
                         )
-                    )
+                        return await self._handle_task_result(
+                            miner_info=miner_info,
+                            executor_info=executor_info,
+                            spec=machine_spec,
+                            score=0,
+                            job_score=0,
+                            collateral_deposited=collateral_deposited,
+                            log_text=log_text,
+                            verified_job_info=verified_job_info,
+                            success=False,
+                            gpu_model_count=gpu_model_count,
+                            clear_verified_job_info=False,
+                        )
+
+                    logger.info(_m("Verifyx validation processed", extra=get_extra_info(default_extra)))
 
                 is_valid = await self.validation_service.validate_gpu_model_and_process_job(
                     ssh_client=shell.ssh_client,
