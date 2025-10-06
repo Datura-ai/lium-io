@@ -458,7 +458,7 @@ class ExecutorConnectivityService:
                 )
         else:
             # Default range if port_range is empty
-            ports = list(range(20000, 65536))
+            ports = list(range(20000, 65535))
 
         ports = [port for port in ports if port != executor_info.ssh_port]
 
