@@ -65,11 +65,13 @@ class Validator:
         self.docker_service = DockerService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao,
         )
         self.miner_service = MinerService(
             ssh_service=ssh_service,
             task_service=task_service,
             redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao,
         )
 
         # init miner_scores

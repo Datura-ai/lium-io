@@ -64,10 +64,11 @@ class DockerService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)]
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-        self.port_mapping_dao = PortMappingDao()
+        self.port_mapping_dao = port_mapping_dao
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
@@ -83,7 +84,7 @@ class DockerService:
 
             if not available_ports:
                 logger.warning(f"No successful ports found in database for executor {executor_id}")
-                raise Exception("")
+                raise Exception("No successful ports found in database")
 
             mappings = []
 

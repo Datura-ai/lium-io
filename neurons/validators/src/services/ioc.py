@@ -41,12 +41,14 @@ async def initiate_services():
     )
     ioc["DockerService"] = DockerService(
         ssh_service=ioc["SSHService"],
-        redis_service=ioc["RedisService"]
+        redis_service=ioc["RedisService"],
+        port_mapping_dao=ioc["PortMappingDao"],
     )
     ioc["MinerService"] = MinerService(
         ssh_service=ioc["SSHService"],
         task_service=ioc["TaskService"],
-        redis_service=ioc["RedisService"]
+        redis_service=ioc["RedisService"],
+        port_mapping_dao=ioc["PortMappingDao"],
     )
 
 

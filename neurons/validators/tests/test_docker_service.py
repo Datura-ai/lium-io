@@ -25,8 +25,8 @@ async def docker_service(mock_dependencies):
     service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
+        port_mapping_dao=port_mapping_dao
     )
-    service.port_mapping_dao = port_mapping_dao
     return service
 
 
