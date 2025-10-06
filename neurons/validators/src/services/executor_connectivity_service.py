@@ -185,6 +185,18 @@ class ExecutorConnectivityService:
         )
 
         try:
+            # pull docker
+            command = f"/usr/bin/docker pull {BATCH_VERIFIER_IMAGE}"
+            logger.debug(_m(f"DEBUG: Running command: {command[:100]}...", extra))
+            result = await ssh_client.run(command)
+            if result.exit_status != 0:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                logger.error(
+                    _m(f"error: Batch container pull failed {command} - {error_msg} (api_port={api_external})", extra), exc_info=True
+                )
+                return [], []
+            logger.info(_m(f"batch-check: Container pulled successfully", extra))
+
             # Start Docker container
             command = (
                 f"/usr/bin/docker run -d --name {container_name} --network=host "
