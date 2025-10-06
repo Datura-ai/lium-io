@@ -81,7 +81,7 @@ class ExecutorConnectivityService:
             logger.debug(_m(f"Checking {len(port_maps)} port mappings", extra))
 
             successful_ports, failed_ports = await self.verify_other_ports(ssh_client, port_maps, executor_info, extra)
-            dind_port = successful_ports.pop(0) if successful_ports else port_maps[0]
+            dind_port = successful_ports.pop(0) if successful_ports else random.choice(port_maps)
             dind_result = await self.verify_single_port(
                 ssh_client,
                 job_batch_id,

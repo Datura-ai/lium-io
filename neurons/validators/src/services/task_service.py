@@ -792,6 +792,15 @@ class TaskService:
                                 ssh_pub_keys=ssh_pub_keys,
                             )
 
+                    # get available port count from DB (fallback to Redis)
+                    port_count = await self.get_available_port_count(
+                        miner_info.miner_hotkey, executor_info.uuid
+                    )
+                    machine_spec = {
+                        **machine_spec,
+                        "available_port_count": port_count,
+                    }
+                    
                     # In backend, there are 2 scores. actual score and job score.
                     # job score is the score which executor gets when matrix multiply is finished.
                     # actual score is the score which executor gets for incentive
