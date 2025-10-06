@@ -13,7 +13,8 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
 from core.config import settings
-from core.utils import _m, context, get_extra_info
+from core.utils import _m, context, get_extra_info, StructuredMessage
+from daos.port_mapping_dao import PortMappingDao
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
     GPU_MODEL_RATES,
@@ -28,6 +29,7 @@ from services.const import (
     BATCH_PORT_VERIFICATION_SIZE,
     DOCKER_DIND_IMAGE,
 )
+from services.executor_connectivity_service import ExecutorConnectivityService
 from services.redis_service import (
     RedisService,
     DUPLICATED_MACHINE_SET,
@@ -46,7 +48,6 @@ logger = logging.getLogger(__name__)
 JOB_LENGTH = 300
 SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
-
 class JobResult(BaseModel):
     spec: dict | None = None
     executor_info: ExecutorSSHInfo
@@ -62,10 +63,6 @@ class JobResult(BaseModel):
     ssh_pub_keys: list[str] | None = None
 
 
-class DockerConnectionCheckResult(BaseModel):
-    success: bool
-    log_text: str | None = None
-    sysbox_runtime: bool
 
 
 class TaskService:
@@ -76,6 +73,8 @@ class TaskService:
         validation_service: Annotated[ValidationService, Depends(ValidationService)],
         verifyx_validation_service: Annotated[VerifyXValidationService, Depends(VerifyXValidationService)],
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
+        executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
+        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -83,6 +82,9 @@ class TaskService:
         self.verifyx_validation_service = verifyx_validation_service
         self.collateral_contract_service = collateral_contract_service
         self.wallet = settings.get_bittensor_wallet()
+
+        self.executor_connectivity_service = executor_connectivity_service
+        self.port_mapping_dao = port_mapping_dao
 
     async def is_script_running(
         self, ssh_client: asyncssh.SSHClientConnection, script_path: str
@@ -177,286 +179,32 @@ class TaskService:
         banned_guids = await self.redis_service.get_banned_guids()
         return any(guid in banned_guids for guid in guids)
 
-    def get_available_port_maps(
-        self,
-        executor_info: ExecutorSSHInfo,
-        batch_size: int = 3,
-    ) -> list[tuple[int, int]]:
-        """Get a list of available port maps for batch verification."""
-        if executor_info.port_mappings:
-            port_mappings: list[tuple[int, int]] = json.loads(executor_info.port_mappings)
-            port_mappings = [
-                (internal_port, external_port)
-                for internal_port, external_port in port_mappings
-                if internal_port != executor_info.ssh_port
-                and external_port != executor_info.ssh_port
-            ]
+    async def get_available_port_count(
+        self, miner_hotkey: str, executor_id: str
+    ) -> int:
+        """Get count_ports of available ports from DB, fallback to Redis if needed.
 
-            # Return up to batch_size port mappings
-            return random.sample(port_mappings, min(batch_size, len(port_mappings)))
-
-        # Generate ports from range
-        if executor_info.port_range:
-            if "-" in executor_info.port_range:
-                min_port, max_port = map(
-                    int, (part.strip() for part in executor_info.port_range.split("-"))
-                )
-                ports = list(range(min_port, max_port + 1))
-            else:
-                ports = list(
-                    map(int, (part.strip() for part in executor_info.port_range.split(",")))
-                )
-        else:
-            # Default range if port_range is empty
-            ports = list(range(40000, 65536))
-
-        ports = [port for port in ports if port != executor_info.ssh_port]
-
-        if not ports:
-            return []
-
-        # Select random ports for batch verification
-        selected_ports = random.sample(ports, min(batch_size, len(ports)))
-        return [(port, port) for port in selected_ports]
-
-    async def batch_verify_ports(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        job_batch_id: str,
-        miner_hotkey: str,
-        executor_info: ExecutorSSHInfo,
-        private_key: str,
-        public_key: str,
-        sysbox_runtime: bool = False,
-    ) -> DockerConnectionCheckResult:
-        """Verify multiple ports concurrently."""
-        default_extra = {
-            "job_batch_id": job_batch_id,
-            "miner_hotkey": miner_hotkey,
-            "executor_uuid": executor_info.uuid,
-            "executor_ip_address": executor_info.address,
-            "executor_port": executor_info.port,
-            "ssh_username": executor_info.ssh_username,
-            "ssh_port": executor_info.ssh_port,
-            "version": settings.VERSION,
-            "sysbox_runtime": sysbox_runtime,
-        }
-        try:
-            # remove all containers that has conatiner_ prefix in its name, since it's unrented
-            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
-            result = await ssh_client.run(command)
-            if result.stdout.strip():
-                container_names = " ".join(result.stdout.strip().split("\n"))
-
-                logger.info(
-                    _m(
-                        "Cleaning existing docker containers",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "container_names": container_names,
-                        }),
-                    ),
-                )
-
-                command = f'/usr/bin/docker rm {container_names} -f'
-                await ssh_client.run(command)
-
-                command = f'/usr/bin/docker volume prune -af'
-                await ssh_client.run(command)
-
-            port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE)
-            if not port_maps:
-                return DockerConnectionCheckResult(
-                    success=False,
-                    log_text="No port available for docker container",
-                    sysbox_runtime=sysbox_runtime,
-                )
-
-            log_text = _m(
-                "Verifying multiple ports",
-                extra=get_extra_info({
-                    **default_extra,
-                    "port_maps": port_maps,
-                }),
-            )
-            logger.info(log_text)
-
-            tasks = [
-                self.verify_single_port(
-                    ssh_client, job_batch_id, miner_hotkey, executor_info,
-                    private_key, public_key, internal_port, external_port, sysbox_runtime
-                )
-                for internal_port, external_port in port_maps
-            ]
-
-            # Execute all port verification tasks concurrently
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Filter successful port verifications
-            successful_ports = []
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.warning(f"Port verification failed for {port_maps[i]}: {result}")
-                    continue
-
-                if result.success:  # result is True if port verification succeeded
-                    successful_ports.append(port_maps[i])
-                    sysbox_runtime = result.sysbox_runtime
-
-            if not successful_ports:
-                return DockerConnectionCheckResult(
-                    success=False,
-                    log_text="No port available for docker container",
-                    sysbox_runtime=sysbox_runtime,
-                )
-
-            # set port on redis
-            key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
-            for internal_port, external_port in successful_ports:
-                port_map = f"{internal_port},{external_port}"
-
-                # delete all the same port_maps in the list
-                await self.redis_service.lrem(key=key, element=port_map)
-
-                # insert port_map in the list
-                await self.redis_service.lpush(key, port_map)
-
-                # keep the latest 10 port maps
-                port_maps = await self.redis_service.lrange(key)
-                if len(port_maps) > 10:
-                    await self.redis_service.rpop(key)
-
-            return DockerConnectionCheckResult(
-                success=True,
-                log_text="All ports verified successfully",
-                sysbox_runtime=sysbox_runtime,
-            )
-        except Exception as e:
-            return DockerConnectionCheckResult(
-                success=False,
-                log_text=str(e),
-                sysbox_runtime=sysbox_runtime,
-            )
-
-    async def verify_single_port(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        job_batch_id: str,
-        miner_hotkey: str,
-        executor_info: ExecutorSSHInfo,
-        private_key: str,
-        public_key: str,
-        internal_port: int,
-        external_port: int,
-        sysbox_runtime: bool = False,
-    ) -> DockerConnectionCheckResult:
-        default_extra = {
-            "job_batch_id": job_batch_id,
-            "miner_hotkey": miner_hotkey,
-            "executor_uuid": executor_info.uuid,
-            "executor_ip_address": executor_info.address,
-            "executor_port": executor_info.port,
-            "ssh_username": executor_info.ssh_username,
-            "ssh_port": executor_info.ssh_port,
-            "version": settings.VERSION,
-            "sysbox_runtime": sysbox_runtime,
-            "internal_port": internal_port,
-            "external_port": external_port,
-        }
-
-        container_name = f"container_{miner_hotkey}_{external_port}"
+        Returns:
+            Count of available ports
+        """
+        extra = {"miner_hotkey": miner_hotkey, "executor_id": executor_id}
 
         try:
-            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
-            command = (
-                f'/usr/bin/docker run -d '
-                f'{"--runtime=sysbox-runc " if sysbox_runtime else ""}'
-                f'--name {container_name} --gpus all '
-                f'-p {internal_port}:22 '
-                f'{DOCKER_DIND_IMAGE} '
-                f'{docker_cmd}'
-            )
+            count_ports = await self.port_mapping_dao.get_successful_ports_count(executor_id)
 
-            result = await ssh_client.run(command)
-            if result.exit_status != 0:
-                error_message = result.stderr.strip() if result.stderr else "No error message available"
-                log_text = _m(
-                    "Error creating docker connection",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "error": error_message
-                    }),
-                )
-                logger.error(log_text, exc_info=True)
+            if count_ports > 0:
+                logger.info(_m(f"Retrieved {count_ports} ports count_ports from DB", extra=extra))
+                return count_ports
 
-                try:
-                    command = f"/usr/bin/docker rm {container_name} -f"
-                    await ssh_client.run(command)
-                except Exception as e:
-                    pass
+            logger.warning(_m("No ports in DB, fallback to Redis", extra=extra))
 
-                return DockerConnectionCheckResult(
-                    success=False,
-                    log_text=str(log_text),
-                    sysbox_runtime=sysbox_runtime,
-                )
-
-            await asyncio.sleep(5)
-
-            pkey = asyncssh.import_private_key(private_key)
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=external_port,
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=None,
-            ) as container_ssh_client:
-                log_text = _m(
-                    "Connected into docker container",
-                    extra=default_extra,
-                )
-                logger.info(log_text)
-
-                if sysbox_runtime:
-                    command = f"docker pull hello-world"
-                    result = await container_ssh_client.run(command)
-                    if result.exit_status != 0:
-                        error_message = result.stderr.strip() if result.stderr else "No error message available"
-                        logger.error(
-                            _m(
-                                "Error DinD not working",
-                                extra=get_extra_info({**default_extra, "error": error_message}),
-                            ),
-                            exc_info=True,
-                        )
-                        sysbox_runtime = False
-
-            command = f"/usr/bin/docker rm {container_name} -f"
-            await ssh_client.run(command)
-
-            return DockerConnectionCheckResult(
-                success=True,
-                log_text=str(log_text),
-                sysbox_runtime=sysbox_runtime,
-            )
         except Exception as e:
-            log_text = _m(
-                "Error connection docker container",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
-            )
-            logger.error(log_text, exc_info=True)
+            logger.error(_m("DB error, fallback to Redis", extra={**extra, "error": str(e)}), exc_info=True)
 
-            try:
-                command = f"/usr/bin/docker rm {container_name} -f"
-                await ssh_client.run(command)
-            except Exception as e:
-                pass
-
-            return DockerConnectionCheckResult(
-                success=False,
-                log_text=str(log_text),
-                sysbox_runtime=sysbox_runtime,
-            )
+        # Fallback to Redis
+        port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
+        port_maps_bytes = await self.redis_service.lrange(port_map_key)
+        return len([tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes])
 
     async def check_pod_running(
         self,
@@ -579,7 +327,7 @@ class TaskService:
         gpu_processes: list[dict],
         default_extra: dict,
         rented: bool = False,
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool, str | None | StructuredMessage]:
         # check gpu usages
         for detail in gpu_details:
             gpu_utilization = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
@@ -718,13 +466,7 @@ class TaskService:
                 updated_machine_spec = self.update_keys(machine_spec, reverse_all_keys)
                 updated_machine_spec = self.update_keys(updated_machine_spec, ORIGINAL_KEYS)
 
-                # get available port maps
-                port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_info.miner_hotkey}:{executor_info.uuid}"
-                port_maps = await self.redis_service.lrange(port_map_key)
-                machine_spec = {
-                    **updated_machine_spec,
-                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
-                }
+                machine_spec = {**updated_machine_spec}
 
                 gpu_model = None
                 if machine_spec.get("gpu", {}).get("count", 0) > 0:
@@ -962,7 +704,7 @@ class TaskService:
                 )
                 if is_duplicated:
                     log_text = _m(
-                        f"Executor is duplicated",
+                        "Executor is duplicated",
                         extra=get_extra_info(default_extra),
                     )
 
@@ -1050,6 +792,15 @@ class TaskService:
                                 ssh_pub_keys=ssh_pub_keys,
                             )
 
+                    # get available port count from DB (fallback to Redis)
+                    port_count = await self.get_available_port_count(
+                        miner_info.miner_hotkey, executor_info.uuid
+                    )
+                    machine_spec = {
+                        **machine_spec,
+                        "available_port_count": port_count,
+                    }
+                    
                     # In backend, there are 2 scores. actual score and job score.
                     # job score is the score which executor gets when matrix multiply is finished.
                     # actual score is the score which executor gets for incentive
@@ -1131,7 +882,7 @@ class TaskService:
                         **default_extra,
                         "renting_in_progress": True,
                     }
-                    docker_connection_check_result = await self.batch_verify_ports(
+                    docker_connection_check_result = await self.executor_connectivity_service.batch_verify_ports(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
@@ -1238,11 +989,13 @@ class TaskService:
                         clear_verified_job_info=False,
                     )
 
-                # get available port maps
-                port_maps = await self.redis_service.lrange(port_map_key)
+                # get available port count from DB (fallback to Redis)
+                port_count = await self.get_available_port_count(
+                    miner_info.miner_hotkey, executor_info.uuid
+                )
                 machine_spec = {
                     **machine_spec,
-                    "available_port_maps": [port_map.decode().split(",") for port_map in port_maps],
+                    "available_port_count": port_count,
                 }
 
                 job_score = 1
@@ -1253,9 +1006,9 @@ class TaskService:
                     actual_score = 0
                     job_score = 0
                     log_msg = "Train task is finished. But not eligible from collateral contract."
-                elif len(port_maps) < MIN_PORT_COUNT:
+                elif port_count < MIN_PORT_COUNT:
                     actual_score = 0
-                    log_msg = f"Current port maps: {len(port_maps)}. Minimum required: {MIN_PORT_COUNT}."
+                    log_msg = f"Current port count: {port_count}. Minimum required: {MIN_PORT_COUNT}."
                 elif not is_rental_succeed:
                     actual_score = 0
                     log_msg = "Train task is finished. Set score 0 until it's verified by rental check"
