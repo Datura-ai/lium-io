@@ -9,6 +9,7 @@ from sqlmodel import SQLModel
 
 from models.executor import *  # noqa
 from models.task import *  # noqa
+from models.port_mapping import *  # noqa
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
