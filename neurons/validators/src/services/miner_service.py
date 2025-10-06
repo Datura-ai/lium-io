@@ -8,6 +8,7 @@ from asyncssh import SSHKey
 import asyncssh
 import bittensor
 from clients.miner_client import MinerClient
+from daos.port_mapping_dao import PortMappingDao
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     DeclineJobRequest,
@@ -28,6 +29,7 @@ from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerDeleteRequest,
     AddSshPublicKeyRequest,
+    RemoveSshPublicKeysRequest,
     FailedContainerErrorCodes,
     FailedContainerErrorTypes,
     FailedContainerRequest,
@@ -60,10 +62,12 @@ class MinerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.redis_service = redis_service
+        self.port_mapping_dao = port_mapping_dao
 
     async def request_job_to_miner(
         self,
@@ -307,6 +311,7 @@ class MinerService:
         docker_service = DockerService(
             ssh_service=self.ssh_service,
             redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao
         )
 
         try:
@@ -484,6 +489,16 @@ class MinerService:
                                 ),
                             ),
                         )
+
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
+                            )
+                        )
+
+                        return result
+                    elif isinstance(payload, RemoveSshPublicKeysRequest):
+                        result = await docker_service.remove_ssh_keys(payload, executor, my_key, private_key.decode("utf-8"))
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(

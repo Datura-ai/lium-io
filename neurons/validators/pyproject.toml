@@ -31,6 +31,10 @@ dependencies = [
     "tenacity>=9.1.2",
     "uvicorn>=0.35.0",
     "pytest>=8.4.2",
+    "pytest-asyncio>=0.25.0",
+    "pytest-mock>=3.15.0",
+    "aiosqlite>=0.21.0",
+    "asyncpg>=0.30.0",
 ]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
@@ -43,3 +47,7 @@ build-backend = "pdm.backend"
 
 [tool.pdm]
 distribution = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

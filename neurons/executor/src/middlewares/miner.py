@@ -25,8 +25,29 @@ class MinerMiddleware(BaseHTTPMiddleware):
 
             logger.info(_m("miner ip", extra=default_extra))
 
-            keypair = bittensor.Keypair(ss58_address=settings.MINER_HOTKEY_SS58_ADDRESS)
-            if not keypair.verify(payload.data_to_sign, payload.signature):
+            # Try verifying with both the configured miner hotkey and the default portal hotkey
+            hotkeys_to_verify = [
+                settings.MINER_HOTKEY_SS58_ADDRESS,
+                settings.DEFAULT_MINER_HOTKEY,
+            ]
+
+            verified = False
+            for hotkey in hotkeys_to_verify:
+                keypair = bittensor.Keypair(ss58_address=hotkey)
+                if keypair.verify(payload.data_to_sign, payload.signature):
+                    verified = True
+                    logger.info(
+                        _m(
+                            "Auth successful",
+                            extra={
+                                **default_extra,
+                                "verified_with_hotkey": hotkey,
+                            },
+                        )
+                    )
+                    break
+
+            if not verified:
                 logger.error(
                     _m(
                         "Auth failed. incorrect signature",
@@ -34,7 +55,7 @@ class MinerMiddleware(BaseHTTPMiddleware):
                             **default_extra,
                             "signature": payload.signature,
                             "data_to_sign": payload.data_to_sign,
-                            "miner_hotkey": settings.MINER_HOTKEY_SS58_ADDRESS,
+                            "tried_hotkeys": hotkeys_to_verify,
                         },
                     )
                 )

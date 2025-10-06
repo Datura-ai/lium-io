@@ -1,9 +1,10 @@
 import asyncio
+import random
 from datetime import datetime
 import logging
 import time
-from typing import Annotated
-from uuid import uuid4
+from typing import Annotated, Any
+from uuid import uuid4, UUID
 import shlex
 
 import aiohttp
@@ -17,11 +18,13 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopRequest,
     AddSshPublicKeyRequest,
+    RemoveSshPublicKeysRequest,
     ContainerCreated,
     ContainerDeleted,
     ContainerStarted,
     ContainerStopped,
     SshPubKeyAdded,
+    SshPubKeyRemoved,
     FailedContainerErrorCodes,
     FailedContainerRequest,
     FailedContainerErrorTypes,
@@ -30,6 +33,8 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
+from daos.port_mapping_dao import PortMappingDao
+from services.const import PREFERRED_POD_PORTS
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
@@ -59,17 +64,55 @@ class DockerService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)]
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.port_mapping_dao = port_mapping_dao
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
         self.is_realtime_logging = False
 
-    async def generate_portMappings(self, miner_hotkey, executor_id, internal_ports=None):
+    async def generate_portMappings(self, miner_hotkey: str, executor_id: str, internal_ports: list[int] = None) -> list[tuple[int, int, int]]:
         try:
-            docker_internal_ports = [22, 20000, 20001, 20002, 20003]
+            docker_internal_ports = internal_ports or PREFERRED_POD_PORTS
+
+            # Get successful ports from database as dict {external_port: PortMapping}
+            available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
+
+
+            if not available_ports:
+                logger.warning(f"No successful ports found in database for executor {executor_id}")
+                raise Exception("No successful ports found in database")
+
+            mappings = []
+
+            # For each docker port: try exact match first, then random
+            for docker_port in docker_internal_ports:
+                if docker_port in available_ports:
+                    # Exact match - use this external_port
+                    port_mapping = available_ports.pop(docker_port)
+                    mappings.append((docker_port, port_mapping.internal_port, docker_port))
+                elif available_ports:
+                    # Random available external_port
+                    external_port = random.choice(list(available_ports.keys()))
+                    port_mapping = available_ports.pop(external_port)
+                    mappings.append((docker_port, port_mapping.internal_port, external_port))
+                # If no more available_ports - skip this docker_port
+
+
+            logger.info(f"Generated {len(mappings)} port mappings from database for executor {executor_id}")
+            return mappings
+
+        except Exception as e:
+            logger.error(f"Error generating port mappings from database: {e}", exc_info=True)
+            return await self.generate_port_mapping_from_redis(executor_id, internal_ports, miner_hotkey)
+
+
+    async def generate_port_mapping_from_redis(self, executor_id, internal_ports, miner_hotkey) -> list[Any]:
+        try:
+            docker_internal_ports = PREFERRED_POD_PORTS
             if internal_ports:
                 docker_internal_ports = internal_ports
 
@@ -933,6 +976,107 @@ class DockerService:
                 executor_id=payload.executor_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+    async def remove_ssh_keys(
+        self,
+        payload: RemoveSshPublicKeysRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_uuid": payload.executor_id,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "executor_ssh_username": executor_info.ssh_username,
+            "executor_ssh_port": executor_info.ssh_port,
+        }
+
+        logger.info(
+            _m(
+                "Remove ssh key(s) from pod",
+                extra=get_extra_info({**default_extra}),
+            ),
+        )
+
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
+
+        try:
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client:
+                if not payload.user_public_keys:
+                    log_text = _m(
+                        "ssh key Remove error: no public key",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": payload.container_name,
+                            "error": "No public keys",
+                        }),
+                    )
+                    logger.error(log_text)
+
+                    return FailedContainerRequest(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        msg=str(log_text),
+                        error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                        error_code=FailedContainerErrorCodes.NoSshKeys,
+                    )
+
+                # Remove each public key from authorized_keys
+                for pubkey in payload.user_public_keys:
+                    # Remove the public key from authorized_keys
+                    # Properly escape slashes and pluses in pubkey for sed
+                    # Use Python's shlex.quote to safely quote the pubkey for shell usage
+                    import shlex
+
+                    # Remove the public key from authorized_keys by matching the exact line
+                    # This approach is safer and more reliable than trying to escape characters for sed
+                    quoted_pubkey = shlex.quote(pubkey)
+                    remove_cmd = (
+                        f"/usr/bin/docker exec -i {payload.container_name} "
+                        f"sh -c \"grep -vxF {quoted_pubkey} /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp && "
+                        f"mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys\""
+                    )
+                    await ssh_client.run(remove_cmd)
+
+                logger.info(
+                    _m(
+                        "Removed ssh key(s) from the container",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": payload.container_name,
+                            "removed_keys": payload.user_public_keys,
+                        }),
+                    ),
+                )
+
+                return SshPubKeyRemoved(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    user_public_keys=payload.user_public_keys,
+                )
+        except Exception as e:
+            log_text = _m(
+                "Unknown Error remove_ssh_keys",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
