@@ -21,13 +21,9 @@ from services.const import (
     MAX_GPU_COUNT,
     UNRENTED_MULTIPLIER,
     LIB_NVIDIA_ML_DIGESTS,
-    DOCKER_DIGEST,
-    PYTHON_DIGEST,
     GPU_UTILIZATION_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     MIN_PORT_COUNT,
-    BATCH_PORT_VERIFICATION_SIZE,
-    DOCKER_DIND_IMAGE,
 )
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.redis_service import (
@@ -386,34 +382,6 @@ class TaskService:
                 private_key=private_key,
                 port=executor_info.ssh_port,
             ) as shell:
-                docker_checksums = await shell.get_checksums_over_scp('/usr/bin/docker')
-                if docker_checksums != DOCKER_DIGEST:
-                    logger.info(
-                        _m(
-                            "Docker checksum",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "checksum": docker_checksums,
-                                "DOCKER_DIGEST": DOCKER_DIGEST
-                            }),
-                        )
-                    )
-                    # raise Exception("Docker is altered")
-
-                python_checksums = await shell.get_checksums_over_scp('/usr/bin/python')
-                if python_checksums != PYTHON_DIGEST or executor_info.python_path != '/usr/bin/python':
-                    logger.info(
-                        _m(
-                            "Python checksum",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "checksum": python_checksums,
-                                "PYTHON_DIGEST": PYTHON_DIGEST
-                            }),
-                        )
-                    )
-                    # raise Exception("Python is altered")
-
                 # start gpus_utility.py
                 program_id = str(uuid.uuid4())
                 command_args = {
