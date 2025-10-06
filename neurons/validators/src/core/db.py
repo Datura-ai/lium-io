@@ -14,7 +14,7 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
-POOL_SIZE = 100
+POOL_SIZE = 20
 
 # Create engine with conditional parameters based on environment
 if settings.ENV == "test":

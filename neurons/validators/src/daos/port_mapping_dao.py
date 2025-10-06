@@ -2,6 +2,7 @@ import logging
 import time
 from asyncio import Semaphore
 from uuid import UUID
+from core.db import POOL_SIZE
 
 from sqlalchemy import select, update
 
@@ -9,7 +10,7 @@ from daos.base import BaseDao
 from models.port_mapping import PortMapping
 
 logger = logging.getLogger(__name__)
-upsert_semaphore = Semaphore(10)
+upsert_semaphore = Semaphore(POOL_SIZE)
 
 
 class PortMappingDao(BaseDao):
