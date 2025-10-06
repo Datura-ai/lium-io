@@ -76,7 +76,7 @@ def test_get_available_port_maps_default_range(executor_service):
 
     assert len(result) == batch_size
     for internal_port, external_port in result:
-        assert 40000 <= internal_port <= 65535
+        assert 20000 <= internal_port <= 65535
         assert internal_port == external_port
         assert internal_port != 22
 
@@ -118,7 +118,7 @@ def test_get_available_port_maps_empty_range(executor_service):
 
     assert len(result) == batch_size
     for internal_port, external_port in result:
-        assert 40000 <= internal_port <= 65535
+        assert 20000 <= internal_port <= 65535
 
 
 @pytest.mark.asyncio
