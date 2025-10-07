@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 JOB_LENGTH = 300
 SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
+
 class JobResult(BaseModel):
     spec: dict | None = None
     executor_info: ExecutorSSHInfo
@@ -57,8 +58,6 @@ class JobResult(BaseModel):
     gpu_count: int = 0
     sysbox_runtime: bool = False
     ssh_pub_keys: list[str] | None = None
-
-
 
 
 class TaskService:
@@ -768,7 +767,7 @@ class TaskService:
                         **machine_spec,
                         "available_port_count": port_count,
                     }
-                    
+
                     # In backend, there are 2 scores. actual score and job score.
                     # job score is the score which executor gets when matrix multiply is finished.
                     # actual score is the score which executor gets for incentive
@@ -776,24 +775,31 @@ class TaskService:
                     # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and 1 for job score, because if both scores are 0, executor will be flagged as invalid in backend.
                     job_score = 0
                     actual_score = 1
-                    log_msg = "Executor is already rented."
+                    log_msg = "Executor is rented."
+                    warning_msgs = []
 
-                    if not collateral_deposited and settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
+                    if not is_rental_succeed:
                         job_score = 1
                         actual_score = 0
-                        log_msg = "Executor is rented. But not eligible from collateral contract."
-                    elif not is_rental_succeed:
-                        job_score = 1
-                        actual_score = 0
-                        log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
-                    elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
-                        log_msg = "Executor is rented. But not eligible from collateral contract."
+                        warning_msgs.append("Set score 0 until it's verified by rental check")
+                    if settings.ENABLE_COLLATERAL_CONTRACT:
+                        if not collateral_deposited:
+                            if settings.ENABLE_NO_COLLATERAL:
+                                job_score = 1
+                                actual_score = actual_score * settings.NO_COLLATERAL_SCORE_MULTIPLIER
+                                warning_msgs.append(f"Set {settings.NO_COLLATERAL_SCORE_MULTIPLIER} score, since no collateral deposited")
+                            else:
+                                job_score = 1
+                                actual_score = 0
+                                warning_msgs.append("Set 0 score, since no collateral deposited")
+                        elif contract_version and contract_version != settings.get_latest_contract_version():
+                            job_score = 1
+                            actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                            warning_msgs.append(f"Set {SCORE_PORTION_FOR_OLD_CONTRACT} score, since your contract version is not the latest.")
+                    elif not collateral_deposited:
+                        warning_msgs.append("Not eligible from collateral contract.")
 
-                    # apply half score if contract version is not the latest
-                    if contract_version and contract_version != settings.get_latest_contract_version():
-                        actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
-                        job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
-                        log_msg += f" WARNING: Your contract version is not the latest. So you'll get {SCORE_PORTION_FOR_OLD_CONTRACT} score."
+                    log_msg += ("WARNING: " + " | ".join(warning_msgs)) if warning_msgs else ""
 
                     log_text = _m(
                         log_msg,
@@ -969,26 +975,31 @@ class TaskService:
                 job_score = 1
                 actual_score = 1
                 log_msg = "Train task is finished."
+                warning_msgs = []
 
-                if not collateral_deposited and settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
+                if port_count < MIN_PORT_COUNT:
                     actual_score = 0
-                    job_score = 0
-                    log_msg = "Train task is finished. But not eligible from collateral contract."
-                elif port_count < MIN_PORT_COUNT:
+                    warning_msgs.append(f"Current port count: {port_count}. Minimum required: {MIN_PORT_COUNT}.")
+                if not is_rental_succeed:
                     actual_score = 0
-                    log_msg = f"Current port count: {port_count}. Minimum required: {MIN_PORT_COUNT}."
-                elif not is_rental_succeed:
-                    actual_score = 0
-                    log_msg = "Train task is finished. Set score 0 until it's verified by rental check"
-                elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
-                    log_msg = "Train task is finished. But not eligible from collateral contract."
+                    warning_msgs.append("Set score 0 until it's verified by rental check")
+                if settings.ENABLE_COLLATERAL_CONTRACT:
+                    if not collateral_deposited:
+                        if settings.ENABLE_NO_COLLATERAL:
+                            actual_score = actual_score * settings.NO_COLLATERAL_SCORE_MULTIPLIER
+                            warning_msgs.append(f"Set {settings.NO_COLLATERAL_SCORE_MULTIPLIER} score, since no collateral deposited")
+                        else:
+                            actual_score = 0
+                            warning_msgs.append("Set 0 score, since no collateral deposited")
+                    elif contract_version and contract_version != settings.get_latest_contract_version():
+                        actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                        job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
+                        warning_msgs.append(f"Set {SCORE_PORTION_FOR_OLD_CONTRACT} score, since your contract version is not the latest.")
+                elif not collateral_deposited:
+                    warning_msgs.append("Not eligible from collateral contract.")
 
                 success = True if actual_score > 0 else False
-
-                if contract_version and contract_version != settings.get_latest_contract_version():
-                    actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
-                    job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
-                    log_msg += f" WARNING: Your contract version is not the latest. So you'll get {SCORE_PORTION_FOR_OLD_CONTRACT} score."
+                log_msg += ("WARNING: " + " | ".join(warning_msgs)) if warning_msgs else ""
 
                 log_text = _m(
                     log_msg,

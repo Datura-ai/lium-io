@@ -60,8 +60,9 @@ class Settings(BaseSettings):
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    ENABLE_COLLATERAL_CONTRACT: bool = False
-    ENABLE_NEW_INCENTIVE_ALGO: bool = False
+    ENABLE_COLLATERAL_CONTRACT: bool = True
+    ENABLE_NO_COLLATERAL: bool = True
+    NO_COLLATERAL_SCORE_MULTIPLIER: float = 0.5
     ENABLE_VERIFYX: bool = True
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(

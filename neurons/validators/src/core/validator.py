@@ -115,18 +115,20 @@ class Validator:
         )
 
     async def calc_job_score(self, total_gpu_model_count_map: dict, job_result: JobResult):
+        default_extra = {
+            "executor_id": str(job_result.executor_info.uuid),
+            "job_batch_id": job_result.job_batch_id,
+            "gpu_model": job_result.gpu_model,
+            "gpu_count": job_result.gpu_count,
+            "score": job_result.score,
+            "collateral_deposited": job_result.collateral_deposited,
+            "sysbox_runtime": job_result.sysbox_runtime,
+        }
         if job_result.score == 0:
             logger.info(
                 _m(
                     "Debug: No need to calc score, score is 0",
-                    extra=get_extra_info({
-                        "executor_id": str(job_result.executor_info.uuid),
-                        "job_batch_id": job_result.job_batch_id,
-                        "gpu_model": job_result.gpu_model,
-                        "gpu_count": job_result.gpu_count,
-                        "score": 0,
-                        "sysbox_runtime": job_result.sysbox_runtime,
-                    })
+                    extra=get_extra_info(default_extra)
                 )
             )
             return 0
@@ -138,13 +140,13 @@ class Validator:
 
         score_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
         score = score_portion * job_result.gpu_count / total_gpu_count
-        
+
         # calc multiplier
         multiplier = 1
 
         # calc multiplier for sysbox_runtime
         if not job_result.sysbox_runtime:
-            multiplier = multiplier  - settings.PORTION_FOR_SYSBOX
+            multiplier = 1 - settings.PORTION_FOR_SYSBOX
 
         # calc multiplier for uptime
         uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
@@ -156,14 +158,11 @@ class Validator:
             _m(
                 "Debug: calculating score",
                 extra=get_extra_info({
-                    "executor_id": str(job_result.executor_info.uuid),
-                    "job_batch_id": job_result.job_batch_id,
-                    "gpu_model": job_result.gpu_model,
-                    "total_gpu_count": total_gpu_count,
-                    "gpu_count": job_result.gpu_count,
+                    **default_extra,
                     "score_portion": score_portion,
+                    "uptime_in_minutes": uptime_in_minutes,
+                    "multiplier": multiplier,
                     "score": score,
-                    "sysbox_runtime": job_result.sysbox_runtime,
                 })
             )
         )
