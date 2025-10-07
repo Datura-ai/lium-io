@@ -312,7 +312,7 @@ class ExecutorConnectivityService:
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
-                        if len(data.get("success_count", 0)) <= 2:
+                        if data.get("success_count", 0) <= 2:
                             logger.warning(
                                 _m(
                                     f"Port check request returned only {len(data.get('success_count'))} successful",
