@@ -312,6 +312,16 @@ class ExecutorConnectivityService:
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
+                        if len(data.get("success_count", 0)) <= 2:
+                            logger.warning(
+                                _m(
+                                    f"Port check request returned only {len(data.get('success_count'))} successful",
+                                    {
+                                        **extra,
+                                        "data": data,
+                                    },
+                                )
+                            )
                         return data.get("results", {})
                     else:
                         logger.error(_m(f"Port check request failed with status {response.status}", extra))
