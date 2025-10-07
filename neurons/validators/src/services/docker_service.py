@@ -80,11 +80,9 @@ class DockerService:
 
             # Get successful ports from database as dict {external_port: PortMapping}
             available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
-
-
-            if not available_ports:
-                logger.warning(f"No successful ports found in database for executor {executor_id}")
-                raise Exception("No successful ports found in database")
+            MIN_PORTS = 3
+            if len(available_ports) < MIN_PORTS:
+                raise Exception(f"Not enough successful ports found in database for executor {executor_id}")
 
             mappings = []
 
