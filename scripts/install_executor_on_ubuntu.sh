@@ -1,223 +1,142 @@
-#!/bin/bash
-set -u
+#!/usr/bin/env bash
+# Purpose: Install minimal executor prerequisites on Ubuntu/Debian.
+# Behavior: Fail fast, clear errors, refuse on non-apt systems.
 
-# enable command completion
-set -o history -o histexpand
+set -Eeuo pipefail
 
-abort() {
-  printf "%s\n" "$1"
-  exit 1
-}
+# =============== UX helpers ===============
+RED=$'\e[1;31m'; GRN=$'\e[1;32m'; BLU=$'\e[1;34m'; BLD=$'\e[1m'; RST=$'\e[0m'
+log()   { printf "${BLU}==>${RST} %s\n" "$*"; }
+ok()    { printf "${GRN}✓${RST} %s\n" "$*"; }
+die()   { printf "${RED}✗ %s${RST}\n" "$*" >&2; exit 1; }
 
-getc() {
-  local save_state
-  save_state=$(/bin/stty -g)
-  /bin/stty raw -echo
-  IFS= read -r -n 1 -d '' "$@"
-  /bin/stty "$save_state"
-}
+trap 'die "Failed at: ${BASH_COMMAND}"' ERR
 
-exit_on_error() {
-    exit_code=$1
-    last_command=${@:2}
-    if [ $exit_code -ne 0 ]; then
-        >&2 echo "\"${last_command}\" command failed with exit code ${exit_code}."
-        exit $exit_code
-    fi
-}
-
-shell_join() {
-  local arg
-  printf "%s" "$1"
+CONFIRM=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes) CONFIRM=0 ;;          # legacy no-op (always non-interactive)
+    -c|--confirm) CONFIRM=1 ;;       # require RETURN before actions
+    *) die "Unknown flag: $1" ;;
+  esac
   shift
-  for arg in "$@"; do
-    printf " "
-    printf "%s" "${arg// /\ }"
-  done
+done
+
+pause_if_needed() {
+  [[ $CONFIRM -eq 1 ]] || return 0
+  read -r -p "Press RETURN to continue or Ctrl+C to abort..." _
 }
 
-# string formatters
-if [[ -t 1 ]]; then
-  tty_escape() { printf "\033[%sm" "$1"; }
-else
-  tty_escape() { :; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
+
+# =============== Guards ===============
+# 1) Must have apt-get (Ubuntu/Debian). Fail early on Arch, etc.
+command -v apt-get >/dev/null 2>&1 || die "This installer supports only Debian/Ubuntu (apt-get not found)."
+
+# 2) Must have sudo or be root
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  require_cmd sudo
 fi
-tty_mkbold() { tty_escape "1;$1"; }
-tty_underline="$(tty_escape "4;39")"
-tty_blue="$(tty_mkbold 34)"
-tty_red="$(tty_mkbold 31)"
-tty_bold="$(tty_mkbold 39)"
-tty_reset="$(tty_escape 0)"
 
-ohai() {
-  printf "${tty_blue}==>${tty_bold} %s${tty_reset}\n" "$(shell_join "$@")"
+# 3) Detect distro info for repo setup
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  DISTRO_ID="${ID:-unknown}"
+  DISTRO_CODENAME="${VERSION_CODENAME:-}"
+else
+  DISTRO_ID="unknown"; DISTRO_CODENAME=""
+fi
+
+log "Detected: ${DISTRO_ID} ${DISTRO_CODENAME}"
+
+export DEBIAN_FRONTEND=noninteractive
+APT="sudo apt-get -y -qq"
+APT_INSTALL="$APT install --no-install-recommends"
+
+# =============== Steps ===============
+apt_refresh() {
+  log "Refreshing apt metadata"
+  $APT update
+  ok "apt updated"
 }
 
-wait_for_user() {
-  local c
-  echo
-  echo "Press RETURN to continue or any other key to abort"
-  getc c
-  # we test for \r and \n because some stuff does \r instead
-  if ! [[ "$c" == $'\r' || "$c" == $'\n' ]]; then
-    exit 1
-  fi
+install_base() {
+  log "Installing base packages"
+  $APT_INSTALL ca-certificates curl git build-essential apt-transport-https gnupg lsb-release software-properties-common
+  ok "Base packages installed"
 }
 
-#install pre
-install_pre() {
-    sudo apt update
-    sudo apt install --no-install-recommends --no-install-suggests -y sudo apt-utils curl git cmake build-essential
-    exit_on_error $?
-}
-
-# check if python is installed, if not install it
-install_python() {
-    # Check if python3.11 is installed
-    if command -v python3.11 &> /dev/null
-    then
-        # Check the version
-        PYTHON_VERSION=$(python3.11 --version 2>&1)
-        if [[ $PYTHON_VERSION == *"Python 3.11"* ]]; then
-            ohai "Python 3.11 is already installed."
-        else
-            ohai "Linking python to python 3.11"
-            sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
-            python -m pip install cffi
-            python -m pip install cryptography
-        fi
-    else
-        ohai "Installing Python 3.11"
-        add-apt-repository ppa:deadsnakes/ppa
-        sudo apt install python3.11
-        sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
-        python -m pip install cffi
-        python -m pip install cryptography
-    fi
-
-    # check if PDM is installed
-    if command -v pdm &> /dev/null
-    then
-        ohai "PDM is already installed."
-        echo "Checking PDM version..."
-        pdm --version
-    else
-        ohai "Installing PDM..."
-        sudo apt install -y python3.12-venv
-        curl -sSL https://pdm-project.org/install-pdm.py | python3 -
-
-        local bashrc_file="/root/.bashrc"
-        local path_string="export PATH=/root/.local/bin:\$PATH"
-
-        if ! grep -Fxq "$path_string" $bashrc_file; then
-            echo "$path_string" >> $bashrc_file
-            echo "Added $path_string to $bashrc_file"
-        else
-            echo "$path_string already present in $bashrc_file"
-        fi
-
-        export PATH=/root/.local/bin:$PATH
-
-        echo "Checking PDM version..."
-        pdm --version
-    fi
-}
-
-# install redis
-install_redis() {
-    if command -v redis-server &> /dev/null
-    then
-        ohai "Redis is already installed."
-        echo "Checking Redis version..."
-        redis-server --version
-    else
-        ohai "Installing Redis..."
-
-        sudo apt install -y redis-server
-
-        echo "Starting Redis server..."
-        sudo systemctl start redis-server.service
-
-        echo "Checking Redis server status..."
-        sudo systemctl status redis-server.service
-    fi
-}
-
-# install postgresql
-install_postgresql() {
-    if command -v psql &> /dev/null
-    then
-        ohai "PostgreSQL is already installed."
-        echo "Checking PostgreSQL version..."
-        psql --version
-
-        # Check if the database exists
-        DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='compute_subnet_db'")
-        if [ "$DB_EXISTS" == "1" ]; then
-            echo "Database compute_subnet_db already exists."
-        else
-            echo "Creating database compute_subnet_db..."
-            sudo -u postgres createdb compute_subnet_db
-        fi
-    else
-        echo "Installing PostgreSQL..."
-        sudo apt install -y postgresql postgresql-contrib
-
-        echo "Starting PostgreSQL server..."
-        sudo systemctl start postgresql.service
-
-        echo "Setting password for postgres user..."
-        sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'password';"
-
-        echo "Creating database compute_subnet_db..."
-        sudo -u postgres createdb compute_subnet_db
-    fi
-}
-
-# install btcli
-install_btcli() {
-    if command -v btcli &> /dev/null
-    then
-        ohai "BtCLI is already installed."
-    else
-        ohai "Installing BtCLI..."
-
-        sudo apt install -y pipx 
-        pipx install bittensor
-        source ~/.bashrc
-    fi
-}
-
-# install docker
 install_docker() {
-  if command -v docker &> /dev/null; then
-    ohai "Docker is already installed."
-    return 0
+  if command -v docker >/dev/null 2>&1; then
+    ok "Docker already installed: $(docker --version 2>/dev/null | head -n1)"
+    return
+  fi
+  log "Installing Docker Engine"
+
+  # Keyring dir
+  sudo install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+  # Repo (use ubuntu repo for Debian derivatives with matching codename if present)
+  CODENAME="${DISTRO_CODENAME:-$(lsb_release -cs 2>/dev/null || echo focal)}"
+  echo \
+"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+ ${CODENAME} stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+
+  $APT update
+  $APT install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # Add current user to docker group if not root and user exists
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    sudo usermod -aG docker "${SUDO_USER:-$USER}" || true
+    ok "Added ${SUDO_USER:-$USER} to docker group (log out/in to take effect)"
+  fi
+  ok "Docker installed"
+}
+
+verify_docker() {
+  log "Verifying Docker daemon"
+  # Try to ping the daemon (this fails if user session needs re-login after group change)
+  if ! docker info >/dev/null 2>&1; then
+    die "Docker daemon not reachable. If you were just added to the docker group, log out and back in, then retry."
+  fi
+
+  # Check compose v2 is available
+  if ! docker compose version >/dev/null 2>&1; then
+    die "docker compose plugin not available."
+  fi
+  ok "Docker daemon reachable & compose available"
+}
+
+optional_python_tools() {
+  # Keep it minimal; don’t hard-pin 3.11 unless you must.
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "Installing Python"
+    $APT_INSTALL python3 python3-pip python3-venv
+    ok "Python installed"
   else
-    ohai "Installing Docker..."
-    sudo apt-get update -y
-    sudo apt-get install -y ca-certificates curl
-    sudo install -m 0755 -d /etc/apt/keyrings
-    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-    sudo chmod a+r /etc/apt/keyrings/docker.asc
-    
-    # Add the repository to Apt sources:
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-    sudo apt-get update -y
-    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    sudo groupadd docker
-    sudo usermod -aG docker $USER
-    newgrp docker
+    ok "Python present: $(python3 --version)"
   fi
 }
 
-ohai "This script will install:"
-echo "docker"
+# (Optional) redis/postgres/btcli—only if you really require them for the executor host.
+# Wire these behind flags later if needed.
 
+# =============== Run ===============
+apt_refresh
+pause_if_needed
 
-wait_for_user
-install_pre
+install_base
+pause_if_needed
+
 install_docker
+pause_if_needed
+
+verify_docker
+pause_if_needed
+
+optional_python_tools
+
+ok "All required executor prerequisites are installed."
