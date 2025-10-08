@@ -1,9 +1,8 @@
-import asyncio
 import json
 import logging
 import random
 import uuid
-from typing import Annotated
+from typing import Annotated, Union
 from pydantic import BaseModel
 
 import asyncssh
@@ -44,6 +43,7 @@ logger = logging.getLogger(__name__)
 JOB_LENGTH = 300
 SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
+
 class JobResult(BaseModel):
     spec: dict | None = None
     executor_info: ExecutorSSHInfo
@@ -57,8 +57,6 @@ class JobResult(BaseModel):
     gpu_count: int = 0
     sysbox_runtime: bool = False
     ssh_pub_keys: list[str] | None = None
-
-
 
 
 class TaskService:
@@ -341,6 +339,48 @@ class TaskService:
                 return False, log_text
 
         return True, None
+
+    def calc_scores(
+        self,
+        gpu_model: str,
+        collateral_deposited: bool,
+        is_rental_succeed: bool,
+        contract_version: str,
+        rented: bool = False,
+        port_count: int = 0,
+    ) -> Union[float, float, str]:
+        warning_messages = []
+        job_score = 1
+        actual_score = 1
+        
+        def _return_value(actual_score, job_score, warning_messages):
+            return actual_score, 1 if rented else job_score, (" WARNING: " + " | ".join(warning_messages)) if warning_messages else ""
+
+        if not is_rental_succeed:
+            actual_score = 0
+            warning_messages.append("Set score 0 until it's verified by rental check")
+
+        if port_count < MIN_PORT_COUNT and not rented:
+            actual_score = 0
+            job_score = 0
+            warning_messages.append(f"Set score 0, since port count is less than {MIN_PORT_COUNT}")
+
+        if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
+            return _return_value(actual_score, job_score, warning_messages)
+
+        if not collateral_deposited:
+            if settings.ENABLE_NO_COLLATERAL:
+                warning_messages.append("No collateral deposited")
+            else:
+                actual_score = 0
+                job_score = 0
+                warning_messages.append("Set score 0, since no collateral deposited")
+        elif contract_version and contract_version != settings.get_latest_contract_version():
+            actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
+            job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
+            warning_messages.append(f"Set score {SCORE_PORTION_FOR_OLD_CONTRACT}, since contract version is not the latest")
+
+        return _return_value(actual_score, job_score, warning_messages)
 
     async def create_task(
         self,
@@ -768,32 +808,17 @@ class TaskService:
                         **machine_spec,
                         "available_port_count": port_count,
                     }
-                    
-                    # In backend, there are 2 scores. actual score and job score.
-                    # job score is the score which executor gets when matrix multiply is finished.
-                    # actual score is the score which executor gets for incentive
-                    # In rented executor, there should be no job score. But we can't give actual score to executor until it pass rental check.
-                    # So, if executor is rented but didn't pass rental check, we can give 0 for actual score and 1 for job score, because if both scores are 0, executor will be flagged as invalid in backend.
-                    job_score = 0
-                    actual_score = 1
+
                     log_msg = "Executor is already rented."
+                    actual_score, job_score, warning_message = self.calc_scores(
+                        gpu_model=gpu_model,
+                        collateral_deposited=collateral_deposited,
+                        is_rental_succeed=is_rental_succeed,
+                        contract_version=contract_version,
+                        rented=True,
+                    )
 
-                    if not collateral_deposited and settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
-                        job_score = 1
-                        actual_score = 0
-                        log_msg = "Executor is rented. But not eligible from collateral contract."
-                    elif not is_rental_succeed:
-                        job_score = 1
-                        actual_score = 0
-                        log_msg = "Executor is rented. Set score 0 until it's verified by rental check"
-                    elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
-                        log_msg = "Executor is rented. But not eligible from collateral contract."
-
-                    # apply half score if contract version is not the latest
-                    if contract_version and contract_version != settings.get_latest_contract_version():
-                        actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
-                        job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
-                        log_msg += f" WARNING: Your contract version is not the latest. So you'll get {SCORE_PORTION_FOR_OLD_CONTRACT} score."
+                    log_msg += warning_message
 
                     log_text = _m(
                         log_msg,
@@ -966,29 +991,18 @@ class TaskService:
                     "available_port_count": port_count,
                 }
 
-                job_score = 1
-                actual_score = 1
                 log_msg = "Train task is finished."
-
-                if not collateral_deposited and settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
-                    actual_score = 0
-                    job_score = 0
-                    log_msg = "Train task is finished. But not eligible from collateral contract."
-                elif port_count < MIN_PORT_COUNT:
-                    actual_score = 0
-                    log_msg = f"Current port count: {port_count}. Minimum required: {MIN_PORT_COUNT}."
-                elif not is_rental_succeed:
-                    actual_score = 0
-                    log_msg = "Train task is finished. Set score 0 until it's verified by rental check"
-                elif not collateral_deposited and not settings.ENABLE_COLLATERAL_CONTRACT and not settings.ENABLE_NEW_INCENTIVE_ALGO:
-                    log_msg = "Train task is finished. But not eligible from collateral contract."
+                actual_score, job_score, warning_message = self.calc_scores(
+                    gpu_model=gpu_model,
+                    collateral_deposited=collateral_deposited,
+                    is_rental_succeed=is_rental_succeed,
+                    contract_version=contract_version,
+                    rented=False,
+                    port_count=port_count,
+                )
+                log_msg += warning_message
 
                 success = True if actual_score > 0 else False
-
-                if contract_version and contract_version != settings.get_latest_contract_version():
-                    actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
-                    job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
-                    log_msg += f" WARNING: Your contract version is not the latest. So you'll get {SCORE_PORTION_FOR_OLD_CONTRACT} score."
 
                 log_text = _m(
                     log_msg,
