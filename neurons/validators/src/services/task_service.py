@@ -340,7 +340,7 @@ class TaskService:
 
         return True, None
 
-    def calc_actual_score_for_valid(
+    def calc_scores(
         self,
         gpu_model: str,
         collateral_deposited: bool,
@@ -348,32 +348,39 @@ class TaskService:
         contract_version: str,
         rented: bool = False,
         port_count: int = 0,
-    ) -> Union[float, str]:
+    ) -> Union[float, float, str]:
         warning_messages = []
-        score = 1
+        job_score = 1
+        actual_score = 1
+        
+        def _return_value(actual_score, job_score, warning_messages):
+            return actual_score, 1 if rented else job_score, (" WARNING: " + " | ".join(warning_messages)) if warning_messages else ""
 
         if not is_rental_succeed:
-            score = 0
+            actual_score = 0
             warning_messages.append("Set score 0 until it's verified by rental check")
 
         if port_count < MIN_PORT_COUNT and not rented:
-            score = 0
+            actual_score = 0
+            job_score = 0
             warning_messages.append(f"Set score 0, since port count is less than {MIN_PORT_COUNT}")
 
         if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
-            return score, ("WARNING: " + " | ".join(warning_messages)) if warning_messages else ""
+            return _return_value(actual_score, job_score, warning_messages)
 
         if not collateral_deposited:
             if settings.ENABLE_NO_COLLATERAL:
                 warning_messages.append("No collateral deposited")
             else:
-                score = 0
+                actual_score = 0
+                job_score = 0
                 warning_messages.append("Set score 0, since no collateral deposited")
         elif contract_version and contract_version != settings.get_latest_contract_version():
-            score = score * SCORE_PORTION_FOR_OLD_CONTRACT
+            actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
+            job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
             warning_messages.append(f"Set score {SCORE_PORTION_FOR_OLD_CONTRACT}, since contract version is not the latest")
 
-        return score, (" WARNING: " + " | ".join(warning_messages)) if warning_messages else ""
+        return _return_value(actual_score, job_score, warning_messages)
 
     async def create_task(
         self,
@@ -803,8 +810,7 @@ class TaskService:
                     }
 
                     log_msg = "Executor is already rented."
-                    job_score = 1
-                    actual_score, warning_message = self.calc_actual_score_for_valid(
+                    actual_score, job_score, warning_message = self.calc_scores(
                         gpu_model=gpu_model,
                         collateral_deposited=collateral_deposited,
                         is_rental_succeed=is_rental_succeed,
@@ -986,8 +992,7 @@ class TaskService:
                 }
 
                 log_msg = "Train task is finished."
-                job_score = 1
-                actual_score, warning_message = self.calc_actual_score_for_valid(
+                actual_score, job_score, warning_message = self.calc_scores(
                     gpu_model=gpu_model,
                     collateral_deposited=collateral_deposited,
                     is_rental_succeed=is_rental_succeed,
