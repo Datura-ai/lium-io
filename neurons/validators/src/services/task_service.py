@@ -373,7 +373,7 @@ class TaskService:
             score = score * SCORE_PORTION_FOR_OLD_CONTRACT
             warning_messages.append(f"Set score {SCORE_PORTION_FOR_OLD_CONTRACT}, since contract version is not the latest")
 
-        return score, ("WARNING: " + " | ".join(warning_messages)) if warning_messages else ""
+        return score, (" WARNING: " + " | ".join(warning_messages)) if warning_messages else ""
 
     async def create_task(
         self,
