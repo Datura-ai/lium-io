@@ -147,8 +147,9 @@ class Validator:
             multiplier = multiplier  - settings.PORTION_FOR_SYSBOX
 
         # calc multiplier for uptime
-        uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
-        multiplier = multiplier * (1 - settings.PORTION_FOR_UPTIME + settings.PORTION_FOR_UPTIME * min(1, uptime_in_minutes / settings.UPTIME_REQUIRED_MINUTES))
+        if not job_result.collateral_deposited:
+            uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
+            multiplier = multiplier * (1 - settings.PORTION_FOR_UPTIME + settings.PORTION_FOR_UPTIME * min(1, uptime_in_minutes / settings.UPTIME_REQUIRED_MINUTES))
 
         score = score * multiplier
 
