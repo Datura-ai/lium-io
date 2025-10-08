@@ -15,6 +15,10 @@ class MinerMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request, call_next):
+        # Skip middleware for hardware_utilization endpoint
+        if request.url.path == "/hardware_utilization":
+            return await call_next(request)
+            
         try:
             body_bytes = await request.body()
             miner_ip = request.client.host
