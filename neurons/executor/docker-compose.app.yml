@@ -33,10 +33,11 @@ services:
     labels:
       autoheal-app: true
     healthcheck:
-      test: [ "CMD-SHELL", "nvidia-smi || exit 1" ]
-      interval: 2m
+      test: [ "CMD-SHELL", "curl -f http://localhost:${INTERNAL_PORT}/health" ]
+      interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s
     deploy:
       resources:
         reservations:

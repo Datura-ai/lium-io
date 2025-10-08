@@ -11,6 +11,11 @@ from dependencies.auth import verify_allowed_hotkey_signature
 apis_router = APIRouter()
 
 
+@apis_router.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
 @apis_router.post("/upload_ssh_key")
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
