@@ -144,7 +144,7 @@ class Validator:
 
         # calc multiplier for sysbox_runtime
         if not job_result.sysbox_runtime:
-            multiplier = multiplier  - settings.PORTION_FOR_SYSBOX
+            multiplier = multiplier * (1  - settings.PORTION_FOR_SYSBOX)
 
         # calc multiplier for uptime
         if not job_result.collateral_deposited:
