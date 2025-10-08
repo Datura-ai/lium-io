@@ -139,7 +139,7 @@ class Validator:
             return 0
 
         score_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
-        score = score_portion * job_result.gpu_count / total_gpu_count
+        score = job_result.score * score_portion * job_result.gpu_count / total_gpu_count
         
         # calc multiplier
         multiplier = 1
