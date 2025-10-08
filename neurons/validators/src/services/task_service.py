@@ -367,8 +367,8 @@ class TaskService:
             if settings.ENABLE_NO_COLLATERAL:
                 warning_messages.append("No collateral deposited")
             else:
-                warning_messages.append("Set score 0, since no collateral deposited")
                 score = 0
+                warning_messages.append("Set score 0, since no collateral deposited")
         elif contract_version and contract_version != settings.get_latest_contract_version():
             score = score * SCORE_PORTION_FOR_OLD_CONTRACT
             warning_messages.append(f"Set score {SCORE_PORTION_FOR_OLD_CONTRACT}, since contract version is not the latest")
