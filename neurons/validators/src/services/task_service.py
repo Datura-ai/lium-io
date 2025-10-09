@@ -185,12 +185,12 @@ class TaskService:
 
         try:
             count_ports = await self.port_mapping_dao.get_successful_ports_count(executor_id)
-
-            if count_ports > 0:
+            MIN_PORTS = 3
+            if count_ports >= MIN_PORTS:
                 logger.info(_m(f"Retrieved {count_ports} ports count_ports from DB", extra=extra))
                 return count_ports
 
-            logger.warning(_m("No ports in DB, fallback to Redis", extra=extra))
+            logger.warning(_m(f"only {count_ports} in DB, fallback to Redis", extra=extra))
 
         except Exception as e:
             logger.error(_m("DB error, fallback to Redis", extra={**extra, "error": str(e)}), exc_info=True)
