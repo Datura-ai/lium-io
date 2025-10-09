@@ -252,4 +252,47 @@ async def test_partial_exact_match_preferred_ports_uses_min_for_missing(docker_s
     for i in range(len(remaining_mappings)):
         assert external_ports_used[i] == 9000 + i
 
-    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
+    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(
+        UUID(test_executor_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_flexible_mode_deviates_from_preferred_when_unavailable(
+    docker_service, test_executor_id, test_miner_hotkey
+):
+    """Test that FLEXIBLE mode allows deviation from PREFERRED_POD_PORTS when preferred ports unavailable.
+
+    In flexible mode (internal_ports=None), when no exact matches exist:
+    - First element (docker_port) = external_port (NOT from PREFERRED_POD_PORTS)
+    - This allows using any available port for both docker and external
+    """
+    from services.const import PREFERRED_POD_PORTS
+
+    # Available ports completely different from PREFERRED_POD_PORTS
+    available_ports = list(range(9000, 9000 + len(PREFERRED_POD_PORTS)))
+    mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
+    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
+
+    # Act - internal_ports=None means use PREFERRED_POD_PORTS in flexible mode
+    result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, None)
+
+    # Assert
+    assert len(result) == len(PREFERRED_POD_PORTS)
+
+    # In flexible mode with no exact matches, docker_port should equal external_port
+    # (both come from available_ports, NOT from PREFERRED_POD_PORTS)
+    for docker_port, internal_port, external_port in result:
+        # KEY ASSERTION: docker_port equals external_port (both from available set)
+        assert docker_port == external_port
+        # Both should be from available_ports range, not PREFERRED_POD_PORTS
+        assert docker_port in available_ports
+        assert docker_port not in PREFERRED_POD_PORTS
+
+    # Verify ports are selected in ascending order (min strategy)
+    docker_ports_used = [m[0] for m in result]
+    assert docker_ports_used == sorted(available_ports)[: len(PREFERRED_POD_PORTS)]
+
+    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(
+        UUID(test_executor_id)
+    )
