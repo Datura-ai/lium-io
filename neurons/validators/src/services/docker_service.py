@@ -92,14 +92,16 @@ class DockerService:
                     # Exact match - use this external_port
                     port_mapping = available_ports.pop(docker_port)
                     mappings.append((docker_port, port_mapping.internal_port, docker_port))
-                elif available_ports:
+                elif internal_ports:
                     # Random available external_port
                     external_port = random.choice(list(available_ports.keys()))
                     port_mapping = available_ports.pop(external_port)
                     mappings.append((docker_port, port_mapping.internal_port, external_port))
-                # If no more available_ports - skip this docker_port
-
-
+                else:
+                    # if internal_ports wasn't set - then just pick the first external_port
+                    external_port = min(available_ports.keys())
+                    port_mapping = available_ports.pop(external_port)
+                    mappings.append((external_port, port_mapping.internal_port, external_port))
             logger.info(f"Generated {len(mappings)} port mappings from database for executor {executor_id}")
             return mappings
 
