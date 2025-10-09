@@ -875,7 +875,7 @@ class TaskService:
                         **default_extra,
                         "renting_in_progress": True,
                     }
-                    docker_connection_check_result = await self.executor_connectivity_service.batch_verify_ports(
+                    docker_connection_check_result = await self.executor_connectivity_service.verify_ports(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
