@@ -72,8 +72,6 @@ class ExecutorConnectivityService:
         try:
             t1 = time.monotonic()
             await self.cleanup_docker_containers(ssh_client, extra)
-            raw_ports = executor_info.port_range or executor_info.port_mappings
-            logger.info(_m(f"raw_ports: {raw_ports[:100]}", extra))
             port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE)
             if not port_maps:
                 return DockerConnectionCheckResult(
