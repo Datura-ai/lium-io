@@ -294,7 +294,7 @@ class ExecutorConnectivityService:
                 async with session.post(start_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as response:
                     if response.status == 200:
                         data = await response.json()
-                        logger.info(_m("response", {**extra, "data": data}))
+                        logger.info(_m("response", {**extra, "data": str(data)[:200]}))
                     else:
                         logger.error(_m(f"port check failed status={response.status}", extra))
                         return {}
