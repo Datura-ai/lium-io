@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from typing import Any
 from uuid import UUID
 
@@ -19,6 +20,8 @@ from services.const import (
     BATCH_PORT_VERIFICATION_SIZE,
     DOCKER_DIND_IMAGE,
     PREFERRED_POD_PORTS,
+    BATCH_PORT_TIMEOUT,
+    BATCH_PORT_CONCURRENCY,
 )
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
@@ -27,7 +30,7 @@ from services.redis_service import (
 
 # Constants
 BATCH_VERIFIER_CONTAINER_PREFIX = "container_batch_verifier"
-BATCH_VERIFIER_IMAGE = "daturaai/batch-port-verifier:0.0.0"
+BATCH_VERIFIER_IMAGE = "daturaai/batch-port-verifier:0.0.1"
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +46,7 @@ class ExecutorConnectivityService:
         self.redis_service = redis_service
         self.port_mapping_dao = port_mapping_dao
 
-    async def batch_verify_ports(
+    async def verify_ports(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         job_batch_id: str,
@@ -67,24 +70,21 @@ class ExecutorConnectivityService:
 
         """Verify multiple ports concurrently."""
         try:
+            t1 = time.monotonic()
             await self.cleanup_docker_containers(ssh_client, extra)
-
+            logger.info(_m(f"raw_ports: {executor_info.raw_ports}", extra))
             port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE)
             if not port_maps:
                 return DockerConnectionCheckResult(
-                    success=False,
-                    log_text="No port available for docker container",
-                    sysbox_runtime=sysbox_runtime,
+                    success=False, log_text="No port available for docker container", sysbox_runtime=sysbox_runtime,
                 )
 
-            # Debug: show port mappings summary
-            logger.debug(_m(f"Checking {len(port_maps)} port mappings", extra))
+            logger.debug(_m(f"checking {len(port_maps)} port mappings", extra))
 
-            successful_ports, failed_ports = await self.verify_other_ports(ssh_client, port_maps, executor_info, extra)
+            successful_ports, failed_ports = await self.verify_ports_bulk(ssh_client, port_maps, executor_info, extra)
             dind_port = successful_ports.pop(0) if successful_ports else random.choice(port_maps)
-            dind_result = await self.verify_single_port(
+            dind_result = await self.verify_port_dind(
                 ssh_client,
-                job_batch_id,
                 miner_hotkey,
                 executor_info,
                 private_key,
@@ -105,9 +105,7 @@ class ExecutorConnectivityService:
 
             # Calculate statistics
             total_checked = len(successful_ports) + len(failed_ports)
-            success_percentage = (
-                (len(successful_ports) / total_checked * 100) if total_checked > 0 else 0
-            )
+            success_percentage = (len(successful_ports) / total_checked * 100) if total_checked > 0 else 0
 
             # Log verification summary
             dind_status = "ok" if dind_result.success else "failed"
@@ -116,17 +114,12 @@ class ExecutorConnectivityService:
 
             if not successful_ports:
                 failure_msg = "No working ports found"
-                return DockerConnectionCheckResult(
-                    success=False,
-                    log_text=failure_msg,
-                    sysbox_runtime=sysbox_runtime,
-                )
+                return DockerConnectionCheckResult(success=False, log_text=failure_msg, sysbox_runtime=sysbox_runtime,)
 
             # Save successful ports
             redis_task = self.save_to_redis(executor_info, miner_hotkey, successful_ports, extra)
             db_task = self.save_to_db(executor_info, miner_hotkey, successful_ports, failed_ports, extra)
             await asyncio.gather(redis_task, db_task)
-
 
             # Create detailed success message
             successful_internal_ports = [port_pair[0] for port_pair in successful_ports]
@@ -135,42 +128,28 @@ class ExecutorConnectivityService:
             success_sample = sorted(successful_internal_ports)[:5]
             failed_sample = sorted(failed_internal_ports)[:5]
 
-            success_msg = f"Port verification completed successfully {success_percentage:.0f}% ports available. "
-            success_msg += f"{dind_status}, {batch_status}, {len(successful_ports)} success ports: {success_sample}"
-
+            total_time = time.monotonic() - t1
+            success_msg = f"verification complete {total_time=:.2f}s {success_percentage:.0f}% available, dind={dind_status} batch={batch_status} ok={len(successful_ports)}{success_sample}"
             if failed_ports:
-                success_msg += f", {len(failed_ports)} failed ports: {failed_sample}"
+                success_msg += f" fail={len(failed_ports)}{failed_sample}"
             logger.info(_m(success_msg, extra))
 
-            return DockerConnectionCheckResult(
-                success=True,
-                log_text=success_msg,
-                sysbox_runtime=sysbox_runtime,
-            )
+            return DockerConnectionCheckResult(success=True, log_text=success_msg, sysbox_runtime=sysbox_runtime,)
         except Exception as e:
-            # Log overall verification failure
-            logger.error(
-                _m(f"error: Port verification failed - {str(e)} (executor={executor_info.address})", extra), exc_info=True
-            )
+            logger.error(_m(f"verification failed: {str(e)} executor={executor_info.address}", extra), exc_info=True)
 
             return DockerConnectionCheckResult(
-                success=False,
-                log_text=f"Verification failed: {str(e)}",
-                sysbox_runtime=sysbox_runtime,
+                success=False, log_text=f"Verification failed: {str(e)}", sysbox_runtime=sysbox_runtime,
             )
 
-    async def verify_other_ports(
+    async def verify_ports_bulk(
         self,
         ssh_client: SSHClientConnection,
         port_maps: list[tuple[int, int]],
         executor_info: ExecutorSSHInfo,
-            extra: dict = {}
+        extra: dict = {},
     ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-        """Check multiple ports using dockerized batch port verifier service.
-
-        Returns:
-            tuple: (successful_port_pairs, failed_port_pairs)
-        """
+        """Start docker on executor -> open ports there -> check ports -> close docker"""
         if not port_maps:
             return [], []
 
@@ -179,51 +158,24 @@ class ExecutorConnectivityService:
         ports_to_check = port_maps[1:]
         container_name = f"{BATCH_VERIFIER_CONTAINER_PREFIX}_{api_external}"
 
-        # Log batch check start
-        logger.info(
-            _m(f"batch-check: Starting batch verifier on port {api_internal}:{api_external}, checking {len(ports_to_check)} ports...", extra)
-        )
+        logger.info(_m(f"batch: start docker {api_internal}:{api_external}", extra))
 
         try:
             # Start Docker container
-            command = (
-                f"/usr/bin/docker run -d --name {container_name} --network=host "
-                f"-e API_PORT={api_internal} {BATCH_VERIFIER_IMAGE}"
-            )
+            await self._docker_start(api_external, api_internal, container_name, extra, ssh_client)
 
-            # Debug: log command
-            logger.debug(_m(f"DEBUG: Running command: {command[:100]}...", extra))
+            logger.info(_m(f"batch: docker started {api_external}, wait health", extra))
+            if not await self._docker_wait_for_health(executor_info.address, api_external, extra):
+                raise Exception(f"batch health check failed port={api_external}")
 
-            result = await ssh_client.run(command)
-            if result.exit_status != 0:
-                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-                logger.error(
-                    _m(f"error: Batch container start failed - {error_msg} (api_port={api_external})", extra), exc_info=True
+            logger.info(_m(f"batch: healthy {api_external}, verify {len(ports_to_check)} ports", extra))
+            batch_size = 1000
+            results = {}
+            for i in range(0, len(ports_to_check), batch_size):
+                batch_ports = ports_to_check[i : i + batch_size]
+                results.update(
+                    await self._start_and_check_ports(executor_info.address, api_external, batch_ports, extra)
                 )
-                return [], []
-
-            # Log container started
-            logger.info(_m(f"batch-check: Container started on port {api_external}, waiting for health...", extra))
-
-            # Wait for health endpoint
-            if not await self._wait_for_health(executor_info.address, api_external, extra):
-                logger.error(
-                    _m(f"error: Batch service health check failed - Service did not become healthy (api_port={api_external})", extra), exc_info=True
-                )
-                return [], []
-
-            # Log health ready
-            logger.info(_m(f"batch-check: Service healthy on port {api_external}, sending request...", extra))
-
-            # Log request sending
-            logger.info(
-                _m(f"batch-check: Port verification request sent for {len(ports_to_check)} ports...", extra)
-            )
-
-            # Send port check request
-            results = await self._send_port_check_request(
-                executor_info.address, api_external, ports_to_check, extra
-            )
 
             # Process results into port pairs
             successful_ports = []
@@ -235,41 +187,40 @@ class ExecutorConnectivityService:
 
             # Process other ports based on results
             for port_pair in ports_to_check:
-                internal_port = port_pair[0]
-                # results uses string keys
-                if results.get(str(internal_port), False):
-                    successful_ports.append(port_pair)
-                else:
-                    failed_ports.append(port_pair)
+                target = successful_ports if results.get(str(port_pair[0]), False) else failed_ports
+                target.append(port_pair)
 
-            # Count successful ports
-            successful_count = len(successful_ports) - 1  # exclude api_port from count
-
-            # Log batch results
-            logger.info(
-                _m(f"batch-check: Results: {successful_count}/{len(ports_to_check)} + api_port", extra)
-            )
-
-            # Log batch completion
-            status = "SUCCESS" if successful_count > 0 else "failed"
-            logger.info(
-                _m(f"batch-check: Batch verification completed: {status} ({len(ports_to_check)} ports checked)", extra)
-            )
-
+            status = "ok" if len(successful_ports) > 1 else "fail"
+            logger.info(_m(f"batch: complete {status} {successful_ports[:10]}/{len(port_maps)} + api", extra))
             return successful_ports, failed_ports
 
         except Exception as e:
-            logger.error(_m(f"error: Batch port verification failed - {str(e)} (api_port={api_external})", extra), exc_info=True)
+            logger.error(_m(f"batch verification failed: {str(e)} port={api_external}", extra), exc_info=True)
             return [], []
         finally:
-            # Cleanup container
             try:
                 cleanup_command = f"/usr/bin/docker rm -f {container_name}"
                 await ssh_client.run(cleanup_command)
             except Exception as e:
-                logger.debug(_m(f"Container cleanup warning: {e}", extra))
+                logger.debug(_m(f"cleanup warning: {e}", extra))
 
-    async def _wait_for_health(self, external_ip: str, api_port: int, extra: dict = {}) -> bool:
+    async def _docker_start(
+        self, api_external: int, api_internal: int, container_name: str, extra: dict, ssh_client: SSHClientConnection
+    ):
+        """Run the special container in the executor machine"""
+        command = (
+            f"/usr/bin/docker run -d --name {container_name} --network=host "
+            f"-e API_PORT={api_internal} {BATCH_VERIFIER_IMAGE}"
+        )
+
+        logger.debug(_m(f"run: {command[:200]}...", extra))
+
+        result = await ssh_client.run(command)
+        if result.exit_status != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            raise Exception(f"batch docker start failed: {error_msg} port={api_external}")
+
+    async def _docker_wait_for_health(self, external_ip: str, api_port: int, extra: dict = {}) -> bool:
         """Wait for batch port verifier service to become healthy."""
         health_url = f"http://{external_ip}:{api_port}/health"
         timeout = 10  # seconds
@@ -278,60 +229,107 @@ class ExecutorConnectivityService:
         async with aiohttp.ClientSession() as session:
             while asyncio.get_event_loop().time() - start_time < timeout:
                 try:
-                    async with session.get(
-                        health_url, timeout=aiohttp.ClientTimeout(total=2)
-                    ) as response:
+                    async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=4)) as response:
                         if response.status == 200:
                             data = await response.json()
                             if data.get("status") == "ok":
-                                logger.debug(_m(f"Health check successful for {external_ip}:{api_port}", extra))
+                                logger.debug(_m(f"health ok {external_ip}:{api_port}", extra))
                                 return True
-                except Exception:
+                except Exception as e:
+                    logger.debug(_m(f"health error: {e}", extra))
                     pass  # Continue retrying
 
                 await asyncio.sleep(0.5)
 
         return False
 
-    async def _send_port_check_request(
+    async def _verify_port(
+        self, host: str, external_port: int, expected_response: str, int_port: int, session: aiohttp.ClientSession,
+    ) -> tuple[bool, int | None]:
+        """Verify remote port is responding correctly via HTTP GET."""
+        url = f"http://{host}:{external_port}/"
+
+        try:
+            t1 = time.monotonic()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=BATCH_PORT_TIMEOUT)) as response:
+                response_text = await response.text()
+                is_valid = response_text.strip() == expected_response
+                return is_valid, int_port
+        except Exception:
+            return False, None
+
+    async def _start_and_check_ports(
         self, external_ip: str, api_port: int, port_maps: list[tuple[int, int]], extra: dict = {}
     ) -> dict[str, bool]:
+        """
+        will send POST /start-ports command to turn_on ports with list of internal ports
+        then in paralel will send GET request to every external port to check if it is open
+        Send Post /close-ports command to turn_off ports after all ports are checked
+        """
         """Send HTTP request to check ports."""
-        check_url = f"http://{external_ip}:{api_port}/check-ports"
+        start_url = f"http://{external_ip}:{api_port}/start-ports"
+        stop_url = f"http://{external_ip}:{api_port}/stop-ports"
         if not port_maps:
-            logger.info(_m("No ports to check, skipping request...", extra))
+            logger.debug(_m("no ports to check, skip", extra))
             return {}
 
         # Prepare request payload
-        payload = {"external_ip": external_ip, "ports": port_maps}
+        internal_ports, external_ports = zip(*port_maps)
+        external_dict = {
+            external_port: internal_port for external_port, internal_port in zip(external_ports, internal_ports)
+        }
+        secret = str(random.randint(100000, 999999))
+        payload = {"ports": internal_ports, "secret": secret}
 
+        # Create session with connection pool
+        concurrency = min(len(external_dict), BATCH_PORT_CONCURRENCY)
+        connector = aiohttp.TCPConnector(
+            limit=concurrency, limit_per_host=concurrency, force_close=False, enable_cleanup_closed=True,
+        )
+
+        # start ports.
+        t1 = time.monotonic()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    check_url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
+            async with aiohttp.ClientSession(connector=connector) as session:
+                # Start ports
+                async with session.post(start_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as response:
                     if response.status == 200:
                         data = await response.json()
-                        if data.get("success_count", 0) <= 2:
-                            logger.warning(
-                                _m(
-                                    f"Port check request returned only {len(data.get('success_count'))} successful",
-                                    {
-                                        **extra,
-                                        "data": data,
-                                    },
-                                )
-                            )
-                        return data.get("results", {})
+                        logger.info(_m("response", {**extra, "data": data}))
                     else:
-                        logger.error(_m(f"Port check request failed with status {response.status}", extra))
+                        logger.error(_m(f"port check failed status={response.status}", extra))
                         return {}
+
+                started = time.monotonic() - t1
+                # Run verify_port in parallel for all ports
+                tasks = []
+                for external_port, internal_port in external_dict.items():
+                    expected_response = f"{internal_port}_{secret}"
+                    tasks.append(
+                        self._verify_port(external_ip, external_port, expected_response, internal_port, session,)
+                    )
+
+                results = await asyncio.gather(*tasks)
+                results_dict = {
+                    str(internal_port): success for success, internal_port in results if internal_port is not None
+                }
+                check_time = time.monotonic() - t1 - started
+
+                # stop_ports
+                async with session.post(stop_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status != 200:
+                        logger.error(_m(f"port check failed status={response.status}", extra))
+                stop_time = time.monotonic() - t1 - started - check_time
+
         except Exception as e:
-            logger.error(_m(f"Error sending port check request: {e}", extra), exc_info=True)
+            logger.error(_m(f"port check request failed: {e}", extra), exc_info=True)
             return {}
 
+        logger.info(_m(f"port check complete {started:.2f}s {check_time:.2f}s {stop_time:.2f}s", extra))
+        return results_dict
+
     async def save_to_redis(
-        self, executor_info: ExecutorSSHInfo, miner_hotkey: str, successful_ports: list[Any], extra: dict = {}
+        self, executor_info: ExecutorSSHInfo, miner_hotkey: str, successful_ports: list[Any], extra: dict = {},
     ):
         key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
         MAX_REDIS_SAVE = 10
@@ -350,14 +348,13 @@ class ExecutorConnectivityService:
             if len(port_maps) > MAX_REDIS_KEEP:
                 await self.redis_service.rpop(key)
 
-
     async def save_to_db(
         self,
         executor_info: ExecutorSSHInfo,
         miner_hotkey: str,
         successful_ports: list[tuple[int, int]],
         failed_ports: list[tuple[int, int]],
-        extra: dict = {}
+        extra: dict = {},
     ):
         """Save successful port verification results to database."""
         try:
@@ -368,7 +365,7 @@ class ExecutorConnectivityService:
                     executor_id=UUID(executor_info.uuid),
                     internal_port=internal_port,
                     external_port=external_port,
-                    is_successful=True
+                    is_successful=True,
                 )
                 for internal_port, external_port in successful_ports
             ]
@@ -379,18 +376,17 @@ class ExecutorConnectivityService:
                         executor_id=UUID(executor_info.uuid),
                         internal_port=internal_port,
                         external_port=external_port,
-                        is_successful=False
+                        is_successful=False,
                     )
                 )
 
             if db_records:
                 await self.port_mapping_dao.upsert_port_results(db_records)
                 await self.port_mapping_dao.clean_ports(db_records[0].executor_id)
-                logger.info(_m(f"Saved {len(db_records)} successful ports to database", extra))
+                logger.info(_m(f"saved {len(db_records)} ports to db", extra))
 
         except Exception as e:
-            logger.error(_m(f"Error saving ports to database: {e}", extra), exc_info=True)
-            # Redis still works as fallback
+            logger.error(_m(f"save to db failed: {e}", extra), exc_info=True)
 
     async def cleanup_docker_containers(self, ssh_client: SSHClientConnection, extra: dict = {}):
         # Clean container_ prefixed containers
@@ -401,56 +397,40 @@ class ExecutorConnectivityService:
         if result.stdout.strip():
             container_names.extend(result.stdout.strip().split("\n"))
 
-        # Log cleanup start
-        logger.info(
-            _m(f"CLEANUP: Starting cleanup of old containers... found: {len(container_names)} - {container_names}", extra)
-        )
+        logger.info(_m(f"cleanup: found {len(container_names)} containers {container_names}", extra))
 
         if container_names:
             container_names_str = " ".join(container_names)
-
             command = f"/usr/bin/docker rm {container_names_str} -f"
             await ssh_client.run(command)
-
             command = "/usr/bin/docker volume prune -af"
             await ssh_client.run(command)
 
-        # Log cleanup completion
-        logger.info(_m(f"CLEANUP: Cleanup completed, removed: {len(container_names)} containers", extra))
+        logger.info(_m(f"cleanup: removed {len(container_names)} containers", extra))
 
-    def get_available_port_maps(
-        self,
-        executor_info: ExecutorSSHInfo,
-        batch_size: int = 1000,
-    ) -> list[tuple[int, int]]:
+    def get_available_port_maps(self, executor_info: ExecutorSSHInfo, batch_size: int = 1000,) -> list[tuple[int, int]]:
         """Get a list of available port maps for batch verification. with priority for PREFERED_POD_PORTS"""
         if executor_info.port_mappings:
             port_mappings: list[tuple[int, int]] = json.loads(executor_info.port_mappings)
             port_mappings = [
                 (internal_port, external_port)
                 for internal_port, external_port in port_mappings
-                if internal_port != executor_info.ssh_port
-                and external_port != executor_info.ssh_port
+                if internal_port != executor_info.ssh_port and external_port != executor_info.ssh_port
             ]
 
             # Prioritize preferred ports from existing port mappings
             preferred_mappings = [
-                mapping for mapping in port_mappings
+                mapping
+                for mapping in port_mappings
                 if mapping[0] in PREFERRED_POD_PORTS or mapping[1] in PREFERRED_POD_PORTS
             ]
-            remaining_mappings = [
-                mapping for mapping in port_mappings
-                if mapping not in preferred_mappings
-            ]
+            remaining_mappings = [mapping for mapping in port_mappings if mapping not in preferred_mappings]
 
             # Combine preferred first, then sample from remaining
             result = preferred_mappings[:]
             if len(result) < batch_size and remaining_mappings:
                 additional_needed = batch_size - len(result)
-                additional_ports = random.sample(
-                    remaining_mappings,
-                    min(additional_needed, len(remaining_mappings))
-                )
+                additional_ports = random.sample(remaining_mappings, min(additional_needed, len(remaining_mappings)))
                 result.extend(additional_ports)
 
             return result[:batch_size]
@@ -458,14 +438,10 @@ class ExecutorConnectivityService:
         # Generate ports from range
         if executor_info.port_range:
             if "-" in executor_info.port_range:
-                min_port, max_port = map(
-                    int, (part.strip() for part in executor_info.port_range.split("-"))
-                )
+                min_port, max_port = map(int, (part.strip() for part in executor_info.port_range.split("-")))
                 ports = list(range(min_port, max_port + 1))
             else:
-                ports = list(
-                    map(int, (part.strip() for part in executor_info.port_range.split(",")))
-                )
+                ports = list(map(int, (part.strip() for part in executor_info.port_range.split(","))))
         else:
             # Default range if port_range is empty
             ports = list(range(20000, 65535))
@@ -485,18 +461,14 @@ class ExecutorConnectivityService:
         # Add remaining ports if needed
         if len(selected_ports) < batch_size and remaining_ports:
             additional_needed = batch_size - len(selected_ports)
-            additional_ports = random.sample(
-                remaining_ports,
-                min(additional_needed, len(remaining_ports))
-            )
+            additional_ports = random.sample(remaining_ports, min(additional_needed, len(remaining_ports)))
             selected_ports.extend(additional_ports)
 
         return [(port, port) for port in selected_ports[:batch_size]]
 
-    async def verify_single_port(
+    async def verify_port_dind(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-        job_batch_id: str,
         miner_hotkey: str,
         executor_info: ExecutorSSHInfo,
         private_key: str,
@@ -504,42 +476,33 @@ class ExecutorConnectivityService:
         internal_port: int,
         external_port: int,
         sysbox_runtime: bool = False,
-        extra: dict = {}
+        extra: dict = {},
     ) -> DockerConnectionCheckResult:
-        extra.update( {
-            "internal_port": internal_port,
-            "external_port": external_port,
-        })
+        extra.update(
+            {"internal_port": internal_port, "external_port": external_port,}
+        )
 
         container_name = f"container_{miner_hotkey}_{external_port}"
 
         try:
-            # Log dind check start
-            logger.info(_m(f"dind-check: Starting container on port {internal_port}...", extra))
+            logger.info(_m(f"dind: start docker port={internal_port}", extra))
 
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
             command = (
-                f'/usr/bin/docker run -d '
+                f"/usr/bin/docker run -d "
                 f'{"--runtime=sysbox-runc " if sysbox_runtime else ""}'
-                f'--name {container_name} --gpus all '
-                f'-p {internal_port}:22 '
-                f'{DOCKER_DIND_IMAGE} '
-                f'{docker_cmd}'
+                f"--name {container_name} --gpus all "
+                f"-p {internal_port}:22 "
+                f"{DOCKER_DIND_IMAGE} "
+                f"{docker_cmd}"
             )
 
-            # Debug: log command (truncated)
-            logger.debug(_m(f"DEBUG: Running command: {command[:100]}...", extra))
+            logger.debug(_m(f"run: {command[:100]}...", extra))
 
             result = await ssh_client.run(command)
             if result.exit_status != 0:
-                error_message = (
-                    result.stderr.strip() if result.stderr else "No error message available"
-                )
-
-                # Log container creation failure
-                logger.error(
-                    _m(f"error: dind container creation failed - {error_message} (port={internal_port})", extra)
-                )
+                error_message = result.stderr.strip() if result.stderr else "No error message"
+                logger.error(_m(f"dind docker creation failed: {error_message} port={internal_port}", extra))
 
                 try:
                     command = f"/usr/bin/docker rm {container_name} -f"
@@ -547,64 +510,40 @@ class ExecutorConnectivityService:
                 except Exception:
                     pass
 
-                failure_msg = (
-                    f"dind-check: Container check completed: failed (port {internal_port})"
-                )
-                return DockerConnectionCheckResult(
-                    success=False,
-                    log_text=failure_msg,
-                    sysbox_runtime=sysbox_runtime,
-                )
+                failure_msg = f"dind: check failed port={internal_port}"
+                return DockerConnectionCheckResult(success=False, log_text=failure_msg, sysbox_runtime=sysbox_runtime,)
 
-            # Log container created, waiting for SSH
-            logger.info(
-                _m(f"dind-check: Container created on port {internal_port}, waiting for SSH...", extra)
-            )
+            logger.info(_m(f"dind: docker created", extra))
 
             await asyncio.sleep(5)
 
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
-                host=executor_info.address,
-                port=external_port,
-                username="root",
-                client_keys=[pkey],
-                known_hosts=None,
+                host=executor_info.address, port=external_port, username="root", client_keys=[pkey], known_hosts=None,
             ) as container_ssh_client:
-                # Log SSH connection established
-                logger.info(_m(f"dind-check: SSH connection established on port {internal_port}", extra))
+                logger.info(_m(f"dind: ssh connected", extra))
 
                 if sysbox_runtime:
                     command = "docker pull hello-world"
                     result = await container_ssh_client.run(command)
                     sysbox_success = result.exit_status == 0
-
-                    # Log sysbox test result
-                    status = "ok" if sysbox_success else "failed"
-                    logger.info(_m(f"dind-check: Sysbox runtime test: {status}", extra))
+                    status = "ok" if sysbox_success else "fail"
+                    logger.info(_m(f"dind: sysbox test {status}", extra))
 
                     if not sysbox_success:
-                        error_message = (
-                            result.stderr.strip() if result.stderr else "No error message available"
-                        )
-                        logger.debug(_m(f"error: Sysbox runtime test failed - {error_message}", extra))
+                        error_message = result.stderr.strip() if result.stderr else "No error message"
+                        logger.debug(_m(f"sysbox test failed: {error_message}", extra))
                         sysbox_runtime = False
 
             command = f"/usr/bin/docker rm {container_name} -f"
             await ssh_client.run(command)
 
-            # Log dind check completion
-            success_msg = f"dind-check: Container check completed: SUCCESS (port {internal_port})"
+            success_msg = f"dind: check ok port={internal_port}"
             logger.info(_m(success_msg, extra))
 
-            return DockerConnectionCheckResult(
-                success=True,
-                log_text=success_msg,
-                sysbox_runtime=sysbox_runtime,
-            )
+            return DockerConnectionCheckResult(success=True, log_text=success_msg, sysbox_runtime=sysbox_runtime,)
         except Exception as e:
-            # Log exception with better formatting
-            logger.error(_m(f"error: dind check failed - {str(e)} (port={internal_port})", extra), exc_info=True)
+            logger.error(_m(f"dind check failed: {str(e)} port={internal_port}", extra), exc_info=True)
 
             try:
                 command = f"/usr/bin/docker rm {container_name} -f"
@@ -612,9 +551,5 @@ class ExecutorConnectivityService:
             except Exception:
                 pass
 
-            failure_msg = f"dind-check: Container check completed: failed (port {internal_port})"
-            return DockerConnectionCheckResult(
-                success=False,
-                log_text=failure_msg,
-                sysbox_runtime=sysbox_runtime,
-            )
+            failure_msg = f"dind: check failed port={internal_port}"
+            return DockerConnectionCheckResult(success=False, log_text=failure_msg, sysbox_runtime=sysbox_runtime,)
