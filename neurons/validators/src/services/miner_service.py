@@ -241,6 +241,7 @@ class MinerService:
                         "executor_uuid": result.executor_info.uuid,
                         "executor_ip": result.executor_info.address,
                         "executor_port": result.executor_info.port,
+                        "executor_ssh_port": result.executor_info.ssh_port,
                         "executor_price": result.executor_info.price,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,
