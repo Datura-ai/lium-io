@@ -283,7 +283,7 @@ class ExecutorConnectivityService:
         payload = {"ports": internal_ports, "secret": secret}
 
         # Create session with connection pool
-        concurrency = min(len(external_dict), BATCH_PORT_CONCURRENCYe)
+        concurrency = min(len(external_dict), BATCH_PORT_CONCURRENCY)
         connector = aiohttp.TCPConnector(# 300 executors * 200 concurrency. (in paralel)
             limit=concurrency, limit_per_host=concurrency, force_close=False, enable_cleanup_closed=True,
         )
