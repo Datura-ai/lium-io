@@ -168,7 +168,7 @@ class ExecutorConnectivityService:
                 raise Exception(f"batch health check failed port={api_external}")
 
             logger.info(_m(f"batch: healthy {api_external}, verify {len(ports_to_check)} ports", extra))
-            batch_size = 1000
+            batch_size = 100
             results = {}
             for i in range(0, len(ports_to_check), batch_size):
                 batch_ports = ports_to_check[i : i + batch_size]
@@ -281,8 +281,8 @@ class ExecutorConnectivityService:
         payload = {"ports": internal_ports, "secret": secret}
 
         # Create session with connection pool
-        concurrency = min(len(external_dict), BATCH_PORT_CONCURRENCY)
-        connector = aiohttp.TCPConnector(
+        concurrency = min(len(external_dict), BATCH_PORT_CONCURRENCYe)
+        connector = aiohttp.TCPConnector(# 300 executors * 200 concurrency. (in paralel)
             limit=concurrency, limit_per_host=concurrency, force_close=False, enable_cleanup_closed=True,
         )
 
@@ -290,7 +290,6 @@ class ExecutorConnectivityService:
         t1 = time.monotonic()
         try:
             async with aiohttp.ClientSession(connector=connector) as session:
-                # Start ports
                 async with session.post(start_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as response:
                     if response.status == 200:
                         data = await response.json()
