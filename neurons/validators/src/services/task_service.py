@@ -374,7 +374,7 @@ class TaskService:
                 actual_score = 0
                 job_score = 0
                 warning_messages.append("Set score 0, since no collateral deposited")
-        elif contract_version and contract_version != settings.get_latest_contract_version():
+        elif contract_version and contract_version != settings.get_latest_contract_version() and not settings.ENABLE_NO_COLLATERAL:
             actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
             job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
             warning_messages.append(f"Set score {SCORE_PORTION_FOR_OLD_CONTRACT}, since contract version is not the latest")

@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     ENABLE_VERIFYX: bool = True
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
-        env='COLLATERAL_CONTRACT_ADDRESS', default='0xfB0FEAf1aB5d3788B40F97076ae0104bFbbdC124'
+        env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )
     CONTRACT_VERSIONS: dict = {
         "1.0.2": {
