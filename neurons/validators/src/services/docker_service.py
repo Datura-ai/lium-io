@@ -34,7 +34,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
 from daos.port_mapping_dao import PortMappingDao
-from services.const import PREFERRED_POD_PORTS
+from services.const import PREFERRED_POD_PORTS, MIN_PORT_COUNT
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
@@ -78,8 +78,7 @@ class DockerService:
         try:
             # Get successful ports from database as dict {external_port: PortMapping}
             available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
-            MIN_PORTS = 3
-            if len(available_ports) < MIN_PORTS:
+            if len(available_ports) < MIN_PORT_COUNT:
                 raise Exception(f"Not enough successful ports found in database for executor {executor_id}")
 
             mappings = []

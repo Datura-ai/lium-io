@@ -185,8 +185,7 @@ class TaskService:
 
         try:
             count_ports = await self.port_mapping_dao.get_successful_ports_count(executor_id)
-            MIN_PORTS = 3
-            if count_ports >= MIN_PORTS:
+            if count_ports >= MIN_PORT_COUNT:
                 logger.info(_m(f"Retrieved {count_ports} ports count_ports from DB", extra=extra))
                 return count_ports
 
