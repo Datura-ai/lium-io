@@ -34,7 +34,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
 from daos.port_mapping_dao import PortMappingDao
-from services.const import PREFERRED_POD_PORTS
+from services.const import PREFERRED_POD_PORTS, MIN_PORT_COUNT
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
@@ -76,31 +76,47 @@ class DockerService:
 
     async def generate_portMappings(self, miner_hotkey: str, executor_id: str, internal_ports: list[int] = None) -> list[tuple[int, int, int]]:
         try:
-            docker_internal_ports = internal_ports or PREFERRED_POD_PORTS
-
             # Get successful ports from database as dict {external_port: PortMapping}
             available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
-            MIN_PORTS = 3
-            if len(available_ports) < MIN_PORTS:
+            if len(available_ports) < MIN_PORT_COUNT:
                 raise Exception(f"Not enough successful ports found in database for executor {executor_id}")
 
             mappings = []
 
-            # For each docker port: try exact match first, then random
-            for docker_port in docker_internal_ports:
-                if docker_port in available_ports:
-                    # Exact match - use this external_port
-                    port_mapping = available_ports.pop(docker_port)
-                    mappings.append((docker_port, port_mapping.internal_port, docker_port))
-                elif available_ports:
-                    # Random available external_port
-                    external_port = random.choice(list(available_ports.keys()))
-                    port_mapping = available_ports.pop(external_port)
-                    mappings.append((docker_port, port_mapping.internal_port, external_port))
-                # If no more available_ports - skip this docker_port
+            if internal_ports:
+                # ============ STRICT MODE: Custom docker ports (must preserve docker port numbers) ============
+                # User explicitly requested specific docker ports - we MUST use them
+                # Strategy: docker_port is fixed, external_port can be any available
+                for docker_port in internal_ports:
+                    if docker_port in available_ports:
+                        # Exact match: docker_port == external_port
+                        port_mapping = available_ports.pop(docker_port)
+                        mappings.append((docker_port, port_mapping.internal_port, docker_port))
+                    else:
+                        # No exact match: docker_port stays fixed, pick random external_port
+                        external_port = random.choice(list(available_ports.keys()))
+                        port_mapping = available_ports.pop(external_port)
+                        mappings.append((docker_port, port_mapping.internal_port, external_port))
+            else:
+                # ============ FLEXIBLE MODE: Preferred ports (can deviate if needed) ============
+                # Using PREFERRED_POD_PORTS as soft preference, not strict requirement
+                # Strategy: prefer exact match, but if unavailable use any port (both docker and external)
+                for preferred_port in PREFERRED_POD_PORTS:
+                    if preferred_port in available_ports:
+                        # Exact match: preferred_port available
+                        port_mapping = available_ports.pop(preferred_port)
+                        mappings.append(
+                            (preferred_port, port_mapping.internal_port, preferred_port)
+                        )
+                    else:
+                        # No preferred port available: use any available port for both docker and external
+                        external_port = min(available_ports.keys())
+                        port_mapping = available_ports.pop(external_port)
+                        mappings.append((external_port, port_mapping.internal_port, external_port))
 
-
-            logger.info(f"Generated {len(mappings)} port mappings from database for executor {executor_id}")
+            logger.info(
+                f"Generated {len(mappings)} port mappings from database for executor {executor_id}"
+            )
             return mappings
 
         except Exception as e:

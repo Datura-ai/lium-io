@@ -185,8 +185,7 @@ class TaskService:
 
         try:
             count_ports = await self.port_mapping_dao.get_successful_ports_count(executor_id)
-            MIN_PORTS = 3
-            if count_ports >= MIN_PORTS:
+            if count_ports >= MIN_PORT_COUNT:
                 logger.info(_m(f"Retrieved {count_ports} ports count_ports from DB", extra=extra))
                 return count_ports
 
@@ -375,7 +374,7 @@ class TaskService:
                 actual_score = 0
                 job_score = 0
                 warning_messages.append("Set score 0, since no collateral deposited")
-        elif contract_version and contract_version != settings.get_latest_contract_version():
+        elif contract_version and contract_version != settings.get_latest_contract_version() and not settings.ENABLE_NO_COLLATERAL:
             actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
             job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
             warning_messages.append(f"Set score {SCORE_PORTION_FOR_OLD_CONTRACT}, since contract version is not the latest")
@@ -875,7 +874,7 @@ class TaskService:
                         **default_extra,
                         "renting_in_progress": True,
                     }
-                    docker_connection_check_result = await self.executor_connectivity_service.batch_verify_ports(
+                    docker_connection_check_result = await self.executor_connectivity_service.verify_ports(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
