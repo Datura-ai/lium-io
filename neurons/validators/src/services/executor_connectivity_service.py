@@ -152,9 +152,9 @@ class ExecutorConnectivityService:
         if not port_maps:
             return [], []
 
-        # Use first port as API_PORT for checker container
-        api_internal, api_external = port_maps[0]  # external port
-        ports_to_check = port_maps[1:]
+        # Use random port as API_PORT for checker container
+        api_internal, api_external = random.choice(port_maps)
+        ports_to_check = [p for p in port_maps if p != (api_internal, api_external)]
         container_name = f"{BATCH_VERIFIER_CONTAINER_PREFIX}_{api_external}"
 
         logger.info(_m(f"batch: start docker {api_internal}:{api_external}", extra))
@@ -181,7 +181,7 @@ class ExecutorConnectivityService:
             failed_ports = []
 
             # Add api_port to successful ports (it was used for the service)
-            api_port_pair = port_maps[0]
+            api_port_pair = (api_internal, api_external)
             successful_ports.append(api_port_pair)
 
             # Process other ports based on results
