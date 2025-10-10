@@ -186,8 +186,10 @@ class ExecutorConnectivityService:
 
             # Process other ports based on results
             for port_pair in ports_to_check:
-                target = successful_ports if results.get(str(port_pair[0]), False) else failed_ports
-                target.append(port_pair)
+                if results.get(str(port_pair[0]), False):
+                    successful_ports.append(port_pair)
+                else:
+                    failed_ports.append(port_pair)
 
             status = "ok" if len(successful_ports) > 1 else "fail"
             logger.info(_m(f"batch: complete {status} {successful_ports[:10]}/{len(port_maps)} + api", extra))
