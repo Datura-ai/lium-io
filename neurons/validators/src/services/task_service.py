@@ -185,8 +185,7 @@ class TaskService:
 
         try:
             count_ports = await self.port_mapping_dao.get_successful_ports_count(executor_id)
-            MIN_PORTS = 3
-            if count_ports >= MIN_PORTS:
+            if count_ports >= MIN_PORT_COUNT:
                 logger.info(_m(f"Retrieved {count_ports} ports count_ports from DB", extra=extra))
                 return count_ports
 
@@ -875,7 +874,7 @@ class TaskService:
                         **default_extra,
                         "renting_in_progress": True,
                     }
-                    docker_connection_check_result = await self.executor_connectivity_service.batch_verify_ports(
+                    docker_connection_check_result = await self.executor_connectivity_service.verify_ports(
                         ssh_client=shell.ssh_client,
                         job_batch_id=miner_info.job_batch_id,
                         miner_hotkey=miner_info.miner_hotkey,
