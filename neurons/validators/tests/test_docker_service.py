@@ -154,23 +154,47 @@ async def test_generate_portMappings_fallback_to_redis(
     )
 
 
+@pytest.mark.parametrize("available_ports,expected_mappings", [
+    # Exact match with PREFERRED_POD_PORTS
+    (
+        [22, 20000, 20001],
+        [(22, 22, 22), (20000, 20000, 20000), (20001, 20001, 20001)]
+    ),
+    # Simple available ports - SSH missing, gets max port
+    (
+        [20000, 20001, 20002],
+        [(22, 20002, 20002), (20000, 20000, 20000), (20001, 20001, 20001)]
+    ),
+    # Available ports don't match PREFERRED_POD_PORTS - flexible mode assigns SSH to max port
+    (
+        [9000, 9001, 9002],
+        [(22, 9002, 9002), (9000, 9000, 9000), (9001, 9001, 9001)]
+    ),
+])
 @pytest.mark.asyncio
-async def test_generate_portMappings_default_preferred_ports(docker_service, test_executor_id, test_miner_hotkey):
-    """Test that method uses PREFERED_POD_PORTS when internal_ports is None."""
-    from services.const import PREFERRED_POD_PORTS
+async def test_flexible_mode_port_mappings(
+    docker_service, test_executor_id, test_miner_hotkey, available_ports, expected_mappings, monkeypatch
+):
+    """Test FLEXIBLE mode with various available port scenarios.
 
-    # Mock database response with all preferred ports available
-    mock_ports = create_mock_port_dict(PREFERRED_POD_PORTS, test_miner_hotkey, UUID(test_executor_id))
+    In flexible mode (internal_ports=None):
+    - If exact matches exist, use them
+    - If no exact matches, docker_port = external_port from available set
+    - SSH port (22) gets special handling: max port if not available
+    """
+    # Mock PREFERRED_POD_PORTS to a shorter list for easier testing
+    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", [22, 20000, 20001])
+
+    # Mock database response
+    mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
     docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
 
-    # Act - internal_ports=None should use PREFERRED_POD_PORTS
+    # Act - internal_ports=None triggers flexible mode
     result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, None)
 
     # Assert
-    # Expect exact matches for all PREFERRED_POD_PORTS
-    assert len(result) == len(PREFERRED_POD_PORTS)
-    for port in PREFERRED_POD_PORTS:
-        assert (port, port, port) in result
+    assert len(result) == len(expected_mappings)
+    assert set(result) == set(expected_mappings)
     docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
 
 
@@ -202,97 +226,3 @@ async def test_no_exact_match_custom_ports_uses_random_selection(docker_service,
         assert internal_port == external_port
 
     docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
-
-
-@pytest.mark.asyncio
-async def test_no_exact_match_preferred_ports_uses_min_selection(docker_service, test_executor_id, test_miner_hotkey):
-    """Test min selection when no exact matches found with PREFERRED_POD_PORTS."""
-    from services.const import PREFERRED_POD_PORTS
-
-    # Available ports don't overlap with PREFERRED_POD_PORTS - create sequential ports starting from 9000
-    available_ports = list(range(9000, 9000 + len(PREFERRED_POD_PORTS)))
-    mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
-    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
-
-    # Act - internal_ports=None means use PREFERRED_POD_PORTS
-    result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, None)
-
-    # Assert
-    # Expect min selection: external ports selected in ascending order
-    assert len(result) == len(PREFERRED_POD_PORTS)
-
-    external_ports_used = [m[2] for m in result]
-    for i in range(len(PREFERRED_POD_PORTS)):
-        assert external_ports_used[i] == 9000 + i
-
-    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
-
-
-@pytest.mark.asyncio
-async def test_partial_exact_match_preferred_ports_uses_min_for_missing(docker_service, test_executor_id, test_miner_hotkey):
-    """Test combination of exact match and min selection with PREFERRED_POD_PORTS."""
-    from services.const import PREFERRED_POD_PORTS
-
-    # Available ports: exact match for port 22, rest don't overlap with PREFERRED_POD_PORTS
-    available_ports = [22] + list(range(9000, 9000 + len(PREFERRED_POD_PORTS)))
-    mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
-    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
-
-    # Act - internal_ports=None means use PREFERRED_POD_PORTS
-    result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, None)
-
-    # Assert
-    # Expect exact match for 22, min selection for remaining
-    assert len(result) == len(PREFERRED_POD_PORTS)
-    assert (22, 22, 22) in result
-
-    # Remaining mappings should use min selection
-    remaining_mappings = [m for m in result if m[0] != 22]
-    external_ports_used = [m[2] for m in remaining_mappings]
-    for i in range(len(remaining_mappings)):
-        assert external_ports_used[i] == 9000 + i
-
-    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(
-        UUID(test_executor_id)
-    )
-
-
-@pytest.mark.asyncio
-async def test_flexible_mode_deviates_from_preferred_when_unavailable(
-    docker_service, test_executor_id, test_miner_hotkey
-):
-    """Test that FLEXIBLE mode allows deviation from PREFERRED_POD_PORTS when preferred ports unavailable.
-
-    In flexible mode (internal_ports=None), when no exact matches exist:
-    - First element (docker_port) = external_port (NOT from PREFERRED_POD_PORTS)
-    - This allows using any available port for both docker and external
-    """
-    from services.const import PREFERRED_POD_PORTS
-
-    # Available ports completely different from PREFERRED_POD_PORTS
-    available_ports = list(range(9000, 9000 + len(PREFERRED_POD_PORTS)))
-    mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
-    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
-
-    # Act - internal_ports=None means use PREFERRED_POD_PORTS in flexible mode
-    result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, None)
-
-    # Assert
-    assert len(result) == len(PREFERRED_POD_PORTS)
-
-    # In flexible mode with no exact matches, docker_port should equal external_port
-    # (both come from available_ports, NOT from PREFERRED_POD_PORTS)
-    for docker_port, internal_port, external_port in result:
-        # KEY ASSERTION: docker_port equals external_port (both from available set)
-        assert docker_port == external_port
-        # Both should be from available_ports range, not PREFERRED_POD_PORTS
-        assert docker_port in available_ports
-        assert docker_port not in PREFERRED_POD_PORTS
-
-    # Verify ports are selected in ascending order (min strategy)
-    docker_ports_used = [m[0] for m in result]
-    assert docker_ports_used == sorted(available_ports)[: len(PREFERRED_POD_PORTS)]
-
-    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(
-        UUID(test_executor_id)
-    )
