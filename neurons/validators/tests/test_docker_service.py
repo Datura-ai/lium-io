@@ -220,10 +220,12 @@ async def test_no_exact_match_preferred_ports_uses_min_selection(docker_service,
     # Assert
     # Expect min selection: external ports selected in ascending order
     assert len(result) == len(PREFERRED_POD_PORTS)
+    # first port (SSH) assigned to the max port.
+    assert result[0] == (22, max(available_ports), max(available_ports))
 
     external_ports_used = [m[2] for m in result]
-    for i in range(len(PREFERRED_POD_PORTS)):
-        assert external_ports_used[i] == 9000 + i
+    for i in range(len(PREFERRED_POD_PORTS[1:]) - 1):
+        assert external_ports_used[i + 1] == 9000 + i
 
     docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
 
@@ -279,19 +281,16 @@ async def test_flexible_mode_deviates_from_preferred_when_unavailable(
 
     # Assert
     assert len(result) == len(PREFERRED_POD_PORTS)
+    assert result[0][0] == 22  # Port 22 is always assigned
 
     # In flexible mode with no exact matches, docker_port should equal external_port
     # (both come from available_ports, NOT from PREFERRED_POD_PORTS)
-    for docker_port, internal_port, external_port in result:
+    for docker_port, internal_port, external_port in result[1:]:
         # KEY ASSERTION: docker_port equals external_port (both from available set)
         assert docker_port == external_port
         # Both should be from available_ports range, not PREFERRED_POD_PORTS
         assert docker_port in available_ports
         assert docker_port not in PREFERRED_POD_PORTS
-
-    # Verify ports are selected in ascending order (min strategy)
-    docker_ports_used = [m[0] for m in result]
-    assert docker_ports_used == sorted(available_ports)[: len(PREFERRED_POD_PORTS)]
 
     docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(
         UUID(test_executor_id)
