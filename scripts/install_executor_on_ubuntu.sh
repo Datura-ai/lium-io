@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Purpose: Install minimal executor prerequisites on Ubuntu/Debian.
-# Behavior: Fail fast, clear errors, refuse on non-apt systems.
+# Purpose: Install minimal executor prerequisites on Ubuntu/Debian, 100% non-interactive.
+# Behavior: Fail fast, clear errors, refuse on non-apt systems or when sudo would prompt.
 
 set -Eeuo pipefail
 
@@ -16,7 +16,7 @@ CONFIRM=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -y|--yes) CONFIRM=0 ;;          # legacy no-op (always non-interactive)
-    -c|--confirm) CONFIRM=1 ;;       # require RETURN before actions
+    -c|--confirm) CONFIRM=1 ;;       # require RETURN before actions (opt-in only)
     *) die "Unknown flag: $1" ;;
   esac
   shift
@@ -30,34 +30,47 @@ pause_if_needed() {
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 
 # =============== Guards ===============
-# 1) Must have apt-get (Ubuntu/Debian). Fail early on Arch, etc.
-command -v apt-get >/dev/null 2>&1 || die "This installer supports only Debian/Ubuntu (apt-get not found)."
+require_cmd apt-get
 
-# 2) Must have sudo or be root
+# Must have sudo or be root, and sudo must be passwordless for non-interactive runs
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   require_cmd sudo
+  if ! sudo -n true 2>/dev/null; then
+    die "Passwordless sudo required (or run as root). Aborting to remain non-interactive."
+  fi
+  SUDO="sudo -n"
+else
+  SUDO=""
 fi
 
-# 3) Detect distro info for repo setup
+# Detect distro info for repo setup
+DISTRO_ID="unknown"; DISTRO_CODENAME=""
 if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091
   . /etc/os-release
   DISTRO_ID="${ID:-unknown}"
   DISTRO_CODENAME="${VERSION_CODENAME:-}"
-else
-  DISTRO_ID="unknown"; DISTRO_CODENAME=""
+  UBUNTU_CODENAME="${UBUNTU_CODENAME:-${UBUNTU_CODENAME:-}}"
+  ID_LIKE="${ID_LIKE:-}"
 fi
-
-log "Detected: ${DISTRO_ID} ${DISTRO_CODENAME}"
+log "Detected: ${DISTRO_ID} ${DISTRO_CODENAME:-?}"
 
 export DEBIAN_FRONTEND=noninteractive
-APT="sudo apt-get -y -qq"
+# Auto-accept service restarts during package upgrades
+export NEEDRESTART_MODE=a
+
+APT="$SUDO apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
 APT_INSTALL="$APT install --no-install-recommends"
 
 # =============== Steps ===============
 apt_refresh() {
-  log "Refreshing apt metadata"
-  $APT update
+  log "Refreshing apt metadata (with retries)"
+  local tries=0 max=5
+  until $APT update; do
+    tries=$((tries+1))
+    (( tries >= max )) && die "apt update failed after ${max} attempts"
+    sleep $((2 * tries))
+  done
   ok "apt updated"
 }
 
@@ -74,55 +87,53 @@ install_docker() {
   fi
   log "Installing Docker Engine"
 
+  # Determine repo family and codename
+  local family codename
+  if [[ "$DISTRO_ID" == "ubuntu" || -n "${UBUNTU_CODENAME:-}" ]]; then
+    family="ubuntu"
+    codename="${UBUNTU_CODENAME:-${DISTRO_CODENAME:-$($SUDO lsb_release -cs 2>/dev/null || echo focal)}}"
+  elif [[ "$DISTRO_ID" == "debian" || "$ID_LIKE" == *debian* ]]; then
+    family="debian"
+    codename="${DISTRO_CODENAME:-$($SUDO lsb_release -cs 2>/dev/null || echo bookworm)}"
+  else
+    die "Unsupported or unrecognized Debian/Ubuntu derivative (${DISTRO_ID})."
+  fi
+
   # Keyring dir
-  sudo install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+  $SUDO install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/${family}/gpg" | $SUDO gpg --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+  $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
 
-  # Repo (use ubuntu repo for Debian derivatives with matching codename if present)
-  CODENAME="${DISTRO_CODENAME:-$(lsb_release -cs 2>/dev/null || echo focal)}"
-  echo \
-"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
- ${CODENAME} stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+  # Repo
+  echo "deb [arch=$($SUDO dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${family} ${codename} stable" \
+    | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
 
-  $APT update
+  apt_refresh
   $APT install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-  # Add current user to docker group if not root and user exists
+  # Ensure daemon enabled/started on systemd hosts
+  if command -v systemctl >/dev/null 2>&1; then
+    $SUDO systemctl enable --now docker || true
+  fi
+
+  # Add current user to docker group if not root
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    sudo usermod -aG docker "${SUDO_USER:-$USER}" || true
-    ok "Added ${SUDO_USER:-$USER} to docker group (log out/in to take effect)"
+    $SUDO usermod -aG docker "${SUDO_USER:-$USER}" || true
+    ok "Added ${SUDO_USER:-$USER} to docker group (relogin needed)"
   fi
   ok "Docker installed"
 }
 
 verify_docker() {
   log "Verifying Docker daemon"
-  # Try to ping the daemon (this fails if user session needs re-login after group change)
+  # Try a quick ping to the daemon
   if ! docker info >/dev/null 2>&1; then
-    die "Docker daemon not reachable. If you were just added to the docker group, log out and back in, then retry."
+    die "Docker daemon not reachable. If you were just added to the docker group, re-login and retry. On servers, ensure 'systemctl status docker' is healthy."
   fi
-
   # Check compose v2 is available
-  if ! docker compose version >/dev/null 2>&1; then
-    die "docker compose plugin not available."
-  fi
+  docker compose version >/dev/null 2>&1 || die "docker compose plugin not available."
   ok "Docker daemon reachable & compose available"
 }
-
-optional_python_tools() {
-  # Keep it minimal; don’t hard-pin 3.11 unless you must.
-  if ! command -v python3 >/dev/null 2>&1; then
-    log "Installing Python"
-    $APT_INSTALL python3 python3-pip python3-venv
-    ok "Python installed"
-  else
-    ok "Python present: $(python3 --version)"
-  fi
-}
-
-# (Optional) redis/postgres/btcli—only if you really require them for the executor host.
-# Wire these behind flags later if needed.
 
 # =============== Run ===============
 apt_refresh
@@ -137,6 +148,4 @@ pause_if_needed
 verify_docker
 pause_if_needed
 
-optional_python_tools
-
-ok "All required executor prerequisites are installed."
+ok "All required executor prerequisites are installed (non-interactive)."
