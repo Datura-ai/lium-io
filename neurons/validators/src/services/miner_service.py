@@ -167,10 +167,9 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
-                    await self.publish_machine_specs(results, miner_client.miner_hotkey, payload.miner_coldkey)
-
                     return {
                         "miner_hotkey": payload.miner_hotkey,
+                        "miner_coldkey": payload.miner_coldkey,
                         "results": [result for result in results if result.gpu_model is not None and result.gpu_count > 0],
                     }
                 elif isinstance(msg, FailedRequest):
@@ -245,6 +244,7 @@ class MinerService:
                         "executor_price": result.executor_info.price,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,
+                        "validator_score": result.validator_score,
                         "job_batch_id": result.job_batch_id,
                         "log_status": result.log_status,
                         "log_text": result.log_text,
