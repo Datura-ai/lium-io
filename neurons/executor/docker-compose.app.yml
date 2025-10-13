@@ -34,7 +34,7 @@ services:
       autoheal-app: true
     healthcheck:
       test: [ "CMD-SHELL", "nvidia-smi || exit 1" ]
-      interval: 2m
+      interval: 30s
       timeout: 10s
       retries: 3
     deploy:
