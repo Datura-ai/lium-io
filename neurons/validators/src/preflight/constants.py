@@ -1,0 +1,30 @@
+"""Constants for preflight validation checks.
+
+Imports shared constants from services/const.py to avoid duplication.
+"""
+
+from services.const import (
+    GPU_MODEL_RATES,
+    MAX_GPU_COUNT,
+    GPU_UTILIZATION_LIMIT,
+    GPU_MEMORY_UTILIZATION_LIMIT,
+    MEMORY_ALLOCATION_PERCENTAGE,
+    MEMORY_MIN_TEST_GB,
+    MEMORY_MAX_TEST_GB,
+    STORAGE_MIN_AVAILABLE_GB,
+    STORAGE_THROUGHPUT_TEST_GB,
+    NETWORK_TIMEOUT_SECONDS,
+)
+
+__all__ = [
+    "GPU_MODEL_RATES",
+    "MAX_GPU_COUNT",
+    "GPU_UTILIZATION_LIMIT",
+    "GPU_MEMORY_UTILIZATION_LIMIT",
+    "MEMORY_ALLOCATION_PERCENTAGE",
+    "MEMORY_MIN_TEST_GB",
+    "MEMORY_MAX_TEST_GB",
+    "STORAGE_MIN_AVAILABLE_GB",
+    "STORAGE_THROUGHPUT_TEST_GB",
+    "NETWORK_TIMEOUT_SECONDS",
+]
