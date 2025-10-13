@@ -46,5 +46,4 @@ class BaseConsumer(abc.ABC):
             logger.info("Websocket connection closed, e: %s", str(ex))
             await self.disconnect()
         except Exception as ex:
-            logger.info("Handling message error: %s", str(ex))
             await self.disconnect()
