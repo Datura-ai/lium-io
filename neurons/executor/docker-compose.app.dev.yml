@@ -33,7 +33,7 @@ services:
     labels:
       autoheal-app: true
     healthcheck:
-      test: [ "CMD-SHELL", "nvidia-smi || true 1" ]
+      test: [ "CMD-SHELL", "nvidia-smi || exit 1" ]
       interval: 30s
       timeout: 10s
       retries: 3
