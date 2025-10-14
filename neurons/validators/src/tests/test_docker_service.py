@@ -7,7 +7,7 @@ import pytest_asyncio
 
 from services.docker_service import DockerService
 from models.port_mapping import PortMapping
-from tests.factories import create_port_mapping, create_port_mappings_batch
+from .factories import create_port_mapping, create_port_mappings_batch
 
 
 def create_mock_port_dict(
@@ -154,26 +154,44 @@ async def test_generate_portMappings_fallback_to_redis(
     )
 
 
-@pytest.mark.parametrize("available_ports,expected_mappings", [
-    # Exact match with PREFERRED_POD_PORTS
-    (
-        [22, 20000, 20001],
-        [(22, 22, 22), (20000, 20000, 20000), (20001, 20001, 20001)]
-    ),
-    # Simple available ports - SSH missing, gets max port
-    (
-        [20000, 20001, 20002],
-        [(22, 20002, 20002), (20000, 20000, 20000), (20001, 20001, 20001)]
-    ),
-    # Available ports don't match PREFERRED_POD_PORTS - flexible mode assigns SSH to max port
-    (
-        [9000, 9001, 9002],
-        [(22, 9002, 9002), (9000, 9000, 9000), (9001, 9001, 9001)]
-    ),
-])
+@pytest.mark.parametrize(
+    "available_ports,expected_mappings,initial_port_count",
+    [
+        # Exact match with PREFERRED_POD_PORTS
+        (
+            [22, 20000, 20001],
+            [(22, 22, 22), (20000, 20000, 20000), (20001, 20001, 20001)],
+            None,
+        ),
+        # Simple available ports - SSH missing, gets max port
+        (
+            [20000, 20001, 20002],
+            [(22, 20002, 20002), (20000, 20000, 20000), (20001, 20001, 20001)],
+            None,
+        ),
+        # Available ports don't match PREFERRED_POD_PORTS - flexible mode assigns SSH to max port
+        (
+            [9000, 9001, 9002],
+            [(22, 9002, 9002), (9000, 9000, 9000), (9001, 9001, 9001)],
+            None,
+        ),
+        # many ports available, only 1 initial_port_count
+        (
+            [r for r in range(20000, 20100)],
+            [(22, 20099, 20099), (20000, 20000, 20000)],
+            1,
+        ),
+        # many ports available, 50 initial_port_count
+        (
+            [r for r in range(20000, 20100)],
+            [(22, 20099, 20099)] + [(port, port, port) for port in range(20000, 20050)],
+            50,
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_flexible_mode_port_mappings(
-    docker_service, test_executor_id, test_miner_hotkey, available_ports, expected_mappings, monkeypatch
+    docker_service, test_executor_id, test_miner_hotkey, available_ports, expected_mappings, initial_port_count, monkeypatch
 ):
     """Test FLEXIBLE mode with various available port scenarios.
 
@@ -190,7 +208,7 @@ async def test_flexible_mode_port_mappings(
     docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
 
     # Act - internal_ports=None triggers flexible mode
-    result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, None)
+    result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, None, initial_port_count)
 
     # Assert
     assert len(result) == len(expected_mappings)
@@ -226,3 +244,55 @@ async def test_no_exact_match_custom_ports_uses_random_selection(docker_service,
         assert internal_port == external_port
 
     docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
+
+
+@pytest.mark.parametrize("initial_port_count,expected_length,expected_first_port,should_have_extra_ports", [
+    # No initial count - returns all PREFERRED_POD_PORTS
+    (None, 11, 22, False),
+    # Less than PREFERRED_POD_PORTS length - returns limited list
+    (0, 1, 22, False),
+    (2, 3, 22, False),  # +1 for SSH port = 3 total
+    (5, 6, 22, False),  # +1 for SSH port = 6 total
+    # More than PREFERRED_POD_PORTS length - returns PREFERRED_POD_PORTS + extra
+    (11, 12, 22, True),  # +1 for SSH port = 12 total, 1 extra port needed
+    (15, 16, 22, True),  # +1 for SSH port = 16 total, 5 extra ports needed
+])
+def test_get_preferred_ports(
+    docker_service,
+    initial_port_count,
+    expected_length,
+    expected_first_port,
+    should_have_extra_ports,
+    monkeypatch
+):
+    """Test get_prefered_ports method with various initial_port_count scenarios.
+
+    The method adds 1 to initial_port_count for SSH port and returns:
+    - All PREFERRED_POD_PORTS if initial_port_count is None/0
+    - Limited PREFERRED_POD_PORTS if initial_port_count < len(PREFERRED_POD_PORTS)
+    - PREFERRED_POD_PORTS + extra ports if initial_port_count > len(PREFERRED_POD_PORTS)
+    """
+    # Arrange - Mock PREFERRED_POD_PORTS to a known list
+    mock_preferred_ports = [22, 20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 20008, 20009]
+    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", mock_preferred_ports)
+
+    # Act
+    result = docker_service._get_preferred_ports(initial_port_count)
+
+    # Assert
+    assert len(result) == expected_length
+    assert result[0] == expected_first_port
+
+    # Verify all ports are from PREFERRED_POD_PORTS or are extra sequential ports
+    if should_have_extra_ports:
+        # Check that first 11 ports are from PREFERRED_POD_PORTS
+        assert result[:11] == mock_preferred_ports
+        # Check that extra ports are sequential after max preferred port
+        max_preferred = max(mock_preferred_ports)
+        extra_ports = result[11:]
+        for i, port in enumerate(extra_ports):
+            assert port == max_preferred + i
+    else:
+        # All ports should be from PREFERRED_POD_PORTS
+        for port in result:
+            assert port in mock_preferred_ports
