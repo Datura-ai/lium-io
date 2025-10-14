@@ -144,7 +144,7 @@ def get_balance_of_eth_address(private_key: str):
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 @click.option(
-    "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
+    "--validator", required=False, help="Validator hotkey that executor opens to."
 )
 @click.option(
     "--price", type=float, required=False, help="Price per hour in USD"
@@ -162,7 +162,7 @@ def get_balance_of_eth_address(private_key: str):
 def add_executor(
     address: str,
     port: int,
-    validator: str,
+    validator: str | None = None,
     price: float | None = None,
     gpu_type: str | None = None,
     gpu_count: int | None = None,

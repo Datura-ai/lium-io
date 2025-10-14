@@ -247,7 +247,7 @@ class CliService:
         self,
         address: str,
         port: int,
-        validator: str,
+        validator: str | None = None,
         price_per_hour: float | None = None,
         deposit_amount: float | None = None,
         gpu_type: str | None = None,
@@ -264,6 +264,9 @@ class CliService:
         :param gpu_count: Number of GPUs (optional)
         :return: True if successful, False otherwise
         """
+        if validator is None:
+            validator = settings.DEFAULT_VALIDATOR_HOTKEY
+
         executor_uuid = uuid.uuid4()
         try:
             executor = self.executor_dao.save(Executor(uuid=executor_uuid, address=address, port=port, validator=validator, price_per_hour=price_per_hour))
