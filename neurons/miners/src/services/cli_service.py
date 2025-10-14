@@ -248,6 +248,7 @@ class CliService:
         address: str,
         port: int,
         validator: str,
+        price_per_hour: float | None = None,
         deposit_amount: float | None = None,
         gpu_type: str | None = None,
         gpu_count: int | None = None
@@ -256,6 +257,7 @@ class CliService:
         Add an executor to the database and deposit collateral.
         :param address: Executor IP address
         :param port: Executor port
+        :param price_per_hour: Executor price per hour
         :param validator: Validator hotkey
         :param deposit_amount: Amount of TAO to deposit (optional)
         :param gpu_type: Type of GPU (optional)
@@ -264,7 +266,7 @@ class CliService:
         """
         executor_uuid = uuid.uuid4()
         try:
-            executor = self.executor_dao.save(Executor(uuid=executor_uuid, address=address, port=port, validator=validator))
+            executor = self.executor_dao.save(Executor(uuid=executor_uuid, address=address, port=port, validator=validator, price_per_hour=price_per_hour))
             self.logger.info("Added executor (id=%s)", str(executor.uuid))
         except Exception as e:
             self.logger.error("❌ Failed to add executor: %s", str(e))

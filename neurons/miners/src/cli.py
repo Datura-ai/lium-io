@@ -147,6 +147,9 @@ def get_balance_of_eth_address(private_key: str):
     "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
 )
 @click.option(
+    "--price", type=float, required=False, help="Price per hour in USD"
+)
+@click.option(
     "--gpu-type", help="Type of GPU", required=False
 )
 @click.option(
@@ -160,6 +163,7 @@ def add_executor(
     address: str,
     port: int,
     validator: str,
+    price: float | None = None,
     gpu_type: str | None = None,
     gpu_count: int | None = None,
     private_key: str | None = None,
@@ -173,7 +177,7 @@ def add_executor(
 
     cli_service = CliService(private_key=private_key, with_executor_db=True)
     success = asyncio.run(
-        cli_service.add_executor(address, port, validator, deposit_amount, gpu_type, gpu_count)
+        cli_service.add_executor(address, port, validator, price, deposit_amount, gpu_type, gpu_count)
     )
     if success:
         logger.info("✅ Added executor and deposited collateral successfully.")
