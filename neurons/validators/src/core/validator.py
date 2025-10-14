@@ -368,7 +368,7 @@ class Validator:
                     for miner_hotkey, results in all_job_results.items():
                         for result in results:
                             score = await self.calc_job_score(total_gpu_model_count_map, result)
-                            result.validator_score = score
+                            result.score = score
                             self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
 
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)

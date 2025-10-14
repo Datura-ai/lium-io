@@ -244,7 +244,6 @@ class MinerService:
                         "executor_price": result.executor_info.price,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,
-                        "validator_score": result.validator_score,
                         "job_batch_id": result.job_batch_id,
                         "log_status": result.log_status,
                         "log_text": result.log_text,
