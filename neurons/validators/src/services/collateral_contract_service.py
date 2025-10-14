@@ -99,9 +99,6 @@ class CollateralContractService:
         :return: Tuple containing eligibility status, error message, and contract version
         """
         error_message = None
-        if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
-            logger.info(f"GPU model {gpu_model} is excluded from collateral checks")
-            return True, None, settings.get_latest_contract_version()
 
         default_extra = {
             "miner_hotkey": miner_hotkey,
