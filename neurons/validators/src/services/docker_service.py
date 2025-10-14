@@ -101,9 +101,12 @@ class DockerService:
                 # ============ FLEXIBLE MODE: Preferred ports (can deviate if needed) ============
                 # Using PREFERRED_POD_PORTS as soft preference, not strict requirement
                 # Strategy: prefer exact match, but if unavailable use min port (both docker and external) + SSH port always.
-                prefered_ports = self._get_preferred_ports(initial_port_count)
+                preferred_ports = self._get_preferred_ports(initial_port_count)
                 ssh_port = 22
-                for preferred_port in prefered_ports:
+                for preferred_port in preferred_ports:
+                    if not len(available_ports):
+                        break
+
                     if preferred_port in available_ports:
                         # Exact match: preferred_port available
                         port_mapping = available_ports.pop(preferred_port)

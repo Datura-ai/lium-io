@@ -187,6 +187,12 @@ async def test_generate_portMappings_fallback_to_redis(
             [(22, 20099, 20099)] + [(port, port, port) for port in range(20000, 20050)],
             50,
         ),
+        # case - we have a small amount of ports available, but big initial_port_count
+        (
+            [r for r in range(20000, 20005)],
+            [(22, 20004, 20004)]  + [(port, port, port) for port in range(20000, 20004)],
+            50
+        )
     ],
 )
 @pytest.mark.asyncio
@@ -265,7 +271,7 @@ def test_get_preferred_ports(
     should_have_extra_ports,
     monkeypatch
 ):
-    """Test get_prefered_ports method with various initial_port_count scenarios.
+    """Test get_preferred_ports method with various initial_port_count scenarios.
 
     The method adds 1 to initial_port_count for SSH port and returns:
     - All PREFERRED_POD_PORTS if initial_port_count is None/0
