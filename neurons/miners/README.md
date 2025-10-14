@@ -172,6 +172,18 @@ docker exec -it <docker instance> pdm run /root/app/src/cli.py switch-validator 
 - `<executor-port>`: The port number used for the executor.
 - `<validator-hotkey>`: The validator hotkey you want to switch
 
+### Set/Update Executor Price
+
+Run the following command to set or update the executor price:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py update-executor-price --address <executor public ip> --port <executor external port> --price <executor price>
+```
+
+- `<executor public ip>`: The public IP address of the executor machine.
+- `<executor external port>`: The external port number used for the executor.
+- `<executor price>`: Hourly price of executor in USD
+
 ### Removing an Executor
 
 To remove an executor from the central miner, follow these steps:
