@@ -430,10 +430,7 @@ class CliService:
         try:
             executor = self.executor_dao.findOne(address, port)
             executor_uuid = str(executor.uuid)
-        except Exception as e:
-            self.logger.error("❌ Failed to find executor: %s", str(e))
-            return False
-        try:
+            
             collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
             self.logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
             return True
@@ -517,12 +514,14 @@ class CliService:
                     "uuid": str(executor.uuid),
                     "address": executor.address,
                     "port": executor.port,
-                    "validator": executor.validator
+                    "validator": executor.validator,
+                    "price_per_hour": executor.price_per_hour
                 }
                 for executor in executors
             ]
             for ex in result:
-                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> {ex['validator']}")
+                price_info = f" (Price: {ex['price_per_hour']} USD/hour)" if ex['price_per_hour'] is not None else " (No price set)"
+                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> {ex['validator']}{price_info}")
             return True
         except Exception as e:
             self.logger.error("Failed in showing an executor: %s", str(e))
@@ -538,7 +537,8 @@ class CliService:
         :return: True if successful, False otherwise
         """
         try:
-            self.executor_dao.update(Executor(uuid=uuid.uuid4(), address=address, port=port, validator=validator))
+            payload = {'validator': validator}
+            self.executor_dao.update(address, port, payload)
             self.logger.info(f"✅ Successfully switched validator for executor {address}:{port} to {validator}")
             return True
         except Exception as e:
@@ -559,6 +559,24 @@ class CliService:
             return True
         except Exception as e:
             self.logger.error("Failed in removing an executor: %s", str(e))
+            return False
+
+    @require_executor_dao
+    async def update_executor_price(self, address: str, port: int, price_per_hour: float):
+        """
+        Update the price per hour for an executor by address and port.
+        :param address: Executor IP address
+        :param port: Executor port
+        :param price_per_hour: New price per hour in USD
+        :return: True if successful, False otherwise
+        """
+        try:
+            payload = {'price_per_hour': price_per_hour}
+            self.executor_dao.update(address, port, payload)
+            self.logger.info(f"✅ Successfully updated price for executor {address}:{port} to {price_per_hour} USD/hour")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to update executor price: %s", str(e))
             return False
 
     def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> float:

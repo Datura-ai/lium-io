@@ -283,6 +283,24 @@ def switch_validator(address: str, port: int, validator: str):
 
 
 @cli.command()
+@click.option("--address", prompt="IP Address", help="IP address of executor")
+@click.option("--port", type=int, prompt="Port", help="Port of executor")
+@click.option("--price", type=float, prompt="Price per hour (USD)", help="New price per hour in USD")
+def update_executor_price(address: str, port: int, price: float):
+    """Update the price per hour for an executor in USD"""
+    if price < 0:
+        logger.error("❌ Price cannot be negative.")
+        return
+    
+    cli_service = CliService(with_executor_db=True)
+    success = asyncio.run(cli_service.update_executor_price(address, port, price))
+    if success:
+        logger.info("✅ Successfully updated executor price.")
+    else:
+        logger.error("❌ Failed to update executor price.")
+
+
+@cli.command()
 def get_miner_collateral():
     """Get miner collateral by summing up collateral from all registered executors"""
     
