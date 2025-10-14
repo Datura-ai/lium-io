@@ -141,12 +141,18 @@ Executors are machines running on GPUs that you can add to your central miner. T
 2. Use the following command to add an executor to the central miner:
 
     ```bash
-    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey> --deposit_amount <deposit-amount> --private-key <ethereum-private-key>
+    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey> [--price <price-per-hour>] [--gpu-type <gpu-type>] [--gpu-count <gpu-count>] [--deposit-amount <deposit-amount>] [--private-key <ethereum-private-key>]
     ```
 
+    **Required parameters:**
     - `<executor-ip-address>`: The IP address of the executor machine.
     - `<executor-port>`: The port number used for the executor (default: `8001`).
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. Which validator hotkey should you pick? Follow [this guide](assigning_validator_hotkeys.md).
+
+    **Optional parameters:**
+    - `<price-per-hour>`: Price per hour in USD for the executor.
+    - `<gpu-type>`: Type of GPU available on the executor.
+    - `<gpu-count>`: Number of GPUs available on the executor.
     - `<deposit-amount>`: The amount of TAO to deposit as collateral for this executor (must meet minimum required collateral).
     - `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral transactions).
 
@@ -182,7 +188,7 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py update-execu
 
 - `<executor public ip>`: The public IP address of the executor machine.
 - `<executor external port>`: The external port number used for the executor.
-- `<executor price>`: Hourly price of executor in USD
+- `<executor price>`: Price per hour in USD for the executor.
 
 ### Removing an Executor
 
