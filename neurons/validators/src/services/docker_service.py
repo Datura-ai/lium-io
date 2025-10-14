@@ -105,6 +105,7 @@ class DockerService:
                 ssh_port = 22
                 for preferred_port in preferred_ports:
                     if not len(available_ports):
+                        logger.warning(f"Not enough available ports for executor {executor_id}, {str(preferred_ports)[:300]}")
                         break
 
                     if preferred_port in available_ports:
