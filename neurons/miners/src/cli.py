@@ -228,7 +228,9 @@ def deposit_collateral(address: str, port: int, gpu_type: str, gpu_count: int, p
 def remove_executor(address: str, port: int):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
-        cli_service = CliService(with_executor_db=True)
+        # Use the reusable version selection function
+        selected_version = select_contract_version("Contract Version Selection for Executor Removal")
+        cli_service = CliService(with_executor_db=True, version=selected_version)
         success = asyncio.run(cli_service.remove_executor(address, port))
         if success:
             logger.info(f"✅ Removed executor ({address}:{port})")

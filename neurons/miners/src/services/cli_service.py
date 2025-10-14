@@ -430,7 +430,7 @@ class CliService:
         try:
             executor = self.executor_dao.findOne(address, port)
             executor_uuid = str(executor.uuid)
-            
+
             collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
             self.logger.info("Executor %s collateral: %f TAO from collateral contract", executor_uuid, collateral)
             return True
@@ -554,6 +554,14 @@ class CliService:
         :return: True if successful, False otherwise
         """
         try:
+            executor = self.executor_dao.findOne(address, port)
+            executor_uuid = str(executor.uuid)
+
+            collateral = await self.collateral_contract.get_executor_collateral(executor_uuid)
+            if float(collateral) > 0:
+                self.logger.error("Executor %s has collateral %f TAO, cannot remove", executor_uuid, collateral)
+                return False
+
             self.executor_dao.delete_by_address_port(address, port)
             self.logger.info("Removed an executor(%s:%d)", address, port)
             return True
