@@ -43,6 +43,8 @@ class BaseConsumer(abc.ABC):
                 data: BaseRequest = await self.receive_message()
                 await self.handle_message(data)
         except WebSocketDisconnect as ex:
+            logger.debug("Websocket connection closed, ex: %s", str(ex))
             await self.disconnect()
         except Exception as ex:
+            logger.debug("Handling message error: %s", str(ex))
             await self.disconnect()
