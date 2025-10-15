@@ -144,7 +144,10 @@ def get_balance_of_eth_address(private_key: str):
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 @click.option(
-    "--validator", prompt="Validator Hotkey", help="Validator hotkey that executor opens to."
+    "--validator", required=False, help="Validator hotkey that executor opens to."
+)
+@click.option(
+    "--price", type=float, required=False, help="Price per hour in USD"
 )
 @click.option(
     "--gpu-type", help="Type of GPU", required=False
@@ -159,7 +162,8 @@ def get_balance_of_eth_address(private_key: str):
 def add_executor(
     address: str,
     port: int,
-    validator: str,
+    validator: str | None = None,
+    price: float | None = None,
     gpu_type: str | None = None,
     gpu_count: int | None = None,
     private_key: str | None = None,
@@ -173,7 +177,7 @@ def add_executor(
 
     cli_service = CliService(private_key=private_key, with_executor_db=True)
     success = asyncio.run(
-        cli_service.add_executor(address, port, validator, deposit_amount, gpu_type, gpu_count)
+        cli_service.add_executor(address, port, validator, price, deposit_amount, gpu_type, gpu_count)
     )
     if success:
         logger.info("✅ Added executor and deposited collateral successfully.")
@@ -228,7 +232,9 @@ def deposit_collateral(address: str, port: int, gpu_type: str, gpu_count: int, p
 def remove_executor(address: str, port: int):
     """Remove executor machine to the database"""
     if click.confirm('Are you sure you want to remove this executor? This may lead to unexpected results'):
-        cli_service = CliService(with_executor_db=True)
+        # Use the reusable version selection function
+        selected_version = select_contract_version("Contract Version Selection for Executor Removal")
+        cli_service = CliService(with_executor_db=True, version=selected_version)
         success = asyncio.run(cli_service.remove_executor(address, port))
         if success:
             logger.info(f"✅ Removed executor ({address}:{port})")
@@ -280,6 +286,24 @@ def switch_validator(address: str, port: int, validator: str):
         asyncio.run(cli_service.switch_validator(address, port, validator))
     else:
         logger.info("Cancelled.")
+
+
+@cli.command()
+@click.option("--address", prompt="IP Address", help="IP address of executor")
+@click.option("--port", type=int, prompt="Port", help="Port of executor")
+@click.option("--price", type=float, prompt="Price per hour (USD)", help="New price per hour in USD")
+def update_executor_price(address: str, port: int, price: float):
+    """Update the price per hour for an executor in USD"""
+    if price < 0:
+        logger.error("❌ Price cannot be negative.")
+        return
+    
+    cli_service = CliService(with_executor_db=True)
+    success = asyncio.run(cli_service.update_executor_price(address, port, price))
+    if success:
+        logger.info("✅ Successfully updated executor price.")
+    else:
+        logger.error("❌ Failed to update executor price.")
 
 
 @cli.command()

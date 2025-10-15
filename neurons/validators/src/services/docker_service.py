@@ -74,7 +74,7 @@ class DockerService:
         self.log_task: asyncio.Task | None = None
         self.is_realtime_logging = False
 
-    async def generate_portMappings(self, miner_hotkey: str, executor_id: str, internal_ports: list[int] = None) -> list[tuple[int, int, int]]:
+    async def generate_portMappings(self, miner_hotkey: str, executor_id: str, internal_ports: list[int] = None, initial_port_count: int | None = None) -> list[tuple[int, int, int]]:
         try:
             # Get successful ports from database as dict {external_port: PortMapping}
             available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
@@ -82,12 +82,19 @@ class DockerService:
                 raise Exception(f"Not enough successful ports found in database for executor {executor_id}")
 
             mappings = []
+            ssh_port = 22
 
             if internal_ports:
                 # ============ STRICT MODE: Custom docker ports (must preserve docker port numbers) ============
                 # User explicitly requested specific docker ports - we MUST use them
                 # Strategy: docker_port is fixed, external_port can be any available
+                if ssh_port not in internal_ports:
+                    internal_ports.append(ssh_port)
+
                 for docker_port in internal_ports:
+                    if not len(available_ports):
+                        logger.warning(f"Not enough available ports for executor {executor_id}")
+                        break
                     if docker_port in available_ports:
                         # Exact match: docker_port == external_port
                         port_mapping = available_ports.pop(docker_port)
@@ -100,9 +107,13 @@ class DockerService:
             else:
                 # ============ FLEXIBLE MODE: Preferred ports (can deviate if needed) ============
                 # Using PREFERRED_POD_PORTS as soft preference, not strict requirement
-                # Strategy: prefer exact match, but if unavailable use any port (both docker and external) + SSH port always.
-                ssh_port = 22
-                for preferred_port in PREFERRED_POD_PORTS:
+                # Strategy: prefer exact match, but if unavailable use min port (both docker and external) + SSH port always.
+                preferred_ports = self._get_preferred_ports(initial_port_count)
+                for preferred_port in preferred_ports:
+                    if not len(available_ports):
+                        logger.warning(f"Not enough available ports for executor {executor_id}, {str(preferred_ports)[:300]}")
+                        break
+
                     if preferred_port in available_ports:
                         # Exact match: preferred_port available
                         port_mapping = available_ports.pop(preferred_port)
@@ -115,7 +126,7 @@ class DockerService:
                         port_mapping = available_ports.pop(external_port)
                         mappings.append((preferred_port, port_mapping.internal_port, external_port))
                     else:
-                        # No preferred port available: use any available port for both docker and external
+                        # No preferred port available: use min available port for both docker and external
                         external_port = min(available_ports.keys())
                         port_mapping = available_ports.pop(external_port)
                         mappings.append((external_port, port_mapping.internal_port, external_port))
@@ -128,7 +139,6 @@ class DockerService:
         except Exception as e:
             logger.error(f"Error generating port mappings from database: {e}", exc_info=True)
             return await self.generate_port_mapping_from_redis(executor_id, internal_ports, miner_hotkey)
-
 
     async def generate_port_mapping_from_redis(self, executor_id, internal_ports, miner_hotkey) -> list[Any]:
         try:
@@ -475,7 +485,7 @@ class DockerService:
             # generate port maps
             custom_internal_ports = custom_options.internal_ports if custom_options and custom_options.internal_ports else None
             port_maps = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_internal_ports
+                payload.miner_hotkey, payload.executor_id, custom_internal_ports, custom_options.initial_port_count
             )
 
             # Add profiler for port mappings generation
@@ -1315,3 +1325,26 @@ class DockerService:
                 )
             )
             return False, log_text, log_status
+
+    def _get_preferred_ports(self, initial_port_count: int | None) -> list[int]:
+        """Calculate preferred ports based on initial_port_count.
+
+        - None: return all PREFERRED_POD_PORTS
+        - Less than PREFERRED_POD_PORTS length: return limited list
+        - More than PREFERRED_POD_PORTS length: return PREFERRED_POD_PORTS + sequential extras
+        """
+        if initial_port_count is None:
+            return PREFERRED_POD_PORTS
+
+        # Add SSH port to count
+        port_count = initial_port_count + 1
+
+        if port_count <= len(PREFERRED_POD_PORTS):
+            return PREFERRED_POD_PORTS[:port_count]
+
+        # Need more ports than available in PREFERRED_POD_PORTS
+        max_port = max(PREFERRED_POD_PORTS)
+        extra_count = port_count - len(PREFERRED_POD_PORTS)
+        extra_ports = [max_port + i for i in range(extra_count)]
+
+        return list(PREFERRED_POD_PORTS) + extra_ports
