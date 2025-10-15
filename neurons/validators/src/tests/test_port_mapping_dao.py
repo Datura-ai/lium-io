@@ -5,7 +5,7 @@ import pytest
 
 from daos.port_mapping_dao import PortMappingDao
 from models.port_mapping import PortMapping
-from tests.factories import create_port_mappings_batch
+from .factories import create_port_mappings_batch
 
 
 @pytest.fixture
