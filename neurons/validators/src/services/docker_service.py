@@ -82,12 +82,19 @@ class DockerService:
                 raise Exception(f"Not enough successful ports found in database for executor {executor_id}")
 
             mappings = []
+            ssh_port = 22
 
             if internal_ports:
                 # ============ STRICT MODE: Custom docker ports (must preserve docker port numbers) ============
                 # User explicitly requested specific docker ports - we MUST use them
                 # Strategy: docker_port is fixed, external_port can be any available
+                if ssh_port not in internal_ports:
+                    internal_ports.append(ssh_port)
+
                 for docker_port in internal_ports:
+                    if not len(available_ports):
+                        logger.warning(f"Not enough available ports for executor {executor_id}")
+                        break
                     if docker_port in available_ports:
                         # Exact match: docker_port == external_port
                         port_mapping = available_ports.pop(docker_port)
@@ -102,7 +109,6 @@ class DockerService:
                 # Using PREFERRED_POD_PORTS as soft preference, not strict requirement
                 # Strategy: prefer exact match, but if unavailable use min port (both docker and external) + SSH port always.
                 preferred_ports = self._get_preferred_ports(initial_port_count)
-                ssh_port = 22
                 for preferred_port in preferred_ports:
                     if not len(available_ports):
                         logger.warning(f"Not enough available ports for executor {executor_id}, {str(preferred_ports)[:300]}")
@@ -133,7 +139,6 @@ class DockerService:
         except Exception as e:
             logger.error(f"Error generating port mappings from database: {e}", exc_info=True)
             return await self.generate_port_mapping_from_redis(executor_id, internal_ports, miner_hotkey)
-
 
     async def generate_port_mapping_from_redis(self, executor_id, internal_ports, miner_hotkey) -> list[Any]:
         try:
