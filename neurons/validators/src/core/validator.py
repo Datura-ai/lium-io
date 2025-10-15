@@ -265,6 +265,7 @@ class Validator:
                 try:
                     total_gpu_model_count_map = {}
                     all_job_results = {}
+                    miner_coldkeys = {}
 
                     # Run all jobs with asyncio.wait and set a timeout
                     done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
@@ -276,6 +277,7 @@ class Validator:
                             if result:
                                 miner_hotkey = result.get("miner_hotkey")
                                 job_results: list[JobResult] = result.get("results", [])
+                                miner_coldkey = result.get("miner_coldkey")
 
                                 logger.info(
                                     _m(
@@ -291,6 +293,7 @@ class Validator:
                                 )
 
                                 all_job_results[miner_hotkey] = job_results
+                                miner_coldkeys[miner_hotkey] = miner_coldkey
 
                                 for job_result in job_results:
                                     total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
@@ -365,7 +368,12 @@ class Validator:
                     for miner_hotkey, results in all_job_results.items():
                         for result in results:
                             score = await self.calc_job_score(total_gpu_model_count_map, result)
+                            result.score = score
                             self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+
+                        miner_coldkey = miner_coldkeys.get(miner_hotkey)
+                        if miner_coldkey:
+                            await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
 
                     logger.info(
                         _m(
