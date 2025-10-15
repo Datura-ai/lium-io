@@ -12,7 +12,7 @@ class CustomOptions(BaseModel):
     internal_ports: list[int] | None = None
     startup_commands: str | None = None
     shm_size: str | None = None
-    required_port_count: int | None = None
+    initial_port_count: int | None = None
 
 
 class MinerJobRequestPayload(BaseModel):

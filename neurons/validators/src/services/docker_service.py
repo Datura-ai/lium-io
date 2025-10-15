@@ -480,7 +480,7 @@ class DockerService:
             # generate port maps
             custom_internal_ports = custom_options.internal_ports if custom_options and custom_options.internal_ports else None
             port_maps = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_internal_ports, custom_options.required_port_count
+                payload.miner_hotkey, payload.executor_id, custom_internal_ports, custom_options.initial_port_count
             )
 
             # Add profiler for port mappings generation
