@@ -1,12 +1,15 @@
 import asyncio
 import json
 import os
+
+from daos.port_mapping_dao import PortMappingDao
 from payload_models.payloads import MinerJobRequestPayload
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
+from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
 from services.redis_service import PENDING_PODS_PREFIX, RedisService
@@ -44,21 +47,31 @@ class Validator:
         self.validation_service = ValidationService()
         self.verifyx_validation_service = VerifyXValidationService()
         self.collateral_contract_service = CollateralContractService()
+        self.port_mapping_dao = PortMappingDao()
+        self.executor_connectivity_service = ExecutorConnectivityService(
+            redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao,
+        )
+
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             validation_service=self.validation_service,
             verifyx_validation_service=self.verifyx_validation_service,
             collateral_contract_service=self.collateral_contract_service,
+            executor_connectivity_service=self.executor_connectivity_service,
+            port_mapping_dao=self.port_mapping_dao,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao,
         )
         self.miner_service = MinerService(
             ssh_service=ssh_service,
             task_service=task_service,
             redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao,
         )
 
         # init miner_scores
@@ -102,18 +115,20 @@ class Validator:
         )
 
     async def calc_job_score(self, total_gpu_model_count_map: dict, job_result: JobResult):
+        default_extra = {
+            "executor_id": str(job_result.executor_info.uuid),
+            "job_batch_id": job_result.job_batch_id,
+            "gpu_model": job_result.gpu_model,
+            "gpu_count": job_result.gpu_count,
+            "score": job_result.score,
+            "collateral_deposited": job_result.collateral_deposited,
+            "sysbox_runtime": job_result.sysbox_runtime,
+        }
         if job_result.score == 0:
             logger.info(
                 _m(
                     "Debug: No need to calc score, score is 0",
-                    extra=get_extra_info({
-                        "executor_id": str(job_result.executor_info.uuid),
-                        "job_batch_id": job_result.job_batch_id,
-                        "gpu_model": job_result.gpu_model,
-                        "gpu_count": job_result.gpu_count,
-                        "score": 0,
-                        "sysbox_runtime": job_result.sysbox_runtime,
-                    })
+                    extra=get_extra_info(default_extra)
                 )
             )
             return 0
@@ -124,35 +139,30 @@ class Validator:
             return 0
 
         score_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
-        score = score_portion * job_result.gpu_count / total_gpu_count
+        score = job_result.score * score_portion * job_result.gpu_count / total_gpu_count
+        
+        # calc multiplier
+        multiplier = 1
 
-        # get uptime of the executor
-        uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
-        # if uptime in the subnet is exceed 5 days, then it'll get max score
-        # if uptime is less than 5 days, then it'll get score based on the uptime
-        # give 50% of max still to avoid 0 score all miners at deployment
-        # If sysbox_runtime is true, then the score will be increased by PORTION_FOR_SYSBOX per cent.
-        five_days_in_minutes = 60 * 24 * 5
-        score = score * (settings.PORTION_FOR_UPTIME + min((1 - settings.PORTION_FOR_UPTIME), uptime_in_minutes / five_days_in_minutes))
+        # calc multiplier for sysbox_runtime
+        if not job_result.sysbox_runtime:
+            multiplier = multiplier * (1  - settings.PORTION_FOR_SYSBOX)
 
-        if job_result.sysbox_runtime:
-            score = score * (1 + settings.PORTION_FOR_SYSBOX)
-
+        # calc multiplier for uptime
         if not job_result.collateral_deposited:
-            score = score * IS_NOT_DEPOSITED_SCORE_MULTIPLIER
+            uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
+            multiplier = multiplier * (1 - settings.PORTION_FOR_UPTIME + settings.PORTION_FOR_UPTIME * min(1, uptime_in_minutes / settings.UPTIME_REQUIRED_MINUTES))
+
+        score = score * multiplier
 
         logger.info(
             _m(
                 "Debug: calculating score",
                 extra=get_extra_info({
-                    "executor_id": str(job_result.executor_info.uuid),
-                    "job_batch_id": job_result.job_batch_id,
-                    "gpu_model": job_result.gpu_model,
-                    "total_gpu_count": total_gpu_count,
-                    "gpu_count": job_result.gpu_count,
+                    **default_extra,
                     "score_portion": score_portion,
+                    "multiplier": multiplier,
                     "score": score,
-                    "sysbox_runtime": job_result.sysbox_runtime,
                 })
             )
         )
@@ -255,6 +265,7 @@ class Validator:
                 try:
                     total_gpu_model_count_map = {}
                     all_job_results = {}
+                    miner_coldkeys = {}
 
                     # Run all jobs with asyncio.wait and set a timeout
                     done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
@@ -266,6 +277,7 @@ class Validator:
                             if result:
                                 miner_hotkey = result.get("miner_hotkey")
                                 job_results: list[JobResult] = result.get("results", [])
+                                miner_coldkey = result.get("miner_coldkey")
 
                                 logger.info(
                                     _m(
@@ -281,6 +293,7 @@ class Validator:
                                 )
 
                                 all_job_results[miner_hotkey] = job_results
+                                miner_coldkeys[miner_hotkey] = miner_coldkey
 
                                 for job_result in job_results:
                                     total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
@@ -355,7 +368,12 @@ class Validator:
                     for miner_hotkey, results in all_job_results.items():
                         for result in results:
                             score = await self.calc_job_score(total_gpu_model_count_map, result)
+                            result.score = score
                             self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+
+                        miner_coldkey = miner_coldkeys.get(miner_hotkey)
+                        if miner_coldkey:
+                            await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
 
                     logger.info(
                         _m(

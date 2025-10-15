@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     COLLATERAL_DAYS: int = 7
     ENV: str = Field(env="ENV", default="dev")
 
-    PORTION_FOR_UPTIME: float = 0.05
+    PORTION_FOR_UPTIME: float = 1
+    UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
     PORTION_FOR_SYSBOX: float = 0.2
 
@@ -59,12 +60,11 @@ class Settings(BaseSettings):
 
     BURNERS: list[int] = [4, 206, 207, 208]
 
-    ENABLE_COLLATERAL_CONTRACT: bool = True
-    ENABLE_NEW_INCENTIVE_ALGO: bool = False
+    ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
-        env='COLLATERAL_CONTRACT_ADDRESS', default='0xfB0FEAf1aB5d3788B40F97076ae0104bFbbdC124'
+        env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )
     CONTRACT_VERSIONS: dict = {
         "1.0.2": {

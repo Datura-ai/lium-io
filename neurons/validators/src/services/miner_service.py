@@ -8,6 +8,7 @@ from asyncssh import SSHKey
 import asyncssh
 import bittensor
 from clients.miner_client import MinerClient
+from daos.port_mapping_dao import PortMappingDao
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     DeclineJobRequest,
@@ -61,10 +62,12 @@ class MinerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
+        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.redis_service = redis_service
+        self.port_mapping_dao = port_mapping_dao
 
     async def request_job_to_miner(
         self,
@@ -164,10 +167,9 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
-                    await self.publish_machine_specs(results, miner_client.miner_hotkey, payload.miner_coldkey)
-
                     return {
                         "miner_hotkey": payload.miner_hotkey,
+                        "miner_coldkey": payload.miner_coldkey,
                         "results": [result for result in results if result.gpu_model is not None and result.gpu_count > 0],
                     }
                 elif isinstance(msg, FailedRequest):
@@ -238,6 +240,7 @@ class MinerService:
                         "executor_uuid": result.executor_info.uuid,
                         "executor_ip": result.executor_info.address,
                         "executor_port": result.executor_info.port,
+                        "executor_ssh_port": result.executor_info.ssh_port,
                         "executor_price": result.executor_info.price,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,
@@ -308,6 +311,7 @@ class MinerService:
         docker_service = DockerService(
             ssh_service=self.ssh_service,
             redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao
         )
 
         try:
