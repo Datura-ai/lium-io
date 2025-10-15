@@ -111,7 +111,7 @@ class ValidatorConsumer(BaseConsumer):
                 )
             )
         else:
-            logger.info("Not found any executors for validator(%s)", self.validator_key)
+            logger.debug("Not found any executors for validator(%s)", self.validator_key)
             await self.send_message(DeclineJobRequest())
             await self.disconnect()
 
