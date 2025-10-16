@@ -409,7 +409,7 @@ class ExecutorConnectivityService:
         logger.info(_m(f"cleanup: removed {len(container_names)} containers", extra))
 
     def get_available_port_maps(self, executor_info: ExecutorSSHInfo, batch_size: int = 1000,) -> list[tuple[int, int]]:
-        """Get a list of available port maps for batch verification. with priority for PREFERED_POD_PORTS"""
+        """Get a list of available port maps for batch verification. with priority for PREFERRED_POD_PORTS"""
         if executor_info.port_mappings:
             port_mappings: list[tuple[int, int]] = json.loads(executor_info.port_mappings)
             port_mappings = [

@@ -167,11 +167,10 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(public_key=public_key))
 
-                    await self.publish_machine_specs(results, miner_client.miner_hotkey, payload.miner_coldkey)
-
                     return {
                         "miner_hotkey": payload.miner_hotkey,
-                        "results": [result for result in results if result.gpu_model is not None and result.gpu_count > 0],
+                        "miner_coldkey": payload.miner_coldkey,
+                        "results": results,
                     }
                 elif isinstance(msg, FailedRequest):
                     logger.warning(
