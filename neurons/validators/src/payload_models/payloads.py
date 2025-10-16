@@ -94,6 +94,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     timestamp: int | None = None
     backup_log_id: str | None = None
     restore_path: str | None = None
+    enable_jupyter: bool | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -193,6 +194,8 @@ class ContainerCreated(ContainerBaseResponse):
     profilers: list[dict] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
+    jupyter_port_map: tuple[int, int] | None = None
+    jupyter_token: str | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -235,6 +238,7 @@ class FailedContainerErrorCodes(enum.Enum):
     ExceptionError = "ExceptionError"
     FailedMsgFromMiner = "FailedMsgFromMiner"
     RentingInProgress = "RentingInProgress"
+    NoJupyterPortMapping = "NoJupyterPortMapping"
 
 
 class FailedContainerErrorTypes(enum.Enum):
