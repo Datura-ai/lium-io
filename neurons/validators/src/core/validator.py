@@ -296,7 +296,8 @@ class Validator:
                                 miner_coldkeys[miner_hotkey] = miner_coldkey
 
                                 for job_result in job_results:
-                                    total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
+                                    if job_result.gpu_model and job_result.gpu_count and (job_result.score > 0 or job_result.job_score > 0):
+                                        total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
 
                             else:
                                 info = task_info.get(task, {})
