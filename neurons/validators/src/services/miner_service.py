@@ -41,6 +41,9 @@ from payload_models.payloads import (
     AddDebugSshKeyRequest,
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
+    InstallJupyterServerRequest,
+    JupyterServerInstalled,
+    JupyterInstallationFailed,
 )
 
 from core.config import settings
@@ -499,6 +502,16 @@ class MinerService:
                         return result
                     elif isinstance(payload, RemoveSshPublicKeysRequest):
                         result = await docker_service.remove_ssh_keys(payload, executor, my_key, private_key.decode("utf-8"))
+
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
+                            )
+                        )
+
+                        return result
+                    elif isinstance(payload, InstallJupyterServerRequest):
+                        result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(

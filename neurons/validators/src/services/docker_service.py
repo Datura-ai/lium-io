@@ -29,6 +29,9 @@ from payload_models.payloads import (
     FailedContainerRequest,
     FailedContainerErrorTypes,
     ExternalVolumeInfo,
+    InstallJupyterServerRequest,
+    JupyterServerInstalled,
+    JupyterInstallationFailed,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -241,7 +244,7 @@ class DockerService:
                 )
 
         if not status and raise_exception:
-            raise Exception(f"Failed ${log_text}. command: {command} error: {error}")
+            raise Exception(f"Failed {log_text}. command: {command} error: {error}")
 
         return status, error
 
@@ -468,14 +471,45 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
         jupyter_token: str,
-        jupyter_port: int | None = 8888,
+        jupyter_port: int,
+        log_tag: str,
+        log_extra: dict,
     ):
         command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/tmp/run_jupyter.sh"
-        await ssh_client.run(command)
+        await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Copying run_jupyter.sh to container",
+            log_extra=log_extra,
+            raise_exception=True
+        )
         command = f"/usr/bin/docker exec {container_name} sh -c 'chmod +x /tmp/run_jupyter.sh'"
-        await ssh_client.run(command)
+        await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="chmod +x /tmp/run_jupyter.sh",
+            log_extra=log_extra,
+            raise_exception=True
+        )
         command = f"/usr/bin/docker exec {container_name} sh -c '/tmp/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
-        await ssh_client.run(command)
+        status, error = await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Running jupyter",
+            log_extra=log_extra,
+            raise_exception=False
+        )
+        
+        # Only raise exception for actual errors, not warnings or info messages
+        if not status and error and any(keyword in error for keyword in [
+            "Error:", "ERROR:", "FATAL:", "CRITICAL:", "Traceback", "Exception:",
+            "Permission denied", "Address already in use", "No such file or directory",
+            "Connection refused", "Port already in use", "Failed to start"
+        ]):
+            raise Exception(error)
 
     async def create_container(
         self,
@@ -524,8 +558,9 @@ class DockerService:
         try:
             # generate port maps
             custom_internal_ports = custom_options.internal_ports if custom_options and custom_options.internal_ports else None
+            initial_port_count = custom_options.initial_port_count if custom_options and custom_options.initial_port_count else None
             port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_internal_ports, custom_options.initial_port_count, payload.enable_jupyter
+                payload.miner_hotkey, payload.executor_id, custom_internal_ports, initial_port_count, payload.enable_jupyter
             )
 
             # Add profiler for port mappings generation
@@ -546,7 +581,7 @@ class DockerService:
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
                 )
-            
+
             if payload.enable_jupyter and not jupyter_port_map:
                 log_text = _m(
                     "No Jupyter port mapping found",
@@ -809,7 +844,7 @@ class DockerService:
                     log_tag=log_tag,
                     log_extra=default_extra,
                 )
-                
+
                 jupyter_token = None
                 if payload.enable_jupyter and jupyter_port_map:
                     jupyter_token = secrets.token_hex(16)
@@ -818,6 +853,8 @@ class DockerService:
                         container_name=container_name,
                         jupyter_token=jupyter_token,
                         jupyter_port=jupyter_port_map[0],
+                        log_tag=log_tag,
+                        log_extra=default_extra,
                     )
 
                 # Add profiler for ssh service installation
@@ -1074,6 +1111,82 @@ class DockerService:
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+    async def install_jupyter_server(
+        self,
+        payload: InstallJupyterServerRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_uuid": payload.executor_id,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "executor_ssh_username": executor_info.ssh_username,
+            "executor_ssh_port": executor_info.ssh_port,
+        }
+
+        logger.info(
+            _m(
+                "Install Jupyter server on pod",
+                extra=get_extra_info({**default_extra, "payload": str(payload)}),
+            ),
+        )
+
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
+
+        try:
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client:
+                jupyter_token = secrets.token_hex(16)
+                jupyter_port = payload.jupyter_port_map[0]
+                await self.run_jupyter(
+                    ssh_client=ssh_client,
+                    container_name=payload.container_name,
+                    jupyter_token=jupyter_token,
+                    jupyter_port=jupyter_port,
+                    log_tag="jupyter",
+                    log_extra=default_extra,
+                )
+
+                logger.info(
+                    _m(
+                        "Jupyter server installed",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": payload.container_name,
+                            "jupyter_token": jupyter_token,
+                            "jupyter_port": jupyter_port,
+                        }),
+                    ),
+                )
+
+                return JupyterServerInstalled(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    jupyter_token=jupyter_token,
+                    jupyter_port_map=payload.jupyter_port_map,
+                )
+        except Exception as e:
+            log_text = _m(
+                "Failed install jupyter server",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return JupyterInstallationFailed(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=str(log_text),
             )
 
     async def remove_ssh_keys(

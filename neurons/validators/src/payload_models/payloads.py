@@ -63,6 +63,7 @@ class ContainerRequestType(enum.Enum):
     AddDebugSshKeyRequest = "AddDebugSshKeyRequest"
     BackupContainerRequest = "BackupContainerRequest"
     RestoreContainerRequest = "RestoreContainerRequest"
+    InstallJupyterServer = "InstallJupyterServer"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -123,6 +124,12 @@ class AddDebugSshKeyRequest(ContainerBaseRequest):
     public_key: str
 
 
+class InstallJupyterServerRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.InstallJupyterServer
+    container_name: str
+    jupyter_port_map: tuple[int, int]
+
+
 class ContainerStopRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStopRequest
     container_name: str
@@ -178,6 +185,8 @@ class ContainerResponseType(enum.Enum):
     DebugSshKeyAdded = "DebugSshKeyAdded"
     FailedAddDebugSshKey = "FailedAddDebugSshKey"
     SshPubKeyRemoved = "SshPubKeyRemoved"
+    JupyterServerInstalled = "JupyterServerInstalled"
+    JupyterInstallationFailed = "JupyterInstallationFailed"
 
 
 class ContainerBaseResponse(BaseRequest):
@@ -277,4 +286,15 @@ class FailedGetPodLogs(ContainerBaseResponse):
 
 class FailedAddDebugSshKey(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedAddDebugSshKey
+    msg: str
+
+
+class JupyterServerInstalled(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.JupyterServerInstalled
+    jupyter_token: str
+    jupyter_port_map: tuple[int, int]
+
+
+class JupyterInstallationFailed(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.JupyterInstallationFailed
     msg: str
