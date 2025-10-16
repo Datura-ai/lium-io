@@ -80,6 +80,8 @@ install_base() {
   ok "Base packages installed"
 }
 
+USER_ADDED_TO_DOCKER_GROUP=0
+
 install_docker() {
   if command -v docker >/dev/null 2>&1; then
     ok "Docker already installed: $(docker --version 2>/dev/null | head -n1)"
@@ -118,20 +120,31 @@ install_docker() {
 
   # Add current user to docker group if not root
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    $SUDO usermod -aG docker "${SUDO_USER:-$USER}" || true
-    ok "Added ${SUDO_USER:-$USER} to docker group (relogin needed)"
+    if ! id -nG "${SUDO_USER:-$USER}" | grep -qw docker; then
+      $SUDO usermod -aG docker "${SUDO_USER:-$USER}" || true
+      USER_ADDED_TO_DOCKER_GROUP=1
+      ok "Added ${SUDO_USER:-$USER} to docker group (activating for this session)"
+    fi
   fi
   ok "Docker installed"
 }
 
 verify_docker() {
   log "Verifying Docker daemon"
-  # Try a quick ping to the daemon
-  if ! docker info >/dev/null 2>&1; then
-    die "Docker daemon not reachable. If you were just added to the docker group, re-login and retry. On servers, ensure 'systemctl status docker' is healthy."
+
+  # If user was just added to docker group, use sg to activate it for verification
+  if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
+    if ! sg docker -c "docker info" >/dev/null 2>&1; then
+      die "Docker daemon not reachable. Ensure 'systemctl status docker' is healthy."
+    fi
+    sg docker -c "docker compose version" >/dev/null 2>&1 || die "docker compose plugin not available."
+  else
+    if ! docker info >/dev/null 2>&1; then
+      die "Docker daemon not reachable. Ensure 'systemctl status docker' is healthy."
+    fi
+    docker compose version >/dev/null 2>&1 || die "docker compose plugin not available."
   fi
-  # Check compose v2 is available
-  docker compose version >/dev/null 2>&1 || die "docker compose plugin not available."
+
   ok "Docker daemon reachable & compose available"
 }
 
@@ -149,3 +162,9 @@ verify_docker
 pause_if_needed
 
 ok "All required executor prerequisites are installed (non-interactive)."
+
+# If we added user to docker group, activate it for the current session
+if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
+  log "Activating docker group for current session..."
+  exec sg docker -c "$SHELL"
+fi
