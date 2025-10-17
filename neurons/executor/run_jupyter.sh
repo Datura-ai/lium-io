@@ -150,13 +150,11 @@ install_python_jupyter() {
     if ! command -v python3 >/dev/null 2>&1; then
         echo "Python not found. Installing system packages and Python..."
         install_system_packages
-        install_python_packages
-    elif ! command -v jupyter >/dev/null 2>&1; then
-        echo "Jupyter not found. Installing Python packages..."
-        install_python_packages
     else
-        echo "Python and Jupyter are already installed."
+        echo "Python is already installed."
     fi
+
+    install_python_packages
 }
 
 # Detect available shell for Jupyter terminal
@@ -181,17 +179,41 @@ start_jupyter() {
     shell_cmd=$(detect_shell)
     echo "Using shell: $shell_cmd"
     
-    nohup jupyter lab --allow-root --no-browser --port=$JUPYTER_PORT --ip=0.0.0.0 --FileContentsManager.delete_to_trash=False --ServerApp.terminado_settings="{\"shell_command\":[\"$shell_cmd\"]}" --ServerApp.token=$JUPYTER_PASSWORD --ServerApp.allow_origin=* --ServerApp.preferred_dir=/root --ServerApp.disable_check_xsrf=True --ServerApp.tornado_settings="{\"max_body_size\": 536870912}" &> /jupyter.log &
+    # Start Jupyter lab
+    nohup jupyter lab \
+        --allow-root \
+        --no-browser \
+        --port=$JUPYTER_PORT \
+        --ip=0.0.0.0 \
+        --FileContentsManager.delete_to_trash=False \
+        --ServerApp.terminado_settings="{\"shell_command\":[\"$shell_cmd\"]}" \
+        --IdentityProvider.token=$JUPYTER_PASSWORD \
+        --ServerApp.allow_origin=* \
+        --FileContentsManager.preferred_dir=/root \
+        --ServerApp.disable_check_xsrf=True \
+        --ServerApp.tornado_settings="{\"max_body_size\": 536870912}" \
+        --ServerApp.log_level=ERROR \
+        &> /jupyter.log &
     
-    echo "✅ Jupyter Lab started successfully on port $JUPYTER_PORT"
-    echo "Access Jupyter at: http://localhost:$JUPYTER_PORT"
-    echo "Password: $JUPYTER_PASSWORD"
-    echo ""
-    echo "Available commands:"
-    echo "  - python3"
-    echo "  - jupyter"
-    echo "  - jupyter lab"
-    echo "  - jupyter notebook"
+    # Wait a moment for Jupyter to start
+    sleep 3
+    
+    # Check if Jupyter is actually running and accessible
+    if pgrep -f "jupyter lab" > /dev/null; then
+        echo "✅ Jupyter Lab started successfully on port $JUPYTER_PORT"
+        echo "Access Jupyter at: http://localhost:$JUPYTER_PORT"
+        echo "Password: $JUPYTER_PASSWORD"
+        echo ""
+        echo "Available commands:"
+        echo "  - python3"
+        echo "  - jupyter"
+        echo "  - jupyter lab"
+        echo "  - jupyter notebook"
+    else
+        echo "❌ Failed to start Jupyter Lab"
+        echo "Check logs: cat /jupyter.log"
+        exit 1
+    fi
 }
 
 # Parse command line arguments
