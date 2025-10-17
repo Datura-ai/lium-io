@@ -272,11 +272,12 @@ async def _debug_validator(count: int):
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--docker_image", prompt="Docker Image", help="Docker Image")
-def create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
-    asyncio.run(_create_container_to_miner(miner_hotkey, executor_id, docker_image))
+@click.option("--enable-jupyter", is_flag=True, default=False, help="Enable Jupyter (default: False)")
+def create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, enable_jupyter: bool = False):
+    asyncio.run(_create_container_to_miner(miner_hotkey, executor_id, docker_image, enable_jupyter))
 
 
-async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
+async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, enable_jupyter: bool):
     try:
         subtensor_client = await SubtensorClient.initialize()
         miner = subtensor_client.get_miner(miner_hotkey)
@@ -290,6 +291,7 @@ async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker
             miner_hotkey=miner_hotkey,
             miner_address=miner.axon_info.ip,
             miner_port=miner.axon_info.port,
+            enable_jupyter=enable_jupyter,
         )
         response = await miner_service.handle_container(payload)
         print('response ==>', response)

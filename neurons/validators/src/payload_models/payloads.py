@@ -203,8 +203,7 @@ class ContainerCreated(ContainerBaseResponse):
     profilers: list[dict] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
-    jupyter_port_map: tuple[int, int] | None = None
-    jupyter_token: str | None = None
+    jupyter_url: str | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -291,8 +290,7 @@ class FailedAddDebugSshKey(ContainerBaseResponse):
 
 class JupyterServerInstalled(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.JupyterServerInstalled
-    jupyter_token: str
-    jupyter_port_map: tuple[int, int]
+    jupyter_url: str
 
 
 class JupyterInstallationFailed(ContainerBaseResponse):
