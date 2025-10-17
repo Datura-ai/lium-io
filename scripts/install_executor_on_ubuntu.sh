@@ -1,223 +1,170 @@
-#!/bin/bash
-set -u
+#!/usr/bin/env bash
+# Purpose: Install minimal executor prerequisites on Ubuntu/Debian, 100% non-interactive.
+# Behavior: Fail fast, clear errors, refuse on non-apt systems or when sudo would prompt.
 
-# enable command completion
-set -o history -o histexpand
+set -Eeuo pipefail
 
-abort() {
-  printf "%s\n" "$1"
-  exit 1
-}
+# =============== UX helpers ===============
+RED=$'\e[1;31m'; GRN=$'\e[1;32m'; BLU=$'\e[1;34m'; BLD=$'\e[1m'; RST=$'\e[0m'
+log()   { printf "${BLU}==>${RST} %s\n" "$*"; }
+ok()    { printf "${GRN}✓${RST} %s\n" "$*"; }
+die()   { printf "${RED}✗ %s${RST}\n" "$*" >&2; exit 1; }
 
-getc() {
-  local save_state
-  save_state=$(/bin/stty -g)
-  /bin/stty raw -echo
-  IFS= read -r -n 1 -d '' "$@"
-  /bin/stty "$save_state"
-}
+trap 'die "Failed at: ${BASH_COMMAND}"' ERR
 
-exit_on_error() {
-    exit_code=$1
-    last_command=${@:2}
-    if [ $exit_code -ne 0 ]; then
-        >&2 echo "\"${last_command}\" command failed with exit code ${exit_code}."
-        exit $exit_code
-    fi
-}
-
-shell_join() {
-  local arg
-  printf "%s" "$1"
+CONFIRM=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes) CONFIRM=0 ;;          # legacy no-op (always non-interactive)
+    -c|--confirm) CONFIRM=1 ;;       # require RETURN before actions (opt-in only)
+    *) die "Unknown flag: $1" ;;
+  esac
   shift
-  for arg in "$@"; do
-    printf " "
-    printf "%s" "${arg// /\ }"
-  done
+done
+
+pause_if_needed() {
+  [[ $CONFIRM -eq 1 ]] || return 0
+  read -r -p "Press RETURN to continue or Ctrl+C to abort..." _
 }
 
-# string formatters
-if [[ -t 1 ]]; then
-  tty_escape() { printf "\033[%sm" "$1"; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
+
+# =============== Guards ===============
+require_cmd apt-get
+
+# Must have sudo or be root, and sudo must be passwordless for non-interactive runs
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  require_cmd sudo
+  if ! sudo -n true 2>/dev/null; then
+    die "Passwordless sudo required (or run as root). Aborting to remain non-interactive."
+  fi
+  SUDO="sudo -n"
 else
-  tty_escape() { :; }
+  SUDO=""
 fi
-tty_mkbold() { tty_escape "1;$1"; }
-tty_underline="$(tty_escape "4;39")"
-tty_blue="$(tty_mkbold 34)"
-tty_red="$(tty_mkbold 31)"
-tty_bold="$(tty_mkbold 39)"
-tty_reset="$(tty_escape 0)"
 
-ohai() {
-  printf "${tty_blue}==>${tty_bold} %s${tty_reset}\n" "$(shell_join "$@")"
+# Detect distro info for repo setup
+DISTRO_ID="unknown"; DISTRO_CODENAME=""
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  DISTRO_ID="${ID:-unknown}"
+  DISTRO_CODENAME="${VERSION_CODENAME:-}"
+  UBUNTU_CODENAME="${UBUNTU_CODENAME:-${UBUNTU_CODENAME:-}}"
+  ID_LIKE="${ID_LIKE:-}"
+fi
+log "Detected: ${DISTRO_ID} ${DISTRO_CODENAME:-?}"
+
+export DEBIAN_FRONTEND=noninteractive
+# Auto-accept service restarts during package upgrades
+export NEEDRESTART_MODE=a
+
+APT="$SUDO apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+APT_INSTALL="$APT install --no-install-recommends"
+
+# =============== Steps ===============
+apt_refresh() {
+  log "Refreshing apt metadata (with retries)"
+  local tries=0 max=5
+  until $APT update; do
+    tries=$((tries+1))
+    (( tries >= max )) && die "apt update failed after ${max} attempts"
+    sleep $((2 * tries))
+  done
+  ok "apt updated"
 }
 
-wait_for_user() {
-  local c
-  echo
-  echo "Press RETURN to continue or any other key to abort"
-  getc c
-  # we test for \r and \n because some stuff does \r instead
-  if ! [[ "$c" == $'\r' || "$c" == $'\n' ]]; then
-    exit 1
-  fi
+install_base() {
+  log "Installing base packages"
+  $APT_INSTALL ca-certificates curl git build-essential apt-transport-https gnupg lsb-release software-properties-common
+  ok "Base packages installed"
 }
 
-#install pre
-install_pre() {
-    sudo apt update
-    sudo apt install --no-install-recommends --no-install-suggests -y sudo apt-utils curl git cmake build-essential
-    exit_on_error $?
-}
+USER_ADDED_TO_DOCKER_GROUP=0
 
-# check if python is installed, if not install it
-install_python() {
-    # Check if python3.11 is installed
-    if command -v python3.11 &> /dev/null
-    then
-        # Check the version
-        PYTHON_VERSION=$(python3.11 --version 2>&1)
-        if [[ $PYTHON_VERSION == *"Python 3.11"* ]]; then
-            ohai "Python 3.11 is already installed."
-        else
-            ohai "Linking python to python 3.11"
-            sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
-            python -m pip install cffi
-            python -m pip install cryptography
-        fi
-    else
-        ohai "Installing Python 3.11"
-        add-apt-repository ppa:deadsnakes/ppa
-        sudo apt install python3.11
-        sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
-        python -m pip install cffi
-        python -m pip install cryptography
-    fi
-
-    # check if PDM is installed
-    if command -v pdm &> /dev/null
-    then
-        ohai "PDM is already installed."
-        echo "Checking PDM version..."
-        pdm --version
-    else
-        ohai "Installing PDM..."
-        sudo apt install -y python3.12-venv
-        curl -sSL https://pdm-project.org/install-pdm.py | python3 -
-
-        local bashrc_file="/root/.bashrc"
-        local path_string="export PATH=/root/.local/bin:\$PATH"
-
-        if ! grep -Fxq "$path_string" $bashrc_file; then
-            echo "$path_string" >> $bashrc_file
-            echo "Added $path_string to $bashrc_file"
-        else
-            echo "$path_string already present in $bashrc_file"
-        fi
-
-        export PATH=/root/.local/bin:$PATH
-
-        echo "Checking PDM version..."
-        pdm --version
-    fi
-}
-
-# install redis
-install_redis() {
-    if command -v redis-server &> /dev/null
-    then
-        ohai "Redis is already installed."
-        echo "Checking Redis version..."
-        redis-server --version
-    else
-        ohai "Installing Redis..."
-
-        sudo apt install -y redis-server
-
-        echo "Starting Redis server..."
-        sudo systemctl start redis-server.service
-
-        echo "Checking Redis server status..."
-        sudo systemctl status redis-server.service
-    fi
-}
-
-# install postgresql
-install_postgresql() {
-    if command -v psql &> /dev/null
-    then
-        ohai "PostgreSQL is already installed."
-        echo "Checking PostgreSQL version..."
-        psql --version
-
-        # Check if the database exists
-        DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='compute_subnet_db'")
-        if [ "$DB_EXISTS" == "1" ]; then
-            echo "Database compute_subnet_db already exists."
-        else
-            echo "Creating database compute_subnet_db..."
-            sudo -u postgres createdb compute_subnet_db
-        fi
-    else
-        echo "Installing PostgreSQL..."
-        sudo apt install -y postgresql postgresql-contrib
-
-        echo "Starting PostgreSQL server..."
-        sudo systemctl start postgresql.service
-
-        echo "Setting password for postgres user..."
-        sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'password';"
-
-        echo "Creating database compute_subnet_db..."
-        sudo -u postgres createdb compute_subnet_db
-    fi
-}
-
-# install btcli
-install_btcli() {
-    if command -v btcli &> /dev/null
-    then
-        ohai "BtCLI is already installed."
-    else
-        ohai "Installing BtCLI..."
-
-        sudo apt install -y pipx 
-        pipx install bittensor
-        source ~/.bashrc
-    fi
-}
-
-# install docker
 install_docker() {
-  if command -v docker &> /dev/null; then
-    ohai "Docker is already installed."
-    return 0
-  else
-    ohai "Installing Docker..."
-    sudo apt-get update -y
-    sudo apt-get install -y ca-certificates curl
-    sudo install -m 0755 -d /etc/apt/keyrings
-    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-    sudo chmod a+r /etc/apt/keyrings/docker.asc
-    
-    # Add the repository to Apt sources:
-    echo \
-      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-    sudo apt-get update -y
-    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    sudo groupadd docker
-    sudo usermod -aG docker $USER
-    newgrp docker
+  if command -v docker >/dev/null 2>&1; then
+    ok "Docker already installed: $(docker --version 2>/dev/null | head -n1)"
+    return
   fi
+  log "Installing Docker Engine"
+
+  # Determine repo family and codename
+  local family codename
+  if [[ "$DISTRO_ID" == "ubuntu" || -n "${UBUNTU_CODENAME:-}" ]]; then
+    family="ubuntu"
+    codename="${UBUNTU_CODENAME:-${DISTRO_CODENAME:-$($SUDO lsb_release -cs 2>/dev/null || echo focal)}}"
+  elif [[ "$DISTRO_ID" == "debian" || "$ID_LIKE" == *debian* ]]; then
+    family="debian"
+    codename="${DISTRO_CODENAME:-$($SUDO lsb_release -cs 2>/dev/null || echo bookworm)}"
+  else
+    die "Unsupported or unrecognized Debian/Ubuntu derivative (${DISTRO_ID})."
+  fi
+
+  # Keyring dir
+  $SUDO install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/${family}/gpg" | $SUDO gpg --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+  $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
+
+  # Repo
+  echo "deb [arch=$($SUDO dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${family} ${codename} stable" \
+    | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+
+  apt_refresh
+  $APT install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+  # Ensure daemon enabled/started on systemd hosts
+  if command -v systemctl >/dev/null 2>&1; then
+    $SUDO systemctl enable --now docker || true
+  fi
+
+  # Add current user to docker group if not root
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    if ! id -nG "${SUDO_USER:-$USER}" | grep -qw docker; then
+      $SUDO usermod -aG docker "${SUDO_USER:-$USER}" || true
+      USER_ADDED_TO_DOCKER_GROUP=1
+      ok "Added ${SUDO_USER:-$USER} to docker group (activating for this session)"
+    fi
+  fi
+  ok "Docker installed"
 }
 
-ohai "This script will install:"
-echo "docker"
+verify_docker() {
+  log "Verifying Docker daemon"
 
+  # If user was just added to docker group, use sg to activate it for verification
+  if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
+    if ! sg docker -c "docker info" >/dev/null 2>&1; then
+      die "Docker daemon not reachable. Ensure 'systemctl status docker' is healthy."
+    fi
+    sg docker -c "docker compose version" >/dev/null 2>&1 || die "docker compose plugin not available."
+  else
+    if ! docker info >/dev/null 2>&1; then
+      die "Docker daemon not reachable. Ensure 'systemctl status docker' is healthy."
+    fi
+    docker compose version >/dev/null 2>&1 || die "docker compose plugin not available."
+  fi
 
-wait_for_user
-install_pre
+  ok "Docker daemon reachable & compose available"
+}
+
+# =============== Run ===============
+apt_refresh
+pause_if_needed
+
+install_base
+pause_if_needed
+
 install_docker
+pause_if_needed
+
+verify_docker
+pause_if_needed
+
+ok "All required executor prerequisites are installed (non-interactive)."
+
+# If we added user to docker group, activate it for the current session
+if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
+  log "Activating docker group for current session..."
+  exec sg docker -c "$SHELL"
+fi
