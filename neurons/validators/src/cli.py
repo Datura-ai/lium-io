@@ -22,6 +22,7 @@ from payload_models.payloads import (
     CustomOptions,
     GetPodLogsRequestFromServer,
     AddDebugSshKeyRequest,
+    InstallJupyterServerRequest,
 )
 
 configure_logs_of_other_modules()
@@ -320,6 +321,37 @@ async def _delete_pod(miner_hotkey: str, executor_id: str, container_name: str, 
             executor_id=executor_id,
             container_name=container_name,
             volume_name=volume_name,
+        )
+        response = await miner_service.handle_container(payload)
+        print('response ==>', response)
+    finally:
+        logger.info("Shutting down subtensor client")
+        await SubtensorClient.shutdown()
+
+
+@cli.command()
+@click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
+@click.option("--executor_id", prompt="Executor Id", help="Executor Id")
+@click.option("--container_name", prompt="Container name", help="Container name")
+@click.option("--jupyter_port", type=int, prompt="Jupyter Port", help="Jupyter Port")
+def install_jupyter_server(miner_hotkey: str, executor_id: str, container_name: str, jupyter_port: int):
+    asyncio.run(_install_jupyter_server(miner_hotkey, executor_id, container_name, jupyter_port))
+
+
+async def _install_jupyter_server(miner_hotkey: str, executor_id: str, container_name: str, jupyter_port: int):
+    try:
+        subtensor_client = await SubtensorClient.initialize()
+        miner = subtensor_client.get_miner(miner_hotkey)
+
+        miner_service: MinerService = ioc["MinerService"]
+
+        payload = InstallJupyterServerRequest(
+            miner_hotkey=miner_hotkey,
+            miner_address=miner.axon_info.ip,
+            miner_port=miner.axon_info.port,
+            executor_id=executor_id,
+            container_name=container_name,
+            jupyter_port_map=(jupyter_port, jupyter_port),
         )
         response = await miner_service.handle_container(payload)
         print('response ==>', response)
