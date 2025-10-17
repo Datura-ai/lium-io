@@ -193,12 +193,12 @@ class RedisService:
         else:
             failed += 1
 
-        if failed * 20 >= count:
-            return await self.clear_verified_job_info(
-                miner_hotkey=miner_hotkey,
-                executor_id=executor_id,
-                prev_info=prev_info,
-            )
+        # if failed * 20 >= count:
+        #     return await self.clear_verified_job_info(
+        #         miner_hotkey=miner_hotkey,
+        #         executor_id=executor_id,
+        #         prev_info=prev_info,
+        #     )
 
         data = {
             "count": count,
