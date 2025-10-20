@@ -122,16 +122,25 @@ install_system_packages() {
     python3 --version
 }
 
-# Function to install Python packages with pip
+# Function to install Python packages with pip using virtual environment
 install_python_packages() {
-    echo "Installing Python packages with pip..."
+    echo "Installing Python packages with pip using virtual environment..."
     
-    # Upgrade pip first
-    python3 -m pip install --upgrade pip
+    # Create virtual environment
+    echo "Creating virtual environment at /opt/jupyter-env..."
+    python3 -m venv /opt/jupyter-env
     
-    # Install Jupyter and common packages, ignoring system-installed packages
+    # Activate virtual environment
+    echo "Activating virtual environment..."
+    . /opt/jupyter-env/bin/activate
+    
+    # Upgrade pip in virtual environment
+    echo "Upgrading pip..."
+    pip install --upgrade pip
+    
+    # Install Jupyter and common packages
     echo "Installing Jupyter and Python packages..."
-    python3 -m pip install --ignore-installed \
+    pip install \
         jupyter \
         jupyterlab \
         notebook \
@@ -142,7 +151,7 @@ install_python_packages() {
         requests
 
     echo "Verifying installation..."
-    jupyter --version
+    /opt/jupyter-env/bin/jupyter --version
 }
 
 # Install Python and Jupyter if needed
@@ -179,8 +188,8 @@ start_jupyter() {
     shell_cmd=$(detect_shell)
     echo "Using shell: $shell_cmd"
     
-    # Start Jupyter lab
-    nohup jupyter lab \
+    # Start Jupyter lab using virtual environment
+    nohup /opt/jupyter-env/bin/jupyter lab \
         --allow-root \
         --no-browser \
         --port=$JUPYTER_PORT \
@@ -199,16 +208,16 @@ start_jupyter() {
     sleep 3
     
     # Check if Jupyter is actually running and accessible
-    if pgrep -f "jupyter lab" > /dev/null; then
+    if pgrep -f "jupyter.*lab" > /dev/null || pgrep -f "/opt/jupyter-env/bin/jupyter" > /dev/null; then
         echo "✅ Jupyter Lab started successfully on port $JUPYTER_PORT"
         echo "Access Jupyter at: http://localhost:$JUPYTER_PORT"
         echo "Password: $JUPYTER_PASSWORD"
         echo ""
         echo "Available commands:"
-        echo "  - python3"
-        echo "  - jupyter"
-        echo "  - jupyter lab"
-        echo "  - jupyter notebook"
+        echo "  - /opt/jupyter-env/bin/python3"
+        echo "  - /opt/jupyter-env/bin/jupyter"
+        echo "  - /opt/jupyter-env/bin/jupyter lab"
+        echo "  - /opt/jupyter-env/bin/jupyter notebook"
     else
         echo "❌ Failed to start Jupyter Lab"
         echo "Check logs: cat /jupyter.log"
