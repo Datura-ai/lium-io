@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import uuid
-from typing import Annotated, Union, Any, Optional
+from typing import Annotated, Union, Any, Optional, Callable
 from pydantic import BaseModel, Field
 
 import asyncssh
@@ -231,6 +231,110 @@ class SSHCommandRunner:
 
         # should never reach here, fallback
         raise last_exc or RuntimeError(f"Unknown SSH error for cmd: {cmd}")
+
+class CheckResult(BaseModel):
+    passed: bool
+    event: "ValidationEvent"
+    updates: dict[str, Any] = {}
+
+class Context(BaseModel):
+    executor: ExecutorSSHInfo
+    miner_hotkey: str
+    ssh: asyncssh.SSHClientConnection
+    runner: SSHCommandRunner
+    # dynamic state
+    specs: dict = {}
+    verified: dict = {}
+    settings: dict = {}
+    encrypt_key: Optional[str] = None
+
+class MachineSpecScrapeCheck:
+    check_id = "gpu.scrape.machine_spec"
+    fatal = True
+
+    def __init__(
+        self,
+        *,
+        script_path: str,
+        decrypt_func: Callable[[str, str], str],      # (encrypt_key, ciphertext) -> plaintext
+        deobfuscate_func: Callable[[dict], dict],     # your update_keys wrapper
+        timeout: int = 300,
+    ):
+        self.script_path = script_path
+        self.decrypt = decrypt_func
+        self.deobfuscate = deobfuscate_func
+        self.timeout = timeout
+
+    async def run(self, ctx: Context) -> CheckResult:
+        runner: SSHCommandRunner = ctx.runner
+
+        # Make executable and run in one command
+        res = await runner.run(
+            f"chmod +x {self.script_path} && {self.script_path}",
+            timeout=self.timeout,
+            retryable=False
+        )
+
+        if not res.success or not res.stdout.strip():
+            event = build_msg(
+                event="Machine specs scrape failed",
+                reason="SCRAPE_FAILED",
+                severity="error",
+                category="env",
+                impact="Validation halted — GPU unverified",
+                remediation=(
+                    f"Ensure the scrape script exists and is executable:\n"
+                    f"  chmod +x {self.script_path}\n"
+                    f"Check stderr and environment (Python deps) on the executor."
+                ),
+                what={
+                    "command_id": res.command_id,
+                    "exit_code": res.exit_code,
+                    "duration_ms": res.duration_ms,
+                    "stderr_tail": res.stderr[-400:],
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        # Parse + decrypt first line
+        try:
+            line = res.stdout.splitlines()[0].strip()
+            if not ctx.encrypt_key:
+                raise ValueError("Missing encrypt_key in context")
+
+            decrypted = self.decrypt(ctx.encrypt_key, line)
+            raw = json.loads(decrypted)
+
+            specs = self.deobfuscate(raw)
+
+            event = build_msg(
+                event="Machine specs scraped",
+                reason="SCRAPE_OK",
+                severity="info",
+                category="env",
+                impact="Proceed",
+                what={"gpu_count": specs.get("gpu", {}).get("count", 0)},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=True, event=event, updates={"specs": specs})
+
+        except Exception as e:
+            event = build_msg(
+                event="Machine specs parse/decrypt failed",
+                reason="SCRAPE_PARSE_FAILED",
+                severity="error",
+                category="env",
+                impact="Validation halted — GPU unverified",
+                remediation="Confirm encryption key, payload, and repo versions on both validator and executor.",
+                what={"exception": str(e)[:300], "stdout_head": res.stdout[:200]},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
 
 class TaskService:
     def __init__(
