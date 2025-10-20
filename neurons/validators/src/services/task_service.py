@@ -1,8 +1,10 @@
+import asyncio
+import time
 import json
 import logging
 import random
 import uuid
-from typing import Annotated, Union, Any
+from typing import Annotated, Union, Any, Optional
 from pydantic import BaseModel, Field
 
 import asyncssh
@@ -112,6 +114,123 @@ def build_msg(
         context=ctx or {},
     )
 
+
+class SSHCommandResult(BaseModel):
+    command: str
+    command_id: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    duration_ms: int
+    started_at: datetime
+    finished_at: datetime
+    success: bool
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+
+class SSHCommandRunner:
+    """Safe, observable SSH command runner with metrics and retries."""
+
+    def __init__(self, ssh_client: asyncssh.SSHClientConnection, *, max_retries: int = 1):
+        self.ssh = ssh_client
+        self.max_retries = max_retries
+
+    async def run(
+        self,
+        cmd: str,
+        *,
+        timeout: int = 60,
+        check: bool = False,
+        retryable: bool = True,
+        truncate_output: int = 4000,
+    ) -> SSHCommandResult:
+        """Run a command and capture stdout/stderr safely."""
+        attempt = 0
+        last_exc = None
+
+        while attempt <= self.max_retries:
+            attempt += 1
+            cid = str(uuid.uuid4())
+            start = datetime.now(UTC)
+            t0 = time.perf_counter()
+            try:
+                result = await asyncio.wait_for(self.ssh.run(cmd), timeout=timeout)
+                dt = int((time.perf_counter() - t0) * 1000)
+                stdout = (str(result.stdout) or "")[:truncate_output]
+                stderr = (str(result.stderr) or "")[:truncate_output]
+                exit_code = result.exit_status or 0
+                ok = (exit_code == 0)
+
+                # check flag can raise if needed
+                if check and not ok:
+                    raise RuntimeError(f"Command failed with exit code {exit_code}: {cmd}")
+
+                return SSHCommandResult(
+                    command=cmd,
+                    command_id=cid,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    duration_ms=dt,
+                    started_at=start,
+                    finished_at=datetime.now(UTC),
+                    success=ok,
+                )
+
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                if not retryable or attempt > self.max_retries:
+                    return SSHCommandResult(
+                        command=cmd,
+                        command_id=cid,
+                        exit_code=-1,
+                        stdout="",
+                        stderr="",
+                        duration_ms=int((time.perf_counter() - t0) * 1000),
+                        started_at=start,
+                        finished_at=datetime.now(UTC),
+                        success=False,
+                        error_type="timeout",
+                        error_message=str(e),
+                    )
+                await asyncio.sleep(1.0 * attempt)  # backoff before retry
+
+            except asyncssh.Error as e:
+                last_exc = e
+                if not retryable or attempt > self.max_retries:
+                    return SSHCommandResult(
+                        command=cmd,
+                        command_id=cid,
+                        exit_code=-1,
+                        stdout="",
+                        stderr="",
+                        duration_ms=int((time.perf_counter() - t0) * 1000),
+                        started_at=start,
+                        finished_at=datetime.now(UTC),
+                        success=False,
+                        error_type=e.__class__.__name__,
+                        error_message=str(e),
+                    )
+                await asyncio.sleep(0.5 * attempt)
+
+            except Exception as e:
+                # any other unhandled exceptions
+                return SSHCommandResult(
+                    command=cmd,
+                    command_id=cid,
+                    exit_code=-1,
+                    stdout="",
+                    stderr="",
+                    duration_ms=int((time.perf_counter() - t0) * 1000),
+                    started_at=start,
+                    finished_at=datetime.now(UTC),
+                    success=False,
+                    error_type=e.__class__.__name__,
+                    error_message=str(e),
+                )
+
+        # should never reach here, fallback
+        raise last_exc or RuntimeError(f"Unknown SSH error for cmd: {cmd}")
 
 class TaskService:
     def __init__(
