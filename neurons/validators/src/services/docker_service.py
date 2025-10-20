@@ -504,8 +504,8 @@ class DockerService:
         )
         
         # Only raise exception for actual errors, not warnings or info messages
-        if not status and error and any(keyword in error for keyword in [
-            "Error:", "ERROR:", "FATAL:", "CRITICAL:", "Traceback", "Exception:",
+        if not status and error and any(keyword.lower() in error.lower() for keyword in [
+            "Error", "FATAL", "CRITICAL", "Traceback", "Exception",
             "Permission denied", "Address already in use", "No such file or directory",
             "Connection refused", "Port already in use", "Failed to start"
         ]):
