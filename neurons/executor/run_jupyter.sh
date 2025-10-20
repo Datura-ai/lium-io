@@ -219,8 +219,8 @@ start_jupyter() {
         echo "  - /opt/jupyter-env/bin/jupyter lab"
         echo "  - /opt/jupyter-env/bin/jupyter notebook"
     else
-        echo "❌ Failed to start Jupyter Lab"
-        echo "Check logs: cat /jupyter.log"
+        echo "Error: ❌ Failed to start Jupyter Lab" >&2
+        echo "Check logs: cat /jupyter.log" >&2
         exit 1
     fi
 }
