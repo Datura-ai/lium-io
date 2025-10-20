@@ -327,12 +327,24 @@ class TaskService:
             gpu_memory_utilization = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
             if len(gpu_processes) > 0 and (gpu_utilization >= GPU_UTILIZATION_LIMIT or gpu_memory_utilization > GPU_MEMORY_UTILIZATION_LIMIT):
                 log_text = _m(
-                    "High gpu utilization detected" if not rented else "GPU is using in some other places on the rented machine",
+                    "GPU busy outside validator" if not rented else "Tenant container does not own GPU",
                     extra=get_extra_info({
                         **default_extra,
-                        "gpu_utilization": gpu_utilization,
-                        "gpu_memory_utilization": gpu_memory_utilization,
+                        "reason_code": "GPU_USAGE_HIGH" if not rented else "GPU_USAGE_OUTSIDE_TENANT",
+                        "severity": "warning",
+                        "what_we_saw": {
+                            "gpu_utilization": f"{gpu_utilization}%",
+                            "vram_utilization": f"{gpu_memory_utilization}%",
+                            "process_count": len(gpu_processes),
+                        },
                         "gpu_processes": gpu_processes,
+                        "impact": "Validation skipped; score set to 0" if not rented else "Validation failed; score set to 0",
+                        "remediation": (
+                            "Stop all GPU processes and re-run. If using Docker, ensure no host processes are running: "
+                            "`sudo fuser -v /dev/nvidia*` then kill offending PIDs."
+                        ) if not rented else (
+                            "Terminate host-level GPU workloads (outside the tenant container) and keep GPU usage within the rented container only."
+                        ),
                     }),
                 )
                 return False, log_text
@@ -357,12 +369,12 @@ class TaskService:
 
         if not is_rental_succeed:
             actual_score = 0
-            warning_messages.append("Set score 0 until it's verified by rental check")
+            warning_messages.append("Score set to 0 pending rental verification")
 
         if port_count < MIN_PORT_COUNT and not rented:
             actual_score = 0
             job_score = 0
-            warning_messages.append(f"Set score 0, since port count is less than {MIN_PORT_COUNT}")
+            warning_messages.append(f"Insufficient ports: {port_count} available, {MIN_PORT_COUNT} required")
 
         if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
             return _return_value(actual_score, job_score, warning_messages)
@@ -373,11 +385,11 @@ class TaskService:
             else:
                 actual_score = 0
                 job_score = 0
-                warning_messages.append("Set score 0, since no collateral deposited")
+                warning_messages.append("Collateral required but not deposited")
         elif contract_version and contract_version != settings.get_latest_contract_version() and not settings.ENABLE_NO_COLLATERAL:
             actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
             job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
-            warning_messages.append(f"Set score {SCORE_PORTION_FOR_OLD_CONTRACT}, since contract version is not the latest")
+            warning_messages.append(f"Outdated contract version (current: {contract_version}, latest: {settings.get_latest_contract_version()})")
 
         return _return_value(actual_score, job_score, warning_messages)
 
@@ -533,8 +545,18 @@ class TaskService:
 
                 if gpu_count > MAX_GPU_COUNT:
                     log_text = _m(
-                        f"GPU count({gpu_count}) is greater than the maximum allowed ({MAX_GPU_COUNT}).",
-                        extra=get_extra_info(default_extra),
+                        "GPU count exceeds policy",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "reason_code": "GPU_COUNT_EXCEEDS_MAX",
+                            "severity": "error",
+                            "what_we_saw": {
+                                "count": gpu_count,
+                                "max": MAX_GPU_COUNT,
+                            },
+                            "impact": "Score set to 0",
+                            "remediation": "Reduce visible GPU count (e.g., CUDA_VISIBLE_DEVICES) to policy limit.",
+                        }),
                     )
 
                     return await self._handle_task_result(
@@ -564,17 +586,24 @@ class TaskService:
                     }
                     if gpu_model:
                         extra_info["gpu_model"] = gpu_model
-                        extra_info["help_text"] = (
-                            "If you have the gpu machine and encountering this issue consistently, "
-                            "then please pull the latest version of github repository and follow the installation guide here: "
-                            "https://github.com/Datura-ai/compute-subnet/tree/main/neurons/executor. "
-                            "Also, please configure the nvidia-container-runtime correctly. Check out here: "
-                            "https://stackoverflow.com/questions/72932940/failed-to-initialize-nvml-unknown-error-in-docker-after-few-hours "
-                            "https://bobcares.com/blog/docker-failed-to-initialize-nvml-unknown-error/"
-                        )
+
+                    extra_info["reason_code"] = "GPU_SCRAPE_EMPTY"
+                    extra_info["severity"] = "warning"
+                    extra_info["what_we_saw"] = {
+                        "gpu_count": gpu_count,
+                        "details_len": len(gpu_details),
+                    }
+                    extra_info["impact"] = "Job skipped; score set to 0"
+                    extra_info["remediation"] = (
+                        "1) Ensure `nvidia-smi` works on host. "
+                        "2) Ensure Docker can see GPUs: "
+                        "`docker run --rm --gpus all nvidia/cuda:12.3.2-base-ubuntu22.04 nvidia-smi`. "
+                        "3) Install and configure nvidia-container-toolkit."
+                    )
+                    extra_info["help_uri"] = "https://github.com/NVIDIA/nvidia-container-toolkit"
 
                     log_text = _m(
-                        f"No GPU in list or GPU count({gpu_count}) is 0. No need to run job.",
+                        "No usable GPUs detected",
                         extra=get_extra_info(
                             {
                                 **default_extra,
@@ -598,14 +627,21 @@ class TaskService:
 
                 if nvidia_driver and LIB_NVIDIA_ML_DIGESTS.get(nvidia_driver) != libnvidia_ml:
                     log_text = _m(
-                        "Nvidia driver is altered",
+                        "NVML library digest mismatch",
                         extra=get_extra_info(
                             {
                                 **default_extra,
+                                "reason_code": "NVML_DIGEST_MISMATCH",
+                                "severity": "error",
+                                "what_we_saw": {
+                                    "driver": nvidia_driver,
+                                    "expected_md5": LIB_NVIDIA_ML_DIGESTS.get(nvidia_driver),
+                                    "actual_md5": libnvidia_ml,
+                                },
                                 "gpu_model": gpu_model,
                                 "gpu_count": gpu_count,
-                                "nvidia_driver": nvidia_driver,
-                                "libnvidia_ml": libnvidia_ml,
+                                "impact": "Score set to 0; previous verification cleared",
+                                "remediation": "Reinstall NVIDIA driver for this version, ensure libnvidia-ml matches. Avoid LD_PRELOAD/overrides of NVML.",
                             }
                         ),
                     )
@@ -625,12 +661,18 @@ class TaskService:
 
                 if prev_spec and prev_spec != gpu_model_count:
                     log_text = _m(
-                        "Machine spec is changed",
+                        "GPU inventory changed",
                         extra=get_extra_info(
                             {
                                 **default_extra,
-                                "prev_spec": prev_spec,
-                                "current_spec": gpu_model_count,
+                                "reason_code": "SPEC_CHANGED",
+                                "severity": "warning",
+                                "what_we_saw": {
+                                    "previous": prev_spec,
+                                    "current": gpu_model_count,
+                                },
+                                "impact": "Verification reset; score set to 0",
+                                "remediation": "Keep a stable GPU configuration between checks. If you hot-plugged GPUs or changed MIG, revert or re-verify.",
                             }
                         ),
                     )
@@ -650,12 +692,18 @@ class TaskService:
 
                 if self.check_fingerprints_changed(prev_uuids, gpu_uuids):
                     log_text = _m(
-                        "GPUs are changed",
+                        "GPU fingerprints changed",
                         extra=get_extra_info(
                             {
                                 **default_extra,
-                                "prev_uuids": prev_uuids,
-                                "gpu_uuids": gpu_uuids,
+                                "reason_code": "GPU_UUID_CHANGED",
+                                "severity": "warning",
+                                "what_we_saw": {
+                                    "previous": prev_uuids,
+                                    "current": gpu_uuids,
+                                },
+                                "impact": "Verification reset; score set to 0",
+                                "remediation": "Ensure the same physical GPUs are attached. Power-cycling or different PCIe mapping can change order; ensure stable mapping.",
                             }
                         ),
                     )
@@ -675,12 +723,17 @@ class TaskService:
 
                 if await self.check_banned_guids(gpu_uuids.split(',')):
                     log_text = _m(
-                        "Your GPUs are banned due to low rental-rate in the site.",
+                        "GPU model temporarily ineligible",
                         extra=get_extra_info(
                             {
                                 **default_extra,
-                                "prev_uuids": prev_uuids,
-                                "gpu_uuids": gpu_uuids,
+                                "reason_code": "GPU_BANNED",
+                                "severity": "warning",
+                                "what_we_saw": {
+                                    "gpu_uuids": gpu_uuids,
+                                },
+                                "impact": "Score set to 0; verification cleared",
+                                "remediation": "Use eligible GPUs per current marketplace policy or wait for policy updates.",
                             }
                         ),
                     )
@@ -711,8 +764,18 @@ class TaskService:
                 )
                 if is_duplicated:
                     log_text = _m(
-                        "Executor is duplicated",
-                        extra=get_extra_info(default_extra),
+                        "Duplicate executor registration",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "reason_code": "EXECUTOR_DUPLICATE",
+                            "severity": "warning",
+                            "what_we_saw": {
+                                "executor_uuid": executor_info.uuid,
+                                "hotkey": miner_info.miner_hotkey,
+                            },
+                            "impact": "Score set to 0; verification cleared",
+                            "remediation": "Deregister duplicates or ensure each executor has a unique UUID and host identity.",
+                        }),
                     )
 
                     return await self._handle_task_result(
@@ -743,11 +806,18 @@ class TaskService:
                     )
                     if not is_pod_running:
                         log_text = _m(
-                            "Pod is not running",
+                            "Tenant container not running",
                             extra=get_extra_info(
                                 {
                                     **default_extra,
-                                    "container_name": container_name,
+                                    "reason_code": "POD_NOT_RUNNING",
+                                    "severity": "error",
+                                    "what_we_saw": {
+                                        "container": container_name,
+                                        "status": "not found in `docker ps`",
+                                    },
+                                    "impact": "Score set to 0; verification cleared",
+                                    "remediation": f"Start the container and keep it healthy: `docker start {container_name}`. Investigate container exit logs: `docker logs --tail=200 {container_name}`.",
                                 }
                             ),
                         )
@@ -808,7 +878,6 @@ class TaskService:
                         "available_port_count": port_count,
                     }
 
-                    log_msg = "Executor is already rented."
                     actual_score, job_score, warning_message = self.calc_scores(
                         gpu_model=gpu_model,
                         collateral_deposited=collateral_deposited,
@@ -817,16 +886,21 @@ class TaskService:
                         rented=True,
                     )
 
-                    log_msg += warning_message
-
                     log_text = _m(
-                        log_msg,
+                        "Executor already rented",
                         extra=get_extra_info({
                             **default_extra,
+                            "reason_code": "RENTED",
+                            "severity": "info",
+                            "what_we_saw": {
+                                "contract_version": contract_version,
+                                "collateral": collateral_deposited,
+                            },
+                            "impact": f"Reported rented score={job_score} (actual={actual_score})",
+                            "remediation": f"No action needed.{warning_message}",
                             "actual_score": actual_score,
                             "is_rental_succeed": is_rental_succeed,
                             "job_score": job_score,
-                            "contract_version": contract_version,
                         }),
                     )
 
@@ -935,8 +1009,13 @@ class TaskService:
                             "VerifyX validation failed",
                             extra=get_extra_info({
                                 **default_extra,
-                                "verifyx_success": False,
-                                "verifyx_error_message": error_msg
+                                "reason_code": "VERIFYX_FAILED",
+                                "severity": "error",
+                                "what_we_saw": {
+                                    "errors": error_msg,
+                                },
+                                "impact": "Score set to 0",
+                                "remediation": "Run VerifyX locally to debug. Ensure network, disk and RAM probes pass within timeouts.",
                             })
                         )
                         return await self._handle_task_result(
@@ -964,8 +1043,14 @@ class TaskService:
 
                 if not is_valid:
                     log_text = _m(
-                        "GPU Verification failed",
-                        extra=get_extra_info(default_extra),
+                        "GPU capability verification failed",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "reason_code": "GPU_VERIFY_FAILED",
+                            "severity": "error",
+                            "impact": "Score set to 0",
+                            "remediation": "Run: `docker run --rm --gpus all nvidia/cuda:12.3.2-base-ubuntu22.04 nvidia-smi` and ensure it succeeds; then retry validation.",
+                        }),
                     )
                     return await self._handle_task_result(
                         miner_info=miner_info,
@@ -990,7 +1075,6 @@ class TaskService:
                     "available_port_count": port_count,
                 }
 
-                log_msg = "Train task is finished."
                 actual_score, job_score, warning_message = self.calc_scores(
                     gpu_model=gpu_model,
                     collateral_deposited=collateral_deposited,
@@ -999,23 +1083,28 @@ class TaskService:
                     rented=False,
                     port_count=port_count,
                 )
-                log_msg += warning_message
 
                 success = True if actual_score > 0 else False
 
                 log_text = _m(
-                    log_msg,
+                    "Validation task completed",
                     extra=get_extra_info(
                         {
                             **default_extra,
+                            "reason_code": "VALIDATION_COMPLETED",
+                            "severity": "info" if success else "warning",
+                            "what_we_saw": {
+                                "gpu_model": gpu_model,
+                                "gpu_count": gpu_count,
+                                "contract_version": contract_version,
+                            },
+                            "impact": f"Job score={job_score}, actual score={actual_score}",
+                            "remediation": f"No action needed.{warning_message}" if success else f"Address issues:{warning_message}",
                             "job_score": job_score,
                             "actual_score": actual_score,
-                            "gpu_model": gpu_model,
-                            "gpu_count": gpu_count,
                             "is_rental_succeed": is_rental_succeed,
                             "unrented_multiplier": UNRENTED_MULTIPLIER,
                             "sysbox_runtime": sysbox_runtime,
-                            "contract_version": contract_version,
                         }
                     ),
                 )
@@ -1045,8 +1134,17 @@ class TaskService:
         except Exception as e:
             log_status = "error"
             log_text = _m(
-                "Error creating task for executor",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                "Task orchestration error",
+                extra=get_extra_info({
+                    **default_extra,
+                    "reason_code": "TASK_ERROR",
+                    "severity": "error",
+                    "what_we_saw": {
+                        "exception": str(e)[:200],
+                    },
+                    "impact": "Score set to 0",
+                    "remediation": "Check SSH connectivity, file paths, and executor logs. Retry after fixing environment.",
+                }),
             )
 
             try:
@@ -1109,11 +1207,30 @@ class TaskService:
             actual_errors = [error for error in errors if "warning" not in error.lower()]
 
             if len(results) == 0 and len(actual_errors) > 0:
-                logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "errors": actual_errors})))
+                logger.error(_m("Remote command failed", extra=get_extra_info({
+                    **default_extra,
+                    "reason_code": "COMMAND_EXEC_ERROR",
+                    "severity": "error",
+                    "what_we_saw": {
+                        "stderr_lines": len(actual_errors),
+                    },
+                    "errors": actual_errors,
+                    "impact": "Task aborted",
+                    "remediation": "Re-run the command via SSH to inspect stderr. Ensure file is executable: `chmod +x <file>`.",
+                })))
                 return None, str(actual_errors)
 
             if len(results) == 0:
-                logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "error": "No results"})))
+                logger.error(_m("Remote command failed", extra=get_extra_info({
+                    **default_extra,
+                    "reason_code": "COMMAND_EXEC_ERROR",
+                    "severity": "error",
+                    "what_we_saw": {
+                        "result": "No output",
+                    },
+                    "impact": "Task aborted",
+                    "remediation": "Re-run the command via SSH to inspect output. Ensure file is executable: `chmod +x <file>`.",
+                })))
                 return None, "No results"
 
             return results, None
