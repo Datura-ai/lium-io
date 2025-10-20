@@ -291,6 +291,12 @@ class MinerService:
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=error_code,
             )
+        elif isinstance(payload, InstallJupyterServerRequest):
+            return JupyterInstallationFailed(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=msg,
+            )
         else:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -570,9 +576,7 @@ class MinerService:
             log_text = _m(
                 "Resulted in an exception",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
-                exc_info=True,
             )
-
             return self._handle_container_error(
                 payload=payload,
                 msg=str(log_text),
