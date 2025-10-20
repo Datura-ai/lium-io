@@ -340,10 +340,9 @@ class TaskService:
                         "gpu_processes": gpu_processes,
                         "impact": "Validation skipped; score set to 0" if not rented else "Validation failed; score set to 0",
                         "remediation": (
-                            "Stop all GPU processes and re-run. If using Docker, ensure no host processes are running: "
-                            "`sudo fuser -v /dev/nvidia*` then kill offending PIDs."
+                            "Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running."
                         ) if not rented else (
-                            "Terminate host-level GPU workloads (outside the tenant container) and keep GPU usage within the rented container only."
+                            "Terminate host-level GPU processes, make sure nvidia-smi doesn't show any running processes."
                         ),
                     }),
                 )
@@ -806,7 +805,7 @@ class TaskService:
                     )
                     if not is_pod_running:
                         log_text = _m(
-                            "Tenant container not running",
+                            "Pod not running",
                             extra=get_extra_info(
                                 {
                                     **default_extra,
@@ -1215,8 +1214,7 @@ class TaskService:
                         "stderr_lines": len(actual_errors),
                     },
                     "errors": actual_errors,
-                    "impact": "Task aborted",
-                    "remediation": "Re-run the command via SSH to inspect stderr. Ensure file is executable: `chmod +x <file>`.",
+                    "impact": "Task aborted"
                 })))
                 return None, str(actual_errors)
 
@@ -1229,7 +1227,6 @@ class TaskService:
                         "result": "No output",
                     },
                     "impact": "Task aborted",
-                    "remediation": "Re-run the command via SSH to inspect output. Ensure file is executable: `chmod +x <file>`.",
                 })))
                 return None, "No results"
 
