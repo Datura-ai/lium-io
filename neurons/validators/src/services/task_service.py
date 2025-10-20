@@ -1009,7 +1009,7 @@ class TaskService:
                         {
                             **default_extra,
                             "job_score": job_score,
-                            "acutal_score": actual_score,
+                            "actual_score": actual_score,
                             "gpu_model": gpu_model,
                             "gpu_count": gpu_count,
                             "is_rental_succeed": is_rental_succeed,
@@ -1106,7 +1106,7 @@ class TaskService:
             results = result.stdout.splitlines()
             errors = result.stderr.splitlines()
 
-            actual_errors = [error for error in errors if "warnning" not in error.lower()]
+            actual_errors = [error for error in errors if "warning" not in error.lower()]
 
             if len(results) == 0 and len(actual_errors) > 0:
                 logger.error(_m("Failed to execute command!", extra=get_extra_info({**default_extra, "errors": actual_errors})))
