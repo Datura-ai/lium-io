@@ -443,6 +443,10 @@ class DockerService:
         command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
         await ssh_client.run(command)
 
+        # set allow_other option
+        command = f'/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
+        await ssh_client.run(command)
+
         # enable volume plugin
         command = f"/usr/bin/docker plugin enable s3fs"
         await ssh_client.run(command)
