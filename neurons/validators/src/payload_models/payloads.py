@@ -128,6 +128,8 @@ class InstallJupyterServerRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.InstallJupyterServer
     container_name: str
     jupyter_port_map: tuple[int, int]
+    local_volume: str | None = None
+    local_volume_path: str = "/root"
 
 
 class ContainerStopRequest(ContainerBaseRequest):
