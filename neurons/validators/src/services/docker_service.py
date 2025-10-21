@@ -479,16 +479,7 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
     ):
-        command = f"/usr/bin/docker exec {container_name} sh -c 'mkdir -p /tmp'"
-        await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text="Creating /tmp directory",
-            log_extra=log_extra,
-            raise_exception=True
-        )
-        command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/tmp/run_jupyter.sh"
+        command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/root/run_jupyter.sh"
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
@@ -497,16 +488,16 @@ class DockerService:
             log_extra=log_extra,
             raise_exception=True
         )
-        command = f"/usr/bin/docker exec {container_name} sh -c 'chmod +x /tmp/run_jupyter.sh'"
+        command = f"/usr/bin/docker exec {container_name} sh -c 'chmod +x /root/run_jupyter.sh'"
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
             log_tag=log_tag,
-            log_text="chmod +x /tmp/run_jupyter.sh",
+            log_text="chmod +x /root/run_jupyter.sh",
             log_extra=log_extra,
             raise_exception=True
         )
-        command = f"/usr/bin/docker exec {container_name} sh -c '/tmp/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+        command = f"/usr/bin/docker exec {container_name} sh -c '/root/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
         status, error = await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
