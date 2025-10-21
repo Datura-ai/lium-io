@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import uuid
-from typing import Annotated, Union, Any, Optional, Callable
+from typing import Annotated, Union, Any, Optional, Callable, Protocol, List, Tuple
 from pydantic import BaseModel, Field
 
 import asyncssh
@@ -238,6 +238,7 @@ class CheckResult(BaseModel):
     updates: dict[str, Any] = {}
 
 class Context(BaseModel):
+    model_config = {"frozen": True, "arbitrary_types_allowed": True}
     executor: ExecutorSSHInfo
     miner_hotkey: str
     ssh: asyncssh.SSHClientConnection
@@ -247,6 +248,180 @@ class Context(BaseModel):
     verified: dict = {}
     settings: dict = {}
     encrypt_key: Optional[str] = None
+    remote_dir: Optional[str] = None
+
+class Check(Protocol):
+    check_id: str
+    fatal: bool
+    async def run(self, ctx: Context) -> CheckResult: ...
+
+class EventSink(Protocol):
+    async def emit(self, event: "ValidationEvent") -> None: ...
+
+class LoggerSink:
+    def __init__(self, logger):
+        self.logger = logger
+    async def emit(self, event):
+        level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
+        # use your _m wrapper to preserve existing log format
+        getattr(self.logger, level)(_m(event.event, extra=event.model_dump(mode="json")))
+
+class Pipeline:
+    def __init__(self, checks: List[Check], sink: EventSink):
+        self.checks = checks
+        self.sink = sink
+
+    async def run(self, ctx: Context) -> Tuple[bool, list["ValidationEvent"], Context]:
+        events: list["ValidationEvent"] = []
+        current_ctx = ctx
+
+        for chk in self.checks:
+            res = await chk.run(current_ctx)
+
+            await self.sink.emit(res.event)
+            events.append(res.event)
+
+            if res.updates:
+                current_ctx = current_ctx.model_copy(update=res.updates)
+
+            if not res.passed and getattr(chk, "fatal", False):
+                return False, events, current_ctx
+
+        return True, events, current_ctx
+
+class StartGPUMonitorCheck:
+    check_id = "prep.start_gpu_monitor"
+    fatal = False  # Non-fatal - continue even if it fails
+
+    def __init__(
+        self,
+        *,
+        script_path: str,
+        command_args: dict,
+        executor_info: ExecutorSSHInfo,
+    ):
+        self.script_path = script_path
+        self.command_args = command_args
+        self.executor_info = executor_info
+
+    async def run(self, ctx: Context) -> CheckResult:
+        runner = ctx.runner
+
+        # Check if already running
+        check_cmd = f'ps aux | grep "python.*{self.script_path}" | grep -v grep'
+        check_res = await runner.run(check_cmd, timeout=10, retryable=False)
+
+        if check_res.stdout.strip():
+            # Already running
+            event = build_msg(
+                event="GPU monitor already running",
+                reason="MONITOR_RUNNING",
+                severity="info",
+                category="prep",
+                impact="Proceed",
+                what={"script_path": self.script_path},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=True, event=event)
+
+        # Install dependencies
+        deps_res = await runner.run(
+            "pip install aiohttp click pynvml psutil",
+            timeout=30,
+            retryable=True
+        )
+
+        # Start monitor in background
+        args_string = " ".join([f"--{k} {v}" for k, v in self.command_args.items()])
+        start_cmd = f"nohup {self.executor_info.python_path} {self.script_path} {args_string} > /dev/null 2>&1 &"
+        start_res = await runner.run(start_cmd, timeout=50, retryable=False)
+
+        if start_res.success:
+            event = build_msg(
+                event="GPU monitor started",
+                reason="MONITOR_STARTED",
+                severity="info",
+                category="prep",
+                impact="Proceed with monitoring enabled",
+                what={
+                    "script_path": self.script_path,
+                    "command_id": start_res.command_id,
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=True, event=event)
+        else:
+            event = build_msg(
+                event="Failed to start GPU monitor",
+                reason="MONITOR_START_FAILED",
+                severity="warning",
+                category="prep",
+                impact="Validation continues without real-time GPU monitoring",
+                remediation="Check Python installation and script permissions on executor",
+                what={
+                    "exit_code": start_res.exit_code,
+                    "stderr": start_res.stderr[-400:],
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+class UploadFilesCheck:
+    check_id = "prep.upload_validation_files"
+    fatal = True
+
+    def __init__(
+        self,
+        *,
+        local_dir: str,
+        executor_root: str,
+        generate_random_name: Callable[[], str],
+    ):
+        self.local_dir = local_dir
+        self.executor_root = executor_root
+        self.generate_random_name = generate_random_name
+
+    async def run(self, ctx: Context) -> CheckResult:
+        # Generate random remote directory
+        random_name = self.generate_random_name()
+        remote_dir = f"{self.executor_root}/{random_name}"
+
+        try:
+            # Upload via SSH SFTP
+            async with ctx.ssh.start_sftp_client() as sftp:
+                await sftp.put(self.local_dir, remote_dir, recurse=True)
+
+            event = build_msg(
+                event="Validation files uploaded",
+                reason="UPLOAD_OK",
+                severity="info",
+                category="prep",
+                impact="Proceed to validation",
+                what={"remote_dir": remote_dir, "local_dir": self.local_dir},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={"remote_dir": remote_dir}
+            )
+        except Exception as e:
+            event = build_msg(
+                event="Failed to upload validation files",
+                reason="UPLOAD_FAILED",
+                severity="error",
+                category="prep",
+                impact="Validation halted",
+                remediation="Check network connectivity, disk space on executor, and SSH permissions",
+                what={"error": str(e)[:200]},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
 
 class MachineSpecScrapeCheck:
     check_id = "gpu.scrape.machine_spec"
@@ -255,12 +430,12 @@ class MachineSpecScrapeCheck:
     def __init__(
         self,
         *,
-        script_path: str,
+        script_filename: str,
         decrypt_func: Callable[[str, str], str],      # (encrypt_key, ciphertext) -> plaintext
         deobfuscate_func: Callable[[dict], dict],     # your update_keys wrapper
         timeout: int = 300,
     ):
-        self.script_path = script_path
+        self.script_filename = script_filename
         self.decrypt = decrypt_func
         self.deobfuscate = deobfuscate_func
         self.timeout = timeout
@@ -268,9 +443,25 @@ class MachineSpecScrapeCheck:
     async def run(self, ctx: Context) -> CheckResult:
         runner: SSHCommandRunner = ctx.runner
 
+        # Check that remote_dir is set
+        if not ctx.remote_dir:
+            event = build_msg(
+                event="Remote directory not set",
+                reason="MISSING_REMOTE_DIR",
+                severity="error",
+                category="prep",
+                impact="Cannot locate scrape script",
+                remediation="Internal error - UploadFilesCheck must run before MachineSpecScrapeCheck",
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        script_path = f"{ctx.remote_dir}/{self.script_filename}"
+
         # Make executable and run in one command
         res = await runner.run(
-            f"chmod +x {self.script_path} && {self.script_path}",
+            f"chmod +x {script_path} && {script_path}",
             timeout=self.timeout,
             retryable=False
         )
@@ -284,7 +475,7 @@ class MachineSpecScrapeCheck:
                 impact="Validation halted — GPU unverified",
                 remediation=(
                     f"Ensure the scrape script exists and is executable:\n"
-                    f"  chmod +x {self.script_path}\n"
+                    f"  chmod +x {script_path}\n"
                     f"Check stderr and environment (Python deps) on the executor."
                 ),
                 what={
@@ -669,7 +860,7 @@ class TaskService:
 
         return _return_value(actual_score, job_score, warning_messages)
 
-    async def create_task(
+    async def create_task_old(
         self,
         miner_info: MinerJobRequestPayload,
         executor_info: ExecutorSSHInfo,
@@ -1446,6 +1637,154 @@ class TaskService:
                 job_batch_id=miner_info.job_batch_id,
                 log_status=log_status,
                 log_text=str(log_text),
+                gpu_model=None,
+                gpu_count=0,
+                sysbox_runtime=False,
+            )
+
+    async def create_task(
+        self,
+        miner_info: MinerJobRequestPayload,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+        public_key: str,
+        encrypted_files: MinerJobEnryptedFiles,
+    ):
+        """New pipeline-based validation task implementation."""
+        try:
+            # Decrypt private key
+            private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+
+            async with InteractiveShellService(
+                host=executor_info.address,
+                username=executor_info.ssh_username,
+                private_key=private_key,
+                port=executor_info.ssh_port,
+            ) as shell:
+
+                runner = SSHCommandRunner(shell.ssh_client, max_retries=1)
+
+                def _decrypt(enc_key: str, ciphertext: str) -> str:
+                    return self.ssh_service.decrypt_payload(enc_key, ciphertext)
+
+                def _deobfuscate(spec: dict) -> dict:
+                    all_keys = encrypted_files.all_keys
+                    reverse_all_keys = {v: k for k, v in all_keys.items()}
+                    s1 = self.update_keys(spec, reverse_all_keys)
+                    s2 = self.update_keys(s1, ORIGINAL_KEYS)
+                    return s2
+
+                base_ctx = Context(
+                    executor=executor_info,
+                    miner_hotkey=miner_info.miner_hotkey,
+                    ssh=shell.ssh_client,
+                    runner=runner,
+                    specs={},
+                    verified=await self.redis_service.get_verified_job_info(executor_info.uuid),
+                    settings={"version": settings.VERSION},
+                    encrypt_key=encrypted_files.encrypt_key,
+                )
+
+                # Generate command args for GPU monitor
+                program_id = str(uuid.uuid4())
+                command_args = {
+                    "program_id": program_id,
+                    "signature": f"0x{keypair.sign(program_id.encode()).hex()}",
+                    "executor_id": executor_info.uuid,
+                    "validator_hotkey": keypair.ss58_address,
+                    "compute_rest_app_url": settings.COMPUTE_REST_API_URL,
+                }
+
+                gpu_monitor = StartGPUMonitorCheck(
+                    script_path=f"{executor_info.root_dir}/src/gpus_utility.py",
+                    command_args=command_args,
+                    executor_info=executor_info,
+                )
+
+                upload = UploadFilesCheck(
+                    local_dir=encrypted_files.tmp_directory,
+                    executor_root=executor_info.root_dir,
+                    generate_random_name=lambda: self.ssh_service.generate_random_string(
+                        length=random.randint(5, 15), string_only=True
+                    ),
+                )
+
+                scrape = MachineSpecScrapeCheck(
+                    script_filename=encrypted_files.machine_scrape_file_name,
+                    decrypt_func=_decrypt,
+                    deobfuscate_func=_deobfuscate,
+                    timeout=JOB_LENGTH,
+                )
+
+                # Run pipeline
+                ok, events, last_context = await Pipeline(
+                    [gpu_monitor, upload, scrape],
+                    sink=LoggerSink(logger)
+                ).run(base_ctx)
+
+                if not ok:
+                    # Fatal check failed - return failure
+                    last_event = events[-1]
+                    return JobResult(
+                        spec=last_context.specs,
+                        executor_info=executor_info,
+                        score=0,
+                        job_score=0,
+                        collateral_deposited=False,
+                        job_batch_id=miner_info.job_batch_id,
+                        log_status="error",
+                        log_text=_m(last_event.event, extra=last_event.model_dump()),
+                        gpu_model=None,
+                        gpu_count=0,
+                        sysbox_runtime=False,
+                    )
+
+                # Success - return with scraped specs
+                gpu_model = None
+                gpu_count = 0
+                if last_context.specs.get("gpu", {}).get("count", 0) > 0:
+                    details = last_context.specs["gpu"].get("details", [])
+                    if len(details) > 0:
+                        gpu_model = details[0].get("name", None)
+                        gpu_count = last_context.specs["gpu"].get("count", 0)
+
+                return JobResult(
+                    spec=last_context.specs,
+                    executor_info=executor_info,
+                    score=1.0,  # Placeholder - will add scoring checks later
+                    job_score=1.0,
+                    collateral_deposited=False,
+                    job_batch_id=miner_info.job_batch_id,
+                    log_status="info",
+                    log_text="Pipeline validation completed",
+                    gpu_model=gpu_model,
+                    gpu_count=gpu_count,
+                    sysbox_runtime=False,
+                )
+
+        except Exception as e:
+            logger.error(
+                _m(
+                    "Pipeline validation error",
+                    extra=get_extra_info({
+                        "job_batch_id": miner_info.job_batch_id,
+                        "miner_hotkey": miner_info.miner_hotkey,
+                        "executor_uuid": executor_info.uuid,
+                        "error": str(e),
+                    })
+                ),
+                exc_info=True,
+            )
+            return JobResult(
+                spec=None,
+                executor_info=executor_info,
+                score=0,
+                job_score=0,
+                collateral_deposited=False,
+                job_batch_id=miner_info.job_batch_id,
+                log_status="error",
+                log_text=str(e),
                 gpu_model=None,
                 gpu_count=0,
                 sysbox_runtime=False,
