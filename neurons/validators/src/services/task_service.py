@@ -526,6 +526,194 @@ class MachineSpecScrapeCheck:
             )
             return CheckResult(passed=False, event=event)
 
+class GpuCountCheck:
+    check_id = "gpu.validate.count"
+    fatal = True
+
+    def __init__(self, *, max_gpu_count: int):
+        self.max_gpu_count = max_gpu_count
+
+    async def run(self, ctx: Context) -> CheckResult:
+        gpu_count = ctx.specs.get("gpu", {}).get("count", 0)
+
+        if gpu_count > self.max_gpu_count:
+            event = build_msg(
+                event="GPU count exceeds policy",
+                reason="GPU_COUNT_EXCEEDS_MAX",
+                severity="error",
+                category="policy",
+                impact="Score set to 0",
+                remediation=f"Reduce visible GPU count to {self.max_gpu_count} or less (e.g., use CUDA_VISIBLE_DEVICES environment variable)",
+                what={
+                    "count": gpu_count,
+                    "max_allowed": self.max_gpu_count,
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        # Success
+        event = build_msg(
+            event="GPU count within limits",
+            reason="GPU_COUNT_OK",
+            severity="info",
+            category="policy",
+            impact="Proceed",
+            what={"count": gpu_count, "max_allowed": self.max_gpu_count},
+            check_id=self.check_id,
+            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+        )
+        return CheckResult(passed=True, event=event)
+
+class GpuModelValidCheck:
+    check_id = "gpu.validate.model"
+    fatal = True
+
+    def __init__(self, *, gpu_model_rates: dict):
+        self.gpu_model_rates = gpu_model_rates
+
+    async def run(self, ctx: Context) -> CheckResult:
+        gpu_count = ctx.specs.get("gpu", {}).get("count", 0)
+        gpu_details = ctx.specs.get("gpu", {}).get("details", [])
+
+        gpu_model = None
+        if gpu_count > 0 and len(gpu_details) > 0:
+            gpu_model = gpu_details[0].get("name", None)
+
+        # Check if GPU model is supported
+        if not self.gpu_model_rates.get(gpu_model):
+            supported_models = list(self.gpu_model_rates.keys())
+            event = build_msg(
+                event="GPU model not supported",
+                reason="GPU_MODEL_UNSUPPORTED",
+                severity="warning",
+                category="policy",
+                impact="Job skipped; score set to 0",
+                remediation=f"Use a supported GPU model. Supported models: {', '.join(supported_models[:5])}{'...' if len(supported_models) > 5 else ''}",
+                what={
+                    "gpu_model": gpu_model,
+                    "gpu_count": gpu_count,
+                    "supported_models": supported_models,
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        # Check if GPU count is valid
+        if gpu_count == 0:
+            event = build_msg(
+                event="No GPUs detected",
+                reason="GPU_COUNT_ZERO",
+                severity="warning",
+                category="env",
+                impact="Job skipped; score set to 0",
+                remediation="Ensure GPUs are properly installed and visible to the system",
+                what={"gpu_count": gpu_count},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        # Check if GPU details match count
+        if len(gpu_details) != gpu_count:
+            event = build_msg(
+                event="GPU count mismatch",
+                reason="GPU_DETAILS_MISMATCH",
+                severity="warning",
+                category="env",
+                impact="Job skipped; score set to 0",
+                remediation="GPU count and details length don't match. Check GPU detection",
+                what={
+                    "gpu_count": gpu_count,
+                    "details_len": len(gpu_details),
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        # Success
+        event = build_msg(
+            event="GPU model validated",
+            reason="GPU_MODEL_OK",
+            severity="info",
+            category="env",
+            impact="Proceed",
+            what={
+                "gpu_model": gpu_model,
+                "gpu_count": gpu_count,
+            },
+            check_id=self.check_id,
+            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+        )
+        return CheckResult(passed=True, event=event)
+
+class CollateralCheck:
+    check_id = "gpu.validate.collateral"
+
+    def __init__(self, *, collateral_service, enable_no_collateral: bool):
+        self.collateral_service = collateral_service
+        self.fatal = not enable_no_collateral  # Fatal if collateral is required
+
+    async def run(self, ctx: Context) -> CheckResult:
+        gpu_count = ctx.specs.get("gpu", {}).get("count", 0)
+        gpu_details = ctx.specs.get("gpu", {}).get("details", [])
+        gpu_model = gpu_details[0].get("name") if gpu_details else None
+
+        # Call collateral service
+        collateral_deposited, error_message, contract_version = await self.collateral_service.is_eligible_executor(
+            miner_hotkey=ctx.miner_hotkey,
+            executor_uuid=ctx.executor.uuid,
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+        )
+
+        # Build event
+        if collateral_deposited:
+            event = build_msg(
+                event="Collateral verified",
+                reason="COLLATERAL_OK",
+                severity="info",
+                category="policy",
+                impact="Proceed",
+                what={
+                    "collateral_deposited": True,
+                    "contract_version": contract_version,
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+        else:
+            event = build_msg(
+                event="No collateral deposited",
+                reason="COLLATERAL_MISSING",
+                severity="warning",
+                category="policy",
+                impact="Score may be reduced or set to 0 based on policy",
+                remediation=f"Deposit collateral for this executor. Error: {error_message}" if error_message else "Deposit collateral for this executor",
+                what={
+                    "collateral_deposited": False,
+                    "error_message": error_message,
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+
+        # Update context with collateral info
+        # Pass if collateral deposited OR if no collateral is enabled
+        passed = collateral_deposited or not self.fatal
+
+        return CheckResult(
+            passed=passed,
+            event=event,
+            updates={
+                "collateral_deposited": collateral_deposited,
+                "contract_version": contract_version,
+            }
+        )
+
 
 class TaskService:
     def __init__(
@@ -1717,9 +1905,22 @@ class TaskService:
                     timeout=JOB_LENGTH,
                 )
 
+                gpu_count_check = GpuCountCheck(
+                    max_gpu_count=MAX_GPU_COUNT,
+                )
+
+                gpu_model_check = GpuModelValidCheck(
+                    gpu_model_rates=GPU_MODEL_RATES,
+                )
+
+                collateral_check = CollateralCheck(
+                    collateral_service=self.collateral_contract_service,
+                    enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
+                )
+
                 # Run pipeline
                 ok, events, last_context = await Pipeline(
-                    [gpu_monitor, upload, scrape],
+                    [gpu_monitor, upload, scrape, gpu_count_check, gpu_model_check, collateral_check],
                     sink=LoggerSink(logger)
                 ).run(base_ctx)
 
