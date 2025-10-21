@@ -479,6 +479,15 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
     ):
+        command = f"/usr/bin/docker exec {container_name} sh -c 'mkdir -p /tmp'"
+        await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Creating /tmp directory",
+            log_extra=log_extra,
+            raise_exception=True
+        )
         command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/tmp/run_jupyter.sh"
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
