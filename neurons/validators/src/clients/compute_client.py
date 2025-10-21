@@ -35,6 +35,9 @@ from payload_models.payloads import (
     AddDebugSshKeyRequest,
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
+    InstallJupyterServerRequest,
+    JupyterServerInstalled,
+    JupyterInstallationFailed,
 )
 from protocol.vc_protocol.compute_requests import (
     Error,
@@ -592,6 +595,7 @@ class ComputeClient:
         | AddDebugSshKeyRequest
         | BackupContainerRequest
         | RestoreContainerRequest
+        | InstallJupyterServerRequest
     ):
         """drive a miner client from job start to completion, then close miner connection"""
         logger.info(
@@ -745,6 +749,15 @@ class ComputeClient:
             response: (
                 DebugSshKeyAdded | FailedAddDebugSshKey
             ) = await self.miner_service.add_debug_ssh_key(job_request)
+
+            async with self.lock:
+                self.message_queue.append(response)
+        elif isinstance(job_request, InstallJupyterServerRequest):
+            job_request.miner_address = miner_axon_info.ip
+            job_request.miner_port = miner_axon_info.port
+            response: (
+                JupyterServerInstalled | JupyterInstallationFailed
+            ) = await self.miner_service.handle_container(job_request)
 
             async with self.lock:
                 self.message_queue.append(response)
