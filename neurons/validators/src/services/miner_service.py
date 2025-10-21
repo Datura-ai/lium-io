@@ -41,6 +41,9 @@ from payload_models.payloads import (
     AddDebugSshKeyRequest,
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
+    InstallJupyterServerRequest,
+    JupyterServerInstalled,
+    JupyterInstallationFailed,
 )
 
 from core.config import settings
@@ -288,6 +291,12 @@ class MinerService:
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=error_code,
             )
+        elif isinstance(payload, InstallJupyterServerRequest):
+            return JupyterInstallationFailed(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=msg,
+            )
         else:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -507,6 +516,16 @@ class MinerService:
                         )
 
                         return result
+                    elif isinstance(payload, InstallJupyterServerRequest):
+                        result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
+
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
+                            )
+                        )
+
+                        return result
                     elif isinstance(payload, BackupContainerRequest):
                         return await self.handle_backup_container_req(executor, payload, ssh_pkey)
                     elif isinstance(payload, RestoreContainerRequest):
@@ -557,9 +576,7 @@ class MinerService:
             log_text = _m(
                 "Resulted in an exception",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
-                exc_info=True,
             )
-
             return self._handle_container_error(
                 payload=payload,
                 msg=str(log_text),
