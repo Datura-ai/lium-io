@@ -478,35 +478,90 @@ class DockerService:
         jupyter_port: int,
         log_tag: str,
         log_extra: dict,
+        local_volume: str | None = None,
+        local_volume_path: str = '/root',
     ):
-        command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/root/run_jupyter.sh"
-        await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text="Copying run_jupyter.sh to container",
-            log_extra=log_extra,
-            raise_exception=True
-        )
-        command = f"/usr/bin/docker exec {container_name} sh -c 'chmod +x /root/run_jupyter.sh'"
-        await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text="chmod +x /root/run_jupyter.sh",
-            log_extra=log_extra,
-            raise_exception=True
-        )
-        command = f"/usr/bin/docker exec {container_name} sh -c '/root/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
-        status, error = await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text="Running jupyter",
-            log_extra=log_extra,
-            raise_exception=False
-        )
-        
+        if local_volume:
+            temp_container_name = f"temp_jupyter_copy_{uuid4()}"
+            try:
+                command = (
+                    f"/usr/bin/docker run -d --rm -v {local_volume}:/mnt "
+                    f"--name {temp_container_name} --entrypoint sh "
+                    f"daturaai/compute-subnet-executor:latest -c 'cp /root/app/run_jupyter.sh /mnt/'"
+                )
+                await self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=command,
+                    log_tag=log_tag,
+                    log_text="Creating temporary container for script copy",
+                    log_extra=log_extra,
+                    raise_exception=True,
+                )
+            finally:
+                command = f"/usr/bin/docker rm -f {temp_container_name}"
+                await self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=command,
+                    log_tag=log_tag,
+                    log_text="Removing temporary container",
+                    log_extra=log_extra,
+                    raise_exception=False,
+                )
+
+            command = (
+                f"/usr/bin/docker exec {container_name} "
+                f"sh -c 'chmod +x {local_volume_path}/run_jupyter.sh'"
+            )
+            await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Making run_jupyter.sh executable",
+                log_extra=log_extra,
+                raise_exception=True,
+            )
+
+            command = (
+                f"/usr/bin/docker exec {container_name} sh -c "
+                f"'{local_volume_path}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+            )
+            status, error = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Running jupyter from volume",
+                log_extra=log_extra,
+                raise_exception=False,
+            )
+        else:
+            command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/root/run_jupyter.sh"
+            await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Copying run_jupyter.sh to container",
+                log_extra=log_extra,
+                raise_exception=True
+            )
+            command = f"/usr/bin/docker exec {container_name} sh -c 'chmod +x /root/run_jupyter.sh'"
+            await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="chmod +x /root/run_jupyter.sh",
+                log_extra=log_extra,
+                raise_exception=True
+            )
+            command = f"/usr/bin/docker exec {container_name} sh -c '/root/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+            status, error = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Running jupyter",
+                log_extra=log_extra,
+                raise_exception=False
+            )
+
         # Only raise exception for actual errors, not warnings or info messages
         if not status and error and any(keyword.lower() in error.lower() for keyword in [
             "Error", "FATAL", "CRITICAL", "Traceback", "Exception",
@@ -864,6 +919,8 @@ class DockerService:
                         jupyter_port=jupyter_port_map[0],
                         log_tag=log_tag,
                         log_extra=default_extra,
+                        local_volume=local_volume,
+                        local_volume_path=local_volume_path,
                     )
                     jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
@@ -1158,6 +1215,8 @@ class DockerService:
             ) as ssh_client:
                 jupyter_token = secrets.token_hex(16)
                 jupyter_port = payload.jupyter_port_map[0]
+                local_volume = payload.local_volume
+                local_volume_path = payload.local_volume_path
                 await self.run_jupyter(
                     ssh_client=ssh_client,
                     container_name=payload.container_name,
@@ -1165,6 +1224,8 @@ class DockerService:
                     jupyter_port=jupyter_port,
                     log_tag="jupyter",
                     log_extra=default_extra,
+                    local_volume=local_volume,
+                    local_volume_path=local_volume_path,
                 )
 
                 logger.info(
