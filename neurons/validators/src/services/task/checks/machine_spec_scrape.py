@@ -77,17 +77,35 @@ class MachineSpecScrapeCheck:
             raw = json.loads(decrypted)
             specs = self.deobfuscate(raw)
 
+            gpu_info = specs.get("gpu", {}) or {}
+            gpu_count = gpu_info.get("count", 0) or 0
+            gpu_details = gpu_info.get("details", []) or []
+            gpu_model = None
+            if gpu_count > 0 and gpu_details:
+                gpu_model = gpu_details[0].get("name")
+
+            gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
+            gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
+
             event = build_msg(
                 event="Machine specs scraped",
                 reason="SCRAPE_OK",
                 severity="info",
                 category="env",
                 impact="Proceed",
-                what={"gpu_count": specs.get("gpu", {}).get("count", 0)},
+                what={
+                    "gpu_count": gpu_count,
+                    "gpu_model": gpu_model,
+                },
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
-            return CheckResult(passed=True, event=event, updates={"specs": specs})
+            updates = {"specs": specs}
+            if gpu_model_count:
+                updates["gpu_model_count"] = gpu_model_count
+            if gpu_uuids:
+                updates["gpu_uuids"] = gpu_uuids
+            return CheckResult(passed=True, event=event, updates=updates)
 
         except Exception as exc:
             event = build_msg(

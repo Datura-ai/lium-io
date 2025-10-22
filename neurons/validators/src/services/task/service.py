@@ -42,9 +42,12 @@ from services.file_encrypt_service import ORIGINAL_KEYS
 from .checks import (
     CollateralCheck,
     GpuCountCheck,
+    GpuFingerprintCheck,
     GpuModelValidCheck,
     MachineSpecScrapeCheck,
+    NvmlDigestCheck,
     StartGPUMonitorCheck,
+    SpecChangeCheck,
     UploadFilesCheck,
 )
 from .models import JobResult
@@ -1254,6 +1257,16 @@ class TaskService:
                     gpu_model_rates=GPU_MODEL_RATES,
                 )
 
+                nvml_digest_check = NvmlDigestCheck(
+                    digest_map=LIB_NVIDIA_ML_DIGESTS,
+                )
+
+                spec_change_check = SpecChangeCheck()
+
+                fingerprint_check = GpuFingerprintCheck(
+                    fingerprint_checker=self.check_fingerprints_changed,
+                )
+
                 collateral_check = CollateralCheck(
                     collateral_service=self.collateral_contract_service,
                     enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
@@ -1261,7 +1274,17 @@ class TaskService:
 
                 # Run pipeline
                 ok, events, last_context = await Pipeline(
-                    [gpu_monitor, upload, scrape, gpu_count_check, gpu_model_check, collateral_check],
+                    [
+                        gpu_monitor,
+                        upload,
+                        scrape,
+                        gpu_count_check,
+                        gpu_model_check,
+                        nvml_digest_check,
+                        spec_change_check,
+                        fingerprint_check,
+                        collateral_check,
+                    ],
                     sink=LoggerSink(logger)
                 ).run(base_ctx)
 

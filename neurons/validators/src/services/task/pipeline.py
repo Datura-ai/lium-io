@@ -27,6 +27,9 @@ class Context(BaseModel):
     settings: dict = {}
     encrypt_key: str | None = None
     remote_dir: str | None = None
+    gpu_model_count: str | None = None
+    gpu_uuids: str | None = None
+    clear_verified_job_info: bool = False
 
 
 class Check(Protocol):
