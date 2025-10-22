@@ -40,15 +40,25 @@ from services.collateral_contract_service import CollateralContractService
 from services.file_encrypt_service import ORIGINAL_KEYS
 
 from .checks import (
+    BannedGpuCheck,
+    CapabilityCheck,
     CollateralCheck,
+    DuplicateExecutorCheck,
+    FinalizeCheck,
     GpuCountCheck,
     GpuFingerprintCheck,
     GpuModelValidCheck,
+    GpuUsageCheck,
     MachineSpecScrapeCheck,
     NvmlDigestCheck,
+    PortConnectivityCheck,
+    PortCountCheck,
+    RentedMachineCheck,
+    ScoreCheck,
     StartGPUMonitorCheck,
     SpecChangeCheck,
     UploadFilesCheck,
+    VerifyXCheck,
 )
 from .models import JobResult
 from .pipeline import Context, LoggerSink, Pipeline
@@ -1207,15 +1217,36 @@ class TaskService:
                     s2 = self.update_keys(s1, ORIGINAL_KEYS)
                     return s2
 
+                verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
+
+                default_extra = {
+                    "job_batch_id": miner_info.job_batch_id,
+                    "miner_hotkey": miner_info.miner_hotkey,
+                    "executor_uuid": executor_info.uuid,
+                    "executor_ip_address": executor_info.address,
+                    "executor_port": executor_info.port,
+                    "executor_ssh_username": executor_info.ssh_username,
+                    "executor_ssh_port": executor_info.ssh_port,
+                    "version": settings.VERSION,
+                    "rented": False,
+                    "renting_in_progress": False,
+                }
+
+                is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
+                    RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
+                )
+
                 base_ctx = Context(
                     executor=executor_info,
                     miner_hotkey=miner_info.miner_hotkey,
                     ssh=shell.ssh_client,
                     runner=runner,
                     specs={},
-                    verified=await self.redis_service.get_verified_job_info(executor_info.uuid),
+                    verified=verified_job_info,
                     settings={"version": settings.VERSION},
                     encrypt_key=encrypted_files.encrypt_key,
+                    default_extra=default_extra,
+                    is_rental_succeed=is_rental_succeed,
                 )
 
                 # Generate command args for GPU monitor
@@ -1257,9 +1288,7 @@ class TaskService:
                     gpu_model_rates=GPU_MODEL_RATES,
                 )
 
-                nvml_digest_check = NvmlDigestCheck(
-                    digest_map=LIB_NVIDIA_ML_DIGESTS,
-                )
+                nvml_digest_check = NvmlDigestCheck(digest_map=LIB_NVIDIA_ML_DIGESTS)
 
                 spec_change_check = SpecChangeCheck()
 
@@ -1267,10 +1296,86 @@ class TaskService:
                     fingerprint_checker=self.check_fingerprints_changed,
                 )
 
+                banned_gpu_check = BannedGpuCheck(
+                    banned_checker=self.check_banned_guids,
+                )
+
+                async def _duplicate_checker(miner_hotkey: str, executor_uuid: str) -> bool:
+                    return await self.redis_service.is_elem_exists_in_set(
+                        DUPLICATED_MACHINE_SET,
+                        f"{miner_hotkey}:{executor_uuid}",
+                    )
+
+                duplicate_executor_check = DuplicateExecutorCheck(
+                    duplicate_checker=_duplicate_checker,
+                )
+
                 collateral_check = CollateralCheck(
                     collateral_service=self.collateral_contract_service,
                     enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
                 )
+
+                async def _fetch_rented_machine() -> dict | None:
+                    return await self.redis_service.get_rented_machine(executor_info)
+
+                rented_machine_check = RentedMachineCheck(
+                    rented_machine_fetcher=_fetch_rented_machine,
+                    pod_checker=self.check_pod_running,
+                    gpu_usage_checker=self.check_gpu_usage,
+                    port_counter=self.get_available_port_count,
+                    score_calculator=self.calc_scores,
+                )
+
+                gpu_usage_check = GpuUsageCheck(
+                    gpu_usage_checker=self.check_gpu_usage,
+                    rented=False,
+                )
+
+                async def _renting_checker(miner_hotkey: str, executor_uuid: str) -> bool:
+                    return await self.redis_service.renting_in_progress(miner_hotkey, executor_uuid)
+
+                port_connectivity_check = PortConnectivityCheck(
+                    renting_checker=_renting_checker,
+                    verifier=self.executor_connectivity_service.verify_ports,
+                    private_key=private_key,
+                    public_key=public_key,
+                    job_batch_id=miner_info.job_batch_id,
+                )
+
+                async def _run_verifyx(context: Context):
+                    return await self.verifyx_validation_service.validate_verifyx_and_process_job(
+                        shell=shell,
+                        executor_info=executor_info,
+                        default_extra=context.default_extra,
+                        machine_spec=context.specs,
+                    )
+
+                verifyx_check = VerifyXCheck(
+                    verifyx_runner=_run_verifyx,
+                    enabled=settings.ENABLE_VERIFYX,
+                )
+
+                async def _run_capability(context: Context) -> bool:
+                    return await self.validation_service.validate_gpu_model_and_process_job(
+                        ssh_client=context.ssh,
+                        executor_info=executor_info,
+                        default_extra=context.default_extra,
+                        machine_spec=context.specs,
+                    )
+
+                capability_check = CapabilityCheck(
+                    capability_runner=_run_capability,
+                )
+
+                port_count_check = PortCountCheck(
+                    port_counter=self.get_available_port_count,
+                )
+
+                score_check = ScoreCheck(
+                    score_calculator=self.calc_scores,
+                )
+
+                finalize_check = FinalizeCheck()
 
                 # Run pipeline
                 ok, events, last_context = await Pipeline(
@@ -1283,49 +1388,68 @@ class TaskService:
                         nvml_digest_check,
                         spec_change_check,
                         fingerprint_check,
+                        banned_gpu_check,
+                        duplicate_executor_check,
                         collateral_check,
+                        rented_machine_check,
+                        gpu_usage_check,
+                        port_connectivity_check,
+                        verifyx_check,
+                        capability_check,
+                        port_count_check,
+                        score_check,
+                        finalize_check,
                     ],
                     sink=LoggerSink(logger)
                 ).run(base_ctx)
 
+                def _resolve_reason(reason_value: str | None) -> ResetVerifiedJobReason:
+                    if not reason_value:
+                        return ResetVerifiedJobReason.DEFAULT
+                    try:
+                        return ResetVerifiedJobReason(reason_value)
+                    except ValueError:
+                        return ResetVerifiedJobReason.DEFAULT
+
                 if not ok:
-                    # Fatal check failed - return failure
                     last_event = events[-1]
-                    return JobResult(
-                        spec=last_context.specs,
+                    log_struct = _m(last_event.event, extra=last_event.model_dump())
+                    return await self._handle_task_result(
+                        miner_info=miner_info,
                         executor_info=executor_info,
-                        score=0,
-                        job_score=0,
-                        collateral_deposited=False,
-                        job_batch_id=miner_info.job_batch_id,
-                        log_status="error",
-                        log_text=_m(last_event.event, extra=last_event.model_dump()),
-                        gpu_model=None,
-                        gpu_count=0,
-                        sysbox_runtime=False,
+                        spec=last_context.specs or None,
+                        score=last_context.score,
+                        job_score=last_context.job_score,
+                        collateral_deposited=last_context.collateral_deposited,
+                        log_text=log_struct,
+                        verified_job_info=verified_job_info,
+                        success=False,
+                        clear_verified_job_info=last_context.clear_verified_job_info,
+                        gpu_model_count=last_context.gpu_model_count or "",
+                        gpu_uuids=last_context.gpu_uuids or "",
+                        sysbox_runtime=last_context.sysbox_runtime,
+                        ssh_pub_keys=last_context.ssh_pub_keys,
+                        clear_verified_job_reason=_resolve_reason(last_context.clear_verified_job_reason),
                     )
 
-                # Success - return with scraped specs
-                gpu_model = None
-                gpu_count = 0
-                if last_context.specs.get("gpu", {}).get("count", 0) > 0:
-                    details = last_context.specs["gpu"].get("details", [])
-                    if len(details) > 0:
-                        gpu_model = details[0].get("name", None)
-                        gpu_count = last_context.specs["gpu"].get("count", 0)
+                log_text = last_context.log_text or "Pipeline validation completed"
 
-                return JobResult(
-                    spec=last_context.specs,
+                return await self._handle_task_result(
+                    miner_info=miner_info,
                     executor_info=executor_info,
-                    score=1.0,  # Placeholder - will add scoring checks later
-                    job_score=1.0,
-                    collateral_deposited=False,
-                    job_batch_id=miner_info.job_batch_id,
-                    log_status="info",
-                    log_text="Pipeline validation completed",
-                    gpu_model=gpu_model,
-                    gpu_count=gpu_count,
-                    sysbox_runtime=False,
+                    spec=last_context.specs or None,
+                    score=last_context.score,
+                    job_score=last_context.job_score,
+                    collateral_deposited=last_context.collateral_deposited,
+                    log_text=log_text,
+                    verified_job_info=verified_job_info,
+                    success=last_context.success,
+                    clear_verified_job_info=last_context.clear_verified_job_info,
+                    gpu_model_count=last_context.gpu_model_count or "",
+                    gpu_uuids=last_context.gpu_uuids or "",
+                    sysbox_runtime=last_context.sysbox_runtime,
+                    ssh_pub_keys=last_context.ssh_pub_keys,
+                    clear_verified_job_reason=_resolve_reason(last_context.clear_verified_job_reason),
                 )
 
         except Exception as e:

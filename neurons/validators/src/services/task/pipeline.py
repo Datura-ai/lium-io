@@ -14,6 +14,7 @@ class CheckResult(BaseModel):
     passed: bool
     event: ValidationEvent
     updates: dict[str, Any] = {}
+    halt: bool = False
 
 
 class Context(BaseModel):
@@ -27,6 +28,29 @@ class Context(BaseModel):
     settings: dict = {}
     encrypt_key: str | None = None
     remote_dir: str | None = None
+    default_extra: dict[str, Any] = {}
+    gpu_model_count: str | None = None
+    gpu_uuids: str | None = None
+    clear_verified_job_info: bool = False
+    clear_verified_job_reason: str | None = None
+    gpu_model: str | None = None
+    gpu_count: int = 0
+    gpu_details: list[dict] = []
+    gpu_processes: list[dict] = []
+    sysbox_runtime: bool = False
+    collateral_deposited: bool = False
+    contract_version: str | None = None
+    is_rental_succeed: bool = False
+    rented: bool = False
+    renting_in_progress: bool = False
+    ssh_pub_keys: list[str] | None = None
+    port_count: int = 0
+    score: float = 0.0
+    job_score: float = 0.0
+    score_warning: str | None = None
+    log_status: str = "info"
+    log_text: str | None = None
+    success: bool = False
     gpu_model_count: str | None = None
     gpu_uuids: str | None = None
     clear_verified_job_info: bool = False
@@ -72,5 +96,8 @@ class Pipeline:
 
             if not res.passed and getattr(chk, "fatal", False):
                 return False, events, current_ctx
+
+            if res.halt:
+                return True, events, current_ctx
 
         return True, events, current_ctx

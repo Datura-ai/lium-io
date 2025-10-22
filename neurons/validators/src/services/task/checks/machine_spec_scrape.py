@@ -100,7 +100,14 @@ class MachineSpecScrapeCheck:
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
-            updates = {"specs": specs}
+            updates = {
+                "specs": specs,
+                "gpu_model": gpu_model,
+                "gpu_count": gpu_count,
+                "gpu_details": gpu_details,
+                "gpu_processes": specs.get("gpu_processes", []) or [],
+                "sysbox_runtime": specs.get("sysbox_runtime", False) or False,
+            }
             if gpu_model_count:
                 updates["gpu_model_count"] = gpu_model_count
             if gpu_uuids:
