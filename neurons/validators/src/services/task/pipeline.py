@@ -1,0 +1,73 @@
+import logging
+from typing import Any, List, Protocol, Tuple
+
+import asyncssh
+from pydantic import BaseModel
+
+from datura.requests.miner_requests import ExecutorSSHInfo
+
+from core.utils import _m
+from .models import ValidationEvent
+
+
+class CheckResult(BaseModel):
+    passed: bool
+    event: ValidationEvent
+    updates: dict[str, Any] = {}
+
+
+class Context(BaseModel):
+    model_config = {"frozen": True, "arbitrary_types_allowed": True}
+    executor: ExecutorSSHInfo
+    miner_hotkey: str
+    ssh: asyncssh.SSHClientConnection
+    runner: Any
+    specs: dict = {}
+    verified: dict = {}
+    settings: dict = {}
+    encrypt_key: str | None = None
+    remote_dir: str | None = None
+
+
+class Check(Protocol):
+    check_id: str
+    fatal: bool
+
+    async def run(self, ctx: Context) -> CheckResult: ...
+
+
+class EventSink(Protocol):
+    async def emit(self, event: ValidationEvent) -> None: ...
+
+
+class LoggerSink:
+    def __init__(self, logger_: logging.Logger):
+        self.logger = logger_
+
+    async def emit(self, event: ValidationEvent) -> None:
+        level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
+        getattr(self.logger, level)(_m(event.event, extra=event.model_dump(mode="json")))
+
+
+class Pipeline:
+    def __init__(self, checks: List[Check], sink: EventSink):
+        self.checks = checks
+        self.sink = sink
+
+    async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        events: list[ValidationEvent] = []
+        current_ctx = ctx
+
+        for chk in self.checks:
+            res = await chk.run(current_ctx)
+
+            await self.sink.emit(res.event)
+            events.append(res.event)
+
+            if res.updates:
+                current_ctx = current_ctx.model_copy(update=res.updates)
+
+            if not res.passed and getattr(chk, "fatal", False):
+                return False, events, current_ctx
+
+        return True, events, current_ctx
