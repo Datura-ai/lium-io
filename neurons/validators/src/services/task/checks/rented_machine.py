@@ -10,6 +10,13 @@ from ..pipeline import CheckResult, Context
 
 
 class RentedMachineCheck:
+    """Handle the specialised flow when the executor is already rented to a tenant.
+
+    The legacy code short-circuited out of validation in this scenario after checking pod
+    health, GPU ownership, ports, and score adjustments. Keeping it as a single check
+    documents that bespoke behaviour and ensures we still emit the historical log format.
+    """
+
     check_id = "executor.validate.rented_state"
     fatal = True
 

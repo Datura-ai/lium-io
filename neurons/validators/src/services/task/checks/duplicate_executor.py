@@ -7,6 +7,12 @@ from ..pipeline import CheckResult, Context
 
 
 class DuplicateExecutorCheck:
+    """Ensure a miner is not registering the same executor UUID multiple times.
+
+    The original pipeline cleared verification when Redis flagged duplicates. Keeping the
+    guard avoids wasted scoring cycles and enforces one-to-one miner/executor mappings.
+    """
+
     check_id = "executor.validate.duplicate"
     fatal = True
 

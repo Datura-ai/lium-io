@@ -7,6 +7,12 @@ from ..pipeline import CheckResult, Context
 
 
 class PortCountCheck:
+    """Record available ports so scoring can penalise poorly configured hosts.
+
+    The legacy task surfaced the DB/Redis-derived count in its final message and used it
+    for scoring. Keeping it as a check keeps that behaviour observable and testable.
+    """
+
     check_id = "executor.validate.port_count"
     fatal = False
 

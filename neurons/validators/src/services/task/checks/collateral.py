@@ -5,6 +5,13 @@ from ..pipeline import CheckResult, Context
 
 
 class CollateralCheck:
+    """Confirm collateral eligibility so scores respect marketplace policy.
+
+    Legacy logic zeroed out jobs when miners lacked the required bond. Keeping the
+    decision close to the top of the pipeline ensures we do not waste time probing hosts
+    that will ultimately be rejected by staking rules.
+    """
+
     check_id = "gpu.validate.collateral"
 
     def __init__(self, *, collateral_service, enable_no_collateral: bool):

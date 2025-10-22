@@ -5,6 +5,13 @@ from ..pipeline import CheckResult, Context
 
 
 class GpuModelValidCheck:
+    """Gate validation on supported GPU SKUs and healthy scrape output.
+
+    This mirrors the legacy guard that rejected unknown models, zero counts, or mismatched
+    detail lists. It prevents us from handing out scores when the scrape clearly failed or
+    when a miner advertises off-policy hardware.
+    """
+
     check_id = "gpu.validate.model"
     fatal = True
 

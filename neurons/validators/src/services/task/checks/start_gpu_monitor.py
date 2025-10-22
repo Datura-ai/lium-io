@@ -9,6 +9,13 @@ from ..pipeline import CheckResult, Context
 
 
 class StartGPUMonitorCheck:
+    """Ensure the GPU monitor agent is running so validators receive live telemetry.
+
+    This mirrors legacy logic that boots `gpus_utility.py` on the executor. Without it we
+    lose visibility into runtime utilisation, so the remainder of the pipeline may produce
+    misleading scores when GPUs are already busy.
+    """
+
     check_id = "prep.start_gpu_monitor"
     fatal = False
 

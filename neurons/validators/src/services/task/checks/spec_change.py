@@ -5,6 +5,13 @@ from ..pipeline import CheckResult, Context
 
 
 class SpecChangeCheck:
+    """Reset verification when the GPU model:count tuple changes between runs.
+
+    Validators previously cleared Redis when inventory shifted, forcing a fresh audit.
+    Keeping that behaviour thwarts miners who hot-swap or reconfigure GPUs between checks
+    to game the scoring window.
+    """
+
     check_id = "gpu.validate.spec_change"
     fatal = True
 

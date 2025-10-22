@@ -7,6 +7,13 @@ from ..pipeline import CheckResult, Context
 
 
 class NvmlDigestCheck:
+    """Detect tampered NVIDIA driver stacks by hashing libnvidia-ml.
+
+    The old flow treated mismatched MD5 sums as proof of environment spoofing. That
+    safeguard protects the marketplace from miners that LD_PRELOAD a fake NVML, so we
+    carry it forward verbatim.
+    """
+
     check_id = "gpu.validate.nvml_digest"
     fatal = True
 

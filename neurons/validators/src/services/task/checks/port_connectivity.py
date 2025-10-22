@@ -7,6 +7,12 @@ from ..pipeline import CheckResult, Context
 
 
 class PortConnectivityCheck:
+    """Verify Docker port mappings by running the batch verifier exactly like before.
+
+    Connectivity failures used to abort the task immediately because miners could not be
+    rented. This check preserves that contract and updates sysbox state for later scoring.
+    """
+
     check_id = "executor.validate.port_connectivity"
     fatal = True
 

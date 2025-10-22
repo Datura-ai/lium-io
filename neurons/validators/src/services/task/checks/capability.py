@@ -7,6 +7,13 @@ from ..pipeline import CheckResult, Context
 
 
 class CapabilityCheck:
+    """Run the containerised GPU capability probe (nvidia-smi in Docker).
+
+    This executes the same `validate_gpu_model_and_process_job` command used before, which
+    verifies that containers can see the GPUs. Failing it previously zeroed the score, so
+    keeping it prevents miners from hiding driver issues behind a good scrape.
+    """
+
     check_id = "gpu.validate.capability"
     fatal = True
 

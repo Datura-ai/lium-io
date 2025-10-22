@@ -7,6 +7,13 @@ from ..pipeline import CheckResult, Context
 
 
 class BannedGpuCheck:
+    """Block miners whose GPU UUIDs appear on the banlist maintained in Redis.
+
+    Legacy validation refused to score temporarily ineligible GPUs (e.g., due to fraud or
+    hardware defects). Keeping this explicit check lets policy updates propagate without
+    editing the core pipeline.
+    """
+
     check_id = "gpu.validate.banned"
     fatal = True
 

@@ -9,6 +9,13 @@ from ..pipeline import CheckResult, Context
 
 
 class GpuUsageCheck:
+    """Re-use the legacy GPU utilisation guard for both rented and idle states.
+
+    In the old flow high utilisation outside the validator zeroed the job. We keep that
+    policy so miners cannot collect rewards while GPUs are already occupied by host jobs
+    or rogue containers.
+    """
+
     check_id = "gpu.validate.usage"
     fatal = True
 

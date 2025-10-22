@@ -5,6 +5,13 @@ from ..pipeline import CheckResult, Context
 
 
 class GpuCountCheck:
+    """Enforce the subnet's maximum visible GPU policy before scoring work.
+
+    The old task rejected miners reporting more than `MAX_GPU_COUNT`; keeping this early
+    avoids downstream scoring on hardware that would be disqualified regardless of
+    collateral or performance.
+    """
+
     check_id = "gpu.validate.count"
     fatal = True
 

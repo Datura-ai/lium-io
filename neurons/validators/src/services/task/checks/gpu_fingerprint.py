@@ -7,6 +7,13 @@ from ..pipeline import CheckResult, Context
 
 
 class GpuFingerprintCheck:
+    """Compare stored GPU UUIDs with the latest scrape to detect hardware swaps.
+
+    This retains the old `check_fingerprints_changed` guard, catching cases where miners
+    cycle hardware or reorder devices to dodge bans. Deviations trigger a verification
+    reset just like the legacy flow.
+    """
+
     check_id = "gpu.validate.fingerprint"
     fatal = True
 

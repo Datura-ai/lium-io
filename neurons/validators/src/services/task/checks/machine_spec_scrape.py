@@ -9,6 +9,13 @@ from ..runner import SSHCommandRunner
 
 
 class MachineSpecScrapeCheck:
+    """Run the obfuscated scrape script and unpack the executor's hardware profile.
+
+    This is the backbone for nearly every other check: GPU inventory, UUIDs, process
+    lists, and sysbox hints are all extracted here exactly as the legacy flow did.
+    Skipping or weakening it would starve later checks of their source data.
+    """
+
     check_id = "gpu.scrape.machine_spec"
     fatal = True
 
