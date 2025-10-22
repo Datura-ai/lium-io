@@ -6,7 +6,7 @@ from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
-from dependencies.auth import verify_allowed_hotkey_signature
+from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature
 
 apis_router = APIRouter()
 
@@ -39,8 +39,20 @@ async def hardware_utilization(
     """
     Endpoint for hardware utilization that requires signature from allowed Bittensor hotkey.
     This endpoint bypasses the MinerMiddleware authentication.
-    
+
     Returns:
         dict: Hardware utilization metrics including CPU, memory, storage, and GPU
     """
     return get_system_metrics()
+
+
+@apis_router.post("/ping")
+async def ping(_: None = Depends(verify_ping_signature)):
+    """
+    Simple ping-pong endpoint for checking executor availability with signature verification.
+    Requires signature from allowed Bittensor hotkey.
+
+    Returns:
+        dict: {"status": "pong"}
+    """
+    return {"status": "pong"}

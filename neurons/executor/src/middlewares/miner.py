@@ -15,8 +15,8 @@ class MinerMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request, call_next):
-        # Skip middleware for hardware_utilization endpoint
-        if request.url.path == "/hardware_utilization":
+        # Skip middleware for endpoints with their own signature verification
+        if request.url.path in ["/hardware_utilization", "/ping"]:
             return await call_next(request)
             
         try:
