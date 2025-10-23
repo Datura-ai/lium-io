@@ -42,6 +42,7 @@ async def verify_signature(payload: SignaturePayload, message: str) -> None:
     except HTTPException:
         raise
     except Exception as e:
+        logger.error("Error: %s", str(e), exc_info=True)
         raise HTTPException(
             status_code=400,
             detail=f"Error verifying signature: {str(e)}"

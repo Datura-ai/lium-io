@@ -8,9 +8,9 @@ class SignaturePayload(BaseModel):
 
 class HardwareUtilizationPayload(SignaturePayload):
     """Payload for hardware utilization endpoint with signature verification"""
-    pass  # Hex signature of the fixed string "hardware_utilization_request"
+    pass
 
 
 class PingPayload(SignaturePayload):
     """Payload for ping endpoint with signature verification"""
-    pass  # Hex signature of the fixed string "ping_request"
+    pass
