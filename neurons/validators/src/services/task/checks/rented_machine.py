@@ -1,15 +1,79 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Iterable
 
-from core.utils import StructuredMessage
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
+from ...const import GPU_MEMORY_UTILIZATION_LIMIT, GPU_UTILIZATION_LIMIT
 
 
-class RentedMachineCheck:
+def _has_gpu_process_outside_container(container_name: str, processes: Iterable[dict]) -> bool:
+    """True when any process is missing a container or belongs to a different container."""
+    for process in processes:
+        process_container = process.get("container_name")
+        if not process_container or process_container != container_name:
+            return True
+    return False
+
+
+def _is_gpu_usage_within_limits(gpu_details: Iterable[dict], gpu_processes: Iterable[dict]) -> bool:
+    """True when utilisation metrics do not exceed protocol limits."""
+    if not gpu_processes:
+        return True
+
+    for detail in gpu_details:
+        utilisation = detail.get("gpu_utilization", GPU_UTILIZATION_LIMIT)
+        memory_utilisation = detail.get("memory_utilization", GPU_MEMORY_UTILIZATION_LIMIT)
+
+        if utilisation >= GPU_UTILIZATION_LIMIT or memory_utilisation > GPU_MEMORY_UTILIZATION_LIMIT:
+            return False
+
+    return True
+
+
+def _gpu_usage_violation_details(
+    gpu_details: Iterable[dict],
+    gpu_processes: Iterable[dict],
+) -> dict:
+    """Prepare diagnostic data describing the observed GPU usage."""
+    processes = list(gpu_processes)
+    utilisation = None
+    memory_utilisation = None
+
+    for detail in gpu_details:
+        utilisation = detail.get("gpu_utilization")
+        memory_utilisation = detail.get("memory_utilization")
+
+        exceeds_utilisation = utilisation is not None and utilisation >= GPU_UTILIZATION_LIMIT
+        exceeds_memory = memory_utilisation is not None and memory_utilisation > GPU_MEMORY_UTILIZATION_LIMIT
+
+        if exceeds_utilisation or exceeds_memory:
+            break
+    else:
+        utilisation = None
+        memory_utilisation = None
+
+    utilisation_display = (
+        f"{utilisation}%"
+        if utilisation is not None
+        else f">={GPU_UTILIZATION_LIMIT}%"
+    )
+    memory_display = (
+        f"{memory_utilisation}%"
+        if memory_utilisation is not None
+        else f">{GPU_MEMORY_UTILIZATION_LIMIT}%"
+    )
+
+    return {
+        "gpu_utilization": utilisation_display,
+        "vram_utilization": memory_display,
+        "process_count": len(processes),
+    }
+
+
+class TenantEnforcementCheck:
     """Handle the specialised flow when the executor is already rented to a tenant.
 
     The legacy code short-circuited out of validation in this scenario after checking pod
@@ -25,13 +89,11 @@ class RentedMachineCheck:
         *,
         rented_machine_fetcher: Callable[[], Awaitable[dict | None]],
         pod_checker: Callable[[object, str, object], Awaitable[tuple[bool, list[str]]]],
-        gpu_usage_checker: Callable[[list[dict], list[dict], dict, bool], tuple[bool, StructuredMessage | None]],
         port_counter: Callable[[str, str], Awaitable[int]],
         score_calculator: Callable[[str, bool, bool, str, bool, int], tuple[float, float, str]],
     ):
         self.rented_machine_fetcher = rented_machine_fetcher
         self.pod_checker = pod_checker
-        self.gpu_usage_checker = gpu_usage_checker
         self.port_counter = port_counter
         self.score_calculator = score_calculator
 
@@ -93,27 +155,27 @@ class RentedMachineCheck:
                 },
             )
 
-        gpu_processes = ctx.gpu_processes or []
-        gpu_running_outside = False
-        for process in gpu_processes:
-            process_container = process.get("container_name")
-            if not process_container or process_container != container_name:
-                gpu_running_outside = True
-                break
+        gpu_processes = list(ctx.gpu_processes or [])
+        gpu_running_outside = _has_gpu_process_outside_container(container_name, gpu_processes)
 
         if not rented_machine.get("owner_flag", False) and gpu_running_outside:
-            ok, log_msg = self.gpu_usage_checker(ctx.gpu_details or [], gpu_processes, extra, True)
-            if not ok:
-                message = log_msg.message if isinstance(log_msg, StructuredMessage) else str(log_msg)
-                payload = log_msg.extra if isinstance(log_msg, StructuredMessage) else {}
+            gpu_details = ctx.gpu_details or []
+            if not _is_gpu_usage_within_limits(gpu_details, gpu_processes):
+                observation = _gpu_usage_violation_details(gpu_details, gpu_processes)
                 event = build_msg(
-                    event=message,
-                    reason=payload.get("reason_code", "GPU_USAGE_OUTSIDE_TENANT"),
-                    severity=payload.get("severity", "warning"),
+                    event="Tenant container does not own GPU",
+                    reason="GPU_USAGE_OUTSIDE_TENANT",
+                    severity="warning",
                     category="runtime",
-                    impact=payload.get("impact", "Score set to 0"),
-                    remediation=payload.get("remediation"),
-                    what=payload.get("what_we_saw", {}),
+                    impact="Validation failed; score set to 0",
+                    remediation="Terminate host-level GPU processes, make sure nvidia-smi doesn't show any running processes.",
+                    what={
+                        "expected_container": container_name,
+                        "process_count": observation["process_count"],
+                        "gpu_utilization": observation["gpu_utilization"],
+                        "vram_utilization": observation["vram_utilization"],
+                        "gpu_processes": gpu_processes,
+                    },
                     check_id=self.check_id,
                     ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
                 )

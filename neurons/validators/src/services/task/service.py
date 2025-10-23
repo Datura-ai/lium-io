@@ -53,7 +53,7 @@ from .checks import (
     NvmlDigestCheck,
     PortConnectivityCheck,
     PortCountCheck,
-    RentedMachineCheck,
+    TenantEnforcementCheck,
     ScoreCheck,
     StartGPUMonitorCheck,
     SpecChangeCheck,
@@ -1318,10 +1318,9 @@ class TaskService:
                 async def _fetch_rented_machine() -> dict | None:
                     return await self.redis_service.get_rented_machine(executor_info)
 
-                rented_machine_check = RentedMachineCheck(
+                tenant_enforcement_check = TenantEnforcementCheck(
                     rented_machine_fetcher=_fetch_rented_machine,
                     pod_checker=self.check_pod_running,
-                    gpu_usage_checker=self.check_gpu_usage,
                     port_counter=self.get_available_port_count,
                     score_calculator=self.calc_scores,
                 )
@@ -1391,7 +1390,7 @@ class TaskService:
                         banned_gpu_check,
                         duplicate_executor_check,
                         collateral_check,
-                        rented_machine_check,
+                        tenant_enforcement_check,
                         gpu_usage_check,
                         port_connectivity_check,
                         verifyx_check,
