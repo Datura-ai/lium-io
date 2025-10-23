@@ -24,9 +24,9 @@ class StartGPUMonitorCheck:
         runner = ctx.runner
         executor = ctx.executor
 
-        validator_keypair = ctx.services.get("validator_keypair")
-        compute_rest_app_url = ctx.config.get("compute_rest_app_url")
-        script_relative_path = ctx.config.get("gpu_monitor_script_relative", "src/gpus_utility.py")
+        validator_keypair = ctx.services.validator_keypair
+        compute_rest_app_url = ctx.config.compute_rest_app_url
+        script_relative_path = ctx.config.gpu_monitor_script_relative
 
         if not isinstance(validator_keypair, Keypair) or not compute_rest_app_url:
             event = build_msg(

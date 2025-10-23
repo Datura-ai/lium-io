@@ -59,7 +59,7 @@ class MachineSpecScrapeCheck:
             )
             return CheckResult(passed=False, event=event)
 
-        script_filename = ctx.config.get("machine_scrape_filename")
+        script_filename = ctx.config.machine_scrape_filename
         if not script_filename:
             event = build_msg(
                 event="Machine scrape configuration missing",
@@ -75,9 +75,9 @@ class MachineSpecScrapeCheck:
             return CheckResult(passed=False, event=event)
 
         script_path = f"{ctx.remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
-        timeout = ctx.config.get("machine_scrape_timeout") or self.DEFAULT_TIMEOUT
+        timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
-        decrypt_service = ctx.services.get("ssh_service")
+        decrypt_service = ctx.services.ssh
         if not isinstance(decrypt_service, SSHService):
             event = build_msg(
                 event="SSH service unavailable",
@@ -124,7 +124,7 @@ class MachineSpecScrapeCheck:
 
             decrypted = decrypt_service.decrypt_payload(ctx.encrypt_key, line)
             raw = json.loads(decrypted)
-            obfuscation_keys = ctx.config.get("obfuscation_keys")
+            obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)
 
             gpu_info = specs.get("gpu", {}) or {}

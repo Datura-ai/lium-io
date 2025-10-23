@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 
 from ..models import build_msg
-from ..pipeline import CheckResult, Context
+from ..pipeline import CheckResult, Context, ContextState
 
 
 class UploadFilesCheck:
@@ -17,8 +17,8 @@ class UploadFilesCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        local_dir = ctx.state.get("upload_local_dir")
-        executor_root = ctx.config.get("executor_root")
+        local_dir = ctx.state.upload_local_dir
+        executor_root = ctx.config.executor_root
 
         if not local_dir or not executor_root:
             event = build_msg(
@@ -54,7 +54,10 @@ class UploadFilesCheck:
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
-            updated_state = {**ctx.state, "upload_remote_dir": remote_dir}
+            updated_state = ContextState(
+                upload_local_dir=ctx.state.upload_local_dir,
+                upload_remote_dir=remote_dir,
+            )
             return CheckResult(
                 passed=True,
                 event=event,

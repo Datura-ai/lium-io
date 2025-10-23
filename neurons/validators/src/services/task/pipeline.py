@@ -1,5 +1,6 @@
 import logging
-from typing import Any, List, Protocol, Tuple
+from dataclasses import dataclass
+from typing import Any, List, Optional, Protocol, Tuple
 
 import asyncssh
 from pydantic import BaseModel, Field
@@ -8,6 +9,31 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import _m
 from .models import ValidationEvent
+@dataclass(frozen=True)
+class ContextServices:
+    ssh: Any
+    redis: Any
+    collateral: Any
+    validation: Any
+    verifyx: Any
+    connectivity: Any
+    validator_keypair: Optional[Any] = None
+
+
+@dataclass(frozen=True)
+class ContextConfig:
+    executor_root: str
+    compute_rest_app_url: str
+    gpu_monitor_script_relative: str
+    machine_scrape_filename: str
+    machine_scrape_timeout: int
+    obfuscation_keys: Any
+
+
+@dataclass(frozen=True)
+class ContextState:
+    upload_local_dir: Optional[str] = None
+    upload_remote_dir: Optional[str] = None
 
 
 class CheckResult(BaseModel):
@@ -29,9 +55,9 @@ class Context(BaseModel):
     encrypt_key: str | None = None
     remote_dir: str | None = None
     default_extra: dict[str, Any] = {}
-    services: dict[str, Any] = Field(default_factory=dict)
-    config: dict[str, Any] = Field(default_factory=dict)
-    state: dict[str, Any] = Field(default_factory=dict)
+    services: ContextServices
+    config: ContextConfig
+    state: ContextState = Field(default_factory=ContextState)
     gpu_model_count: str | None = None
     gpu_uuids: str | None = None
     clear_verified_job_info: bool = False
