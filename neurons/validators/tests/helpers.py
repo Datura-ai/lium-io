@@ -90,7 +90,7 @@ def make_context(
     config_obj = config or build_context_config()
     state_obj = state or build_state()
 
-    return Context.model_construct(
+    base_kwargs = dict(
         executor=executor_obj,
         miner_hotkey=miner_hotkey,
         ssh=None,
@@ -103,5 +103,7 @@ def make_context(
         config=config_obj,
         state=state_obj,
         is_rental_succeed=False,
-        **extra,
     )
+    base_kwargs.update(extra)
+
+    return Context.model_construct(**base_kwargs)
