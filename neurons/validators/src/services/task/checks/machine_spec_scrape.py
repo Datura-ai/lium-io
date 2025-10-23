@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 import json
-from typing import Callable
+from typing import Any
 
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
+from services.file_encrypt_service import ORIGINAL_KEYS
+from services.ssh_service import SSHService
+
+
+def _update_keys(data: Any, key_mapping: dict[str, str]) -> Any:
+    if isinstance(data, dict):
+        updated: dict[str, Any] = {}
+        for key, value in data.items():
+            original_key = key_mapping.get(key, key)
+            updated[original_key] = _update_keys(value, key_mapping)
+        return updated
+    if isinstance(data, list):
+        return [_update_keys(item, key_mapping) for item in data]
+    return data
+
+
+def _deobfuscate(spec: dict[str, Any], obfuscation_keys: dict[str, str] | None) -> dict[str, Any]:
+    if not obfuscation_keys:
+        return spec
+    reverse = {v: k for k, v in obfuscation_keys.items()}
+    first_pass = _update_keys(spec, reverse)
+    return _update_keys(first_pass, ORIGINAL_KEYS)
 
 
 class MachineSpecScrapeCheck:
@@ -19,18 +41,7 @@ class MachineSpecScrapeCheck:
     check_id = "gpu.scrape.machine_spec"
     fatal = True
 
-    def __init__(
-        self,
-        *,
-        script_filename: str,
-        decrypt_func: Callable[[str, str], str],
-        deobfuscate_func: Callable[[dict], dict],
-        timeout: int = 300,
-    ):
-        self.script_filename = script_filename
-        self.decrypt = decrypt_func
-        self.deobfuscate = deobfuscate_func
-        self.timeout = timeout
+    DEFAULT_TIMEOUT = 300
 
     async def run(self, ctx: Context) -> CheckResult:
         runner: SSHCommandRunner = ctx.runner
@@ -48,9 +59,40 @@ class MachineSpecScrapeCheck:
             )
             return CheckResult(passed=False, event=event)
 
-        script_path = f"{ctx.remote_dir}/{self.script_filename}"
+        script_filename = ctx.config.get("machine_scrape_filename")
+        if not script_filename:
+            event = build_msg(
+                event="Machine scrape configuration missing",
+                reason="SCRAPE_CONFIG_MISSING",
+                severity="error",
+                category="prep",
+                impact="Validation halted",
+                remediation="Validator bug: missing scrape configuration in context",
+                what={"machine_scrape_filename": script_filename},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
 
-        res = await runner.run(f"chmod +x {script_path} && {script_path}", timeout=self.timeout, retryable=False)
+        script_path = f"{ctx.remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
+        timeout = ctx.config.get("machine_scrape_timeout") or self.DEFAULT_TIMEOUT
+
+        decrypt_service = ctx.services.get("ssh_service")
+        if not isinstance(decrypt_service, SSHService):
+            event = build_msg(
+                event="SSH service unavailable",
+                reason="SCRAPE_DECRYPT_MISSING",
+                severity="error",
+                category="prep",
+                impact="Validation halted",
+                remediation="Validator bug: missing SSH service in context",
+                what={},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        res = await runner.run(f"chmod +x {script_path} && {script_path}", timeout=timeout, retryable=False)
 
         if not res.success or not res.stdout.strip():
             event = build_msg(
@@ -80,9 +122,10 @@ class MachineSpecScrapeCheck:
             if not ctx.encrypt_key:
                 raise ValueError("Missing encrypt_key in context")
 
-            decrypted = self.decrypt(ctx.encrypt_key, line)
+            decrypted = decrypt_service.decrypt_payload(ctx.encrypt_key, line)
             raw = json.loads(decrypted)
-            specs = self.deobfuscate(raw)
+            obfuscation_keys = ctx.config.get("obfuscation_keys")
+            specs = _deobfuscate(raw, obfuscation_keys)
 
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0

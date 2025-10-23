@@ -1207,16 +1207,6 @@ class TaskService:
 
                 runner = SSHCommandRunner(shell.ssh_client, max_retries=1)
 
-                def _decrypt(enc_key: str, ciphertext: str) -> str:
-                    return self.ssh_service.decrypt_payload(enc_key, ciphertext)
-
-                def _deobfuscate(spec: dict) -> dict:
-                    all_keys = encrypted_files.all_keys
-                    reverse_all_keys = {v: k for k, v in all_keys.items()}
-                    s1 = self.update_keys(spec, reverse_all_keys)
-                    s2 = self.update_keys(s1, ORIGINAL_KEYS)
-                    return s2
-
                 verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
 
                 default_extra = {
@@ -1259,6 +1249,9 @@ class TaskService:
                         "executor_root": executor_info.root_dir,
                         "compute_rest_app_url": settings.COMPUTE_REST_API_URL,
                         "gpu_monitor_script_relative": "src/gpus_utility.py",
+                        "machine_scrape_filename": encrypted_files.machine_scrape_file_name,
+                        "machine_scrape_timeout": JOB_LENGTH,
+                        "obfuscation_keys": encrypted_files.all_keys,
                     },
                     state={
                         "upload_local_dir": encrypted_files.tmp_directory,
@@ -1270,12 +1263,7 @@ class TaskService:
 
                 upload = UploadFilesCheck()
 
-                scrape = MachineSpecScrapeCheck(
-                    script_filename=encrypted_files.machine_scrape_file_name,
-                    decrypt_func=_decrypt,
-                    deobfuscate_func=_deobfuscate,
-                    timeout=JOB_LENGTH,
-                )
+                scrape = MachineSpecScrapeCheck()
 
                 gpu_count_check = GpuCountCheck(
                     max_gpu_count=MAX_GPU_COUNT,
