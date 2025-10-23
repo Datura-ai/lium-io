@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
+from typing import Any
 from dataclasses import replace
 
 from ..models import build_msg
@@ -53,12 +55,13 @@ class VerifyXCheck:
 
         if result.data and result.data.get("success"):
             base_specs = ctx.state.specs
+            sanitized = _to_iso(result.data)
             updated_specs = dict(base_specs)
             updated_specs.update(
                 {
-                    "ram": result.data.get("ram", updated_specs.get("ram")),
-                    "hard_disk": result.data.get("hard_disk", updated_specs.get("hard_disk")),
-                    "network": result.data.get("network", updated_specs.get("network")),
+                    "ram": sanitized.get("ram", updated_specs.get("ram")),
+                    "hard_disk": sanitized.get("hard_disk", updated_specs.get("hard_disk")),
+                    "network": sanitized.get("network", updated_specs.get("network")),
                 }
             )
 
@@ -99,3 +102,15 @@ class VerifyXCheck:
             ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
         )
         return CheckResult(passed=False, event=event)
+
+
+def _to_iso(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _to_iso(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_iso(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_to_iso(v) for v in value)
+    return value

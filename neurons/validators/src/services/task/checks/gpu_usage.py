@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
 from services.const import GPU_MEMORY_UTILIZATION_LIMIT, GPU_UTILIZATION_LIMIT
