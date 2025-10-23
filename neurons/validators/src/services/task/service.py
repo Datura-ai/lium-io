@@ -1289,15 +1289,7 @@ class TaskService:
 
                 collateral_check = CollateralCheck()
 
-                async def _fetch_rented_machine() -> dict | None:
-                    return await self.redis_service.get_rented_machine(executor_info)
-
-                tenant_enforcement_check = TenantEnforcementCheck(
-                    rented_machine_fetcher=_fetch_rented_machine,
-                    pod_checker=self.check_pod_running,
-                    port_counter=self.get_available_port_count,
-                    score_calculator=self.calc_scores,
-                )
+                tenant_enforcement_check = TenantEnforcementCheck()
 
                 gpu_usage_check = GpuUsageCheck()
 

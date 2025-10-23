@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Iterable
+from typing import Iterable
 
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
-from ...const import GPU_MEMORY_UTILIZATION_LIMIT, GPU_UTILIZATION_LIMIT
+from ...const import (
+    GPU_MEMORY_UTILIZATION_LIMIT,
+    GPU_UTILIZATION_LIMIT,
+    MIN_PORT_COUNT,
+    AVAILABLE_PORT_MAPS_PREFIX,
+)
 
 
 def _has_gpu_process_outside_container(container_name: str, processes: Iterable[dict]) -> bool:
@@ -84,21 +89,9 @@ class TenantEnforcementCheck:
     check_id = "executor.validate.rented_state"
     fatal = True
 
-    def __init__(
-        self,
-        *,
-        rented_machine_fetcher: Callable[[], Awaitable[dict | None]],
-        pod_checker: Callable[[object, str, object], Awaitable[tuple[bool, list[str]]]],
-        port_counter: Callable[[str, str], Awaitable[int]],
-        score_calculator: Callable[[str, bool, bool, str, bool, int], tuple[float, float, str]],
-    ):
-        self.rented_machine_fetcher = rented_machine_fetcher
-        self.pod_checker = pod_checker
-        self.port_counter = port_counter
-        self.score_calculator = score_calculator
-
     async def run(self, ctx: Context) -> CheckResult:
-        rented_machine = await self.rented_machine_fetcher()
+        redis_service = ctx.services.redis
+        rented_machine = await redis_service.get_rented_machine(ctx.executor)
 
         if not rented_machine or not rented_machine.get("container_name"):
             extra = {**ctx.default_extra, "rented": False}
@@ -129,7 +122,7 @@ class TenantEnforcementCheck:
             "container_name": container_name,
         }
 
-        pod_running, ssh_pub_keys = await self.pod_checker(ctx.ssh, container_name, ctx.executor)
+        pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
         if not pod_running:
             event = build_msg(
                 event="Pod not running",
@@ -185,9 +178,10 @@ class TenantEnforcementCheck:
                     updates={"default_extra": extra, "ssh_pub_keys": ssh_pub_keys},
                 )
 
-        port_count = await self.port_counter(ctx.miner_hotkey, ctx.executor.uuid)
+        port_count = await _compute_port_count(ctx)
 
-        actual_score, job_score, warning_message = self.score_calculator(
+        score_calculator = ctx.services.score_calculator
+        actual_score, job_score, warning_message = score_calculator(
             ctx.state.gpu_model or "",
             ctx.collateral_deposited,
             ctx.is_rental_succeed,
@@ -230,3 +224,39 @@ class TenantEnforcementCheck:
             },
             halt=True,
         )
+
+
+async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str]]:
+    try:
+        ps_result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name}")
+        pod_running = bool(ps_result.stdout.strip())
+    except Exception:
+        pod_running = False
+
+    try:
+        keys_result = await ssh_client.run(
+            f"/usr/bin/docker exec -i {container_name} sh -c 'cat ~/.ssh/authorized_keys'"
+        )
+        ssh_keys = keys_result.stdout.strip().split("\n") if keys_result.stdout else []
+    except Exception:
+        ssh_keys = []
+
+    return pod_running, ssh_keys
+
+
+async def _compute_port_count(ctx: Context) -> int:
+    port_mapping = ctx.services.port_mapping
+    redis_service = ctx.services.redis
+    executor_uuid = ctx.executor.uuid
+
+    try:
+        port_count = await port_mapping.get_successful_ports_count(executor_uuid)
+    except Exception:
+        port_count = 0
+
+    if port_count >= MIN_PORT_COUNT:
+        return port_count
+
+    port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{ctx.miner_hotkey}:{executor_uuid}"
+    port_maps_bytes = await redis_service.lrange(port_map_key)
+    return len([tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes])
