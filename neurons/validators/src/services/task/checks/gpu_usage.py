@@ -11,23 +11,7 @@ class GpuUsageCheck:
     check_id = "gpu.validate.usage"
     fatal = True
 
-    def __init__(self, *, rented: bool = False):
-        self.rented = rented
-
     async def run(self, ctx: Context) -> CheckResult:
-        if ctx.rented and not self.rented:
-            event = build_msg(
-                event="GPU usage validation skipped for rented executor",
-                reason="GPU_USAGE_SKIPPED",
-                severity="info",
-                category="runtime",
-                impact="Proceed",
-                what={"rented": True},
-                check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
-            )
-            return CheckResult(passed=True, event=event)
-
         gpu_details = ctx.state.gpu_details
         gpu_processes = ctx.state.gpu_processes
 
@@ -46,21 +30,13 @@ class GpuUsageCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        reason = "GPU_USAGE_OUTSIDE_TENANT" if self.rented else "GPU_USAGE_HIGH"
-        impact = "Validation failed; score set to 0" if self.rented else "Validation skipped; score set to 0"
-        remediation = (
-            "Terminate host-level GPU processes, make sure nvidia-smi doesn't show any running processes."
-            if self.rented
-            else "Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running."
-        )
-
         event = build_msg(
-            event="Tenant container does not own GPU" if self.rented else "GPU busy outside validator",
-            reason=reason,
+            event="GPU busy outside validator",
+            reason="GPU_USAGE_HIGH",
             severity="warning",
             category="runtime",
-            impact=impact,
-            remediation=remediation,
+            impact="Validation skipped; score set to 0",
+            remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
             what=violation,
             check_id=self.check_id,
             ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
