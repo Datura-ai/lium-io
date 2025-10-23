@@ -15,13 +15,25 @@ class GpuCountCheck:
     check_id = "gpu.validate.count"
     fatal = True
 
-    def __init__(self, *, max_gpu_count: int):
-        self.max_gpu_count = max_gpu_count
-
     async def run(self, ctx: Context) -> CheckResult:
         gpu_count = ctx.specs.get("gpu", {}).get("count", 0)
+        max_gpu_count = ctx.config.max_gpu_count
 
-        if gpu_count > self.max_gpu_count:
+        if max_gpu_count is None:
+            event = build_msg(
+                event="GPU count policy missing",
+                reason="GPU_COUNT_POLICY_MISSING",
+                severity="error",
+                category="policy",
+                impact="Validation halted",
+                remediation="Validator bug: max GPU count not configured in context",
+                what={"observed_count": gpu_count},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        if gpu_count > max_gpu_count:
             event = build_msg(
                 event="GPU count exceeds policy",
                 reason="GPU_COUNT_EXCEEDS_MAX",
@@ -29,9 +41,9 @@ class GpuCountCheck:
                 category="policy",
                 impact="Score set to 0",
                 remediation=(
-                    f"Reduce visible GPU count to {self.max_gpu_count} or less (e.g., use CUDA_VISIBLE_DEVICES environment variable)"
+                    f"Reduce visible GPU count to {max_gpu_count} or less (e.g., use CUDA_VISIBLE_DEVICES environment variable)"
                 ),
-                what={"count": gpu_count, "max_allowed": self.max_gpu_count},
+                what={"count": gpu_count, "max_allowed": max_gpu_count},
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
@@ -43,7 +55,7 @@ class GpuCountCheck:
             severity="info",
             category="policy",
             impact="Proceed",
-            what={"count": gpu_count, "max_allowed": self.max_gpu_count},
+            what={"count": gpu_count, "max_allowed": max_gpu_count},
             check_id=self.check_id,
             ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
         )

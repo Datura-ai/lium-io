@@ -9,6 +9,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import _m
 from .models import ValidationEvent
+
 @dataclass(frozen=True)
 class ContextServices:
     ssh: Any
@@ -28,6 +29,9 @@ class ContextConfig:
     machine_scrape_timeout: int
     obfuscation_keys: Any
     validator_keypair: Optional[Any] = None
+    max_gpu_count: Optional[int] = None
+    gpu_model_rates: Optional[dict] = None
+    nvml_digest_map: Optional[dict[str, str]] = None
 
 
 @dataclass(frozen=True)

@@ -15,10 +15,23 @@ class GpuModelValidCheck:
     check_id = "gpu.validate.model"
     fatal = True
 
-    def __init__(self, *, gpu_model_rates: dict):
-        self.gpu_model_rates = gpu_model_rates
-
     async def run(self, ctx: Context) -> CheckResult:
+        gpu_model_rates = ctx.config.gpu_model_rates
+        if not gpu_model_rates:
+            event = build_msg(
+                event="GPU model policy missing",
+                reason="GPU_MODEL_POLICY_MISSING",
+                severity="error",
+                category="policy",
+                impact="Validation halted",
+                remediation="Validator bug: GPU model rates not configured in context",
+                what={},
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        gpu_model_rates_map = gpu_model_rates
         gpu_count = ctx.specs.get("gpu", {}).get("count", 0)
         gpu_details = ctx.specs.get("gpu", {}).get("details", [])
 
@@ -26,8 +39,8 @@ class GpuModelValidCheck:
         if gpu_count > 0 and len(gpu_details) > 0:
             gpu_model = gpu_details[0].get("name", None)
 
-        if not self.gpu_model_rates.get(gpu_model):
-            supported_models = list(self.gpu_model_rates.keys())
+        if not gpu_model_rates_map.get(gpu_model):
+            supported_models = list(gpu_model_rates_map.keys())
             event = build_msg(
                 event="GPU model not supported",
                 reason="GPU_MODEL_UNSUPPORTED",

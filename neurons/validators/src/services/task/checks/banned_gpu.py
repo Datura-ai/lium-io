@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable
-
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
 
@@ -16,9 +14,6 @@ class BannedGpuCheck:
 
     check_id = "gpu.validate.banned"
     fatal = True
-
-    def __init__(self, *, banned_checker: Callable[[list[str]], Awaitable[bool]]):
-        self.banned_checker = banned_checker
 
     async def run(self, ctx: Context) -> CheckResult:
         current_uuids = ctx.gpu_uuids or ""
@@ -37,7 +32,10 @@ class BannedGpuCheck:
             return CheckResult(passed=True, event=event)
 
         uuids = [u for u in current_uuids.split(",") if u]
-        is_banned = await self.banned_checker(uuids)
+
+        redis_service = ctx.services.redis
+        banned_guids = await redis_service.get_banned_guids()
+        is_banned = any(guid in banned_guids for guid in uuids)
 
         if is_banned:
             event = build_msg(

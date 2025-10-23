@@ -17,16 +17,14 @@ class NvmlDigestCheck:
     check_id = "gpu.validate.nvml_digest"
     fatal = True
 
-    def __init__(self, *, digest_map: dict[str, str] | None = None):
-        self.digest_map = digest_map or LIB_NVIDIA_ML_DIGESTS
-
     async def run(self, ctx: Context) -> CheckResult:
+        digest_map = ctx.config.nvml_digest_map or LIB_NVIDIA_ML_DIGESTS
         specs = ctx.specs or {}
         gpu_info = specs.get("gpu", {}) or {}
         driver_version = gpu_info.get("driver") or ""
         lib_digest = specs.get("md5_checksums", {}).get("libnvidia_ml", "") or ""
 
-        if driver_version and self.digest_map.get(driver_version) != lib_digest:
+        if driver_version and digest_map.get(driver_version) != lib_digest:
             event = build_msg(
                 event="NVML library digest mismatch",
                 reason="NVML_DIGEST_MISMATCH",
@@ -39,7 +37,7 @@ class NvmlDigestCheck:
                 ),
                 what={
                     "driver": driver_version,
-                    "expected_md5": self.digest_map.get(driver_version),
+                    "expected_md5": digest_map.get(driver_version),
                     "actual_md5": lib_digest,
                 },
                 check_id=self.check_id,

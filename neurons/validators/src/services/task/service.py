@@ -1252,6 +1252,9 @@ class TaskService:
                         machine_scrape_timeout=JOB_LENGTH,
                         obfuscation_keys=encrypted_files.all_keys,
                         validator_keypair=keypair,
+                        max_gpu_count=MAX_GPU_COUNT,
+                        gpu_model_rates=GPU_MODEL_RATES,
+                        nvml_digest_map=LIB_NVIDIA_ML_DIGESTS,
                     ),
                     state=ContextState(upload_local_dir=encrypted_files.tmp_directory),
                     is_rental_succeed=is_rental_succeed,
@@ -1263,25 +1266,17 @@ class TaskService:
 
                 scrape = MachineSpecScrapeCheck()
 
-                gpu_count_check = GpuCountCheck(
-                    max_gpu_count=MAX_GPU_COUNT,
-                )
+                gpu_count_check = GpuCountCheck()
 
-                gpu_model_check = GpuModelValidCheck(
-                    gpu_model_rates=GPU_MODEL_RATES,
-                )
+                gpu_model_check = GpuModelValidCheck()
 
-                nvml_digest_check = NvmlDigestCheck(digest_map=LIB_NVIDIA_ML_DIGESTS)
+                nvml_digest_check = NvmlDigestCheck()
 
                 spec_change_check = SpecChangeCheck()
 
-                fingerprint_check = GpuFingerprintCheck(
-                    fingerprint_checker=self.check_fingerprints_changed,
-                )
+                fingerprint_check = GpuFingerprintCheck()
 
-                banned_gpu_check = BannedGpuCheck(
-                    banned_checker=self.check_banned_guids,
-                )
+                banned_gpu_check = BannedGpuCheck()
 
                 async def _duplicate_checker(miner_hotkey: str, executor_uuid: str) -> bool:
                     return await self.redis_service.is_elem_exists_in_set(
