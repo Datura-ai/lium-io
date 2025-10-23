@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import build_msg
+from ..messages import ScoreMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -26,19 +26,16 @@ class ScoreCheck:
             ctx.port_count,
         )
 
-        event = build_msg(
-            event="Scores computed",
-            reason="SCORE_COMPUTED",
-            severity="info",
-            category="policy",
+        event = render_message(
+            Msg.SCORE_COMPUTED,
+            ctx=ctx,
+            check_id=self.check_id,
             impact=f"Job score={job_score}, actual score={actual_score}",
             what={
                 "actual_score": actual_score,
                 "job_score": job_score,
                 "warning_message": warning_message,
             },
-            check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
         )
 
         return CheckResult(

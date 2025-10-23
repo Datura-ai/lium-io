@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import replace
 
-from ..models import build_msg
+from ..messages import UploadFilesMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -22,19 +22,14 @@ class UploadFilesCheck:
         executor_root = ctx.config.executor_root
 
         if not local_dir or not executor_root:
-            event = build_msg(
-                event="Upload configuration missing",
-                reason="UPLOAD_CONFIG_MISSING",
-                severity="error",
-                category="prep",
-                impact="Validation halted",
-                remediation="Validator bug: missing upload metadata in context",
+            event = render_message(
+                Msg.CONFIG_MISSING,
+                ctx=ctx,
+                check_id=self.check_id,
                 what={
                     "local_dir": local_dir,
                     "executor_root": executor_root,
                 },
-                check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=False, event=event)
 
@@ -45,15 +40,11 @@ class UploadFilesCheck:
             async with ctx.ssh.start_sftp_client() as sftp:
                 await sftp.put(local_dir, remote_dir, recurse=True)
 
-            event = build_msg(
-                event="Validation files uploaded",
-                reason="UPLOAD_OK",
-                severity="info",
-                category="prep",
-                impact="Proceed to validation",
-                what={"remote_dir": remote_dir, "local_dir": local_dir},
+            event = render_message(
+                Msg.UPLOAD_OK,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"remote_dir": remote_dir, "local_dir": local_dir},
             )
             updated_state = replace(
                 ctx.state,
@@ -66,15 +57,10 @@ class UploadFilesCheck:
                 updates={"state": updated_state},
             )
         except Exception as exc:
-            event = build_msg(
-                event="Failed to upload validation files",
-                reason="UPLOAD_FAILED",
-                severity="error",
-                category="prep",
-                impact="Validation halted",
-                remediation="Check network connectivity, disk space on executor, and SSH permissions",
-                what={"error": str(exc)[:200]},
+            event = render_message(
+                Msg.UPLOAD_FAILED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"error": str(exc)[:200]},
             )
             return CheckResult(passed=False, event=event)

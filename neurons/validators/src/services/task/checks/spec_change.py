@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import build_msg
+from ..messages import SpecChangeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -20,22 +20,14 @@ class SpecChangeCheck:
         current_spec = ctx.state.gpu_model_count or ""
 
         if prev_spec and current_spec and prev_spec != current_spec:
-            event = build_msg(
-                event="GPU inventory changed",
-                reason="SPEC_CHANGED",
-                severity="warning",
-                category="env",
-                impact="Verification reset; score set to 0",
-                remediation=(
-                    "Keep GPU configuration stable between checks. Avoid hot-plugging GPUs or "
-                    "changing MIG profiles mid-validation."
-                ),
+            event = render_message(
+                Msg.SPEC_CHANGED,
+                ctx=ctx,
+                check_id=self.check_id,
                 what={
                     "previous": prev_spec,
                     "current": current_spec,
                 },
-                check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(
                 passed=False,
@@ -43,14 +35,10 @@ class SpecChangeCheck:
                 updates={"clear_verified_job_info": True},
             )
 
-        event = build_msg(
-            event="GPU inventory stable",
-            reason="SPEC_UNCHANGED",
-            severity="info",
-            category="env",
-            impact="Proceed",
-            what={"gpu_model_count": current_spec},
+        event = render_message(
+            Msg.SPEC_UNCHANGED,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"gpu_model_count": current_spec},
         )
         return CheckResult(passed=True, event=event)

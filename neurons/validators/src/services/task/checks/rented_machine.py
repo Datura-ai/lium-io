@@ -2,7 +2,7 @@ from typing import Iterable
 
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
-from ..models import build_msg
+from ..messages import TenantEnforcementMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ...const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
@@ -93,15 +93,11 @@ class TenantEnforcementCheck:
 
         if not rented_machine or not rented_machine.get("container_name"):
             extra = {**ctx.default_extra, "rented": False}
-            event = build_msg(
-                event="Executor not rented",
-                reason="EXECUTOR_NOT_RENTED",
-                severity="info",
-                category="policy",
-                impact="Proceed",
-                what={"executor_uuid": ctx.executor.uuid},
+            event = render_message(
+                Msg.NOT_RENTED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"executor_uuid": ctx.executor.uuid},
             )
             return CheckResult(
                 passed=True,
@@ -122,19 +118,15 @@ class TenantEnforcementCheck:
 
         pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
         if not pod_running:
-            event = build_msg(
-                event="Pod not running",
-                reason="POD_NOT_RUNNING",
-                severity="error",
-                category="runtime",
-                impact="Score set to 0; verification cleared",
+            event = render_message(
+                Msg.POD_NOT_RUNNING,
+                ctx=ctx,
+                check_id=self.check_id,
                 remediation=f"Start container {container_name} and ensure it stays healthy.",
                 what={
                     "container": container_name,
                     "executor_uuid": ctx.executor.uuid,
                 },
-                check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(
                 passed=False,
@@ -153,13 +145,10 @@ class TenantEnforcementCheck:
             gpu_details = ctx.state.gpu_details
             if not _is_gpu_usage_within_limits(gpu_details, gpu_processes):
                 observation = _gpu_usage_violation_details(gpu_details, gpu_processes)
-                event = build_msg(
-                    event="Tenant container does not own GPU",
-                    reason="GPU_USAGE_OUTSIDE_TENANT",
-                    severity="warning",
-                    category="runtime",
-                    impact="Validation failed; score set to 0",
-                    remediation="Terminate host-level GPU processes, make sure nvidia-smi doesn't show any running processes.",
+                event = render_message(
+                    Msg.GPU_OUTSIDE_TENANT,
+                    ctx=ctx,
+                    check_id=self.check_id,
                     what={
                         "expected_container": container_name,
                         "process_count": observation["process_count"],
@@ -167,8 +156,6 @@ class TenantEnforcementCheck:
                         "vram_utilization": observation["vram_utilization"],
                         "gpu_processes": gpu_processes,
                     },
-                    check_id=self.check_id,
-                    ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
                 )
                 return CheckResult(
                     passed=False,
@@ -188,11 +175,10 @@ class TenantEnforcementCheck:
             port_count,
         )
 
-        event = build_msg(
-            event="Executor already rented",
-            reason="RENTED",
-            severity="info",
-            category="policy",
+        event = render_message(
+            Msg.ALREADY_RENTED,
+            ctx=ctx,
+            check_id=self.check_id,
             impact=f"Reported rented score={job_score} (actual={actual_score})",
             remediation=f"No action needed.{warning_message}" if warning_message else "No action needed.",
             what={
@@ -201,8 +187,6 @@ class TenantEnforcementCheck:
                 "actual_score": actual_score,
                 "job_score": job_score,
             },
-            check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
         )
 
         return CheckResult(

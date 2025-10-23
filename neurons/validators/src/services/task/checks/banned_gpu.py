@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from ..models import build_msg
-from ..pipeline import CheckResult, Context
+from ..messages import BannedGpuMessages as Msg, render_message
+from ..pipeline = CheckResult, Context
 
 
 class BannedGpuCheck:
@@ -19,15 +19,10 @@ class BannedGpuCheck:
         current_uuids = ctx.state.gpu_uuids or ""
 
         if not current_uuids:
-            event = build_msg(
-                event="No GPU fingerprints captured",
-                reason="GPU_UUID_EMPTY",
-                severity="info",
-                category="env",
-                impact="Proceed",
-                remediation="Ensure the scrape script emits GPU UUIDs via nvidia-smi",
+            event = render_message(
+                Msg.UUID_EMPTY,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=True, event=event)
 
@@ -38,16 +33,11 @@ class BannedGpuCheck:
         is_banned = any(guid in banned_guids for guid in uuids)
 
         if is_banned:
-            event = build_msg(
-                event="GPU model temporarily ineligible",
-                reason="GPU_BANNED",
-                severity="warning",
-                category="policy",
-                impact="Score set to 0; verification cleared",
-                remediation="Swap to eligible GPUs or wait for policy updates before retrying validation.",
-                what={"gpu_uuids": current_uuids},
+            event = render_message(
+                Msg.GPU_BANNED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"gpu_uuids": current_uuids},
             )
             return CheckResult(
                 passed=False,
@@ -55,14 +45,10 @@ class BannedGpuCheck:
                 updates={"clear_verified_job_info": True},
             )
 
-        event = build_msg(
-            event="GPU fingerprints allowed",
-            reason="GPU_BANNED_CHECK_OK",
-            severity="info",
-            category="policy",
-            impact="Proceed",
-            what={"gpu_uuids": current_uuids},
+        event = render_message(
+            Msg.GPU_ALLOWED,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"gpu_uuids": current_uuids},
         )
         return CheckResult(passed=True, event=event)

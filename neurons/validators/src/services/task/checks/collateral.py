@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import build_msg
+from ..messages import CollateralMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -37,31 +37,24 @@ class CollateralCheck:
         )
 
         if collateral_deposited:
-            event = build_msg(
-                event="Collateral verified",
-                reason="COLLATERAL_OK",
-                severity="info",
-                category="policy",
-                impact="Proceed",
-                what={"collateral_deposited": True, "contract_version": contract_version},
+            event = render_message(
+                Msg.VERIFIED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"collateral_deposited": True, "contract_version": contract_version},
             )
         else:
-            event = build_msg(
-                event="No collateral deposited",
-                reason="COLLATERAL_MISSING",
-                severity="warning",
-                category="policy",
-                impact="Score may be reduced or set to 0 based on policy",
-                remediation=(
-                    f"Deposit collateral for this executor. Error: {error_message}"
-                    if error_message
-                    else "Deposit collateral for this executor"
-                ),
-                what={"collateral_deposited": False, "error_message": error_message},
+            remediation = (
+                f"Deposit collateral for this executor. Error: {error_message}"
+                if error_message
+                else Msg.MISSING.remediation
+            )
+            event = render_message(
+                Msg.MISSING,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"collateral_deposited": False, "error_message": error_message},
+                remediation=remediation,
             )
 
         passed = collateral_deposited or not self.fatal

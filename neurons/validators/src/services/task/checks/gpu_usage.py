@@ -1,4 +1,4 @@
-from ..models import build_msg
+from ..messages import GpuUsageMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from services.const import GPU_MEMORY_UTILIZATION_LIMIT, GPU_UTILIZATION_LIMIT
 
@@ -16,28 +16,19 @@ class GpuUsageCheck:
         violation = _find_violation(gpu_details, gpu_processes)
 
         if violation is None:
-            event = build_msg(
-                event="GPU usage within limits",
-                reason="GPU_USAGE_OK",
-                severity="info",
-                category="runtime",
-                impact="Proceed",
-                what={"process_count": len(gpu_processes)},
+            event = render_message(
+                Msg.USAGE_OK,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"process_count": len(gpu_processes)},
             )
             return CheckResult(passed=True, event=event)
 
-        event = build_msg(
-            event="GPU busy outside validator",
-            reason="GPU_USAGE_HIGH",
-            severity="warning",
-            category="runtime",
-            impact="Validation skipped; score set to 0",
-            remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
-            what=violation,
+        event = render_message(
+            Msg.USAGE_HIGH,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what=violation,
         )
         return CheckResult(passed=False, event=event)
 

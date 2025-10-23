@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from services.const import UNRENTED_MULTIPLIER
 
-from ..models import build_msg
+from ..messages import FinalizeMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -26,11 +26,11 @@ class FinalizeCheck:
         else:
             remediation = "No action needed." if success else "Address issues."
 
-        event = build_msg(
-            event="Validation task completed",
-            reason="VALIDATION_COMPLETED",
+        event = render_message(
+            Msg.COMPLETED,
+            ctx=ctx,
+            check_id=self.check_id,
             severity=severity,
-            category="runtime",
             impact=f"Job score={ctx.job_score}, actual score={ctx.score}",
             remediation=remediation,
             what={
@@ -40,8 +40,6 @@ class FinalizeCheck:
                 "unrented_multiplier": UNRENTED_MULTIPLIER,
                 "sysbox_runtime": ctx.state.sysbox_runtime,
             },
-            check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
         )
 
         return CheckResult(

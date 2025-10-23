@@ -5,7 +5,7 @@ import uuid
 
 from bittensor import Keypair
 
-from ..models import build_msg
+from ..messages import StartGpuMonitorMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -29,19 +29,14 @@ class StartGPUMonitorCheck:
         script_relative_path = ctx.config.gpu_monitor_script_relative
 
         if not isinstance(validator_keypair, Keypair) or not compute_rest_app_url:
-            event = build_msg(
-                event="GPU monitor configuration missing",
-                reason="MONITOR_CONFIG_MISSING",
-                severity="error",
-                category="prep",
-                impact="Validation halted",
-                remediation="Validator bug: missing monitor configuration in context",
+            event = render_message(
+                Msg.CONFIG_MISSING,
+                ctx=ctx,
+                check_id=self.check_id,
                 what={
                     "has_validator_keypair": isinstance(validator_keypair, Keypair),
                     "compute_rest_app_url": compute_rest_app_url,
                 },
-                check_id=self.check_id,
-                ctx={"executor_uuid": executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=False, event=event)
 
@@ -51,15 +46,11 @@ class StartGPUMonitorCheck:
         check_res = await runner.run(check_cmd, timeout=10, retryable=False)
 
         if check_res.stdout.strip():
-            event = build_msg(
-                event="GPU monitor already running",
-                reason="MONITOR_RUNNING",
-                severity="info",
-                category="prep",
-                impact="Proceed",
-                what={"script_path": script_path},
+            event = render_message(
+                Msg.ALREADY_RUNNING,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"script_path": script_path},
             )
             return CheckResult(passed=True, event=event)
 
@@ -81,27 +72,18 @@ class StartGPUMonitorCheck:
         start_res = await runner.run(start_cmd, timeout=50, retryable=False)
 
         if start_res.success:
-            event = build_msg(
-                event="GPU monitor started",
-                reason="MONITOR_STARTED",
-                severity="info",
-                category="prep",
-                impact="Proceed with monitoring enabled",
-                what={"script_path": script_path, "command_id": start_res.command_id},
+            event = render_message(
+                Msg.STARTED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"script_path": script_path, "command_id": start_res.command_id},
             )
             return CheckResult(passed=True, event=event)
 
-        event = build_msg(
-            event="Failed to start GPU monitor",
-            reason="MONITOR_START_FAILED",
-            severity="warning",
-            category="prep",
-            impact="Validation continues without real-time GPU monitoring",
-            remediation="Check Python installation and script permissions on executor",
-            what={"exit_code": start_res.exit_code, "stderr": start_res.stderr[-400:]},
+        event = render_message(
+            Msg.START_FAILED,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"exit_code": start_res.exit_code, "stderr": start_res.stderr[-400:]},
         )
         return CheckResult(passed=False, event=event)

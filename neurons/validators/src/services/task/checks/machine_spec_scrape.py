@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
-from dataclasses import replace
-
-from ..models import build_msg
+from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
 from services.file_encrypt_service import ORIGINAL_KEYS
@@ -51,30 +50,20 @@ class MachineSpecScrapeCheck:
         remote_dir = ctx.state.remote_dir
 
         if not remote_dir:
-            event = build_msg(
-                event="Remote directory not set",
-                reason="MISSING_REMOTE_DIR",
-                severity="error",
-                category="prep",
-                impact="Cannot locate scrape script",
-                remediation="Internal error - UploadFilesCheck must run before MachineSpecScrapeCheck",
+            event = render_message(
+                Msg.REMOTE_DIR_MISSING,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=False, event=event)
 
         script_filename = ctx.config.machine_scrape_filename
         if not script_filename:
-            event = build_msg(
-                event="Machine scrape configuration missing",
-                reason="SCRAPE_CONFIG_MISSING",
-                severity="error",
-                category="prep",
-                impact="Validation halted",
-                remediation="Validator bug: missing scrape configuration in context",
-                what={"machine_scrape_filename": script_filename},
+            event = render_message(
+                Msg.CONFIG_MISSING,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"machine_scrape_filename": script_filename},
             )
             return CheckResult(passed=False, event=event)
 
@@ -83,41 +72,26 @@ class MachineSpecScrapeCheck:
 
         decrypt_service = ctx.services.ssh
         if not isinstance(decrypt_service, SSHService):
-            event = build_msg(
-                event="SSH service unavailable",
-                reason="SCRAPE_DECRYPT_MISSING",
-                severity="error",
-                category="prep",
-                impact="Validation halted",
-                remediation="Validator bug: missing SSH service in context",
-                what={},
+            event = render_message(
+                Msg.DECRYPT_MISSING,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=False, event=event)
 
         res = await runner.run(f"chmod +x {script_path} && {script_path}", timeout=timeout, retryable=False)
 
         if not res.success or not res.stdout.strip():
-            event = build_msg(
-                event="Machine specs scrape failed",
-                reason="SCRAPE_FAILED",
-                severity="error",
-                category="env",
-                impact="Validation halted — GPU unverified",
-                remediation=(
-                    f"Ensure the scrape script exists and is executable:\n"
-                    f"  chmod +x {script_path}\n"
-                    f"Check stderr and environment (Python deps) on the executor."
-                ),
+            event = render_message(
+                Msg.SCRAPE_FAILED,
+                ctx=ctx,
+                check_id=self.check_id,
                 what={
                     "command_id": res.command_id,
                     "exit_code": res.exit_code,
                     "duration_ms": res.duration_ms,
                     "stderr_tail": res.stderr[-400:],
                 },
-                check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=False, event=event)
 
@@ -141,18 +115,14 @@ class MachineSpecScrapeCheck:
             gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
             gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
 
-            event = build_msg(
-                event="Machine specs scraped",
-                reason="SCRAPE_OK",
-                severity="info",
-                category="env",
-                impact="Proceed",
+            event = render_message(
+                Msg.SCRAPE_OK,
+                ctx=ctx,
+                check_id=self.check_id,
                 what={
                     "gpu_count": gpu_count,
                     "gpu_model": gpu_model,
                 },
-                check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             updated_state = replace(
                 ctx.state,
@@ -170,15 +140,10 @@ class MachineSpecScrapeCheck:
             return CheckResult(passed=True, event=event, updates=updates)
 
         except Exception as exc:
-            event = build_msg(
-                event="Machine specs parse/decrypt failed",
-                reason="SCRAPE_PARSE_FAILED",
-                severity="error",
-                category="env",
-                impact="Validation halted — GPU unverified",
-                remediation="Confirm encryption key, payload, and repo versions on both validator and executor.",
-                what={"exception": str(exc)[:300], "stdout_head": res.stdout[:200]},
+            event = render_message(
+                Msg.SCRAPE_PARSE_FAILED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"exception": str(exc)[:300], "stdout_head": res.stdout[:200]},
             )
             return CheckResult(passed=False, event=event)

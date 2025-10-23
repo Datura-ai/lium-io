@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ..models import build_msg
+from ..messages import PortConnectivityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -18,14 +18,10 @@ class PortConnectivityCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         if ctx.rented:
-            event = build_msg(
-                event="Port connectivity skipped for rented executor",
-                reason="PORT_CONNECTIVITY_SKIPPED",
-                severity="info",
-                category="runtime",
-                impact="Proceed",
+            event = render_message(
+                Msg.SKIPPED_RENTED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=True, event=event)
 
@@ -34,15 +30,11 @@ class PortConnectivityCheck:
         extra = {**ctx.default_extra, "renting_in_progress": renting_in_progress}
 
         if renting_in_progress:
-            event = build_msg(
-                event="Renting already in progress",
-                reason="RENTING_IN_PROGRESS",
-                severity="info",
-                category="runtime",
-                impact="Proceed",
-                what={"renting_in_progress": True},
+            event = render_message(
+                Msg.RENTING_IN_PROGRESS,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"renting_in_progress": True},
             )
             return CheckResult(
                 passed=True,
@@ -51,15 +43,10 @@ class PortConnectivityCheck:
             )
 
         if not all([ctx.config.job_batch_id, ctx.config.port_private_key, ctx.config.port_public_key]):
-            event = build_msg(
-                event="Port connectivity configuration missing",
-                reason="PORT_CONNECTIVITY_CONFIG_MISSING",
-                severity="error",
-                category="runtime",
-                impact="Validation halted",
-                remediation="Validator bug: missing port verification config in context",
+            event = render_message(
+                Msg.CONFIG_MISSING,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=False, event=event)
 
@@ -75,16 +62,11 @@ class PortConnectivityCheck:
         )
 
         if not result.success:
-            event = build_msg(
-                event="Port verification failed",
-                reason="PORT_VERIFY_FAILED",
-                severity="error",
-                category="runtime",
-                impact="Score set to 0",
-                remediation="Check Docker access and port mappings, then retry validation.",
-                what={"details": result.log_text},
+            event = render_message(
+                Msg.VERIFY_FAILED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"details": result.log_text},
             )
             updated_state = replace(ctx.state, sysbox_runtime=result.sysbox_runtime)
             return CheckResult(
@@ -93,15 +75,11 @@ class PortConnectivityCheck:
                 updates={"default_extra": extra, "state": updated_state},
             )
 
-        event = build_msg(
-            event="Port verification completed",
-            reason="PORT_VERIFY_OK",
-            severity="info",
-            category="runtime",
-            impact="Proceed",
-            what={"message": result.log_text},
+        event = render_message(
+            Msg.VERIFY_OK,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"message": result.log_text},
         )
         updated_state = replace(ctx.state, sysbox_runtime=result.sysbox_runtime)
         return CheckResult(

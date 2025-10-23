@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import build_msg
+from ..messages import DuplicateExecutorMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 DUPLICATED_MACHINE_SET = "duplicated_machine:set"
@@ -23,19 +23,14 @@ class DuplicateExecutorCheck:
         )
 
         if is_duplicate:
-            event = build_msg(
-                event="Duplicate executor registration",
-                reason="EXECUTOR_DUPLICATE",
-                severity="warning",
-                category="policy",
-                impact="Score set to 0; verification cleared",
-                remediation="Ensure every executor has a unique UUID and deregister duplicates before retrying.",
+            event = render_message(
+                Msg.DUPLICATE,
+                ctx=ctx,
+                check_id=self.check_id,
                 what={
                     "executor_uuid": ctx.executor.uuid,
                     "miner_hotkey": ctx.miner_hotkey,
                 },
-                check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(
                 passed=False,
@@ -43,14 +38,10 @@ class DuplicateExecutorCheck:
                 updates={"clear_verified_job_info": True},
             )
 
-        event = build_msg(
-            event="Executor registration unique",
-            reason="EXECUTOR_NOT_DUPLICATE",
-            severity="info",
-            category="policy",
-            impact="Proceed",
-            what={"executor_uuid": ctx.executor.uuid},
+        event = render_message(
+            Msg.UNIQUE,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"executor_uuid": ctx.executor.uuid},
         )
         return CheckResult(passed=True, event=event)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import build_msg
+from ..messages import CapabilityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -18,15 +18,10 @@ class CapabilityCheck:
     async def run(self, ctx: Context) -> CheckResult:
         specs = ctx.state.specs
         if not specs:
-            event = build_msg(
-                event="GPU capability skipped (no specs)",
-                reason="GPU_VERIFY_SKIPPED",
-                severity="error",
-                category="env",
-                impact="Validation halted",
-                remediation="Run machine scrape before capability validation.",
+            event = render_message(
+                Msg.NO_SPECS,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=False, event=event)
 
@@ -46,26 +41,17 @@ class CapabilityCheck:
             failure_reason = None
 
         if ok:
-            event = build_msg(
-                event="GPU capability validated",
-                reason="GPU_VERIFY_OK",
-                severity="info",
-                category="env",
-                impact="Proceed",
+            event = render_message(
+                Msg.VERIFY_OK,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=True, event=event)
 
-        event = build_msg(
-            event="GPU capability verification failed",
-            reason="GPU_VERIFY_FAILED",
-            severity="error",
-            category="env",
-            impact="Score set to 0",
-            remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
-            what={"error": failure_reason} if failure_reason else {},
+        event = render_message(
+            Msg.VERIFY_FAILED,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"error": failure_reason} if failure_reason else {},
         )
         return CheckResult(passed=False, event=event)

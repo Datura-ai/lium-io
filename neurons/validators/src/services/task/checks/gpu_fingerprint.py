@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import build_msg
+from ..messages import GpuFingerprintMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -24,22 +24,14 @@ class GpuFingerprintCheck:
             current_sorted = sorted(u for u in current_uuids.split(",") if u)
 
             if prev_sorted != current_sorted:
-                event = build_msg(
-                    event="GPU fingerprints changed",
-                    reason="GPU_UUID_CHANGED",
-                    severity="warning",
-                    category="env",
-                    impact="Verification reset; score set to 0",
-                    remediation=(
-                        "Ensure the same physical GPUs remain attached and stable. Power-cycling or PCIe "
-                        "reordering can change UUID order; keep the mapping consistent."
-                    ),
+                event = render_message(
+                    Msg.UUID_CHANGED,
+                    ctx=ctx,
+                    check_id=self.check_id,
                     what={
                         "previous": prev_uuids,
                         "current": current_uuids,
                     },
-                    check_id=self.check_id,
-                    ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
                 )
                 return CheckResult(
                     passed=False,
@@ -47,14 +39,10 @@ class GpuFingerprintCheck:
                     updates={"clear_verified_job_info": True},
                 )
 
-        event = build_msg(
-            event="GPU fingerprints stable",
-            reason="GPU_UUID_OK",
-            severity="info",
-            category="env",
-            impact="Proceed",
-            what={"gpu_uuids": current_uuids},
+        event = render_message(
+            Msg.UUID_OK,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"gpu_uuids": current_uuids},
         )
         return CheckResult(passed=True, event=event)

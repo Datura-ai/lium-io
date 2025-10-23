@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import build_msg
+from ..messages import GpuCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -23,43 +23,27 @@ class GpuCountCheck:
         max_gpu_count = ctx.config.max_gpu_count
 
         if max_gpu_count is None:
-            event = build_msg(
-                event="GPU count policy missing",
-                reason="GPU_COUNT_POLICY_MISSING",
-                severity="error",
-                category="policy",
-                impact="Validation halted",
-                remediation="Validator bug: max GPU count not configured in context",
-                what={"observed_count": gpu_count},
+            event = render_message(
+                Msg.POLICY_MISSING,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"observed_count": gpu_count},
             )
             return CheckResult(passed=False, event=event)
 
         if gpu_count > max_gpu_count:
-            event = build_msg(
-                event="GPU count exceeds policy",
-                reason="GPU_COUNT_EXCEEDS_MAX",
-                severity="error",
-                category="policy",
-                impact="Score set to 0",
-                remediation=(
-                    f"Reduce visible GPU count to {max_gpu_count} or less (e.g., use CUDA_VISIBLE_DEVICES environment variable)"
-                ),
-                what={"count": gpu_count, "max_allowed": max_gpu_count},
+            event = render_message(
+                Msg.COUNT_EXCEEDS,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"count": gpu_count, "max_allowed": max_gpu_count},
             )
             return CheckResult(passed=False, event=event)
 
-        event = build_msg(
-            event="GPU count within limits",
-            reason="GPU_COUNT_OK",
-            severity="info",
-            category="policy",
-            impact="Proceed",
-            what={"count": gpu_count, "max_allowed": max_gpu_count},
+        event = render_message(
+            Msg.COUNT_OK,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"count": gpu_count, "max_allowed": max_gpu_count},
         )
         return CheckResult(passed=True, event=event)

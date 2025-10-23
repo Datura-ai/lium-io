@@ -3,9 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
-from dataclasses import replace
 
-from ..models import build_msg
+from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -22,28 +21,19 @@ class VerifyXCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         if not ctx.config.verifyx_enabled:
-            event = build_msg(
-                event="VerifyX validation skipped",
-                reason="VERIFYX_DISABLED",
-                severity="info",
-                category="env",
-                impact="Proceed",
+            event = render_message(
+                Msg.DISABLED,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=True, event=event)
         verifyx_service = ctx.services.verifyx
         specs = ctx.state.specs
         if not specs:
-            event = build_msg(
-                event="VerifyX validation skipped (no specs)",
-                reason="VERIFYX_NO_SPECS",
-                severity="error",
-                category="env",
-                impact="Validation halted",
-                remediation="Run the machine scrape before executing VerifyX.",
+            event = render_message(
+                Msg.NO_SPECS,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=False, event=event)
         result = await verifyx_service.validate_verifyx_and_process_job(
@@ -65,15 +55,11 @@ class VerifyXCheck:
                 }
             )
 
-            event = build_msg(
-                event="VerifyX validation passed",
-                reason="VERIFYX_OK",
-                severity="info",
-                category="env",
-                impact="Proceed",
-                what={"verifyx_success": True},
+            event = render_message(
+                Msg.VERIFY_SUCCESS,
+                ctx=ctx,
                 check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+                what={"verifyx_success": True},
             )
             updated_state = replace(ctx.state, specs=updated_specs)
 
@@ -90,16 +76,11 @@ class VerifyXCheck:
             errors = result.data.get("errors")
         errors = errors or result.error or "Unknown errors"
 
-        event = build_msg(
-            event="VerifyX validation failed",
-            reason="VERIFYX_FAILED",
-            severity="error",
-            category="env",
-            impact="Score set to 0",
-            remediation="Run VerifyX locally to debug network, disk, and RAM probes.",
-            what={"errors": errors},
+        event = render_message(
+            Msg.VERIFY_FAILED,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"errors": errors},
         )
         return CheckResult(passed=False, event=event)
 

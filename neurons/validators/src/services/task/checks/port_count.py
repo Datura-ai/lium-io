@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..models import build_msg
+from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX
 from services.const import MIN_PORT_COUNT
@@ -31,15 +31,11 @@ class PortCountCheck:
             port_maps_bytes = await redis_service.lrange(port_map_key)
             port_count = len([tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes])
 
-        event = build_msg(
-            event="Port availability inspected",
-            reason="PORT_COUNT_RECORDED",
-            severity="info",
-            category="runtime",
-            impact="Proceed",
-            what={"available_port_count": port_count},
+        event = render_message(
+            Msg.PORT_COUNT_RECORDED,
+            ctx=ctx,
             check_id=self.check_id,
-            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            what={"available_port_count": port_count},
         )
 
         return CheckResult(
