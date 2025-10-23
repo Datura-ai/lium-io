@@ -17,7 +17,6 @@ class ContextServices:
     validation: Any
     verifyx: Any
     connectivity: Any
-    validator_keypair: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +27,7 @@ class ContextConfig:
     machine_scrape_filename: str
     machine_scrape_timeout: int
     obfuscation_keys: Any
+    validator_keypair: Optional[Any] = None
 
 
 @dataclass(frozen=True)

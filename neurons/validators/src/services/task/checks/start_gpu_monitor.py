@@ -24,7 +24,7 @@ class StartGPUMonitorCheck:
         runner = ctx.runner
         executor = ctx.executor
 
-        validator_keypair = ctx.services.validator_keypair
+        validator_keypair = ctx.config.validator_keypair
         compute_rest_app_url = ctx.config.compute_rest_app_url
         script_relative_path = ctx.config.gpu_monitor_script_relative
 

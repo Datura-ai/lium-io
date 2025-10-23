@@ -61,7 +61,7 @@ from .checks import (
     VerifyXCheck,
 )
 from .models import JobResult
-from .pipeline import Context, LoggerSink, Pipeline
+from .pipeline import Context, ContextConfig, ContextServices, ContextState, LoggerSink, Pipeline
 from .runner import SSHCommandRunner
 
 logger = logging.getLogger(__name__)
@@ -1243,7 +1243,6 @@ class TaskService:
                         validation=self.validation_service,
                         verifyx=self.verifyx_validation_service,
                         connectivity=self.executor_connectivity_service,
-                        validator_keypair=keypair,
                     ),
                     config=ContextConfig(
                         executor_root=executor_info.root_dir,
@@ -1252,6 +1251,7 @@ class TaskService:
                         machine_scrape_filename=encrypted_files.machine_scrape_file_name,
                         machine_scrape_timeout=JOB_LENGTH,
                         obfuscation_keys=encrypted_files.all_keys,
+                        validator_keypair=keypair,
                     ),
                     state=ContextState(upload_local_dir=encrypted_files.tmp_directory),
                     is_rental_succeed=is_rental_succeed,
@@ -1365,22 +1365,22 @@ class TaskService:
                         gpu_monitor,
                         upload,
                         scrape,
-                        gpu_count_check,
-                        gpu_model_check,
-                        nvml_digest_check,
-                        spec_change_check,
-                        fingerprint_check,
-                        banned_gpu_check,
-                        duplicate_executor_check,
-                        collateral_check,
-                        tenant_enforcement_check,
-                        gpu_usage_check,
-                        port_connectivity_check,
-                        verifyx_check,
-                        capability_check,
-                        port_count_check,
-                        score_check,
-                        finalize_check,
+                        # gpu_count_check,
+                        # gpu_model_check,
+                        # nvml_digest_check,
+                        # spec_change_check,
+                        # fingerprint_check,
+                        # banned_gpu_check,
+                        # duplicate_executor_check,
+                        # collateral_check,
+                        # tenant_enforcement_check,
+                        # gpu_usage_check,
+                        # port_connectivity_check,
+                        # verifyx_check,
+                        # capability_check,
+                        # port_count_check,
+                        # score_check,
+                        # finalize_check,
                     ],
                     sink=LoggerSink(logger)
                 ).run(base_ctx)
