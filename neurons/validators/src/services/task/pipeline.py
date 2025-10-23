@@ -2,7 +2,7 @@ import logging
 from typing import Any, List, Protocol, Tuple
 
 import asyncssh
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -29,6 +29,9 @@ class Context(BaseModel):
     encrypt_key: str | None = None
     remote_dir: str | None = None
     default_extra: dict[str, Any] = {}
+    services: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+    state: dict[str, Any] = Field(default_factory=dict)
     gpu_model_count: str | None = None
     gpu_uuids: str | None = None
     clear_verified_job_info: bool = False
@@ -51,9 +54,6 @@ class Context(BaseModel):
     log_status: str = "info"
     log_text: str | None = None
     success: bool = False
-    gpu_model_count: str | None = None
-    gpu_uuids: str | None = None
-    clear_verified_job_info: bool = False
 
 
 class Check(Protocol):

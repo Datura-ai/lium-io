@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+import uuid
 
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
@@ -16,24 +16,33 @@ class UploadFilesCheck:
     check_id = "prep.upload_validation_files"
     fatal = True
 
-    def __init__(
-        self,
-        *,
-        local_dir: str,
-        executor_root: str,
-        generate_random_name: Callable[[], str],
-    ):
-        self.local_dir = local_dir
-        self.executor_root = executor_root
-        self.generate_random_name = generate_random_name
-
     async def run(self, ctx: Context) -> CheckResult:
-        random_name = self.generate_random_name()
-        remote_dir = f"{self.executor_root}/{random_name}"
+        local_dir = ctx.state.get("upload_local_dir")
+        executor_root = ctx.config.get("executor_root")
+
+        if not local_dir or not executor_root:
+            event = build_msg(
+                event="Upload configuration missing",
+                reason="UPLOAD_CONFIG_MISSING",
+                severity="error",
+                category="prep",
+                impact="Validation halted",
+                remediation="Validator bug: missing upload metadata in context",
+                what={
+                    "local_dir": local_dir,
+                    "executor_root": executor_root,
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        random_name = uuid.uuid4().hex
+        remote_dir = f"{executor_root.rstrip('/')}/{random_name}"
 
         try:
             async with ctx.ssh.start_sftp_client() as sftp:
-                await sftp.put(self.local_dir, remote_dir, recurse=True)
+                await sftp.put(local_dir, remote_dir, recurse=True)
 
             event = build_msg(
                 event="Validation files uploaded",
@@ -41,11 +50,16 @@ class UploadFilesCheck:
                 severity="info",
                 category="prep",
                 impact="Proceed to validation",
-                what={"remote_dir": remote_dir, "local_dir": self.local_dir},
+                what={"remote_dir": remote_dir, "local_dir": local_dir},
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
-            return CheckResult(passed=True, event=event, updates={"remote_dir": remote_dir})
+            updated_state = {**ctx.state, "upload_remote_dir": remote_dir}
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={"remote_dir": remote_dir, "state": updated_state},
+            )
         except Exception as exc:
             event = build_msg(
                 event="Failed to upload validation files",

@@ -1246,6 +1246,20 @@ class TaskService:
                     settings={"version": settings.VERSION},
                     encrypt_key=encrypted_files.encrypt_key,
                     default_extra=default_extra,
+                    services={
+                        "ssh_service": self.ssh_service,
+                        "redis_service": self.redis_service,
+                        "collateral_contract_service": self.collateral_contract_service,
+                        "validation_service": self.validation_service,
+                        "verifyx_validation_service": self.verifyx_validation_service,
+                        "executor_connectivity_service": self.executor_connectivity_service,
+                    },
+                    config={
+                        "executor_root": executor_info.root_dir,
+                    },
+                    state={
+                        "upload_local_dir": encrypted_files.tmp_directory,
+                    },
                     is_rental_succeed=is_rental_succeed,
                 )
 
@@ -1254,13 +1268,7 @@ class TaskService:
                     compute_rest_app_url=settings.COMPUTE_REST_API_URL,
                 )
 
-                upload = UploadFilesCheck(
-                    local_dir=encrypted_files.tmp_directory,
-                    executor_root=executor_info.root_dir,
-                    generate_random_name=lambda: self.ssh_service.generate_random_string(
-                        length=random.randint(5, 15), string_only=True
-                    ),
-                )
+                upload = UploadFilesCheck()
 
                 scrape = MachineSpecScrapeCheck(
                     script_filename=encrypted_files.machine_scrape_file_name,
