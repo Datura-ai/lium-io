@@ -20,22 +20,32 @@ class StartGPUMonitorCheck:
     check_id = "prep.start_gpu_monitor"
     fatal = False
 
-    def __init__(
-        self,
-        *,
-        validator_keypair: Keypair,
-        compute_rest_app_url: str | None,
-        script_relative_path: str = "src/gpus_utility.py",
-    ):
-        self.validator_keypair = validator_keypair
-        self.compute_rest_app_url = compute_rest_app_url
-        self.script_relative_path = script_relative_path
-
     async def run(self, ctx: Context) -> CheckResult:
         runner = ctx.runner
         executor = ctx.executor
 
-        script_path = f"{executor.root_dir}/{self.script_relative_path}"
+        validator_keypair = ctx.services.get("validator_keypair")
+        compute_rest_app_url = ctx.config.get("compute_rest_app_url")
+        script_relative_path = ctx.config.get("gpu_monitor_script_relative", "src/gpus_utility.py")
+
+        if not isinstance(validator_keypair, Keypair) or not compute_rest_app_url:
+            event = build_msg(
+                event="GPU monitor configuration missing",
+                reason="MONITOR_CONFIG_MISSING",
+                severity="error",
+                category="prep",
+                impact="Validation halted",
+                remediation="Validator bug: missing monitor configuration in context",
+                what={
+                    "has_validator_keypair": isinstance(validator_keypair, Keypair),
+                    "compute_rest_app_url": compute_rest_app_url,
+                },
+                check_id=self.check_id,
+                ctx={"executor_uuid": executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        script_path = f"{executor.root_dir.rstrip('/')}/{script_relative_path.lstrip('/')}"
 
         check_cmd = f'ps aux | grep "python.*{script_path}" | grep -v grep'
         check_res = await runner.run(check_cmd, timeout=10, retryable=False)
@@ -58,10 +68,10 @@ class StartGPUMonitorCheck:
         program_id = str(uuid.uuid4())
         command_args: Dict[str, Any] = {
             "program_id": program_id,
-            "signature": f"0x{self.validator_keypair.sign(program_id.encode()).hex()}",
+            "signature": f"0x{validator_keypair.sign(program_id.encode()).hex()}",
             "executor_id": executor.uuid,
-            "validator_hotkey": self.validator_keypair.ss58_address,
-            "compute_rest_app_url": self.compute_rest_app_url,
+            "validator_hotkey": validator_keypair.ss58_address,
+            "compute_rest_app_url": compute_rest_app_url,
         }
 
         args_string = " ".join([f"--{k} {v}" for k, v in command_args.items()])

@@ -1253,9 +1253,12 @@ class TaskService:
                         "validation_service": self.validation_service,
                         "verifyx_validation_service": self.verifyx_validation_service,
                         "executor_connectivity_service": self.executor_connectivity_service,
+                        "validator_keypair": keypair,
                     },
                     config={
                         "executor_root": executor_info.root_dir,
+                        "compute_rest_app_url": settings.COMPUTE_REST_API_URL,
+                        "gpu_monitor_script_relative": "src/gpus_utility.py",
                     },
                     state={
                         "upload_local_dir": encrypted_files.tmp_directory,
@@ -1263,10 +1266,7 @@ class TaskService:
                     is_rental_succeed=is_rental_succeed,
                 )
 
-                gpu_monitor = StartGPUMonitorCheck(
-                    validator_keypair=keypair,
-                    compute_rest_app_url=settings.COMPUTE_REST_API_URL,
-                )
+                gpu_monitor = StartGPUMonitorCheck()
 
                 upload = UploadFilesCheck()
 
