@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..messages import BannedGpuMessages as Msg, render_message
-from ..pipeline = CheckResult, Context
+from ..pipeline import CheckResult, Context
 
 
 class BannedGpuCheck:
