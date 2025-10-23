@@ -1249,20 +1249,9 @@ class TaskService:
                     is_rental_succeed=is_rental_succeed,
                 )
 
-                # Generate command args for GPU monitor
-                program_id = str(uuid.uuid4())
-                command_args = {
-                    "program_id": program_id,
-                    "signature": f"0x{keypair.sign(program_id.encode()).hex()}",
-                    "executor_id": executor_info.uuid,
-                    "validator_hotkey": keypair.ss58_address,
-                    "compute_rest_app_url": settings.COMPUTE_REST_API_URL,
-                }
-
                 gpu_monitor = StartGPUMonitorCheck(
-                    script_path=f"{executor_info.root_dir}/src/gpus_utility.py",
-                    command_args=command_args,
-                    executor_info=executor_info,
+                    validator_keypair=keypair,
+                    compute_rest_app_url=settings.COMPUTE_REST_API_URL,
                 )
 
                 upload = UploadFilesCheck(

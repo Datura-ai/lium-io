@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict
+import uuid
 
-from datura.requests.miner_requests import ExecutorSSHInfo
+from bittensor import Keypair
 
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
@@ -22,18 +23,21 @@ class StartGPUMonitorCheck:
     def __init__(
         self,
         *,
-        script_path: str,
-        command_args: Dict[str, Any],
-        executor_info: ExecutorSSHInfo,
+        validator_keypair: Keypair,
+        compute_rest_app_url: str | None,
+        script_relative_path: str = "src/gpus_utility.py",
     ):
-        self.script_path = script_path
-        self.command_args = command_args
-        self.executor_info = executor_info
+        self.validator_keypair = validator_keypair
+        self.compute_rest_app_url = compute_rest_app_url
+        self.script_relative_path = script_relative_path
 
     async def run(self, ctx: Context) -> CheckResult:
         runner = ctx.runner
+        executor = ctx.executor
 
-        check_cmd = f'ps aux | grep "python.*{self.script_path}" | grep -v grep'
+        script_path = f"{executor.root_dir}/{self.script_relative_path}"
+
+        check_cmd = f'ps aux | grep "python.*{script_path}" | grep -v grep'
         check_res = await runner.run(check_cmd, timeout=10, retryable=False)
 
         if check_res.stdout.strip():
@@ -43,7 +47,7 @@ class StartGPUMonitorCheck:
                 severity="info",
                 category="prep",
                 impact="Proceed",
-                what={"script_path": self.script_path},
+                what={"script_path": script_path},
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
@@ -51,9 +55,18 @@ class StartGPUMonitorCheck:
 
         await runner.run("pip install aiohttp click pynvml psutil", timeout=30, retryable=True)
 
-        args_string = " ".join([f"--{k} {v}" for k, v in self.command_args.items()])
+        program_id = str(uuid.uuid4())
+        command_args: Dict[str, Any] = {
+            "program_id": program_id,
+            "signature": f"0x{self.validator_keypair.sign(program_id.encode()).hex()}",
+            "executor_id": executor.uuid,
+            "validator_hotkey": self.validator_keypair.ss58_address,
+            "compute_rest_app_url": self.compute_rest_app_url,
+        }
+
+        args_string = " ".join([f"--{k} {v}" for k, v in command_args.items()])
         start_cmd = (
-            f"nohup {self.executor_info.python_path} {self.script_path} {args_string} > /dev/null 2>&1 &"
+            f"nohup {executor.python_path} {script_path} {args_string} > /dev/null 2>&1 &"
         )
         start_res = await runner.run(start_cmd, timeout=50, retryable=False)
 
@@ -64,7 +77,7 @@ class StartGPUMonitorCheck:
                 severity="info",
                 category="prep",
                 impact="Proceed with monitoring enabled",
-                what={"script_path": self.script_path, "command_id": start_res.command_id},
+                what={"script_path": script_path, "command_id": start_res.command_id},
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
