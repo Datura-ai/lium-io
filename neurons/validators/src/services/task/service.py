@@ -1277,15 +1277,7 @@ class TaskService:
 
                 banned_gpu_check = BannedGpuCheck()
 
-                async def _duplicate_checker(miner_hotkey: str, executor_uuid: str) -> bool:
-                    return await self.redis_service.is_elem_exists_in_set(
-                        DUPLICATED_MACHINE_SET,
-                        f"{miner_hotkey}:{executor_uuid}",
-                    )
-
-                duplicate_executor_check = DuplicateExecutorCheck(
-                    duplicate_checker=_duplicate_checker,
-                )
+                duplicate_executor_check = DuplicateExecutorCheck()
 
                 collateral_check = CollateralCheck(
                     collateral_service=self.collateral_contract_service,
@@ -1359,12 +1351,12 @@ class TaskService:
                         gpu_monitor,
                         upload,
                         scrape,
-                        # gpu_count_check,
-                        # gpu_model_check,
-                        # nvml_digest_check,
-                        # spec_change_check,
-                        # fingerprint_check,
-                        # banned_gpu_check,
+                        gpu_count_check,
+                        gpu_model_check,
+                        nvml_digest_check,
+                        spec_change_check,
+                        fingerprint_check,
+                        banned_gpu_check,
                         # duplicate_executor_check,
                         # collateral_check,
                         # tenant_enforcement_check,

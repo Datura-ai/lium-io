@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable
-
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
 
+DUPLICATED_MACHINE_SET = "duplicated_machine:set"
 
 class DuplicateExecutorCheck:
     """Ensure a miner is not registering the same executor UUID multiple times.
@@ -16,11 +15,12 @@ class DuplicateExecutorCheck:
     check_id = "executor.validate.duplicate"
     fatal = True
 
-    def __init__(self, *, duplicate_checker: Callable[[str, str], Awaitable[bool]]):
-        self.duplicate_checker = duplicate_checker
-
     async def run(self, ctx: Context) -> CheckResult:
-        is_duplicate = await self.duplicate_checker(ctx.miner_hotkey, ctx.executor.uuid)
+        redis_service = ctx.services.redis
+        is_duplicate = await redis_service.is_elem_exists_in_set(
+            DUPLICATED_MACHINE_SET,
+            f"{ctx.miner_hotkey}:{ctx.executor.uuid}",
+        )
 
         if is_duplicate:
             event = build_msg(
