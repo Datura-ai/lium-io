@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
-from services.const import AVAILABLE_PORT_MAPS_PREFIX, MIN_PORT_COUNT
+from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX
+from services.const import MIN_PORT_COUNT
 
 
 class PortCountCheck:

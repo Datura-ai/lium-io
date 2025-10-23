@@ -10,8 +10,8 @@ from ...const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     MIN_PORT_COUNT,
-    AVAILABLE_PORT_MAPS_PREFIX,
 )
+from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX
 
 
 def _has_gpu_process_outside_container(container_name: str, processes: Iterable[dict]) -> bool:

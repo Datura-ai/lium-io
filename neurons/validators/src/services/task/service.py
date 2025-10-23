@@ -4,7 +4,7 @@ import logging
 import random
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated, Any, Optional, Union
+from typing import Annotated, Any, Optional, Union, cast
 
 import asyncssh
 import bittensor
@@ -61,7 +61,15 @@ from .checks import (
     VerifyXCheck,
 )
 from .models import JobResult
-from .pipeline import Context, ContextConfig, ContextServices, ContextState, LoggerSink, Pipeline
+from .pipeline import (
+    Check,
+    Context,
+    ContextConfig,
+    ContextServices,
+    ContextState,
+    LoggerSink,
+    Pipeline,
+)
 from .runner import SSHCommandRunner
 
 logger = logging.getLogger(__name__)
@@ -1267,69 +1275,32 @@ class TaskService:
                     is_rental_succeed=is_rental_succeed,
                 )
 
-                gpu_monitor = StartGPUMonitorCheck()
-
-                upload = UploadFilesCheck()
-
-                scrape = MachineSpecScrapeCheck()
-
-                gpu_count_check = GpuCountCheck()
-
-                gpu_model_check = GpuModelValidCheck()
-
-                nvml_digest_check = NvmlDigestCheck()
-
-                spec_change_check = SpecChangeCheck()
-
-                fingerprint_check = GpuFingerprintCheck()
-
-                banned_gpu_check = BannedGpuCheck()
-
-                duplicate_executor_check = DuplicateExecutorCheck()
-
-                collateral_check = CollateralCheck()
-
-                tenant_enforcement_check = TenantEnforcementCheck()
-
-                gpu_usage_check = GpuUsageCheck()
-
-                port_connectivity_check = PortConnectivityCheck()
-
-                verifyx_check = VerifyXCheck()
-
-                capability_check = CapabilityCheck()
-
-                port_count_check = PortCountCheck()
-
-                score_check = ScoreCheck()
-
-                finalize_check = FinalizeCheck()
-
-                # Run pipeline
-                ok, events, last_context = await Pipeline(
+                checks = cast(
+                    list[Check],
                     [
-                        gpu_monitor,
-                        upload,
-                        scrape,
-                        gpu_count_check,
-                        gpu_model_check,
-                        nvml_digest_check,
-                        spec_change_check,
-                        fingerprint_check,
-                        banned_gpu_check,
-                        # duplicate_executor_check,
-                        # collateral_check,
-                        # tenant_enforcement_check,
-                        # gpu_usage_check,
-                        # port_connectivity_check,
-                        # verifyx_check,
-                        # capability_check,
-                        # port_count_check,
-                        # score_check,
-                        # finalize_check,
+                        StartGPUMonitorCheck(),
+                        UploadFilesCheck(),
+                        MachineSpecScrapeCheck(),
+                        GpuCountCheck(),
+                        GpuModelValidCheck(),
+                        NvmlDigestCheck(),
+                        SpecChangeCheck(),
+                        GpuFingerprintCheck(),
+                        BannedGpuCheck(),
+                        DuplicateExecutorCheck(),
+                        CollateralCheck(),
+                        TenantEnforcementCheck(),
+                        GpuUsageCheck(),
+                        PortConnectivityCheck(),
+                        VerifyXCheck(),
+                        CapabilityCheck(),
+                        PortCountCheck(),
+                        ScoreCheck(),
+                        FinalizeCheck(),
                     ],
-                    sink=LoggerSink(logger)
-                ).run(base_ctx)
+                )
+
+                ok, events, last_context = await Pipeline(checks, sink=LoggerSink(logger)).run(base_ctx)
 
                 def _resolve_reason(reason_value: str | None) -> ResetVerifiedJobReason:
                     if not reason_value:
