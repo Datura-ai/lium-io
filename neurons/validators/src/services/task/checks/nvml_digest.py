@@ -19,8 +19,8 @@ class NvmlDigestCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         digest_map = ctx.config.nvml_digest_map or LIB_NVIDIA_ML_DIGESTS
-        specs = ctx.specs or {}
-        gpu_info = specs.get("gpu", {}) or {}
+        specs = ctx.state.specs
+        gpu_info = specs.get("gpu", {})
         driver_version = gpu_info.get("driver") or ""
         lib_digest = specs.get("md5_checksums", {}).get("libnvidia_ml", "") or ""
 

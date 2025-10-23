@@ -17,7 +17,7 @@ class GpuFingerprintCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         prev_uuids = (ctx.verified or {}).get("uuids") or ""
-        current_uuids = ctx.gpu_uuids or ""
+        current_uuids = ctx.state.gpu_uuids or ""
 
         if prev_uuids and current_uuids:
             prev_sorted = sorted(u for u in prev_uuids.split(",") if u)

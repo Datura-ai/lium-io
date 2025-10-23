@@ -32,8 +32,13 @@ class GpuModelValidCheck:
             return CheckResult(passed=False, event=event)
 
         gpu_model_rates_map = gpu_model_rates
-        gpu_count = ctx.specs.get("gpu", {}).get("count", 0)
-        gpu_details = ctx.specs.get("gpu", {}).get("details", [])
+        specs = ctx.state.specs
+        gpu_count = ctx.state.gpu_count
+        if gpu_count is None:
+            gpu_count = specs.get("gpu", {}).get("count", 0)
+        gpu_details = ctx.state.gpu_details
+        if not gpu_details:
+            gpu_details = specs.get("gpu", {}).get("details", [])
 
         gpu_model = None
         if gpu_count > 0 and len(gpu_details) > 0:

@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Optional, Protocol, Tuple
 
 import asyncssh
@@ -30,7 +30,7 @@ class ContextConfig:
     obfuscation_keys: Any
     validator_keypair: Optional[Any] = None
     max_gpu_count: Optional[int] = None
-    gpu_model_rates: Optional[dict] = None
+    gpu_model_rates: Optional[dict[str, Any]] = None
     nvml_digest_map: Optional[dict[str, str]] = None
 
 
@@ -38,6 +38,15 @@ class ContextConfig:
 class ContextState:
     upload_local_dir: Optional[str] = None
     upload_remote_dir: Optional[str] = None
+    remote_dir: Optional[str] = None
+    specs: dict[str, Any] = field(default_factory=dict)
+    gpu_model: Optional[str] = None
+    gpu_count: Optional[int] = None
+    gpu_details: list[dict] = field(default_factory=list)
+    gpu_processes: list[dict] = field(default_factory=list)
+    sysbox_runtime: bool = False
+    gpu_model_count: Optional[str] = None
+    gpu_uuids: Optional[str] = None
 
 
 class CheckResult(BaseModel):
@@ -53,24 +62,15 @@ class Context(BaseModel):
     miner_hotkey: str
     ssh: asyncssh.SSHClientConnection
     runner: Any
-    specs: dict = {}
     verified: dict = {}
     settings: dict = {}
     encrypt_key: str | None = None
-    remote_dir: str | None = None
     default_extra: dict[str, Any] = {}
     services: ContextServices
     config: ContextConfig
     state: ContextState = Field(default_factory=ContextState)
-    gpu_model_count: str | None = None
-    gpu_uuids: str | None = None
     clear_verified_job_info: bool = False
     clear_verified_job_reason: str | None = None
-    gpu_model: str | None = None
-    gpu_count: int = 0
-    gpu_details: list[dict] = []
-    gpu_processes: list[dict] = []
-    sysbox_runtime: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False

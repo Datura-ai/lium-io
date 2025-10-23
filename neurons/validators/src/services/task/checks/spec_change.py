@@ -17,7 +17,7 @@ class SpecChangeCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         prev_spec = (ctx.verified or {}).get("spec") or ""
-        current_spec = ctx.gpu_model_count or ""
+        current_spec = ctx.state.gpu_model_count or ""
 
         if prev_spec and current_spec and prev_spec != current_spec:
             event = build_msg(

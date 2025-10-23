@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Awaitable, Callable
 
 from ..models import build_msg
@@ -71,7 +72,7 @@ class PortConnectivityCheck:
             ctx.executor,
             self.private_key,
             self.public_key,
-            ctx.sysbox_runtime,
+            ctx.state.sysbox_runtime,
         )
 
         if not result.success:
@@ -86,10 +87,11 @@ class PortConnectivityCheck:
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
+            updated_state = replace(ctx.state, sysbox_runtime=result.sysbox_runtime)
             return CheckResult(
                 passed=False,
                 event=event,
-                updates={"default_extra": extra, "sysbox_runtime": result.sysbox_runtime},
+                updates={"default_extra": extra, "state": updated_state},
             )
 
         event = build_msg(
@@ -102,11 +104,12 @@ class PortConnectivityCheck:
             check_id=self.check_id,
             ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
         )
+        updated_state = replace(ctx.state, sysbox_runtime=result.sysbox_runtime)
         return CheckResult(
             passed=True,
             event=event,
             updates={
                 "default_extra": extra,
-                "sysbox_runtime": result.sysbox_runtime,
+                "state": updated_state,
             },
         )

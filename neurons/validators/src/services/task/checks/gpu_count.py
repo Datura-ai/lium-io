@@ -16,7 +16,10 @@ class GpuCountCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        gpu_count = ctx.specs.get("gpu", {}).get("count", 0)
+        specs = ctx.state.specs
+        gpu_count = ctx.state.gpu_count
+        if gpu_count is None:
+            gpu_count = specs.get("gpu", {}).get("count", 0)
         max_gpu_count = ctx.config.max_gpu_count
 
         if max_gpu_count is None:

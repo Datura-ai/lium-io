@@ -155,11 +155,11 @@ class TenantEnforcementCheck:
                 },
             )
 
-        gpu_processes = list(ctx.gpu_processes or [])
+        gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(container_name, gpu_processes)
 
         if not rented_machine.get("owner_flag", False) and gpu_running_outside:
-            gpu_details = ctx.gpu_details or []
+            gpu_details = ctx.state.gpu_details
             if not _is_gpu_usage_within_limits(gpu_details, gpu_processes):
                 observation = _gpu_usage_violation_details(gpu_details, gpu_processes)
                 event = build_msg(
@@ -188,7 +188,7 @@ class TenantEnforcementCheck:
         port_count = await self.port_counter(ctx.miner_hotkey, ctx.executor.uuid)
 
         actual_score, job_score, warning_message = self.score_calculator(
-            ctx.gpu_model or "",
+            ctx.state.gpu_model or "",
             ctx.collateral_deposited,
             ctx.is_rental_succeed,
             ctx.contract_version or "",

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 
 from ..models import build_msg
-from ..pipeline import CheckResult, Context, ContextState
+from ..pipeline import CheckResult, Context
 
 
 class UploadFilesCheck:
@@ -54,14 +55,15 @@ class UploadFilesCheck:
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
-            updated_state = ContextState(
-                upload_local_dir=ctx.state.upload_local_dir,
+            updated_state = replace(
+                ctx.state,
                 upload_remote_dir=remote_dir,
+                remote_dir=remote_dir,
             )
             return CheckResult(
                 passed=True,
                 event=event,
-                updates={"remote_dir": remote_dir, "state": updated_state},
+                updates={"state": updated_state},
             )
         except Exception as exc:
             event = build_msg(

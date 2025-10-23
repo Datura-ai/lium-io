@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Awaitable, Callable
 
 from ..models import build_msg
@@ -42,7 +43,8 @@ class VerifyXCheck:
         result = await self.verifyx_runner(ctx)
 
         if result.data and result.data.get("success"):
-            updated_specs = dict(ctx.specs)
+            base_specs = ctx.state.specs
+            updated_specs = dict(base_specs)
             updated_specs.update(
                 {
                     "ram": result.data.get("ram", updated_specs.get("ram")),
@@ -61,11 +63,13 @@ class VerifyXCheck:
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
+            updated_state = replace(ctx.state, specs=updated_specs)
+
             return CheckResult(
                 passed=True,
                 event=event,
                 updates={
-                    "specs": updated_specs,
+                    "state": updated_state,
                 },
             )
 

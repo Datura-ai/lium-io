@@ -16,7 +16,7 @@ class BannedGpuCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        current_uuids = ctx.gpu_uuids or ""
+        current_uuids = ctx.state.gpu_uuids or ""
 
         if not current_uuids:
             event = build_msg(

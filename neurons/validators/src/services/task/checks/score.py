@@ -22,7 +22,7 @@ class ScoreCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         actual_score, job_score, warning_message = self.score_calculator(
-            ctx.gpu_model or "",
+            ctx.state.gpu_model or "",
             ctx.collateral_deposited,
             ctx.is_rental_succeed,
             ctx.contract_version or "",

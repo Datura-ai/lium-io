@@ -42,9 +42,12 @@ class GpuUsageCheck:
             )
             return CheckResult(passed=True, event=event)
 
+        gpu_details = ctx.state.gpu_details
+        gpu_processes = ctx.state.gpu_processes
+
         ok, log_msg = self.gpu_usage_checker(
-            ctx.gpu_details or [],
-            ctx.gpu_processes or [],
+            gpu_details,
+            gpu_processes,
             ctx.default_extra,
             self.rented,
         )
@@ -53,13 +56,13 @@ class GpuUsageCheck:
             event = build_msg(
                 event="GPU usage within limits",
                 reason="GPU_USAGE_OK",
-                severity="info",
-                category="runtime",
-                impact="Proceed",
-                what={"process_count": len(ctx.gpu_processes or [])},
-                check_id=self.check_id,
-                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
-            )
+            severity="info",
+            category="runtime",
+            impact="Proceed",
+            what={"process_count": len(gpu_processes)},
+            check_id=self.check_id,
+            ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+        )
             return CheckResult(passed=True, event=event)
 
         message = log_msg.message if isinstance(log_msg, StructuredMessage) else str(log_msg)

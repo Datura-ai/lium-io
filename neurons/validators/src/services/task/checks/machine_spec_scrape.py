@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from dataclasses import replace
+
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
@@ -46,7 +48,9 @@ class MachineSpecScrapeCheck:
     async def run(self, ctx: Context) -> CheckResult:
         runner: SSHCommandRunner = ctx.runner
 
-        if not ctx.remote_dir:
+        remote_dir = ctx.state.remote_dir
+
+        if not remote_dir:
             event = build_msg(
                 event="Remote directory not set",
                 reason="MISSING_REMOTE_DIR",
@@ -74,7 +78,7 @@ class MachineSpecScrapeCheck:
             )
             return CheckResult(passed=False, event=event)
 
-        script_path = f"{ctx.remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
+        script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
         decrypt_service = ctx.services.ssh
@@ -150,18 +154,19 @@ class MachineSpecScrapeCheck:
                 check_id=self.check_id,
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
-            updates = {
-                "specs": specs,
-                "gpu_model": gpu_model,
-                "gpu_count": gpu_count,
-                "gpu_details": gpu_details,
-                "gpu_processes": specs.get("gpu_processes", []) or [],
-                "sysbox_runtime": specs.get("sysbox_runtime", False) or False,
-            }
-            if gpu_model_count:
-                updates["gpu_model_count"] = gpu_model_count
-            if gpu_uuids:
-                updates["gpu_uuids"] = gpu_uuids
+            updated_state = replace(
+                ctx.state,
+                specs=specs,
+                gpu_model=gpu_model,
+                gpu_count=gpu_count,
+                gpu_details=gpu_details,
+                gpu_processes=specs.get("gpu_processes", []) or [],
+                sysbox_runtime=specs.get("sysbox_runtime", False) or False,
+                gpu_model_count=gpu_model_count,
+                gpu_uuids=gpu_uuids,
+            )
+
+            updates: dict[str, object] = {"state": updated_state}
             return CheckResult(passed=True, event=event, updates=updates)
 
         except Exception as exc:
