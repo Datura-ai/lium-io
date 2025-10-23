@@ -1242,6 +1242,9 @@ class TaskService:
                         validation=self.validation_service,
                         verifyx=self.verifyx_validation_service,
                         connectivity=self.executor_connectivity_service,
+                        shell=shell,
+                        port_mapping=self.port_mapping_dao,
+                        score_calculator=self.calc_scores,
                     ),
                     config=ContextConfig(
                         executor_root=executor_info.root_dir,
@@ -1254,6 +1257,11 @@ class TaskService:
                         max_gpu_count=MAX_GPU_COUNT,
                         gpu_model_rates=GPU_MODEL_RATES,
                         nvml_digest_map=LIB_NVIDIA_ML_DIGESTS,
+                        enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
+                        verifyx_enabled=settings.ENABLE_VERIFYX,
+                        port_private_key=private_key,
+                        port_public_key=public_key,
+                        job_batch_id=miner_info.job_batch_id,
                     ),
                     state=ContextState(upload_local_dir=encrypted_files.tmp_directory),
                     is_rental_succeed=is_rental_succeed,
@@ -1279,10 +1287,7 @@ class TaskService:
 
                 duplicate_executor_check = DuplicateExecutorCheck()
 
-                collateral_check = CollateralCheck(
-                    collateral_service=self.collateral_contract_service,
-                    enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
-                )
+                collateral_check = CollateralCheck()
 
                 async def _fetch_rented_machine() -> dict | None:
                     return await self.redis_service.get_rented_machine(executor_info)
@@ -1294,54 +1299,17 @@ class TaskService:
                     score_calculator=self.calc_scores,
                 )
 
-                gpu_usage_check = GpuUsageCheck(
-                    gpu_usage_checker=self.check_gpu_usage,
-                    rented=False,
-                )
+                gpu_usage_check = GpuUsageCheck()
 
-                async def _renting_checker(miner_hotkey: str, executor_uuid: str) -> bool:
-                    return await self.redis_service.renting_in_progress(miner_hotkey, executor_uuid)
+                port_connectivity_check = PortConnectivityCheck()
 
-                port_connectivity_check = PortConnectivityCheck(
-                    renting_checker=_renting_checker,
-                    verifier=self.executor_connectivity_service.verify_ports,
-                    private_key=private_key,
-                    public_key=public_key,
-                    job_batch_id=miner_info.job_batch_id,
-                )
+                verifyx_check = VerifyXCheck()
 
-                async def _run_verifyx(context: Context):
-                    return await self.verifyx_validation_service.validate_verifyx_and_process_job(
-                        shell=shell,
-                        executor_info=executor_info,
-                        default_extra=context.default_extra,
-                        machine_spec=context.specs,
-                    )
+                capability_check = CapabilityCheck()
 
-                verifyx_check = VerifyXCheck(
-                    verifyx_runner=_run_verifyx,
-                    enabled=settings.ENABLE_VERIFYX,
-                )
+                port_count_check = PortCountCheck()
 
-                async def _run_capability(context: Context) -> bool:
-                    return await self.validation_service.validate_gpu_model_and_process_job(
-                        ssh_client=context.ssh,
-                        executor_info=executor_info,
-                        default_extra=context.default_extra,
-                        machine_spec=context.specs,
-                    )
-
-                capability_check = CapabilityCheck(
-                    capability_runner=_run_capability,
-                )
-
-                port_count_check = PortCountCheck(
-                    port_counter=self.get_available_port_count,
-                )
-
-                score_check = ScoreCheck(
-                    score_calculator=self.calc_scores,
-                )
+                score_check = ScoreCheck()
 
                 finalize_check = FinalizeCheck()
 

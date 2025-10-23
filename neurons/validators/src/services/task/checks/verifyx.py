@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Awaitable, Callable
+from dataclasses import replace
 
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
@@ -18,17 +18,8 @@ class VerifyXCheck:
     check_id = "gpu.validate.verifyx"
     fatal = True
 
-    def __init__(
-        self,
-        *,
-        verifyx_runner: Callable[[Context], Awaitable[object]],
-        enabled: bool,
-    ):
-        self.verifyx_runner = verifyx_runner
-        self.enabled = enabled
-
     async def run(self, ctx: Context) -> CheckResult:
-        if not self.enabled:
+        if not ctx.config.verifyx_enabled:
             event = build_msg(
                 event="VerifyX validation skipped",
                 reason="VERIFYX_DISABLED",
@@ -39,8 +30,26 @@ class VerifyXCheck:
                 ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
             )
             return CheckResult(passed=True, event=event)
-
-        result = await self.verifyx_runner(ctx)
+        verifyx_service = ctx.services.verifyx
+        specs = ctx.state.specs
+        if not specs:
+            event = build_msg(
+                event="VerifyX validation skipped (no specs)",
+                reason="VERIFYX_NO_SPECS",
+                severity="error",
+                category="env",
+                impact="Validation halted",
+                remediation="Run the machine scrape before executing VerifyX.",
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+        result = await verifyx_service.validate_verifyx_and_process_job(
+            shell=ctx.services.shell,
+            executor_info=ctx.executor,
+            default_extra=ctx.default_extra,
+            machine_spec=specs,
+        )
 
         if result.data and result.data.get("success"):
             base_specs = ctx.state.specs

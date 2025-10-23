@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Protocol, Tuple
+from typing import Any, Callable, List, Optional, Protocol, Tuple
 
 import asyncssh
 from pydantic import BaseModel, Field
@@ -18,6 +18,9 @@ class ContextServices:
     validation: Any
     verifyx: Any
     connectivity: Any
+    shell: Any
+    port_mapping: Any
+    score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
 
 
 @dataclass(frozen=True)
@@ -32,6 +35,11 @@ class ContextConfig:
     max_gpu_count: Optional[int] = None
     gpu_model_rates: Optional[dict[str, Any]] = None
     nvml_digest_map: Optional[dict[str, str]] = None
+    enable_no_collateral: bool = False
+    verifyx_enabled: bool = False
+    port_private_key: Optional[str] = None
+    port_public_key: Optional[str] = None
+    job_batch_id: Optional[str] = None
 
 
 @dataclass(frozen=True)

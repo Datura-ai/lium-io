@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable
-
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
 
@@ -17,11 +15,35 @@ class CapabilityCheck:
     check_id = "gpu.validate.capability"
     fatal = True
 
-    def __init__(self, *, capability_runner: Callable[[Context], Awaitable[bool]]):
-        self.capability_runner = capability_runner
-
     async def run(self, ctx: Context) -> CheckResult:
-        ok = await self.capability_runner(ctx)
+        specs = ctx.state.specs
+        if not specs:
+            event = build_msg(
+                event="GPU capability skipped (no specs)",
+                reason="GPU_VERIFY_SKIPPED",
+                severity="error",
+                category="env",
+                impact="Validation halted",
+                remediation="Run machine scrape before capability validation.",
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        validation_service = ctx.services.validation
+
+        try:
+            ok = await validation_service.validate_gpu_model_and_process_job(
+                ssh_client=ctx.ssh,
+                executor_info=ctx.executor,
+                default_extra=ctx.default_extra,
+                machine_spec=specs,
+            )
+        except Exception as exc:
+            ok = False
+            failure_reason = str(exc)
+        else:
+            failure_reason = None
 
         if ok:
             event = build_msg(
@@ -42,6 +64,7 @@ class CapabilityCheck:
             category="env",
             impact="Score set to 0",
             remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
+            what={"error": failure_reason} if failure_reason else {},
             check_id=self.check_id,
             ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
         )

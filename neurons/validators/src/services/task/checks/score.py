@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Callable, Tuple
-
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
 
@@ -17,11 +15,9 @@ class ScoreCheck:
     check_id = "gpu.validate.score"
     fatal = False
 
-    def __init__(self, *, score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]):
-        self.score_calculator = score_calculator
-
     async def run(self, ctx: Context) -> CheckResult:
-        actual_score, job_score, warning_message = self.score_calculator(
+        score_calculator = ctx.services.score_calculator
+        actual_score, job_score, warning_message = score_calculator(
             ctx.state.gpu_model or "",
             ctx.collateral_deposited,
             ctx.is_rental_succeed,

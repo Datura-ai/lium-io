@@ -13,12 +13,13 @@ class CollateralCheck:
     """
 
     check_id = "gpu.validate.collateral"
-
-    def __init__(self, *, collateral_service, enable_no_collateral: bool):
-        self.collateral_service = collateral_service
-        self.fatal = not enable_no_collateral
+    fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
+        collateral_service = ctx.services.collateral
+        enable_no_collateral = ctx.config.enable_no_collateral
+        self.fatal = not enable_no_collateral
+
         specs = ctx.state.specs
         gpu_count = ctx.state.gpu_count
         if gpu_count is None:
@@ -28,7 +29,7 @@ class CollateralCheck:
             gpu_details = specs.get("gpu", {}).get("details", [])
         gpu_model = gpu_details[0].get("name") if gpu_details else None
 
-        collateral_deposited, error_message, contract_version = await self.collateral_service.is_eligible_executor(
+        collateral_deposited, error_message, contract_version = await collateral_service.is_eligible_executor(
             miner_hotkey=ctx.miner_hotkey,
             executor_uuid=ctx.executor.uuid,
             gpu_model=gpu_model,

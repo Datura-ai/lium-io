@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Awaitable, Callable
 
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
@@ -17,21 +16,6 @@ class PortConnectivityCheck:
     check_id = "executor.validate.port_connectivity"
     fatal = True
 
-    def __init__(
-        self,
-        *,
-        renting_checker: Callable[[str, str], Awaitable[bool]],
-        verifier: Callable[[object, str, str, object, str, str, bool], Awaitable[object]],
-        private_key: str,
-        public_key: str,
-        job_batch_id: str,
-    ):
-        self.renting_checker = renting_checker
-        self.verifier = verifier
-        self.private_key = private_key
-        self.public_key = public_key
-        self.job_batch_id = job_batch_id
-
     async def run(self, ctx: Context) -> CheckResult:
         if ctx.rented:
             event = build_msg(
@@ -45,7 +29,8 @@ class PortConnectivityCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        renting_in_progress = await self.renting_checker(ctx.miner_hotkey, ctx.executor.uuid)
+        redis_service = ctx.services.redis
+        renting_in_progress = await redis_service.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid)
         extra = {**ctx.default_extra, "renting_in_progress": renting_in_progress}
 
         if renting_in_progress:
@@ -65,13 +50,27 @@ class PortConnectivityCheck:
                 updates={"default_extra": extra, "renting_in_progress": True},
             )
 
-        result = await self.verifier(
+        if not all([ctx.config.job_batch_id, ctx.config.port_private_key, ctx.config.port_public_key]):
+            event = build_msg(
+                event="Port connectivity configuration missing",
+                reason="PORT_CONNECTIVITY_CONFIG_MISSING",
+                severity="error",
+                category="runtime",
+                impact="Validation halted",
+                remediation="Validator bug: missing port verification config in context",
+                check_id=self.check_id,
+                ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+            )
+            return CheckResult(passed=False, event=event)
+
+        connectivity_service = ctx.services.connectivity
+        result = await connectivity_service.verify_ports(
             ctx.ssh,
-            self.job_batch_id,
+            ctx.config.job_batch_id or "",
             ctx.miner_hotkey,
             ctx.executor,
-            self.private_key,
-            self.public_key,
+            ctx.config.port_private_key or "",
+            ctx.config.port_public_key or "",
             ctx.state.sysbox_runtime,
         )
 

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable
-
 from ..models import build_msg
 from ..pipeline import CheckResult, Context
+from services.const import AVAILABLE_PORT_MAPS_PREFIX, MIN_PORT_COUNT
 
 
 class PortCountCheck:
@@ -16,11 +15,20 @@ class PortCountCheck:
     check_id = "executor.validate.port_count"
     fatal = False
 
-    def __init__(self, *, port_counter: Callable[[str, str], Awaitable[int]]):
-        self.port_counter = port_counter
-
     async def run(self, ctx: Context) -> CheckResult:
-        port_count = await self.port_counter(ctx.miner_hotkey, ctx.executor.uuid)
+        port_mapping = ctx.services.port_mapping
+        redis_service = ctx.services.redis
+        executor_uuid = ctx.executor.uuid
+
+        try:
+            port_count = await port_mapping.get_successful_ports_count(executor_uuid)
+        except Exception:
+            port_count = 0
+
+        if port_count < MIN_PORT_COUNT:
+            port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{ctx.miner_hotkey}:{executor_uuid}"
+            port_maps_bytes = await redis_service.lrange(port_map_key)
+            port_count = len([tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes])
 
         event = build_msg(
             event="Port availability inspected",
