@@ -1,6 +1,7 @@
 import pytest
 
 from neurons.validators.src.services.task.checks.duplicate_executor import DuplicateExecutorCheck
+from neurons.validators.src.services.task.messages import DuplicateExecutorMessages as Msg
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -18,8 +19,8 @@ class DummyRedis:
 @pytest.mark.parametrize(
     "duplicates,expected_pass,expected_reason,expect_clear",
     [
-        (set(), True, "EXECUTOR_NOT_DUPLICATE", False),
-        ({"miner-hotkey:executor-123"}, False, "EXECUTOR_DUPLICATE", True),
+        (set(), True, Msg.UNIQUE.reason, False),
+        ({"miner-hotkey:executor-123"}, False, Msg.DUPLICATE.reason, True),
     ],
 )
 @pytest.mark.asyncio

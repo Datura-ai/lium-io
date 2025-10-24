@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from neurons.validators.src.services.task.checks.port_count import PortCountCheck
+from neurons.validators.src.services.task.messages import PortCountMessages as Msg
 from services.const import MIN_PORT_COUNT
 from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX
 
@@ -63,7 +64,7 @@ async def test_port_count_check(
     result = await PortCountCheck().run(ctx)
 
     assert result.passed is True
-    assert result.event.reason_code == "PORT_COUNT_RECORDED"
+    assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
     assert result.updates["port_count"] == expected_count
 
     if expect_redis_call:

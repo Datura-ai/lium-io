@@ -1,15 +1,16 @@
 import pytest
 
 from neurons.validators.src.services.task.checks.gpu_count import GpuCountCheck
+from neurons.validators.src.services.task.messages import GpuCountMessages as Msg
 from tests.helpers import build_context_config, build_services, build_state
 
 
 @pytest.mark.parametrize(
     "gpu_count,max_gpu_count,expected_pass,expected_reason",
     [
-        (2, 3, True, "GPU_COUNT_OK"),
-        (5, None, False, "GPU_COUNT_POLICY_MISSING"),
-        (5, 4, False, "GPU_COUNT_EXCEEDS_MAX"),
+        (2, 3, True, Msg.COUNT_OK.reason),
+        (5, None, False, Msg.POLICY_MISSING.reason),
+        (5, 4, False, Msg.COUNT_EXCEEDS.reason),
     ],
 )
 @pytest.mark.asyncio

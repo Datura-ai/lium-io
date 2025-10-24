@@ -1,6 +1,7 @@
 import pytest
 
 from neurons.validators.src.services.task.checks.nvml_digest import NvmlDigestCheck
+from neurons.validators.src.services.task.messages import NvmlDigestMessages as Msg
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -14,7 +15,7 @@ from tests.helpers import build_context_config, build_services, build_state
             "abc123",
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             True,
-            "NVML_DIGEST_OK",
+            Msg.DIGEST_OK.reason,
             False,
         ),
         # Matching digest - should pass
@@ -23,7 +24,7 @@ from tests.helpers import build_context_config, build_services, build_state
             "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f",
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             True,
-            "NVML_DIGEST_OK",
+            Msg.DIGEST_OK.reason,
             False,
         ),
         # Mismatched digest - should fail
@@ -32,7 +33,7 @@ from tests.helpers import build_context_config, build_services, build_state
             "wrong_digest_here",
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
-            "NVML_DIGEST_MISMATCH",
+            Msg.DIGEST_MISMATCH.reason,
             True,
         ),
         # Driver version not in map - should fail
@@ -41,7 +42,7 @@ from tests.helpers import build_context_config, build_services, build_state
             "any_digest",
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
-            "NVML_DIGEST_MISMATCH",
+            Msg.DIGEST_MISMATCH.reason,
             True,
         ),
         # Empty digest - should fail if driver version is known
@@ -50,7 +51,7 @@ from tests.helpers import build_context_config, build_services, build_state
             "",
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
-            "NVML_DIGEST_MISMATCH",
+            Msg.DIGEST_MISMATCH.reason,
             True,
         ),
     ],

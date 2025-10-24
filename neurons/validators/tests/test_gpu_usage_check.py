@@ -1,6 +1,7 @@
 import pytest
 
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
+from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -13,42 +14,42 @@ from tests.helpers import build_context_config, build_services, build_state
             [{"gpu_utilization": 10, "memory_utilization": 10}],
             [],
             True,
-            "GPU_USAGE_OK",
+            Msg.USAGE_OK.reason,
         ),
         # Usage within limits - should pass
         (
             [{"gpu_utilization": 3, "memory_utilization": 4}],
             [{"pid": 1234, "name": "test"}],
             True,
-            "GPU_USAGE_OK",
+            Msg.USAGE_OK.reason,
         ),
         # GPU utilization at limit (>= 5%) - should fail
         (
             [{"gpu_utilization": 5, "memory_utilization": 3}],
             [{"pid": 1234, "name": "test"}],
             False,
-            "GPU_USAGE_HIGH",
+            Msg.USAGE_HIGH.reason,
         ),
         # GPU utilization exceeds limit - should fail
         (
             [{"gpu_utilization": 10, "memory_utilization": 3}],
             [{"pid": 1234, "name": "test"}],
             False,
-            "GPU_USAGE_HIGH",
+            Msg.USAGE_HIGH.reason,
         ),
         # Memory utilization exceeds limit (> 5%) - should fail
         (
             [{"gpu_utilization": 3, "memory_utilization": 6}],
             [{"pid": 1234, "name": "test"}],
             False,
-            "GPU_USAGE_HIGH",
+            Msg.USAGE_HIGH.reason,
         ),
         # Both exceed limits - should fail
         (
             [{"gpu_utilization": 10, "memory_utilization": 10}],
             [{"pid": 1234, "name": "test"}, {"pid": 5678, "name": "test2"}],
             False,
-            "GPU_USAGE_HIGH",
+            Msg.USAGE_HIGH.reason,
         ),
     ],
 )

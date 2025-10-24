@@ -1,6 +1,7 @@
 import pytest
 
 from neurons.validators.src.services.task.checks.banned_gpu import BannedGpuCheck
+from neurons.validators.src.services.task.messages import BannedGpuMessages as Msg
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -16,9 +17,9 @@ class DummyRedis:
 @pytest.mark.parametrize(
     "gpu_uuids,banned_list,expected_pass,expected_reason,expect_clear",
     [
-        (None, [], True, "GPU_UUID_EMPTY", False),
-        ("abc123", ["abc123"], False, "GPU_BANNED", True),
-        ("abc123,def456", ["zzz"], True, "GPU_BANNED_CHECK_OK", False),
+        (None, [], True, Msg.UUID_EMPTY.reason, False),
+        ("abc123", ["abc123"], False, Msg.GPU_BANNED.reason, True),
+        ("abc123,def456", ["zzz"], True, Msg.GPU_ALLOWED.reason, False),
     ],
 )
 @pytest.mark.asyncio

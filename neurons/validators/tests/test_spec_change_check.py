@@ -1,6 +1,7 @@
 import pytest
 
 from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
+from neurons.validators.src.services.task.messages import SpecChangeMessages as Msg
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -8,9 +9,9 @@ from tests.helpers import build_context_config, build_services, build_state
 @pytest.mark.parametrize(
     "verified_spec,new_spec,expected_pass,expected_reason,expect_clear",
     [
-        ("", "model:2", True, "SPEC_UNCHANGED", False),
-        ("model:2", "model:2", True, "SPEC_UNCHANGED", False),
-        ("model:2", "model:4", False, "SPEC_CHANGED", True),
+        ("", "model:2", True, Msg.SPEC_UNCHANGED.reason, False),
+        ("model:2", "model:2", True, Msg.SPEC_UNCHANGED.reason, False),
+        ("model:2", "model:4", False, Msg.SPEC_CHANGED.reason, True),
     ],
 )
 @pytest.mark.asyncio

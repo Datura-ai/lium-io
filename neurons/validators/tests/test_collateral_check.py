@@ -1,6 +1,7 @@
 import pytest
 
 from neurons.validators.src.services.task.checks.collateral import CollateralCheck
+from neurons.validators.src.services.task.messages import CollateralMessages as Msg
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -33,9 +34,9 @@ class DummyCollateralService:
 @pytest.mark.parametrize(
     "deposited,error,enable_no_collateral,expected_pass,expected_reason",
     [
-        (True, None, False, True, "COLLATERAL_OK"),
-        (False, "insufficient bond", False, False, "COLLATERAL_MISSING"),
-        (False, None, True, True, "COLLATERAL_MISSING"),
+        (True, None, False, True, Msg.VERIFIED.reason),
+        (False, "insufficient bond", False, False, Msg.MISSING.reason),
+        (False, None, True, True, Msg.MISSING.reason),
     ],
 )
 @pytest.mark.asyncio

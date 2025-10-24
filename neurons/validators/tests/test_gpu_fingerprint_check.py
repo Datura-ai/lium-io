@@ -1,6 +1,7 @@
 import pytest
 
 from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFingerprintCheck
+from neurons.validators.src.services.task.messages import GpuFingerprintMessages as Msg
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -8,13 +9,13 @@ from tests.helpers import build_context_config, build_services, build_state
 @pytest.mark.parametrize(
     "prev_uuids,current_uuids,expected_pass,expected_reason,expect_clear",
     [
-        ("", "", True, "GPU_UUID_OK", False),
-        ("", "gpu-001", True, "GPU_UUID_OK", False),
-        ("gpu-001", "", True, "GPU_UUID_OK", False),
-        ("gpu-001,gpu-002", "gpu-001,gpu-002", True, "GPU_UUID_OK", False),
-        ("gpu-002,gpu-001", "gpu-001,gpu-002", True, "GPU_UUID_OK", False),  # sorted comparison
-        ("gpu-001,gpu-002", "gpu-001,gpu-003", False, "GPU_UUID_CHANGED", True),
-        ("gpu-001", "gpu-001,gpu-002", False, "GPU_UUID_CHANGED", True),
+        ("", "", True, Msg.UUID_OK.reason, False),
+        ("", "gpu-001", True, Msg.UUID_OK.reason, False),
+        ("gpu-001", "", True, Msg.UUID_OK.reason, False),
+        ("gpu-001,gpu-002", "gpu-001,gpu-002", True, Msg.UUID_OK.reason, False),
+        ("gpu-002,gpu-001", "gpu-001,gpu-002", True, Msg.UUID_OK.reason, False),  # sorted comparison
+        ("gpu-001,gpu-002", "gpu-001,gpu-003", False, Msg.UUID_CHANGED.reason, True),
+        ("gpu-001", "gpu-001,gpu-002", False, Msg.UUID_CHANGED.reason, True),
     ],
 )
 @pytest.mark.asyncio
