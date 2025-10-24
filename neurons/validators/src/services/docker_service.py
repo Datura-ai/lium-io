@@ -145,11 +145,14 @@ class DockerService:
 
         return mappings, jupyter_port_map
 
-    def assign_special_port(self, mappings: list[tuple[int, int, int]] , special_port: int) -> tuple[list[tuple[int, int, int]], tuple[int, int]]:
+    def assign_special_port(self, mappings: list[tuple[int, int, int]], special_port: int) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
         """
         if special_port already exists in the list. then just move it to the first position
         if it's not exists - take tha last element, change the first element to the special_port and put it to the first position.
         """
+        if not mappings:
+            return mappings, None
+
         element_index = len(mappings) - 1
         for i, line in enumerate(mappings):
             if line[0] == special_port:
