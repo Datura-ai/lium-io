@@ -32,6 +32,7 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
+    CustomOptions,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -634,14 +635,12 @@ class DockerService:
         )
 
         log_tag = "container_creation"
-        custom_options = payload.custom_options
 
         try:
+            custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
-            custom_internal_ports = custom_options.internal_ports if custom_options and custom_options.internal_ports else None
-            initial_port_count = custom_options.initial_port_count if custom_options and custom_options.initial_port_count else None
             port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_internal_ports, initial_port_count, payload.enable_jupyter
+                payload.miner_hotkey, payload.executor_id, custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
             )
 
             # Add profiler for port mappings generation
@@ -765,21 +764,8 @@ class DockerService:
                     ]
                 )
 
-                # Prepare extra options
-                sanitized_volumes = [
-                    volume for volume
-                    in (custom_options.volumes if custom_options and custom_options.volumes else [])
-                    if volume.strip()
-                ]
-
-                # volume_flags = (
-                #     " ".join([f"-v {volume}" for volume in sanitized_volumes])
-                #     if sanitized_volumes
-                #     else ""
-                # )
-
                 # Get the container path from the first volume
-                local_volume_path = sanitized_volumes[0].split(':')[-1] if sanitized_volumes else '/root'
+                local_volume_path = custom_options.volumes[0].split(':')[-1] if custom_options.volumes else '/root'
                 entrypoint_flag = (
                     f"--entrypoint {custom_options.entrypoint}"
                     if custom_options

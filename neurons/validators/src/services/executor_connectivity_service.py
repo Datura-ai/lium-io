@@ -389,14 +389,26 @@ class ExecutorConnectivityService:
             logger.error(_m(f"save to db failed: {e}", extra), exc_info=True)
 
     async def cleanup_docker_containers(self, ssh_client: SSHClientConnection, extra: dict = {}):
-        # Clean container_ prefixed containers
-        command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
+        executor_containers = [
+            'executor-watchtower-1',
+            'executor-executor-runner-1',
+            'executor-executor-1',
+            'executor-monitor-1',
+            'executor-db-1',
+            'executor-autoheal-1',
+        ]
+        if settings.DEBUG:
+            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
+        else:
+            command = '/usr/bin/docker ps -a --format "{{.Names}}"'
+
         result = await ssh_client.run(command)
         container_names = []
 
         if result.stdout.strip():
             container_names.extend(result.stdout.strip().split("\n"))
 
+        container_names = [container for container in container_names if container not in executor_containers]
         logger.info(_m(f"cleanup: found {len(container_names)} containers {container_names}", extra))
 
         if container_names:
