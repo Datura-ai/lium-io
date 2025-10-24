@@ -70,7 +70,7 @@ class PortMappingDao(BaseDao):
                     )
                     raise
 
-    async def clean_ports(self, executor_id: UUID, period_minutes: int = 60) -> int:
+    async def clean_ports(self, executor_id: UUID, period_minutes: int = 120) -> int:
         """delete ports older than period_minutes from DB"""
         async with self.get_session() as session:
             try:

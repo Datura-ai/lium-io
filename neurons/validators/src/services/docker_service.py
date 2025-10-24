@@ -89,8 +89,20 @@ class DockerService:
         try:
             # Get successful ports from database as dict {external_port: PortMapping}
             available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
+            if len(available_ports) < MIN_PORT_COUNT:
+                raise Exception("No enough ports found in database")
         except Exception as e:
-            logger.error(f"Error generating port mappings from database: {e}", exc_info=True)
+            logger.error(
+                _m(
+                    "Error generating port mappings from database",
+                    extra=get_extra_info({
+                        "miner_hotkey": miner_hotkey,
+                        "executor_id": executor_id,
+                        "error": str(e),
+                    }),
+                ),
+                exc_info=True,
+            )
             available_ports = await self.generate_port_mapping_from_redis(miner_hotkey, executor_id)
 
         if len(available_ports) < MIN_PORT_COUNT:
@@ -191,7 +203,17 @@ class DockerService:
                 )
             return mappings
         except Exception as e:
-            logger.error(f"Error generating port mappings from redis: {e}", exc_info=True)
+            logger.error(
+                _m(
+                    "Error generating port mappings from redis",
+                    extra=get_extra_info({
+                        "miner_hotkey": miner_hotkey,
+                        "executor_id": executor_id,
+                        "error": str(e),
+                    }),
+                ),
+                exc_info=True,
+            )
             return mappings
 
     async def execute_and_stream_logs(
@@ -640,7 +662,7 @@ class DockerService:
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
                 )
-            
+
             default_extra = {
                 **default_extra,
                 "jupyter_port_map": jupyter_port_map,
