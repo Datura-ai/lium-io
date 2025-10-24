@@ -22,6 +22,7 @@ from services.const import (
     PREFERRED_POD_PORTS,
     BATCH_PORT_TIMEOUT,
     BATCH_PORT_CONCURRENCY,
+    BATCH_HEALTH_CHECK_TIMEOUT,
 )
 from services.redis_service import (
     AVAILABLE_PORT_MAPS_PREFIX,
@@ -165,7 +166,18 @@ class ExecutorConnectivityService:
 
             logger.info(_m(f"batch: docker started {api_external}, wait health", extra))
             if not await self._docker_wait_for_health(executor_info.address, api_external, extra):
-                raise Exception(f"batch health check failed port={api_external}")
+                # Health check failed - run diagnostics
+                logger.error(_m(f"batch: health check failed, running diagnostics port={api_external}", extra))
+
+                diagnosis = await self._diagnose_container_status(ssh_client, container_name, extra)
+                port_info = await self._check_port_on_executor(ssh_client, api_internal, extra)
+
+                error_msg = (
+                    f"batch health check failed port={api_external} "
+                    f"container_running={diagnosis.get('is_running', False)} "
+                    f"port_listening={port_info.get('is_listening', False)}"
+                )
+                raise Exception(error_msg)
 
             logger.info(_m(f"batch: healthy {api_external}, verify {len(ports_to_check)} ports", extra))
             batch_size = 100
@@ -221,11 +233,51 @@ class ExecutorConnectivityService:
             error_msg = result.stderr.strip() if result.stderr else "Unknown error"
             raise Exception(f"batch docker start failed: {error_msg} port={api_external}")
 
+    async def _diagnose_container_status(
+        self, ssh_client: SSHClientConnection, container_name: str, extra: dict = {}
+    ) -> dict[str, Any]:
+        """Diagnose container status with detailed information"""
+        diagnosis = {
+            "status": None,
+            "logs": None,
+            "is_running": False,
+        }
+
+        try:
+            # Check container status
+            status_cmd = f'/usr/bin/docker ps -a --filter name={container_name} --format "{{{{.Status}}}}"'
+            status_result = await ssh_client.run(status_cmd)
+            if status_result.exit_status == 0 and status_result.stdout.strip():
+                diagnosis["status"] = status_result.stdout.strip()
+                diagnosis["is_running"] = "Up" in diagnosis["status"]
+                logger.info(_m(f"container status: {diagnosis['status']}", extra))
+            else:
+                logger.error(_m(f"failed to get container status", extra))
+
+            # Get container logs (last 50 lines)
+            logs_cmd = f"/usr/bin/docker logs --tail 50 {container_name}"
+            logs_result = await ssh_client.run(logs_cmd)
+            if logs_result.exit_status == 0:
+                diagnosis["logs"] = f"logs: {logs_result.stdout.strip()[-250:]}"
+                diagnosis["logs"] += f"errors: {logs_result.stderr.strip()[-250:]}" if logs_result.stderr else ""
+                if diagnosis["logs"]:
+                    logger.info(_m(diagnosis["logs"], extra))
+                else:
+                    logger.warning(_m(f"container has no logs", extra))
+            else:
+                logger.error(_m(f"failed to get container logs: {logs_result.stderr}", extra))
+
+        except Exception as e:
+            logger.error(_m(f"diagnosis failed: {e}", extra), exc_info=True)
+
+        return diagnosis
+
     async def _docker_wait_for_health(self, external_ip: str, api_port: int, extra: dict = {}) -> bool:
         """Wait for batch port verifier service to become healthy."""
         health_url = f"http://{external_ip}:{api_port}/health"
-        timeout = 10  # seconds
+        timeout = BATCH_HEALTH_CHECK_TIMEOUT
         start_time = asyncio.get_event_loop().time()
+        last_error = None
 
         async with aiohttp.ClientSession() as session:
             while asyncio.get_event_loop().time() - start_time < timeout:
@@ -234,15 +286,46 @@ class ExecutorConnectivityService:
                         if response.status == 200:
                             data = await response.json()
                             if data.get("status") == "ok":
-                                logger.debug(_m(f"health ok {external_ip}:{api_port}", extra))
+                                elapsed = asyncio.get_event_loop().time() - start_time
+                                logger.info(_m(f"health check ok after {elapsed:.1f}s", extra))
                                 return True
                 except Exception as e:
-                    logger.debug(_m(f"health error: {e}", extra))
-                    pass  # Continue retrying
+                    last_error = str(e)[:100]
 
                 await asyncio.sleep(0.5)
 
+        # Health check failed
+        elapsed = asyncio.get_event_loop().time() - start_time
+        logger.error(_m(f"health check failed after {elapsed:.1f}s, last error: {last_error}", extra))
         return False
+
+    async def _check_port_on_executor(
+        self, ssh_client: SSHClientConnection, port: int, extra: dict = {}
+    ) -> dict[str, Any]:
+        """Check if port is listening on executor"""
+        port_info: dict[str, Any] = {"is_listening": False, "health_accessible": False}
+
+        try:
+            # Check with netstat if port is listening
+            netstat_cmd = f"netstat -tuln | grep ':{port} '"
+            netstat_result = await ssh_client.run(netstat_cmd)
+            if netstat_result.exit_status == 0 and netstat_result.stdout.strip():
+                port_info["is_listening"] = True
+                logger.info(_m(f"port {port} is listening", extra))
+
+                # Only try curl if port is listening
+                curl_cmd = f"curl -s -m 2 http://localhost:{port}/health"
+                curl_result = await ssh_client.run(curl_cmd)
+                port_info["health_accessible"] = curl_result.exit_status == 0
+                if port_info["health_accessible"]:
+                    logger.info(_m(f"port {port} health check accessible", extra))
+            else:
+                logger.warning(_m(f"port {port} is NOT listening internally", extra))
+
+        except Exception as e:
+            logger.error(_m(f"port check failed: {e}", extra))
+
+        return port_info
 
     async def _verify_port(
         self, host: str, external_port: int, expected_response: str, int_port: int, session: aiohttp.ClientSession,
@@ -382,8 +465,8 @@ class ExecutorConnectivityService:
 
             if db_records:
                 await self.port_mapping_dao.upsert_port_results(db_records)
-                await self.port_mapping_dao.clean_ports(db_records[0].executor_id)
-                logger.info(_m(f"saved {len(db_records)} ports to db", extra))
+                cleaned_ports = await self.port_mapping_dao.clean_ports(db_records[0].executor_id)
+                logger.info(_m(f"saved {len(db_records)} ports to db, {cleaned_ports=}", extra))
 
         except Exception as e:
             logger.error(_m(f"save to db failed: {e}", extra), exc_info=True)
