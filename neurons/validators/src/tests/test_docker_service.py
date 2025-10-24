@@ -72,6 +72,7 @@ async def test_generate_portMappings_exact_matches(docker_service, test_executor
 
     # Act
     result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, docker_ports)
+    result = result[0]
 
     # Assert
     # Expect exact matches for all ports
@@ -93,6 +94,7 @@ async def test_generate_portMappings_mixed_scenario(docker_service, test_executo
 
     # Act
     result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, docker_ports)
+    result = result[0]
 
     # Assert
     # Expect exact match for 22, random selection for others
@@ -111,7 +113,7 @@ async def test_generate_portMappings_mixed_scenario(docker_service, test_executo
         "empty_database",
         {},
         [22, 20000],
-        []
+        [(22, 22, 22), (20000, 20000, 20000)]
     ),
     (
         "insufficient_ports",
@@ -140,64 +142,92 @@ async def test_generate_portMappings_fallback_to_redis(
         docker_service.port_mapping_dao.get_successful_ports = AsyncMock(side_effect=db_response)
     else:
         docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=db_response)
-
-    docker_service.generate_port_mapping_from_redis = AsyncMock(return_value=expected_result)
+    port_mapping_redis_result = create_mock_port_dict([22, 20000, 20001], test_miner_hotkey, UUID(test_executor_id))
+    docker_service.generate_port_mapping_from_redis = AsyncMock(return_value=port_mapping_redis_result)
 
     # Act
     result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, docker_ports)
+    result = result[0]
 
     # Assert
     # Expect fallback to Redis in all scenarios
     assert result == expected_result
     docker_service.generate_port_mapping_from_redis.assert_called_once_with(
-        test_executor_id, docker_ports, test_miner_hotkey
+        test_miner_hotkey, test_executor_id
     )
 
 
 @pytest.mark.parametrize(
-    "available_ports,expected_mappings,initial_port_count",
+    "available_ports,expected_mappings,initial_port_count,enable_jupyter",
     [
         # Exact match with PREFERRED_POD_PORTS
         (
             [22, 20000, 20001],
             [(22, 22, 22), (20000, 20000, 20000), (20001, 20001, 20001)],
             None,
+            False,
         ),
         # Simple available ports - SSH missing, gets max port
         (
             [20000, 20001, 20002],
             [(22, 20002, 20002), (20000, 20000, 20000), (20001, 20001, 20001)],
             None,
+            False,
         ),
         # Available ports don't match PREFERRED_POD_PORTS - flexible mode assigns SSH to max port
         (
             [9000, 9001, 9002],
             [(22, 9002, 9002), (9000, 9000, 9000), (9001, 9001, 9001)],
             None,
+            False,
         ),
         # many ports available, only 1 initial_port_count
         (
             [r for r in range(20000, 20100)],
             [(22, 20099, 20099), (20000, 20000, 20000)],
             1,
+            False,
         ),
         # many ports available, 50 initial_port_count
         (
             [r for r in range(20000, 20100)],
             [(22, 20099, 20099)] + [(port, port, port) for port in range(20000, 20050)],
             50,
+            False,
         ),
         # case - we have a small amount of ports available, but big initial_port_count
         (
             [r for r in range(20000, 20005)],
             [(22, 20004, 20004)]  + [(port, port, port) for port in range(20000, 20004)],
-            50
-        )
+            50,
+            False,
+        ),
+        # enable_jupyter=True, 8888 available - exact match
+        (
+            [22, 8888, 20000, 20001],
+            [(22, 22, 22), (8888, 8888, 8888), (20000, 20000, 20000), (20001, 20001, 20001)],
+            None,
+            True,
+        ),
+        # enable_jupyter=True, 8888 not available - SSH gets max, Jupyter gets next available
+        (
+            [9000, 9001, 9002, 9003],
+            [(22, 9003, 9003), (8888, 9002, 9002), (9000, 9000, 9000), (9001, 9001, 9001)],
+            None,
+            True,
+        ),
+        # enable_jupyter=True with initial_port_count - SSH, Jupyter, then 2 more ports
+        (
+            [r for r in range(20000, 20100)],
+            [(22, 20099, 20099), (8888, 20098, 20098), (20000, 20000, 20000), (20001, 20001, 20001)],
+            2,
+            True,
+        ),
     ],
 )
 @pytest.mark.asyncio
 async def test_flexible_mode_port_mappings(
-    docker_service, test_executor_id, test_miner_hotkey, available_ports, expected_mappings, initial_port_count, monkeypatch
+    docker_service, test_executor_id, test_miner_hotkey, available_ports, expected_mappings, initial_port_count, enable_jupyter, monkeypatch
 ):
     """Test FLEXIBLE mode with various available port scenarios.
 
@@ -205,6 +235,7 @@ async def test_flexible_mode_port_mappings(
     - If exact matches exist, use them
     - If no exact matches, docker_port = external_port from available set
     - SSH port (22) gets special handling: max port if not available
+    - When enable_jupyter=True, Jupyter port (8888) is inserted at position 1
     """
     # Mock PREFERRED_POD_PORTS to a shorter list for easier testing
     monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", [22, 20000, 20001])
@@ -214,7 +245,10 @@ async def test_flexible_mode_port_mappings(
     docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
 
     # Act - internal_ports=None triggers flexible mode
-    result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, None, initial_port_count)
+    result = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, None, initial_port_count, enable_jupyter=enable_jupyter
+    )
+    result = result[0]
 
     # Assert
     assert len(result) == len(expected_mappings)
@@ -233,19 +267,21 @@ async def test_no_exact_match_custom_ports_uses_random_selection(docker_service,
 
     # Act
     result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, custom_internal_ports)
+    result = result[0]
 
     # Assert
     # Expect random selection: docker ports from custom list, external ports from available set
     assert len(result) == 3
     docker_ports_used = {m[0] for m in result}
-    assert docker_ports_used == {8080, 8081, 8082}
+    assert docker_ports_used == {8080, 8081, 22}
 
     external_ports_used = {m[2] for m in result}
     assert external_ports_used == {9000, 9001, 9002}
+    possible_internal_ports = custom_internal_ports + [22]
 
     # Verify mapping structure
     for docker_port, internal_port, external_port in result:
-        assert docker_port in custom_internal_ports
+        assert docker_port in possible_internal_ports
         assert external_port in {9000, 9001, 9002}
         assert internal_port == external_port
 
@@ -302,3 +338,67 @@ def test_get_preferred_ports(
         # All ports should be from PREFERRED_POD_PORTS
         for port in result:
             assert port in mock_preferred_ports
+
+
+@pytest.mark.parametrize(
+    "enable_jupyter,internal_ports,available_ports,expected_jupyter_in_mappings,jupyter_port_position",
+    [
+        # # Scenario 1: enable_jupyter=True, STRICT mode, 8888 available (exact match)
+        (True, [22, 8080, 8888], [22, 8080, 8888, 9000], True, 1),
+        # # Scenario 2: enable_jupyter=True, STRICT mode, 8888 not available (random assignment)
+        (True, [22, 8080, 8888], [22, 8080, 9000, 9100], True, 1),
+        # # Scenario 3: enable_jupyter=True, FLEXIBLE mode, 8888 available
+        (True, None, [22, 8888, 20000, 20001], True, 1),
+        # Scenario 4: enable_jupyter=True, FLEXIBLE mode, 8888 not available
+        (True, None, [9000, 9001, 9002, 9003], True, 1),
+        # Scenario 5: enable_jupyter=False, should not include jupyter port
+        (False, [22, 8080, 9000], [22, 8080, 9000], False, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_enable_jupyter_feature(
+    docker_service,
+    test_executor_id,
+    test_miner_hotkey,
+    enable_jupyter,
+    internal_ports,
+    available_ports,
+    expected_jupyter_in_mappings,
+    jupyter_port_position,
+    monkeypatch,
+):
+    """Test enable_jupyter feature in various scenarios.
+
+    Covers:
+    - STRICT mode (with internal_ports): jupyter port 8888 inserted at position 1
+    - FLEXIBLE mode (without internal_ports): jupyter port 8888 inserted at position 1
+    - Disabled jupyter: no jupyter port in mappings, jupyter_port_map is None
+    """
+    # Arrange
+    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", [22, 20000, 20001, 20002, 20003])
+    mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
+    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
+
+    # Act
+    mappings, jupyter_port_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, internal_ports, enable_jupyter=enable_jupyter
+    )
+
+    # Assert
+    # SSH port should always be first
+    first_ports = [m[0] for m in mappings]
+    assert 22 in first_ports
+
+    if expected_jupyter_in_mappings:
+        # Jupyter port should be at specified position
+        assert mappings[jupyter_port_position][0] == 8888
+        # Jupyter port map should be returned
+        assert jupyter_port_map is not None
+        assert jupyter_port_map[0] == 8888
+        assert jupyter_port_map[1] in available_ports
+    else:
+        # Jupyter port should not be in mappings
+        jupyter_ports = [m for m in mappings if m[0] == 8888]
+        assert len(jupyter_ports) == 0
+        # Jupyter port map should be None
+        assert jupyter_port_map is None
