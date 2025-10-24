@@ -397,10 +397,10 @@ class ExecutorConnectivityService:
             'executor-db-1',
             'executor-autoheal-1',
         ]
-        if settings.ENV == 'prod':
-            command = '/usr/bin/docker ps -a --format "{{.Names}}"'
-        else:
+        if settings.DEBUG:
             command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
+        else:
+            command = '/usr/bin/docker ps -a --format "{{.Names}}"'
 
         result = await ssh_client.run(command)
         container_names = []
