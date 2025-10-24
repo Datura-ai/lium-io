@@ -8,7 +8,6 @@ from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
 from services.file_encrypt_service import ORIGINAL_KEYS
-from services.ssh_service import SSHService
 
 
 def _update_keys(data: Any, key_mapping: dict[str, str]) -> Any:
@@ -70,15 +69,6 @@ class MachineSpecScrapeCheck:
         script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
-        decrypt_service = ctx.services.ssh
-        if not isinstance(decrypt_service, SSHService):
-            event = render_message(
-                Msg.DECRYPT_MISSING,
-                ctx=ctx,
-                check_id=self.check_id,
-            )
-            return CheckResult(passed=False, event=event)
-
         res = await runner.run(f"chmod +x {script_path} && {script_path}", timeout=timeout, retryable=False)
 
         if not res.success or not res.stdout.strip():
@@ -100,7 +90,7 @@ class MachineSpecScrapeCheck:
             if not ctx.encrypt_key:
                 raise ValueError("Missing encrypt_key in context")
 
-            decrypted = decrypt_service.decrypt_payload(ctx.encrypt_key, line)
+            decrypted = ctx.services.ssh.decrypt_payload(ctx.encrypt_key, line)
             raw = json.loads(decrypted)
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)

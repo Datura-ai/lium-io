@@ -3,8 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict
 import uuid
 
-from bittensor import Keypair
-
 from ..messages import StartGpuMonitorMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -28,15 +26,12 @@ class StartGPUMonitorCheck:
         compute_rest_app_url = ctx.config.compute_rest_app_url
         script_relative_path = ctx.config.gpu_monitor_script_relative
 
-        if not isinstance(validator_keypair, Keypair) or not compute_rest_app_url:
+        if not compute_rest_app_url:
             event = render_message(
                 Msg.CONFIG_MISSING,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={
-                    "has_validator_keypair": isinstance(validator_keypair, Keypair),
-                    "compute_rest_app_url": compute_rest_app_url,
-                },
+                what={"compute_rest_app_url": compute_rest_app_url},
             )
             return CheckResult(passed=False, event=event)
 
