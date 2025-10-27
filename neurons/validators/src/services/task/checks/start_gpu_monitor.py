@@ -39,8 +39,9 @@ class StartGPUMonitorCheck:
 
         check_cmd = f'ps aux | grep "python.*{script_path}" | grep -v grep'
         check_res = await runner.run(check_cmd, timeout=10, retryable=False)
+        processes = [line for line in check_res.stdout.splitlines() if "grep" not in line]
 
-        if check_res.stdout.strip():
+        if processes:
             event = render_message(
                 Msg.ALREADY_RUNNING,
                 ctx=ctx,

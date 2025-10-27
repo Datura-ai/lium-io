@@ -36,7 +36,6 @@ class SSHCommandRunner:
         timeout: int = 60,
         check: bool = False,
         retryable: bool = True,
-        truncate_output: int = 4000,
     ) -> SSHCommandResult:
         """Run a command and capture stdout/stderr safely."""
         attempt = 0
