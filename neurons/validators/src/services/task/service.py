@@ -1310,29 +1310,16 @@ class TaskService:
                     except ValueError:
                         return ResetVerifiedJobReason.DEFAULT
 
+                # Determine log_text and success based on ok status
                 if not ok:
                     last_event = events[-1]
-                    log_struct = _m(last_event.event, extra=last_event.model_dump())
-                    return await self._handle_task_result(
-                        miner_info=miner_info,
-                        executor_info=executor_info,
-                        spec=last_context.state.specs or None,
-                        score=last_context.score,
-                        job_score=last_context.job_score,
-                        collateral_deposited=last_context.collateral_deposited,
-                        log_text=log_struct,
-                        verified_job_info=verified_job_info,
-                        success=False,
-                        clear_verified_job_info=last_context.clear_verified_job_info,
-                        gpu_model_count=last_context.state.gpu_model_count or "",
-                        gpu_uuids=last_context.state.gpu_uuids or "",
-                        sysbox_runtime=last_context.state.sysbox_runtime,
-                        ssh_pub_keys=last_context.ssh_pub_keys,
-                        clear_verified_job_reason=_resolve_reason(last_context.clear_verified_job_reason),
-                    )
+                    log_text = _m(last_event.event, extra=last_event.model_dump())
+                    success = False
+                else:
+                    log_text = last_context.log_text or "Pipeline validation completed"
+                    success = last_context.success
 
-                log_text = last_context.log_text or "Pipeline validation completed"
-
+                # Single call to handle result
                 return await self._handle_task_result(
                     miner_info=miner_info,
                     executor_info=executor_info,
@@ -1342,7 +1329,7 @@ class TaskService:
                     collateral_deposited=last_context.collateral_deposited,
                     log_text=log_text,
                     verified_job_info=verified_job_info,
-                    success=last_context.success,
+                    success=success,
                     clear_verified_job_info=last_context.clear_verified_job_info,
                     gpu_model_count=last_context.state.gpu_model_count or "",
                     gpu_uuids=last_context.state.gpu_uuids or "",
