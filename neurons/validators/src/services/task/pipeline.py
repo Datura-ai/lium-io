@@ -8,18 +8,26 @@ from pydantic import BaseModel, Field
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import _m
+from daos.port_mapping_dao import PortMappingDao
+from services.ssh_service import SSHService
+from services.redis_service import RedisService
+from services.collateral_contract_service import CollateralContractService
+from services.matrix_validation_service import ValidationService
+from services.verifyx_validation_service import VerifyXValidationService
+from services.executor_connectivity_service import ExecutorConnectivityService
+from services.interactive_shell_service import InteractiveShellService
 from .models import ValidationEvent
 
 @dataclass(frozen=True)
 class ContextServices:
-    ssh: Any
-    redis: Any
-    collateral: Any
-    validation: Any
-    verifyx: Any
-    connectivity: Any
-    shell: Any
-    port_mapping: Any
+    ssh: SSHService
+    redis: RedisService
+    collateral: CollateralContractService
+    validation: ValidationService
+    verifyx: VerifyXValidationService
+    connectivity: ExecutorConnectivityService
+    shell: InteractiveShellService
+    port_mapping: PortMappingDao
     score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
 
 
