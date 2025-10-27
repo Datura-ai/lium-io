@@ -1311,13 +1311,10 @@ class TaskService:
                         return ResetVerifiedJobReason.DEFAULT
 
                 # Determine log_text and success based on ok status
-                if not ok:
-                    last_event = events[-1]
-                    log_text = _m(last_event.event, extra=last_event.model_dump())
-                    success = False
-                else:
-                    log_text = last_context.log_text or "Pipeline validation completed"
-                    success = last_context.success
+                # Always use the last event for structured logging (Grafana consumption)
+                last_event = events[-1]
+                log_text = _m(last_event.event, extra=last_event.model_dump())
+                success = False if not ok else last_context.success
 
                 # Single call to handle result
                 return await self._handle_task_result(
