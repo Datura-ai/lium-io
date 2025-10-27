@@ -50,8 +50,8 @@ class SSHCommandRunner:
             try:
                 result = await asyncio.wait_for(self.ssh.run(cmd), timeout=timeout)
                 dt = int((time.perf_counter() - t0) * 1000)
-                stdout = (str(result.stdout) or "")[:truncate_output]
-                stderr = (str(result.stderr) or "")[:truncate_output]
+                stdout = str(result.stdout) or ""
+                stderr = str(result.stderr) or ""
                 exit_code = result.exit_status or 0
                 ok = exit_code == 0
 
@@ -62,8 +62,8 @@ class SSHCommandRunner:
                     command=cmd,
                     command_id=cid,
                     exit_code=exit_code,
-                    stdout=stdout,
-                    stderr=stderr,
+                    stdout=stdout.strip(),
+                    stderr=stderr.strip(),
                     duration_ms=dt,
                     started_at=start,
                     finished_at=datetime.now(UTC),

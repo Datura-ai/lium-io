@@ -17,6 +17,7 @@ from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
 from .models import ValidationEvent
+from .runner import SSHCommandRunner
 
 @dataclass(frozen=True)
 class ContextServices:
@@ -77,7 +78,7 @@ class Context(BaseModel):
     executor: ExecutorSSHInfo
     miner_hotkey: str
     ssh: asyncssh.SSHClientConnection
-    runner: Any
+    runner: SSHCommandRunner
     verified: dict = {}
     settings: dict = {}
     encrypt_key: str | None = None
