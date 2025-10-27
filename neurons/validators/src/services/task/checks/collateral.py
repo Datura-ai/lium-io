@@ -53,7 +53,7 @@ class CollateralCheck:
                 Msg.MISSING,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"collateral_deposited": False, "error_message": error_message},
+                what={"collateral_deposited": False, "contract_version": contract_version, "error_message": error_message},
                 remediation=remediation,
             )
 

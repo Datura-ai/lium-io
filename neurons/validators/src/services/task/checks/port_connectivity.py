@@ -60,6 +60,9 @@ class PortConnectivityCheck:
             ctx.config.port_public_key or "",
             ctx.state.sysbox_runtime,
         )
+        extra_info = {
+            "sysbox_runtime": result.sysbox_runtime,
+        }
 
         if not result.success:
             event = render_message(
@@ -67,6 +70,7 @@ class PortConnectivityCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 what={"details": result.log_text},
+                extra=extra_info,
             )
             updated_state = replace(ctx.state, sysbox_runtime=result.sysbox_runtime)
             return CheckResult(
@@ -80,13 +84,14 @@ class PortConnectivityCheck:
             ctx=ctx,
             check_id=self.check_id,
             what={"message": result.log_text},
+            extra=extra_info,
         )
         updated_state = replace(ctx.state, sysbox_runtime=result.sysbox_runtime)
         return CheckResult(
             passed=True,
             event=event,
             updates={
-                "default_extra": extra,
+                "default_extra": {**extra, **extra_info},
                 "state": updated_state,
             },
         )

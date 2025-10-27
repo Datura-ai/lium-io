@@ -104,6 +104,10 @@ class MachineSpecScrapeCheck:
 
             gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
             gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
+            sysbox_runtime = specs.get("sysbox_runtime", False)
+            extra_info = {
+                "sysbox_runtime": sysbox_runtime,
+            }
 
             event = render_message(
                 Msg.SCRAPE_OK,
@@ -113,6 +117,7 @@ class MachineSpecScrapeCheck:
                     "gpu_count": gpu_count,
                     "gpu_model": gpu_model,
                 },
+                extra=extra_info,
             )
             updated_state = replace(
                 ctx.state,
@@ -121,12 +126,12 @@ class MachineSpecScrapeCheck:
                 gpu_count=gpu_count,
                 gpu_details=gpu_details,
                 gpu_processes=specs.get("gpu_processes", []) or [],
-                sysbox_runtime=specs.get("sysbox_runtime", False) or False,
+                sysbox_runtime=sysbox_runtime,
                 gpu_model_count=gpu_model_count,
                 gpu_uuids=gpu_uuids,
             )
 
-            updates: dict[str, object] = {"state": updated_state}
+            updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
             return CheckResult(passed=True, event=event, updates=updates)
 
         except Exception as exc:

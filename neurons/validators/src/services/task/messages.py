@@ -31,6 +31,7 @@ def render_message(
     impact: str | None = None,
     remediation: str | None = None,
     help_uri: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> Any:
     """Render a `MessageTemplate` into a structured message via `build_msg`."""
     return build_msg(
@@ -42,7 +43,7 @@ def render_message(
         remediation=(remediation if remediation is not None else template.remediation) or "",
         what=what or {},
         check_id=check_id,
-        ctx={"executor_uuid": ctx.executor.uuid, "miner_hotkey": ctx.miner_hotkey},
+        ctx={**ctx.default_extra, **(extra or {})},
         help_uri=help_uri or template.help_uri,
     )
 
