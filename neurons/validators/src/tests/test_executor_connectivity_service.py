@@ -286,7 +286,7 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
     # Arrange
     # Mock responses: 1) list containers command, 2) rm command, 3) prune command
     mock_ssh_client.run.side_effect = [
-        AsyncMock(stdout="container_test1\ncontainer_test2\n", exit_status=0),
+        AsyncMock(stdout="container_test1\ncontainer_test2\nexecutor-executor-1", exit_status=0),
         AsyncMock(stdout="", exit_status=0),  # docker rm response
         AsyncMock(stdout="", exit_status=0),  # docker volume prune response
     ]
@@ -301,9 +301,9 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
     all_calls = [call.args[0] for call in mock_ssh_client.run.call_args_list]
 
     # Expect first call to list containers with name filter
-    assert "docker ps" in all_calls[0] and "container_" in all_calls[0]
+    assert "docker ps" in all_calls[0]
     # Expect second call to remove found containers
-    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1]
+    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1] and "executor-executor-1" not in all_calls[1]
     # Expect third call to prune volumes
     assert "docker volume prune" in all_calls[2]
 
