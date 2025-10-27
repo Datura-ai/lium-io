@@ -434,14 +434,6 @@ class PortConnectivityMessages:
 
 
 class PortCountMessages:
-    PORT_COUNT_DB_ERROR = MessageTemplate(
-        event="Port count database error",
-        reason="PORT_COUNT_DB_ERROR",
-        severity="error",
-        category="runtime",
-        impact="Validation halted; score set to 0",
-        remediation="Check database connectivity and port mapping table availability.",
-    )
     PORT_COUNT_RECORDED = MessageTemplate(
         event="Port availability inspected",
         reason="PORT_COUNT_RECORDED",

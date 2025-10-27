@@ -21,20 +21,7 @@ class PortCountCheck:
         redis_service = ctx.services.redis
         executor_uuid = ctx.executor.uuid
 
-        try:
-            port_count = await port_mapping.get_successful_ports_count(executor_uuid)
-        except Exception as e:
-            event = render_message(
-                Msg.PORT_COUNT_DB_ERROR,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={"error": str(e)},
-            )
-            return CheckResult(
-                passed=False,
-                event=event,
-                updates={"port_count": 0},
-            )
+        port_count = await port_mapping.get_successful_ports_count(executor_uuid)
 
         if port_count < MIN_PORT_COUNT:
             port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{ctx.miner_hotkey}:{executor_uuid}"
