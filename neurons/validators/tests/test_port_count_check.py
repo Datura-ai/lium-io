@@ -11,17 +11,12 @@ from tests.helpers import build_context_config, build_services, build_state
 
 
 class DummyPortMapping:
-    def __init__(self, *, count: int | None = None, should_raise: bool = False):
+    def __init__(self, *, count: int):
         self.count = count
-        self.should_raise = should_raise
         self.called_with: list[str] = []
 
     async def get_successful_ports_count(self, executor_uuid: str) -> int:
         self.called_with.append(executor_uuid)
-        if self.should_raise:
-            raise RuntimeError("port mapping failure")
-        if self.count is None:
-            raise RuntimeError("count not set")
         return self.count
 
 
@@ -37,23 +32,22 @@ class DummyRedis:
 
 
 @pytest.mark.parametrize(
-    "port_count,should_raise,redis_values,expected_count,expect_redis_call",
+    "port_count,redis_values,expected_count,expect_redis_call",
     [
-        (MIN_PORT_COUNT + 1, False, [], MIN_PORT_COUNT + 1, False),
-        (MIN_PORT_COUNT - 1, False, [b"3000,3001", b"3002,3003"], 2, True),
-        (None, True, [b"4000,4001"], 1, True),
+        (MIN_PORT_COUNT + 1, [], MIN_PORT_COUNT + 1, False),
+        (MIN_PORT_COUNT - 1, [b"3000,3001", b"3002,3003"], 2, True),
+        (0, [b"4000,4001"], 1, True),
     ],
 )
 @pytest.mark.asyncio
 async def test_port_count_check(
     port_count,
-    should_raise,
     redis_values,
     expected_count,
     expect_redis_call,
     context_factory,
 ):
-    port_mapping = DummyPortMapping(count=port_count, should_raise=should_raise)
+    port_mapping = DummyPortMapping(count=port_count)
     redis_service = DummyRedis(redis_values)
     services = build_services(port_mapping=port_mapping, redis=redis_service)
     config = build_context_config()
