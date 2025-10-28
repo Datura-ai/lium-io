@@ -141,7 +141,7 @@ class MinerService:
                     tasks = [
                         asyncio.create_task(
                             asyncio.wait_for(
-                                self.task_service.create_task_old(
+                                self.task_service.create_task(
                                     miner_info=payload,
                                     executor_info=executor_info,
                                     keypair=my_key,
