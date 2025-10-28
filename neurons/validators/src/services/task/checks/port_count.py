@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import replace
 
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -34,9 +35,20 @@ class PortCountCheck:
             check_id=self.check_id,
             what={"available_port_count": port_count},
         )
+        
+        updated_stats = replace(
+            ctx.state,
+            specs={
+                **ctx.state.specs,
+                "available_port_count": port_count,
+            }
+        )
 
         return CheckResult(
             passed=True,
             event=event,
-            updates={"port_count": port_count},
+            updates={
+                "state": updated_stats,
+                "port_count": port_count
+            },
         )
