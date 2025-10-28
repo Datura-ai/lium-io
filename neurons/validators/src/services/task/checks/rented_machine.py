@@ -99,6 +99,7 @@ class TenantEnforcementCheck:
                 ctx=ctx,
                 check_id=self.check_id,
                 what={"executor_uuid": ctx.executor.uuid},
+                extra=extra
             )
             return CheckResult(
                 passed=True,
@@ -128,6 +129,7 @@ class TenantEnforcementCheck:
                     "container": container_name,
                     "executor_uuid": ctx.executor.uuid,
                 },
+                extra=extra
             )
             return CheckResult(
                 passed=False,
@@ -157,6 +159,7 @@ class TenantEnforcementCheck:
                         "vram_utilization": observation["vram_utilization"],
                         "gpu_processes": gpu_processes,
                     },
+                    extra=extra
                 )
                 return CheckResult(
                     passed=False,
@@ -196,6 +199,7 @@ class TenantEnforcementCheck:
                 "actual_score": actual_score,
                 "job_score": job_score,
             },
+            extra=extra
         )
 
         return CheckResult(
