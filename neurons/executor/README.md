@@ -146,3 +146,46 @@ The above command should show the `nvidia-smi` result if sysbox is installed cor
 sudo systemctl restart docker
 ```
 
+## Intel TDX Attestation
+
+### What is TDX Attestation?
+
+Intel TDX (Trust Domain Extensions) attestation provides hardware-based security guarantees for your executor. When enabled, the executor generates cryptographic proofs (quotes) that validators can verify to ensure:
+
+- The executor is running on genuine Intel TDX-capable hardware
+- The execution environment hasn't been tampered with
+- The SSH host key is authentic and bound to the secure enclave
+
+### How It Works
+
+1. **Quote Generation**: When a validator requests SSH access, the executor generates a TDX quote that includes a hash of the SSH host key
+2. **Quote Transmission**: The quote is sent to the validator along with the SSH host key
+3. **Verification**: The validator sends the quote to a TDX verifier service to validate its authenticity
+4. **Attestation Digest**: The verifier extracts OS image hash and compose hash to create an attestation digest
+5. **Whitelist Check**: (Optional) The validator checks if the attestation digest is in the approved whitelist
+
+### Configuration
+
+To enable TDX attestation on your executor:
+
+1. Ensure your hardware supports Intel TDX
+2. Install the dstack-sdk (included in dependencies)
+3. Add to your `.env` file:
+```bash
+ENABLE_TDX_ATTESTATION=true
+TDX_QUOTE_TIMEOUT=60
+```
+4. Restart your executor: `docker compose restart`
+
+### Verification
+
+To verify TDX is working correctly:
+
+1. Check executor logs for TDX-related messages:
+```bash
+docker compose logs -f
+```
+
+2. Look for messages like:
+   - "TDX attestation enabled"
+   - "Generated TDX quote for SSH host key"

@@ -8,6 +8,7 @@ class MinerAuthPayload(BaseModel):
 
 class UploadSShKeyPayload(MinerAuthPayload):
     public_key: str
+    validator_signature: str | None = None
 
 
 class GetPodLogsPaylod(MinerAuthPayload):

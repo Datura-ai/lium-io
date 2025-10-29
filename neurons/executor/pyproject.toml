@@ -30,6 +30,7 @@ dependencies = [
     "colorama==0.4.6",
     "cryptography==43.0.3",
     "cytoolz==1.0.1",
+    "dstack-sdk==0.5.3",
     "datura @ file:///${PROJECT_ROOT}/../../datura",
     "decorator==5.1.1",
     "eth-hash==0.7.1",

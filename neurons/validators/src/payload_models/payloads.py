@@ -334,6 +334,7 @@ class ContainerCreated(ContainerBaseResponse):
     backup_log_id: str | None = None
     restore_path: str | None = None
     jupyter_url: str | None = None
+    executor_host_key: str | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -377,6 +378,7 @@ class FailedContainerErrorCodes(enum.Enum):
     FailedMsgFromMiner = "FailedMsgFromMiner"
     RentingInProgress = "RentingInProgress"
     NoJupyterPortMapping = "NoJupyterPortMapping"
+    AttestationError = "AttestationError"
 
 
 class FailedContainerErrorTypes(enum.Enum):

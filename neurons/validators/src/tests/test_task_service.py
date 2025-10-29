@@ -24,6 +24,7 @@ def task_service(mock_redis_service, mock_port_mapping_dao):
         verifyx_validation_service=Mock(),
         collateral_contract_service=Mock(),
         executor_connectivity_service=Mock(),
+        attestation_service=Mock(),
         port_mapping_dao=mock_port_mapping_dao,
     )
     return service

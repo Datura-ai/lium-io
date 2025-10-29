@@ -153,7 +153,7 @@ class ValidatorConsumer(BaseConsumer):
             try:
                 msg: SSHPubKeySubmitRequest
                 executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
-                    self.validator_key, msg.public_key, msg.executor_id
+                    self.validator_key, msg.public_key, msg.executor_id, msg.validator_signature
                 )
                 if msg.is_rental_request and len(executors) == 1:
                     await self.invoke_rental_request_hook(

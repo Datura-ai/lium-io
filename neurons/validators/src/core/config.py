@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     COLLATERAL_DAYS: int = 7
     ENV: str = Field(env="ENV", default="dev")
 
+    ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
+    TDX_VERIFIER_URL: str | None = Field(env="TDX_VERIFIER_URL", default=None)
+    ENABLE_ATTESTATION_WHITELIST: bool = Field(env="ENABLE_ATTESTATION_WHITELIST", default=False)
+
     PORTION_FOR_UPTIME: float = 1
     UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 

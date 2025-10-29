@@ -280,6 +280,8 @@ class ComputeClient:
                             executor_price=data["executor_price"],
                             collateral_deposited=data["collateral_deposited"],
                             ssh_pub_keys=data["ssh_pub_keys"],
+                            attestation_digest=data.get("attestation_digest"),
+                            tee_type=data.get("tee_type"),
                         )
 
                         async with self.lock:

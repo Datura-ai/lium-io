@@ -22,11 +22,19 @@ class InteractiveShellService:
     port: int
     remote_dir: str | None = None
 
-    def __init__(self, host: str, username: str, private_key: str, port: int):
+    def __init__(
+        self,
+        host: str,
+        username: str,
+        private_key: str,
+        port: int,
+        known_hosts: asyncssh.SSHKnownHosts | None = None,
+    ):
         self.host = host
         self.username = username
         self.private_key = private_key
         self.port = port
+        self.known_hosts = known_hosts
         self.log_extra = {
             "host": host,
             "username": username,
@@ -91,7 +99,7 @@ class InteractiveShellService:
             port=self.port,
             username=self.username,
             client_keys=[pkey],
-            known_hosts=None,
+            known_hosts=self.known_hosts,
         )
 
     async def __aenter__(self):

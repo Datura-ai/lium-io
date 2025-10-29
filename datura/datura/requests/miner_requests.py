@@ -50,6 +50,8 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     port_range: str | None = None
     port_mappings: str | None = None
     price: float | None = None
+    ssh_host_key: str | None = None
+    tdx_quote: str | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

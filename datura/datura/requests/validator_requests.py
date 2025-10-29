@@ -39,6 +39,7 @@ class AuthenticateRequest(BaseValidatorRequest):
 class SSHPubKeySubmitRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeySubmitRequest
     public_key: bytes
+    validator_signature: Optional[str] = None  # Optional for backward compatibility
     executor_id: Optional[str] = None
     is_rental_request: bool = False
 

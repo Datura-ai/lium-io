@@ -150,13 +150,14 @@ class ExecutorService:
         return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
 
     async def send_pubkey_to_executor(
-        self, executor: Executor, pubkey: str
+        self, executor: Executor, pubkey: str, validator_signature: Optional[str] = None
     ) -> ExecutorSSHInfo | None:
-        """TODO: Send API request to executor with pubkey
+        """Send API request to executor with pubkey and dual signatures
 
         Args:
             executor (Executor): Executor instance that register validator hotkey
             pubkey (str): SSH public key from validator
+            validator_signature (Optional[str]): Validator's signature of the pubkey
 
         Return:
             response (ExecutorSSHInfo | None): Executor SSH connection info.
@@ -169,6 +170,8 @@ class ExecutorService:
             "data_to_sign": pubkey,
             "signature": f"0x{keypair.sign(pubkey).hex()}"
         }
+        if validator_signature:
+            payload["validator_signature"] = validator_signature
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, json=payload) as response:
@@ -217,19 +220,20 @@ class ExecutorService:
                     "API request failed to register SSH key. url=%s, error=%s", url, str(e)
                 )
 
-    async def register_pubkey(self, validator_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
+    async def register_pubkey(self, validator_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None, validator_signature: Optional[str] = None):
         """Register pubkeys to executors for given validator.
 
         Args:
             validator_hotkey (str): Validator hotkey
             pubkey (bytes): SSH pubkey from validator.
+            validator_signature (Optional[str]): Validator's signature of the pubkey
 
         Return:
             List[dict/object]: Executors SSH connection infos that accepted validator pubkey.
         """
         tasks = [
             asyncio.create_task(
-                self.send_pubkey_to_executor(executor, pubkey.decode("utf-8")),
+                self.send_pubkey_to_executor(executor, pubkey.decode("utf-8"), validator_signature),
                 name=f"{executor}.send_pubkey_to_executor",
             )
             for executor in self.get_executors_for_validator(validator_hotkey, executor_id)
