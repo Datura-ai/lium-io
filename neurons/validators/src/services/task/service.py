@@ -1148,7 +1148,10 @@ class TaskService:
                     RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
                 )
 
+                pipeline_id = str(uuid.uuid4())
+
                 base_ctx = Context(
+                    pipeline_id=pipeline_id,
                     executor=executor_info,
                     miner_hotkey=miner_info.miner_hotkey,
                     ssh=shell.ssh_client,

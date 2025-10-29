@@ -75,6 +75,7 @@ class CheckResult(BaseModel):
 
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
+    pipeline_id: str
     executor: ExecutorSSHInfo
     miner_hotkey: str
     ssh: asyncssh.SSHClientConnection

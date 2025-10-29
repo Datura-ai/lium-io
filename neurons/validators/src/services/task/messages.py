@@ -43,6 +43,7 @@ def render_message(
         remediation=(remediation if remediation is not None else template.remediation) or "",
         what=what or {},
         check_id=check_id,
+        pipeline_id=ctx.pipeline_id,
         ctx={**ctx.default_extra, **(extra or {})},
         help_uri=help_uri or template.help_uri,
     )

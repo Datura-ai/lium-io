@@ -33,6 +33,7 @@ class ValidationEvent(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     help_uri: str | None = None
     check_id: str | None = None
+    pipeline_id: str | None = None
     trace_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     when: datetime
     context: dict[str, Any] = Field(default_factory=dict)
@@ -54,6 +55,7 @@ def build_msg(
     warnings: list[str] | None = None,
     help_uri: str | None = None,
     check_id: str = "",
+    pipeline_id: str | None = None,
     ctx: dict | None = None,
 ) -> ValidationEvent:
     """Return a consistent structured message with timestamp and trace ID."""
@@ -68,6 +70,7 @@ def build_msg(
         warnings=warnings or [],
         help_uri=help_uri,
         check_id=check_id,
+        pipeline_id=pipeline_id,
         trace_id=str(uuid.uuid4()),
         when=datetime.now(UTC),
         context=ctx or {},
