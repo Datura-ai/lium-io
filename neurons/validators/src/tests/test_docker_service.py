@@ -184,14 +184,14 @@ async def test_generate_portMappings_fallback_to_redis(
         # many ports available, only 1 initial_port_count
         (
             [r for r in range(20000, 20100)],
-            [(22, 20001, 20001), (20000, 20000, 20000)],
+            [(22, 20099, 20099), (20000, 20000, 20000)],
             1,
             False,
         ),
         # many ports available, 50 initial_port_count
         (
             [r for r in range(20000, 20100)],
-            [(22, 20050, 20050)] + [(port, port, port) for port in range(20000, 20050)],
+            [(22, 20099, 20099)] + [(port, port, port) for port in range(20000, 20050)],
             50,
             False,
         ),
@@ -212,14 +212,14 @@ async def test_generate_portMappings_fallback_to_redis(
         # enable_jupyter=True, 8888 not available - SSH gets max, Jupyter gets next available
         (
             [9000, 9001, 9002, 9003],
-            [(22, 9002, 9002), (8888, 9003, 9003), (9000, 9000, 9000), (9001, 9001, 9001)],
+            [(22, 9003, 9003), (8888, 9002, 9002), (9000, 9000, 9000), (9001, 9001, 9001)],
             None,
             True,
         ),
         # enable_jupyter=True with initial_port_count - SSH, Jupyter, then 2 more ports
         (
             [r for r in range(20000, 20100)],
-            [(22, 20002, 20002), (8888, 20003, 20003), (20000, 20000, 20000), (20001, 20001, 20001)],
+            [(22, 20099, 20099), (8888, 20098, 20098), (20000, 20000, 20000), (20001, 20001, 20001)],
             2,
             True,
         ),
@@ -291,13 +291,11 @@ async def test_no_exact_match_custom_ports_uses_random_selection(docker_service,
 @pytest.mark.parametrize("initial_port_count,expected_length,expected_first_port,should_have_extra_ports", [
     # No initial count - returns all PREFERRED_POD_PORTS
     (None, 11, 22, False),
-    # Less than PREFERRED_POD_PORTS length - returns limited list
-    (0, 1, 22, False),
-    (2, 3, 22, False),  # +1 for SSH port = 3 total
-    (5, 6, 22, False),  # +1 for SSH port = 6 total
+    (2, 2, 22, False),  # +1 for SSH port = 3 total
+    (5, 5, 22, False),  # +1 for SSH port = 6 total
     # More than PREFERRED_POD_PORTS length - returns PREFERRED_POD_PORTS + extra
-    (11, 12, 22, True),  # +1 for SSH port = 12 total, 1 extra port needed
-    (15, 16, 22, True),  # +1 for SSH port = 16 total, 5 extra ports needed
+    (11, 11, 22, True),  # +1 for SSH port = 12 total, 1 extra port needed
+    (15, 15, 22, True),  # +1 for SSH port = 16 total, 5 extra ports needed
 ])
 def test_get_preferred_ports(
     docker_service,

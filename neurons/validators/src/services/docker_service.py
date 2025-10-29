@@ -96,77 +96,49 @@ class DockerService:
         ssh_port = 22
         jupyter_port = 8888
         jupyter_port_map: tuple[int, int] | None = None
+        
+        user_defined = bool(internal_ports)
+        docker_internal_ports = internal_ports or self._get_preferred_ports(initial_port_count)
+        if ssh_port in docker_internal_ports:
+            docker_internal_ports.remove(ssh_port)
+        docker_internal_ports.insert(0, ssh_port)
+            
+        if enable_jupyter:
+            if jupyter_port in docker_internal_ports:
+                docker_internal_ports.remove(jupyter_port)
+            docker_internal_ports.insert(1, jupyter_port)
 
-        if internal_ports:
-            # ============ STRICT MODE: Custom docker ports (must preserve docker port numbers) ============
-            # User explicitly requested specific docker ports - we MUST use them
-            # Strategy: docker_port is fixed, external_port can be any available
+        for port in docker_internal_ports:
+            if not len(available_ports):
+                break
 
-            for docker_port in internal_ports:
-                if not len(available_ports):
-                    break
-
-                if docker_port in available_ports:
-                    # Exact match: docker_port == external_port
-                    port_mapping = available_ports.pop(docker_port)
-                    mappings.append((docker_port, port_mapping.internal_port, docker_port))
-                else:
-                    # No exact match: docker_port stays fixed, pick random external_port
-                    external_port = random.choice(list(available_ports.keys()))
-                    port_mapping = available_ports.pop(external_port)
-                    mappings.append((docker_port, port_mapping.internal_port, external_port))
-        else:
-            # ============ FLEXIBLE MODE: Preferred ports (can deviate if needed) ============
-            # Using PREFERRED_POD_PORTS as soft preference, not strict requirement
-            # Strategy: prefer exact match, but if unavailable use min port (both docker and external)
-            preferred_ports = self._get_preferred_ports(initial_port_count, enable_jupyter)
-            for preferred_port in preferred_ports:
-                if not len(available_ports):
-                    break
-
-                if preferred_port in available_ports:
-                    # Exact match: preferred_port available
-                    port_mapping = available_ports.pop(preferred_port)
-                    mappings.append(
-                        (preferred_port, port_mapping.internal_port, preferred_port)
-                    )
-                else:
-                    # No preferred port available: use min available port for both docker and external
-                    external_port = min(available_ports.keys())
-                    port_mapping = available_ports.pop(external_port)
-                    mappings.append((external_port, port_mapping.internal_port, external_port))
+            if port in available_ports:
+                docker_port = port
+                external_port = port
+            elif port == ssh_port or port == jupyter_port:
+                docker_port = port
+                external_port = max(available_ports.keys())
+            else:
+                external_port = random.choice(list(available_ports.keys())) if user_defined else min(available_ports.keys())
+                docker_port = port if user_defined else external_port
+                
+            port_mapping = available_ports.pop(external_port)
+            mappings.append((docker_port, port_mapping.internal_port, external_port))
 
         logger.info(
             f"Generated {len(mappings)} port mappings from database for executor {executor_id}"
         )
 
         if enable_jupyter:
-            mappings, jupyter_port_map = self.assign_special_port(mappings, jupyter_port)
-        mappings, _ = self.assign_special_port(mappings, ssh_port)
+            mapping = self._find_mapping_by_docker_port(mappings, jupyter_port)
+            if mapping:
+                jupyter_port_map = (mapping[0], mapping[2])
 
         return mappings, jupyter_port_map
 
-    def assign_special_port(self, mappings: list[tuple[int, int, int]], special_port: int) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
-        """
-        if special_port already exists in the list. then just move it to the first position
-        if it's not exists - take tha last element, change the first element to the special_port and put it to the first position.
-        """
-        if not mappings:
-            return mappings, None
-
-        element_index = len(mappings) - 1
-        for i, line in enumerate(mappings):
-            if line[0] == special_port:
-                element_index = i
-                break
-
-        docker_port, internal_port, external_port = mappings[element_index]
-        mappings[element_index] = (special_port, internal_port, external_port)
-
-        # put to the first position
-        mappings.insert(0, mappings.pop(element_index))
-        port_map = (mappings[0][0], mappings[0][2])
-        return mappings, port_map
+    def _find_mapping_by_docker_port(self, mappings: list[tuple[int, int, int]], docker_port: int) -> tuple[int, int, int] | None:
+        """Find a port mapping by docker port number."""
+        return next((m for m in mappings if m[0] == docker_port), None)
 
     async def _get_available_ports(self, executor_id: str, miner_hotkey: str) -> dict[int, PortMapping]:
         try:
@@ -1591,7 +1563,7 @@ class DockerService:
             )
             return False, log_text, log_status
 
-    def _get_preferred_ports(self, initial_port_count: int | None, enable_jupyter: bool = False) -> list[int]:
+    def _get_preferred_ports(self, initial_port_count: int | None) -> list[int]:
         """Calculate preferred ports based on initial_port_count.
 
         - None: return all PREFERRED_POD_PORTS
@@ -1601,18 +1573,12 @@ class DockerService:
         if initial_port_count is None:
             return PREFERRED_POD_PORTS
 
-        if enable_jupyter:
-            initial_port_count += 1
-
-        # Add SSH port to count
-        port_count = initial_port_count + 1
-
-        if port_count <= len(PREFERRED_POD_PORTS):
-            return PREFERRED_POD_PORTS[:port_count]
+        if initial_port_count <= len(PREFERRED_POD_PORTS):
+            return PREFERRED_POD_PORTS[:initial_port_count]
 
         # Need more ports than available in PREFERRED_POD_PORTS
         max_port = max(PREFERRED_POD_PORTS)
-        extra_count = port_count - len(PREFERRED_POD_PORTS)
+        extra_count = initial_port_count - len(PREFERRED_POD_PORTS)
         extra_ports = [max_port + i for i in range(extra_count)]
 
         return list(PREFERRED_POD_PORTS) + extra_ports
