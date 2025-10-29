@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from typing import Annotated
 
 from asyncssh import SSHKey
@@ -141,7 +142,11 @@ class MinerService:
                     tasks = [
                         asyncio.create_task(
                             asyncio.wait_for(
-                                self.task_service.create_task(
+                                (
+                                    self.task_service.create_task
+                                    if random.randint(0, 100) < settings.NEW_PIPELINE_ROLLOUT_PERCENTAGE
+                                    else self.task_service.create_task_old
+                                )(
                                     miner_info=payload,
                                     executor_info=executor_info,
                                     keypair=my_key,
