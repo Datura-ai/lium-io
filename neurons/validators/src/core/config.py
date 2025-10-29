@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     # Percentage of tasks to use new pipeline (0-100). Default 50 means 50% new, 50% old
     NEW_PIPELINE_ROLLOUT_PERCENTAGE: int = Field(
-        env="NEW_PIPELINE_ROLLOUT_PERCENTAGE", default=0
+        env="NEW_PIPELINE_ROLLOUT_PERCENTAGE", default=100
     )
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
