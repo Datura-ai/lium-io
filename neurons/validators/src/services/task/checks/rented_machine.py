@@ -1,5 +1,5 @@
 from typing import Iterable
-
+from dataclasses import replace
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ..messages import TenantEnforcementMessages as Msg, render_message
@@ -167,6 +167,19 @@ class TenantEnforcementCheck:
                 )
 
         port_count = await _compute_port_count(ctx)
+                
+        extra = {
+            **extra,
+            "available_port_count": port_count,
+        }
+        
+        updated_state = replace(
+            ctx.state,
+            specs={
+                **ctx.state.specs,
+                "available_port_count": port_count,
+            },
+        )
 
         score_calculator = ctx.services.score_calculator
         actual_score, job_score, warning_message = score_calculator(
@@ -197,6 +210,7 @@ class TenantEnforcementCheck:
             passed=True,
             event=event,
             updates={
+                "state": updated_state,
                 "default_extra": extra,
                 "rented": True,
                 "ssh_pub_keys": ssh_pub_keys,

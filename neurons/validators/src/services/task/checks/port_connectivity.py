@@ -63,6 +63,14 @@ class PortConnectivityCheck:
         extra_info = {
             "sysbox_runtime": result.sysbox_runtime,
         }
+        updated_state = replace(
+            ctx.state,
+            specs={
+                **ctx.state.specs,
+                "sysbox_runtime": result.sysbox_runtime,
+            },
+            sysbox_runtime=result.sysbox_runtime
+        )
 
         if not result.success:
             event = render_message(
@@ -72,7 +80,6 @@ class PortConnectivityCheck:
                 what={"details": result.log_text},
                 extra=extra_info,
             )
-            updated_state = replace(ctx.state, sysbox_runtime=result.sysbox_runtime)
             return CheckResult(
                 passed=False,
                 event=event,
@@ -86,7 +93,6 @@ class PortConnectivityCheck:
             what={"message": result.log_text},
             extra=extra_info,
         )
-        updated_state = replace(ctx.state, sysbox_runtime=result.sysbox_runtime)
         return CheckResult(
             passed=True,
             event=event,

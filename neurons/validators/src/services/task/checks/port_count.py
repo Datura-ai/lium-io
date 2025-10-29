@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX
@@ -28,6 +29,14 @@ class PortCountCheck:
             port_maps_bytes = await redis_service.lrange(port_map_key)
             port_count = len([tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes])
 
+        updated_state = replace(
+            ctx.state,
+            specs={
+                **ctx.state.specs,
+                "available_port_count": port_count,
+            },
+        )
+        
         event = render_message(
             Msg.PORT_COUNT_RECORDED,
             ctx=ctx,
@@ -38,5 +47,5 @@ class PortCountCheck:
         return CheckResult(
             passed=True,
             event=event,
-            updates={"port_count": port_count},
+            updates={"port_count": port_count, "state": updated_state},
         )
