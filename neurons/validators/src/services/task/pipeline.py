@@ -1,0 +1,151 @@
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Optional, Protocol, Tuple
+
+import asyncssh
+from pydantic import BaseModel, Field
+
+from datura.requests.miner_requests import ExecutorSSHInfo
+
+from core.utils import _m
+from daos.port_mapping_dao import PortMappingDao
+from services.ssh_service import SSHService
+from services.redis_service import RedisService
+from services.collateral_contract_service import CollateralContractService
+from services.matrix_validation_service import ValidationService
+from services.verifyx_validation_service import VerifyXValidationService
+from services.executor_connectivity_service import ExecutorConnectivityService
+from services.interactive_shell_service import InteractiveShellService
+from .models import ValidationEvent
+from .runner import SSHCommandRunner
+
+@dataclass(frozen=True)
+class ContextServices:
+    ssh: SSHService
+    redis: RedisService
+    collateral: CollateralContractService
+    validation: ValidationService
+    verifyx: VerifyXValidationService
+    connectivity: ExecutorConnectivityService
+    shell: InteractiveShellService
+    port_mapping: PortMappingDao
+    score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
+
+
+@dataclass(frozen=True)
+class ContextConfig:
+    executor_root: str
+    compute_rest_app_url: str
+    gpu_monitor_script_relative: str
+    machine_scrape_filename: str
+    machine_scrape_timeout: int
+    obfuscation_keys: Any
+    validator_keypair: Optional[Any] = None
+    max_gpu_count: Optional[int] = None
+    gpu_model_rates: Optional[dict[str, Any]] = None
+    nvml_digest_map: Optional[dict[str, str]] = None
+    enable_no_collateral: bool = False
+    verifyx_enabled: bool = False
+    port_private_key: Optional[str] = None
+    port_public_key: Optional[str] = None
+    job_batch_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ContextState:
+    upload_local_dir: Optional[str] = None
+    upload_remote_dir: Optional[str] = None
+    remote_dir: Optional[str] = None
+    specs: dict[str, Any] = field(default_factory=dict)
+    gpu_model: Optional[str] = None
+    gpu_count: Optional[int] = None
+    gpu_details: list[dict] = field(default_factory=list)
+    gpu_processes: list[dict] = field(default_factory=list)
+    sysbox_runtime: bool = False
+    gpu_model_count: Optional[str] = None
+    gpu_uuids: Optional[str] = None
+
+
+class CheckResult(BaseModel):
+    passed: bool
+    event: ValidationEvent
+    updates: dict[str, Any] = {}
+    halt: bool = False
+
+
+class Context(BaseModel):
+    model_config = {"frozen": True, "arbitrary_types_allowed": True}
+    pipeline_id: str
+    executor: ExecutorSSHInfo
+    miner_hotkey: str
+    ssh: asyncssh.SSHClientConnection
+    runner: SSHCommandRunner
+    verified: dict = {}
+    settings: dict = {}
+    encrypt_key: str | None = None
+    default_extra: dict[str, Any] = {}
+    services: ContextServices
+    config: ContextConfig
+    state: ContextState = Field(default_factory=ContextState)
+    clear_verified_job_info: bool = False
+    clear_verified_job_reason: str | None = None
+    collateral_deposited: bool = False
+    contract_version: str | None = None
+    is_rental_succeed: bool = False
+    rented: bool = False
+    renting_in_progress: bool = False
+    ssh_pub_keys: list[str] | None = None
+    port_count: int = 0
+    score: float = 0.0
+    job_score: float = 0.0
+    score_warning: str | None = None
+    log_status: str = "info"
+    log_text: str | None = None
+    success: bool = False
+
+
+class Check(Protocol):
+    check_id: str
+    fatal: bool
+
+    async def run(self, ctx: Context) -> CheckResult: ...
+
+
+class EventSink(Protocol):
+    async def emit(self, event: ValidationEvent) -> None: ...
+
+
+class LoggerSink:
+    def __init__(self, logger_: logging.Logger):
+        self.logger = logger_
+
+    async def emit(self, event: ValidationEvent) -> None:
+        level = {"info": "info", "warning": "warning", "error": "error"}[event.severity]
+        getattr(self.logger, level)(_m(event.event, extra=event.model_dump(mode="json")))
+
+
+class Pipeline:
+    def __init__(self, checks: List[Check], sink: EventSink):
+        self.checks = checks
+        self.sink = sink
+
+    async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        events: list[ValidationEvent] = []
+        current_ctx = ctx
+
+        for chk in self.checks:
+            res = await chk.run(current_ctx)
+
+            await self.sink.emit(res.event)
+            events.append(res.event)
+
+            if res.updates:
+                current_ctx = current_ctx.model_copy(update=res.updates)
+
+            if not res.passed and getattr(chk, "fatal", False):
+                return False, events, current_ctx
+
+            if res.halt:
+                return True, events, current_ctx
+
+        return True, events, current_ctx

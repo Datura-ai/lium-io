@@ -171,7 +171,7 @@ class StructuredMessage:
         self.extra = extra
 
     def __str__(self):
-        return "%s >>> %s" % (self.message, json.dumps(self.extra))  # noqa
+        return "%s >>> %s" % (self.message, json.dumps(self.extra, default=str))  # noqa
 
 
 _m = StructuredMessage
