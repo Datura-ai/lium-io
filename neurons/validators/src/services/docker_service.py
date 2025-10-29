@@ -873,7 +873,7 @@ class DockerService:
                     log_tag=log_tag,
                     log_text="Creating docker container",
                     log_extra=default_extra,
-                    timeout=30
+                    timeout=60
                 )
 
                 # check if the container is running correctly
