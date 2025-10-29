@@ -24,6 +24,25 @@ class GpuUsageCheck:
             )
             return CheckResult(passed=True, event=event)
 
+        # Check for orphaned rental containers
+        for process in gpu_processes:
+            container_name = process.get("container_name")
+            if container_name and container_name.startswith("container_") and not ctx.rented:
+                # Found orphaned rental container - rental ended but container still running
+                event = render_message(
+                    Msg.ORPHANED_CONTAINER,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    remediation=Msg.ORPHANED_CONTAINER.remediation.format(orphaned_container=container_name),
+                    what={
+                        **violation,
+                        "orphaned_container": container_name,
+                        "rental_status": "ended",
+                        "container_status": "still running",
+                    },
+                )
+                return CheckResult(passed=False, event=event)
+
         event = render_message(
             Msg.USAGE_HIGH,
             ctx=ctx,

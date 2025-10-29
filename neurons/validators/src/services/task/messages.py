@@ -393,6 +393,14 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
     )
+    ORPHANED_CONTAINER = MessageTemplate(
+        event="Orphaned rental container detected",
+        reason="ORPHANED_RENTAL_CONTAINER",
+        severity="error",
+        category="runtime",
+        impact="Validation skipped; score set to 0",
+        remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
+    )
 
 
 class PortConnectivityMessages:
