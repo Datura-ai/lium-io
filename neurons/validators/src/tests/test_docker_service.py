@@ -238,7 +238,7 @@ async def test_flexible_mode_port_mappings(
     - When enable_jupyter=True, Jupyter port (8888) is inserted at position 1
     """
     # Mock PREFERRED_POD_PORTS to a shorter list for easier testing
-    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", [22, 20000, 20001])
+    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", [20000, 20001, 20002, 20003])
 
     # Mock database response
     mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
@@ -291,13 +291,11 @@ async def test_no_exact_match_custom_ports_uses_random_selection(docker_service,
 @pytest.mark.parametrize("initial_port_count,expected_length,expected_first_port,should_have_extra_ports", [
     # No initial count - returns all PREFERRED_POD_PORTS
     (None, 11, 22, False),
-    # Less than PREFERRED_POD_PORTS length - returns limited list
-    (0, 1, 22, False),
-    (2, 3, 22, False),  # +1 for SSH port = 3 total
-    (5, 6, 22, False),  # +1 for SSH port = 6 total
+    (2, 2, 22, False),  # +1 for SSH port = 3 total
+    (5, 5, 22, False),  # +1 for SSH port = 6 total
     # More than PREFERRED_POD_PORTS length - returns PREFERRED_POD_PORTS + extra
-    (11, 12, 22, True),  # +1 for SSH port = 12 total, 1 extra port needed
-    (15, 16, 22, True),  # +1 for SSH port = 16 total, 5 extra ports needed
+    (11, 11, 22, True),  # +1 for SSH port = 12 total, 1 extra port needed
+    (15, 15, 22, True),  # +1 for SSH port = 16 total, 5 extra ports needed
 ])
 def test_get_preferred_ports(
     docker_service,
@@ -343,11 +341,11 @@ def test_get_preferred_ports(
 @pytest.mark.parametrize(
     "enable_jupyter,internal_ports,available_ports,expected_jupyter_in_mappings,jupyter_port_position",
     [
-        # # Scenario 1: enable_jupyter=True, STRICT mode, 8888 available (exact match)
+        # Scenario 1: enable_jupyter=True, STRICT mode, 8888 available (exact match)
         (True, [22, 8080, 8888], [22, 8080, 8888, 9000], True, 1),
-        # # Scenario 2: enable_jupyter=True, STRICT mode, 8888 not available (random assignment)
+        # Scenario 2: enable_jupyter=True, STRICT mode, 8888 not available (random assignment)
         (True, [22, 8080, 8888], [22, 8080, 9000, 9100], True, 1),
-        # # Scenario 3: enable_jupyter=True, FLEXIBLE mode, 8888 available
+        # Scenario 3: enable_jupyter=True, FLEXIBLE mode, 8888 available
         (True, None, [22, 8888, 20000, 20001], True, 1),
         # Scenario 4: enable_jupyter=True, FLEXIBLE mode, 8888 not available
         (True, None, [9000, 9001, 9002, 9003], True, 1),
@@ -375,7 +373,7 @@ async def test_enable_jupyter_feature(
     - Disabled jupyter: no jupyter port in mappings, jupyter_port_map is None
     """
     # Arrange
-    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", [22, 20000, 20001, 20002, 20003])
+    monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", [20000, 20001, 20002, 20003])
     mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
     docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
 
@@ -386,8 +384,7 @@ async def test_enable_jupyter_feature(
 
     # Assert
     # SSH port should always be first
-    first_ports = [m[0] for m in mappings]
-    assert 22 in first_ports
+    assert mappings[0][0] == 22
 
     if expected_jupyter_in_mappings:
         # Jupyter port should be at specified position

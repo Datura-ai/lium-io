@@ -53,3 +53,27 @@ class GetPodLogsRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.GetPodLogsRequest
     executor_id: str
     container_name: str
+
+
+# Simple REST API models for validator authentication
+class SimpleValidatorRequest(pydantic.BaseModel):
+    """Simplified request model for REST API with basic signature validation.
+
+    Validator signs their own hotkey to prove ownership.
+    No timestamp or miner_hotkey required for read-only operations.
+    """
+    signature: str
+    validator_hotkey: str
+
+
+class ExecutorInfo(pydantic.BaseModel):
+    """Information about a single executor."""
+    uuid: str
+    address: str
+    port: int
+
+
+class ExecutorListResponse(pydantic.BaseModel):
+    """Response model containing list of executors for validator."""
+    validator_hotkey: str
+    executors: list[ExecutorInfo]
