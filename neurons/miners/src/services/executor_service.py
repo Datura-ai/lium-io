@@ -146,7 +146,7 @@ class ExecutorService:
                 error=str(log_text),
             )
 
-    def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None):
+    def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None)  -> list[Executor]:
         return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
 
     async def send_pubkey_to_executor(
