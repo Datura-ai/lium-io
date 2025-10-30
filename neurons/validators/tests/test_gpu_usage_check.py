@@ -75,3 +75,32 @@ async def test_gpu_usage_check(
     # Verify the what_we_saw field contains process count
     if gpu_processes:
         assert result.event.what_we_saw.get("process_count") == len(gpu_processes)
+
+
+@pytest.mark.asyncio
+async def test_gpu_usage_orphaned_container(context_factory):
+    """Test detection of orphaned rental containers."""
+    services = build_services()
+    config = build_context_config()
+
+    # GPU usage exceeds limits with orphaned rental container
+    gpu_details = [{"gpu_utilization": 100, "memory_utilization": 61}]
+    gpu_processes = [
+        {
+            "pid": 3217038,
+            "info": "0::/../df2b545dac1b4caa3642d0db98ca054a0d923a1d0a3e470b60852c5aac81301f/init.scope",
+            "container_name": "container_5703f4c9-c2f4-4fae-a652-3dee4753030a",
+        }
+    ]
+
+    state = build_state(gpu_details=gpu_details, gpu_processes=gpu_processes)
+    ctx = context_factory(services=services, config=config, state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert result.event.what_we_saw.get("orphaned_container") == "container_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    assert result.event.what_we_saw.get("rental_status") == "ended"
+    assert result.event.what_we_saw.get("container_status") == "still running"
+    assert "docker stop container_5703f4c9-c2f4-4fae-a652-3dee4753030a" in result.event.remediation

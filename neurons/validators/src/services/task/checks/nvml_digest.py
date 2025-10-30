@@ -24,17 +24,32 @@ class NvmlDigestCheck:
         driver_version = gpu_info.get("driver") or ""
         lib_digest = specs.get("md5_checksums", {}).get("libnvidia_ml", "") or ""
 
-        if driver_version and digest_map.get(driver_version) != lib_digest:
-            event = render_message(
-                Msg.DIGEST_MISMATCH,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "driver": driver_version,
-                    "expected_md5": digest_map.get(driver_version),
-                    "actual_md5": lib_digest,
-                },
-            )
+        expected_digest = digest_map.get(driver_version)
+
+        if driver_version and expected_digest != lib_digest:
+            # Check if driver version is unknown (not in our map)
+            if expected_digest is None:
+                event = render_message(
+                    Msg.DRIVER_UNKNOWN,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "driver": driver_version,
+                        "actual_md5": lib_digest,
+                    },
+                )
+            else:
+                # Driver is known but digest doesn't match - possible tampering
+                event = render_message(
+                    Msg.DIGEST_MISMATCH,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "driver": driver_version,
+                        "expected_md5": expected_digest,
+                        "actual_md5": lib_digest,
+                    },
+                )
             return CheckResult(
                 passed=False,
                 event=event,

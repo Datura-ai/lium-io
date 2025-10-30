@@ -237,6 +237,14 @@ class NvmlDigestMessages:
         impact="Score set to 0; previous verification cleared",
         remediation="Reinstall the NVIDIA driver matching this version and ensure libnvidia-ml is not tampered.",
     )
+    DRIVER_UNKNOWN = MessageTemplate(
+        event="Unknown NVIDIA driver version",
+        reason="NVML_DRIVER_UNKNOWN",
+        severity="error",
+        category="env",
+        impact="Score set to 0; previous verification cleared",
+        remediation="Update to a supported NVIDIA driver version. Your current driver version is not recognized.",
+    )
     DIGEST_OK = MessageTemplate(
         event="NVML library digest verified",
         reason="NVML_DIGEST_OK",
@@ -392,6 +400,14 @@ class GpuUsageMessages:
         category="runtime",
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
+    )
+    ORPHANED_CONTAINER = MessageTemplate(
+        event="Orphaned rental container detected",
+        reason="ORPHANED_RENTAL_CONTAINER",
+        severity="error",
+        category="runtime",
+        impact="Validation skipped; score set to 0",
+        remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
     )
 
 
