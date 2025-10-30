@@ -36,13 +36,22 @@ from tests.helpers import build_context_config, build_services, build_state
             Msg.DIGEST_MISMATCH.reason,
             True,
         ),
-        # Driver version not in map - should fail
+        # Driver version not in map - should fail with DRIVER_UNKNOWN
         (
             "999.999.99",
             "any_digest",
             {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
             False,
-            Msg.DIGEST_MISMATCH.reason,
+            Msg.DRIVER_UNKNOWN.reason,
+            True,
+        ),
+        # Real-world unknown driver case - 535.274.02
+        (
+            "535.274.02",
+            "939800fdf0d88c143e416203d68a7d39:25e82746a4eb51597e9e901bc59d5a4e05c5971f8e0069df49c6d4f6cfeb4b51",
+            {"535.183.01": "58fc46eefa8ebb265293556951a75a39:67185f510159acdc8f38b768b059bfb0f3ec5869baaffd1dc1c949e52012b18f"},
+            False,
+            Msg.DRIVER_UNKNOWN.reason,
             True,
         ),
         # Empty digest - should fail if driver version is known
