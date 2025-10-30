@@ -243,6 +243,18 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py get-executor
 
 This will display the TAO collateral associated with the specified executor.
 
+### Reclaim Request
+
+To reclaim your collateral, use the following command:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py reclaim-collateral --executor_uuid <executor_uuid> --private-key <ethereum-private-key>
+```
+
+- `<executor_uuid>`: The uuid of the executor.
+- `<ethereum-private-key>`: The Ethereum private key for the miner (used for collateral contract transactions).
+
+
 ### Getting Miner Reclaim Requests
 
 To view all reclaim requests for the current miner, use the following command:

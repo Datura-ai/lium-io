@@ -13,6 +13,7 @@ jobs:
       TARGET_FILE: "docker-compose.app.yml"
       DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
 
     steps:
       - uses: actions/checkout@v4

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from typing import Annotated
 
 from asyncssh import SSHKey
@@ -41,6 +42,9 @@ from payload_models.payloads import (
     AddDebugSshKeyRequest,
     DebugSshKeyAdded,
     FailedAddDebugSshKey,
+    InstallJupyterServerRequest,
+    JupyterServerInstalled,
+    JupyterInstallationFailed,
 )
 
 from core.config import settings
@@ -138,7 +142,11 @@ class MinerService:
                     tasks = [
                         asyncio.create_task(
                             asyncio.wait_for(
-                                self.task_service.create_task(
+                                (
+                                    self.task_service.create_task
+                                    if random.randint(0, 100) < settings.NEW_PIPELINE_ROLLOUT_PERCENTAGE
+                                    else self.task_service.create_task_old
+                                )(
                                     miner_info=payload,
                                     executor_info=executor_info,
                                     keypair=my_key,
@@ -170,7 +178,7 @@ class MinerService:
                     return {
                         "miner_hotkey": payload.miner_hotkey,
                         "miner_coldkey": payload.miner_coldkey,
-                        "results": [result for result in results if result.gpu_model is not None and result.gpu_count > 0],
+                        "results": results,
                     }
                 elif isinstance(msg, FailedRequest):
                     logger.warning(
@@ -287,6 +295,12 @@ class MinerService:
                 msg=msg,
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=error_code,
+            )
+        elif isinstance(payload, InstallJupyterServerRequest):
+            return JupyterInstallationFailed(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=msg,
             )
         else:
             return FailedContainerRequest(
@@ -507,6 +521,16 @@ class MinerService:
                         )
 
                         return result
+                    elif isinstance(payload, InstallJupyterServerRequest):
+                        result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
+
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key, executor_id=payload.executor_id
+                            )
+                        )
+
+                        return result
                     elif isinstance(payload, BackupContainerRequest):
                         return await self.handle_backup_container_req(executor, payload, ssh_pkey)
                     elif isinstance(payload, RestoreContainerRequest):
@@ -557,9 +581,7 @@ class MinerService:
             log_text = _m(
                 "Resulted in an exception",
                 extra=get_extra_info({**default_extra, "error": str(e)}),
-                exc_info=True,
             )
-
             return self._handle_container_error(
                 payload=payload,
                 msg=str(log_text),

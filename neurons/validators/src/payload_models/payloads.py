@@ -12,6 +12,135 @@ class CustomOptions(BaseModel):
     internal_ports: list[int] | None = None
     startup_commands: str | None = None
     shm_size: str | None = None
+    initial_port_count: int | None = None
+
+    @classmethod
+    def sanitize(cls, custom_options: 'CustomOptions | None') -> 'CustomOptions':
+        """Sanitize CustomOptions to prevent command injection attacks."""
+        if not custom_options:
+            return cls()
+
+        # Sanitize volumes - only allow valid host:container path format
+        volumes = cls._sanitize_volumes(custom_options.volumes or [])
+        
+        # Sanitize entrypoint - only allow single command, no flags
+        entrypoint = cls._sanitize_entrypoint(custom_options.entrypoint)
+        
+        # Sanitize shm size - only allow valid size format
+        shm_size = cls._sanitize_shm_size(custom_options.shm_size)
+        
+        # Sanitize environment variables
+        environment = cls._sanitize_environment(custom_options.environment or {})
+        
+        return cls(
+            volumes=volumes if volumes else None,
+            environment=environment if environment else None,
+            entrypoint=entrypoint,
+            internal_ports=custom_options.internal_ports,
+            initial_port_count=custom_options.initial_port_count,
+            startup_commands=custom_options.startup_commands,
+            shm_size=shm_size,
+        )
+
+    @staticmethod
+    def _sanitize_volumes(volumes: list[str]) -> list[str]:
+        """Sanitize volume mounts to prevent command injection."""
+        import re
+        sanitized = []
+        for volume in volumes:
+            if not volume or not volume.strip():
+                continue
+                
+            # Remove any extra flags or commands
+            clean_volume = volume.strip().split()[0]
+            
+            # Validate format: must be host_path:container_path
+            if ':' not in clean_volume:
+                continue
+                
+            host_path, container_path = clean_volume.split(':', 1)
+            
+            # Basic validation - reject dangerous paths
+            if CustomOptions._is_dangerous_path(host_path) or CustomOptions._is_dangerous_path(container_path):
+                continue
+                
+            sanitized.append(clean_volume)
+            
+        return sanitized
+
+    @staticmethod
+    def _sanitize_entrypoint(entrypoint: str | None) -> str | None:
+        """Sanitize entrypoint to prevent command injection."""
+        import re
+        if not entrypoint or not entrypoint.strip():
+            return None
+            
+        # Only allow single command, no flags or arguments
+        clean_entrypoint = entrypoint.strip().split()[0]
+        
+        # Basic validation - only allow alphanumeric, dots, slashes, hyphens, underscores
+        # Allow relative paths (./), absolute paths (/), and simple commands (abc/)
+        if not re.match(r'^[a-zA-Z0-9./_-]+$', clean_entrypoint):
+            return None
+            
+        return clean_entrypoint
+
+    @staticmethod
+    def _sanitize_shm_size(shm_size: str | None) -> str | None:
+        """Sanitize shared memory size to prevent command injection."""
+        import re
+        if not shm_size or not shm_size.strip():
+            return None
+            
+        # Only allow valid size format (e.g., "1g", "512m", "1024")
+        clean_size = shm_size.strip().split()[0]
+        
+        # Validate format: number followed by optional unit (case insensitive)
+        if not re.match(r'^\d+[kmg]?$', clean_size.lower()):
+            return None
+            
+        return clean_size
+
+    @staticmethod
+    def _sanitize_environment(environment: dict[str, str]) -> dict[str, str]:
+        """Sanitize environment variables to prevent command injection."""
+        sanitized = {}
+        for key, value in environment.items():
+            if not key or not value or not key.strip() or not str(value).strip():
+                continue
+                
+            # Basic validation for key and value
+            clean_key = key.strip()
+            clean_value = str(value).strip()
+            
+            # Reject keys that might be dangerous
+            if CustomOptions._is_dangerous_env_key(clean_key):
+                continue
+                
+            sanitized[clean_key] = clean_value
+            
+        return sanitized
+
+    @staticmethod
+    def _is_dangerous_path(path: str) -> bool:
+        """Check if path is potentially dangerous."""
+        dangerous_patterns = [
+            '/etc', '/proc', '/sys', '/dev', '/var/run/docker.sock',
+            '/usr/bin/docker', '/bin', '/sbin', '/usr/sbin'
+        ]
+        
+        path_lower = path.lower()
+        return any(dangerous in path_lower for dangerous in dangerous_patterns)
+
+    @staticmethod
+    def _is_dangerous_env_key(key: str) -> bool:
+        """Check if environment key is potentially dangerous."""
+        dangerous_keys = [
+            'PATH', 'LD_LIBRARY_PATH', 'LD_PRELOAD', 'PYTHONPATH',
+            'NODE_PATH', 'RUBYLIB', 'PERL5LIB'
+        ]
+        
+        return key.upper() in dangerous_keys
 
 
 class MinerJobRequestPayload(BaseModel):
@@ -62,6 +191,7 @@ class ContainerRequestType(enum.Enum):
     AddDebugSshKeyRequest = "AddDebugSshKeyRequest"
     BackupContainerRequest = "BackupContainerRequest"
     RestoreContainerRequest = "RestoreContainerRequest"
+    InstallJupyterServer = "InstallJupyterServer"
 
 
 class ContainerBaseRequest(BaseRequest):
@@ -93,6 +223,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     timestamp: int | None = None
     backup_log_id: str | None = None
     restore_path: str | None = None
+    enable_jupyter: bool | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -119,6 +250,14 @@ class RemoveSshPublicKeysRequest(ContainerBaseRequest):
 class AddDebugSshKeyRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.AddDebugSshKeyRequest
     public_key: str
+
+
+class InstallJupyterServerRequest(ContainerBaseRequest):
+    message_type: ContainerRequestType = ContainerRequestType.InstallJupyterServer
+    container_name: str
+    jupyter_port_map: tuple[int, int]
+    local_volume: str | None = None
+    local_volume_path: str = "/root"
 
 
 class ContainerStopRequest(ContainerBaseRequest):
@@ -176,6 +315,8 @@ class ContainerResponseType(enum.Enum):
     DebugSshKeyAdded = "DebugSshKeyAdded"
     FailedAddDebugSshKey = "FailedAddDebugSshKey"
     SshPubKeyRemoved = "SshPubKeyRemoved"
+    JupyterServerInstalled = "JupyterServerInstalled"
+    JupyterInstallationFailed = "JupyterInstallationFailed"
 
 
 class ContainerBaseResponse(BaseRequest):
@@ -192,6 +333,7 @@ class ContainerCreated(ContainerBaseResponse):
     profilers: list[dict] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
+    jupyter_url: str | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -234,6 +376,7 @@ class FailedContainerErrorCodes(enum.Enum):
     ExceptionError = "ExceptionError"
     FailedMsgFromMiner = "FailedMsgFromMiner"
     RentingInProgress = "RentingInProgress"
+    NoJupyterPortMapping = "NoJupyterPortMapping"
 
 
 class FailedContainerErrorTypes(enum.Enum):
@@ -272,4 +415,14 @@ class FailedGetPodLogs(ContainerBaseResponse):
 
 class FailedAddDebugSshKey(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedAddDebugSshKey
+    msg: str
+
+
+class JupyterServerInstalled(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.JupyterServerInstalled
+    jupyter_url: str
+
+
+class JupyterInstallationFailed(ContainerBaseResponse):
+    message_type: ContainerResponseType = ContainerResponseType.JupyterInstallationFailed
     msg: str

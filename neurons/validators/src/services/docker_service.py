@@ -6,7 +6,7 @@ import time
 from typing import Annotated, Any
 from uuid import uuid4, UUID
 import shlex
-
+import secrets
 import aiohttp
 import asyncssh
 import bittensor
@@ -29,6 +29,10 @@ from payload_models.payloads import (
     FailedContainerRequest,
     FailedContainerErrorTypes,
     ExternalVolumeInfo,
+    InstallJupyterServerRequest,
+    JupyterServerInstalled,
+    JupyterInstallationFailed,
+    CustomOptions,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -41,6 +45,7 @@ from services.redis_service import (
     RedisService,
 )
 from services.ssh_service import SSHService
+from models.port_mapping import PortMapping
 
 logger = logging.getLogger(__name__)
 
@@ -74,86 +79,122 @@ class DockerService:
         self.log_task: asyncio.Task | None = None
         self.is_realtime_logging = False
 
-    async def generate_portMappings(self, miner_hotkey: str, executor_id: str, internal_ports: list[int] = None) -> list[tuple[int, int, int]]:
+    async def generate_portMappings(
+        self,
+        miner_hotkey: str,
+        executor_id: str,
+        internal_ports: list[int] | None = None,
+        initial_port_count: int | None = None,
+        enable_jupyter: bool | None = False,
+    ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
+        available_ports = await self._get_available_ports(executor_id, miner_hotkey)
+
+        if len(available_ports) < MIN_PORT_COUNT:
+            return [], None
+
+        mappings = []
+        ssh_port = 22
+        jupyter_port = 8888
+        jupyter_port_map: tuple[int, int] | None = None
+        
+        user_defined = bool(internal_ports)
+        docker_internal_ports = internal_ports or self._get_preferred_ports(initial_port_count)
+        if ssh_port in docker_internal_ports:
+            docker_internal_ports.remove(ssh_port)
+        docker_internal_ports.insert(0, ssh_port)
+            
+        if enable_jupyter:
+            if jupyter_port in docker_internal_ports:
+                docker_internal_ports.remove(jupyter_port)
+            docker_internal_ports.insert(1, jupyter_port)
+
+        for port in docker_internal_ports:
+            if not len(available_ports):
+                break
+
+            if port in available_ports:
+                docker_port = port
+                external_port = port
+            elif port == ssh_port or port == jupyter_port:
+                docker_port = port
+                external_port = max(available_ports.keys())
+            else:
+                external_port = random.choice(list(available_ports.keys())) if user_defined else min(available_ports.keys())
+                docker_port = port if user_defined else external_port
+                
+            port_mapping = available_ports.pop(external_port)
+            mappings.append((docker_port, port_mapping.internal_port, external_port))
+
+        logger.info(
+            f"Generated {len(mappings)} port mappings from database for executor {executor_id}"
+        )
+
+        if enable_jupyter:
+            mapping = self._find_mapping_by_docker_port(mappings, jupyter_port)
+            if mapping:
+                jupyter_port_map = (mapping[0], mapping[2])
+
+        return mappings, jupyter_port_map
+
+    def _find_mapping_by_docker_port(self, mappings: list[tuple[int, int, int]], docker_port: int) -> tuple[int, int, int] | None:
+        """Find a port mapping by docker port number."""
+        return next((m for m in mappings if m[0] == docker_port), None)
+
+    async def _get_available_ports(self, executor_id: str, miner_hotkey: str) -> dict[int, PortMapping]:
         try:
             # Get successful ports from database as dict {external_port: PortMapping}
             available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
-            if len(available_ports) < MIN_PORT_COUNT:
-                raise Exception(f"Not enough successful ports found in database for executor {executor_id}")
 
-            mappings = []
+            if len(available_ports) >= MIN_PORT_COUNT:
+                return available_ports
 
-            if internal_ports:
-                # ============ STRICT MODE: Custom docker ports (must preserve docker port numbers) ============
-                # User explicitly requested specific docker ports - we MUST use them
-                # Strategy: docker_port is fixed, external_port can be any available
-                for docker_port in internal_ports:
-                    if docker_port in available_ports:
-                        # Exact match: docker_port == external_port
-                        port_mapping = available_ports.pop(docker_port)
-                        mappings.append((docker_port, port_mapping.internal_port, docker_port))
-                    else:
-                        # No exact match: docker_port stays fixed, pick random external_port
-                        external_port = random.choice(list(available_ports.keys()))
-                        port_mapping = available_ports.pop(external_port)
-                        mappings.append((docker_port, port_mapping.internal_port, external_port))
-            else:
-                # ============ FLEXIBLE MODE: Preferred ports (can deviate if needed) ============
-                # Using PREFERRED_POD_PORTS as soft preference, not strict requirement
-                # Strategy: prefer exact match, but if unavailable use any port (both docker and external) + SSH port always.
-                ssh_port = 22
-                for preferred_port in PREFERRED_POD_PORTS:
-                    if preferred_port in available_ports:
-                        # Exact match: preferred_port available
-                        port_mapping = available_ports.pop(preferred_port)
-                        mappings.append(
-                            (preferred_port, port_mapping.internal_port, preferred_port)
-                        )
-                    elif preferred_port == ssh_port:
-                        # if it's SSH port - assign max available port, because SSH port is strict.
-                        external_port = max(list(available_ports.keys()))
-                        port_mapping = available_ports.pop(external_port)
-                        mappings.append((preferred_port, port_mapping.internal_port, external_port))
-                    else:
-                        # No preferred port available: use any available port for both docker and external
-                        external_port = min(available_ports.keys())
-                        port_mapping = available_ports.pop(external_port)
-                        mappings.append((external_port, port_mapping.internal_port, external_port))
-
-            logger.info(
-                f"Generated {len(mappings)} port mappings from database for executor {executor_id}"
+            logger.warning(
+                f"Insufficient ports in database ({len(available_ports)}/{MIN_PORT_COUNT}), "
+                f"falling back to Redis for executor {executor_id}"
             )
-            return mappings
-
         except Exception as e:
-            logger.error(f"Error generating port mappings from database: {e}", exc_info=True)
-            return await self.generate_port_mapping_from_redis(executor_id, internal_ports, miner_hotkey)
+            logger.warning(
+                f"Failed to fetch port mappings from database for executor {executor_id}: {e}",
+                exc_info=True
+            )
 
+        # Fallback to Redis
+        return await self.generate_port_mapping_from_redis(miner_hotkey, executor_id)
 
-    async def generate_port_mapping_from_redis(self, executor_id, internal_ports, miner_hotkey) -> list[Any]:
+    async def generate_port_mapping_from_redis(self, miner_hotkey: str, executor_id: str) -> dict[int, PortMapping]:
+        mappings: dict[int, PortMapping] = {}
         try:
-            docker_internal_ports = PREFERRED_POD_PORTS
-            if internal_ports:
-                docker_internal_ports = internal_ports
-
             key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
             available_port_maps = await self.redis_service.lrange(key)
 
             logger.info(f"available_port_maps: {key}, {available_port_maps}")
-
-            mappings = []
-            for i, docker_port in enumerate(docker_internal_ports):
-                if i < len(available_port_maps):
-                    internal_port, external_port = map(
-                        int, available_port_maps[i].decode().split(",")
-                    )
-                    mappings.append((docker_port, internal_port, external_port))
-                else:
-                    break
+            for available_port_map in available_port_maps:
+                internal_port, external_port = map(
+                    int, available_port_map.decode().split(",")
+                )
+                mappings[external_port] = PortMapping(
+                    uuid=uuid4(),
+                    miner_hotkey=miner_hotkey,
+                    executor_id=UUID(executor_id),
+                    internal_port=internal_port,
+                    external_port=external_port,
+                    is_successful=True,
+                    verification_time=datetime.utcnow()
+                )
             return mappings
         except Exception as e:
-            logger.error(f"Error generating port mappings: {e}", exc_info=True)
-            return []
+            logger.error(
+                _m(
+                    "Error generating port mappings from redis",
+                    extra=get_extra_info({
+                        "miner_hotkey": miner_hotkey,
+                        "executor_id": executor_id,
+                        "error": str(e),
+                    }),
+                ),
+                exc_info=True,
+            )
+            return mappings
 
     async def execute_and_stream_logs(
         self,
@@ -205,7 +246,7 @@ class DockerService:
                 )
 
         if not status and raise_exception:
-            raise Exception(f"Failed ${log_text}. command: {command} error: {error}")
+            raise Exception(f"Failed {log_text}. command: {command} error: {error}")
 
         return status, error
 
@@ -404,6 +445,10 @@ class DockerService:
         command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
         await ssh_client.run(command)
 
+        # set allow_other option
+        command = f'/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
+        await ssh_client.run(command)
+
         # enable volume plugin
         command = f"/usr/bin/docker plugin enable s3fs"
         await ssh_client.run(command)
@@ -427,6 +472,106 @@ class DockerService:
         command = f"/usr/bin/docker plugin disable s3fs -f"
         await ssh_client.run(command)
 
+    async def run_jupyter(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        jupyter_token: str,
+        jupyter_port: int,
+        log_tag: str,
+        log_extra: dict,
+        local_volume: str | None = None,
+        local_volume_path: str = '/root',
+    ):
+        if local_volume:
+            temp_container_name = f"temp_jupyter_copy_{uuid4()}"
+            try:
+                command = (
+                    f"/usr/bin/docker run -d --rm -v {local_volume}:/mnt "
+                    f"--name {temp_container_name} --entrypoint sh "
+                    f"daturaai/compute-subnet-executor:latest -c 'cp /root/app/run_jupyter.sh /mnt/'"
+                )
+                await self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=command,
+                    log_tag=log_tag,
+                    log_text="Creating temporary container for script copy",
+                    log_extra=log_extra,
+                    raise_exception=True,
+                )
+            finally:
+                command = f"/usr/bin/docker rm -f {temp_container_name}"
+                await self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=command,
+                    log_tag=log_tag,
+                    log_text="Removing temporary container",
+                    log_extra=log_extra,
+                    raise_exception=False,
+                )
+
+            command = (
+                f"/usr/bin/docker exec {container_name} "
+                f"sh -c 'chmod +x {local_volume_path}/run_jupyter.sh'"
+            )
+            await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Making run_jupyter.sh executable",
+                log_extra=log_extra,
+                raise_exception=True,
+            )
+
+            command = (
+                f"/usr/bin/docker exec {container_name} sh -c "
+                f"'{local_volume_path}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+            )
+            status, error = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Running jupyter from volume",
+                log_extra=log_extra,
+                raise_exception=False,
+            )
+        else:
+            command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/root/run_jupyter.sh"
+            await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Copying run_jupyter.sh to container",
+                log_extra=log_extra,
+                raise_exception=True
+            )
+            command = f"/usr/bin/docker exec {container_name} sh -c 'chmod +x /root/run_jupyter.sh'"
+            await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="chmod +x /root/run_jupyter.sh",
+                log_extra=log_extra,
+                raise_exception=True
+            )
+            command = f"/usr/bin/docker exec {container_name} sh -c '/root/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+            status, error = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Running jupyter",
+                log_extra=log_extra,
+                raise_exception=False
+            )
+
+        # Only raise exception for actual errors, not warnings or info messages
+        if not status and error and any(keyword.lower() in error.lower() for keyword in [
+            "Error", "FATAL", "CRITICAL", "Traceback", "Exception",
+            "Permission denied", "Address already in use", "No such file or directory",
+            "Connection refused", "Port already in use", "Failed to start"
+        ]):
+            raise Exception(error)
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -448,7 +593,7 @@ class DockerService:
             "local_volume": local_volume,
             "edit_pod": True if local_volume else False,
             "external_volume": external_volume_info.name if external_volume_info else None,
-            "debug": payload.debug,
+            "enable_jupyter": payload.enable_jupyter,
         }
 
         # Deploy container profiler
@@ -469,13 +614,12 @@ class DockerService:
         )
 
         log_tag = "container_creation"
-        custom_options = payload.custom_options
 
         try:
+            custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
-            custom_internal_ports = custom_options.internal_ports if custom_options and custom_options.internal_ports else None
-            port_maps = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_internal_ports
+            port_maps, jupyter_port_map = await self.generate_portMappings(
+                payload.miner_hotkey, payload.executor_id, custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
             )
 
             # Add profiler for port mappings generation
@@ -495,6 +639,26 @@ class DockerService:
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
+                )
+
+            default_extra = {
+                **default_extra,
+                "jupyter_port_map": jupyter_port_map,
+            }
+
+            if payload.enable_jupyter and not jupyter_port_map:
+                log_text = _m(
+                    "No Jupyter port mapping found",
+                    extra=get_extra_info(default_extra),
+                )
+                logger.error(log_text)
+
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    msg=str(log_text),
+                    error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                    error_code=FailedContainerErrorCodes.NoJupyterPortMapping,
                 )
 
             if not payload.user_public_keys:
@@ -579,21 +743,8 @@ class DockerService:
                     ]
                 )
 
-                # Prepare extra options
-                sanitized_volumes = [
-                    volume for volume
-                    in (custom_options.volumes if custom_options and custom_options.volumes else [])
-                    if volume.strip()
-                ]
-
-                # volume_flags = (
-                #     " ".join([f"-v {volume}" for volume in sanitized_volumes])
-                #     if sanitized_volumes
-                #     else ""
-                # )
-
                 # Get the container path from the first volume
-                local_volume_path = sanitized_volumes[0].split(':')[-1] if sanitized_volumes else '/root'
+                local_volume_path = custom_options.volumes[0].split(':')[-1] if custom_options.volumes else '/root'
                 entrypoint_flag = (
                     f"--entrypoint {custom_options.entrypoint}"
                     if custom_options
@@ -701,8 +852,9 @@ class DockerService:
                     log_tag=log_tag,
                     log_text="Creating docker container",
                     log_extra=default_extra,
-                    timeout=30
+                    timeout=60
                 )
+                logger.info(f"Container creation step finished")
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
@@ -744,6 +896,21 @@ class DockerService:
                     log_tag=log_tag,
                     log_extra=default_extra,
                 )
+
+                jupyter_url = None
+                if payload.enable_jupyter and jupyter_port_map:
+                    jupyter_token = secrets.token_hex(16)
+                    await self.run_jupyter(
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        jupyter_token=jupyter_token,
+                        jupyter_port=jupyter_port_map[0],
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                        local_volume=local_volume,
+                        local_volume_path=local_volume_path,
+                    )
+                    jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
                 # Add profiler for ssh service installation
                 profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -802,6 +969,7 @@ class DockerService:
                     profilers=profilers,
                     backup_log_id=payload.backup_log_id,
                     restore_path=payload.restore_path,
+                    jupyter_url=jupyter_url,
                 )
         except Exception as e:
             log_text = _m(
@@ -997,6 +1165,85 @@ class DockerService:
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+    async def install_jupyter_server(
+        self,
+        payload: InstallJupyterServerRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_uuid": payload.executor_id,
+            "executor_ip_address": executor_info.address,
+            "executor_port": executor_info.port,
+            "executor_ssh_username": executor_info.ssh_username,
+            "executor_ssh_port": executor_info.ssh_port,
+        }
+
+        logger.info(
+            _m(
+                "Install Jupyter server on pod",
+                extra=get_extra_info({**default_extra, "payload": str(payload)}),
+            ),
+        )
+
+        private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
+
+        try:
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client:
+                jupyter_token = secrets.token_hex(16)
+                jupyter_port = payload.jupyter_port_map[0]
+                local_volume = payload.local_volume
+                local_volume_path = payload.local_volume_path
+                await self.run_jupyter(
+                    ssh_client=ssh_client,
+                    container_name=payload.container_name,
+                    jupyter_token=jupyter_token,
+                    jupyter_port=jupyter_port,
+                    log_tag="jupyter",
+                    log_extra=default_extra,
+                    local_volume=local_volume,
+                    local_volume_path=local_volume_path,
+                )
+
+                logger.info(
+                    _m(
+                        "Jupyter server installed",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": payload.container_name,
+                            "jupyter_token": jupyter_token,
+                            "jupyter_port": jupyter_port,
+                        }),
+                    ),
+                )
+
+                return JupyterServerInstalled(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    jupyter_url=f"http://{executor_info.address}:{payload.jupyter_port_map[1]}/lab?token={jupyter_token}",
+                )
+        except Exception as e:
+            log_text = _m(
+                "Failed install jupyter server",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return JupyterInstallationFailed(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=str(log_text),
             )
 
     async def remove_ssh_keys(
@@ -1315,3 +1562,25 @@ class DockerService:
                 )
             )
             return False, log_text, log_status
+
+    def _get_preferred_ports(self, initial_port_count: int | None) -> list[int]:
+        """Calculate preferred ports based on initial_port_count.
+
+        - None: return all PREFERRED_POD_PORTS
+        - Less than PREFERRED_POD_PORTS length: return limited list
+        - More than PREFERRED_POD_PORTS length: return PREFERRED_POD_PORTS + sequential extras
+        """
+        if initial_port_count is None:
+            return PREFERRED_POD_PORTS
+
+        if initial_port_count <= len(PREFERRED_POD_PORTS):
+            return PREFERRED_POD_PORTS[:initial_port_count]
+
+        # Need more ports than available in PREFERRED_POD_PORTS
+        max_port = max(PREFERRED_POD_PORTS)
+        extra_count = initial_port_count - len(PREFERRED_POD_PORTS)
+        extra_ports = [max_port + i for i in range(extra_count)]
+
+        return list(PREFERRED_POD_PORTS) + extra_ports
+
+
