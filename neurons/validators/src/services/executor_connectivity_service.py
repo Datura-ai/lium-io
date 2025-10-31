@@ -231,7 +231,7 @@ class ExecutorConnectivityService:
         port_mappings = " ".join([f"-p {int_}:{int_}" for int_, _ in all_port_maps])
 
         command = (
-            f"/usr/bin/docker run -d -it --name {container_name} "
+            f"/usr/bin/docker run -d --name {container_name} "
             f"{port_mappings} "
             f"-e API_PORT={api_internal} {BATCH_VERIFIER_IMAGE}"
         )
