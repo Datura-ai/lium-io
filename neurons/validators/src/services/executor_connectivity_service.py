@@ -162,7 +162,7 @@ class ExecutorConnectivityService:
 
         try:
             # Start Docker container
-            await self._docker_start(api_external, api_internal, container_name, extra, ssh_client)
+            await self._docker_start(api_external, api_internal, container_name, extra, ssh_client, port_maps)
 
             logger.info(_m(f"batch: docker started {api_external}, wait health", extra))
             if not await self._docker_wait_for_health(executor_info.address, api_external, extra):
@@ -218,15 +218,25 @@ class ExecutorConnectivityService:
                 logger.debug(_m(f"cleanup warning: {e}", extra))
 
     async def _docker_start(
-        self, api_external: int, api_internal: int, container_name: str, extra: dict, ssh_client: SSHClientConnection
+        self,
+        api_external: int,
+        api_internal: int,
+        container_name: str,
+        extra: dict,
+        ssh_client: SSHClientConnection,
+        all_port_maps: list[tuple[int, int]],
     ):
         """Run the special container in the executor machine"""
+        # Build port mappings for all ports: -p internal:internal
+        port_mappings = " ".join([f"-p {int_}:{int_}" for int_, _ in all_port_maps])
+
         command = (
-            f"/usr/bin/docker run -d --name {container_name} --network=host "
+            f"/usr/bin/docker run -d -it --name {container_name} "
+            f"{port_mappings} "
             f"-e API_PORT={api_internal} {BATCH_VERIFIER_IMAGE}"
         )
 
-        logger.debug(_m(f"run: {command[:200]}...", extra))
+        logger.info(_m(f"run: {command[:200]}...", extra))
 
         result = await ssh_client.run(command)
         if result.exit_status != 0:
