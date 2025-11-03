@@ -1260,6 +1260,10 @@ class TaskService:
                         "job_batch_id": miner_info.job_batch_id,
                         "miner_hotkey": miner_info.miner_hotkey,
                         "executor_uuid": executor_info.uuid,
+                        "executor_ip_address": executor_info.address,
+                        "executor_port": executor_info.port,
+                        "ssh_user": executor_info.ssh_username,
+                        "ssh_port": executor_info.ssh_port,
                         "error": str(e),
                     })
                 ),
