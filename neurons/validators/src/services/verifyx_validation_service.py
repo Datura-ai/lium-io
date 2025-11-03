@@ -163,14 +163,14 @@ class VerifyXValidationService:
                 return VerifyXResponse(error="SSH command returned no result")
 
             try:
-                stdout = result.stdout.strip()
+                challenge_response = result.stdout.strip()
             except AttributeError:
                 return VerifyXResponse(error="SSH result missing stdout")
 
-            logger.info(_m("Challenge response received", extra=get_extra_info(log_extra)))
+            logger.info(_m("Challenge response received", extra=get_extra_info({**log_extra, "challenge_response": challenge_response})))
 
             try:
-                payload = verifyx_validator.verify_response(stdout)
+                payload = verifyx_validator.verify_response(challenge_response)
                 verification_result = _perform_verification_checks(payload)
                 return VerifyXResponse(data=verification_result)
             except Exception as e:
