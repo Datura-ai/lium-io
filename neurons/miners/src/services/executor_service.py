@@ -146,7 +146,7 @@ class ExecutorService:
                 error=str(log_text),
             )
 
-    async def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None, miner_hotkey: Optional[str] = None):
+    async def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None, miner_hotkey: Optional[str] = None)  -> list[Executor]:
         # Standard mode: use local DB, in Standard mode, miner_hotkey is not provided
         if not settings.CENTRAL_MODE and not miner_hotkey:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
