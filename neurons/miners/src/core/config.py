@@ -52,7 +52,9 @@ class Settings(BaseSettings):
     COLLATERAL_DAYS: int = 7
 
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
+    MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")
     DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default="5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1")
+    CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)
 
     def get_bittensor_wallet(self) -> "bittensor_wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

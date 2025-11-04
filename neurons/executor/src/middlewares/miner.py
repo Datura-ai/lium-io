@@ -33,6 +33,7 @@ class MinerMiddleware(BaseHTTPMiddleware):
             hotkeys_to_verify = [
                 settings.MINER_HOTKEY_SS58_ADDRESS,
                 settings.DEFAULT_MINER_HOTKEY,
+                settings.CENTRAL_MINER_HOTKEY,
             ]
 
             verified = False

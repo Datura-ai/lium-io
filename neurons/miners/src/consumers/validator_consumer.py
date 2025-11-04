@@ -60,8 +60,8 @@ class ValidatorConsumer(BaseConsumer):
     def verify_auth_msg(self, msg: AuthenticateRequest) -> tuple[bool, str]:
         if msg.payload.timestamp < time.time() - AUTH_MESSAGE_MAX_AGE:
             return False, "msg too old"
-        if msg.payload.miner_hotkey != self.my_hotkey:
-            return False, f"wrong miner hotkey ({self.my_hotkey}!={msg.payload.miner_hotkey})"
+        # if msg.payload.miner_hotkey != self.my_hotkey:
+        #     return False, f"wrong miner hotkey ({self.my_hotkey}!={msg.payload.miner_hotkey})"
         if msg.payload.validator_hotkey != self.validator_key:
             return (
                 False,
@@ -99,7 +99,7 @@ class ValidatorConsumer(BaseConsumer):
 
         If no executors, decline job request
         """
-        executors = self.executor_service.get_executors_for_validator(self.validator_key)
+        executors = await self.executor_service.get_executors_for_validator(self.validator_key)
         if len(executors):
             logger.info("Found %d executors for validator(%s)", len(executors), self.validator_key)
             await self.send_message(
@@ -153,7 +153,7 @@ class ValidatorConsumer(BaseConsumer):
             try:
                 msg: SSHPubKeySubmitRequest
                 executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
-                    self.validator_key, msg.public_key, msg.executor_id
+                    self.validator_key, msg.public_key, msg.executor_id, msg.miner_hotkey
                 )
                 if msg.is_rental_request and len(executors) == 1:
                     await self.invoke_rental_request_hook(
@@ -175,7 +175,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, SSHPubKeyRemoveRequest):
             logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
             try:
-                await self.executor_service.deregister_pubkey(self.validator_key, msg.public_key, msg.executor_id)
+                await self.executor_service.deregister_pubkey(self.validator_key, msg.public_key, msg.executor_id, msg.miner_hotkey)
                 logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Failed SSHKeyRemoved request: %s", str(e))
@@ -185,7 +185,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, GetPodLogsRequest):
             logger.info("Validator %s get pod logs for container %s.", self.validator_key, msg.container_name)
             try:
-                logs: list[PodLog] = await self.executor_service.get_pod_logs(self.validator_key, msg.executor_id, msg.container_name)
+                logs: list[PodLog] = await self.executor_service.get_pod_logs(self.validator_key, msg.executor_id, msg.container_name, msg.miner_hotkey)
                 await self.send_message(PodLogsResponse(logs=logs))
                 logger.info("Sent GetPodLogs to validator %s", self.validator_key)
             except Exception as e:

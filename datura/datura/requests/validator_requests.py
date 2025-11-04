@@ -41,15 +41,18 @@ class SSHPubKeySubmitRequest(BaseValidatorRequest):
     public_key: bytes
     executor_id: Optional[str] = None
     is_rental_request: bool = False
+    miner_hotkey: Optional[str] = None
 
 
 class SSHPubKeyRemoveRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeyRemoveRequest
     public_key: bytes
     executor_id: Optional[str] = None
+    miner_hotkey: Optional[str] = None
 
 
 class GetPodLogsRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.GetPodLogsRequest
     executor_id: str
     container_name: str
+    miner_hotkey: Optional[str] = None
