@@ -91,7 +91,7 @@ class ValidatorConsumer(BaseConsumer):
         for msg in self.msg_queue:
             await self.handle_message(msg)
 
-    async def check_validator_allowance(self):
+    async def check_validator_allowance(self, msg: AuthenticateRequest):
         """Check if there's any executors opened for current validator.
 
         If there are any executors, send accept job request to validator w/ executors list
@@ -99,7 +99,7 @@ class ValidatorConsumer(BaseConsumer):
 
         If no executors, decline job request
         """
-        executors = await self.executor_service.get_executors_for_validator(self.validator_key)
+        executors = await self.executor_service.get_executors_for_validator(self.validator_key, None, msg.payload.miner_hotkey)
         if len(executors):
             logger.info("Found %d executors for validator(%s)", len(executors), self.validator_key)
             await self.send_message(
@@ -135,7 +135,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, AuthenticateRequest):
             await self.handle_authentication(msg)
             if self.validator_authenticated:
-                await self.check_validator_allowance()
+                await self.check_validator_allowance(msg)
             return
 
         # TODO: update logic here, fow now, it sends AcceptJobRequest regardless

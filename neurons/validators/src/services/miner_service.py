@@ -99,8 +99,6 @@ class MinerService:
                 miner_address = payload.miner_address
                 miner_port = payload.miner_port
 
-            miner_opted_in = optin_info.get("opt_in_status")
-            
             miner_client = MinerClient(
                 loop=loop,
                 miner_address=miner_address,
@@ -119,7 +117,7 @@ class MinerService:
                 await miner_client.send_model(
                     SSHPubKeySubmitRequest(
                         public_key=public_key,
-                        miner_hotkey=payload.miner_hotkey if miner_opted_in else None, # if miner is opted-in, include miner's hotkey in the request
+                        miner_hotkey=payload.miner_hotkey, # include miner's hotkey in the request
                     )
                 )
 
@@ -192,7 +190,7 @@ class MinerService:
 
                     await miner_client.send_model(SSHPubKeyRemoveRequest(
                         public_key=public_key, 
-                        miner_hotkey=payload.miner_hotkey if miner_opted_in else None,
+                        miner_hotkey=payload.miner_hotkey
                     ))
 
                     return {
@@ -357,8 +355,6 @@ class MinerService:
                 miner_address = payload.miner_address
                 miner_port = payload.miner_port
 
-            miner_opted_in = optin_info.get("opt_in_status")
-
             miner_client = MinerClient(
                 loop=loop,
                 miner_address=miner_address,
@@ -378,7 +374,7 @@ class MinerService:
                         public_key=public_key,
                         executor_id=payload.executor_id,
                         is_rental_request=isinstance(payload, ContainerCreateRequest),
-                        miner_hotkey=payload.miner_hotkey if miner_opted_in else None,
+                        miner_hotkey=payload.miner_hotkey
                     )
                 )
 
@@ -409,7 +405,9 @@ class MinerService:
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
-                                public_key=public_key, executor_id=payload.executor_id, miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                public_key=public_key, 
+                                executor_id=payload.executor_id, 
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 
@@ -437,7 +435,9 @@ class MinerService:
 
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
-                                public_key=public_key, executor_id=payload.executor_id, miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                public_key=public_key, 
+                                executor_id=payload.executor_id, 
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 
@@ -475,7 +475,7 @@ class MinerService:
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 executor_id=payload.executor_id,
-                                miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 
@@ -509,7 +509,7 @@ class MinerService:
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 executor_id=payload.executor_id,
-                                miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 
@@ -543,7 +543,7 @@ class MinerService:
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 executor_id=payload.executor_id,
-                                miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 
@@ -555,7 +555,7 @@ class MinerService:
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 executor_id=payload.executor_id,
-                                miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 
@@ -567,7 +567,7 @@ class MinerService:
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 executor_id=payload.executor_id,
-                                miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 
@@ -588,7 +588,7 @@ class MinerService:
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
                                 executor_id=payload.executor_id,
-                                miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 
@@ -651,8 +651,6 @@ class MinerService:
                 miner_address = payload.miner_address
                 miner_port = payload.miner_port
 
-            miner_opted_in = optin_info.get("opt_in_status")
-
             miner_client = MinerClient(
                 loop=loop,
                 miner_address=miner_address,
@@ -669,7 +667,7 @@ class MinerService:
                     GetPodLogsRequest(
                         container_name=payload.container_name, 
                         executor_id=payload.executor_id, 
-                        miner_hotkey=payload.miner_hotkey if miner_opted_in else None,
+                        miner_hotkey=payload.miner_hotkey,
                     )
                 )
 
@@ -757,8 +755,6 @@ class MinerService:
                 miner_address = payload.miner_address
                 miner_port = payload.miner_port
 
-            miner_opted_in = optin_info.get("opt_in_status")
-
             miner_client = MinerClient(
                 loop=loop,
                 miner_address=miner_address,
@@ -776,7 +772,7 @@ class MinerService:
                         public_key=payload.public_key,
                         executor_id=payload.executor_id,
                         is_rental_request=False,
-                        miner_hotkey=payload.miner_hotkey if miner_opted_in else None,
+                        miner_hotkey=payload.miner_hotkey,
                     )
                 )
 
@@ -810,7 +806,7 @@ class MinerService:
                             SSHPubKeyRemoveRequest(
                                 public_key=payload.public_key, 
                                 executor_id=payload.executor_id,
-                                miner_hotkey=payload.miner_hotkey if miner_opted_in else None
+                                miner_hotkey=payload.miner_hotkey
                             )
                         )
 

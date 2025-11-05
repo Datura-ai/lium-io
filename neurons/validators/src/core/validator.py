@@ -215,8 +215,6 @@ class Validator:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
 
-                miners = [miner for miner in miners if miner.axon_info.is_serving]
-
                 logger.info(
                     _m(
                         "[sync] Send jobs to miners",

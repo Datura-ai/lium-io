@@ -220,7 +220,7 @@ class SubtensorClient:
             miners = [
                 neuron
                 for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
+                if not neuron.validator_permit and neuron.active
             ]
         logger.info(
             _m(

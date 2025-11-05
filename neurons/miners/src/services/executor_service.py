@@ -148,14 +148,14 @@ class ExecutorService:
 
     async def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None, miner_hotkey: Optional[str] = None)  -> list[Executor]:
         # Standard mode: use local DB, in Standard mode, miner_hotkey is not provided
-        if not settings.CENTRAL_MODE and not miner_hotkey:
+        if not settings.CENTRAL_MODE:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
 
         # Central mode: fetch from portal
         from clients.miner_portal_api import MinerPortalAPI
 
         # Properly await the async HTTP call
-        data = await MinerPortalAPI.fetch_executors(miner_hotkey)
+        data = await MinerPortalAPI.fetch_executors(executor_id, miner_hotkey)
 
         # Expected fields per executor from portal: uuid, validator, address, port, price_per_hour
         result: list[Executor] = []
