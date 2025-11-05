@@ -217,16 +217,21 @@ class SubtensorClient:
             miners = [self.debug_miner]
         else:
             metagraph = self.get_metagraph()
+            
+            miners = metagraph.neurons
+            
+            # TODO: get miners that has opt_in_status from portal BE.
+            miners_with_opt_in_status = []
+            
+            # TODO: update axon info with opt_in_info (ip, port) from portal BE.
+            
             miners = [
                 neuron
                 for neuron in metagraph.neurons
                 if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
             ]
             
-            # TODO: get miners that has opt_in_status from portal BE.
-            miners_with_opt_in_status = []
-            
-            return miners + miners_with_opt_in_status
+            return miners
         logger.info(
             _m(
                 f"[fetch_miners] Found {len(miners)} miners",
