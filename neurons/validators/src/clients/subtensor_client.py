@@ -17,6 +17,7 @@ from core.utils import _m, get_extra_info, get_logger
 
 from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
+from clients.validator_portal_api import ValidatorPortalAPI
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
@@ -205,7 +206,7 @@ class SubtensorClient:
     def get_tempo(self):
         return self.subtensor.tempo(self.netuid)
 
-    def fetch_miners(self):
+    async def fetch_miners(self):
         logger.info(
             _m(
                 "[fetch_miners] Fetching miners",
@@ -217,21 +218,34 @@ class SubtensorClient:
             miners = [self.debug_miner]
         else:
             metagraph = self.get_metagraph()
-            
+
             miners = metagraph.neurons
-            
-            # TODO: get miners that has opt_in_status from portal BE.
-            miners_with_opt_in_status = []
-            
-            # TODO: update axon info with opt_in_info (ip, port) from portal BE.
-            
+
+            # Get miners that have opted in from portal BE
+            miners_with_opt_in_status = await ValidatorPortalAPI.get_opted_in_miners()
+
+            logger.info(
+                _m(
+                    f"[fetch_miners] Found {len(miners_with_opt_in_status)} opted-in miners from portal",
+                    extra=get_extra_info(self.default_extra),
+                ),
+            )
+
             miners = [
                 neuron
                 for neuron in metagraph.neurons
-                if not neuron.validator_permit and neuron.active
+                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
             ]
-            
-            return miners
+        # Update miners in `miners` list based on miners_with_opt_in_status.
+        # For each miner in miners, if there is an opt-in with the same hotkey (or coldkey), update its ip and port.
+        hotkey_to_opt_in = {
+            opt_in["miner_hotkey"]: opt_in for opt_in in miners_with_opt_in_status
+        }
+        for miner in miners:
+            opt_in = hotkey_to_opt_in.get(miner.hotkey)
+            if opt_in is not None:
+                miner.axon_info.ip = opt_in.get("central_miner_ip")
+                miner.axon_info.port = opt_in.get("central_miner_port")
         logger.info(
             _m(
                 f"[fetch_miners] Found {len(miners)} miners",
@@ -241,17 +255,17 @@ class SubtensorClient:
 
         self.miners = miners
 
-    def get_miner(self, hotkey: str) -> bittensor.NeuronInfo:
-        miners = self.get_miners()
+    async def get_miner(self, hotkey: str) -> bittensor.NeuronInfo:
+        miners = await self.get_miners()
 
         neurons = [n for n in miners if n.hotkey == hotkey]
         if not neurons:
             raise ValueError(f"Miner with {hotkey=} not present in this subnetwork")
         return neurons[0]
 
-    def get_miners(self) -> list[bittensor.NeuronInfo]:
+    async def get_miners(self) -> list[bittensor.NeuronInfo]:
         if not self.miners:
-            self.fetch_miners()
+            await self.fetch_miners()
         return self.miners
     
     async def send_weights_to_lium(self, payload: dict):
@@ -275,7 +289,7 @@ class SubtensorClient:
             logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
     async def set_weights(self, miner_scores: dict[str, float]):
-        miners = self.get_miners()
+        miners = await self.get_miners()
         logger.info(
             _m(
                 "[set_weights] scores",
@@ -528,12 +542,12 @@ class SubtensorClient:
                 self.set_subtensor()
 
                 if count == 0:
-                    self.fetch_miners()
+                    await self.fetch_miners()
                     self.sync_evm_address_maps()
 
                 count += 1
                 if count > 10:
-                    self.fetch_miners()
+                    await self.fetch_miners()
                     self.sync_evm_address_maps()
                     count = 1
 

@@ -90,23 +90,14 @@ class MinerService:
 
         try:
             logger.info(_m("Requesting job to miner", extra=get_extra_info(default_extra)))
-
-            optin_info = await ValidatorPortalAPI.get_opt_in_connection_info(payload.miner_hotkey)
-            if optin_info.get("opt_in_status") is True:
-                miner_address = optin_info.get("central_miner_ip")
-                miner_port = optin_info.get("central_miner_port")
-            else:
-                miner_address = payload.miner_address
-                miner_port = payload.miner_port
-
             miner_client = MinerClient(
                 loop=loop,
-                miner_address=miner_address,
-                miner_port=miner_port,
+                miner_address=payload.miner_address,
+                miner_port=payload.miner_port,
                 miner_hotkey=payload.miner_hotkey,
                 my_hotkey=my_key.ss58_address,
                 keypair=my_key,
-                miner_url=f"ws://{miner_address}:{miner_port}/websocket/{my_key.ss58_address}"
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}"
             )
 
             async with miner_client:
@@ -347,22 +338,14 @@ class MinerService:
         )
 
         try:
-            optin_info = await ValidatorPortalAPI.get_opt_in_connection_info(payload.miner_hotkey)
-            if optin_info.get("opt_in_status") is True:
-                miner_address = optin_info.get("central_miner_ip")
-                miner_port = optin_info.get("central_miner_port")
-            else:
-                miner_address = payload.miner_address
-                miner_port = payload.miner_port
-
             miner_client = MinerClient(
                 loop=loop,
-                miner_address=miner_address,
-                miner_port=miner_port,
+                miner_address=payload.miner_address,
+                miner_port=payload.miner_port,
                 miner_hotkey=payload.miner_hotkey,
                 my_hotkey=my_key.ss58_address,
                 keypair=my_key,
-                miner_url=f"ws://{miner_address}:{miner_port}/websocket/{my_key.ss58_address}",
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
             )
 
             async with miner_client:
@@ -643,22 +626,14 @@ class MinerService:
         }
 
         try:
-            optin_info = await ValidatorPortalAPI.get_opt_in_connection_info(payload.miner_hotkey)
-            if optin_info.get("opt_in_status") is True:
-                miner_address = optin_info.get("central_miner_ip")
-                miner_port = optin_info.get("central_miner_port")
-            else:
-                miner_address = payload.miner_address
-                miner_port = payload.miner_port
-
             miner_client = MinerClient(
                 loop=loop,
-                miner_address=miner_address,
-                miner_port=miner_port,
+                miner_address=payload.miner_address,
+                miner_port=payload.miner_port,
                 miner_hotkey=payload.miner_hotkey,
                 my_hotkey=my_key.ss58_address,
                 keypair=my_key,
-                miner_url=f"ws://{miner_address}:{miner_port}/websocket/{my_key.ss58_address}",
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
             )
 
             async with miner_client:
@@ -747,22 +722,14 @@ class MinerService:
         }
 
         try:
-            optin_info = await ValidatorPortalAPI.get_opt_in_connection_info(payload.miner_hotkey)
-            if optin_info.get("opt_in_status") is True:
-                miner_address = optin_info.get("central_miner_ip")
-                miner_port = optin_info.get("central_miner_port")
-            else:
-                miner_address = payload.miner_address
-                miner_port = payload.miner_port
-
             miner_client = MinerClient(
                 loop=loop,
-                miner_address=miner_address,
-                miner_port=miner_port,
+                miner_address=payload.miner_address,
+                miner_port=payload.miner_port,
                 miner_hotkey=payload.miner_hotkey,
                 my_hotkey=my_key.ss58_address,
                 keypair=my_key,
-                miner_url=f"ws://{miner_address}:{miner_port}/websocket/{my_key.ss58_address}",
+                miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
             )
 
             async with miner_client:

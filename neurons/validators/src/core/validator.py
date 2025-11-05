@@ -179,7 +179,7 @@ class Validator:
             )
 
             # fetch miners
-            miners = self.subtensor_client.get_miners()
+            miners = await self.subtensor_client.get_miners()
 
             try:
                 if await self.subtensor_client.should_set_weights():

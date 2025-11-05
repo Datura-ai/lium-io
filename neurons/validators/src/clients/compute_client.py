@@ -580,7 +580,8 @@ class ComputeClient:
             return
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
-        return self.subtensor_client.get_miner(hotkey).axon_info
+        miner = await self.subtensor_client.get_miner(hotkey)
+        return miner.axon_info
 
     async def miner_driver(
         self,

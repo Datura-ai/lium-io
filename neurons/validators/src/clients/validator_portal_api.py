@@ -15,15 +15,20 @@ logger = logging.getLogger(__name__)
 
 class ValidatorPortalAPI:
     @staticmethod
-    async def get_opt_in_connection_info(miner_hotkey: str) -> dict:
-        """Fetch opt-in status and central miner connection details if available.
+    async def get_opted_in_miners() -> list[dict]:
+        """Fetch list of miners that have opted in.
 
-        Returns dict shape:
-            {
-              "opt_in_status": bool,
-              "miner_hotkey": Optional[str],
-            }
-        Any error returns opt_in_status=False with None details to preserve behavior.
+        Returns list of dicts with shape:
+            [
+                {
+                    "miner_hotkey": str,
+                    "miner_coldkey": str,
+                    "central_miner_ip": str,
+                    "central_miner_port": int,
+                },
+                ...
+            ]
+        Returns empty list on error.
         """
         try:
             keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -31,9 +36,9 @@ class ValidatorPortalAPI:
 
             api_base = settings.MINER_PORTAL_REST_API_URL.rstrip("/") if settings.MINER_PORTAL_REST_API_URL else ""
             if not api_base:
-                return {"opt_in_status": False, "miner_hotkey": None}
+                return []
 
-            url = f"{api_base}/validators/opt-in-status?miner_hotkey={miner_hotkey}"
+            url = f"{api_base}/validators/opted-in"
 
             timestamp = int(time.time())
             signature = f"0x{keypair.sign(str(timestamp)).hex()}"
@@ -52,7 +57,7 @@ class ValidatorPortalAPI:
                             text = await resp.text()
                             logger.error(
                                 _m(
-                                    "Failed to fetch miner opt-in status from portal",
+                                    "Failed to fetch opted-in miners from portal",
                                     extra=get_extra_info({
                                         "status": resp.status,
                                         "body": text,
@@ -60,29 +65,16 @@ class ValidatorPortalAPI:
                                     }),
                                 )
                             )
-                            return {"opt_in_status": False, "miner_hotkey": None}
+                            return []
 
                         data = await resp.json()
-                        opt_in_status = bool(data.get("opt_in_status") is True)
-
-                        return {
-                            "opt_in_status": opt_in_status,
-                            "central_miner_ip": data.get("central_miner_ip"),
-                            "central_miner_port": data.get("central_miner_port"),
-                        }
+                        return data if isinstance(data, list) else []
                 except asyncio.TimeoutError:
-                    logger.error(_m("Timeout fetching miner opt-in status from portal", extra=get_extra_info({"url": url})))
-                    return {"opt_in_status": False, "miner_hotkey": None, "miner_ip": None, "miner_port": None}
+                    logger.error(_m("Timeout fetching opted-in miners from portal", extra=get_extra_info({"url": url})))
+                    return []
                 except Exception as e:
-                    logger.error(_m("Error fetching miner opt-in status from portal", extra=get_extra_info({"url": url, "error": str(e)})))
-                    return {"opt_in_status": False, "miner_hotkey": None}
+                    logger.error(_m("Error fetching opted-in miners from portal", extra=get_extra_info({"url": url, "error": str(e)})))
+                    return []
         except Exception as e:
-            logger.error(_m("Unexpected error during opt-in check", extra=get_extra_info({"error": str(e)})))
-            return {"opt_in_status": False, "miner_hotkey": None}
-
-    @staticmethod
-    async def check_miner_opt_in_status(miner_hotkey: str) -> bool:
-        info = await ValidatorPortalAPI.get_opt_in_connection_info(miner_hotkey)
-        return bool(info.get("opt_in_status") is True)
-
-
+            logger.error(_m("Unexpected error during opted-in miners fetch", extra=get_extra_info({"error": str(e)})))
+            return []
