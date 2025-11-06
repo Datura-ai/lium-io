@@ -200,6 +200,7 @@ class ContainerBaseRequest(BaseRequest):
     miner_address: str | None = None
     miner_port: int | None = None
     executor_id: str
+    pod_id: str
 
 
 class ExternalVolumeInfo(BaseModel):
@@ -323,6 +324,7 @@ class ContainerBaseResponse(BaseRequest):
     message_type: ContainerResponseType
     miner_hotkey: str
     executor_id: str
+    pod_id: str
 
 
 class ContainerCreated(ContainerBaseResponse):

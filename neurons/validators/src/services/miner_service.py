@@ -275,6 +275,7 @@ class MinerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=error_code,
@@ -300,6 +301,7 @@ class MinerService:
             return JupyterInstallationFailed(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
             )
         else:
@@ -317,6 +319,7 @@ class MinerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_id": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip": payload.miner_address,
             "executor_port": payload.miner_port,
             "container_request_type": str(payload.message_type),
