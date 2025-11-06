@@ -99,7 +99,7 @@ class ValidatorConsumer(BaseConsumer):
 
         If no executors, decline job request
         """
-        executors = await self.executor_service.get_executors_for_validator(self.validator_key, None, msg.payload.miner_hotkey)
+        executors = await self.executor_service.get_executors_for_validator(self.validator_key, msg.payload.miner_hotkey, None)
         if len(executors):
             logger.info("Found %d executors for validator(%s)", len(executors), self.validator_key)
             await self.send_message(
@@ -153,7 +153,7 @@ class ValidatorConsumer(BaseConsumer):
             try:
                 msg: SSHPubKeySubmitRequest
                 executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
-                    self.validator_key, msg.public_key, msg.executor_id, msg.miner_hotkey
+                    self.validator_key, msg.miner_hotkey, msg.public_key, msg.executor_id
                 )
                 if msg.is_rental_request and len(executors) == 1:
                     await self.invoke_rental_request_hook(
@@ -175,7 +175,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, SSHPubKeyRemoveRequest):
             logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
             try:
-                await self.executor_service.deregister_pubkey(self.validator_key, msg.public_key, msg.executor_id, msg.miner_hotkey)
+                await self.executor_service.deregister_pubkey(self.validator_key, msg.miner_hotkey, msg.public_key, msg.executor_id)
                 logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Failed SSHKeyRemoved request: %s", str(e))
@@ -185,7 +185,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, GetPodLogsRequest):
             logger.info("Validator %s get pod logs for container %s.", self.validator_key, msg.container_name)
             try:
-                logs: list[PodLog] = await self.executor_service.get_pod_logs(self.validator_key, msg.executor_id, msg.container_name, msg.miner_hotkey)
+                logs: list[PodLog] = await self.executor_service.get_pod_logs(self.validator_key,  msg.miner_hotkey, msg.executor_id, msg.container_name)
                 await self.send_message(PodLogsResponse(logs=logs))
                 logger.info("Sent GetPodLogs to validator %s", self.validator_key)
             except Exception as e:

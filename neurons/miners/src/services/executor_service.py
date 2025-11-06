@@ -146,8 +146,8 @@ class ExecutorService:
                 error=str(log_text),
             )
 
-    async def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None, miner_hotkey: Optional[str] = None)  -> list[Executor]:
-        # Standard mode: use local DB, in Standard mode, miner_hotkey is not provided
+    async def get_executors_for_validator(self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None)  -> list[Executor]:
+        # Standard mode: use local DB, in Standard mode
         if not settings.CENTRAL_MODE:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
 
@@ -155,7 +155,7 @@ class ExecutorService:
         from clients.miner_portal_api import MinerPortalAPI
 
         # Properly await the async HTTP call
-        data = await MinerPortalAPI.fetch_executors(executor_id, miner_hotkey)
+        data = await MinerPortalAPI.fetch_executors(miner_hotkey, executor_id)
 
         # Expected fields per executor from portal: uuid, validator, address, port, price_per_hour
         result: list[Executor] = []
@@ -251,7 +251,7 @@ class ExecutorService:
                     "API request failed to register SSH key. url=%s, error=%s", url, str(e)
                 )
 
-    async def register_pubkey(self, validator_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None, miner_hotkey: Optional[str] = None):
+    async def register_pubkey(self, validator_hotkey: str, miner_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
         """Register pubkeys to executors for given validator.
 
         Args:
@@ -261,7 +261,7 @@ class ExecutorService:
         Return:
             List[dict/object]: Executors SSH connection infos that accepted validator pubkey.
         """
-        executors = await self.get_executors_for_validator(validator_hotkey, executor_id, miner_hotkey)
+        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
             asyncio.create_task(
                 self.send_pubkey_to_executor(executor, pubkey.decode("utf-8")),
@@ -281,14 +281,14 @@ class ExecutorService:
         )
         return results
 
-    async def deregister_pubkey(self, validator_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None, miner_hotkey: Optional[str] = None):
+    async def deregister_pubkey(self, validator_hotkey: str, miner_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
         """Deregister pubkey from executors.
 
         Args:
             validator_hotkey (str): Validator hotkey
             pubkey (bytes): validator pubkey
         """
-        executors = await self.get_executors_for_validator(validator_hotkey, executor_id, miner_hotkey)
+        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
             asyncio.create_task(
                 self.remove_pubkey_from_executor(executor, pubkey.decode("utf-8")),
@@ -299,9 +299,9 @@ class ExecutorService:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_pod_logs(
-        self, validator_hotkey: str, executor_id: str, container_name: str, miner_hotkey: Optional[str] = None
+        self, validator_hotkey: str, miner_hotkey: str, executor_id: str, container_name: str
     ) -> list[PodLog]:
-        executors = await self.get_executors_for_validator(validator_hotkey, executor_id, miner_hotkey)
+        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         if len(executors) == 0:
             raise Exception('[get_pod_logs] Error: not found executor')
 

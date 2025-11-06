@@ -230,22 +230,22 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-
+            # Update miners in `miners` list based on miners_with_opt_in_status.
+            hotkey_to_opt_in = {
+                opt_in["miner_hotkey"]: opt_in for opt_in in miners_with_opt_in_status
+            }
             miners = [
                 neuron
                 for neuron in metagraph.neurons
                 if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
             ]
-        # Update miners in `miners` list based on miners_with_opt_in_status.
-        # For each miner in miners, if there is an opt-in with the same hotkey (or coldkey), update its ip and port.
-        hotkey_to_opt_in = {
-            opt_in["miner_hotkey"]: opt_in for opt_in in miners_with_opt_in_status
-        }
-        for miner in miners:
-            opt_in = hotkey_to_opt_in.get(miner.hotkey)
-            if opt_in is not None:
-                miner.axon_info.ip = opt_in.get("central_miner_ip")
-                miner.axon_info.port = opt_in.get("central_miner_port")
+
+            for miner in miners:
+                opt_in = hotkey_to_opt_in.get(miner.hotkey)
+                if opt_in is not None:
+                    miner.axon_info.ip = opt_in.get("central_miner_ip")
+                    miner.axon_info.port = opt_in.get("central_miner_port")
+
         logger.info(
             _m(
                 f"[fetch_miners] Found {len(miners)} miners",

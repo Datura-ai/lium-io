@@ -12,10 +12,8 @@ logger = logging.getLogger(__name__)
 
 class MinerPortalAPI:
     @staticmethod
-    async def fetch_executors(executor_id: str | None, miner_hotkey: str) -> list[dict[str, Any]]:
-        api_url = f"{settings.MINER_PORTAL_API_URL}/miners/{miner_hotkey}/executors"
-        if executor_id:
-            api_url = f"{settings.MINER_PORTAL_API_URL}/miners/executor/{executor_id}"
+    async def fetch_executors(miner_hotkey: str, executor_id: str | None) -> list[dict[str, Any]]:
+        api_url = f"{settings.MINER_PORTAL_API_URL}/miners/{miner_hotkey}/executors?executor_id={executor_id}"
 
         keypair = settings.get_bittensor_wallet().get_hotkey()
         auth = AuthenticateRequest.from_keypair(keypair)
