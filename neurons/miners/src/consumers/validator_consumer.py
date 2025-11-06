@@ -199,6 +199,7 @@ class ValidatorConsumerManger:
         self,
     ):
         self.active_consumer: ValidatorConsumer | None = None
+        self.active_consumers: list[ValidatorConsumer] = []  # For central mode: allow multiple concurrent connections
         self.lock = asyncio.Lock()
 
     async def addConsumer(
@@ -209,6 +210,8 @@ class ValidatorConsumerManger:
         validator_service: Annotated[ValidatorService, Depends(ValidatorService)],
         executor_service: Annotated[ExecutorService, Depends(ExecutorService)],
     ):
+        from core.config import settings
+
         consumer = ValidatorConsumer(
             websocket=websocket,
             validator_key=validator_key,
@@ -218,17 +221,30 @@ class ValidatorConsumerManger:
         )
         await consumer.connect()
 
-        if self.active_consumer is not None:
-            await consumer.send_message(DeclineJobRequest())
-            await consumer.disconnect()
-            return
+        # In CENTRAL_MODE, allow multiple concurrent connections from same validator
+        if settings.CENTRAL_MODE:
+            async with self.lock:
+                self.active_consumers.append(consumer)
 
-        async with self.lock:
-            self.active_consumer = consumer
+            try:
+                await consumer.handle()
+            finally:
+                async with self.lock:
+                    if consumer in self.active_consumers:
+                        self.active_consumers.remove(consumer)
+        else:
+            # Standard mode: only one connection at a time
+            if self.active_consumer is not None:
+                await consumer.send_message(DeclineJobRequest())
+                await consumer.disconnect()
+                return
 
-            await self.active_consumer.handle()
+            async with self.lock:
+                self.active_consumer = consumer
 
-            self.active_consumer = None
+                await self.active_consumer.handle()
+
+                self.active_consumer = None
 
 
 validatorConsumerManager = ValidatorConsumerManger()
