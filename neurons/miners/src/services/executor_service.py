@@ -68,7 +68,8 @@ class ExecutorService:
                 validator=payload.executor.validator,
                 address=payload.executor.address,
                 port=payload.executor.port,
-                price_per_hour=payload.executor.price_per_hour
+                price_per_hour=payload.executor.price_per_hour,
+                price_per_gpu=payload.executor.price_per_gpu,
             )
             self.executor_dao.update_by_uuid(executor.uuid, executor)
 
@@ -106,6 +107,7 @@ class ExecutorService:
                     executor.address = executor_payload.address
                     executor.port = executor_payload.port
                     executor.price_per_hour = executor_payload.price_per_hour
+                    executor.price_per_gpu = executor_payload.price_per_gpu
                     self.executor_dao.update_by_uuid(executor.uuid, executor)
                     logger.info("Updated executor (id=%s)", str(executor.uuid))
                 else:
@@ -116,7 +118,8 @@ class ExecutorService:
                             validator=executor_payload.validator,
                             address=executor_payload.address,
                             port=executor_payload.port,
-                            price_per_hour=executor_payload.price_per_hour
+                            price_per_hour=executor_payload.price_per_hour,
+                            price_per_gpu=executor_payload.price_per_gpu,
                         )
                     )
 
@@ -182,10 +185,7 @@ class ExecutorService:
                         executor.port,
                         json.dumps(response_obj),
                     )
-                    response_obj["uuid"] = str(executor.uuid)
-                    response_obj["address"] = executor.address
-                    response_obj["port"] = executor.port
-                    response_obj["price"] = executor.price_per_hour
+                    response_obj = {**response_obj, **executor.model_dump(mode="json")}
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(
