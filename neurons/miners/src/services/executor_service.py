@@ -156,6 +156,12 @@ class ExecutorService:
 
         # Properly await the async HTTP call
         data = await MinerPortalAPI.fetch_executors(miner_hotkey, executor_id)
+        logger.info(
+            _m(
+                "Fetched executors from portal",
+                extra=get_extra_info({"miner_hotkey": miner_hotkey, "executor_id": executor_id, "data": data}),
+            ),
+        )
 
         # Expected fields per executor from portal: uuid, validator, address, port, price_per_hour
         result: list[Executor] = []
