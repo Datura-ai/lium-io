@@ -83,6 +83,7 @@ def make_context(
     config: ContextConfig | None = None,
     state: ContextState | None = None,
     miner_hotkey: str = "miner-hotkey",
+    pipeline_id: str = "test-pipeline-id",
     **extra,
 ) -> Context:
     executor_obj = executor or default_executor()
@@ -91,6 +92,7 @@ def make_context(
     state_obj = state or build_state()
 
     base_kwargs = dict(
+        pipeline_id=pipeline_id,
         executor=executor_obj,
         miner_hotkey=miner_hotkey,
         ssh=None,
