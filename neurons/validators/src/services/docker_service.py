@@ -32,7 +32,8 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
-    CustomOptions
+    CustomOptions,
+    ContainerWarningCode,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -591,6 +592,7 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        warnings = []
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
 
@@ -832,6 +834,7 @@ class DockerService:
 
                         volume_flag += f" -v {external_volume_info.name}:/mnt"
                     else:
+                        warnings.append(ContainerWarningCode.ExternalVolumeFailed)
                         profilers.append({"name": "Docker volume creation step failed", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
 
@@ -988,7 +991,7 @@ class DockerService:
                     backup_log_id=payload.backup_log_id,
                     restore_path=payload.restore_path,
                     jupyter_url=jupyter_url,
-                    warning=pod_warning,
+                    warnings=warnings,
                 )
         except Exception as e:
             log_text = _m(
