@@ -91,7 +91,7 @@ class VerifierParams:
         self.seed = seed
         self.uuid = uuid
         self.cipher_text = ""
-    
+
     def generate(self):
         # You can modify the range for more randomness or based on specific needs
         self.dim_n = random.randint(1900, 2000)  # Random dim_n between 1900 and 2000
@@ -101,6 +101,21 @@ class VerifierParams:
 
     def __str__(self) -> str:
         return f"--dim_n {self.dim_n} --dim_k {self.dim_k} --seed {self.seed} --cipher_text {self.cipher_text}"
+
+
+@dataclass
+class ValidationResult:
+    """Result of GPU validation with detailed debugging information."""
+    success: bool
+    expected_uuid: str = ""
+    returned_uuid: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    error_message: str = ""
+
+    def __bool__(self) -> bool:
+        """Allow using ValidationResult in boolean context for backward compatibility."""
+        return self.success
     
 
 class ValidationService:
@@ -165,7 +180,7 @@ class ValidationService:
         executor_info,
         default_extra: dict,
         machine_spec: dict,
-    ) -> bool:
+    ) -> ValidationResult:
         try:
             script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
 
@@ -214,41 +229,91 @@ class ValidationService:
             try:
                 result = await ssh_client.run(command)
             except Exception as e:
-                logger.error(_m("Failed to execute SSH command", extra=get_extra_info(log_extra)))
-                return False
+                error_msg = f"Failed to execute SSH command: {str(e)}"
+                logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    error_message=error_msg
+                )
 
             logger.info(f"{script_path}: {result}")
 
             if result is None:
-                logger.warning(_m("GPU model validation job failed", extra=get_extra_info(log_extra)))
-                return False
+                error_msg = "GPU model validation job failed: result is None"
+                logger.warning(_m(error_msg, extra=get_extra_info(log_extra)))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    error_message=error_msg
+                )
 
             try:
                 stdout = result.stdout.strip()
+                stderr = result.stderr.strip() if hasattr(result, 'stderr') else ""
             except AttributeError as e:
-                logger.error(_m("Result object missing stdout attribute", extra=get_extra_info(log_extra)))
-                return False
+                error_msg = "Result object missing stdout attribute"
+                logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    error_message=error_msg
+                )
 
             # Extract UUID from stdout
             try:
                 uuid_line = next((line for line in stdout.splitlines() if line.startswith("UUID:")), None)
                 uuid = uuid_line.split("UUID:")[1].strip() if uuid_line else ""
             except Exception as e:
-                logger.error(_m("Failed to extract UUID from stdout", extra=get_extra_info(log_extra)))
-                return False
+                error_msg = f"Failed to extract UUID from stdout: {str(e)}"
+                logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    returned_uuid="",
+                    stdout=stdout,
+                    stderr=stderr,
+                    error_message=error_msg
+                )
 
             try:
                 uuid_array = verifier_params.uuid.split(",")
                 if uuid in uuid_array:
                     logger.info(_m("Matrix Multiplication Verification Succeed", extra=get_extra_info(log_extra)))
-                    return True
+                    return ValidationResult(
+                        success=True,
+                        expected_uuid=verifier_params.uuid,
+                        returned_uuid=uuid,
+                        stdout=stdout,
+                        stderr=stderr
+                    )
                 else:
-                    logger.info(_m("Matrix Multiplication Verification Failed", extra=get_extra_info(log_extra)))
-                    return False
+                    error_msg = f"UUID mismatch: expected '{verifier_params.uuid}', got '{uuid}'"
+                    logger.info(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "returned_uuid": uuid, "error": error_msg})))
+                    return ValidationResult(
+                        success=False,
+                        expected_uuid=verifier_params.uuid,
+                        returned_uuid=uuid,
+                        stdout=stdout,
+                        stderr=stderr,
+                        error_message=error_msg
+                    )
             except Exception as e:
-                logger.error(_m("Error during UUID verification", extra=get_extra_info(log_extra)))
-                return False
+                error_msg = f"Error during UUID verification: {str(e)}"
+                logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    returned_uuid=uuid if 'uuid' in locals() else "",
+                    stdout=stdout,
+                    stderr=stderr,
+                    error_message=error_msg
+                )
 
         except Exception as e:
-            logger.error(_m("Unexpected error in validate_gpu_model_and_process_job", extra=default_extra))
-            return False
+            error_msg = f"Unexpected error in validate_gpu_model_and_process_job: {str(e)}"
+            logger.error(_m(error_msg, extra=default_extra))
+            return ValidationResult(
+                success=False,
+                error_message=error_msg
+            )
