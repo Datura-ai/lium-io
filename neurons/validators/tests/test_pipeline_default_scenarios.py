@@ -8,6 +8,7 @@ complete validation flow.
 import pytest
 from unittest.mock import Mock
 
+from neurons.validators.src.services.matrix_validation_service import ValidationResult
 from neurons.validators.src.services.task.pipeline import Pipeline, LoggerSink
 from neurons.validators.src.services.task.checks import (
     BannedGpuCheck,
@@ -178,7 +179,13 @@ class DummyValidationService:
     """Mock validation service for GPU capability checks."""
 
     async def validate_gpu_model_and_process_job(self, *, ssh_client, executor_info, default_extra, machine_spec):
-        return True
+        return ValidationResult(
+            success=True,
+            expected_uuid="test-uuid-123",
+            returned_uuid="test-uuid-123",
+            stdout="UUID: test-uuid-123",
+            stderr=""
+        )
 
 
 class DummyVerifyXService:
