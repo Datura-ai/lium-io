@@ -1,6 +1,5 @@
 import logging
-import uuid
-from typing import Annotated, cast
+from typing import Annotated
 
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -10,60 +9,19 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from core.config import settings
 from core.utils import _m, get_extra_info
 from daos.port_mapping_dao import PortMappingDao
-from services.const import (
-    GPU_MODEL_RATES,
-    MAX_GPU_COUNT,
-    LIB_NVIDIA_ML_DIGESTS,
-)
+from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
-from services.redis_service import (
-    RedisService,
-    RENTAL_SUCCEED_MACHINE_SET,
-)
-from services.ssh_service import SSHService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
+from services.redis_service import RedisService
+from services.ssh_service import SSHService
 from services.verifyx_validation_service import VerifyXValidationService
-from services.collateral_contract_service import CollateralContractService
 
-from .checks import (
-    BannedGpuCheck,
-    CapabilityCheck,
-    CollateralCheck,
-    DuplicateExecutorCheck,
-    FinalizeCheck,
-    GpuCountCheck,
-    GpuFingerprintCheck,
-    GpuModelValidCheck,
-    GpuUsageCheck,
-    MachineSpecScrapeCheck,
-    NvmlDigestCheck,
-    PortConnectivityCheck,
-    PortCountCheck,
-    TenantEnforcementCheck,
-    ScoreCheck,
-    StartGPUMonitorCheck,
-    SpecChangeCheck,
-    UploadFilesCheck,
-    VerifyXCheck,
-)
 from .models import JobResult
-from .pipeline import (
-    Check,
-    Context,
-    ContextConfig,
-    ContextServices,
-    ContextState,
-    LoggerSink,
-    Pipeline,
-)
-from .runner import SSHCommandRunner
-from .score_calculator import calculate_scores
+from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
 
 logger = logging.getLogger(__name__)
-
-JOB_LENGTH = 300
 
 class TaskService:
     def __init__(
@@ -78,13 +36,18 @@ class TaskService:
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-        self.validation_service = validation_service
-        self.verifyx_validation_service = verifyx_validation_service
-        self.collateral_contract_service = collateral_contract_service
         self.wallet = settings.get_bittensor_wallet()
 
-        self.executor_connectivity_service = executor_connectivity_service
-        self.port_mapping_dao = port_mapping_dao
+        # Initialize pipeline factory with all required services
+        self.pipeline_factory = PipelineFactory(
+            ssh_service=ssh_service,
+            redis_service=redis_service,
+            validation_service=validation_service,
+            verifyx_validation_service=verifyx_validation_service,
+            collateral_contract_service=collateral_contract_service,
+            executor_connectivity_service=executor_connectivity_service,
+            port_mapping_dao=port_mapping_dao,
+        )
 
     async def create_task(
         self,
@@ -106,98 +69,21 @@ class TaskService:
                 private_key=private_key,
                 port=executor_info.ssh_port,
             ) as shell:
-
-                runner = SSHCommandRunner(shell.ssh_client, max_retries=1)
-
-                verified_job_info = await self.redis_service.get_verified_job_info(executor_info.uuid)
-
-                default_extra = {
-                    "job_batch_id": miner_info.job_batch_id,
-                    "miner_hotkey": miner_info.miner_hotkey,
-                    "executor_uuid": executor_info.uuid,
-                    "executor_ip_address": executor_info.address,
-                    "executor_port": executor_info.port,
-                    "executor_ssh_username": executor_info.ssh_username,
-                    "executor_ssh_port": executor_info.ssh_port,
-                    "version": settings.VERSION,
-                    "rented": False,
-                    "renting_in_progress": False,
-                }
-
-                is_rental_succeed = await self.redis_service.is_elem_exists_in_set(
-                    RENTAL_SUCCEED_MACHINE_SET, executor_info.uuid
+                # Build validation context
+                base_ctx = await self.pipeline_factory.build_context(
+                    shell=shell,
+                    miner_info=miner_info,
+                    executor_info=executor_info,
+                    keypair=keypair,
+                    private_key=private_key,
+                    public_key=public_key,
+                    encrypted_files=encrypted_files,
                 )
 
-                pipeline_id = str(uuid.uuid4())
-
-                base_ctx = Context(
-                    pipeline_id=pipeline_id,
-                    executor=executor_info,
-                    miner_hotkey=miner_info.miner_hotkey,
-                    ssh=shell.ssh_client,
-                    runner=runner,
-                    verified=verified_job_info,
-                    settings={"version": settings.VERSION},
-                    encrypt_key=encrypted_files.encrypt_key,
-                    default_extra=default_extra,
-                    services=ContextServices(
-                        ssh=self.ssh_service,
-                        redis=self.redis_service,
-                        collateral=self.collateral_contract_service,
-                        validation=self.validation_service,
-                        verifyx=self.verifyx_validation_service,
-                        connectivity=self.executor_connectivity_service,
-                        shell=shell,
-                        port_mapping=self.port_mapping_dao,
-                        score_calculator=calculate_scores,
-                    ),
-                    config=ContextConfig(
-                        executor_root=executor_info.root_dir,
-                        compute_rest_app_url=settings.COMPUTE_REST_API_URL,
-                        gpu_monitor_script_relative="src/gpus_utility.py",
-                        machine_scrape_filename=encrypted_files.machine_scrape_file_name,
-                        machine_scrape_timeout=JOB_LENGTH,
-                        obfuscation_keys=encrypted_files.all_keys,
-                        validator_keypair=keypair,
-                        max_gpu_count=MAX_GPU_COUNT,
-                        gpu_model_rates=GPU_MODEL_RATES,
-                        nvml_digest_map=LIB_NVIDIA_ML_DIGESTS,
-                        enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
-                        verifyx_enabled=settings.ENABLE_VERIFYX,
-                        port_private_key=private_key,
-                        port_public_key=public_key,
-                        job_batch_id=miner_info.job_batch_id,
-                    ),
-                    state=ContextState(upload_local_dir=encrypted_files.tmp_directory),
-                    is_rental_succeed=is_rental_succeed,
-                )
-
-                checks = cast(
-                    list[Check],
-                    [
-                        StartGPUMonitorCheck(),
-                        UploadFilesCheck(),
-                        MachineSpecScrapeCheck(),
-                        GpuCountCheck(),
-                        GpuModelValidCheck(),
-                        NvmlDigestCheck(),
-                        SpecChangeCheck(),
-                        GpuFingerprintCheck(),
-                        BannedGpuCheck(),
-                        DuplicateExecutorCheck(),
-                        CollateralCheck(),
-                        TenantEnforcementCheck(),
-                        GpuUsageCheck(),
-                        PortConnectivityCheck(),
-                        VerifyXCheck(),
-                        CapabilityCheck(),
-                        PortCountCheck(),
-                        ScoreCheck(),
-                        FinalizeCheck(),
-                    ],
-                )
-
-                ok, events, last_context = await Pipeline(checks, sink=LoggerSink(logger)).run(base_ctx)
+                # Build and run validation pipeline
+                checks = self.pipeline_factory.build_checks()
+                pipeline = self.pipeline_factory.build_pipeline(checks)
+                ok, events, last_context = await pipeline.run(base_ctx)
 
                 # Determine log_text and success based on ok status
                 # Always use the last event for structured logging (Grafana consumption)
@@ -211,7 +97,7 @@ class TaskService:
                     context=last_context,
                     miner_info=miner_info,
                     executor_info=executor_info,
-                    verified_job_info=verified_job_info,
+                    verified_job_info=base_ctx.verified,  # From original context
                     log_text=str(log_text),
                     success=success,
                 )
