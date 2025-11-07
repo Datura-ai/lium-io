@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     BURNERS: list[int] = [4, 206, 207, 208]
+    NEW_BURNERS: list[int] = [187, 188, 189, 190, 191, 192, 193, 194, 195, 196]
+    ENABLE_NEW_BURN_LOGIC: bool = True
 
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
