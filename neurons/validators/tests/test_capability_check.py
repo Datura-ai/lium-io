@@ -2,6 +2,7 @@ import pytest
 
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.messages import CapabilityMessages as Msg
+from neurons.validators.src.services.matrix_validation_service import ValidationResult
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -11,9 +12,9 @@ class DummyValidationService:
     def __init__(self, *, success: bool, should_raise: bool = False, error_message: str = ""):
         """
         Args:
-            success: Whether validate_gpu_model_and_process_job should return True/False
+            success: Whether validate_gpu_model_and_process_job should return success/failure
             should_raise: Whether to raise an exception instead of returning
-            error_message: The exception message if should_raise=True
+            error_message: The exception message if should_raise=True or error in ValidationResult
         """
         self.success = success
         self.should_raise = should_raise
@@ -42,8 +43,15 @@ class DummyValidationService:
         if self.should_raise:
             raise RuntimeError(self.error_message)
 
-        # Otherwise return success/failure
-        return self.success
+        # Return ValidationResult instead of bool
+        return ValidationResult(
+            success=self.success,
+            expected_uuid="test-uuid-123",
+            returned_uuid="test-uuid-123" if self.success else "wrong-uuid",
+            stdout="UUID: test-uuid-123" if self.success else "UUID: wrong-uuid",
+            stderr="",
+            error_message="" if self.success else self.error_message or "Validation failed"
+        )
 
 
 @pytest.mark.parametrize(
