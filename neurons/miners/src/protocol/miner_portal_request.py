@@ -35,6 +35,7 @@ class AddExecutorPayload(BaseModel):
     ip_address: str
     port: int
     price_per_hour: float | None = None
+    price_per_gpu: float | None = None
     gpu_count: int
 
     @model_validator(mode="after")
@@ -43,6 +44,8 @@ class AddExecutorPayload(BaseModel):
             raise ValueError("Incorrect gpu_count")
         if self.price_per_hour and self.price_per_hour < 0:
             raise ValueError("Incorrect price_per_hour")
+        if self.price_per_gpu and self.price_per_gpu < 0:
+            raise ValueError("Incorrect price_per_gpu")
 
         return self
 
@@ -57,6 +60,7 @@ class SyncExecutorPayload(BaseModel):
     address: str
     port: int
     price_per_hour: float | None = None
+    price_per_gpu: float | None = None
 
 
 class AddExecutorRequest(BaseMinerPortalRequest):
