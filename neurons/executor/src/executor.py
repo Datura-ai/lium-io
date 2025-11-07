@@ -32,6 +32,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
+    docs_url=None,  # Disable /docs
+    redoc_url=None,  # Disable /redoc
+    openapi_url=None,  # Disable /openapi.json
 )
 
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
