@@ -194,12 +194,15 @@ class ContainerRequestType(enum.Enum):
     InstallJupyterServer = "InstallJupyterServer"
 
 
-class ContainerBaseRequest(BaseRequest):
+class CentralBEBasedRequest:
     message_type: ContainerRequestType
     miner_hotkey: str
     miner_address: str | None = None
     miner_port: int | None = None
     executor_id: str
+
+
+class ContainerBaseRequest(CentralBEBasedRequest):
     pod_id: str
 
 
@@ -248,7 +251,7 @@ class RemoveSshPublicKeysRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
 
 
-class AddDebugSshKeyRequest(ContainerBaseRequest):
+class AddDebugSshKeyRequest(CentralBEBasedRequest):
     message_type: ContainerRequestType = ContainerRequestType.AddDebugSshKeyRequest
     public_key: str
 
@@ -320,12 +323,14 @@ class ContainerResponseType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
 
 
-class ContainerBaseResponse(BaseRequest):
+class CentralBEBasedResponse(BaseRequest):
     message_type: ContainerResponseType
     miner_hotkey: str
     executor_id: str
-    pod_id: str
 
+
+class ContainerBaseResponse(CentralBEBasedResponse):
+    pod_id: str | None = None
 
 class ContainerCreated(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
@@ -361,7 +366,7 @@ class SshPubKeyRemoved(SshPubKeyAdded):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyRemoved
 
 
-class DebugSshKeyAdded(ContainerBaseResponse):
+class DebugSshKeyAdded(CentralBEBasedResponse):
     message_type: ContainerResponseType = ContainerResponseType.DebugSshKeyAdded
     address: str
     port: int

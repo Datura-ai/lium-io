@@ -1256,6 +1256,7 @@ class DockerService:
             return JupyterInstallationFailed(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
             )
 
@@ -1412,6 +1413,7 @@ class DockerService:
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -1434,6 +1436,7 @@ class DockerService:
                 return SshPubKeyAdded(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -1446,6 +1449,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
