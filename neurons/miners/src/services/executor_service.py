@@ -106,8 +106,8 @@ class ExecutorService:
                     executor.validator = executor_payload.validator
                     executor.address = executor_payload.address
                     executor.port = executor_payload.port
-                    executor.price_per_hour = executor_payload.price_per_hour
-                    executor.price_per_gpu = executor_payload.price_per_gpu
+                    executor.price_per_hour = executor_payload.price_per_hour or executor.price_per_hour
+                    executor.price_per_gpu = executor_payload.price_per_gpu or executor.price_per_gpu
                     self.executor_dao.update_by_uuid(executor.uuid, executor)
                     logger.info("Updated executor (id=%s)", str(executor.uuid))
                 else:
