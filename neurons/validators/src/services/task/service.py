@@ -1,12 +1,7 @@
-import asyncio
-import json
 import logging
-import random
 import uuid
-from datetime import UTC, datetime
-from typing import Annotated, Any, Optional, Union, cast
+from typing import Annotated, cast
 
-import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
@@ -18,25 +13,18 @@ from daos.port_mapping_dao import PortMappingDao
 from services.const import (
     GPU_MODEL_RATES,
     MAX_GPU_COUNT,
-    UNRENTED_MULTIPLIER,
     LIB_NVIDIA_ML_DIGESTS,
-    GPU_UTILIZATION_LIMIT,
-    GPU_MEMORY_UTILIZATION_LIMIT,
-    MIN_PORT_COUNT,
 )
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.redis_service import (
     RedisService,
-    DUPLICATED_MACHINE_SET,
     RENTAL_SUCCEED_MACHINE_SET,
-    AVAILABLE_PORT_MAPS_PREFIX,
 )
 from services.ssh_service import SSHService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.collateral_contract_service import CollateralContractService
-from services.file_encrypt_service import ORIGINAL_KEYS
 
 from .checks import (
     BannedGpuCheck,
