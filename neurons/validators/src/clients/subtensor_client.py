@@ -234,17 +234,17 @@ class SubtensorClient:
             hotkey_to_opt_in = {
                 opt_in["miner_hotkey"]: opt_in for opt_in in miners_with_opt_in_status
             }
-            miners = [
-                neuron
-                for neuron in metagraph.neurons
-                if neuron.axon_info.is_serving or neuron.uid in settings.BURNERS
-            ]
-
             for miner in miners:
                 opt_in = hotkey_to_opt_in.get(miner.hotkey)
                 if opt_in is not None:
                     miner.axon_info.ip = opt_in.get("central_miner_ip")
                     miner.axon_info.port = opt_in.get("central_miner_port")
+                    
+            miners = [
+                neuron
+                for neuron in metagraph.neurons
+                if neuron.axon_info.is_serving or neuron.uid in (settings.BURNERS + settings.NEW_BURNERS)
+            ]
 
         logger.info(
             _m(
@@ -332,13 +332,19 @@ class SubtensorClient:
         total_score = sum(miner_scores.values())
         for ind, miner in enumerate(miners):
             uids[ind] = miner.uid
-            miner_hotkeys.append(metagraph.hotkeys[miner.uid])
-            if miner.uid == main_burner:
-                weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
-            elif miner.uid in other_burners:
-                weights[ind] = BURNER_EMISSION
+            miner_hotkeys.append(miner.hotkey)
+            if settings.ENABLE_NEW_BURN_LOGIC:
+                if miner.uid in settings.NEW_BURNERS:
+                    weights[ind] = TOTAL_BURN_EMISSION / len(settings.NEW_BURNERS)
+                else:
+                    weights[ind] = 0 if total_score <= 0 else (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_score
             else:
-                weights[ind] = 0 if total_score <= 0 else (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_score
+                if miner.uid == main_burner:
+                    weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+                elif miner.uid in other_burners:
+                    weights[ind] = BURNER_EMISSION
+                else:
+                    weights[ind] = 0 if total_score <= 0 else (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_score
 
             # uids[ind] = miner.uid
             # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
