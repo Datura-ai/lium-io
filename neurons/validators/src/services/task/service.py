@@ -71,11 +71,11 @@ from .pipeline import (
     Pipeline,
 )
 from .runner import SSHCommandRunner
+from .score_calculator import calculate_scores
 
 logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
-SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
 class TaskService:
     def __init__(
@@ -177,48 +177,6 @@ class TaskService:
             ssh_pub_keys=ssh_pub_keys,
         )
 
-    def calc_scores(
-        self,
-        gpu_model: str,
-        collateral_deposited: bool,
-        is_rental_succeed: bool,
-        contract_version: str,
-        rented: bool = False,
-        port_count: int = 0,
-    ) -> Union[float, float, str]:
-        warning_messages = []
-        job_score = 1
-        actual_score = 1
-        
-        def _return_value(actual_score, job_score, warning_messages):
-            return actual_score, 1 if rented else job_score, (" WARNING: " + " | ".join(warning_messages)) if warning_messages else ""
-
-        if not is_rental_succeed:
-            actual_score = 0
-            warning_messages.append("Score set to 0 pending rental verification")
-
-        if port_count < MIN_PORT_COUNT and not rented:
-            actual_score = 0
-            job_score = 0
-            warning_messages.append(f"Insufficient ports: {port_count} available, {MIN_PORT_COUNT} required")
-
-        if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
-            return _return_value(actual_score, job_score, warning_messages)
-
-        if not collateral_deposited:
-            if settings.ENABLE_NO_COLLATERAL:
-                warning_messages.append("No collateral deposited")
-            else:
-                actual_score = 0
-                job_score = 0
-                warning_messages.append("Collateral required but not deposited")
-        elif contract_version and contract_version != settings.get_latest_contract_version() and not settings.ENABLE_NO_COLLATERAL:
-            actual_score = actual_score * SCORE_PORTION_FOR_OLD_CONTRACT
-            job_score = job_score * SCORE_PORTION_FOR_OLD_CONTRACT
-            warning_messages.append(f"Outdated contract version (current: {contract_version}, latest: {settings.get_latest_contract_version()})")
-
-        return _return_value(actual_score, job_score, warning_messages)
-
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -282,7 +240,7 @@ class TaskService:
                         connectivity=self.executor_connectivity_service,
                         shell=shell,
                         port_mapping=self.port_mapping_dao,
-                        score_calculator=self.calc_scores,
+                        score_calculator=calculate_scores,
                     ),
                     config=ContextConfig(
                         executor_root=executor_info.root_dir,
