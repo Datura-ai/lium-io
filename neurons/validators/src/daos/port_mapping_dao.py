@@ -8,7 +8,6 @@ from sqlalchemy import select, update
 
 from daos.base import BaseDao
 from models.port_mapping import PortMapping
-from services.executor_connectivity_service import MAX_REDIS_KEEP
 
 logger = logging.getLogger(__name__)
 upsert_semaphore = Semaphore(POOL_SIZE)
@@ -85,7 +84,7 @@ class PortMappingDao(BaseDao):
                 total_ports = result.scalar() or 0
 
                 # Only clean if more than 10 ports
-                if total_ports <= MAX_REDIS_KEEP:
+                if total_ports <= 10:
                     return 0
 
                 # Bulk DELETE operation

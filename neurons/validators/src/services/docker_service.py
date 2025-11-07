@@ -125,8 +125,10 @@ class DockerService:
             port_mapping = available_ports.pop(external_port)
             mappings.append((docker_port, port_mapping.internal_port, external_port))
 
+        ssh_mapping = self._find_mapping_by_docker_port(mappings, ssh_port)
+        ssh_external_port = ssh_mapping[2] if ssh_mapping else None
         logger.info(
-            f"Generated {len(mappings)} port mappings from database for executor {executor_id}"
+            f"Generated {len(mappings)} port mappings from database for executor {executor_id}, {ssh_external_port=}"
         )
 
         if enable_jupyter:
