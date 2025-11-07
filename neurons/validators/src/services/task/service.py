@@ -13,9 +13,8 @@ from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
 from core.config import settings
-from core.utils import _m, context, get_extra_info, StructuredMessage
+from core.utils import _m, get_extra_info
 from daos.port_mapping_dao import PortMappingDao
-from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from services.const import (
     GPU_MODEL_RATES,
     MAX_GPU_COUNT,
@@ -72,6 +71,7 @@ from .pipeline import (
 )
 from .runner import SSHCommandRunner
 from .score_calculator import calculate_scores
+from .result_handler import ResultHandler
 
 logger = logging.getLogger(__name__)
 
@@ -97,85 +97,6 @@ class TaskService:
 
         self.executor_connectivity_service = executor_connectivity_service
         self.port_mapping_dao = port_mapping_dao
-
-    async def _handle_task_result(
-        self,
-        miner_info: MinerJobRequestPayload,
-        executor_info: ExecutorSSHInfo,
-        spec: dict | None,
-        score: float,
-        job_score: float,
-        collateral_deposited: bool,
-        log_text: object,
-        verified_job_info: dict,
-        success: bool = True,
-        clear_verified_job_info: bool = False,
-        gpu_model_count: str = '',
-        gpu_uuids: str = '',
-        sysbox_runtime: bool = False,
-        ssh_pub_keys: list[str] | None = None,
-        clear_verified_job_reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
-    ):
-        logger.info(_m("Handle task result: ", extra={
-            "miner_hotkey": miner_info.miner_hotkey,
-            "executor_id": executor_info.uuid,
-            "success": success,
-            "score": score,
-            "job_score": job_score,
-        }))
-        if success:
-            log_status = "info"
-            logger.info(log_text)
-
-            if gpu_model_count and gpu_uuids:
-                await self.redis_service.set_verified_job_info(
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_id=executor_info.uuid,
-                    prev_info=verified_job_info,
-                    success=True,
-                    spec=gpu_model_count,
-                    uuids=gpu_uuids,
-                )
-        else:
-            log_status = "warning"
-            logger.warning(log_text)
-
-            if clear_verified_job_info:
-                await self.redis_service.clear_verified_job_info(
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_id=executor_info.uuid,
-                    prev_info=verified_job_info,
-                    reason=clear_verified_job_reason,
-                )
-            else:
-                await self.redis_service.set_verified_job_info(
-                    miner_hotkey=miner_info.miner_hotkey,
-                    executor_id=executor_info.uuid,
-                    prev_info=verified_job_info,
-                    success=success,
-                )
-
-        gpu_model = None
-        gpu_count = 0
-        if gpu_model_count and ':' in gpu_model_count:
-            gpu_model_count_info = gpu_model_count.split(':')
-            gpu_model = gpu_model_count_info[0]
-            gpu_count = int(gpu_model_count_info[1])
-
-        return JobResult(
-            spec=spec,
-            executor_info=executor_info,
-            score=score,
-            job_score=job_score,
-            collateral_deposited=collateral_deposited,
-            job_batch_id=miner_info.job_batch_id,
-            log_status=log_status,
-            log_text=str(log_text),
-            gpu_model=gpu_model,
-            gpu_count=gpu_count,
-            sysbox_runtime=sysbox_runtime,
-            ssh_pub_keys=ssh_pub_keys,
-        )
 
     async def create_task(
         self,
@@ -290,37 +211,21 @@ class TaskService:
 
                 ok, events, last_context = await Pipeline(checks, sink=LoggerSink(logger)).run(base_ctx)
 
-                def _resolve_reason(reason_value: str | None) -> ResetVerifiedJobReason:
-                    if not reason_value:
-                        return ResetVerifiedJobReason.DEFAULT
-                    try:
-                        return ResetVerifiedJobReason(reason_value)
-                    except ValueError:
-                        return ResetVerifiedJobReason.DEFAULT
-
                 # Determine log_text and success based on ok status
                 # Always use the last event for structured logging (Grafana consumption)
                 last_event = events[-1]
                 log_text = _m(last_event.event, extra=last_event.model_dump())
                 success = False if not ok else last_context.success
 
-                # Single call to handle result
-                return await self._handle_task_result(
+                # Handle result using ResultHandler
+                result_handler = ResultHandler(self.redis_service)
+                return await result_handler.handle_result(
+                    context=last_context,
                     miner_info=miner_info,
                     executor_info=executor_info,
-                    spec=last_context.state.specs or None,
-                    score=last_context.score,
-                    job_score=last_context.job_score,
-                    collateral_deposited=last_context.collateral_deposited,
-                    log_text=log_text,
                     verified_job_info=verified_job_info,
+                    log_text=str(log_text),
                     success=success,
-                    clear_verified_job_info=last_context.clear_verified_job_info,
-                    gpu_model_count=last_context.state.gpu_model_count or "",
-                    gpu_uuids=last_context.state.gpu_uuids or "",
-                    sysbox_runtime=last_context.state.sysbox_runtime,
-                    ssh_pub_keys=last_context.ssh_pub_keys,
-                    clear_verified_job_reason=_resolve_reason(last_context.clear_verified_job_reason),
                 )
 
         except Exception as e:
