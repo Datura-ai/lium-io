@@ -180,6 +180,7 @@ class ExecutorService:
                         address=item.get("executor_ip_address"),
                         port=item.get("executor_ip_port"),
                         price_per_hour=item.get("price_per_hour"),
+                        price_per_gpu=item.get("price_per_gpu"),
                     )
                 )
             except Exception as e:
