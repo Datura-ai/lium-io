@@ -15,7 +15,8 @@ class MinerMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request, call_next):
-        # Skip middleware for GET requests
+        # Skip middleware for GET requests as they have no body to validate.
+        # Prevents false validation errors when GET requests arrive (returns proper 404 instead of 422).
         if request.method == "GET":
             return await call_next(request)
 
