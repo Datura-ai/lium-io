@@ -226,7 +226,7 @@ class ExecutorService:
                         executor.port,
                         json.dumps(response_obj),
                     )
-                    response_obj = {**response_obj, **executor.model_dump(mode="json")}
+                    response_obj = {**response_obj, **executor.model_dump(mode="json"), "price": executor.price_per_hour}
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(
