@@ -34,6 +34,7 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
 )
 
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_middleware(MinerMiddleware)
 app.include_router(apis_router)
 
