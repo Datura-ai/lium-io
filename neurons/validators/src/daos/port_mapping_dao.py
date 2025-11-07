@@ -8,6 +8,7 @@ from sqlalchemy import select, update
 
 from daos.base import BaseDao
 from models.port_mapping import PortMapping
+from services.executor_connectivity_service import MAX_REDIS_KEEP
 
 logger = logging.getLogger(__name__)
 upsert_semaphore = Semaphore(POOL_SIZE)
@@ -71,10 +72,21 @@ class PortMappingDao(BaseDao):
                     raise
 
     async def clean_ports(self, executor_id: UUID, period_minutes: int = 120) -> int:
-        """delete ports older than period_minutes from DB"""
+        """delete ports older than period_minutes from DB only if total ports count > 10"""
         async with self.get_session() as session:
             try:
-                from sqlalchemy import delete, text
+                from sqlalchemy import delete, text, func
+
+                # First, check total ports count for this executor
+                count_stmt = select(func.count(PortMapping.uuid)).where(
+                    PortMapping.executor_id == executor_id
+                )
+                result = await session.exec(count_stmt)
+                total_ports = result.scalar() or 0
+
+                # Only clean if more than 10 ports
+                if total_ports <= MAX_REDIS_KEEP:
+                    return 0
 
                 # Bulk DELETE operation
                 stmt = delete(PortMapping).where(

@@ -65,6 +65,54 @@ def sample_executor_info():
 
 
 @pytest.fixture
+def executor_with_port_range():
+    """ExecutorSSHInfo with port_range instead of port_mappings."""
+    return ExecutorSSHInfo(
+        uuid="test",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        port_mappings=None,
+        port_range="9000-9005",
+        python_path="/usr/bin/python3",
+        root_dir="/tmp",
+    )
+
+
+@pytest.fixture
+def executor_default():
+    """ExecutorSSHInfo with no port_range or port_mappings (uses defaults)."""
+    return ExecutorSSHInfo(
+        uuid="test",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        port_mappings=None,
+        port_range=None,
+        python_path="/usr/bin/python3",
+        root_dir="/tmp",
+    )
+
+
+@pytest.fixture
+def executor_with_large_range():
+    """ExecutorSSHInfo with large port range for testing."""
+    return ExecutorSSHInfo(
+        uuid="test",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        port_mappings=None,
+        port_range="20000-25000",
+        python_path="/usr/bin/python3",
+        root_dir="/tmp",
+    )
+
+
+@pytest.fixture
 def mock_aiohttp_session():
     """Mock aiohttp session for testing HTTP requests."""
     with patch("aiohttp.ClientSession") as mock_session_class:

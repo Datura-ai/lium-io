@@ -32,6 +32,7 @@ from services.redis_service import (
 # Constants
 BATCH_VERIFIER_CONTAINER_PREFIX = "container_batch_verifier"
 BATCH_VERIFIER_IMAGE = "daturaai/batch-port-verifier:0.0.1"
+MAX_REDIS_KEEP = 10
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ class ExecutorConnectivityService:
             t1 = time.monotonic()
             await self.cleanup_docker_containers(ssh_client, extra)
             port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE)
+            shorter_port_maps = sorted(port_maps, key=lambda m: m[1], reverse=True)[:MAX_REDIS_KEEP]
+
             if not port_maps:
                 return DockerConnectionCheckResult(
                     success=False, log_text="No port available for docker container", sysbox_runtime=sysbox_runtime,
@@ -82,7 +85,7 @@ class ExecutorConnectivityService:
             logger.debug(_m(f"checking {len(port_maps)} port mappings", extra))
 
             successful_ports, failed_ports = await self.verify_ports_bulk(ssh_client, port_maps, executor_info, extra)
-            dind_port = successful_ports.pop(0) if successful_ports else random.choice(port_maps)
+            dind_port = successful_ports.pop(0) if successful_ports else random.choice(shorter_port_maps)
             dind_result = await self.verify_port_dind(
                 ssh_client,
                 miner_hotkey,
@@ -415,9 +418,8 @@ class ExecutorConnectivityService:
         self, executor_info: ExecutorSSHInfo, miner_hotkey: str, successful_ports: list[Any], extra: dict = {},
     ):
         key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
-        MAX_REDIS_SAVE = 10
-        MAX_REDIS_KEEP = 10
-        for internal_port, external_port in successful_ports[:MAX_REDIS_SAVE]:
+
+        for internal_port, external_port in successful_ports[:MAX_REDIS_KEEP]:
             port_map = f"{internal_port},{external_port}"
 
             # delete all the same port_maps in the list
@@ -519,6 +521,7 @@ class ExecutorConnectivityService:
                 for mapping in port_mappings
                 if mapping[0] in PREFERRED_POD_PORTS or mapping[1] in PREFERRED_POD_PORTS
             ]
+            # sorted_by_external_port = sorted(filtered_mappings, key=lambda m: m[1], reverse=True)
             remaining_mappings = [mapping for mapping in port_mappings if mapping not in preferred_mappings]
 
             # Combine preferred first, then sample from remaining
@@ -541,14 +544,16 @@ class ExecutorConnectivityService:
             # Default range if port_range is empty
             ports = list(range(20000, 65535))
 
-        ports = [port for port in ports if port != executor_info.ssh_port]
+        ports = sorted([port for port in ports if port != executor_info.ssh_port])
+        # limit len of ports to 4x batch_size
+        ports = ports[: batch_size]
 
         if not ports:
             return []
 
         # Prioritize preferred ports first
         preferred_ports = [port for port in PREFERRED_POD_PORTS if port in ports]
-        remaining_ports = [port for port in ports if port not in PREFERRED_POD_PORTS]
+        remaining_ports = [port for port in ports if port not in preferred_ports]
 
         # Start with preferred ports
         selected_ports = preferred_ports[:]
