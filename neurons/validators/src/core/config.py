@@ -63,11 +63,6 @@ class Settings(BaseSettings):
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
 
-    # Percentage of tasks to use new pipeline (0-100). Default 50 means 50% new, 50% old
-    NEW_PIPELINE_ROLLOUT_PERCENTAGE: int = Field(
-        env="NEW_PIPELINE_ROLLOUT_PERCENTAGE", default=100
-    )
-
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )
