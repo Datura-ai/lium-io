@@ -70,5 +70,5 @@ class MinerMiddleware(BaseHTTPMiddleware):
         except ValidationError as e:
             # Handle validation error if needed
             error_message = str(_m("Validation Error", extra={"errors": str(e.errors())}))
-            logger.error(error_message)
+            logger.debug(error_message)
             return JSONResponse(status_code=422, content=error_message)
