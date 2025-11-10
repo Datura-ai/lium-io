@@ -421,7 +421,7 @@ class FailedGetPodLogs(ContainerBaseResponse):
     msg: str
 
 
-class FailedAddDebugSshKey(ContainerBaseResponse):
+class FailedAddDebugSshKey(BaseValidatorResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedAddDebugSshKey
     msg: str
 
