@@ -399,3 +399,130 @@ async def test_enable_jupyter_feature(
         assert len(jupyter_ports) == 0
         # Jupyter port map should be None
         assert jupyter_port_map is None
+
+
+@pytest.mark.parametrize(
+    "internal_ports,pod_port_mapping,expected",
+    [
+        # Case 1: pod_port_mapping is None
+        (None, None, False),
+        ([22, 8080], None, False),
+        ([22, 8080, 9000], None, False),
+
+        # Case 2: pod_port_mapping exists, internal_ports is None
+        (None, {22: 20022, 8080: 28080}, True),
+        (None, {22: 20022}, True),
+
+        # Case 3: pod_port_mapping exists, internal_ports has same length
+        ([22, 8080], {22: 20022, 8080: 28080}, True),
+        ([22, 8080, 9000], {22: 20022, 8080: 28080, 9000: 29000}, True),
+        ([22], {22: 20022}, True),
+
+        # Case 4: pod_port_mapping exists, internal_ports has different length
+        ([22, 8080], {22: 20022}, False),
+        ([22], {22: 20022, 8080: 28080}, False),
+        ([22, 8080, 9000], {22: 20022, 8080: 28080}, False),
+        ([22, 8080], {22: 20022, 8080: 28080, 9000: 29000}, False),
+    ],
+)
+def test_is_need_port_mapping(docker_service, internal_ports, pod_port_mapping, expected):
+    """Test _is_need_port_mapping with various combinations of internal_ports and pod_port_mapping.
+
+    The function returns True if pod_port_mapping exists and internal_ports either:
+    - is None, or
+    - has the same length as pod_port_mapping
+
+    Returns False if:
+    - pod_port_mapping is None, or
+    - internal_ports exists and has different length than pod_port_mapping
+    """
+    # Act
+    result = docker_service._is_need_port_mapping(internal_ports, pod_port_mapping)
+
+    # Assert
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    "pod_port_mapping,executor_port_mapping,expected_docker_ports,expected_jupyter_map",
+    [
+        # Case 1: Basic case - only pod_port_mapping, no executor_port_mapping, no jupyter
+        (
+            {22: 20022, 8080: 28080},
+            None,
+            [(22, 20022, 20022), (8080, 28080, 28080)],
+            None,
+        ),
+
+        # Case 2: With jupyter port (8888)
+        (
+            {22: 20022, 8888: 28888, 8080: 28080},
+            None,
+            [(22, 20022, 20022), (8888, 28888, 28888), (8080, 28080, 28080)],
+            (8888, 28888),
+        ),
+
+        # Case 3: With executor_port_mapping, no jupyter
+        (
+            {22: 56681, 8080: 56682},
+            '[[46681, 56681], [46682, 56682]]',
+            [(22, 46681, 56681), (8080, 46682, 56682)],
+            None,
+        ),
+
+        # Case 4: With executor_port_mapping and jupyter
+        (
+            {22: 56681, 8888: 56682, 8080: 56683},
+            '[[46681, 56681], [46682, 56682], [46683, 56683]]',
+            [(22, 46681, 56681), (8888, 46682, 56682), (8080, 46683, 56683)],
+            (8888, 56682),
+        ),
+
+        # Case 5: executor_port_mapping doesn't have all ports (fallback to external_port)
+        (
+            {22: 56681, 8080: 56682, 9000: 56683},
+            '[[46681, 56681]]',  # Only first port has mapping
+            [(22, 46681, 56681), (8080, 56682, 56682), (9000, 56683, 56683)],
+            None,
+        ),
+
+        # Case 6: Empty pod_port_mapping
+        (
+            {},
+            None,
+            [],
+            None,
+        ),
+
+        # Case 7: Single port with executor_port_mapping
+        (
+            {22: 56681},
+            '[[46681, 56681]]',
+            [(22, 46681, 56681)],
+            None,
+        ),
+
+        # Case 8: Multiple ports, partial executor_port_mapping with jupyter
+        (
+            {22: 56681, 8888: 56682, 8080: 56683, 9000: 56684},
+            '[[46681, 56681], [46682, 56682]]',
+            [(22, 46681, 56681), (8888, 46682, 56682), (8080, 56683, 56683), (9000, 56684, 56684)],
+            (8888, 56682),
+        ),
+    ],
+)
+def test_use_port_mapping(docker_service, pod_port_mapping, executor_port_mapping, expected_docker_ports, expected_jupyter_map):
+    """Test _use_port_mapping with various combinations of pod_port_mapping and executor_port_mapping.
+
+    The function should:
+    - Convert pod_port_mapping (docker_port: external_port) to list of tuples (docker, internal, external)
+    - If executor_port_mapping provided, use internal ports from it, otherwise use external_port as internal_port
+    - If port 8888 exists in pod_port_mapping, return it as jupyter_port_map tuple
+    """
+    # Act
+    docker_ports, jupyter_port_map = docker_service._use_port_mapping(pod_port_mapping, executor_port_mapping)
+
+    # Assert
+    assert len(docker_ports) == len(expected_docker_ports)
+    assert set(docker_ports) == set(expected_docker_ports)
+    assert jupyter_port_map == expected_jupyter_map
