@@ -844,7 +844,9 @@ class DockerService:
                     f'{startup_commands}'
                 )
 
-                logger.info(f"Running command: {command}")
+                timeout = 120
+                logger.info(f"Running command: {command} with timeout={timeout}")
+
 
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -852,7 +854,7 @@ class DockerService:
                     log_tag=log_tag,
                     log_text="Creating docker container",
                     log_extra=default_extra,
-                    timeout=60
+                    timeout=timeout
                 )
                 logger.info(f"Container creation step finished")
 

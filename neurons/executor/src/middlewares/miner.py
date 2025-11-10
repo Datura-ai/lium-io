@@ -19,10 +19,13 @@ class MinerMiddleware(BaseHTTPMiddleware):
         if request.url.path in ["/hardware_utilization", "/ping"]:
             return await call_next(request)
             
+        default_extra = {
+            'url': request.url.path,
+            'client_host': request.client.host,
+        }
         try:
             body_bytes = await request.body()
-            miner_ip = request.client.host
-            default_extra = {"miner_ip": miner_ip}
+            # miner_ip = request.client.host
 
             # Parse it into the Pydantic model
             payload = MinerAuthPayload.model_validate_json(body_bytes)
@@ -69,6 +72,6 @@ class MinerMiddleware(BaseHTTPMiddleware):
             return response
         except ValidationError as e:
             # Handle validation error if needed
-            error_message = str(_m("Validation Error", extra={"errors": str(e.errors())}))
+            error_message = str(_m("Validation Error", extra={**default_extra, "errors": str(e.errors())}))
             logger.error(error_message)
             return JSONResponse(status_code=422, content=error_message)

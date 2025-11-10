@@ -69,6 +69,7 @@ class ExecutorDao(BaseDao):
         existing_executor.address = executor.address
         existing_executor.port = executor.port
         existing_executor.price_per_hour = executor.price_per_hour
+        existing_executor.price_per_gpu = executor.price_per_gpu
         self.session.commit()
         self.session.refresh(existing_executor)
         return existing_executor
