@@ -14,7 +14,7 @@ async def get_executors_for_validator(
 ):
     if not settings.DEBUG:
         return None
-    return executor_service.get_executors_for_validator(validator_hotkey)
+    return await executor_service.get_executors_for_validator(validator_hotkey)
 
 
 @debug_apis_router.post("/debug/register_pubkey/{validator_hotkey}")

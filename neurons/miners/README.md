@@ -178,7 +178,19 @@ docker exec -it <docker instance> pdm run /root/app/src/cli.py switch-validator 
 - `<executor-port>`: The port number used for the executor.
 - `<validator-hotkey>`: The validator hotkey you want to switch
 
-### Set/Update Executor Price
+### Set/Update Executor Price per GPU
+
+Run the following command to set or update the executor price:
+
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py update-executor-price-per-gpu --address <executor public ip> --port <executor external port> --price_per_gpu <price per gpu>
+```
+
+- `<executor public ip>`: The public IP address of the executor machine.
+- `<executor external port>`: The external port number used for the executor.
+- `<price per gpu>`: Price per gpu per hour in USD for the executor.
+
+### Set/Update Executor Price (Will be deprecated soon)
 
 Run the following command to set or update the executor price:
 

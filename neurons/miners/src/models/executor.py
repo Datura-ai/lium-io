@@ -14,6 +14,7 @@ class Executor(SQLModel, table=True):
     port: int
     validator: str
     price_per_hour: float | None = None
+    price_per_gpu: float | None = None
 
     def __str__(self):
         return f"{self.address}:{self.port}"

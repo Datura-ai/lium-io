@@ -179,7 +179,7 @@ class Validator:
             )
 
             # fetch miners
-            miners = self.subtensor_client.get_miners()
+            miners = await self.subtensor_client.get_miners()
 
             try:
                 if await self.subtensor_client.should_set_weights():
@@ -214,8 +214,6 @@ class Validator:
             if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
-
-                miners = [miner for miner in miners if miner.axon_info.is_serving]
 
                 logger.info(
                     _m(
