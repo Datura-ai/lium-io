@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     MINER_HOTKEY_SS58_ADDRESS: str = Field(env="MINER_HOTKEY_SS58_ADDRESS")
     DEFAULT_MINER_HOTKEY: str = Field(
         env="DEFAULT_MINER_HOTKEY",
-        default="5F2CpjmnJ3byqeKGNGqgL7PvJQGVeR4DYPY448TM8HS29xQb"
+        default="5D4jX4TqUkZwNwKAjjYrbk2FHFNN2U1TgFF6ZMuNPnjnKJVU"
     )
     ALLOWED_HOTKEY_SS58_ADDRESS: str = Field(env="ALLOWED_HOTKEY_SS58_ADDRESS", default="5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1")
 

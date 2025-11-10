@@ -27,20 +27,19 @@ class CapabilityCheck:
 
         validation_service = ctx.services.validation
 
+        result = None
+        failure_reason = None
         try:
-            ok = await validation_service.validate_gpu_model_and_process_job(
+            result = await validation_service.validate_gpu_model_and_process_job(
                 ssh_client=ctx.ssh,
                 executor_info=ctx.executor,
                 default_extra=ctx.default_extra,
                 machine_spec=specs,
             )
         except Exception as exc:
-            ok = False
             failure_reason = str(exc)
-        else:
-            failure_reason = None
 
-        if ok:
+        if result and result.success:
             event = render_message(
                 Msg.VERIFY_OK,
                 ctx=ctx,
@@ -48,10 +47,23 @@ class CapabilityCheck:
             )
             return CheckResult(passed=True, event=event)
 
+        # Build detailed failure information
+        failure_details = {}
+        if result:
+            failure_details = {
+                "error": result.error_message,
+                "expected_uuid": result.expected_uuid,
+                "returned_uuid": result.returned_uuid,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        elif failure_reason:
+            failure_details = {"error": failure_reason}
+
         event = render_message(
             Msg.VERIFY_FAILED,
             ctx=ctx,
             check_id=self.check_id,
-            what={"error": failure_reason} if failure_reason else {},
+            what=failure_details,
         )
         return CheckResult(passed=False, event=event)

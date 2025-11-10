@@ -7,7 +7,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
-    from bittensor_wallet import bittensor_wallet
+    from bittensor import Wallet
 
 
 class Settings(BaseSettings):
@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
     )
+    MINER_PORTAL_REST_API_URL: str = Field(
+        env="MINER_PORTAL_REST_API_URL", default="https://provider-api.lium.io/"
+    )
     TAO_PRICE_API_URL: str = Field(env="TAO_PRICE_API_URL", default="https://api.coingecko.com/api/v3/coins/bittensor")
     COLLATERAL_DAYS: int = 7
     ENV: str = Field(env="ENV", default="dev")
@@ -59,6 +62,8 @@ class Settings(BaseSettings):
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     BURNERS: list[int] = [4, 206, 207, 208]
+    NEW_BURNERS: list[int] = [187, 188, 189, 190, 191, 192, 193, 194, 195, 196]
+    ENABLE_NEW_BURN_LOGIC: bool = True
 
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
@@ -83,7 +88,7 @@ class Settings(BaseSettings):
         "NVIDIA B200"
     ]
 
-    def get_bittensor_wallet(self) -> "bittensor_wallet":
+    def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
         wallet = bittensor.wallet(

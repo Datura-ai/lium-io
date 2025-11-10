@@ -60,8 +60,8 @@ class ValidatorConsumer(BaseConsumer):
     def verify_auth_msg(self, msg: AuthenticateRequest) -> tuple[bool, str]:
         if msg.payload.timestamp < time.time() - AUTH_MESSAGE_MAX_AGE:
             return False, "msg too old"
-        if msg.payload.miner_hotkey != self.my_hotkey:
-            return False, f"wrong miner hotkey ({self.my_hotkey}!={msg.payload.miner_hotkey})"
+        # if msg.payload.miner_hotkey != self.my_hotkey:
+        #     return False, f"wrong miner hotkey ({self.my_hotkey}!={msg.payload.miner_hotkey})"
         if msg.payload.validator_hotkey != self.validator_key:
             return (
                 False,
@@ -91,7 +91,7 @@ class ValidatorConsumer(BaseConsumer):
         for msg in self.msg_queue:
             await self.handle_message(msg)
 
-    async def check_validator_allowance(self):
+    async def check_validator_allowance(self, msg: AuthenticateRequest):
         """Check if there's any executors opened for current validator.
 
         If there are any executors, send accept job request to validator w/ executors list
@@ -99,7 +99,7 @@ class ValidatorConsumer(BaseConsumer):
 
         If no executors, decline job request
         """
-        executors = self.executor_service.get_executors_for_validator(self.validator_key)
+        executors = await self.executor_service.get_executors_for_validator(self.validator_key, msg.payload.miner_hotkey, None)
         if len(executors):
             logger.info("Found %d executors for validator(%s)", len(executors), self.validator_key)
             await self.send_message(
@@ -135,7 +135,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, AuthenticateRequest):
             await self.handle_authentication(msg)
             if self.validator_authenticated:
-                await self.check_validator_allowance()
+                await self.check_validator_allowance(msg)
             return
 
         # TODO: update logic here, fow now, it sends AcceptJobRequest regardless
@@ -153,7 +153,7 @@ class ValidatorConsumer(BaseConsumer):
             try:
                 msg: SSHPubKeySubmitRequest
                 executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
-                    self.validator_key, msg.public_key, msg.executor_id
+                    self.validator_key, msg.miner_hotkey, msg.public_key, msg.executor_id
                 )
                 if msg.is_rental_request and len(executors) == 1:
                     await self.invoke_rental_request_hook(
@@ -175,7 +175,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, SSHPubKeyRemoveRequest):
             logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
             try:
-                await self.executor_service.deregister_pubkey(self.validator_key, msg.public_key, msg.executor_id)
+                await self.executor_service.deregister_pubkey(self.validator_key, msg.miner_hotkey, msg.public_key, msg.executor_id)
                 logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Failed SSHKeyRemoved request: %s", str(e))
@@ -185,7 +185,7 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, GetPodLogsRequest):
             logger.info("Validator %s get pod logs for container %s.", self.validator_key, msg.container_name)
             try:
-                logs: list[PodLog] = await self.executor_service.get_pod_logs(self.validator_key, msg.executor_id, msg.container_name)
+                logs: list[PodLog] = await self.executor_service.get_pod_logs(self.validator_key,  msg.miner_hotkey, msg.executor_id, msg.container_name)
                 await self.send_message(PodLogsResponse(logs=logs))
                 logger.info("Sent GetPodLogs to validator %s", self.validator_key)
             except Exception as e:
@@ -199,6 +199,7 @@ class ValidatorConsumerManger:
         self,
     ):
         self.active_consumer: ValidatorConsumer | None = None
+        self.active_consumers: list[ValidatorConsumer] = []  # For central mode: allow multiple concurrent connections
         self.lock = asyncio.Lock()
 
     async def addConsumer(
@@ -209,6 +210,8 @@ class ValidatorConsumerManger:
         validator_service: Annotated[ValidatorService, Depends(ValidatorService)],
         executor_service: Annotated[ExecutorService, Depends(ExecutorService)],
     ):
+        from core.config import settings
+
         consumer = ValidatorConsumer(
             websocket=websocket,
             validator_key=validator_key,
@@ -218,17 +221,30 @@ class ValidatorConsumerManger:
         )
         await consumer.connect()
 
-        if self.active_consumer is not None:
-            await consumer.send_message(DeclineJobRequest())
-            await consumer.disconnect()
-            return
+        # In CENTRAL_MODE, allow multiple concurrent connections from same validator
+        if settings.CENTRAL_MODE:
+            async with self.lock:
+                self.active_consumers.append(consumer)
 
-        async with self.lock:
-            self.active_consumer = consumer
+            try:
+                await consumer.handle()
+            finally:
+                async with self.lock:
+                    if consumer in self.active_consumers:
+                        self.active_consumers.remove(consumer)
+        else:
+            # Standard mode: only one connection at a time
+            if self.active_consumer is not None:
+                await consumer.send_message(DeclineJobRequest())
+                await consumer.disconnect()
+                return
 
-            await self.active_consumer.handle()
+            async with self.lock:
+                self.active_consumer = consumer
 
-            self.active_consumer = None
+                await self.active_consumer.handle()
+
+                self.active_consumer = None
 
 
 validatorConsumerManager = ValidatorConsumerManger()
