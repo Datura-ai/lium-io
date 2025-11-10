@@ -1,4 +1,5 @@
 import asyncio
+import json
 import random
 from datetime import datetime
 import logging
@@ -86,7 +87,13 @@ class DockerService:
         internal_ports: list[int] | None = None,
         initial_port_count: int | None = None,
         enable_jupyter: bool | None = False,
+        pod_port_mapping: dict[int, int] | None = None,
+        executor_port_mapping: str | None = None,
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
+
+        if self._is_need_port_mapping(internal_ports, pod_port_mapping):
+            return self._use_port_mapping(pod_port_mapping, executor_port_mapping)
+
         available_ports = await self._get_available_ports(executor_id, miner_hotkey)
 
         if len(available_ports) < MIN_PORT_COUNT:
@@ -135,6 +142,43 @@ class DockerService:
                 jupyter_port_map = (mapping[0], mapping[2])
 
         return mappings, jupyter_port_map
+
+    def _is_need_port_mapping(self, internal_ports: list[int] | None, pod_port_mapping: dict[int, int] | None) -> bool:
+        """
+        returns True if pod_port_mapping exists.
+        BUT if internal_ports also exists and num of ports was changed - then False.
+        """
+        if not pod_port_mapping:
+            return False
+        if internal_ports and len(internal_ports) != len(pod_port_mapping):
+            # means we have a new port in the list of internal ports
+            return False
+        return True
+
+    def _use_port_mapping(self, pod_port_mapping: dict[int, int], executor_port_mapping: str | None) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
+        """
+        function, those reuse existing pod_port_mapping. Here just prepare answer in the right format with using executor_port_mapping if needed
+        pod_port_mapping has docker_port: external_port
+        executor_port_mapping is str of json, internal, external. RENTING_PORT_MAPPINGS="[[46681, 56681], [46682, 56682]]"
+        :return: list of docker ports(docker, internal, external) and jupyter ports.
+        """
+        docker_ports = []
+        external_to_internal_map = {}
+        if executor_port_mapping:
+            executor_port_mapping: list[tuple[int, int]] = json.loads(executor_port_mapping)
+            external_to_internal_map = {
+                external_port: internal_port
+                for internal_port, external_port in executor_port_mapping
+            }
+
+        jupyter_port_map = None
+        if 8888 in pod_port_mapping:
+            jupyter_port_map = (8888, pod_port_mapping[8888])
+
+        for docker_port, external_port in pod_port_mapping.items():
+            internal_port = external_to_internal_map.get(external_port, external_port)
+            docker_ports.append((docker_port, internal_port, external_port))
+        return docker_ports, jupyter_port_map
 
     def _find_mapping_by_docker_port(self, mappings: list[tuple[int, int, int]], docker_port: int) -> tuple[int, int, int] | None:
         """Find a port mapping by docker port number."""
@@ -617,9 +661,11 @@ class DockerService:
 
         try:
             custom_options = CustomOptions.sanitize(payload.custom_options)
+
             # generate port maps
             port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
+                payload.miner_hotkey, payload.executor_id, custom_options.internal_ports, custom_options.initial_port_count,
+                payload.enable_jupyter, custom_options.pod_port_mapping, executor_info.port_mappings
             )
 
             # Add profiler for port mappings generation

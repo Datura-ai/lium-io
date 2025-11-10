@@ -13,6 +13,7 @@ class CustomOptions(BaseModel):
     startup_commands: str | None = None
     shm_size: str | None = None
     initial_port_count: int | None = None
+    pod_port_mapping: dict[int, int] | None = None
 
     @classmethod
     def sanitize(cls, custom_options: 'CustomOptions | None') -> 'CustomOptions':
@@ -40,6 +41,7 @@ class CustomOptions(BaseModel):
             initial_port_count=custom_options.initial_port_count,
             startup_commands=custom_options.startup_commands,
             shm_size=shm_size,
+            pod_port_mapping=custom_options.pod_port_mapping,
         )
 
     @staticmethod
