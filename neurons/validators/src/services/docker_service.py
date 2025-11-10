@@ -1374,6 +1374,7 @@ class DockerService:
     ):
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_uuid": payload.executor_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,

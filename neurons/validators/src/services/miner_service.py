@@ -621,6 +621,7 @@ class MinerService:
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_id": payload.executor_id,
             "executor_ip": payload.miner_address,
             "executor_port": payload.miner_port,
@@ -642,7 +643,8 @@ class MinerService:
                 # generate ssh key and send it to miner
                 await miner_client.send_model(
                     GetPodLogsRequest(
-                        container_name=payload.container_name, 
+                        container_name=payload.container_name,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id, 
                         miner_hotkey=payload.miner_hotkey,
                     )
@@ -666,6 +668,7 @@ class MinerService:
                     )
                     return PodLogsResponseToServer(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         logs=msg.logs
@@ -680,6 +683,7 @@ class MinerService:
 
                     return FailedGetPodLogs(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         msg=str(log_text),
@@ -694,6 +698,7 @@ class MinerService:
 
                     return FailedGetPodLogs(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         msg=str(log_text),
