@@ -226,7 +226,13 @@ class ExecutorService:
                         executor.port,
                         json.dumps(response_obj),
                     )
-                    response_obj = {**response_obj, **executor.model_dump(mode="json"), "price": executor.price_per_hour}
+                    response_obj = {
+                        **response_obj,
+                        **executor.model_dump(mode="json"),
+                        "price": executor.price_per_hour,
+                        "uuid": str(executor.uuid),
+                        "port": int(executor.port),
+                    }
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(
