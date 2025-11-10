@@ -7,7 +7,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
-    from bittensor_wallet import bittensor_wallet
+    from bittensor import Wallet
 
 
 class Settings(BaseSettings):
@@ -68,11 +68,6 @@ class Settings(BaseSettings):
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
 
-    # Percentage of tasks to use new pipeline (0-100). Default 50 means 50% new, 50% old
-    NEW_PIPELINE_ROLLOUT_PERCENTAGE: int = Field(
-        env="NEW_PIPELINE_ROLLOUT_PERCENTAGE", default=100
-    )
-
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )
@@ -88,7 +83,7 @@ class Settings(BaseSettings):
         "NVIDIA B200"
     ]
 
-    def get_bittensor_wallet(self) -> "bittensor_wallet":
+    def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
         wallet = bittensor.wallet(
