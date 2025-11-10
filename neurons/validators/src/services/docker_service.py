@@ -435,47 +435,46 @@ class DockerService:
         log_tag: str,
     ):
         responses = []
-        try:
-            # install docker volume plugin
-            command = "/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
-            responses.append(await ssh_client.run(command))
+        # install docker volume plugin
+        command = "/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
+        responses.append(await ssh_client.run(command))
 
-            # disable volume plugin
-            command = "/usr/bin/docker plugin disable s3fs -f"
-            responses.append(await ssh_client.run(command))
+        # disable volume plugin
+        command = "/usr/bin/docker plugin disable s3fs -f"
+        responses.append(await ssh_client.run(command))
 
-            # set credentials
-            command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
-            responses.append(await ssh_client.run(command))
+        # set credentials
+        command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
+        responses.append(await ssh_client.run(command))
 
-            # set allow_other option
-            command = '/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
-            responses.append(await ssh_client.run(command))
+        # set allow_other option
+        command = '/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
+        responses.append(await ssh_client.run(command))
 
-            # enable volume plugin
-            command = "/usr/bin/docker plugin enable s3fs"
-            responses.append(await ssh_client.run(command))
+        # enable volume plugin
+        command = "/usr/bin/docker plugin enable s3fs"
+        responses.append(await ssh_client.run(command))
 
-            # create volume
-            command = f"/usr/bin/docker volume create -d s3fs {volume_info.name}"
-            result = await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Creating docker volume",
-                log_extra=log_extra,
-                raise_exception=True,
-            )
-            logger.info(_m("s3fs_volume success", extra=get_extra_info({**log_extra})))
-            return result
-        except Exception as e:
-            # prepare_responses_text exit_status, stdout, stderr
-            responses_text = str(e)
+        # create volume
+        command = f"/usr/bin/docker volume create -d s3fs {volume_info.name}"
+        result = await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Creating docker volume",
+            log_extra=log_extra,
+            raise_exception=False,
+        )
+        is_success, message = result
+        if not is_success:
+            responses_text = message
             for i, r in enumerate(responses):
                 responses_text += f"|Step {i}: exit={r.exit_status}, stdout={r.stdout}, stderr={r.stderr}"
+            logger.warning(_m(f"s3fs_volume failed. {responses_text}",extra=get_extra_info({**log_extra})))
+        else:
+            logger.info(_m("s3fs_volume success", extra=get_extra_info({**log_extra})))
 
-            logger.warning(_m(f"s3fs_volume failed. {responses_text}", extra=get_extra_info({**log_extra})))
-            return False, responses_text
+        return result
 
     async def disable_s3fs_volume_plugin(
         self,
