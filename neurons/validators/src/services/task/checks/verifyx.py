@@ -51,9 +51,10 @@ class VerifyXCheck:
                 {
                     "ram": sanitized.get("ram", updated_specs.get("ram")),
                     "hard_disk": sanitized.get("hard_disk", updated_specs.get("hard_disk")),
-                    "network": sanitized.get("network", updated_specs.get("network")),
                 }
             )
+
+            updated_specs["network"]["download_speed"] = sanitized["network"]["download_speed"]
 
             event = render_message(
                 Msg.VERIFY_SUCCESS,

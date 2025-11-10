@@ -253,23 +253,16 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
         errors.append(f"Integrity check failed for {download_result['pkg']}")
         success = False
 
-    speedtest = network_execution["speedtest"]
-    if speedtest["download_mbps"] <= 0.0 or speedtest["upload_mbps"] <= 0.0:
-        errors.append("Network performance data unavailable")
-        success = False
+    download_speed = network_execution["download"]["speed_mbps"]
 
-    download_speeds = [speedtest["download_mbps"], network_execution["download"]["speed_mbps"]]
-    average_download_speed = sum(download_speeds) / len(download_speeds)
-
-    if average_download_speed < NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
+    if download_speed < NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
         errors.append(
-            f"Network download speed inadequate: {average_download_speed:.2f} Mbps achieved, {NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+            f"Network download speed inadequate: {download_speed:.2f} Mbps achieved, {NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
         )
         success = False
 
     stats = {
-        "upload_speed": speedtest["upload_mbps"],
-        "download_speed": average_download_speed,
+        "download_speed": download_speed,
         "success": success,
         "execution_time_ms": network_execution["execution_time_ms"],
     }
