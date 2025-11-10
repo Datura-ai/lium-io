@@ -6,7 +6,8 @@ from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
-from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature
+from payloads.backend import ContainerUtilizationPayload
+from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature
 
 apis_router = APIRouter()
 
@@ -43,6 +44,17 @@ async def hardware_utilization(
     Returns:
         dict: Hardware utilization metrics including CPU, memory, storage, and GPU
     """
+    return get_system_metrics()
+
+
+@apis_router.post("/pods/{pod_id}/containers/{container_name}")
+async def container_hardware_utilization(
+    pod_id: str,
+    container_name: str,
+    payload: ContainerUtilizationPayload,
+    _: None = Depends(verify_container_signature)
+):
+    # duplicate get_system_metrics for now
     return get_system_metrics()
 
 

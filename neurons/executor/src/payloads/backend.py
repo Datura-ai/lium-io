@@ -14,3 +14,8 @@ class HardwareUtilizationPayload(SignaturePayload):
 class PingPayload(SignaturePayload):
     """Payload for ping endpoint with signature verification"""
     pass
+
+
+class ContainerUtilizationPayload(SignaturePayload):
+    """Payload for container hardware utilization endpoint with signature verification"""
+    gpu_uuids: list[str]

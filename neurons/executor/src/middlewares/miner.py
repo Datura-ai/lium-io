@@ -1,3 +1,4 @@
+import re
 import bittensor
 from fastapi.responses import JSONResponse
 from payloads.miner import MinerAuthPayload
@@ -17,6 +18,11 @@ class MinerMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         # Skip middleware for endpoints with their own signature verification
         if request.url.path in ["/hardware_utilization", "/ping"]:
+            return await call_next(request)
+        
+        # Skip for specific container hardware utilization endpoint
+        # Pattern: /pods/{pod_id}/containers/{container_name}
+        if re.match(r'^/pods/[^/]+/containers/[^/]+$', request.url.path):
             return await call_next(request)
             
         default_extra = {
