@@ -4,6 +4,11 @@ import json
 
 def get_logger(name: str):
     logger = logging.getLogger(name)
+
+    # Prevent duplicate handlers
+    if logger.hasHandlers():
+        return logger
+
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
         "Name: %(name)s | Time: %(asctime)s | Level: %(levelname)s | File: %(filename)s | Function: %(funcName)s | Line: %(lineno)s | Process: %(process)d | Message: %(message)s"
@@ -11,6 +16,7 @@ def get_logger(name: str):
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     return logger
 
 
