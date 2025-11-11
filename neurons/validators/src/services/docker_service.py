@@ -166,10 +166,10 @@ class DockerService:
         docker_ports = []
         external_to_internal_map = {}
         if executor_port_mapping:
-            executor_port_mapping: list[tuple[int, int]] = json.loads(executor_port_mapping)
+            parsed_port_mapping: list[tuple[int, int]] = json.loads(executor_port_mapping)
             external_to_internal_map = {
                 external_port: internal_port
-                for internal_port, external_port in executor_port_mapping
+                for internal_port, external_port in parsed_port_mapping
             }
 
         jupyter_port_map = None
