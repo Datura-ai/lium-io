@@ -92,6 +92,7 @@ class DockerService:
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
 
         if self._is_need_port_mapping(internal_ports, pod_port_mapping):
+            logger.info(f"use pod_port_mapping ({len(pod_port_mapping)}) for executor {executor_id}")
             return self._use_port_mapping(pod_port_mapping, executor_port_mapping)
 
         available_ports = await self._get_available_ports(executor_id, miner_hotkey)
