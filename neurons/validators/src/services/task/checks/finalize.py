@@ -9,9 +9,9 @@ from ..pipeline import CheckResult, Context
 class FinalizeCheck:
     """Aggregate pipeline results into the structured log + success flag.
 
-    This mirrors the tail of `create_task_old`, producing the user-facing log message and
-    translating score warnings into remediation guidance. Housing it in a dedicated check
-    makes the terminal behaviour explicit and easy to review.
+    This check produces the user-facing log message and translates score warnings into
+    remediation guidance. Housing it in a dedicated check makes the terminal behaviour
+    explicit and easy to review.
     """
 
     check_id = "pipeline.finalize"
