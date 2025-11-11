@@ -47,7 +47,7 @@ async def get_executors_for_validator(
     """
     try:
         miner_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
-        executors = executor_service.get_executors_for_validator(authenticated_validator, miner_hotkey)
+        executors = await executor_service.get_executors_for_validator(authenticated_validator, miner_hotkey)
     except Exception as e:
         logger.error(
             "Failed to retrieve executors for validator %s: %s",
