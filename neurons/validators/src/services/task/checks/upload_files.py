@@ -10,8 +10,8 @@ from ..pipeline import CheckResult, Context
 class UploadFilesCheck:
     """Push encrypted validation assets to the executor before any remote commands run.
 
-    Legacy `create_task_old` failed immediately if staging failed; keeping this guard up
-    front guarantees all later checks operate on freshly uploaded scripts and secrets.
+    This check uploads the encrypted validation scripts and secrets to the executor before
+    any remote commands run, ensuring all later checks operate on freshly uploaded files.
     """
 
     check_id = "prep.upload_validation_files"

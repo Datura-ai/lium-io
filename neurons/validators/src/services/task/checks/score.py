@@ -7,9 +7,9 @@ from ..pipeline import CheckResult, Context
 class ScoreCheck:
     """Convert pipeline context into the same actual/job score pair as the legacy flow.
 
-    By isolating `calc_scores` here we make the business logic transparent and keep the
-    final scoring tweaks (collateral, port count, rentals) reviewable without digging
-    through `_handle_task_result`.
+    The score calculation logic lives in task.score_calculator and is accessible via
+    ctx.services.score_calculator. This check applies that logic to determine the final
+    scores while keeping the business rules transparent and reviewable.
     """
 
     check_id = "gpu.validate.score"
