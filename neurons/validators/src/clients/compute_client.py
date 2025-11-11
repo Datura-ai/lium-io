@@ -278,6 +278,7 @@ class ComputeClient:
                             executor_port=data["executor_port"],
                             executor_ssh_port=data["executor_ssh_port"],
                             executor_price=data["executor_price"],
+                            price_per_gpu=data["price_per_gpu"],
                             collateral_deposited=data["collateral_deposited"],
                             ssh_pub_keys=data["ssh_pub_keys"],
                         )
@@ -580,7 +581,8 @@ class ComputeClient:
             return
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
-        return self.subtensor_client.get_miner(hotkey).axon_info
+        miner = await self.subtensor_client.get_miner(hotkey)
+        return miner.axon_info
 
     async def miner_driver(
         self,

@@ -520,13 +520,13 @@ class CliService:
                     "address": executor.address,
                     "port": executor.port,
                     "validator": executor.validator,
-                    "price_per_hour": executor.price_per_hour
+                    "price_per_hour": executor.price_per_hour,
+                    "price_per_gpu": executor.price_per_gpu
                 }
                 for executor in executors
             ]
             for ex in result:
-                price_info = f" (Price: {ex['price_per_hour']} USD/hour)" if ex['price_per_hour'] is not None else " (No price set)"
-                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> {ex['validator']}{price_info}")
+                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> validator: {ex['validator']}, price_per_gpu (USD/gpu/h): {ex['price_per_gpu']}, price_per_hour (USD/h) (will be deprecated soon): {ex['price_per_hour']} ")
             return True
         except Exception as e:
             self.logger.error("Failed in showing an executor: %s", str(e))
@@ -575,18 +575,35 @@ class CliService:
             return False
 
     @require_executor_dao
-    async def update_executor_price(self, address: str, port: int, price_per_hour: float):
+    async def update_executor_price(
+        self,
+        address: str,
+        port: int,
+        *,
+        price_per_hour: float | None = None,
+        price_per_gpu: float | None = None,
+    ) -> bool:
         """
         Update the price per hour for an executor by address and port.
         :param address: Executor IP address
         :param port: Executor port
         :param price_per_hour: New price per hour in USD
+        :param price_per_gpu: New price per GPU in USD
         :return: True if successful, False otherwise
         """
         try:
-            payload = {'price_per_hour': price_per_hour}
+            if price_per_hour is not None and price_per_gpu is not None:
+                self.logger.error("❌ Cannot update both price per hour and price per GPU at the same time.")
+                return False
+            if price_per_hour is not None:
+                payload = {'price_per_hour': price_per_hour}
+            elif price_per_gpu is not None:
+                payload = {'price_per_gpu': price_per_gpu}
+            else:
+                self.logger.error("❌ No price provided to update.")
+                return False
             self.executor_dao.update(address, port, payload)
-            self.logger.info(f"✅ Successfully updated price for executor {address}:{port} to {price_per_hour} USD/hour")
+            self.logger.info(f"✅ Successfully updated price for executor {address}:{port} to {price_per_hour or price_per_gpu} USD/hour")
             return True
         except Exception as e:
             self.logger.error(f"Failed to update executor price: %s", str(e))

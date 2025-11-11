@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 from typing import Annotated, Optional, Union
+from uuid import UUID
 
 import aiohttp
 import bittensor
@@ -68,7 +69,8 @@ class ExecutorService:
                 validator=payload.executor.validator,
                 address=payload.executor.address,
                 port=payload.executor.port,
-                price_per_hour=payload.executor.price_per_hour
+                price_per_hour=payload.executor.price_per_hour,
+                price_per_gpu=payload.executor.price_per_gpu,
             )
             self.executor_dao.update_by_uuid(executor.uuid, executor)
 
@@ -105,7 +107,8 @@ class ExecutorService:
                     executor.validator = executor_payload.validator
                     executor.address = executor_payload.address
                     executor.port = executor_payload.port
-                    executor.price_per_hour = executor_payload.price_per_hour
+                    executor.price_per_hour = executor_payload.price_per_hour or executor.price_per_hour
+                    executor.price_per_gpu = executor_payload.price_per_gpu or executor.price_per_gpu
                     self.executor_dao.update_by_uuid(executor.uuid, executor)
                     logger.info("Updated executor (id=%s)", str(executor.uuid))
                 else:
@@ -116,7 +119,8 @@ class ExecutorService:
                             validator=executor_payload.validator,
                             address=executor_payload.address,
                             port=executor_payload.port,
-                            price_per_hour=executor_payload.price_per_hour
+                            price_per_hour=executor_payload.price_per_hour,
+                            price_per_gpu=executor_payload.price_per_gpu,
                         )
                     )
 
@@ -146,8 +150,49 @@ class ExecutorService:
                 error=str(log_text),
             )
 
-    def get_executors_for_validator(self, validator_hotkey: str, executor_id: Optional[str] = None)  -> list[Executor]:
-        return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
+    async def get_executors_for_validator(self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None)  -> list[Executor]:
+        # Standard mode: use local DB, in Standard mode
+        if not settings.CENTRAL_MODE:
+            return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
+
+        # Central mode: fetch from portal
+        from clients.miner_portal_api import MinerPortalAPI
+
+        # Properly await the async HTTP call
+        data = await MinerPortalAPI.fetch_executors(miner_hotkey, executor_id)
+        logger.info(
+            _m(
+                "Fetched executors from portal",
+                extra=get_extra_info({"miner_hotkey": miner_hotkey, "executor_id": executor_id, "data": data}),
+            ),
+        )
+
+        # Expected fields per executor from portal: uuid, validator, address, port, price_per_hour
+        result: list[Executor] = []
+        for item in data:
+            try:
+                if item.get("validator_hotkey") != validator_hotkey:
+                    continue
+
+                result.append(
+                    Executor(
+                        uuid=UUID(item.get("id")),
+                        validator=item.get("validator_hotkey"),
+                        address=item.get("executor_ip_address"),
+                        port=int(item.get("executor_ip_port")),
+                        price_per_hour=item.get("price_per_hour"),
+                        price_per_gpu=item.get("price_per_gpu"),
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    _m(
+                        "Failed to parse executor from portal",
+                        extra=get_extra_info({"error": str(e), "item": str(item)}),
+                    )
+                )
+
+        return result
 
     async def send_pubkey_to_executor(
         self, executor: Executor, pubkey: str
@@ -182,10 +227,11 @@ class ExecutorService:
                         executor.port,
                         json.dumps(response_obj),
                     )
-                    response_obj["uuid"] = str(executor.uuid)
-                    response_obj["address"] = executor.address
-                    response_obj["port"] = executor.port
-                    response_obj["price"] = executor.price_per_hour
+                    response_obj = {
+                        **response_obj,
+                        **executor.model_dump(mode="json"),
+                        "price": executor.price_per_hour,
+                    }
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(
@@ -217,7 +263,7 @@ class ExecutorService:
                     "API request failed to register SSH key. url=%s, error=%s", url, str(e)
                 )
 
-    async def register_pubkey(self, validator_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
+    async def register_pubkey(self, validator_hotkey: str, miner_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
         """Register pubkeys to executors for given validator.
 
         Args:
@@ -227,12 +273,13 @@ class ExecutorService:
         Return:
             List[dict/object]: Executors SSH connection infos that accepted validator pubkey.
         """
+        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
             asyncio.create_task(
                 self.send_pubkey_to_executor(executor, pubkey.decode("utf-8")),
                 name=f"{executor}.send_pubkey_to_executor",
             )
-            for executor in self.get_executors_for_validator(validator_hotkey, executor_id)
+            for executor in executors
         ]
 
         total_executors = len(tasks)
@@ -246,26 +293,27 @@ class ExecutorService:
         )
         return results
 
-    async def deregister_pubkey(self, validator_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
+    async def deregister_pubkey(self, validator_hotkey: str, miner_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
         """Deregister pubkey from executors.
 
         Args:
             validator_hotkey (str): Validator hotkey
             pubkey (bytes): validator pubkey
         """
+        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
             asyncio.create_task(
                 self.remove_pubkey_from_executor(executor, pubkey.decode("utf-8")),
                 name=f"{executor}.remove_pubkey_from_executor",
             )
-            for executor in self.get_executors_for_validator(validator_hotkey, executor_id)
+            for executor in executors
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_pod_logs(
-        self, validator_hotkey: str, executor_id: str, container_name: str
+        self, validator_hotkey: str, miner_hotkey: str, executor_id: str, container_name: str
     ) -> list[PodLog]:
-        executors = self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
+        executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         if len(executors) == 0:
             raise Exception('[get_pod_logs] Error: not found executor')
 

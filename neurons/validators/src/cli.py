@@ -127,7 +127,7 @@ def request_job_to_miner(miner_hotkey: str):
 async def _request_job_to_miner(miner_hotkey: str):
     try:
         subtensor_client = await SubtensorClient.initialize()
-        miner = subtensor_client.get_miner(miner_hotkey)
+        miner = await subtensor_client.get_miner(miner_hotkey)
         if not miner:
             raise ValueError(f"Miner with hotkey {miner_hotkey} not found")
 
@@ -165,7 +165,7 @@ async def _debug_validator(count: int):
 
     # fetch miners
     subtensor_client = SubtensorClient.get_instance()
-    miners = subtensor_client.get_miners()
+    miners = await subtensor_client.get_miners()
 
     miner_service: MinerService = ioc["MinerService"]
     file_encrypt_service: FileEncryptService = ioc["FileEncryptService"]
@@ -280,7 +280,7 @@ def create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image:
 async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, enable_jupyter: bool):
     try:
         subtensor_client = await SubtensorClient.initialize()
-        miner = subtensor_client.get_miner(miner_hotkey)
+        miner = await subtensor_client.get_miner(miner_hotkey)
 
         miner_service: MinerService = ioc["MinerService"]
 
@@ -312,7 +312,7 @@ def delete_pod(miner_hotkey: str, executor_id: str, container_name: str, volume_
 async def _delete_pod(miner_hotkey: str, executor_id: str, container_name: str, volume_name: str):
     try:
         subtensor_client = await SubtensorClient.initialize()
-        miner = subtensor_client.get_miner(miner_hotkey)
+        miner = await subtensor_client.get_miner(miner_hotkey)
 
         miner_service: MinerService = ioc["MinerService"]
 
@@ -343,7 +343,7 @@ def install_jupyter_server(miner_hotkey: str, executor_id: str, container_name: 
 async def _install_jupyter_server(miner_hotkey: str, executor_id: str, container_name: str, jupyter_port: int):
     try:
         subtensor_client = await SubtensorClient.initialize()
-        miner = subtensor_client.get_miner(miner_hotkey)
+        miner = await subtensor_client.get_miner(miner_hotkey)
 
         miner_service: MinerService = ioc["MinerService"]
 
@@ -373,7 +373,7 @@ def create_custom_container_to_miner(miner_hotkey: str, executor_id: str, docker
 async def _create_custom_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
     try:
         subtensor_client = await SubtensorClient.initialize()
-        miner = subtensor_client.get_miner(miner_hotkey)
+        miner = await subtensor_client.get_miner(miner_hotkey)
 
         miner_service: MinerService = ioc["MinerService"]
         # mock custom options
@@ -412,7 +412,7 @@ def add_sshkey_to_container(miner_hotkey: str, executor_id: str, container_name:
 async def _add_sshkey_to_container(miner_hotkey: str, executor_id: str, container_name: str, user_public_key: str):
     try:
         subtensor_client = await SubtensorClient.initialize()
-        miner = subtensor_client.get_miner(miner_hotkey)
+        miner = await subtensor_client.get_miner(miner_hotkey)
 
         miner_service: MinerService = ioc["MinerService"]
 
@@ -442,7 +442,7 @@ def get_pod_logs(miner_hotkey: str, executor_id: str, container_name: str):
 async def _get_pod_logs(miner_hotkey: str, executor_id: str, container_name: str):
     try:
         subtensor_client = await SubtensorClient.initialize()
-        miner = subtensor_client.get_miner(miner_hotkey)
+        miner = await subtensor_client.get_miner(miner_hotkey)
 
         miner_service: MinerService = ioc["MinerService"]
 
@@ -471,7 +471,7 @@ def add_debug_ssh_key(miner_hotkey: str, executor_id: str, public_key: str):
 async def _add_debug_ssh_key(miner_hotkey: str, executor_id: str, public_key: str):
     try:
         subtensor_client = await SubtensorClient.initialize()
-        miner = subtensor_client.get_miner(miner_hotkey)
+        miner = await subtensor_client.get_miner(miner_hotkey)
 
         miner_service: MinerService = ioc["MinerService"]
 
