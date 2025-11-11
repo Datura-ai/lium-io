@@ -232,7 +232,7 @@ class SubtensorClient:
             )
             # Update miners in `miners` list based on miners_with_opt_in_status.
             hotkey_to_opt_in = {
-                opt_in["miner_hotkey"]: opt_in for opt_in in miners_with_opt_in_status
+                opt_in["miner_hotkey"]: opt_in for opt_in in miners_with_opt_in_status if opt_in.get("miner_hotkey", None)
             }
             for miner in miners:
                 opt_in = hotkey_to_opt_in.get(miner.hotkey)
