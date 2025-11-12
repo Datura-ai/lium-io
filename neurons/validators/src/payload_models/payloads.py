@@ -194,12 +194,16 @@ class ContainerRequestType(enum.Enum):
     InstallJupyterServer = "InstallJupyterServer"
 
 
-class ContainerBaseRequest(BaseRequest):
+class BaseServerRequest(BaseRequest):
     message_type: ContainerRequestType
     miner_hotkey: str
     miner_address: str | None = None
     miner_port: int | None = None
     executor_id: str
+
+
+class ContainerBaseRequest(BaseServerRequest):
+    pod_id: str
 
 
 class ExternalVolumeInfo(BaseModel):
@@ -247,7 +251,7 @@ class RemoveSshPublicKeysRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
 
 
-class AddDebugSshKeyRequest(ContainerBaseRequest):
+class AddDebugSshKeyRequest(BaseServerRequest):
     message_type: ContainerRequestType = ContainerRequestType.AddDebugSshKeyRequest
     public_key: str
 
@@ -319,11 +323,14 @@ class ContainerResponseType(enum.Enum):
     JupyterInstallationFailed = "JupyterInstallationFailed"
 
 
-class ContainerBaseResponse(BaseRequest):
+class BaseValidatorResponse(BaseRequest):
     message_type: ContainerResponseType
     miner_hotkey: str
     executor_id: str
 
+
+class ContainerBaseResponse(BaseValidatorResponse):
+    pod_id: str
 
 class ContainerCreated(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
@@ -355,11 +362,12 @@ class SshPubKeyAdded(ContainerBaseResponse):
     user_public_keys: list[str] = []
 
 
-class SshPubKeyRemoved(SshPubKeyAdded):
+class SshPubKeyRemoved(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyRemoved
+    user_public_keys: list[str] = []
 
 
-class DebugSshKeyAdded(ContainerBaseResponse):
+class DebugSshKeyAdded(BaseValidatorResponse):
     message_type: ContainerResponseType = ContainerResponseType.DebugSshKeyAdded
     address: str
     port: int
@@ -413,7 +421,7 @@ class FailedGetPodLogs(ContainerBaseResponse):
     msg: str
 
 
-class FailedAddDebugSshKey(ContainerBaseResponse):
+class FailedAddDebugSshKey(BaseValidatorResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedAddDebugSshKey
     msg: str
 
