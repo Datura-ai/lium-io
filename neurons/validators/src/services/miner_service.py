@@ -234,11 +234,13 @@ class MinerService:
         default_extra = {
             "miner_hotkey": miner_hotkey,
         }
+        if not results:
+            return
 
         logger.info(
             _m(
                 "Publishing machine specs to compute app connector process",
-                extra=get_extra_info({**default_extra, "results": len(results)}),
+                extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
             ),
         )
         for result in results:

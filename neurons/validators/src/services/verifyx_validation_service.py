@@ -116,7 +116,7 @@ class VerifyXValidationService:
             executor_checksum = await self._get_executor_checksum(shell)
 
             if local_checksum != executor_checksum:
-                return VerifyXResponse(error="executor not using latest VerifyX library (checksum verification failed)")
+                return VerifyXResponse(error="Executor using outdated VerifyX library. Run docker compose restart to update to the latest executor image")
 
             gpu_details = machine_spec.get("gpu", {}).get("details", [])
             gpu_count = machine_spec.get("gpu", {}).get("count", 0)
