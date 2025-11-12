@@ -116,7 +116,7 @@ class MachineSpecScrapeCheck:
                 what={
                     "gpu_count": gpu_count,
                     "gpu_model": gpu_model,
-                    "specs": specs,
+                    "network": specs.get("network"),
                 },
                 extra=extra_info,
             )
