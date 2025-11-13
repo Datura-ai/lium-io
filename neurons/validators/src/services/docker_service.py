@@ -587,6 +587,7 @@ class DockerService:
 
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_uuid": payload.executor_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
@@ -639,6 +640,7 @@ class DockerService:
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
@@ -659,6 +661,7 @@ class DockerService:
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoJupyterPortMapping,
@@ -674,6 +677,7 @@ class DockerService:
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -967,6 +971,7 @@ class DockerService:
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     container_name=container_name,
                     volume_name=local_volume,
                     port_maps=[
@@ -990,6 +995,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1091,6 +1097,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1157,6 +1164,7 @@ class DockerService:
                 return ContainerDeleted(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                 )
         except Exception as e:
             log_text = _m(
@@ -1168,6 +1176,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1183,6 +1192,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1237,6 +1247,7 @@ class DockerService:
                 return JupyterServerInstalled(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     jupyter_url=f"http://{executor_info.address}:{payload.jupyter_port_map[1]}/lab?token={jupyter_token}",
                 )
         except Exception as e:
@@ -1249,6 +1260,7 @@ class DockerService:
             return JupyterInstallationFailed(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
             )
 
@@ -1262,6 +1274,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1300,6 +1313,7 @@ class DockerService:
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -1336,6 +1350,7 @@ class DockerService:
                 return SshPubKeyRemoved(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -1348,6 +1363,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1362,6 +1378,7 @@ class DockerService:
     ):
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_uuid": payload.executor_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
@@ -1401,6 +1418,7 @@ class DockerService:
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -1423,6 +1441,7 @@ class DockerService:
                 return SshPubKeyAdded(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -1435,6 +1454,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,

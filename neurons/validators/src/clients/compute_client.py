@@ -263,6 +263,19 @@ class ComputeClient:
                     )
 
                     if channel == MACHINE_SPEC_CHANNEL:
+                        logger.info(
+                            _m(
+                                "Received machine specs from redis",
+                                extra=get_extra_info({
+                                    **self.logging_extra,
+                                    "job_batch_id": data['job_batch_id'],
+                                    "miner_hotkey": data["miner_hotkey"],
+                                    "executor_uuid": data["executor_uuid"],
+                                    "actual_score": data["score"],
+                                    "synthetic_job_score": data["synthetic_job_score"],
+                                }),
+                            )
+                        )
                         specs = ExecutorSpecRequest(
                             specs=data["specs"],
                             score=data["score"],

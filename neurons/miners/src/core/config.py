@@ -7,7 +7,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
-    from bittensor_wallet import bittensor_wallet
+    from bittensor import Wallet
 
 
 class Settings(BaseSettings):
@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default="5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1")
     CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)
 
-    def get_bittensor_wallet(self) -> "bittensor_wallet":
+    def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
         wallet = bittensor.wallet(
