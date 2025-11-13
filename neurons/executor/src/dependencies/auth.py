@@ -1,5 +1,6 @@
 from fastapi import HTTPException
 import bittensor
+import json
 from core.config import settings
 from core.logger import get_logger
 from payloads.backend import SignaturePayload, HardwareUtilizationPayload, PingPayload, ContainerUtilizationPayload
@@ -60,5 +61,9 @@ async def verify_ping_signature(payload: PingPayload):
 
 
 async def verify_container_signature(payload: ContainerUtilizationPayload):
-    FIXED_MESSAGE = "container_utilization_request"
-    await verify_signature(payload, FIXED_MESSAGE)
+    signing_data  = {
+        "gpu_uuids": payload.gpu_uuids,
+        "timestamp": payload.timestamp,
+    }
+    message = json.dumps(signing_data, sort_keys=True)
+    await verify_signature(payload, message)

@@ -19,3 +19,4 @@ class PingPayload(SignaturePayload):
 class ContainerUtilizationPayload(SignaturePayload):
     """Payload for container hardware utilization endpoint with signature verification"""
     gpu_uuids: list[str]
+    timestamp: int
