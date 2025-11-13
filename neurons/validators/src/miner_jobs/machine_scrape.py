@@ -950,7 +950,7 @@ def get_machine_specs():
         data["data_ram"] = {
             "ram_total": mem.total / 1024,  # in kB
             "ram_free": mem.free / 1024,
-            "ram_used": mem.free / 1024,
+            "ram_used": mem.used / 1024,
             "ram_available": mem.available / 1024,
             "ram_utilization": mem.percent
         }
