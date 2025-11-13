@@ -1,6 +1,6 @@
 import pytest
 
-from tests.helpers import make_context
+from .helpers import make_context
 
 
 @pytest.fixture

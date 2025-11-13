@@ -77,6 +77,9 @@ class Settings(BaseSettings):
             "info": "3rd version: Fixed 'ExecutorNotOwned' error",
         },
     }
+    FEATURE_FLAGS: dict[str, bool] = {
+        "verifyx_network_validation": False,
+    }
 
     # GPU types that will be excluded in collateral checks
     COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [

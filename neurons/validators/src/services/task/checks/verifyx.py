@@ -43,6 +43,11 @@ class VerifyXCheck:
             machine_spec=specs,
         )
 
+        errors = None
+        if result.data:
+            errors = result.data.get("errors")
+        errors = errors or result.error
+
         if result.data and result.data.get("success"):
             base_specs = ctx.state.specs
             sanitized = _to_iso(result.data)
@@ -65,6 +70,9 @@ class VerifyXCheck:
                 check_id=self.check_id,
                 what={"verifyx_success": True},
             )
+            if errors:
+                event.what_we_saw["errors"] = errors
+
             updated_state = replace(ctx.state, specs=updated_specs)
 
             return CheckResult(
@@ -75,10 +83,7 @@ class VerifyXCheck:
                 },
             )
 
-        errors = None
-        if result.data:
-            errors = result.data.get("errors")
-        errors = errors or result.error or "Unknown errors"
+        errors = errors or "Unknown errors"
 
         event = render_message(
             Msg.VERIFY_FAILED,
