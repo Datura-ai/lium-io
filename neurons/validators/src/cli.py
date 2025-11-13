@@ -273,11 +273,12 @@ async def _debug_validator(count: int):
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--docker_image", prompt="Docker Image", help="Docker Image")
 @click.option("--enable-jupyter", is_flag=True, default=False, help="Enable Jupyter (default: False)")
-def create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, enable_jupyter: bool = False):
-    asyncio.run(_create_container_to_miner(miner_hotkey, executor_id, docker_image, enable_jupyter))
+@click.option("--gpu_uuid", type=str, prompt="GPU UUID  ", help="GPU UUIDs")
+def create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, enable_jupyter: bool = False, gpu_uuid: str = None):
+    asyncio.run(_create_container_to_miner(miner_hotkey, executor_id, docker_image, enable_jupyter, gpu_uuid))
 
 
-async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, enable_jupyter: bool):
+async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, enable_jupyter: bool, gpu_uuid: str):
     try:
         subtensor_client = await SubtensorClient.initialize()
         miner = await subtensor_client.get_miner(miner_hotkey)
@@ -287,6 +288,9 @@ async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker
         payload = ContainerCreateRequest(
             docker_image=docker_image,
             user_public_keys=["user_public_key"],
+            gpu_uuids=[gpu_uuid],
+            cpu_count=2,
+            memory="5g",
             executor_id=executor_id,
             pod_id="pod_id",
             miner_hotkey=miner_hotkey,
@@ -369,11 +373,12 @@ async def _install_jupyter_server(miner_hotkey: str, executor_id: str, container
 @click.option("--miner_hotkey", prompt="Miner Hotkey", help="Hotkey of Miner")
 @click.option("--executor_id", prompt="Executor Id", help="Executor Id")
 @click.option("--docker_image", prompt="Docker Image", help="Docker Image")
-def create_custom_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
-    asyncio.run(_create_custom_container_to_miner(miner_hotkey, executor_id, docker_image))
+@click.option("--gpu_uuid", type=str, prompt="GPU UUID  ", help="GPU UUIDs")
+def create_custom_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, gpu_uuid: str):
+    asyncio.run(_create_custom_container_to_miner(miner_hotkey, executor_id, docker_image, gpu_uuid))
 
 
-async def _create_custom_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str):
+async def _create_custom_container_to_miner(miner_hotkey: str, executor_id: str, docker_image: str, gpu_uuid: str):
     try:
         subtensor_client = await SubtensorClient.initialize()
         miner = await subtensor_client.get_miner(miner_hotkey)
@@ -390,6 +395,9 @@ async def _create_custom_container_to_miner(miner_hotkey: str, executor_id: str,
         payload = ContainerCreateRequest(
             docker_image=docker_image,
             pod_id="pod_id",
+            gpu_uuids=[gpu_uuid],
+            cpu_count=2,
+            memory="5g",
             user_public_keys=["user_public_key"],
             executor_id=executor_id,
             miner_hotkey=miner_hotkey,

@@ -822,6 +822,17 @@ class DockerService:
                     "--device /dev/net/tun "
                 )
 
+                # GPU restriction flags
+                if payload.gpu_uuids:
+                    gpu_devices = ",".join(payload.gpu_uuids)
+                    gpu_flags = f'--gpus "device={gpu_devices}" '
+                else:
+                    gpu_flags = "--gpus all "
+
+                # CPU and memory restriction flags
+                cpu_flags = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
+                memory_flags = f"--memory {payload.memory} " if payload.memory else ""
+
                 command = (
                     f'/usr/bin/docker run -d '
                     f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
@@ -831,7 +842,9 @@ class DockerService:
                     f'{entrypoint_flag} '
                     f'{env_flags} '
                     f'{shm_size_flag} '
-                    f'--gpus all '
+                    f'{gpu_flags}'  # GPU restriction flags
+                    f'{cpu_flags}'  # CPU restriction flags
+                    f'{memory_flags}'  # Memory restriction flags
                     f'--restart unless-stopped '
                     f'--name {container_name} '
                     f'{payload.docker_image} '
