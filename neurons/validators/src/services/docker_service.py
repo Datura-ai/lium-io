@@ -217,14 +217,7 @@ class DockerService:
             ),
         )
 
-        async with self.lock:
-            self.logs_queue.append(
-                {
-                    "log_text": log_text,
-                    "log_status": "success",
-                    "log_tag": log_tag,
-                }
-            )
+        await self.stream_log(log_text, "success", log_tag)
 
         status = True
         error = ''
@@ -237,14 +230,7 @@ class DockerService:
         except asyncio.TimeoutError:
             status = False
             error = "Process timed out"
-            async with self.lock:
-                self.logs_queue.append(
-                    {
-                        "log_text": error,
-                        "log_status": "error",
-                        "log_tag": log_tag,
-                    }
-                )
+            await self.stream_log(error, "error", log_tag)
 
         if not status and raise_exception:
             raise Exception(f"Failed {log_text}. command: {command} error: {error}")
@@ -256,26 +242,13 @@ class DockerService:
         error = ''
 
         async for line in process.stdout:
-            async with self.lock:
-                self.logs_queue.append(
-                    {
-                        "log_text": line.strip(),
-                        "log_status": "success",
-                        "log_tag": log_tag,
-                    }
-                )
+            await self.stream_log(line.strip(), "success", log_tag)
 
         async for line in process.stderr:
             async with self.lock:
                 status = False
                 error += line.strip() + "\n"
-                self.logs_queue.append(
-                    {
-                        "log_text": line.strip(),
-                        "log_status": "error",
-                        "log_tag": log_tag,
-                    }
-                )
+            await self.stream_log(line.strip(), "error", log_tag)
 
         return status, error
 
@@ -896,14 +869,7 @@ class DockerService:
                     ),
                 )
 
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": "Created Docker Container",
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
-                    )
+                await self.stream_log("Created Docker Container", "success", log_tag)
 
                 # skip installing ssh service for daturaai images
                 # if payload.docker_image.startswith("daturaai/"):
