@@ -328,16 +328,17 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
+        pod_name: str,
         sleep: int = 0,
         clear_volume: bool = True
     ):
-        command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
+        command = f'/usr/bin/docker ps -a --format "{{.Names}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
             # wait until the docker connection check is finished.
             await asyncio.sleep(sleep)
 
-            container_names = " ".join(result.stdout.strip().split("\n"))
+            container_names = " ".join([container for container in result.stdout.strip().split("\n") if pod_name in container or 'container_' in container])
 
             logger.info(
                 _m(
@@ -765,11 +766,12 @@ class DockerService:
                     else ""
                 )
 
-                uuid = uuid4()
+                container_name = f"pod_{payload.pod_id}"
 
                 await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
+                    pod_name=container_name,
                     sleep=10,
                     clear_volume=False if local_volume else True,
                 )
@@ -780,7 +782,7 @@ class DockerService:
 
                 if not local_volume:
                     # create docker volume
-                    local_volume = f"volume_{uuid}"
+                    local_volume = f"volume_{payload.pod_id}"
                     command = f"/usr/bin/docker volume create {local_volume}"
                     await self.execute_and_stream_logs(
                         ssh_client=ssh_client,
@@ -812,8 +814,6 @@ class DockerService:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
                         profilers.append({"name": "Docker volume creation step failed", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
-
-                container_name = f"container_{uuid}"
 
                 # Network permission flags (permission to create a network interface inside the container)
                 net_perm_flags = (
@@ -867,7 +867,7 @@ class DockerService:
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
-                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra, pod_name=container_name)
                     raise Exception("Run docker run command but container is not running")
 
                 # Add profiler for docker container creation
