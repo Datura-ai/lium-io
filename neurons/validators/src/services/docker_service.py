@@ -245,9 +245,8 @@ class DockerService:
             await self.stream_log(line.strip(), "success", log_tag)
 
         async for line in process.stderr:
-            async with self.lock:
-                status = False
-                error += line.strip() + "\n"
+            status = False
+            error += line.strip() + "\n"
             await self.stream_log(line.strip(), "error", log_tag)
 
         return status, error
