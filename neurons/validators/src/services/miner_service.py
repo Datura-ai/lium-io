@@ -234,11 +234,13 @@ class MinerService:
         default_extra = {
             "miner_hotkey": miner_hotkey,
         }
+        if not results:
+            return
 
         logger.info(
             _m(
                 "Publishing machine specs to compute app connector process",
-                extra=get_extra_info({**default_extra, "results": len(results)}),
+                extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
             ),
         )
         for result in results:
@@ -280,6 +282,7 @@ class MinerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=error_code,
@@ -289,6 +292,7 @@ class MinerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=error_code,
@@ -297,6 +301,7 @@ class MinerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=error_code,
@@ -305,12 +310,14 @@ class MinerService:
             return JupyterInstallationFailed(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
             )
         else:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.UnknownRequest,
                 error_code=error_code,
@@ -322,6 +329,7 @@ class MinerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_id": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip": payload.miner_address,
             "executor_port": payload.miner_port,
             "container_request_type": str(payload.message_type),
@@ -615,6 +623,7 @@ class MinerService:
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_id": payload.executor_id,
             "executor_ip": payload.miner_address,
             "executor_port": payload.miner_port,
@@ -636,7 +645,8 @@ class MinerService:
                 # generate ssh key and send it to miner
                 await miner_client.send_model(
                     GetPodLogsRequest(
-                        container_name=payload.container_name, 
+                        container_name=payload.container_name,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id, 
                         miner_hotkey=payload.miner_hotkey,
                     )
@@ -660,6 +670,7 @@ class MinerService:
                     )
                     return PodLogsResponseToServer(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         logs=msg.logs
@@ -674,6 +685,7 @@ class MinerService:
 
                     return FailedGetPodLogs(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         msg=str(log_text),
@@ -688,6 +700,7 @@ class MinerService:
 
                     return FailedGetPodLogs(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         msg=str(log_text),

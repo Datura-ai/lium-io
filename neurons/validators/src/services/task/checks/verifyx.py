@@ -54,7 +54,10 @@ class VerifyXCheck:
                 }
             )
 
-            updated_specs["network"]["download_speed"] = sanitized["network"]["download_speed"]
+            if "network" in sanitized and "download_speed" in sanitized["network"]:
+                if "network" not in updated_specs:
+                    updated_specs["network"] = {}
+                updated_specs["network"]["download_speed"] = sanitized["network"]["download_speed"]
 
             event = render_message(
                 Msg.VERIFY_SUCCESS,
