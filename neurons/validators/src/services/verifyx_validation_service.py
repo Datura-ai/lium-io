@@ -6,7 +6,7 @@ import os
 import logging
 from typing import Dict, Any, Optional, Tuple, List
 
-from core.config import settings
+from core.config import settings, FeatureFlag
 from core.utils import _m, get_extra_info
 
 from services.const import (
@@ -303,10 +303,17 @@ def _perform_verification_checks(payload: dict) -> Dict[str, Any]:
     storage_stats, storage_errors = _verify_speed_test(challenge_data, response_data)
     all_errors = network_errors + memory_errors + storage_errors
 
-    success = memory_stats["success"] and storage_stats["success"]
+    # Determine which checks are required
+    required_checks = [
+        memory_stats["success"],
+        storage_stats["success"],
+    ]
 
-    if settings.FEATURE_FLAGS["verifyx_network_validation"]:
-        success = success and network_stats["success"]
+    # Conditionally include network validation based on feature flag
+    if settings.FEATURE_FLAGS.get(FeatureFlag.VERIFYX_NETWORK_VALIDATION, False):
+        required_checks.append(network_stats["success"])
+
+    success = all(required_checks)
 
     return {
         "success": success,

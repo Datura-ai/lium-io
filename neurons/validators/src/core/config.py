@@ -1,5 +1,6 @@
 import argparse
 import pathlib
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import bittensor
@@ -8,6 +9,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
     from bittensor import Wallet
+
+
+class FeatureFlag(str, Enum):
+    """Feature flag names for type-safe access."""
+    VERIFYX_NETWORK_VALIDATION = "verifyx_network_validation"
 
 
 class Settings(BaseSettings):
@@ -78,7 +84,7 @@ class Settings(BaseSettings):
         },
     }
     FEATURE_FLAGS: dict[str, bool] = {
-        "verifyx_network_validation": False,
+        FeatureFlag.VERIFYX_NETWORK_VALIDATION: False,  # If it's True - then bad internet connection will raise error on synthetic job
     }
 
     # GPU types that will be excluded in collateral checks

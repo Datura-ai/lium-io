@@ -19,6 +19,12 @@ class VerifyXCheck:
     check_id = "gpu.validate.verifyx"
     fatal = True
 
+    def _extract_errors(self, result) -> str | list | None:
+        """Extract errors from result with clear priority: data.errors > result.error."""
+        if result.data and result.data.get("errors"):
+            return result.data["errors"]
+        return result.error
+
     async def run(self, ctx: Context) -> CheckResult:
         if not ctx.config.verifyx_enabled:
             event = render_message(
@@ -43,10 +49,8 @@ class VerifyXCheck:
             machine_spec=specs,
         )
 
-        errors = None
-        if result.data:
-            errors = result.data.get("errors")
-        errors = errors or result.error
+        # Extract errors with clear priority: data.errors > result.error
+        errors = self._extract_errors(result)
 
         if result.data and result.data.get("success"):
             base_specs = ctx.state.specs
@@ -59,10 +63,11 @@ class VerifyXCheck:
                 }
             )
 
-            if "network" in sanitized and "download_speed" in sanitized["network"]:
-                if "network" not in updated_specs:
-                    updated_specs["network"] = {}
-                updated_specs["network"]["download_speed"] = sanitized["network"]["download_speed"]
+            # Update network specs if download speed is present
+            if sanitized.get("network", {}).get("download_speed") is not None:
+                updated_specs.setdefault("network", {})["download_speed"] = (
+                    sanitized["network"]["download_speed"]
+                )
 
             event = render_message(
                 Msg.VERIFY_SUCCESS,
@@ -83,13 +88,14 @@ class VerifyXCheck:
                 },
             )
 
-        errors = errors or "Unknown errors"
+        # Ensure we have an error message for the failure case
+        error_message = errors or "Unknown errors"
 
         event = render_message(
             Msg.VERIFY_FAILED,
             ctx=ctx,
             check_id=self.check_id,
-            what={"errors": errors},
+            what={"errors": error_message},
         )
         return CheckResult(passed=False, event=event)
 
