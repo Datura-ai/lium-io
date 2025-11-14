@@ -12,11 +12,11 @@ from ...const import (
 from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX
 
 
-def _has_gpu_process_outside_container(container_name: str, processes: Iterable[dict]) -> bool:
+def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
     """True when any process is missing a container or belongs to a different container."""
     for process in processes:
         process_container = process.get("container_name")
-        if not process_container or process_container != container_name:
+        if not process_container or process_container not in rented_pods:
             return True
     return False
 
@@ -91,7 +91,7 @@ class TenantEnforcementCheck:
         redis_service = ctx.services.redis
         rented_machine = await redis_service.get_rented_machine(ctx.executor)
 
-        if not rented_machine or not rented_machine.get("container_name"):
+        if not rented_machine or not rented_machine.get("containers", None):
             extra = {**ctx.default_extra, "rented": False}
             event = render_message(
                 Msg.NOT_RENTED,
@@ -110,38 +110,43 @@ class TenantEnforcementCheck:
                 },
             )
 
-        container_name = rented_machine.get("container_name", "")
+        rented_pods = rented_machine.get("containers", [])
         extra = {
             **ctx.default_extra,
             "rented": True,
-            "container_name": container_name,
+            "rented_pods": rented_pods,
         }
 
-        pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
-        if not pod_running:
-            event = render_message(
-                Msg.POD_NOT_RUNNING,
-                ctx=ctx,
-                check_id=self.check_id,
-                remediation=f"Start container {container_name} and ensure it stays healthy.",
-                what={
-                    "container": container_name,
-                    "executor_uuid": ctx.executor.uuid,
-                },
-                extra=extra
-            )
-            return CheckResult(
-                passed=False,
-                event=event,
-                updates={
-                    "default_extra": extra,
-                    "clear_verified_job_info": True,
-                    "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
-                },
-            )
+        for pod in rented_pods:
+            container_name = pod.get("name", "")
+            pod_id = pod.get("pod_id", "")
+            pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
+            if not pod_running:
+                event = render_message(
+                    Msg.POD_NOT_RUNNING,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    remediation=f"Start container {container_name} and ensure it stays healthy.",
+                    what={
+                        "pod_id": pod_id,
+                        "container_name": container_name,
+                        "executor_uuid": ctx.executor.uuid,
+                    },
+                    extra=extra
+                )
+                return CheckResult(
+                    passed=False,
+                    event=event,
+                    updates={
+                        "default_extra": extra,
+                        "clear_verified_job_info": True,
+                        "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
+                    },
+                )
 
+        container_names = [pod.get("name", "") for pod in rented_pods]
         gpu_processes = list(ctx.state.gpu_processes)
-        gpu_running_outside = _has_gpu_process_outside_container(container_name, gpu_processes)
+        gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
 
         if not rented_machine.get("owner_flag", False) and gpu_running_outside:
             gpu_details = ctx.state.gpu_details
@@ -152,7 +157,7 @@ class TenantEnforcementCheck:
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
-                        "expected_container": container_name,
+                        "expected_containers": container_names,
                         "process_count": observation["process_count"],
                         "gpu_utilization": observation["gpu_utilization"],
                         "vram_utilization": observation["vram_utilization"],

@@ -942,20 +942,7 @@ class DockerService:
 
                 await self.finish_stream_logs()
 
-                await self.redis_service.add_rented_machine(RentedMachine(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    executor_ip_address=executor_info.address,
-                    executor_ip_port=str(executor_info.port),
-                    container_name=container_name,
-                ))
-
-                rented_machine = await self.redis_service.get_rented_machine(executor_info)
-                if not rented_machine:
-                    logger.error(_m(
-                        "Not found rented pod from redis",
-                        extra=get_extra_info(default_extra),
-                    ))
+                await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
 
                 # Add profiler for ssh service installation
                 profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -1155,7 +1142,7 @@ class DockerService:
                     ),
                 )
 
-                await self.redis_service.remove_rented_machine(executor_info)
+                await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
 
                 logger.info(
                     _m(

@@ -130,16 +130,50 @@ class RedisService:
 
     async def add_rented_machine(self, machine: RentedMachine):
         await self.hset(RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json())
+    
+    async def add_rented_pod(self, executor: ExecutorSSHInfo, pod_id: str, container_name: str):
+        rented_machine = await self.get_rented_machine(executor)
+        if not rented_machine:
+            rented_machine = {"owner_flag": False, "containers": [{"name": container_name, "pod_id": pod_id}]}
+        else:
+            rented_machine["containers"].append({"name": container_name, "pod_id": pod_id})
+        
+        await self.hset(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}", json.dumps(rented_machine))
 
-    async def remove_rented_machine(self, executor: ExecutorSSHInfo):
-        await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
+    async def remove_rented_machine(self, executor: ExecutorSSHInfo, container_name: str | None = None):
+        if not container_name:
+            await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
+        else:
+            rented_machine = await self.get_rented_machine(executor)
+            if not rented_machine:
+                return
+            rented_machine["containers"] = [item for item in rented_machine["containers"] if item["name"] != container_name]
+            if not rented_machine["containers"]:
+                await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
+            else:
+                await self.hset(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}", json.dumps(rented_machine))
 
-    async def get_rented_machine(self, executor: ExecutorSSHInfo):
+    async def get_rented_machine(self, executor: ExecutorSSHInfo) -> dict | None:
         data = await self.hget(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
         if not data:
             return None
 
-        return json.loads(data)
+        data = json.loads(data)
+        
+        # check if the data is new structure
+        if "containers" in data:
+            containers = data.get("containers", [])
+            containers = [container for container in containers if container.get("name", "").strip()]
+            if not containers:
+                return None
+            return {"owner_flag": data.get("owner_flag", False), "containers": containers}
+        
+        # check if the data is old structure
+        container_name: str = data.get("container_name", "")
+        owner_flag: bool = data.get("owner_flag", False)
+        if not container_name or not container_name.strip():
+            return None
+        return {"owner_flag": owner_flag, "containers": [{"name": container_name}]}
 
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))

@@ -15,13 +15,16 @@ class Response(BaseModel, extra="forbid"):
     status: Literal["error", "success"]
     errors: list[Error] = []
 
+class RentedContainer(BaseModel):
+    name: str
+    pod_id: str
 
 class RentedMachine(BaseModel):
     miner_hotkey: str
     executor_id: str
     executor_ip_address: str
     executor_ip_port: str
-    container_name: str
+    containers: list[RentedContainer]
     owner_flag: bool = False
 
 
