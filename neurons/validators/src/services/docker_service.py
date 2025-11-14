@@ -339,6 +339,8 @@ class DockerService:
             await asyncio.sleep(sleep)
 
             container_names = " ".join([container for container in result.stdout.strip().split("\n") if pod_name in container or 'container_' in container])
+            if not container_names:
+                return
 
             logger.info(
                 _m(
@@ -825,7 +827,7 @@ class DockerService:
                 # GPU restriction flags
                 if payload.gpu_uuids:
                     gpu_devices = ",".join(payload.gpu_uuids)
-                    gpu_flags = f'--gpus "device={gpu_devices}" '
+                    gpu_flags = f'--gpus \'"device={gpu_devices}"\' '
                 else:
                     gpu_flags = "--gpus all "
 
