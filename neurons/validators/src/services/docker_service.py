@@ -102,6 +102,7 @@ class DockerService:
             return [], None
 
         mappings = []
+        reused_count = 0
         ssh_port = 22
         jupyter_port = 8888
         jupyter_port_map: tuple[int, int] | None = None
@@ -121,6 +122,7 @@ class DockerService:
             if port in pod_mapping:
                 port_mapping = pod_mapping[port]
                 mappings.append((port, port_mapping.internal_port, port_mapping.external_port))
+                reused_count += 1
                 continue
 
             if not len(available_ports):
@@ -135,12 +137,14 @@ class DockerService:
             else:
                 external_port = random.choice(list(available_ports.keys())) if user_defined else min(available_ports.keys())
                 docker_port = port if user_defined else external_port
-                
+
             port_mapping = available_ports.pop(external_port)
             mappings.append((docker_port, port_mapping.internal_port, external_port))
 
+        allocated_count = len(mappings) - reused_count
         logger.info(
-            f"Generated {len(mappings)} port mappings from database for executor {executor_id}"
+            f"Generated {len(mappings)} port mappings for pod {pod_id}: "
+            f"reused={reused_count}, allocated={allocated_count}, executor={executor_id}"
         )
 
         if enable_jupyter:

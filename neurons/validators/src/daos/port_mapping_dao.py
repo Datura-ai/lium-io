@@ -145,6 +145,15 @@ class PortMappingDao(BaseDao):
                             f"Port {port.external_port} for pod {pod_id} has no docker_port, "
                             f"using external_port as fallback"
                         )
+
+                if port_dict:
+                    docker_ports = sorted([k for k in port_dict.keys()])
+                    external_ports = sorted([p.external_port for p in port_dict.values()])
+                    logger.info(
+                        f"Found {len(port_dict)} ports for pod {pod_id}: "
+                        f"docker_ports={docker_ports}, external={external_ports}"
+                    )
+
                 return port_dict
             except Exception as e:
                 logger.error(f"Error getting ports for pod {pod_id}: {e}", exc_info=True)
@@ -178,7 +187,8 @@ class PortMappingDao(BaseDao):
                     )
                     .values(rented_for_pod_id=None, docker_port=None)
                 )
-                await session.exec(release_stmt)
+                release_result = await session.exec(release_stmt)
+                released_count = release_result.rowcount
 
                 # Step 2: Set pod_id and docker_port for each mapping
                 for docker_port, internal_port, external_port in mappings:
@@ -193,8 +203,12 @@ class PortMappingDao(BaseDao):
                     await session.exec(reserve_stmt)
 
                 await session.commit()
+
+                # Log detailed port mappings
+                port_mappings_str = ", ".join([f"{m[0]}->{m[2]}" for m in mappings])
                 logger.info(
-                    f"Reserved {len(mappings)} ports for pod {pod_id} on executor {executor_id}"
+                    f"Reserved {len(mappings)} ports for pod {pod_id} on executor {executor_id} "
+                    f"(released {released_count} old ports): [{port_mappings_str}]"
                 )
             except Exception as e:
                 logger.error(
@@ -251,12 +265,22 @@ class PortMappingDao(BaseDao):
         """Get set of external ports that are currently rented (rented_for_pod_id IS NOT NULL)."""
         async with self.get_session() as session:
             try:
-                stmt = select(PortMapping.external_port).where(
+                # Get both ports and pod_ids for logging
+                stmt = select(PortMapping.external_port, PortMapping.rented_for_pod_id).where(
                     PortMapping.rented_for_pod_id.isnot(None)
                 )
                 result = await session.exec(stmt)
-                ports = result.scalars().all()
-                return set(ports)
+                rows = result.all()
+
+                ports = set(row[0] for row in rows)
+                pod_ids = set(row[1] for row in rows)
+
+                if ports:
+                    logger.info(
+                        f"Found {len(ports)} busy external ports for {len(pod_ids)} pods: {sorted(pod_ids)}"
+                    )
+
+                return ports
             except Exception as e:
                 logger.error(f"Error getting busy external ports: {e}", exc_info=True)
                 return set()
