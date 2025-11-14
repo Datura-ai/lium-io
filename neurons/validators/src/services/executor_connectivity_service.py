@@ -73,7 +73,8 @@ class ExecutorConnectivityService:
         try:
             t1 = time.monotonic()
             await self.cleanup_docker_containers(ssh_client, extra)
-            port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE)
+            rented_external_ports = await self.port_mapping_dao.get_busy_external_ports()
+            port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE, rented_external_ports)
             if not port_maps:
                 return DockerConnectionCheckResult(
                     success=False, log_text="No port available for docker container", sysbox_runtime=sysbox_runtime,
@@ -117,9 +118,7 @@ class ExecutorConnectivityService:
                 return DockerConnectionCheckResult(success=False, log_text=failure_msg, sysbox_runtime=sysbox_runtime,)
 
             # Save successful ports
-            redis_task = self.save_to_redis(executor_info, miner_hotkey, successful_ports, extra)
-            db_task = self.save_to_db(executor_info, miner_hotkey, successful_ports, failed_ports, extra)
-            await asyncio.gather(redis_task, db_task)
+            await self.save_to_db(executor_info, miner_hotkey, successful_ports, failed_ports, extra)
 
             # Create detailed success message
             successful_internal_ports = [port_pair[0] for port_pair in successful_ports]
@@ -411,26 +410,6 @@ class ExecutorConnectivityService:
         logger.info(_m(f"port check complete {started:.2f}s {check_time:.2f}s {stop_time:.2f}s", extra))
         return results_dict
 
-    async def save_to_redis(
-        self, executor_info: ExecutorSSHInfo, miner_hotkey: str, successful_ports: list[Any], extra: dict = {},
-    ):
-        key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_info.uuid}"
-        MAX_REDIS_SAVE = 10
-        MAX_REDIS_KEEP = 10
-        for internal_port, external_port in successful_ports[:MAX_REDIS_SAVE]:
-            port_map = f"{internal_port},{external_port}"
-
-            # delete all the same port_maps in the list
-            await self.redis_service.lrem(key=key, element=port_map)
-
-            # insert port_map in the list
-            await self.redis_service.lpush(key, port_map)
-
-            # keep the latest 10 port maps
-            port_maps = await self.redis_service.lrange(key)
-            if len(port_maps) > MAX_REDIS_KEEP:
-                await self.redis_service.rpop(key)
-
     async def save_to_db(
         self,
         executor_info: ExecutorSSHInfo,
@@ -465,7 +444,7 @@ class ExecutorConnectivityService:
 
             if db_records:
                 await self.port_mapping_dao.upsert_port_results(db_records)
-                cleaned_ports = await self.port_mapping_dao.clean_ports(db_records[0].executor_id)
+                cleaned_ports = await self.port_mapping_dao.clean_ports(db_records[0].executor_id, 24*60)
                 logger.info(_m(f"saved {len(db_records)} ports to db, {cleaned_ports=}", extra))
 
         except Exception as e:
@@ -503,14 +482,21 @@ class ExecutorConnectivityService:
 
         logger.info(_m(f"cleanup: removed {len(container_names)} containers", extra))
 
-    def get_available_port_maps(self, executor_info: ExecutorSSHInfo, batch_size: int = 1000,) -> list[tuple[int, int]]:
+    def get_available_port_maps(
+        self, executor_info: ExecutorSSHInfo, batch_size: int = 1000, rented_external_ports: set[int] | None = None
+    ) -> list[tuple[int, int]]:
         """Get a list of available port maps for batch verification. with priority for PREFERRED_POD_PORTS"""
+        if rented_external_ports is None:
+            rented_external_ports = set()
+
         if executor_info.port_mappings:
             port_mappings: list[tuple[int, int]] = json.loads(executor_info.port_mappings)
             port_mappings = [
                 (internal_port, external_port)
                 for internal_port, external_port in port_mappings
-                if internal_port != executor_info.ssh_port and external_port != executor_info.ssh_port
+                if internal_port != executor_info.ssh_port
+                and external_port != executor_info.ssh_port
+                and external_port not in rented_external_ports
             ]
 
             # Prioritize preferred ports from existing port mappings
@@ -541,7 +527,7 @@ class ExecutorConnectivityService:
             # Default range if port_range is empty
             ports = list(range(20000, 65535))
 
-        ports = [port for port in ports if port != executor_info.ssh_port]
+        ports = [port for port in ports if port != executor_info.ssh_port and port not in rented_external_ports]
 
         if not ports:
             return []

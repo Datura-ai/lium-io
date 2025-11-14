@@ -68,7 +68,9 @@ async def test_generate_portMappings_exact_matches(docker_service, test_executor
 
     # Mock database response with exact matches for all requested ports
     mock_ports = create_mock_port_dict(docker_ports, test_miner_hotkey, UUID(test_executor_id))
-    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
 
     # Act
     result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, docker_ports)
@@ -80,7 +82,8 @@ async def test_generate_portMappings_exact_matches(docker_service, test_executor
     assert (22, 22, 22) in result
     assert (20000, 20000, 20000) in result
     assert (20001, 20001, 20001) in result
-    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented.assert_called_once_with(UUID(test_executor_id))
+    docker_service.port_mapping_dao.reserve_ports_for_pod.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -90,7 +93,9 @@ async def test_generate_portMappings_mixed_scenario(docker_service, test_executo
 
     # Mock database response: exact match for 22, random for others
     mock_ports = create_mock_port_dict([22, 8080, 9090], test_miner_hotkey, UUID(test_executor_id))
-    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
 
     # Act
     result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, docker_ports)
@@ -106,55 +111,6 @@ async def test_generate_portMappings_mixed_scenario(docker_service, test_executo
     assert len(other_mappings) == 2
     external_ports_used = {m[2] for m in other_mappings}
     assert external_ports_used.issubset({8080, 9090})
-
-
-@pytest.mark.parametrize("scenario,db_response,docker_ports,expected_result", [
-    (
-        "empty_database",
-        {},
-        [22, 20000],
-        [(22, 22, 22), (20000, 20000, 20000)]
-    ),
-    (
-        "insufficient_ports",
-        "create_mock",  # Special marker to create 2 ports
-        [22, 20000, 20001],
-        [(22, 22, 22), (20000, 20000, 20000), (20001, 20001, 20001)]
-    ),
-    (
-        "database_error",
-        Exception("Database error"),
-        [22, 20000],
-        [(22, 22, 22), (20000, 20000, 20000)]
-    )
-])
-@pytest.mark.asyncio
-async def test_generate_portMappings_fallback_to_redis(
-    docker_service, test_executor_id, test_miner_hotkey, scenario, db_response, docker_ports, expected_result
-):
-    """Test fallback to Redis on various database failures."""
-    # Arrange
-    if db_response == "create_mock":
-        # Create insufficient ports (2 ports when MIN_PORTS=3)
-        db_response = create_mock_port_dict([22, 20000], test_miner_hotkey, UUID(test_executor_id))
-
-    if isinstance(db_response, Exception):
-        docker_service.port_mapping_dao.get_successful_ports = AsyncMock(side_effect=db_response)
-    else:
-        docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=db_response)
-    port_mapping_redis_result = create_mock_port_dict([22, 20000, 20001], test_miner_hotkey, UUID(test_executor_id))
-    docker_service.generate_port_mapping_from_redis = AsyncMock(return_value=port_mapping_redis_result)
-
-    # Act
-    result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, docker_ports)
-    result = result[0]
-
-    # Assert
-    # Expect fallback to Redis in all scenarios
-    assert result == expected_result
-    docker_service.generate_port_mapping_from_redis.assert_called_once_with(
-        test_miner_hotkey, test_executor_id
-    )
 
 
 @pytest.mark.parametrize(
@@ -242,7 +198,9 @@ async def test_flexible_mode_port_mappings(
 
     # Mock database response
     mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
-    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
 
     # Act - internal_ports=None triggers flexible mode
     result = await docker_service.generate_portMappings(
@@ -253,7 +211,7 @@ async def test_flexible_mode_port_mappings(
     # Assert
     assert len(result) == len(expected_mappings)
     assert set(result) == set(expected_mappings)
-    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented.assert_called_once_with(UUID(test_executor_id))
 
 
 @pytest.mark.asyncio
@@ -263,7 +221,9 @@ async def test_no_exact_match_custom_ports_uses_random_selection(docker_service,
 
     # Available ports don't match requested ports
     mock_ports = create_mock_port_dict([9000, 9001, 9002], test_miner_hotkey, UUID(test_executor_id))
-    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
 
     # Act
     result = await docker_service.generate_portMappings(test_miner_hotkey, test_executor_id, custom_internal_ports)
@@ -285,7 +245,7 @@ async def test_no_exact_match_custom_ports_uses_random_selection(docker_service,
         assert external_port in {9000, 9001, 9002}
         assert internal_port == external_port
 
-    docker_service.port_mapping_dao.get_successful_ports.assert_called_once_with(UUID(test_executor_id))
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented.assert_called_once_with(UUID(test_executor_id))
 
 
 @pytest.mark.parametrize("initial_port_count,expected_length,expected_first_port,should_have_extra_ports", [
@@ -375,7 +335,9 @@ async def test_enable_jupyter_feature(
     # Arrange
     monkeypatch.setattr("services.docker_service.PREFERRED_POD_PORTS", [20000, 20001, 20002, 20003])
     mock_ports = create_mock_port_dict(available_ports, test_miner_hotkey, UUID(test_executor_id))
-    docker_service.port_mapping_dao.get_successful_ports = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
 
     # Act
     mappings, jupyter_port_map = await docker_service.generate_portMappings(
@@ -399,3 +361,215 @@ async def test_enable_jupyter_feature(
         assert len(jupyter_ports) == 0
         # Jupyter port map should be None
         assert jupyter_port_map is None
+
+
+@pytest.mark.asyncio
+async def test_pod_mapping_reuse(docker_service, test_executor_id, test_miner_hotkey):
+    """Test that existing pod mappings are reused when pod_id is provided."""
+    pod_id = uuid4()
+
+    # Existing pod mappings for ports 22, 8080, 8081 (keyed by docker_port)
+    existing_pod_mapping = {
+        22: create_port_mapping(
+            miner_hotkey=test_miner_hotkey,
+            executor_id=UUID(test_executor_id),
+            internal_port=20000,
+            external_port=20000,
+            rented_for_pod_id=pod_id,
+            docker_port=22,
+        ),
+        8080: create_port_mapping(
+            miner_hotkey=test_miner_hotkey,
+            executor_id=UUID(test_executor_id),
+            internal_port=20001,
+            external_port=20001,
+            rented_for_pod_id=pod_id,
+            docker_port=8080,
+        ),
+        8081: create_port_mapping(
+            miner_hotkey=test_miner_hotkey,
+            executor_id=UUID(test_executor_id),
+            internal_port=20002,
+            external_port=20002,
+            rented_for_pod_id=pod_id,
+            docker_port=8081,
+        ),
+    }
+
+    # Available ports (not used in this test since we have pod_mapping)
+    available_ports = create_mock_port_dict(
+        [9000, 9001, 9002],
+        test_miner_hotkey,
+        UUID(test_executor_id)
+    )
+
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=available_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value=existing_pod_mapping)
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
+
+    # Act - request same ports that are in pod_mapping
+    requested_ports = [22, 8080, 8081]
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, requested_ports, pod_id=pod_id
+    )
+
+    # Assert - should reuse existing pod mappings
+    assert len(result) == 3
+    # Check that we got the exact mappings from pod_mapping (note: internal_port from DB is 20000, 20001, 20002)
+    assert (22, 20000, 20000) in result
+    assert (8080, 20001, 20001) in result
+    assert (8081, 20002, 20002) in result
+
+    # Verify reserve_ports_for_pod was called with correct parameters
+    docker_service.port_mapping_dao.reserve_ports_for_pod.assert_called_once()
+    call_args = docker_service.port_mapping_dao.reserve_ports_for_pod.call_args
+    assert call_args[0][0] == UUID(test_executor_id)
+    # Second argument is now mappings (list of tuples), not external_ports
+    mappings = call_args[0][1]
+    external_ports_from_mappings = {m[2] for m in mappings}
+    assert external_ports_from_mappings == {20000, 20001, 20002}
+    assert call_args[0][2] == pod_id
+
+
+@pytest.mark.asyncio
+async def test_min_port_count_validation(docker_service, test_executor_id, test_miner_hotkey, monkeypatch):
+    """Test that generate_portMappings returns empty when MIN_PORT_COUNT is not met."""
+    # Set MIN_PORT_COUNT to 3
+    monkeypatch.setattr("services.docker_service.MIN_PORT_COUNT", 3)
+
+    # Only 2 available ports (less than MIN_PORT_COUNT)
+    available_ports = create_mock_port_dict(
+        [9000, 9001],
+        test_miner_hotkey,
+        UUID(test_executor_id)
+    )
+
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=available_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+
+    # Act
+    result, jupyter_map = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, [22, 8080, 8081]
+    )
+
+    # Assert - should return empty result
+    assert result == []
+    assert jupyter_map is None
+
+
+@pytest.mark.asyncio
+async def test_pod_id_defaults_to_executor_uuid(docker_service, test_executor_id, test_miner_hotkey):
+    """Test that pod_id defaults to executor_uuid when not provided."""
+    available_ports = create_mock_port_dict(
+        [22, 8080, 8081],
+        test_miner_hotkey,
+        UUID(test_executor_id)
+    )
+
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=available_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
+
+    # Act - don't provide pod_id
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, [22, 8080, 8081]
+    )
+
+    # Assert
+    assert len(result) == 3
+
+    # Verify reserve_ports_for_pod was called with executor_uuid as pod_id
+    docker_service.port_mapping_dao.reserve_ports_for_pod.assert_called_once()
+    call_args = docker_service.port_mapping_dao.reserve_ports_for_pod.call_args
+    assert call_args[0][2] == UUID(test_executor_id)  # pod_id should equal executor_id
+
+
+@pytest.mark.asyncio
+async def test_reserve_ports_called_with_correct_external_ports(docker_service, test_executor_id, test_miner_hotkey):
+    """Test that reserve_ports_for_pod is called with all external ports from mappings."""
+    # Available ports with different external port numbers
+    available_ports = {
+        22: create_port_mapping(
+            miner_hotkey=test_miner_hotkey,
+            executor_id=UUID(test_executor_id),
+            internal_port=20000,
+            external_port=20000,
+        ),
+        8080: create_port_mapping(
+            miner_hotkey=test_miner_hotkey,
+            executor_id=UUID(test_executor_id),
+            internal_port=20001,
+            external_port=20001,
+        ),
+        9999: create_port_mapping(
+            miner_hotkey=test_miner_hotkey,
+            executor_id=UUID(test_executor_id),
+            internal_port=20002,
+            external_port=20002,
+        ),
+    }
+
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=available_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
+
+    pod_id = uuid4()
+
+    # Act
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, [22, 8080, 8081], pod_id=pod_id
+    )
+
+    # Assert
+    assert len(result) == 3
+
+    # Verify reserve_ports_for_pod was called with correct mappings
+    docker_service.port_mapping_dao.reserve_ports_for_pod.assert_called_once()
+    call_args = docker_service.port_mapping_dao.reserve_ports_for_pod.call_args
+    mappings_reserved = call_args[0][1]  # Second argument is now mappings, not external_ports
+
+    # Verify mappings match the result
+    assert mappings_reserved == result
+    assert call_args[0][2] == pod_id
+
+
+@pytest.mark.asyncio
+async def test_pod_mapping_partial_reuse(docker_service, test_executor_id, test_miner_hotkey):
+    """Test that some ports are reused from pod_mapping and some are allocated from available."""
+    pod_id = uuid4()
+
+    # Existing pod mappings only for port 22
+    existing_pod_mapping = {
+        22: create_port_mapping(
+            miner_hotkey=test_miner_hotkey,
+            executor_id=UUID(test_executor_id),
+            internal_port=20000,
+            external_port=20000,
+            rented_for_pod_id=pod_id,
+        ),
+    }
+
+    # Available ports for the rest
+    available_ports = create_mock_port_dict(
+        [8080, 8081, 9000],
+        test_miner_hotkey,
+        UUID(test_executor_id)
+    )
+
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=available_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value=existing_pod_mapping)
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
+
+    # Act - request ports: 22 (in pod_mapping), 8080, 8081 (from available)
+    requested_ports = [22, 8080, 8081]
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, requested_ports, pod_id=pod_id
+    )
+
+    # Assert
+    assert len(result) == 3
+    # Port 22 should be reused from pod_mapping
+    assert (22, 20000, 20000) in result
+    # Ports 8080 and 8081 should be allocated from available
+    assert (8080, 8080, 8080) in result
+    assert (8081, 8081, 8081) in result

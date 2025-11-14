@@ -102,33 +102,6 @@ def test_get_available_port_maps_default_range(executor_service):
         assert internal_port != 22
 
 
-# ========================================================================================
-# Tests for save_to_redis method
-# ========================================================================================
-
-
-@pytest.mark.asyncio
-async def test_save_to_redis(executor_service, mock_redis_service, sample_executor_info):
-    """Test saving successful ports to Redis with deduplication."""
-    # Arrange
-    miner_hotkey = "test_miner_key"
-    successful_ports = [(9000, 9000), (9001, 9001)]
-    mock_redis_service.lrange.return_value = ["9000,9000", "9001,9001"]
-
-    # Act
-    await executor_service.save_to_redis(sample_executor_info, miner_hotkey, successful_ports)
-
-    # Assert
-    expected_key = f"available_port_maps:{miner_hotkey}:{sample_executor_info.uuid}"
-    # Expect lrem to be called for each port to remove duplicates before adding
-    assert mock_redis_service.lrem.call_count == 2
-    # Expect lpush to be called for each port to add them to the list
-    assert mock_redis_service.lpush.call_count == 2
-    # Expect specific port mappings to be added in correct format
-    mock_redis_service.lpush.assert_any_call(expected_key, "9000,9000")
-    mock_redis_service.lpush.assert_any_call(expected_key, "9001,9001")
-
-
 def test_get_available_port_maps_empty_range(executor_service):
     """Test fallback to default range when port_range is empty string."""
     # Arrange
@@ -405,7 +378,6 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
          patch.object(executor_service, 'get_available_port_maps', return_value=port_maps) as mock_get_ports, \
          patch.object(executor_service, 'verify_ports_bulk', new=AsyncMock(return_value=(successful_bulk_ports, failed_bulk_ports))) as mock_bulk, \
          patch.object(executor_service, 'verify_port_dind', new=AsyncMock(return_value=DockerConnectionCheckResult(success=True, log_text="dind ok", sysbox_runtime=False))) as mock_dind, \
-         patch.object(executor_service, 'save_to_redis', new=AsyncMock()) as mock_save_redis, \
          patch.object(executor_service, 'save_to_db', new=AsyncMock()) as mock_save_db:
 
         # Act
@@ -449,12 +421,6 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         # Expect dind was called with first port from successful_bulk_ports (9001, 9001)
         assert dind_call_args[5] == 9001  # internal_port
         assert dind_call_args[6] == 9001  # external_port
-
-        # Expect save_to_redis was called with successful ports
-        mock_save_redis.assert_called_once()
-        redis_successful_ports = mock_save_redis.call_args[0][2]
-        # Expect 2 ports: dind port (9001) is popped from bulk, verified, then added back
-        assert len(redis_successful_ports) == 2
 
         # Expect save_to_db was called with successful and failed ports
         mock_save_db.assert_called_once()

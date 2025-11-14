@@ -87,10 +87,18 @@ class DockerService:
         internal_ports: list[int] | None = None,
         initial_port_count: int | None = None,
         enable_jupyter: bool | None = False,
+        pod_id: UUID | None = None,
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
-        available_ports = await self._get_available_ports(executor_id, miner_hotkey)
+        executor_uuid = UUID(executor_id)
+        pod_id = pod_id or executor_uuid
+        available_ports = await self.port_mapping_dao.get_available_ports_excluding_rented(executor_uuid)
+        pod_mapping = await self.port_mapping_dao.get_ports_for_pod(pod_id) if pod_id else {}
 
-        if len(available_ports) < MIN_PORT_COUNT:
+        if not pod_mapping and len(available_ports) < MIN_PORT_COUNT:
+            logger.warning(
+                f"Insufficient ports in database ({len(available_ports)}/{MIN_PORT_COUNT}), "
+                f"falling back to Redis for executor {executor_id}"
+            )
             return [], None
 
         mappings = []
@@ -110,6 +118,11 @@ class DockerService:
             docker_internal_ports.insert(1, jupyter_port)
 
         for port in docker_internal_ports:
+            if port in pod_mapping:
+                port_mapping = pod_mapping[port]
+                mappings.append((port, port_mapping.internal_port, port_mapping.external_port))
+                continue
+
             if not len(available_ports):
                 break
 
@@ -135,67 +148,13 @@ class DockerService:
             if mapping:
                 jupyter_port_map = (mapping[0], mapping[2])
 
+        await self.port_mapping_dao.reserve_ports_for_pod(executor_uuid, mappings, pod_id)
+
         return mappings, jupyter_port_map
 
     def _find_mapping_by_docker_port(self, mappings: list[tuple[int, int, int]], docker_port: int) -> tuple[int, int, int] | None:
         """Find a port mapping by docker port number."""
         return next((m for m in mappings if m[0] == docker_port), None)
-
-    async def _get_available_ports(self, executor_id: str, miner_hotkey: str) -> dict[int, PortMapping]:
-        try:
-            # Get successful ports from database as dict {external_port: PortMapping}
-            available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
-
-            if len(available_ports) >= MIN_PORT_COUNT:
-                return available_ports
-
-            logger.warning(
-                f"Insufficient ports in database ({len(available_ports)}/{MIN_PORT_COUNT}), "
-                f"falling back to Redis for executor {executor_id}"
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to fetch port mappings from database for executor {executor_id}: {e}",
-                exc_info=True
-            )
-
-        # Fallback to Redis
-        return await self.generate_port_mapping_from_redis(miner_hotkey, executor_id)
-
-    async def generate_port_mapping_from_redis(self, miner_hotkey: str, executor_id: str) -> dict[int, PortMapping]:
-        mappings: dict[int, PortMapping] = {}
-        try:
-            key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
-            available_port_maps = await self.redis_service.lrange(key)
-
-            logger.info(f"available_port_maps: {key}, {available_port_maps}")
-            for available_port_map in available_port_maps:
-                internal_port, external_port = map(
-                    int, available_port_map.decode().split(",")
-                )
-                mappings[external_port] = PortMapping(
-                    uuid=uuid4(),
-                    miner_hotkey=miner_hotkey,
-                    executor_id=UUID(executor_id),
-                    internal_port=internal_port,
-                    external_port=external_port,
-                    is_successful=True,
-                    verification_time=datetime.utcnow()
-                )
-            return mappings
-        except Exception as e:
-            logger.error(
-                _m(
-                    "Error generating port mappings from redis",
-                    extra=get_extra_info({
-                        "miner_hotkey": miner_hotkey,
-                        "executor_id": executor_id,
-                        "error": str(e),
-                    }),
-                ),
-                exc_info=True,
-            )
-            return mappings
 
     async def execute_and_stream_logs(
         self,
@@ -1143,6 +1102,9 @@ class DockerService:
                 )
 
                 await self.redis_service.remove_rented_machine(executor_info)
+
+                # Release ports reserved for this pod
+                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
 
                 logger.info(
                     _m(

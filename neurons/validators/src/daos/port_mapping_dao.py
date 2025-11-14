@@ -79,6 +79,7 @@ class PortMappingDao(BaseDao):
                 # Bulk DELETE operation
                 stmt = delete(PortMapping).where(
                     PortMapping.executor_id == executor_id,
+                    PortMapping.rented_for_pod_id==None,
                     PortMapping.verification_time
                     < text(f"now() - interval '{period_minutes} minutes'"),
                 )
@@ -121,3 +122,141 @@ class PortMappingDao(BaseDao):
             except Exception as e:
                 logger.error(f"Error counting successful ports: {e}", exc_info=True)
                 return 0
+
+    async def get_ports_for_pod(self, pod_id: UUID) -> dict[int, PortMapping]:
+        """
+        Get all ports reserved for a specific pod as dictionary {docker_port: PortMapping}.
+
+        For backward compatibility with old records, if docker_port is None, falls back
+        to using external_port as the key.
+        """
+        async with self.get_session() as session:
+            try:
+                stmt = select(PortMapping).where(PortMapping.rented_for_pod_id == pod_id)
+                result = await session.exec(stmt)
+                ports = result.scalars().all()
+                port_dict = {}
+                for port in ports:
+                    # Use docker_port as key if available, otherwise fallback to external_port
+                    key = port.docker_port if port.docker_port is not None else port.external_port
+                    port_dict[key] = port
+                    if port.docker_port is None:
+                        logger.debug(
+                            f"Port {port.external_port} for pod {pod_id} has no docker_port, "
+                            f"using external_port as fallback"
+                        )
+                return port_dict
+            except Exception as e:
+                logger.error(f"Error getting ports for pod {pod_id}: {e}", exc_info=True)
+                return {}
+
+    async def reserve_ports_for_pod(
+        self, executor_id: UUID, mappings: list[tuple[int, int, int]], pod_id: UUID
+    ) -> None:
+        """
+        Reserve ports for a specific pod on an executor.
+        - Clears pod_id and docker_port from all ports that were previously rented by this pod
+          but are not in the new mappings
+        - Sets pod_id and docker_port for all ports in the mappings
+
+        :param executor_id: Executor UUID to operate on
+        :param mappings: List of (docker_port, internal_port, external_port) tuples to reserve
+        :param pod_id: Pod UUID to reserve ports for
+        """
+        async with self.get_session() as session:
+            try:
+                external_ports = [m[2] for m in mappings] if mappings else []
+
+                # Step 1: Clear pod_id and docker_port from ports that were rented by this pod
+                # but are not in external_ports
+                release_stmt = (
+                    update(PortMapping)
+                    .where(
+                        PortMapping.executor_id == executor_id,
+                        PortMapping.rented_for_pod_id == pod_id,
+                        PortMapping.external_port.notin_(external_ports) if external_ports else True,
+                    )
+                    .values(rented_for_pod_id=None, docker_port=None)
+                )
+                await session.exec(release_stmt)
+
+                # Step 2: Set pod_id and docker_port for each mapping
+                for docker_port, internal_port, external_port in mappings:
+                    reserve_stmt = (
+                        update(PortMapping)
+                        .where(
+                            PortMapping.executor_id == executor_id,
+                            PortMapping.external_port == external_port,
+                        )
+                        .values(rented_for_pod_id=pod_id, docker_port=docker_port)
+                    )
+                    await session.exec(reserve_stmt)
+
+                await session.commit()
+                logger.info(
+                    f"Reserved {len(mappings)} ports for pod {pod_id} on executor {executor_id}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error reserving ports for pod {pod_id} on executor {executor_id}: {e}",
+                    exc_info=True,
+                )
+                raise
+
+    async def release_ports_for_pod(self, pod_id: UUID) -> int:
+        """Release all ports for a specific pod by clearing rented_for_pod_id and docker_port."""
+        async with self.get_session() as session:
+            try:
+                stmt = (
+                    update(PortMapping)
+                    .where(PortMapping.rented_for_pod_id == pod_id)
+                    .values(rented_for_pod_id=None, docker_port=None)
+                )
+                result = await session.exec(stmt)
+                await session.commit()
+                released_count = result.rowcount
+                logger.info(f"Released {released_count} ports for pod {pod_id}")
+                return released_count
+            except Exception as e:
+                logger.error(f"Error releasing ports for pod {pod_id}: {e}", exc_info=True)
+                return 0
+
+    async def get_available_ports_excluding_rented(
+        self, executor_id: UUID, limit: int | None = None
+    ) -> dict[int, PortMapping]:
+        """Get successful ports that are not rented (rented_for_pod_id IS NULL) as dictionary."""
+        async with self.get_session() as session:
+            try:
+                stmt = (
+                    select(PortMapping)
+                    .where(
+                        PortMapping.executor_id == executor_id,
+                        PortMapping.is_successful,
+                        PortMapping.rented_for_pod_id.is_(None),
+                    )
+                    .order_by(PortMapping.verification_time.desc())
+                )
+                if limit is not None:
+                    stmt = stmt.limit(limit)
+                result = await session.exec(stmt)
+                ports = result.scalars().all()
+                return {port.external_port: port for port in ports}
+            except Exception as e:
+                logger.error(
+                    f"Error getting available ports excluding rented: {e}", exc_info=True
+                )
+                return {}
+
+    async def get_busy_external_ports(self) -> set[int]:
+        """Get set of external ports that are currently rented (rented_for_pod_id IS NOT NULL)."""
+        async with self.get_session() as session:
+            try:
+                stmt = select(PortMapping.external_port).where(
+                    PortMapping.rented_for_pod_id.isnot(None)
+                )
+                result = await session.exec(stmt)
+                ports = result.scalars().all()
+                return set(ports)
+            except Exception as e:
+                logger.error(f"Error getting busy external ports: {e}", exc_info=True)
+                return set()
