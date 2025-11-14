@@ -84,15 +84,14 @@ class DockerService:
         self,
         miner_hotkey: str,
         executor_id: str,
+        pod_id: UUID,
         internal_ports: list[int] | None = None,
         initial_port_count: int | None = None,
         enable_jupyter: bool | None = False,
-        pod_id: UUID | None = None,
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
         executor_uuid = UUID(executor_id)
-        pod_id = pod_id or executor_uuid
         available_ports = await self.port_mapping_dao.get_available_ports_excluding_rented(executor_uuid)
-        pod_mapping = await self.port_mapping_dao.get_ports_for_pod(pod_id) if pod_id else {}
+        pod_mapping = await self.port_mapping_dao.get_ports_for_pod(pod_id)
 
         if not pod_mapping and len(available_ports) < MIN_PORT_COUNT:
             logger.warning(
@@ -568,7 +567,7 @@ class DockerService:
             custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
             port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter, UUID(payload.pod_id)
+                payload.miner_hotkey, payload.executor_id, UUID(payload.pod_id), custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
             )
 
             # Add profiler for port mappings generation

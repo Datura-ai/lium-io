@@ -378,7 +378,8 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
          patch.object(executor_service, 'get_available_port_maps', return_value=port_maps) as mock_get_ports, \
          patch.object(executor_service, 'verify_ports_bulk', new=AsyncMock(return_value=(successful_bulk_ports, failed_bulk_ports))) as mock_bulk, \
          patch.object(executor_service, 'verify_port_dind', new=AsyncMock(return_value=DockerConnectionCheckResult(success=True, log_text="dind ok", sysbox_runtime=False))) as mock_dind, \
-         patch.object(executor_service, 'save_to_db', new=AsyncMock()) as mock_save_db:
+         patch.object(executor_service, 'save_to_db', new=AsyncMock()) as mock_save_db, \
+         patch.object(executor_service.port_mapping_dao, 'get_busy_external_ports', new=AsyncMock(return_value=set())) as mock_get_busy_ports:
 
         # Act
         result = await executor_service.verify_ports(
@@ -405,9 +406,9 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert "job_batch_id" in cleanup_args[0][1]
         assert "miner_hotkey" in cleanup_args[0][1]
 
-        # Expect get_available_port_maps was called with correct batch size
+        # Expect get_available_port_maps was called with correct batch size and rented ports
         from services.const import BATCH_PORT_VERIFICATION_SIZE
-        mock_get_ports.assert_called_once_with(sample_executor_info, BATCH_PORT_VERIFICATION_SIZE)
+        mock_get_ports.assert_called_once_with(sample_executor_info, BATCH_PORT_VERIFICATION_SIZE, set())
 
         # Expect verify_ports_bulk was called
         mock_bulk.assert_called_once()
