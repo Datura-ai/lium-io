@@ -154,25 +154,50 @@ class RedisService:
             logger.error(_m("Error getting executor uptime: {e}", extra={"error": e}), exc_info=True)
             return 0
 
-    async def add_pending_pod(self, miner_hotkey: str, executor_id: str):
+    async def add_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
         now = int(time.time())
-        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps({"time": now}))
+        
+        pending_pods.append({"time": now, "pod_id": pod_id})
+        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
 
-    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str):
-        await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
-
-    async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
+    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        pending_pods = [item for item in pending_pods if item.get('pod_id', '') != pod_id]
+        if pending_pods:
+            await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        else:
+            await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
+    
+    async def get_pending_pods(self, miner_hotkey: str, executor_id: str) -> list[dict]:
         data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
-            return False
+            return []
 
-        now = int(time.time())
         data = json.loads(data)
-        if now - data.get('time', 0) >= 30 * 60:  # 30 mins
-            await self.remove_pending_pod(miner_hotkey, executor_id)
-            return False
+        if isinstance(data, dict):
+            data = [data]
+        elif not isinstance(data, list):
+            logger.warning(f"Unexpected data type in get_pending_pods: {type(data)}")
+            return []
+        
+        now = int(time.time())
+        pending_pods = []
+        
+        for item in data:
+            if now - item.get('time', 0) >= 30 * 60:  # 30 mins
+                continue
+            pending_pods.append(item)
+        
+        return pending_pods
 
-        return True
+    async def renting_in_progress(self, miner_hotkey: str, executor_id: str, pod_id: str | None = None) -> bool:
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        
+        if pod_id:
+            pending_pods = [item for item in pending_pods if item.get('pod_id', '') == pod_id]
+        
+        return len(pending_pods) > 0
 
     async def set_verified_job_info(
         self,

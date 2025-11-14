@@ -81,8 +81,7 @@ class TaskService:
                 )
 
                 # Build and run validation pipeline
-                checks = self.pipeline_factory.build_checks()
-                pipeline = self.pipeline_factory.build_pipeline(checks)
+                pipeline = self.pipeline_factory.build_pipeline()
                 ok, events, last_context = await pipeline.run(base_ctx)
 
                 # Determine log_text and success based on ok status

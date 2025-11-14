@@ -667,7 +667,7 @@ class DockerService:
                 )
 
             # add executor in pending status dict
-            await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id)
+            await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
@@ -983,7 +983,7 @@ class DockerService:
             logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
+            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
