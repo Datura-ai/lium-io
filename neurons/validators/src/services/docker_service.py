@@ -568,7 +568,7 @@ class DockerService:
             custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
             port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
+                payload.miner_hotkey, payload.executor_id, custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter, UUID(payload.pod_id)
             )
 
             # Add profiler for port mappings generation
