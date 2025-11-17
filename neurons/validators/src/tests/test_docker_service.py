@@ -34,6 +34,13 @@ def mock_dependencies():
     ssh_service = Mock()
     redis_service = Mock()
     port_mapping_dao = Mock()
+
+    # Mock the async context manager for Redis lock
+    lock_mock = AsyncMock()
+    lock_mock.__aenter__ = AsyncMock(return_value=lock_mock)
+    lock_mock.__aexit__ = AsyncMock(return_value=None)
+    redis_service.acquire_executor_lock = Mock(return_value=lock_mock)
+
     return ssh_service, redis_service, port_mapping_dao
 
 
