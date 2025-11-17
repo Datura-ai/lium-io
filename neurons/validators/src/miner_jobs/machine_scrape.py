@@ -621,7 +621,7 @@ def get_network_speed():
 def speedcheck_output():
     data = {"upload_speed": None, "download_speed": None}
     try:
-        speedtest_cmd = run_cmd("PYTHONPATH=/opt/pypackages/lib python3 /opt/pypackages/bin/speedcheck run --type ookla")
+        speedtest_cmd = run_cmd("/root/app/.venv/bin/speedcheck run --type ookla")
         json_start = speedtest_cmd.find('{')
         json_str = speedtest_cmd[json_start:]
         speedtest_data = json.loads(json_str)
@@ -634,7 +634,7 @@ def speedcheck_output():
 def netmeasure_output():
     data = {"upload_speed": None, "download_speed": None}
     try:
-        speedtest_cmd = run_cmd(f"PYTHONPATH=/opt/pypackages/lib python3 /opt/pypackages/bin/netmeasure speedtest_dotnet")
+        speedtest_cmd = run_cmd(f"/root/app/.venv/bin/netmeasure speedtest_dotnet")
         download_match = re.search(r'Download Rate: ([\d.]+) bit/s', speedtest_cmd)
         upload_match = re.search(r'Upload Rate: ([\d.]+) bit/s', speedtest_cmd)
 
