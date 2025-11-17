@@ -24,10 +24,7 @@ from services.const import (
     BATCH_PORT_CONCURRENCY,
     BATCH_HEALTH_CHECK_TIMEOUT,
 )
-from services.redis_service import (
-    AVAILABLE_PORT_MAPS_PREFIX,
-    RedisService,
-)
+from services.redis_service import RedisService
 
 # Constants
 BATCH_VERIFIER_CONTAINER_PREFIX = "container_batch_verifier"

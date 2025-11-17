@@ -271,9 +271,12 @@ class PortMappingDao(BaseDao):
                 )
                 result = await session.exec(stmt)
                 rows = result.all()
+                
+                if not rows:
+                    return set()
 
                 ports = set(row[0] for row in rows)
-                pod_ids = set(row[1] for row in rows)
+                pod_ids = set(str(row[1]) for row in rows)
 
                 if ports:
                     logger.info(

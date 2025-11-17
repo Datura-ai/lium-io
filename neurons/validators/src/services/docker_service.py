@@ -42,7 +42,6 @@ from core.utils import _m, get_extra_info, retry_ssh_command
 from daos.port_mapping_dao import PortMappingDao
 from services.const import PREFERRED_POD_PORTS, MIN_PORT_COUNT
 from services.redis_service import (
-    AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
@@ -614,6 +613,9 @@ class DockerService:
                     extra=get_extra_info(default_extra),
                 )
                 logger.error(log_text)
+                
+                # Release ports reserved for this pod
+                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -630,6 +632,9 @@ class DockerService:
                     extra=get_extra_info(default_extra),
                 )
                 logger.error(log_text)
+                
+                # Release ports reserved for this pod
+                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -946,6 +951,9 @@ class DockerService:
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
+            
+            # Release ports reserved for this pod
+            await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
