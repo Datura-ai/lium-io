@@ -59,7 +59,7 @@ class UploadFilesCheck:
                 event=event,
                 updates={"state": updated_state},
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             event = render_message(
                 Msg.UPLOAD_FAILED,
                 ctx=ctx,
