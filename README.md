@@ -18,6 +18,7 @@ Welcome to **Lium.io powered by Bittensor Subnet 51**! This project enables a de
 
 The Compute Subnet on Bittensor is a decentralized network that allows miners to contribute their GPU resources to a global pool. Users can rent these resources for computational tasks, such as machine learning, data analysis, and more. The system ensures fair compensation for miners based on the quality and performance of their GPUs.
 
+For detailed documentation, visit [docs.lium.io](https://docs.lium.io/intro).
 
 ## High-Level Architecture
 
