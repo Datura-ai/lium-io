@@ -1,5 +1,7 @@
 # Executor
 
+**[Executor Documentation](https://docs.lium.io/bittensor-subnet/executor)**
+
 ## Setup project
 ### Requirements
 * Ubuntu machine
