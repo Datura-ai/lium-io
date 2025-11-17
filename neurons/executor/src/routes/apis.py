@@ -47,9 +47,8 @@ async def hardware_utilization(
     return get_system_metrics()
 
 
-@apis_router.post("/pods/{pod_id}/containers/{container_name}")
+@apis_router.post("/pods/containers/{container_name}")
 async def container_hardware_utilization(
-    pod_id: str,
     container_name: str,
     payload: ContainerUtilizationPayload,
     _: None = Depends(verify_container_signature)
