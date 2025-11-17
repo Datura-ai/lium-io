@@ -329,6 +329,10 @@ class BaseValidatorResponse(BaseRequest):
     executor_id: str
 
 
+class ContainerWarningCode(enum.Enum):
+    ExternalVolumeFailed = "ExternalVolumeFailed"
+
+
 class ContainerBaseResponse(BaseValidatorResponse):
     pod_id: str
 
@@ -341,6 +345,7 @@ class ContainerCreated(ContainerBaseResponse):
     backup_log_id: str | None = None
     restore_path: str | None = None
     jupyter_url: str | None = None
+    warnings: list[ContainerWarningCode] | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):

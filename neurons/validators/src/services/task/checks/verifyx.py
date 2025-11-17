@@ -19,6 +19,12 @@ class VerifyXCheck:
     check_id = "gpu.validate.verifyx"
     fatal = True
 
+    def _extract_errors(self, result) -> str | list | None:
+        """Extract errors from result with clear priority: data.errors > result.error."""
+        if result.data and result.data.get("errors"):
+            return result.data["errors"]
+        return result.error
+
     async def run(self, ctx: Context) -> CheckResult:
         if not ctx.config.verifyx_enabled:
             event = render_message(
@@ -43,6 +49,9 @@ class VerifyXCheck:
             machine_spec=specs,
         )
 
+        # Extract errors with clear priority: data.errors > result.error
+        errors = self._extract_errors(result)
+
         if result.data and result.data.get("success"):
             base_specs = ctx.state.specs
             sanitized = _to_iso(result.data)
@@ -54,6 +63,7 @@ class VerifyXCheck:
                 }
             )
 
+            # Update network specs if download speed is present
             if "network" in sanitized and "download_speed" in sanitized["network"]:
                 if "network" not in updated_specs:
                     updated_specs["network"] = {}
@@ -65,6 +75,9 @@ class VerifyXCheck:
                 check_id=self.check_id,
                 what={"verifyx_success": True},
             )
+            if errors:
+                event.what_we_saw["errors"] = errors
+
             updated_state = replace(ctx.state, specs=updated_specs)
 
             return CheckResult(
@@ -75,16 +88,14 @@ class VerifyXCheck:
                 },
             )
 
-        errors = None
-        if result.data:
-            errors = result.data.get("errors")
-        errors = errors or result.error or "Unknown errors"
+        # Ensure we have an error message for the failure case
+        error_message = errors or "Unknown errors"
 
         event = render_message(
             Msg.VERIFY_FAILED,
             ctx=ctx,
             check_id=self.check_id,
-            what={"errors": errors},
+            what={"errors": error_message},
         )
         return CheckResult(passed=False, event=event)
 
