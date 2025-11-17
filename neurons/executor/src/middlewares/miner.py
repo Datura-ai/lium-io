@@ -26,8 +26,8 @@ class MinerMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         
         # Skip for specific container hardware utilization endpoint
-        # Pattern: /pods/containers/{container_name}
-        if re.match(r'^/pods/containers(/[^/]+)?/?$', request.url.path):
+        # Pattern: /containers/{container_name}
+        if re.match(r'^/containers(/[^/]+)?/?$', request.url.path):
             return await call_next(request)
             
         default_extra = {
