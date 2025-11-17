@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import replace
 
@@ -20,6 +21,7 @@ class UploadFilesCheck:
     async def run(self, ctx: Context) -> CheckResult:
         local_dir = ctx.state.upload_local_dir
         executor_root = ctx.config.executor_root
+        DEFAULT_TIMEOUT = 300
 
         if not local_dir or not executor_root:
             event = render_message(
@@ -37,8 +39,9 @@ class UploadFilesCheck:
         remote_dir = f"{executor_root.rstrip('/')}/{random_name}"
 
         try:
-            async with ctx.ssh.start_sftp_client() as sftp:
-                await sftp.put(local_dir, remote_dir, recurse=True)
+            async with asyncio.timeout(DEFAULT_TIMEOUT):
+                async with ctx.ssh.start_sftp_client() as sftp:
+                    await sftp.put(local_dir, remote_dir, recurse=True)
 
             event = render_message(
                 Msg.UPLOAD_OK,
@@ -56,6 +59,14 @@ class UploadFilesCheck:
                 event=event,
                 updates={"state": updated_state},
             )
+        except TimeoutError:
+            event = render_message(
+                Msg.UPLOAD_FAILED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"error": f"Upload timed out after {DEFAULT_TIMEOUT} seconds"},
+            )
+            return CheckResult(passed=False, event=event)
         except Exception as exc:
             event = render_message(
                 Msg.UPLOAD_FAILED,

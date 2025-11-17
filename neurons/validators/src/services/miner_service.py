@@ -155,7 +155,7 @@ class MinerService:
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
                                 ),
-                                timeout=settings.JOB_TIME_OUT - 60
+                                timeout=settings.JOB_TIME_OUT - 120
                             )
                         )
                         for executor_info in msg.executors

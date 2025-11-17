@@ -1,4 +1,5 @@
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Protocol, Tuple
 
@@ -132,9 +133,18 @@ class Pipeline:
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
+        pipeline_start_time = time.perf_counter()
 
         for chk in self.checks:
+            check_start_time = time.perf_counter()
             res = await chk.run(current_ctx)
+            check_end_time = time.perf_counter()
+
+            execution_time_ms = int((check_end_time - check_start_time) * 1000)
+            elapsed_time_ms = int((check_end_time - pipeline_start_time) * 1000)
+
+            res.event.context["execution_time_ms"] = execution_time_ms
+            res.event.context["elapsed_time_ms"] = elapsed_time_ms
 
             await self.sink.emit(res.event)
             events.append(res.event)
