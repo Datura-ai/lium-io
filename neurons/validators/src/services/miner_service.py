@@ -866,7 +866,7 @@ class MinerService:
 
             commands = [
                 "nohup",
-                "/usr/bin/python",
+                executor_info.python_path,
                 "/root/app/backup_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--source-volume", payload.source_volume,
@@ -913,7 +913,7 @@ class MinerService:
 
             commands = [
                 "nohup",
-                "/usr/bin/python",
+                executor_info.python_path,
                 "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--target-volume", payload.target_volume,
