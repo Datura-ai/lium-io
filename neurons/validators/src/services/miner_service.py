@@ -864,9 +864,16 @@ class MinerService:
             async with ssh_client.start_sftp_client() as sftp:
                 await sftp.put(local_script_path, remote_script_path)
 
+            logger.info(
+                _m(
+                    "Uploaded backup_storage.py script to the remote server",
+                    extra=get_extra_info({ "remote_script_path": remote_script_path, "local_script_path": local_script_path })
+                )
+            )
+
             commands = [
                 "nohup",
-                "/usr/bin/python",
+                "/root/app/.venv/bin/python",
                 "/root/app/backup_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--source-volume", payload.source_volume,
@@ -913,7 +920,7 @@ class MinerService:
 
             commands = [
                 "nohup",
-                "/usr/bin/python",
+                "/root/app/.venv/bin/python",
                 "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--target-volume", payload.target_volume,
