@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
-from services.hardware_service import get_system_metrics
+from services.hardware_service import get_system_metrics, get_container_metrics
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
@@ -53,8 +53,18 @@ async def container_hardware_utilization(
     payload: ContainerUtilizationPayload,
     _: None = Depends(verify_container_signature)
 ):
-    # duplicate get_system_metrics for now
-    return get_system_metrics()
+    """
+    Endpoint for container-specific hardware utilization.
+    Returns CPU, memory, and GPU metrics for the specified container only.
+
+    Args:
+        container_name: Name of the Docker container
+        payload: Contains gpu_uuids list and signature for verification
+
+    Returns:
+        dict: Container-specific hardware utilization metrics
+    """
+    return get_container_metrics(container_name, payload.gpu_uuids)
 
 
 @apis_router.post("/ping")
