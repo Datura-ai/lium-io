@@ -33,6 +33,7 @@ from payload_models.payloads import (
     JupyterServerInstalled,
     JupyterInstallationFailed,
     CustomOptions,
+    ContainerWarningCode,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -205,7 +206,7 @@ class DockerService:
         log_extra: dict = {},
         timeout: int = 0,
         raise_exception: bool = True,
-    ):
+    ) -> tuple[bool, str]:
         logger.info(
             _m(
                 log_text,
@@ -216,14 +217,7 @@ class DockerService:
             ),
         )
 
-        async with self.lock:
-            self.logs_queue.append(
-                {
-                    "log_text": log_text,
-                    "log_status": "success",
-                    "log_tag": log_tag,
-                }
-            )
+        await self.stream_log(log_text, "success", log_tag)
 
         status = True
         error = ''
@@ -236,14 +230,7 @@ class DockerService:
         except asyncio.TimeoutError:
             status = False
             error = "Process timed out"
-            async with self.lock:
-                self.logs_queue.append(
-                    {
-                        "log_text": error,
-                        "log_status": "error",
-                        "log_tag": log_tag,
-                    }
-                )
+            await self.stream_log(error, "error", log_tag)
 
         if not status and raise_exception:
             raise Exception(f"Failed {log_text}. command: {command} error: {error}")
@@ -255,26 +242,12 @@ class DockerService:
         error = ''
 
         async for line in process.stdout:
-            async with self.lock:
-                self.logs_queue.append(
-                    {
-                        "log_text": line.strip(),
-                        "log_status": "success",
-                        "log_tag": log_tag,
-                    }
-                )
+            await self.stream_log(line.strip(), "success", log_tag)
 
         async for line in process.stderr:
-            async with self.lock:
-                status = False
-                error += line.strip() + "\n"
-                self.logs_queue.append(
-                    {
-                        "log_text": line.strip(),
-                        "log_status": "error",
-                        "log_tag": log_tag,
-                    }
-                )
+            status = False
+            error += line.strip() + "\n"
+            await self.stream_log(line.strip(), "error", log_tag)
 
         return status, error
 
@@ -433,36 +406,47 @@ class DockerService:
         volume_info: ExternalVolumeInfo,
         log_tag: str,
     ):
+        responses = []
         # install docker volume plugin
-        command = f"/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
-        await ssh_client.run(command)
+        command = "/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
+        responses.append(await ssh_client.run(command))
 
         # disable volume plugin
-        command = f"/usr/bin/docker plugin disable s3fs -f"
-        await ssh_client.run(command)
+        command = "/usr/bin/docker plugin disable s3fs -f"
+        responses.append(await ssh_client.run(command))
 
         # set credentials
         command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
-        await ssh_client.run(command)
+        responses.append(await ssh_client.run(command))
 
         # set allow_other option
-        command = f'/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
-        await ssh_client.run(command)
+        command = '/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
+        responses.append(await ssh_client.run(command))
 
         # enable volume plugin
-        command = f"/usr/bin/docker plugin enable s3fs"
-        await ssh_client.run(command)
+        command = "/usr/bin/docker plugin enable s3fs"
+        responses.append(await ssh_client.run(command))
 
         # create volume
         command = f"/usr/bin/docker volume create -d s3fs {volume_info.name}"
-        return await self.execute_and_stream_logs(
+        result = await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
             log_tag=log_tag,
             log_text="Creating docker volume",
             log_extra=log_extra,
-            raise_exception=True
+            raise_exception=False,
         )
+        is_success, message = result
+        if not is_success:
+            responses_text = message
+            for i, r in enumerate(responses):
+                responses_text += f"|Step {i}: exit={r.exit_status}, stdout={r.stdout}, stderr={r.stderr}"
+            logger.warning(_m(f"s3fs_volume failed. {responses_text}",extra=get_extra_info({**log_extra})))
+        else:
+            logger.info(_m("s3fs_volume success", extra=get_extra_info({**log_extra})))
+
+        return result
 
     async def disable_s3fs_volume_plugin(
         self,
@@ -579,11 +563,13 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        warnings = []
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
 
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_uuid": payload.executor_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
@@ -636,6 +622,7 @@ class DockerService:
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
@@ -656,6 +643,7 @@ class DockerService:
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoJupyterPortMapping,
@@ -671,6 +659,7 @@ class DockerService:
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -805,19 +794,24 @@ class DockerService:
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
 
                 if external_volume_info:
-                    await self.create_s3fs_volume(
+                    success, msg = await self.create_s3fs_volume(
                         ssh_client=ssh_client,
                         log_extra=default_extra,
                         volume_info=external_volume_info,
                         log_tag=log_tag,
                     )
-                    # Add profiler for docker volume creation
-                    profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
-                    # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
-                    payload.is_sysbox = False
+                    if success:
+                        # Add profiler for docker volume creation
+                        profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                        # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
+                        payload.is_sysbox = False
 
-                    volume_flag += f" -v {external_volume_info.name}:/mnt"
+                        volume_flag += f" -v {external_volume_info.name}:/mnt"
+                    else:
+                        warnings.append(ContainerWarningCode.ExternalVolumeFailed)
+                        profilers.append({"name": "Docker volume creation step failed", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        await self.stream_log("S3 volume setup failed", "error", log_tag)
 
                 container_name = f"container_{uuid}"
 
@@ -874,14 +868,7 @@ class DockerService:
                     ),
                 )
 
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": "Created Docker Container",
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
-                    )
+                await self.stream_log("Created Docker Container", "success", log_tag)
 
                 # skip installing ssh service for daturaai images
                 # if payload.docker_image.startswith("daturaai/"):
@@ -963,6 +950,7 @@ class DockerService:
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     container_name=container_name,
                     volume_name=local_volume,
                     port_maps=[
@@ -972,6 +960,7 @@ class DockerService:
                     backup_log_id=payload.backup_log_id,
                     restore_path=payload.restore_path,
                     jupyter_url=jupyter_url,
+                    warnings=warnings,
                 )
         except Exception as e:
             log_text = _m(
@@ -986,9 +975,20 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+    async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
+        async with self.lock:
+            self.logs_queue.append(
+                {
+                    "log_text": log_msg,
+                    "log_status": log_status,
+                    "log_tag": log_tag,
+                }
             )
 
     async def stop_container(
@@ -1087,6 +1087,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1153,6 +1154,7 @@ class DockerService:
                 return ContainerDeleted(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                 )
         except Exception as e:
             log_text = _m(
@@ -1164,6 +1166,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1179,6 +1182,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1233,6 +1237,7 @@ class DockerService:
                 return JupyterServerInstalled(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     jupyter_url=f"http://{executor_info.address}:{payload.jupyter_port_map[1]}/lab?token={jupyter_token}",
                 )
         except Exception as e:
@@ -1245,6 +1250,7 @@ class DockerService:
             return JupyterInstallationFailed(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
             )
 
@@ -1258,6 +1264,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1296,6 +1303,7 @@ class DockerService:
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -1332,6 +1340,7 @@ class DockerService:
                 return SshPubKeyRemoved(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -1344,6 +1353,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1358,6 +1368,7 @@ class DockerService:
     ):
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_uuid": payload.executor_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
@@ -1397,6 +1408,7 @@ class DockerService:
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -1419,6 +1431,7 @@ class DockerService:
                 return SshPubKeyAdded(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -1431,6 +1444,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
