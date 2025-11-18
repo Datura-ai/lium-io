@@ -229,10 +229,12 @@ class DockerService:
         self,
         miner_hotkey,
         executor_id,
+        pod_id,
     ):
         default_extra = {
             "miner_hotkey": miner_hotkey,
             "executor_uuid": executor_id,
+            "pod_id": pod_id,
         }
 
         self.is_realtime_logging = True
@@ -252,6 +254,7 @@ class DockerService:
                             "logs": logs_to_process,
                             "miner_hotkey": miner_hotkey,
                             "executor_uuid": executor_id,
+                            "pod_id": pod_id,
                         },
                     )
 
@@ -670,6 +673,7 @@ class DockerService:
                     self.handle_stream_logs(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                     )
                 )
                 # command = f"/usr/bin/docker logout"

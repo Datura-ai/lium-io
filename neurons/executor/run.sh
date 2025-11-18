@@ -18,7 +18,7 @@ ssh-keygen -A
 service ssh start
 
 # db migrate
-alembic upgrade head
+pdm run alembic upgrade head
 
 # run fastapi app
-python src/executor.py
+pdm run python src/executor.py

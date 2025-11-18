@@ -155,7 +155,7 @@ class MinerService:
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
                                 ),
-                                timeout=settings.JOB_TIME_OUT - 60
+                                timeout=settings.JOB_TIME_OUT - 120
                             )
                         )
                         for executor_info in msg.executors
@@ -866,7 +866,7 @@ class MinerService:
 
             commands = [
                 "nohup",
-                "/usr/bin/python",
+                executor_info.python_path,
                 "/root/app/backup_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--source-volume", payload.source_volume,
@@ -913,7 +913,7 @@ class MinerService:
 
             commands = [
                 "nohup",
-                "/usr/bin/python",
+                executor_info.python_path,
                 "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--target-volume", payload.target_volume,
