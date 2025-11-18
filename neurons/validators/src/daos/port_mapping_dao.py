@@ -115,7 +115,9 @@ class PortMappingDao(BaseDao):
                 from sqlalchemy import func
 
                 stmt = select(func.count(PortMapping.uuid)).where(
-                    PortMapping.executor_id == executor_id, PortMapping.is_successful
+                    PortMapping.executor_id == executor_id,
+                    PortMapping.is_successful,
+                    PortMapping.rented_for_pod_id.is_(None),
                 )
                 result = await session.exec(stmt)
                 return result.scalar() or 0
