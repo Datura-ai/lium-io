@@ -250,8 +250,8 @@ class FileEncryptService:
             'each_digest': "",
             'each_name': "",
             'machine_specs': "",
-            'data_sysbox_runtime': "",
             'data_sysbox_runtime_scrape_error': "",
+            'data_sysbox_runtime': "",
         }
 
         # Generate dictionary key mapping on validator side
