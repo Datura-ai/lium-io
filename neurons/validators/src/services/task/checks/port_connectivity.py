@@ -14,7 +14,7 @@ class PortConnectivityCheck:
     """
 
     check_id = "executor.validate.port_connectivity"
-    fatal = True
+    fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
         redis_service = ctx.services.redis
