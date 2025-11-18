@@ -2,8 +2,10 @@ import json
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
+import redis.exceptions
 from datura.requests.miner_requests import ExecutorSSHInfo
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
@@ -25,6 +27,10 @@ REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
 BANNED_GUIDS = "banned_guids"
 PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
 
+# Distributed lock settings
+EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
+EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (seconds)
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +38,33 @@ class RedisService:
     def __init__(self):
         self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
         self.lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def acquire_executor_lock(
+        self,
+        executor_id: str,
+        timeout: int = EXECUTOR_LOCK_TIMEOUT,
+        blocking_timeout: int = EXECUTOR_LOCK_BLOCKING_TIMEOUT,
+    ):
+        """Distributed lock for executor operations to prevent race conditions."""
+        lock = aioredis.lock.Lock(
+            self.redis,
+            f"lock:executor:{executor_id}",
+            timeout=timeout,
+            blocking_timeout=blocking_timeout,
+        )
+
+        try:
+            async with lock:
+                yield lock
+        except (redis.exceptions.LockError, redis.exceptions.LockNotOwnedError) as e:
+            logger.error(
+                _m(
+                    f"Lock error for executor {executor_id}",
+                    extra={"error": str(e)},
+                )
+            )
+            raise
 
     async def publish(self, channel: str, message: dict):
         """Publish a message to a Redis channel."""

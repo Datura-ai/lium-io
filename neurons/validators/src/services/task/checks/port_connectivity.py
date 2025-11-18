@@ -17,14 +17,6 @@ class PortConnectivityCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        if ctx.rented:
-            event = render_message(
-                Msg.SKIPPED_RENTED,
-                ctx=ctx,
-                check_id=self.check_id,
-            )
-            return CheckResult(passed=True, event=event)
-
         redis_service = ctx.services.redis
         renting_in_progress = await redis_service.renting_in_progress(ctx.miner_hotkey, ctx.executor.uuid)
         extra = {**ctx.default_extra, "renting_in_progress": renting_in_progress}
