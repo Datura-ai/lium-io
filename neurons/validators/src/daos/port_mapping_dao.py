@@ -62,7 +62,6 @@ class PortMappingDao(BaseDao):
                         # Bulk insert new ports for this chunk
                         if new_ports:
                             session.add_all(new_ports)
-                        await session.commit()
 
                 except Exception as e:
                     logger.error(

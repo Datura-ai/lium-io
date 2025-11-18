@@ -31,7 +31,8 @@ else:
         future=True,
         poolclass=AsyncAdaptedQueuePool,
         pool_size=POOL_SIZE,
-        max_overflow=30
+        max_overflow=30,
+        pool_pre_ping=True,
     )
 
 AsyncSessionMaker = sessionmaker(
