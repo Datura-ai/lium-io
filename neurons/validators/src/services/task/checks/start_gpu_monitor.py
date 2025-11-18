@@ -63,7 +63,7 @@ class StartGPUMonitorCheck:
 
         args_string = " ".join([f"--{k} {v}" for k, v in command_args.items()])
         start_cmd = (
-            f"nohup {executor.python_path} {script_path} {args_string} > /dev/null 2>&1 &"
+            f"nohup python {script_path} {args_string} > /dev/null 2>&1 &"
         )
         start_res = await runner.run(start_cmd, timeout=50, retryable=False)
 
