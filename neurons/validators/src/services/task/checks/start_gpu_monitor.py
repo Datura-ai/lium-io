@@ -46,11 +46,11 @@ class StartGPUMonitorCheck:
                 Msg.ALREADY_RUNNING,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"script_path": script_path},
+                what={"script_path": script_path, "python_path": executor.python_path},
             )
             return CheckResult(passed=True, event=event)
 
-        await runner.run("pip install aiohttp click pynvml psutil", timeout=30, retryable=True)
+        # await runner.run("pip install aiohttp click pynvml psutil", timeout=30, retryable=True)
 
         program_id = str(uuid.uuid4())
         command_args: Dict[str, Any] = {
@@ -72,7 +72,7 @@ class StartGPUMonitorCheck:
                 Msg.STARTED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"script_path": script_path, "command_id": start_res.command_id},
+                what={"script_path": script_path, "python_path": executor.python_path, "command_id": start_res.command_id},
             )
             return CheckResult(passed=True, event=event)
 
