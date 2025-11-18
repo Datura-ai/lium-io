@@ -306,13 +306,13 @@ class DockerService:
         sleep: int = 0,
         clear_volume: bool = True
     ):
-        command = f'/usr/bin/docker ps -a --format "{{.Names}}"'
+        command = f'/usr/bin/docker ps -a --format "{{{{.Names}}}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
             # wait until the docker connection check is finished.
             await asyncio.sleep(sleep)
 
-            container_names = " ".join([container for container in result.stdout.strip().split("\n") if pod_name in container or 'container_' in container])
+            container_names = " ".join([container for container in result.stdout.strip().split("\n") if pod_name == container or 'container_' in container])
             if not container_names:
                 return
 
