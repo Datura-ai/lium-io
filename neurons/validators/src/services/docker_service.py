@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 REPOSITORIES = [
     "daturaai/compute-subnet-executor:latest",
     "daturaai/compute-subnet-executor-runner:latest",
-    "containrrr/watchtower:1.7.1",
+    "nickfedor/watchtower",
     "daturaai/pytorch",
     "daturaai/ubuntu",
 ]
