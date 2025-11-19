@@ -203,8 +203,6 @@ class PortMappingDao(BaseDao):
                     )
                     await session.exec(reserve_stmt)
 
-                await session.commit()
-
                 # Log detailed port mappings
                 port_mappings_str = ", ".join([f"{m[0]}->{m[2]}" for m in mappings])
                 logger.info(
@@ -228,7 +226,6 @@ class PortMappingDao(BaseDao):
                     .values(rented_for_pod_id=None, docker_port=None)
                 )
                 result = await session.exec(stmt)
-                await session.commit()
                 released_count = result.rowcount
                 logger.info(f"Released {released_count} ports for pod {pod_id}")
                 return released_count

@@ -33,6 +33,8 @@ else:
         pool_size=POOL_SIZE,
         max_overflow=30,
         pool_pre_ping=True,
+        pool_recycle=3600,  # Recycle connections every hour to prevent stale connections
+        pool_timeout=30,  # Timeout for getting connection from pool
     )
 
 AsyncSessionMaker = sessionmaker(
