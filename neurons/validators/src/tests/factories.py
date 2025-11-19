@@ -11,6 +11,8 @@ def create_port_mapping(
     external_port: int = 9000,
     is_successful: bool = True,
     verification_time: datetime | None = None,
+    rented_for_pod_id: UUID | None = None,
+    docker_port: int | None = None,
 ) -> PortMapping:
     """Factory function to create a PortMapping instance with default values."""
     if executor_id is None:
@@ -26,6 +28,8 @@ def create_port_mapping(
         external_port=external_port,
         is_successful=is_successful,
         verification_time=verification_time,
+        rented_for_pod_id=rented_for_pod_id,
+        docker_port=docker_port,
     )
 
 
