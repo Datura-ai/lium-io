@@ -321,8 +321,6 @@ class MinerService:
             ),
         )
         for result in results:
-            if not result.spec:
-                continue
             try:
                 await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL,
