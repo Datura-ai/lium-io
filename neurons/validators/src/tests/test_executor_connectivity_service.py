@@ -248,38 +248,6 @@ def test_get_available_port_maps_preferred_mappings_priority(executor_service):
     assert 20001 in selected_ports
 
 
-# ========================================================================================
-# Tests for cleanup_docker_containers method
-# ========================================================================================
-
-
-@pytest.mark.asyncio
-async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
-    """Test cleanup of Docker containers with 'container_' prefix."""
-    # Arrange
-    # Mock responses: 1) list containers command, 2) rm command, 3) prune command
-    mock_ssh_client.run.side_effect = [
-        AsyncMock(stdout="container_test1\ncontainer_test2\nexecutor-executor-1", exit_status=0),
-        AsyncMock(stdout="", exit_status=0),  # docker rm response
-        AsyncMock(stdout="", exit_status=0),  # docker volume prune response
-    ]
-
-    # Act
-    await executor_service.cleanup_docker_containers(mock_ssh_client)
-
-    # Assert
-    # Expect 3 SSH commands: list, rm, prune
-    assert mock_ssh_client.run.call_count == 3
-
-    all_calls = [call.args[0] for call in mock_ssh_client.run.call_args_list]
-
-    # Expect first call to list containers with name filter
-    assert "docker ps" in all_calls[0]
-    # Expect second call to remove found containers
-    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1] and "executor-executor-1" not in all_calls[1]
-    # Expect third call to prune volumes
-    assert "docker volume prune" in all_calls[2]
-
 
 # ========================================================================================
 # Tests for verify_port_dind method
@@ -300,8 +268,9 @@ async def test_verify_port_dind_successful_connection(executor_service, mock_ssh
 
     # Mock docker run command (successful)
     mock_ssh_client.run.side_effect = [
+        AsyncMock(exit_status=0, stdout="", stderr=""),  # cleanup before run
         AsyncMock(exit_status=0, stdout="container_id", stderr=""),  # docker run
-        AsyncMock(exit_status=0, stdout="", stderr=""),  # docker rm cleanup
+        AsyncMock(exit_status=0, stdout="", stderr=""),  # cleanup in finally
     ]
 
     # Mock asyncssh imports and connection
@@ -335,9 +304,9 @@ async def test_verify_port_dind_successful_connection(executor_service, mock_ssh
         assert str(internal_port) in result.log_text
 
         # Expect docker run command was called with correct parameters
-        docker_run_call = mock_ssh_client.run.call_args_list[0][0][0]
+        docker_run_call = mock_ssh_client.run.call_args_list[1][0][0]
         assert "/usr/bin/docker run" in docker_run_call
-        assert f"container_{miner_hotkey}_{external_port}" in docker_run_call
+        assert f"container_{miner_hotkey}_check_dind" in docker_run_call
         assert f"-p {internal_port}:22" in docker_run_call
 
         # Expect SSH private key was imported
@@ -350,10 +319,10 @@ async def test_verify_port_dind_successful_connection(executor_service, mock_ssh
         assert connect_kwargs['port'] == external_port
         assert connect_kwargs['username'] == 'root'
 
-        # Expect container cleanup was called
-        cleanup_call = mock_ssh_client.run.call_args_list[1][0][0]
+        # Expect container cleanup was called in finally
+        cleanup_call = mock_ssh_client.run.call_args_list[2][0][0]
         assert "docker rm" in cleanup_call
-        assert f"container_{miner_hotkey}_{external_port}" in cleanup_call
+        assert f"container_{miner_hotkey}_check_dind" in cleanup_call
 
 
 @pytest.mark.asyncio
@@ -374,8 +343,7 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
     failed_bulk_ports = []
     dind_port = (9000, 9000)
 
-    with patch.object(executor_service, 'cleanup_docker_containers', new=AsyncMock()) as mock_cleanup, \
-         patch.object(executor_service, 'get_available_port_maps', return_value=port_maps) as mock_get_ports, \
+    with patch.object(executor_service, 'get_available_port_maps', return_value=port_maps) as mock_get_ports, \
          patch.object(executor_service, 'verify_ports_bulk', new=AsyncMock(return_value=(successful_bulk_ports, failed_bulk_ports))) as mock_bulk, \
          patch.object(executor_service, 'verify_port_dind', new=AsyncMock(return_value=DockerConnectionCheckResult(success=True, log_text="dind ok", sysbox_runtime=False))) as mock_dind, \
          patch.object(executor_service, 'save_to_db', new=AsyncMock()) as mock_save_db, \
@@ -397,14 +365,6 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         # Expect log_text contains success summary with verification stats
         assert "verification complete" in result.log_text
         assert "available" in result.log_text
-
-        # Expect cleanup was called first with ssh_client and extra dict
-        mock_cleanup.assert_called_once()
-        cleanup_args = mock_cleanup.call_args
-        assert cleanup_args[0][0] == mock_ssh_client
-        # Expect extra dict contains job metadata
-        assert "job_batch_id" in cleanup_args[0][1]
-        assert "miner_hotkey" in cleanup_args[0][1]
 
         # Expect get_available_port_maps was called with correct batch size and rented ports
         from services.const import BATCH_PORT_VERIFICATION_SIZE
@@ -431,3 +391,153 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert len(db_successful_ports) == 2
         # Expect 0 failed ports because all verifications succeeded
         assert len(db_failed_ports) == 0
+
+
+# ========================================================================================
+# Tests for _cleanup_container method
+# ========================================================================================
+
+
+@pytest.mark.asyncio
+async def test_cleanup_container_successful_removal(executor_service, mock_ssh_client):
+    """Test cleanup successfully removes existing container."""
+    # Arrange
+    container_name = "test_container_batch_check"
+    mock_ssh_client.run.return_value = AsyncMock(exit_status=0, stdout="", stderr="")
+
+    # Act
+    await executor_service._cleanup_container(mock_ssh_client, container_name, {})
+
+    # Assert
+    # Expect docker rm command was called with correct container name
+    mock_ssh_client.run.assert_called_once_with(f"/usr/bin/docker rm -f {container_name}")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_container_not_found(executor_service, mock_ssh_client):
+    """Test cleanup gracefully handles non-existent container."""
+    # Arrange
+    container_name = "nonexistent_container"
+    mock_ssh_client.run.side_effect = Exception("No such container: nonexistent_container")
+
+    # Act - should not raise exception
+    await executor_service._cleanup_container(mock_ssh_client, container_name, {})
+
+    # Assert
+    # Expect docker rm command was called despite exception
+    mock_ssh_client.run.assert_called_once_with(f"/usr/bin/docker rm -f {container_name}")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_container_ssh_error(executor_service, mock_ssh_client):
+    """Test cleanup handles SSH connection errors without crashing."""
+    # Arrange
+    import asyncio
+
+    container_name = "test_container"
+    mock_ssh_client.run.side_effect = asyncio.TimeoutError("SSH connection timeout")
+
+    # Act - should not raise exception
+    await executor_service._cleanup_container(mock_ssh_client, container_name, {})
+
+    # Assert
+    # Expect docker rm command was attempted
+    mock_ssh_client.run.assert_called_once_with(f"/usr/bin/docker rm -f {container_name}")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_container_docker_daemon_error(executor_service, mock_ssh_client):
+    """Test cleanup handles Docker daemon errors without crashing."""
+    # Arrange
+    container_name = "test_container"
+    mock_ssh_client.run.side_effect = Exception("Cannot connect to Docker daemon")
+
+    # Act - should not raise exception
+    await executor_service._cleanup_container(mock_ssh_client, container_name, {})
+
+    # Assert
+    # Expect docker rm command was attempted
+    mock_ssh_client.run.assert_called_once_with(f"/usr/bin/docker rm -f {container_name}")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_container_with_extra_context(executor_service, mock_ssh_client):
+    """Test cleanup correctly uses extra logging context."""
+    # Arrange
+    container_name = "test_container"
+    extra_context = {"job_id": "job_123", "miner": "miner_abc"}
+    mock_ssh_client.run.return_value = AsyncMock(exit_status=0, stdout="", stderr="")
+
+    # Act
+    await executor_service._cleanup_container(mock_ssh_client, container_name, extra_context)
+
+    # Assert
+    # Expect docker rm command was called
+    mock_ssh_client.run.assert_called_once_with(f"/usr/bin/docker rm -f {container_name}")
+
+
+@pytest.mark.asyncio
+async def test_verify_ports_bulk_cleanup_before_start(executor_service, mock_ssh_client, sample_executor_info):
+    """Test that cleanup is called before starting new container in verify_ports_bulk."""
+    # Arrange
+    from unittest.mock import patch
+
+    port_maps = [(9000, 9000), (9001, 9001)]
+    container_name = "container_batch_verifier_batch_check"
+
+    call_sequence = []
+
+    async def track_call(cmd):
+        if "docker rm" in cmd:
+            call_sequence.append("cleanup")
+            return AsyncMock(exit_status=0, stdout="")
+        elif "docker run" in cmd:
+            call_sequence.append("run")
+            return AsyncMock(exit_status=0, stdout="container_id")
+        return AsyncMock(exit_status=0, stdout="")
+
+    mock_ssh_client.run.side_effect = track_call
+
+    with patch.object(executor_service, '_docker_wait_for_health', return_value=False):
+        # Act
+        await executor_service.verify_ports_bulk(mock_ssh_client, port_maps, sample_executor_info, {})
+
+    # Assert
+    # Expect cleanup was called before docker run
+    assert len(call_sequence) >= 2
+    assert call_sequence[0] == "cleanup"
+    assert call_sequence[1] == "run"
+
+
+@pytest.mark.asyncio
+async def test_verify_port_dind_cleanup_on_exception(executor_service, mock_ssh_client, sample_executor_info):
+    """Test that cleanup is called in finally block even when docker run fails."""
+    # Arrange
+    from unittest.mock import patch
+
+    cleanup_call_count = 0
+
+    async def count_cleanup_calls(ssh_client, container_name, extra):
+        nonlocal cleanup_call_count
+        cleanup_call_count += 1
+
+    with patch.object(executor_service, '_cleanup_container', side_effect=count_cleanup_calls) as mock_cleanup:
+        # Mock docker run to fail
+        mock_ssh_client.run.side_effect = Exception("Docker run failed")
+
+        # Act
+        result = await executor_service.verify_port_dind(
+            mock_ssh_client,
+            "miner_key",
+            sample_executor_info,
+            "private_key",
+            "public_key",
+            9000,
+            9000,
+        )
+
+    # Assert
+    # Expect verification failed
+    assert result.success is False
+    # Expect cleanup was called at least once in finally block
+    assert cleanup_call_count >= 1
