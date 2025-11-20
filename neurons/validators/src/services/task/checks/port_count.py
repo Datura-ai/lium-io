@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import replace
 from ..messages import PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX
-from services.const import MIN_PORT_COUNT
 
 
 class PortCountCheck:
@@ -19,15 +17,9 @@ class PortCountCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         port_mapping = ctx.services.port_mapping
-        redis_service = ctx.services.redis
         executor_uuid = ctx.executor.uuid
 
         port_count = await port_mapping.get_successful_ports_count(executor_uuid)
-
-        if port_count < MIN_PORT_COUNT:
-            port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{ctx.miner_hotkey}:{executor_uuid}"
-            port_maps_bytes = await redis_service.lrange(port_map_key)
-            port_count = len([tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes])
 
         updated_state = replace(
             ctx.state,
