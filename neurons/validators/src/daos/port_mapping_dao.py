@@ -259,13 +259,14 @@ class PortMappingDao(BaseDao):
                 )
                 return {}
 
-    async def get_busy_external_ports(self) -> set[int]:
+    async def get_busy_external_ports(self, executor_id: UUID) -> set[int]:
         """Get set of external ports that are currently rented (rented_for_pod_id IS NOT NULL)."""
         async with self.get_session() as session:
             try:
                 # Get both ports and pod_ids for logging
                 stmt = select(PortMapping.external_port, PortMapping.rented_for_pod_id).where(
-                    PortMapping.rented_for_pod_id.isnot(None)
+                    PortMapping.rented_for_pod_id.isnot(None),
+                    PortMapping.executor_id == executor_id
                 )
                 result = await session.exec(stmt)
                 rows = result.all()
@@ -278,7 +279,7 @@ class PortMappingDao(BaseDao):
 
                 if ports:
                     logger.info(
-                        f"Found {len(ports)} busy external ports for {len(pod_ids)} pods: {sorted(pod_ids)}"
+                        f"Found {len(ports)} busy external ports for executor_id({executor_id}) - {len(pod_ids)} pods: {sorted(pod_ids)}"
                     )
 
                 return ports
