@@ -261,7 +261,7 @@ class PortMappingDao(BaseDao):
                 )
                 return {}
 
-    async def get_busy_external_ports(self, executor_id: str) -> set[int]:
+    async def get_busy_external_ports(self, executor_id: UUID) -> set[int]:
         """Get set of external ports that are currently rented (rented_for_pod_id IS NOT NULL)."""
         async with self.get_session() as session:
             try:
