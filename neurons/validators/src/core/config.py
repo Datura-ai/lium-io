@@ -32,6 +32,8 @@ class DebugSettings(BaseSettings):
     MINER_ADDRESS: str | None = Field(default=None, description="Miner address")
     MINER_PORT: int | None = Field(default=None, description="Miner port")
 
+    SKIP_STORAGE_CHECK: bool = Field(default=False, description="Skip storage check")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
