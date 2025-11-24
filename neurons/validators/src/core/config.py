@@ -73,6 +73,7 @@ class Settings(BaseSettings):
 
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
+    SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'

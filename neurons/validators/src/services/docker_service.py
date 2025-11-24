@@ -366,12 +366,12 @@ class DockerService:
 
         # Step 2: start SSH service
         # logger.info(_m("Starting SSH service", extra={**log_extra, "container_name": container_name}))
-        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A; mkdir -p /root/.ssh; chmod 700 /root/.ssh; service ssh start;'"
+        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A && mkdir -p /run/sshd && mkdir -p /root/.ssh && chmod 700 /root/.ssh && /usr/sbin/sshd'"
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
             log_tag=log_tag,
-            log_text="Starting SSH service",
+            log_text="Starting SSH daemon",
             log_extra=log_extra,
             raise_exception=False
         )
