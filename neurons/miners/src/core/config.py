@@ -18,6 +18,8 @@ class DebugSettings(BaseSettings):
     """
     model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore")
 
+    ENABLED: bool = Field(default=False, description="Enable debug mode")
+
     SKIP_VALIDATOR_REGISTRATION_CHECK: bool = Field(default=False, description="Skip validator registration check")
     SKIP_SYNC_FLOW: bool = Field(default=False, description="Skip sync flow")
 
