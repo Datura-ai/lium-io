@@ -14,7 +14,7 @@ class DebugSettings(BaseSettings):
     """Debug configuration - all flags default to False/None.
     
     Set via environment variables prefixed with DEBUG_ (e.g., DEBUG_SKIP_STAKE_CHECKS=true).
-    Use .env.local for local development (git-ignored).
+    Use .env for local development (git-ignored).
     """
     model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore")
 
