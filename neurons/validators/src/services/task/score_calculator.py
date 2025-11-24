@@ -41,7 +41,7 @@ def calculate_scores(
     job_score = 1.0
     actual_score = 1.0
 
-    if not is_rental_succeed:
+    if not is_rental_succeed and not settings.SKIP_RENTAL_VERIFICATION:
         actual_score = 0.0
         warning_messages.append("Score set to 0 pending rental verification")
 
