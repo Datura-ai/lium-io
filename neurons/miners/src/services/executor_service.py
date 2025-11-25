@@ -30,7 +30,6 @@ from protocol.miner_portal_request import (
     ExecutorDeleteFailed,
 )
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -214,18 +213,40 @@ class ExecutorService:
             "data_to_sign": pubkey,
             "signature": f"0x{keypair.sign(pubkey).hex()}"
         }
+        
+        base_log_extra = {
+            "executor_id": str(executor.uuid),
+            "executor_address": executor.address,
+            "executor_port": executor.port,
+            "url": url,
+        }
+        logger.info(
+            _m(
+                "Sending pubkey to executor",
+                extra=get_extra_info(base_log_extra),
+            ),
+        )
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, json=payload) as response:
                     if response.status != 200:
-                        logger.error("API request failed to register SSH key. url=%s", url)
+                        text = await response.text()
+                        logger.error(
+                            _m(
+                                "API request failed to register SSH key - HTTP error",
+                                extra=get_extra_info({**base_log_extra, "status": response.status, "error": text}),
+                            ),
+                        )
                         return None
                     response_obj: dict = await response.json()
                     logger.info(
-                        "Get response from Executor(%s:%s): %s",
-                        executor.address,
-                        executor.port,
-                        json.dumps(response_obj),
+                        _m(
+                            "Received response from executor",
+                            extra=get_extra_info({
+                                **base_log_extra,
+                                "response": response_obj,
+                            }),
+                        ),
                     )
                     response_obj = {
                         **response_obj,
@@ -235,8 +256,15 @@ class ExecutorService:
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
                 logger.error(
-                    "API request failed to register SSH key. url=%s, error=%s", url, str(e)
+                    _m(
+                        "API request failed to register SSH key - request exception",
+                        extra=get_extra_info({
+                            **base_log_extra,
+                            "error": str(e),
+                        }),
+                    ),
                 )
+                return None
 
     async def remove_pubkey_from_executor(self, executor: Executor, pubkey: str):
         """TODO: Send API request to executor to cleanup pubkey
@@ -252,15 +280,36 @@ class ExecutorService:
             "data_to_sign": pubkey,
             "signature": f"0x{keypair.sign(pubkey).hex()}"
         }
+        base_log_extra = {
+            "executor_id": str(executor.uuid),
+            "executor_address": executor.address,
+            "executor_port": executor.port,
+            "url": url,
+        }
+        
+        logger.info(
+            _m(
+                "Removing pubkey from executor",
+                extra=get_extra_info(base_log_extra),
+            ),
+        )
         async with aiohttp.ClientSession(timeout=timeout) as session:
             try:
                 async with session.post(url, json=payload) as response:
                     if response.status != 200:
-                        logger.error("API request failed to register SSH key. url=%s", url)
+                        logger.error(
+                            _m(
+                                "API request failed to register SSH key",
+                                extra=get_extra_info({**base_log_extra, "status": response.status}),
+                            ),
+                        )
                         return None
             except Exception as e:
                 logger.error(
-                    "API request failed to register SSH key. url=%s, error=%s", url, str(e)
+                    _m(
+                        "API request failed to register SSH key",
+                        extra=get_extra_info({**base_log_extra, "error": str(e)}),
+                    ),
                 )
 
     async def register_pubkey(self, validator_hotkey: str, miner_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
@@ -282,14 +331,20 @@ class ExecutorService:
             for executor in executors
         ]
 
-        total_executors = len(tasks)
         results = [
             result for result in await asyncio.gather(*tasks, return_exceptions=True) if result
         ]
         logger.info(
-            "Send pubkey register API requests to %d executors and received results from %d executors",
-            total_executors,
-            len(results),
+            _m( 
+                "Sent pubkey register to executors",
+                extra=get_extra_info({
+                    "miner_hotkey": miner_hotkey,
+                    "executor_id": executor_id,
+                    "executor_ids": [str(executor.uuid) for executor in executors],
+                    "executors": len(executors),
+                    "accepted_executors": len(results),
+                }),
+            ),
         )
         return results
 
