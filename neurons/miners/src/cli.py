@@ -291,23 +291,6 @@ def switch_validator(address: str, port: int, validator: str):
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option("--price", type=float, prompt="Price per hour (USD)", help="New price per hour in USD")
-def update_executor_price(address: str, port: int, price: float):
-    """Update the price per hour for an executor in USD"""
-    if price < 0:
-        logger.error("❌ Price cannot be negative.")
-        return
-    
-    cli_service = CliService(with_executor_db=True)
-    success = asyncio.run(cli_service.update_executor_price(address, port, price_per_hour=price))
-    if success:
-        logger.info("✅ Successfully updated executor price.")
-    else:
-        logger.error("❌ Failed to update executor price.")
-
-@cli.command()
-@click.option("--address", prompt="IP Address", help="IP address of executor")
-@click.option("--port", type=int, prompt="Port", help="Port of executor")
 @click.option("--price_per_gpu", type=float, prompt="Price per GPU per hour (USD)", help="New price per GPU in USD")
 def update_executor_price_per_gpu(address: str, port: int, price_per_gpu: float):
     """Update the price per GPU for an executor in USD"""
