@@ -343,38 +343,25 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
     ) -> None:
-        # Step 1: check openssh-server is installed
-        command = f"/usr/bin/docker exec {container_name} dpkg -l | grep openssh-server"
-        # result = await ssh_client.run(command)
-        status, _ = await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text="Checking openssh-server installed",
-            log_extra=log_extra,
-            raise_exception=False
-        )
-        if not status:
-            # Step 1.1: install if it's not installed in docker container.
-            # logger.info(_m("openssh-server isn't installed in the container. Installing it now.", extra={**log_extra, "container_name": container_name}))
-            command = f"/usr/bin/docker exec {container_name} sh -c 'apt-get update; apt-get install -y openssh-server; '"
-            await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Installing openssh-server now.",
-                log_extra=log_extra,
-                raise_exception=False
-            )
-
-        # Step 2: start SSH service
-        # logger.info(_m("Starting SSH service", extra={**log_extra, "container_name": container_name}))
-        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A; mkdir -p /root/.ssh; chmod 700 /root/.ssh; service ssh start;'"
+        # Always install openssh-server (idempotent - apt will skip if already installed)
+        command = f"/usr/bin/docker exec {container_name} sh -c 'apt-get update && apt-get install -y openssh-server'"
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
             log_tag=log_tag,
-            log_text="Starting SSH service",
+            log_text="Installing openssh-server",
+            log_extra=log_extra,
+            raise_exception=False
+        )
+
+        # Start SSH service
+        # logger.info(_m("Starting SSH service", extra={**log_extra, "container_name": container_name}))
+        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A && mkdir -p /run/sshd && mkdir -p /root/.ssh && chmod 700 /root/.ssh && /usr/sbin/sshd'"
+        await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Starting SSH daemon",
             log_extra=log_extra,
             raise_exception=False
         )
