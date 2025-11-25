@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Annotated
 
+import aiohttp
 from asyncssh import SSHKey
 import asyncssh
 import bittensor
@@ -20,6 +22,7 @@ from datura.requests.validator_requests import (
     SSHPubKeyRemoveRequest,
     SSHPubKeySubmitRequest,
     GetPodLogsRequest,
+    AuthenticationPayload,
 )
 from fastapi import Depends
 from clients.validator_portal_api import ValidatorPortalAPI
@@ -88,6 +91,10 @@ class MinerService:
         payload: MinerJobRequestPayload,
         encrypted_files: MinerJobEnryptedFiles,
     ):
+        """Request job to miner - uses REST API if configured, otherwise WebSocket."""
+        if settings.USE_REST_API:
+            return await self._request_job_to_miner(payload, encrypted_files)
+        
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
@@ -348,6 +355,10 @@ class MinerService:
             )
 
     async def handle_container(self, payload: ContainerBaseRequest):
+        """Handle container request - uses REST API if configured, otherwise WebSocket."""
+        if settings.USE_REST_API:
+            return await self._handle_container(payload)
+        
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
@@ -643,6 +654,10 @@ class MinerService:
             )
 
     async def get_pod_logs(self, payload: GetPodLogsRequestFromServer) -> PodLogsResponseToServer:
+        """Get pod logs - uses REST API if configured, otherwise WebSocket."""
+        if settings.USE_REST_API:
+            return await self._get_pod_logs(payload)
+        
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
@@ -745,6 +760,10 @@ class MinerService:
             )
 
     async def add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
+        """Add debug SSH key - uses REST API if configured, otherwise WebSocket."""
+        if settings.USE_REST_API:
+            return await self._add_debug_ssh_key(payload)
+        
         loop = asyncio.get_event_loop()
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
@@ -952,5 +971,693 @@ class MinerService:
                 "> /root/app/restore_storage.log 2>&1 &"
             ]
             await ssh_client.run(" ".join(commands), timeout=50, check=True)
+
+    def _generate_auth_headers(self, my_key: bittensor.Keypair, miner_hotkey: str) -> dict:
+        """Generate authentication headers for REST API requests."""
+        payload = AuthenticationPayload(
+            validator_hotkey=my_key.ss58_address,
+            miner_hotkey=miner_hotkey,
+            timestamp=int(time.time()),
+        )
+        signature = f"0x{my_key.sign(payload.blob_for_signing()).hex()}"
+        
+        return {
+            "X-Validator-Hotkey": my_key.ss58_address,
+            "X-Miner-Hotkey": miner_hotkey,
+            "X-Timestamp": str(payload.timestamp),
+            "X-Signature": signature,
+        }
+
+    def _serialize_request(self, request) -> dict:
+        """Serialize a Pydantic request model to dict for JSON serialization.
+        
+        Handles bytes fields by ensuring they're properly encoded.
+        """
+        # Use model_dump_json and parse back to ensure proper serialization
+        # This handles bytes fields correctly (base64 encoding)
+        return json.loads(request.model_dump_json())
+
+    async def _request_job_to_miner(
+        self,
+        payload: MinerJobRequestPayload,
+        encrypted_files: MinerJobEnryptedFiles,
+    ):
+        """REST API version of request_job_to_miner."""
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        default_extra = {
+            "job_batch_id": payload.job_batch_id,
+            "miner_hotkey": payload.miner_hotkey,
+            "miner_address": payload.miner_address,
+            "miner_port": payload.miner_port,
+        }
+
+        try:
+            logger.info(_m("Requesting job to miner via REST API", extra=get_extra_info(default_extra)))
+            
+            # Generate SSH key
+            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            
+            # Prepare request
+            ssh_request = SSHPubKeySubmitRequest(
+                public_key=public_key,
+                miner_hotkey=payload.miner_hotkey,
+            )
+            
+            # Make REST API call
+            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
+            headers["Content-Type"] = "application/json"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{base_url}/api/validator/ssh-pubkey-submit",
+                    json=self._serialize_request(ssh_request),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=JOB_LENGTH),
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(
+                            _m(
+                                "Failed to submit SSH key via REST API",
+                                extra=get_extra_info({**default_extra, "status": response.status, "error": error_text}),
+                            )
+                        )
+                        return None
+                    
+                    response_data = await response.json()
+                    msg = AcceptSSHKeyRequest.model_validate(response_data) if "executors" in response_data else FailedRequest.model_validate(response_data)
+            
+            if isinstance(msg, AcceptSSHKeyRequest):
+                logger.info(
+                    _m(
+                        "Received AcceptSSHKeyRequest for miner via REST API. Running tasks for executors",
+                        extra=get_extra_info(
+                            {**default_extra, "executors": len(msg.executors)}
+                        ),
+                    ),
+                )
+                if len(msg.executors) == 0:
+                    return None
+
+                tasks = [
+                    asyncio.create_task(
+                        asyncio.wait_for(
+                            self.task_service.create_task(
+                                miner_info=payload,
+                                executor_info=executor_info,
+                                keypair=my_key,
+                                private_key=private_key.decode("utf-8"),
+                                public_key=public_key.decode("utf-8"),
+                                encrypted_files=encrypted_files,
+                            ),
+                            timeout=settings.JOB_TIME_OUT - 120
+                        )
+                    )
+                    for executor_info in msg.executors
+                ]
+
+                results = [
+                    result
+                    for result in await asyncio.gather(*tasks, return_exceptions=True)
+                    if result and not isinstance(result, Exception) and not isinstance(result, BaseException)
+                ]
+
+                logger.info(
+                    _m(
+                        "Finished running tasks for executors",
+                        extra=get_extra_info({**default_extra, "executors": len(results)}),
+                    ),
+                )
+
+                # Remove SSH key
+                try:
+                    remove_request = SSHPubKeyRemoveRequest(
+                        public_key=public_key,
+                        miner_hotkey=payload.miner_hotkey
+                    )
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{base_url}/api/validator/ssh-pubkey-remove",
+                            json=self._serialize_request(remove_request),
+                            headers=self._generate_auth_headers(my_key, payload.miner_hotkey),
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as resp:
+                            if resp.status != 200:
+                                logger.warning(
+                                    _m(
+                                        "Failed to send SSHPubKeyRemoveRequest via REST API (non-critical)",
+                                        extra=get_extra_info({
+                                            **default_extra,
+                                            "status": resp.status,
+                                        }),
+                                    ),
+                                )
+                except Exception as e:
+                    logger.warning(
+                        _m(
+                            "Failed to send SSHPubKeyRemoveRequest via REST API (non-critical)",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "error": _get_error_details(e),
+                            }),
+                        ),
+                    )
+
+                return {
+                    "miner_hotkey": payload.miner_hotkey,
+                    "miner_coldkey": payload.miner_coldkey,
+                    "results": results,
+                }
+            elif isinstance(msg, FailedRequest):
+                logger.warning(
+                    _m(
+                        "Requesting job failed for miner via REST API",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                    ),
+                )
+                return None
+            else:
+                logger.error(
+                    _m(
+                        "Unexpected response from miner via REST API",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                    ),
+                )
+                return None
+        except asyncio.CancelledError:
+            logger.error(
+                _m("Requesting job to miner via REST API was cancelled", extra=get_extra_info(default_extra)),
+            )
+            return None
+        except asyncio.TimeoutError:
+            logger.error(
+                _m("Requesting job to miner via REST API was timed out", extra=get_extra_info(default_extra)),
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                _m(
+                    "Requesting job to miner via REST API resulted in an exception",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error": _get_error_details(e),
+                    }),
+                ),
+            )
+            return None
+
+    async def _handle_container(self, payload: ContainerBaseRequest):
+        """REST API version of handle_container."""
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_id": payload.executor_id,
+            "pod_id": payload.pod_id,
+            "executor_ip": payload.miner_address,
+            "executor_port": payload.miner_port,
+            "container_request_type": str(payload.message_type),
+        }
+
+        docker_service = DockerService(
+            ssh_service=self.ssh_service,
+            redis_service=self.redis_service,
+            port_mapping_dao=self.port_mapping_dao
+        )
+
+        try:
+            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
+            headers["Content-Type"] = "application/json"
+            
+            # Generate SSH key and send it to miner
+            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+
+            ssh_request = SSHPubKeySubmitRequest(
+                public_key=public_key,
+                executor_id=payload.executor_id,
+                is_rental_request=isinstance(payload, ContainerCreateRequest),
+                miner_hotkey=payload.miner_hotkey
+            )
+
+            logger.info(
+                _m("Sent SSH key to miner via REST API.", extra=get_extra_info(default_extra)),
+            )
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{base_url}/api/validator/ssh-pubkey-submit",
+                    json=self._serialize_request(ssh_request),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=JOB_LENGTH),
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        return self._handle_container_error(
+                            payload=payload,
+                            msg=f"Failed to submit SSH key: {error_text}",
+                            error_code=FailedContainerErrorCodes.FailedMsgFromMiner,
+                        )
+                    
+                    response_data = await response.json()
+                    msg = AcceptSSHKeyRequest.model_validate(response_data) if "executors" in response_data else FailedRequest.model_validate(response_data)
+
+            if isinstance(msg, AcceptSSHKeyRequest):
+                logger.info(
+                    _m(
+                        "Received AcceptSSHKeyRequest via REST API",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                    ),
+                )
+
+                try:
+                    executor = msg.executors[0]
+                except Exception as e:
+                    executor = None
+
+                if executor is None or executor.uuid != payload.executor_id:
+                    log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+
+                    # Remove SSH key
+                    remove_request = SSHPubKeyRemoveRequest(
+                        public_key=public_key, 
+                        executor_id=payload.executor_id, 
+                        miner_hotkey=payload.miner_hotkey
+                    )
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{base_url}/api/validator/ssh-pubkey-remove",
+                            json=self._serialize_request(remove_request),
+                            headers=self._generate_auth_headers(my_key, payload.miner_hotkey),
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ):
+                            pass
+
+                    if executor:
+                        logger.info(
+                            _m(
+                                "Remove rented machine from redis",
+                                extra=get_extra_info(default_extra),
+                            ),
+                        )
+                        await self.redis_service.remove_rented_machine(executor)
+
+                    return self._handle_container_error(
+                        payload=payload,
+                        msg=str(log_text),
+                        error_code=FailedContainerErrorCodes.InvalidExecutorId
+                    )
+
+                renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id)
+                if renting_in_progress:
+                    log_text = _m(
+                        "Decline renting pod request. Renting is still in progress",
+                        extra=get_extra_info(default_extra),
+                    )
+
+                    remove_request = SSHPubKeyRemoveRequest(
+                        public_key=public_key, 
+                        executor_id=payload.executor_id, 
+                        miner_hotkey=payload.miner_hotkey
+                    )
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{base_url}/api/validator/ssh-pubkey-remove",
+                            json=self._serialize_request(remove_request),
+                            headers=self._generate_auth_headers(my_key, payload.miner_hotkey),
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ):
+                            pass
+
+                    return self._handle_container_error(
+                        payload=payload,
+                        msg=str(log_text),
+                        error_code=FailedContainerErrorCodes.RentingInProgress,
+                    )
+
+                # Get private key for ssh connection - asyncssh
+                ssh_pkey = asyncssh.import_private_key(
+                    self.ssh_service.decrypt_payload(
+                        my_key.ss58_address, private_key.decode("utf-8")
+                    )
+                )
+
+                # Handle different container request types
+                result = None
+                if isinstance(payload, ContainerCreateRequest):
+                    logger.info(
+                        _m(
+                            "Creating container",
+                            extra=get_extra_info(
+                                {**default_extra, "payload": str(payload)}
+                            ),
+                        ),
+                    )
+                    result = await docker_service.create_container(
+                        payload,
+                        executor,
+                        my_key,
+                        private_key.decode("utf-8"),
+                    )
+                elif isinstance(payload, ContainerDeleteRequest):
+                    logger.info(
+                        _m(
+                            "Deleting container",
+                            extra=get_extra_info(
+                                {**default_extra, "payload": str(payload)}
+                            ),
+                        ),
+                    )
+                    result = await docker_service.delete_container(
+                        payload,
+                        executor,
+                        my_key,
+                        private_key.decode("utf-8"),
+                    )
+                elif isinstance(payload, AddSshPublicKeyRequest):
+                    logger.info(
+                        _m(
+                            "adding ssh key to container",
+                            extra=get_extra_info(
+                                {**default_extra, "payload": str(payload)}
+                            ),
+                        ),
+                    )
+                    result = await docker_service.add_ssh_key(
+                        payload,
+                        executor,
+                        my_key,
+                        private_key.decode("utf-8"),
+                    )
+                elif isinstance(payload, RemoveSshPublicKeysRequest):
+                    result = await docker_service.remove_ssh_keys(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, InstallJupyterServerRequest):
+                    result = await docker_service.install_jupyter_server(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, BackupContainerRequest):
+                    result = await self.handle_backup_container_req(executor, payload, ssh_pkey)
+                elif isinstance(payload, RestoreContainerRequest):
+                    result = await self.handle_restore_container_req(executor, payload, ssh_pkey)
+                else:
+                    log_text = _m(
+                        "Unexpected request",
+                        extra=get_extra_info(
+                            {**default_extra, "payload": str(payload)}
+                        ),
+                    )
+                    return self._handle_container_error(
+                        payload=payload,
+                        msg=str(log_text),
+                        error_code=FailedContainerErrorCodes.UnknownError,
+                    )
+
+                # Remove SSH key after operation
+                remove_request = SSHPubKeyRemoveRequest(
+                    public_key=public_key,
+                    executor_id=payload.executor_id,
+                    miner_hotkey=payload.miner_hotkey
+                )
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{base_url}/api/validator/ssh-pubkey-remove",
+                        json=remove_request.model_dump(mode="json"),
+                        headers=self._generate_auth_headers(my_key, payload.miner_hotkey),
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ):
+                        pass
+
+                return result
+
+            elif isinstance(msg, FailedRequest):
+                log_text = _m(
+                    "Error: Miner failed job",
+                    extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                )
+
+                return self._handle_container_error(
+                    payload=payload,
+                    msg=str(log_text),
+                    error_code=FailedContainerErrorCodes.FailedMsgFromMiner,
+                )
+            else:
+                log_text = _m(
+                    "Error: Unexpected msg",
+                    extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                )
+
+                return self._handle_container_error(
+                    payload=payload,
+                    msg=str(log_text),
+                    error_code=FailedContainerErrorCodes.UnknownError,
+                )
+        except Exception as e:
+            log_text = _m(
+                "Resulted in an exception",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            return self._handle_container_error(
+                payload=payload,
+                msg=str(log_text),
+                error_code=FailedContainerErrorCodes.ExceptionError,
+            )
+
+    async def _get_pod_logs(self, payload: GetPodLogsRequestFromServer) -> PodLogsResponseToServer:
+        """REST API version of get_pod_logs."""
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
+            "executor_id": payload.executor_id,
+            "executor_ip": payload.miner_address,
+            "executor_port": payload.miner_port,
+            "container_name": payload.container_name,
+        }
+
+        try:
+            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
+            headers["Content-Type"] = "application/json"
+            
+            logs_request = GetPodLogsRequest(
+                container_name=payload.container_name,
+                pod_id=payload.pod_id,
+                executor_id=payload.executor_id, 
+                miner_hotkey=payload.miner_hotkey,
+            )
+
+            logger.info(
+                _m("Getting logs from executor via REST API", extra=get_extra_info(default_extra)),
+            )
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{base_url}/api/validator/pod-logs",
+                    json=self._serialize_request(logs_request),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=JOB_LENGTH),
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        log_text = _m(
+                            "Error: FailedRequest",
+                            extra=get_extra_info({**default_extra, "error": error_text}),
+                        )
+                        logger.error(log_text)
+                        return FailedGetPodLogs(
+                            miner_hotkey=payload.miner_hotkey,
+                            pod_id=payload.pod_id,
+                            executor_id=payload.executor_id,
+                            container_name=payload.container_name,
+                            msg=str(log_text),
+                        )
+                    
+                    response_data = await response.json()
+                    msg = PodLogsResponse.model_validate(response_data) if "logs" in response_data else FailedRequest.model_validate(response_data)
+
+            if isinstance(msg, PodLogsResponse):
+                logger.info(
+                    _m(
+                        "Pod Log result via REST API",
+                        extra=get_extra_info({**default_extra, "logs": len(msg.logs)}),
+                    )
+                )
+                return PodLogsResponseToServer(
+                    miner_hotkey=payload.miner_hotkey,
+                    pod_id=payload.pod_id,
+                    executor_id=payload.executor_id,
+                    container_name=payload.container_name,
+                    logs=msg.logs
+                )
+
+            elif isinstance(msg, FailedRequest):
+                log_text = _m(
+                    "Error: FailedRequest",
+                    extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                )
+                logger.error(log_text)
+
+                return FailedGetPodLogs(
+                    miner_hotkey=payload.miner_hotkey,
+                    pod_id=payload.pod_id,
+                    executor_id=payload.executor_id,
+                    container_name=payload.container_name,
+                    msg=str(log_text),
+                )
+
+            else:
+                log_text = _m(
+                    "Error: Unexpected msg",
+                    extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                )
+                logger.error(log_text)
+
+                return FailedGetPodLogs(
+                    miner_hotkey=payload.miner_hotkey,
+                    pod_id=payload.pod_id,
+                    executor_id=payload.executor_id,
+                    container_name=payload.container_name,
+                    msg=str(log_text),
+                )
+
+        except Exception as e:
+            log_text = _m(
+                "Resulted in an exception",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text)
+
+            return FailedGetPodLogs(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                container_name=payload.container_name,
+                msg=str(log_text),
+            )
+
+    async def _add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
+        """REST API version of add_debug_ssh_key."""
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        default_extra = {
+            "miner_hotkey": payload.miner_hotkey,
+            "executor_id": payload.executor_id,
+            "executor_ip": payload.miner_address,
+            "executor_port": payload.miner_port,
+        }
+
+        try:
+            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
+            headers["Content-Type"] = "application/json"
+            
+            ssh_request = SSHPubKeySubmitRequest(
+                public_key=payload.public_key,
+                executor_id=payload.executor_id,
+                is_rental_request=False,
+                miner_hotkey=payload.miner_hotkey,
+            )
+
+            logger.info(
+                _m("Sent SSH key to miner via REST API.", extra=get_extra_info(default_extra)),
+            )
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{base_url}/api/validator/ssh-pubkey-submit",
+                    json=self._serialize_request(ssh_request),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=JOB_LENGTH),
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        log_text = _m(
+                            "Error: Failed to add debug public key",
+                            extra=get_extra_info({**default_extra, "error": error_text}),
+                        )
+                        logger.error(log_text)
+                        return FailedAddDebugSshKey(
+                            miner_hotkey=payload.miner_hotkey,
+                            executor_id=payload.executor_id,
+                            msg=str(log_text),
+                        )
+                    
+                    response_data = await response.json()
+                    msg = AcceptSSHKeyRequest.model_validate(response_data) if "executors" in response_data else FailedRequest.model_validate(response_data)
+
+            if isinstance(msg, AcceptSSHKeyRequest):
+                logger.info(
+                    _m(
+                        "Received AcceptSSHKeyRequest via REST API",
+                        extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                    ),
+                )
+
+                try:
+                    executor = msg.executors[0]
+                except Exception as e:
+                    executor = None
+
+                if executor is None or executor.uuid != payload.executor_id:
+                    log_text = _m("Error: Invalid executor id", extra=get_extra_info(default_extra))
+                    logger.error(log_text)
+
+                    remove_request = SSHPubKeyRemoveRequest(
+                        public_key=payload.public_key, 
+                        executor_id=payload.executor_id,
+                        miner_hotkey=payload.miner_hotkey
+                    )
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{base_url}/api/validator/ssh-pubkey-remove",
+                            json=self._serialize_request(remove_request),
+                            headers=self._generate_auth_headers(my_key, payload.miner_hotkey),
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ):
+                            pass
+
+                    return FailedAddDebugSshKey(
+                        miner_hotkey=payload.miner_hotkey,
+                        executor_id=payload.executor_id,
+                        msg=str(log_text),
+                    )
+
+                logger.info(
+                    _m(
+                        "Added debug public key",
+                        extra=get_extra_info(default_extra),
+                    ),
+                )
+
+                return DebugSshKeyAdded(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    address=executor.address,
+                    port=executor.port,
+                    ssh_username=executor.ssh_username,
+                    ssh_port=executor.ssh_port,
+                )
+
+            else:
+                log_text = _m(
+                    "Error: Failed to add debug public key",
+                    extra=get_extra_info({**default_extra, "msg": str(msg)}),
+                )
+                logger.error(log_text)
+
+                return FailedAddDebugSshKey(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    msg=str(log_text),
+                )
+
+        except Exception as e:
+            log_text = _m(
+                "Resulted in an exception",
+                extra=get_extra_info({**default_extra, "error": str(e)}),
+            )
+            logger.error(log_text, exc_info=True)
+
+            return FailedAddDebugSshKey(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                msg=str(log_text),
+            )
 
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]

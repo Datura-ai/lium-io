@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [
         "NVIDIA B200"
     ]
+    
+    # Use REST API instead of WebSocket for miner communication
+    USE_REST_API: bool = Field(env="USE_REST_API", default=False)
 
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
