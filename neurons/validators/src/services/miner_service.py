@@ -57,6 +57,16 @@ from services.task_service import TaskService, JobResult
 logger = logging.getLogger(__name__)
 
 
+def _get_error_details(error: Exception) -> str:
+    """Extract exception details. For RetryError unwraps the underlying exception."""
+    last_attempt = getattr(error, 'last_attempt', None)
+    if last_attempt:
+        last_exc = last_attempt.exception()
+        if last_exc:
+            return f"RetryError, {type(last_exc).__name__}: {str(last_exc)}"
+    return f"{type(error).__name__}: {str(error)}"
+
+
 JOB_LENGTH = 30
 
 
@@ -174,10 +184,21 @@ class MinerService:
                         ),
                     )
 
-                    await miner_client.send_model(SSHPubKeyRemoveRequest(
-                        public_key=public_key, 
-                        miner_hotkey=payload.miner_hotkey
-                    ))
+                    try:
+                        await miner_client.send_model(SSHPubKeyRemoveRequest(
+                            public_key=public_key,
+                            miner_hotkey=payload.miner_hotkey
+                        ))
+                    except Exception as e:
+                        logger.warning(
+                            _m(
+                                "Failed to send SSHPubKeyRemoveRequest (non-critical)",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "error": _get_error_details(e),
+                                }),
+                            ),
+                        )
 
                     return {
                         "miner_hotkey": payload.miner_hotkey,
@@ -222,7 +243,10 @@ class MinerService:
             logger.error(
                 _m(
                     "Requesting job to miner resulted in an exception",
-                    extra=get_extra_info({**default_extra, "error": str(e)}),
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error": _get_error_details(e),
+                    }),
                 ),
             )
             return None
