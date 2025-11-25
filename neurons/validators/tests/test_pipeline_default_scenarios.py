@@ -197,7 +197,7 @@ class DummyVerifyXService:
             "success": True,
             "ram": 128000,
             "hard_disk": 1000000,
-            "network": 10000,
+            "network": {"download_speed": 10000},
         }
         result.error = None
         return result

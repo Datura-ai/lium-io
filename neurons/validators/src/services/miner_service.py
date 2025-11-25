@@ -57,6 +57,16 @@ from services.task_service import TaskService, JobResult
 logger = logging.getLogger(__name__)
 
 
+def _get_error_details(error: Exception) -> str:
+    """Extract exception details. For RetryError unwraps the underlying exception."""
+    last_attempt = getattr(error, 'last_attempt', None)
+    if last_attempt:
+        last_exc = last_attempt.exception()
+        if last_exc:
+            return f"RetryError, {type(last_exc).__name__}: {str(last_exc)}"
+    return f"{type(error).__name__}: {str(error)}"
+
+
 JOB_LENGTH = 30
 
 
@@ -155,7 +165,7 @@ class MinerService:
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
                                 ),
-                                timeout=settings.JOB_TIME_OUT - 60
+                                timeout=settings.JOB_TIME_OUT - 120
                             )
                         )
                         for executor_info in msg.executors
@@ -174,10 +184,21 @@ class MinerService:
                         ),
                     )
 
-                    await miner_client.send_model(SSHPubKeyRemoveRequest(
-                        public_key=public_key, 
-                        miner_hotkey=payload.miner_hotkey
-                    ))
+                    try:
+                        await miner_client.send_model(SSHPubKeyRemoveRequest(
+                            public_key=public_key,
+                            miner_hotkey=payload.miner_hotkey
+                        ))
+                    except Exception as e:
+                        logger.warning(
+                            _m(
+                                "Failed to send SSHPubKeyRemoveRequest (non-critical)",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "error": _get_error_details(e),
+                                }),
+                            ),
+                        )
 
                     return {
                         "miner_hotkey": payload.miner_hotkey,
@@ -222,7 +243,10 @@ class MinerService:
             logger.error(
                 _m(
                     "Requesting job to miner resulted in an exception",
-                    extra=get_extra_info({**default_extra, "error": str(e)}),
+                    extra=get_extra_info({
+                        **default_extra,
+                        "error": _get_error_details(e),
+                    }),
                 ),
             )
             return None
@@ -234,11 +258,13 @@ class MinerService:
         default_extra = {
             "miner_hotkey": miner_hotkey,
         }
+        if not results:
+            return
 
         logger.info(
             _m(
                 "Publishing machine specs to compute app connector process",
-                extra=get_extra_info({**default_extra, "results": len(results)}),
+                extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
             ),
         )
         for result in results:
@@ -280,6 +306,7 @@ class MinerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=error_code,
@@ -289,6 +316,7 @@ class MinerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=error_code,
@@ -297,6 +325,7 @@ class MinerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=error_code,
@@ -305,12 +334,14 @@ class MinerService:
             return JupyterInstallationFailed(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
             )
         else:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.UnknownRequest,
                 error_code=error_code,
@@ -322,6 +353,7 @@ class MinerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_id": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip": payload.miner_address,
             "executor_port": payload.miner_port,
             "container_request_type": str(payload.message_type),
@@ -615,6 +647,7 @@ class MinerService:
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_id": payload.executor_id,
             "executor_ip": payload.miner_address,
             "executor_port": payload.miner_port,
@@ -636,7 +669,8 @@ class MinerService:
                 # generate ssh key and send it to miner
                 await miner_client.send_model(
                     GetPodLogsRequest(
-                        container_name=payload.container_name, 
+                        container_name=payload.container_name,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id, 
                         miner_hotkey=payload.miner_hotkey,
                     )
@@ -660,6 +694,7 @@ class MinerService:
                     )
                     return PodLogsResponseToServer(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         logs=msg.logs
@@ -674,6 +709,7 @@ class MinerService:
 
                     return FailedGetPodLogs(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         msg=str(log_text),
@@ -688,6 +724,7 @@ class MinerService:
 
                     return FailedGetPodLogs(
                         miner_hotkey=payload.miner_hotkey,
+                        pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
                         msg=str(log_text),
@@ -853,7 +890,7 @@ class MinerService:
 
             commands = [
                 "nohup",
-                "/usr/bin/python",
+                executor_info.python_path,
                 "/root/app/backup_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--source-volume", payload.source_volume,
@@ -900,7 +937,7 @@ class MinerService:
 
             commands = [
                 "nohup",
-                "/usr/bin/python",
+                executor_info.python_path,
                 "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL,
                 "--target-volume", payload.target_volume,

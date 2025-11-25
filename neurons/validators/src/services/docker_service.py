@@ -10,6 +10,7 @@ import secrets
 import aiohttp
 import asyncssh
 import bittensor
+import redis.exceptions
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
@@ -33,6 +34,7 @@ from payload_models.payloads import (
     JupyterServerInstalled,
     JupyterInstallationFailed,
     CustomOptions,
+    ContainerWarningCode,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -40,7 +42,6 @@ from core.utils import _m, get_extra_info, retry_ssh_command
 from daos.port_mapping_dao import PortMappingDao
 from services.const import PREFERRED_POD_PORTS, MIN_PORT_COUNT
 from services.redis_service import (
-    AVAILABLE_PORT_MAPS_PREFIX,
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
@@ -52,7 +53,7 @@ logger = logging.getLogger(__name__)
 REPOSITORIES = [
     "daturaai/compute-subnet-executor:latest",
     "daturaai/compute-subnet-executor-runner:latest",
-    "containrrr/watchtower:1.7.1",
+    "nickfedor/watchtower",
     "daturaai/pytorch",
     "daturaai/ubuntu",
 ]
@@ -83,118 +84,92 @@ class DockerService:
         self,
         miner_hotkey: str,
         executor_id: str,
+        pod_id: UUID,
         internal_ports: list[int] | None = None,
         initial_port_count: int | None = None,
         enable_jupyter: bool | None = False,
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
-        available_ports = await self._get_available_ports(executor_id, miner_hotkey)
+        executor_uuid = UUID(executor_id)
 
-        if len(available_ports) < MIN_PORT_COUNT:
+        try:
+            # Use distributed lock to prevent race conditions when allocating ports
+            async with self.redis_service.acquire_executor_lock(executor_id):
+                available_ports = await self.port_mapping_dao.get_available_ports_excluding_rented(executor_uuid)
+                pod_mapping = await self.port_mapping_dao.get_ports_for_pod(pod_id)
+
+                if not pod_mapping and len(available_ports) < MIN_PORT_COUNT:
+                    logger.warning(
+                        f"Insufficient ports in database ({len(available_ports)}/{MIN_PORT_COUNT}), "
+                        f"falling back to Redis for executor {executor_id}"
+                    )
+                    return [], None
+
+                mappings = []
+                reused_count = 0
+                ssh_port = 22
+                jupyter_port = 8888
+                jupyter_port_map: tuple[int, int] | None = None
+
+                user_defined = bool(internal_ports)
+                docker_internal_ports = internal_ports or self._get_preferred_ports(initial_port_count)
+                if ssh_port in docker_internal_ports:
+                    docker_internal_ports.remove(ssh_port)
+                docker_internal_ports.insert(0, ssh_port)
+
+                if enable_jupyter:
+                    if jupyter_port in docker_internal_ports:
+                        docker_internal_ports.remove(jupyter_port)
+                    docker_internal_ports.insert(1, jupyter_port)
+
+                for port in docker_internal_ports:
+                    if port in pod_mapping:
+                        port_mapping = pod_mapping[port]
+                        mappings.append((port, port_mapping.internal_port, port_mapping.external_port))
+                        reused_count += 1
+                        continue
+
+                    if not len(available_ports):
+                        break
+
+                    if port in available_ports:
+                        docker_port = port
+                        external_port = port
+                    elif port == ssh_port or port == jupyter_port:
+                        docker_port = port
+                        external_port = max(available_ports.keys())
+                    else:
+                        external_port = random.choice(list(available_ports.keys())) if user_defined else min(available_ports.keys())
+                        docker_port = port if user_defined else external_port
+
+                    port_mapping = available_ports.pop(external_port)
+                    mappings.append((docker_port, port_mapping.internal_port, external_port))
+
+                allocated_count = len(mappings) - reused_count
+                logger.info(
+                    f"Generated {len(mappings)} port mappings for pod {pod_id}: "
+                    f"reused={reused_count}, allocated={allocated_count}, executor={executor_id}"
+                )
+
+                if enable_jupyter:
+                    mapping = self._find_mapping_by_docker_port(mappings, jupyter_port)
+                    if mapping:
+                        jupyter_port_map = (mapping[0], mapping[2])
+
+                await self.port_mapping_dao.reserve_ports_for_pod(executor_uuid, mappings, pod_id)
+
+                return mappings, jupyter_port_map
+
+        except (redis.exceptions.LockError, redis.exceptions.LockNotOwnedError) as e:
+            logger.error(
+                f"Failed to acquire or maintain lock for executor {executor_id} during port mapping generation: {e}",
+                exc_info=True
+            )
+            # Return empty result to signal failure - caller should handle this case
             return [], None
-
-        mappings = []
-        ssh_port = 22
-        jupyter_port = 8888
-        jupyter_port_map: tuple[int, int] | None = None
-        
-        user_defined = bool(internal_ports)
-        docker_internal_ports = internal_ports or self._get_preferred_ports(initial_port_count)
-        if ssh_port in docker_internal_ports:
-            docker_internal_ports.remove(ssh_port)
-        docker_internal_ports.insert(0, ssh_port)
-            
-        if enable_jupyter:
-            if jupyter_port in docker_internal_ports:
-                docker_internal_ports.remove(jupyter_port)
-            docker_internal_ports.insert(1, jupyter_port)
-
-        for port in docker_internal_ports:
-            if not len(available_ports):
-                break
-
-            if port in available_ports:
-                docker_port = port
-                external_port = port
-            elif port == ssh_port or port == jupyter_port:
-                docker_port = port
-                external_port = max(available_ports.keys())
-            else:
-                external_port = random.choice(list(available_ports.keys())) if user_defined else min(available_ports.keys())
-                docker_port = port if user_defined else external_port
-                
-            port_mapping = available_ports.pop(external_port)
-            mappings.append((docker_port, port_mapping.internal_port, external_port))
-
-        logger.info(
-            f"Generated {len(mappings)} port mappings from database for executor {executor_id}"
-        )
-
-        if enable_jupyter:
-            mapping = self._find_mapping_by_docker_port(mappings, jupyter_port)
-            if mapping:
-                jupyter_port_map = (mapping[0], mapping[2])
-
-        return mappings, jupyter_port_map
 
     def _find_mapping_by_docker_port(self, mappings: list[tuple[int, int, int]], docker_port: int) -> tuple[int, int, int] | None:
         """Find a port mapping by docker port number."""
         return next((m for m in mappings if m[0] == docker_port), None)
-
-    async def _get_available_ports(self, executor_id: str, miner_hotkey: str) -> dict[int, PortMapping]:
-        try:
-            # Get successful ports from database as dict {external_port: PortMapping}
-            available_ports = await self.port_mapping_dao.get_successful_ports(UUID(executor_id))
-
-            if len(available_ports) >= MIN_PORT_COUNT:
-                return available_ports
-
-            logger.warning(
-                f"Insufficient ports in database ({len(available_ports)}/{MIN_PORT_COUNT}), "
-                f"falling back to Redis for executor {executor_id}"
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to fetch port mappings from database for executor {executor_id}: {e}",
-                exc_info=True
-            )
-
-        # Fallback to Redis
-        return await self.generate_port_mapping_from_redis(miner_hotkey, executor_id)
-
-    async def generate_port_mapping_from_redis(self, miner_hotkey: str, executor_id: str) -> dict[int, PortMapping]:
-        mappings: dict[int, PortMapping] = {}
-        try:
-            key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{miner_hotkey}:{executor_id}"
-            available_port_maps = await self.redis_service.lrange(key)
-
-            logger.info(f"available_port_maps: {key}, {available_port_maps}")
-            for available_port_map in available_port_maps:
-                internal_port, external_port = map(
-                    int, available_port_map.decode().split(",")
-                )
-                mappings[external_port] = PortMapping(
-                    uuid=uuid4(),
-                    miner_hotkey=miner_hotkey,
-                    executor_id=UUID(executor_id),
-                    internal_port=internal_port,
-                    external_port=external_port,
-                    is_successful=True,
-                    verification_time=datetime.utcnow()
-                )
-            return mappings
-        except Exception as e:
-            logger.error(
-                _m(
-                    "Error generating port mappings from redis",
-                    extra=get_extra_info({
-                        "miner_hotkey": miner_hotkey,
-                        "executor_id": executor_id,
-                        "error": str(e),
-                    }),
-                ),
-                exc_info=True,
-            )
-            return mappings
 
     async def execute_and_stream_logs(
         self,
@@ -205,7 +180,7 @@ class DockerService:
         log_extra: dict = {},
         timeout: int = 0,
         raise_exception: bool = True,
-    ):
+    ) -> tuple[bool, str]:
         logger.info(
             _m(
                 log_text,
@@ -216,14 +191,7 @@ class DockerService:
             ),
         )
 
-        async with self.lock:
-            self.logs_queue.append(
-                {
-                    "log_text": log_text,
-                    "log_status": "success",
-                    "log_tag": log_tag,
-                }
-            )
+        await self.stream_log(log_text, "success", log_tag)
 
         status = True
         error = ''
@@ -236,14 +204,7 @@ class DockerService:
         except asyncio.TimeoutError:
             status = False
             error = "Process timed out"
-            async with self.lock:
-                self.logs_queue.append(
-                    {
-                        "log_text": error,
-                        "log_status": "error",
-                        "log_tag": log_tag,
-                    }
-                )
+            await self.stream_log(error, "error", log_tag)
 
         if not status and raise_exception:
             raise Exception(f"Failed {log_text}. command: {command} error: {error}")
@@ -255,26 +216,12 @@ class DockerService:
         error = ''
 
         async for line in process.stdout:
-            async with self.lock:
-                self.logs_queue.append(
-                    {
-                        "log_text": line.strip(),
-                        "log_status": "success",
-                        "log_tag": log_tag,
-                    }
-                )
+            await self.stream_log(line.strip(), "success", log_tag)
 
         async for line in process.stderr:
-            async with self.lock:
-                status = False
-                error += line.strip() + "\n"
-                self.logs_queue.append(
-                    {
-                        "log_text": line.strip(),
-                        "log_status": "error",
-                        "log_tag": log_tag,
-                    }
-                )
+            status = False
+            error += line.strip() + "\n"
+            await self.stream_log(line.strip(), "error", log_tag)
 
         return status, error
 
@@ -282,10 +229,12 @@ class DockerService:
         self,
         miner_hotkey,
         executor_id,
+        pod_id,
     ):
         default_extra = {
             "miner_hotkey": miner_hotkey,
             "executor_uuid": executor_id,
+            "pod_id": pod_id,
         }
 
         self.is_realtime_logging = True
@@ -305,6 +254,7 @@ class DockerService:
                             "logs": logs_to_process,
                             "miner_hotkey": miner_hotkey,
                             "executor_uuid": executor_id,
+                            "pod_id": pod_id,
                         },
                     )
 
@@ -390,38 +340,25 @@ class DockerService:
         log_tag: str,
         log_extra: dict,
     ) -> None:
-        # Step 1: check openssh-server is installed
-        command = f"/usr/bin/docker exec {container_name} dpkg -l | grep openssh-server"
-        # result = await ssh_client.run(command)
-        status, _ = await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text="Checking openssh-server installed",
-            log_extra=log_extra,
-            raise_exception=False
-        )
-        if not status:
-            # Step 1.1: install if it's not installed in docker container.
-            # logger.info(_m("openssh-server isn't installed in the container. Installing it now.", extra={**log_extra, "container_name": container_name}))
-            command = f"/usr/bin/docker exec {container_name} sh -c 'apt-get update; apt-get install -y openssh-server; '"
-            await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Installing openssh-server now.",
-                log_extra=log_extra,
-                raise_exception=False
-            )
-
-        # Step 2: start SSH service
-        # logger.info(_m("Starting SSH service", extra={**log_extra, "container_name": container_name}))
-        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A; mkdir -p /root/.ssh; chmod 700 /root/.ssh; service ssh start;'"
+        # Always install openssh-server (idempotent - apt will skip if already installed)
+        command = f"/usr/bin/docker exec {container_name} sh -c 'apt-get update && apt-get install -y openssh-server'"
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
             log_tag=log_tag,
-            log_text="Starting SSH service",
+            log_text="Installing openssh-server",
+            log_extra=log_extra,
+            raise_exception=False
+        )
+
+        # Start SSH service
+        # logger.info(_m("Starting SSH service", extra={**log_extra, "container_name": container_name}))
+        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A && mkdir -p /run/sshd && mkdir -p /root/.ssh && chmod 700 /root/.ssh && /usr/sbin/sshd'"
+        await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Starting SSH daemon",
             log_extra=log_extra,
             raise_exception=False
         )
@@ -433,36 +370,47 @@ class DockerService:
         volume_info: ExternalVolumeInfo,
         log_tag: str,
     ):
+        responses = []
         # install docker volume plugin
-        command = f"/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
-        await ssh_client.run(command)
+        command = "/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
+        responses.append(await ssh_client.run(command))
 
         # disable volume plugin
-        command = f"/usr/bin/docker plugin disable s3fs -f"
-        await ssh_client.run(command)
+        command = "/usr/bin/docker plugin disable s3fs -f"
+        responses.append(await ssh_client.run(command))
 
         # set credentials
         command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
-        await ssh_client.run(command)
+        responses.append(await ssh_client.run(command))
 
         # set allow_other option
-        command = f'/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
-        await ssh_client.run(command)
+        command = '/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
+        responses.append(await ssh_client.run(command))
 
         # enable volume plugin
-        command = f"/usr/bin/docker plugin enable s3fs"
-        await ssh_client.run(command)
+        command = "/usr/bin/docker plugin enable s3fs"
+        responses.append(await ssh_client.run(command))
 
         # create volume
         command = f"/usr/bin/docker volume create -d s3fs {volume_info.name}"
-        return await self.execute_and_stream_logs(
+        result = await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
             log_tag=log_tag,
             log_text="Creating docker volume",
             log_extra=log_extra,
-            raise_exception=True
+            raise_exception=False,
         )
+        is_success, message = result
+        if not is_success:
+            responses_text = message
+            for i, r in enumerate(responses):
+                responses_text += f"|Step {i}: exit={r.exit_status}, stdout={r.stdout}, stderr={r.stderr}"
+            logger.warning(_m(f"s3fs_volume failed. {responses_text}",extra=get_extra_info({**log_extra})))
+        else:
+            logger.info(_m("s3fs_volume success", extra=get_extra_info({**log_extra})))
+
+        return result
 
     async def disable_s3fs_volume_plugin(
         self,
@@ -579,11 +527,13 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        warnings = []
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
 
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_uuid": payload.executor_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
@@ -619,7 +569,7 @@ class DockerService:
             custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
             port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
+                payload.miner_hotkey, payload.executor_id, UUID(payload.pod_id), custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
             )
 
             # Add profiler for port mappings generation
@@ -636,6 +586,7 @@ class DockerService:
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
@@ -652,10 +603,14 @@ class DockerService:
                     extra=get_extra_info(default_extra),
                 )
                 logger.error(log_text)
+                
+                # Release ports reserved for this pod
+                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoJupyterPortMapping,
@@ -667,10 +622,14 @@ class DockerService:
                     extra=get_extra_info(default_extra),
                 )
                 logger.error(log_text)
+                
+                # Release ports reserved for this pod
+                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -698,6 +657,7 @@ class DockerService:
                     self.handle_stream_logs(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                     )
                 )
                 # command = f"/usr/bin/docker logout"
@@ -805,19 +765,24 @@ class DockerService:
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
 
                 if external_volume_info:
-                    await self.create_s3fs_volume(
+                    success, msg = await self.create_s3fs_volume(
                         ssh_client=ssh_client,
                         log_extra=default_extra,
                         volume_info=external_volume_info,
                         log_tag=log_tag,
                     )
-                    # Add profiler for docker volume creation
-                    profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
-                    # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
-                    payload.is_sysbox = False
+                    if success:
+                        # Add profiler for docker volume creation
+                        profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                        # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
+                        payload.is_sysbox = False
 
-                    volume_flag += f" -v {external_volume_info.name}:/mnt"
+                        volume_flag += f" -v {external_volume_info.name}:/mnt"
+                    else:
+                        warnings.append(ContainerWarningCode.ExternalVolumeFailed)
+                        profilers.append({"name": "Docker volume creation step failed", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        await self.stream_log("S3 volume setup failed", "error", log_tag)
 
                 container_name = f"container_{uuid}"
 
@@ -874,14 +839,7 @@ class DockerService:
                     ),
                 )
 
-                async with self.lock:
-                    self.logs_queue.append(
-                        {
-                            "log_text": "Created Docker Container",
-                            "log_status": "success",
-                            "log_tag": log_tag,
-                        }
-                    )
+                await self.stream_log("Created Docker Container", "success", log_tag)
 
                 # skip installing ssh service for daturaai images
                 # if payload.docker_image.startswith("daturaai/"):
@@ -963,6 +921,7 @@ class DockerService:
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     container_name=container_name,
                     volume_name=local_volume,
                     port_maps=[
@@ -972,6 +931,7 @@ class DockerService:
                     backup_log_id=payload.backup_log_id,
                     restore_path=payload.restore_path,
                     jupyter_url=jupyter_url,
+                    warnings=warnings,
                 )
         except Exception as e:
             log_text = _m(
@@ -982,13 +942,27 @@ class DockerService:
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
+            
+            # Release ports reserved for this pod
+            await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+    async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
+        async with self.lock:
+            self.logs_queue.append(
+                {
+                    "log_text": log_msg,
+                    "log_status": log_status,
+                    "log_tag": log_tag,
+                }
             )
 
     async def stop_container(
@@ -1087,6 +1061,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1143,6 +1118,9 @@ class DockerService:
 
                 await self.redis_service.remove_rented_machine(executor_info)
 
+                # Release ports reserved for this pod
+                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
+
                 logger.info(
                     _m(
                         "Deleted Docker Container",
@@ -1153,6 +1131,7 @@ class DockerService:
                 return ContainerDeleted(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                 )
         except Exception as e:
             log_text = _m(
@@ -1164,6 +1143,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1179,6 +1159,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1233,6 +1214,7 @@ class DockerService:
                 return JupyterServerInstalled(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     jupyter_url=f"http://{executor_info.address}:{payload.jupyter_port_map[1]}/lab?token={jupyter_token}",
                 )
         except Exception as e:
@@ -1245,6 +1227,7 @@ class DockerService:
             return JupyterInstallationFailed(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
             )
 
@@ -1258,6 +1241,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
+            "pod_id": payload.pod_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1296,6 +1280,7 @@ class DockerService:
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -1332,6 +1317,7 @@ class DockerService:
                 return SshPubKeyRemoved(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -1344,6 +1330,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1358,6 +1345,7 @@ class DockerService:
     ):
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
+            "pod_id": payload.pod_id,
             "executor_uuid": payload.executor_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
@@ -1397,6 +1385,7 @@ class DockerService:
                     return FailedContainerRequest(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
+                        pod_id=payload.pod_id,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -1419,6 +1408,7 @@ class DockerService:
                 return SshPubKeyAdded(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -1431,6 +1421,7 @@ class DockerService:
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,

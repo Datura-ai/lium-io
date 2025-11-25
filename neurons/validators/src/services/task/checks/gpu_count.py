@@ -17,6 +17,13 @@ class GpuCountCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         specs = ctx.state.specs
+        if not specs:
+            event = render_message(
+                Msg.NO_SPECS,
+                ctx=ctx,
+                check_id=self.check_id,
+            )
+            return CheckResult(passed=False, event=event)
         gpu_count = ctx.state.gpu_count
         if gpu_count is None:
             gpu_count = specs.get("gpu", {}).get("count", 0)

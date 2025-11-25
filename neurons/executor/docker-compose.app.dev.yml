@@ -53,7 +53,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /dev/kmsg:/dev/kmsg:ro
     pid: host
-    command: python src/monitor.py
+    command: pdm run src/monitor.py
     environment:
       - DB_URI=postgresql://postgres:password@db:5432/compute-subnet-db
     depends_on:

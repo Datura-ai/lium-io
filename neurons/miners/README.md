@@ -1,5 +1,7 @@
 # Miner
 
+**[Miner Documentation](https://docs.lium.io/bittensor-subnet/miner/overview)**
+
 ## Overview
 
 This miner allows you to contribute your GPU resources to the Compute Subnet and earn compensation for providing computational power. You will run a central miner on a CPU server, which manages multiple executors running on GPU-equipped machines.

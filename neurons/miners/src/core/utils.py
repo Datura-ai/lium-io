@@ -48,11 +48,9 @@ def get_extra_info(extra: dict) -> dict:
 
 
 def configure_logs_of_other_modules():
-    miner_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
-
     logging.basicConfig(
         level=logging.INFO,
-        format=f"Miner: {miner_hotkey} | Name: %(name)s | Time: %(asctime)s | Level: %(levelname)s | File: %(filename)s | Function: %(funcName)s | Line: %(lineno)s | Process: %(process)d | Message: %(message)s",
+        format="%(levelname)-8s %(asctime)s --- %(lineno)-8s [%(name)s] %(funcName)-24s : %(message)s",
     )
 
     sqlalchemy_logger = logging.getLogger("sqlalchemy")
@@ -74,7 +72,7 @@ def configure_logs_of_other_modules():
 
     # Set the formatter for the handler
     handler.setFormatter(
-        CustomFormatter("%(name)s %(asctime)s %(levelname)s %(filename)s %(process)d %(message)s")
+        CustomFormatter("%(name)s %(asctime)s %(levelname)s %(filename)s %(funcName)s %(process)d %(message)s")
     )
 
 
@@ -84,7 +82,7 @@ class StructuredMessage:
         self.extra = extra
 
     def __str__(self):
-        return "%s >>> %s" % (self.message, json.dumps(self.extra))  # noqa
+        return "%s >>> %s" % (self.message, json.dumps(self.extra, default=str))  # noqa
 
 
 _m = StructuredMessage

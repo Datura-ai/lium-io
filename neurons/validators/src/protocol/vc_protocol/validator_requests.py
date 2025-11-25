@@ -79,6 +79,7 @@ class LogStreamRequest(BaseValidatorRequest):
     miner_hotkey: str
     validator_hotkey: str
     executor_uuid: str
+    pod_id: str
     logs: list[dict]
 
 

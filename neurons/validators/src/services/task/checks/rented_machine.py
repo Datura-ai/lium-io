@@ -9,7 +9,6 @@ from ...const import (
     GPU_UTILIZATION_LIMIT,
     MIN_PORT_COUNT,
 )
-from services.redis_service import AVAILABLE_PORT_MAPS_PREFIX
 
 
 def _has_gpu_process_outside_container(container_name: str, processes: Iterable[dict]) -> bool:
@@ -246,7 +245,6 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
 
 async def _compute_port_count(ctx: Context) -> int:
     port_mapping = ctx.services.port_mapping
-    redis_service = ctx.services.redis
     executor_uuid = ctx.executor.uuid
 
     try:
@@ -254,9 +252,4 @@ async def _compute_port_count(ctx: Context) -> int:
     except Exception:
         port_count = 0
 
-    if port_count >= MIN_PORT_COUNT:
-        return port_count
-
-    port_map_key = f"{AVAILABLE_PORT_MAPS_PREFIX}:{ctx.miner_hotkey}:{executor_uuid}"
-    port_maps_bytes = await redis_service.lrange(port_map_key)
-    return len([tuple(map(int, pm.decode().split(","))) for pm in port_maps_bytes])
+    return port_count

@@ -73,7 +73,7 @@ class DummyVerifyXService:
             True,
             True,
             "",
-            {"ram": {"total": "64GB"}, "hard_disk": {"total": "1TB"}, "network": {"speed": "1Gbps"}},
+            {"ram": {"total": "64GB"}, "hard_disk": {"total": "1TB"}, "network": {"download_speed": 1000}},
             True,
             Msg.VERIFY_SUCCESS.reason,
         ),

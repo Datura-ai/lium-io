@@ -1,5 +1,7 @@
 # Validator
 
+**[Validator Documentation](https://docs.lium.io/bittensor-subnet/validator)**
+
 ## System Requirements
 
 For validation, a validator machine will need:

@@ -25,6 +25,19 @@ class MinerPortalAPI:
             "timestamp": str(auth.payload.timestamp),
             "signature": auth.signature,
         }
+        
+        base_log_extra = {
+            "miner_hotkey": miner_hotkey,
+            "executor_id": executor_id,
+            "url": api_url,
+        }
+        
+        logger.info(
+            _m(
+                "Fetching executors from portal",
+                extra=get_extra_info(base_log_extra),
+            ),
+        )
 
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -34,12 +47,12 @@ class MinerPortalAPI:
                         text = await resp.text()
                         logger.error(
                             _m(
-                                "Failed to fetch executors from portal",
+                                "Failed to fetch executors from portal - HTTP error",
                                 extra=get_extra_info(
                                     {
+                                        **base_log_extra,
                                         "status": resp.status,
                                         "body": text,
-                                        "url": api_url,
                                     }
                                 ),
                             )
@@ -51,21 +64,21 @@ class MinerPortalAPI:
                         logger.error(
                             _m(
                                 "Unexpected portal response shape",
-                                extra=get_extra_info({"url": api_url, "type": type(data).__name__}),
+                                extra=get_extra_info({**base_log_extra, "type": type(data).__name__}),
                             )
                         )
                         return []
                     return data
             except asyncio.TimeoutError:
                 logger.error(
-                    _m("Timeout fetching executors from portal", extra=get_extra_info({"url": api_url}))
+                    _m("Timeout fetching executors from portal", extra=get_extra_info(base_log_extra))
                 )
                 return []
             except Exception as e:
                 logger.error(
                     _m(
-                        "Error fetching executors from portal",
-                        extra=get_extra_info({"url": api_url, "error": str(e)}),
+                        "Failed to fetch executors from portal - request exception",
+                        extra=get_extra_info({**base_log_extra, "error": str(e)}),
                     )
                 )
                 return []
