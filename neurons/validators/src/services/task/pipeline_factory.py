@@ -215,7 +215,7 @@ class PipelineFactory:
             ],
         )
 
-    def build_pipeline(self) -> Pipeline:
+    def build_pipeline(self, checks: list[Check]) -> Pipeline:
         """Build a pipeline with the given checks.
 
         Args:
@@ -224,5 +224,4 @@ class PipelineFactory:
         Returns:
             Configured Pipeline ready to run
         """
-        checks = self.build_checks()
         return Pipeline(checks, sink=LoggerSink(logger))
