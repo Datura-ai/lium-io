@@ -1256,13 +1256,9 @@ class MinerService:
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
-                    status = response.status
-                    try:
-                        response_data = await response.json()
-                    except Exception:
-                        response_data = None
-                    return status, response_data
-
+                    response.raise_for_status
+                    response_data = await response.json()
+                    return response.status, response_data
         except asyncio.TimeoutError:
             logger.error(
                 _m(
