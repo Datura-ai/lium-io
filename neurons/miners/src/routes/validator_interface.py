@@ -22,7 +22,6 @@ from consumers.validator_consumer import ValidatorConsumer
 from dependencies.auth import verify_simple_validator_signature, verify_validator_auth_from_headers
 from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
-from services.validator_service import ValidatorService
 
 logger = logging.getLogger(__name__)
 
