@@ -1260,34 +1260,7 @@ class MinerService:
                     try:
                         response_data = await response.json()
                     except Exception:
-                        # If response is not JSON, read as text
-                        response_text = await response.text()
-                        if status != 200:
-                            logger.error(
-                                _m(
-                                    f"REST API {operation_name} failed with non-JSON response",
-                                    extra=get_extra_info({
-                                        **log_extra,
-                                        "status": status,
-                                        "response_text": response_text[:500],  # Limit length
-                                        "url": url,
-                                    }),
-                                ),
-                            )
-                        return status, None
-
-                    if status != 200:
-                        logger.error(
-                            _m(
-                                f"REST API {operation_name} failed",
-                                extra=get_extra_info({
-                                    **log_extra,
-                                    "status": status,
-                                    "response": response_data,
-                                    "url": url,
-                                }),
-                            ),
-                        )
+                        response_data = None
                     return status, response_data
 
         except asyncio.TimeoutError:
