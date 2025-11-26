@@ -130,12 +130,16 @@ async def submit_ssh_pubkey(
                             if resp.status != 200:
                                 logger.error(f"RENTAL_REQUEST_HOOK returned status {resp.status}: {await resp.text()}")
                 except Exception as e:
-                    logger.error(f"Exception in RENTAL_REQUEST_HOOK: {e}")
+                    logger.error(f"Exception in RENTAL_REQUEST_HOOK: {e}", exc_info=True)
         
-        logger.info("Sent AcceptSSHKeyRequest to validator %s via REST API", authenticated_validator)
+        logger.info(
+            "Sent AcceptSSHKeyRequest to validator %s via REST API. Returned executors: %d", 
+            authenticated_validator,
+            len(executors),
+        )
         return AcceptSSHKeyRequest(executors=executors)
     except Exception as e:
-        logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e))
+        logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e), exc_info=True)
         ssh_service.remove_pubkey_from_host(request.public_key)
         return FailedRequest(details=str(e))
 
@@ -168,7 +172,7 @@ async def remove_ssh_pubkey(
         logger.info("Sent SSHKeyRemoved to validator %s via REST API", authenticated_validator)
         return SSHKeyRemoved()
     except Exception as e:
-        logger.error("Failed SSHKeyRemoved request: %s", str(e))
+        logger.error("Failed SSHKeyRemoved request: %s", str(e), exc_info=True)
         return FailedRequest(details=str(e))
 
 
@@ -197,8 +201,8 @@ async def get_pod_logs(
         logs = await executor_service.get_pod_logs(
             authenticated_validator, request.miner_hotkey, request.executor_id, request.container_name
         )
-        logger.info("Sent GetPodLogs to validator %s via REST API", authenticated_validator)
+        logger.info("Sent GetPodLogs to validator %s via REST API. Returned logs: %d", authenticated_validator, len(logs))
         return PodLogsResponse(logs=logs)
     except Exception as e:
-        logger.error("Failed GetPodLogs request: %s", str(e))
+        logger.error("Failed GetPodLogs request: %s", str(e), exc_info=True)
         return FailedRequest(details=str(e))
