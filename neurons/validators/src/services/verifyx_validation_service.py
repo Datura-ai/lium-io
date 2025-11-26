@@ -306,12 +306,14 @@ def _perform_verification_checks(payload: dict) -> Dict[str, Any]:
     # Determine which checks are required
     required_checks = [
         memory_stats["success"],
-        storage_stats["success"],
     ]
 
     # Conditionally include network validation based on feature flag
     if settings.FEATURE_FLAGS.get(FeatureFlag.VERIFYX_NETWORK_VALIDATION, False):
         required_checks.append(network_stats["success"])
+
+    if not settings.debug.SKIP_STORAGE_CHECK:
+        required_checks.append(storage_stats["success"])
 
     success = all(required_checks)
 
