@@ -288,7 +288,7 @@ async def _create_container_to_miner(miner_hotkey: str, executor_id: str, docker
             docker_image=docker_image,
             user_public_keys=["user_public_key"],
             executor_id=executor_id,
-            pod_id="pod_id",
+            pod_id=executor_id,
             miner_hotkey=miner_hotkey,
             miner_address=miner.axon_info.ip,
             miner_port=miner.axon_info.port,
@@ -322,7 +322,7 @@ async def _delete_pod(miner_hotkey: str, executor_id: str, container_name: str, 
             miner_address=miner.axon_info.ip,
             miner_port=miner.axon_info.port,
             executor_id=executor_id,
-            pod_id="pod_id",
+            pod_id=executor_id,
             container_name=container_name,
             volume_name=volume_name,
         )
@@ -351,7 +351,7 @@ async def _install_jupyter_server(miner_hotkey: str, executor_id: str, container
 
         payload = InstallJupyterServerRequest(
             miner_hotkey=miner_hotkey,
-            pod_id="pod_id",
+            pod_id=executor_id,
             miner_address=miner.axon_info.ip,
             miner_port=miner.axon_info.port,
             executor_id=executor_id,
@@ -389,7 +389,7 @@ async def _create_custom_container_to_miner(miner_hotkey: str, executor_id: str,
         )
         payload = ContainerCreateRequest(
             docker_image=docker_image,
-            pod_id="pod_id",
+            pod_id=executor_id,
             user_public_keys=["user_public_key"],
             executor_id=executor_id,
             miner_hotkey=miner_hotkey,

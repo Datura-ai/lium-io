@@ -49,7 +49,7 @@ class CapabilityCheck:
 
         # Build detailed failure information
         failure_details = {}
-        if result:
+        if result is not None:
             failure_details = {
                 "error": result.error_message,
                 "expected_uuid": result.expected_uuid,

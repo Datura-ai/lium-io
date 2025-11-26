@@ -10,6 +10,20 @@ if TYPE_CHECKING:
     from bittensor import Wallet
 
 
+class DebugSettings(BaseSettings):
+    """Debug configuration - all flags default to False/None.
+    
+    Set via environment variables prefixed with DEBUG_ (e.g., DEBUG_SKIP_STAKE_CHECKS=true).
+    Use .env for local development (git-ignored).
+    """
+    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore")
+
+    ENABLED: bool = Field(default=False, description="Enable debug mode")
+
+    SKIP_VALIDATOR_REGISTRATION_CHECK: bool = Field(default=False, description="Skip validator registration check")
+    SKIP_SYNC_FLOW: bool = Field(default=False, description="Skip sync flow")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     PROJECT_NAME: str = "compute-subnet-miner"
@@ -55,6 +69,9 @@ class Settings(BaseSettings):
     MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")
     DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default="5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1")
     CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)
+    
+    # Debug settings - loaded from DEBUG_* environment variables
+    debug: DebugSettings = Field(default_factory=DebugSettings)
 
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

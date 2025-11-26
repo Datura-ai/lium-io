@@ -70,7 +70,7 @@ class ExecutorConnectivityService:
         try:
             t1 = time.monotonic()
             await self.cleanup_docker_containers(ssh_client, extra)
-            rented_external_ports = await self.port_mapping_dao.get_busy_external_ports()
+            rented_external_ports = await self.port_mapping_dao.get_busy_external_ports(UUID(executor_info.uuid))
             port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE, rented_external_ports)
             if not port_maps:
                 return DockerConnectionCheckResult(
@@ -456,7 +456,7 @@ class ExecutorConnectivityService:
             'executor-db-1',
             'executor-autoheal-1',
         ]
-        if settings.DEBUG:
+        if settings.debug.ENABLED:
             command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
         else:
             command = '/usr/bin/docker ps -a --format "{{.Names}}"'
