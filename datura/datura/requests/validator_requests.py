@@ -23,6 +23,25 @@ class AuthenticationPayload(pydantic.BaseModel):
     timestamp: int
 
     def blob_for_signing(self):
+        """Generate the canonical serialization used for signature generation and verification.
+
+        CRITICAL: This method defines the canonical signing format used across both
+        WebSocket and REST authentication flows. All signature generation and verification
+        must use this method to ensure compatibility between validator and miner components.
+
+        The serialization uses sorted keys (sort_keys=True) to ensure consistent ordering
+        across different Python implementations and versions. This method must remain stable;
+        any changes will break signature compatibility across the entire system.
+
+        All callers MUST use this method instead of constructing their own JSON strings.
+        See call sites in:
+        - neurons/validators/src/clients/miner_client.py (WebSocket signing)
+        - neurons/miners/src/dependencies/auth.py (REST verification)
+        - neurons/validators/src/services/miner_service.py (REST signing)
+
+        Returns:
+            str: JSON string with sorted keys representing the payload
+        """
         instance_dict = self.model_dump()
         return json.dumps(instance_dict, sort_keys=True)
 
