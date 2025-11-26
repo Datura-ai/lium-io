@@ -16,6 +16,25 @@ class FeatureFlag(str, Enum):
     VERIFYX_NETWORK_VALIDATION = "verifyx_network_validation"
 
 
+class DebugSettings(BaseSettings):
+    """Debug configuration - all flags default to False/None.
+    
+    Set via environment variables prefixed with DEBUG_ (e.g., DEBUG_SKIP_STAKE_CHECKS=true).
+    Use .env for local development (git-ignored).
+    """
+    model_config = SettingsConfigDict(env_prefix="DEBUG_", env_file=".env", extra="ignore")
+
+    ENABLED: bool = Field(default=False, description="Enable debug mode")
+    USE_LOCAL_MINER: bool = Field(default=False, description="Use local miner")
+    MINER_HOTKEY: str | None = Field(default=None, description="Miner hotkey")
+    MINER_COLDKEY: str | None = Field(default=None, description="Miner coldkey")
+    MINER_UID: int | None = Field(default=None, description="Miner UID")
+    MINER_ADDRESS: str | None = Field(default=None, description="Miner address")
+    MINER_PORT: int | None = Field(default=None, description="Miner port")
+
+    SKIP_STORAGE_CHECK: bool = Field(default=False, description="Skip storage check")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     PROJECT_NAME: str = "compute-subnet-validator"
@@ -33,12 +52,8 @@ class Settings(BaseSettings):
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
+
     DEBUG: bool = Field(env="DEBUG", default=False)
-    DEBUG_MINER_HOTKEY: str | None = Field(env="DEBUG_MINER_HOTKEY", default=None)
-    DEBUG_MINER_COLDKEY: str | None = Field(env="DEBUG_MINER_COLDKEY", default=None)
-    DEBUG_MINER_UID: int | None = Field(env="DEBUG_MINER_UID", default=None)
-    DEBUG_MINER_ADDRESS: str | None = Field(env="DEBUG_MINER_ADDRESS", default=None)
-    DEBUG_MINER_PORT: int | None = Field(env="DEBUG_MINER_PORT", default=None)
 
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     BLOCKS_FOR_JOB: int = 75  # 15 minutes
@@ -92,6 +107,8 @@ class Settings(BaseSettings):
     COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [
         "NVIDIA B200"
     ]
+
+    debug: DebugSettings = Field(default_factory=DebugSettings)
 
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
@@ -149,16 +166,16 @@ class Settings(BaseSettings):
         return bittensor.config(parser)
 
     def get_debug_miner(self) -> dict:
-        if not self.DEBUG_MINER_ADDRESS or not self.DEBUG_MINER_PORT:
+        if not self.debug.MINER_ADDRESS or not self.debug.MINER_PORT:
             raise RuntimeError("Debug miner not configured")
 
         miner = type("Miner", (object,), {})()
-        miner.hotkey            = self.DEBUG_MINER_HOTKEY
-        miner.coldkey           = self.DEBUG_MINER_COLDKEY
-        miner.uid               = self.DEBUG_MINER_UID
+        miner.hotkey            = self.debug.MINER_HOTKEY
+        miner.coldkey           = self.debug.MINER_COLDKEY
+        miner.uid               = self.debug.MINER_UID
         miner.axon_info         = type("AxonInfo", (object,), {})()
-        miner.axon_info.ip      = self.DEBUG_MINER_ADDRESS
-        miner.axon_info.port    = self.DEBUG_MINER_PORT
+        miner.axon_info.ip      = self.debug.MINER_ADDRESS
+        miner.axon_info.port    = self.debug.MINER_PORT
         miner.axon_info.is_serving = True
         return miner
 

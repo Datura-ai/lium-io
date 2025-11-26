@@ -59,7 +59,6 @@ class VerifyXCheck:
             updated_specs.update(
                 {
                     "ram": sanitized.get("ram", updated_specs.get("ram")),
-                    "hard_disk": sanitized.get("hard_disk", updated_specs.get("hard_disk")),
                 }
             )
 
@@ -68,6 +67,12 @@ class VerifyXCheck:
                 if "network" not in updated_specs:
                     updated_specs["network"] = {}
                 updated_specs["network"]["download_speed"] = sanitized["network"]["download_speed"]
+            
+            # Update storage specs if storage is present
+            if "hard_disk" in sanitized:
+                updated_specs.update({
+                    "hard_disk": sanitized.get("hard_disk", updated_specs.get("hard_disk")),
+                })
 
             event = render_message(
                 Msg.VERIFY_SUCCESS,

@@ -12,7 +12,7 @@ debug_apis_router = APIRouter()
 async def get_executors_for_validator(
     validator_hotkey: str, executor_service: Annotated[ExecutorService, Depends(ExecutorService)]
 ):
-    if not settings.DEBUG:
+    if not settings.debug.ENABLED:
         return None
     return await executor_service.get_executors_for_validator(validator_hotkey)
 
@@ -21,7 +21,7 @@ async def get_executors_for_validator(
 async def register_pubkey(
     validator_hotkey: str, executor_service: Annotated[ExecutorService, Depends(ExecutorService)]
 ):
-    if not settings.DEBUG:
+    if not settings.debug.ENABLED:
         return None
     pub_key = "Test Pubkey"
     return await executor_service.register_pubkey(validator_hotkey, pub_key.encode("utf-8"))
@@ -31,7 +31,7 @@ async def register_pubkey(
 async def remove_pubkey_from_executor(
     validator_hotkey: str, executor_service: Annotated[ExecutorService, Depends(ExecutorService)]
 ):
-    if not settings.DEBUG:
+    if not settings.debug.ENABLED:
         return None
     pub_key = "Test Pubkey"
     await executor_service.deregister_pubkey(validator_hotkey, pub_key.encode("utf-8"))
