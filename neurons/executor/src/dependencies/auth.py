@@ -67,3 +67,22 @@ async def verify_container_signature(payload: ContainerUtilizationPayload):
     }
     message = json.dumps(signing_data, sort_keys=True)
     await verify_signature(payload, message)
+
+
+async def verify_container_logs_signature(container_name: str, timestamp: int, signature: str):
+    """
+    Verify signature for container logs endpoint using header-based auth.
+
+    Args:
+        container_name: Name of the container (part of signed message)
+        timestamp: Unix timestamp (part of signed message)
+        signature: The signature from header
+    """
+    signing_data = {
+        "container_name": container_name,
+        "timestamp": timestamp,
+    }
+    message = json.dumps(signing_data, sort_keys=True)
+
+    payload = SignaturePayload(signature=signature)
+    await verify_signature(payload, message)
