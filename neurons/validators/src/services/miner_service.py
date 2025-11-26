@@ -447,7 +447,6 @@ class MinerService:
                         "executor_ip": result.executor_info.address,
                         "executor_port": result.executor_info.port,
                         "executor_ssh_port": result.executor_info.ssh_port,
-                        "executor_price": result.executor_info.price,
                         "price_per_gpu": result.executor_info.price_per_gpu,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,

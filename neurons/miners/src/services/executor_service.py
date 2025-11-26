@@ -176,7 +176,6 @@ class ExecutorService:
                         validator=item.get("validator_hotkey"),
                         address=item.get("executor_ip_address"),
                         port=int(item.get("executor_ip_port")),
-                        price_per_hour=item.get("price_per_hour"),
                         price_per_gpu=item.get("price_per_gpu"),
                     )
                 )
@@ -248,7 +247,6 @@ class ExecutorService:
                     response_obj = {
                         **response_obj,
                         **executor.model_dump(mode="json"),
-                        "price": executor.price_per_hour,
                     }
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
