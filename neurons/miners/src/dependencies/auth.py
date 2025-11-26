@@ -5,7 +5,7 @@ import time
 from typing import Annotated
 
 import bittensor
-from datura.requests.validator_requests import SimpleValidatorRequest, AuthenticateRequest, AuthenticationPayload
+from datura.requests.validator_requests import SimpleValidatorRequest
 from fastapi import Depends, Header, HTTPException, status
 
 from core.config import settings
