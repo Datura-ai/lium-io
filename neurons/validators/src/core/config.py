@@ -107,6 +107,9 @@ class Settings(BaseSettings):
     COLLATERAL_EXCLUDED_GPU_TYPES: list[str] = [
         "NVIDIA B200"
     ]
+    
+    # Use REST API instead of WebSocket for miner communication
+    USE_REST_API: bool = Field(env="USE_REST_API", default=False)
 
     debug: DebugSettings = Field(default_factory=DebugSettings)
 
