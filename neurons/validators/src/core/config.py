@@ -53,8 +53,6 @@ class Settings(BaseSettings):
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
     ASYNC_SQLALCHEMY_DATABASE_URI: str = Field(env="ASYNC_SQLALCHEMY_DATABASE_URI")
 
-    DEBUG: bool = Field(env="DEBUG", default=False)
-
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     BLOCKS_FOR_JOB: int = 75  # 15 minutes
     JOB_TIME_OUT: int = 60 * 15  # 15 minutes
