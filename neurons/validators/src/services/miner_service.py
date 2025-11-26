@@ -275,7 +275,8 @@ class MinerService:
 
     def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
         executor_info = ExecutorSSHInfo(
-            uuid=f"{payload.job_batch_id}:{payload.miner_hotkey}",
+            # Special uuid for failed miners
+            uuid="11111111-1111-1111-1111-111111111111",
             address=payload.miner_address,
             port=payload.miner_port,
             ssh_username="unknown",
