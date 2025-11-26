@@ -12,12 +12,14 @@ import bittensor
 from clients.miner_client import MinerClient
 from daos.port_mapping_dao import PortMappingDao
 from datura.requests.miner_requests import (
+    AcceptJobRequest,
     AcceptSSHKeyRequest,
     DeclineJobRequest,
     ExecutorSSHInfo,
     FailedRequest,
     PodLogsResponse,
     RequestType,
+    SSHKeyRemoved,
 )
 from datura.requests.validator_requests import (
     SSHPubKeyRemoveRequest,
@@ -112,32 +114,10 @@ def _parse_miner_response(response_data: dict) -> AcceptSSHKeyRequest | FailedRe
         return AcceptSSHKeyRequest.model_validate(response_data)
     elif message_type == RequestType.PodLogsResponse:
         return PodLogsResponse.model_validate(response_data)
-    elif message_type == RequestType.FailedRequest:
-        return FailedRequest.model_validate(response_data)
-    elif message_type == RequestType.UnAuthorizedRequest:
+    elif message_type in [RequestType.FailedRequest, RequestType.UnAuthorizedRequest, RequestType.SSHKeyRemoved]:
         return FailedRequest.model_validate(response_data)
     elif message_type == RequestType.SSHKeyRemoved:
-        # SSHKeyRemoved is a success response, but we don't have a use case for it yet
-        # Treat it as an unexpected response for now
-        logger.error(
-            f"Unexpected message_type: {message_type}. Raw payload: {json.dumps(response_data)}"
-        )
-        return FailedRequest(
-            message_type=RequestType.FailedRequest,
-            details=f"Unexpected message_type: {message_type}"
-        )
-    elif message_type == RequestType.GenericError:
-        # GenericError should be treated as a FailedRequest
-        return FailedRequest.model_validate(response_data)
-    elif message_type in (RequestType.AcceptJobRequest, RequestType.DeclineJobRequest):
-        # These message types are not expected in REST API responses
-        logger.error(
-            f"Unexpected message_type: {message_type}. Raw payload: {json.dumps(response_data)}"
-        )
-        return FailedRequest(
-            message_type=RequestType.FailedRequest,
-            details=f"Unexpected message_type: {message_type}"
-        )
+        return SSHKeyRemoved.model_validate(response_data)
     else:
         # Handle any other unknown message types
         logger.error(
@@ -1488,7 +1468,10 @@ class MinerService:
                     ),
                 )
                 if len(msg.executors) == 0:
-                    return None
+                    return self._build_failed_job_result(
+                        payload,
+                        "Miner returned zero executors in AcceptSSHKeyRequest",
+                    )
 
                 tasks = [
                     asyncio.create_task(
@@ -1543,7 +1526,10 @@ class MinerService:
                         extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     ),
                 )
-                return None
+                return self._build_failed_job_result(
+                    payload,
+                    f"Miner returned FailedRequest: {msg.details or 'unknown reason'}",
+                )
             else:
                 logger.error(
                     _m(
@@ -1551,7 +1537,10 @@ class MinerService:
                         extra=get_extra_info({**default_extra, "msg": str(msg)}),
                     ),
                 )
-                return None
+                return self._build_failed_job_result(
+                    payload,
+                    f"Unexpected response from miner: {msg}",
+                )
         except asyncio.CancelledError:
             logger.error(
                 _m("Requesting job to miner via REST API was cancelled", extra=get_extra_info(default_extra)),
