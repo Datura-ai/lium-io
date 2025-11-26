@@ -1,13 +1,15 @@
-from typing import Annotated
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends
+import docker
+from fastapi import APIRouter, Depends, Query, Header
+from fastapi.responses import StreamingResponse
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics, get_container_metrics
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
-from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature
+from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature
 
 apis_router = APIRouter()
 
@@ -77,3 +79,49 @@ async def ping(_: None = Depends(verify_ping_signature)):
         dict: {"status": "pong"}
     """
     return {"status": "pong"}
+
+
+@apis_router.get("/containers/{container_name}/logs")
+async def stream_container_logs(
+    container_name: str,
+    x_signature: str = Header(..., description="Signature for authentication"),
+    x_timestamp: int = Header(..., description="Unix timestamp used in signature"),
+    follow: bool = Query(False, description="Follow log output"),
+    tail: Optional[int] = Query(None, description="Number of lines to show from the end"),
+    since: Optional[int] = Query(None, description="Unix timestamp to show logs since"),
+    stdout: bool = Query(True, description="Include stdout"),
+    stderr: bool = Query(True, description="Include stderr"),
+):
+    """
+    Stream logs from a Docker container.
+
+    Args:
+        container_name: Name of the Docker container
+        x_signature: Signature header for authentication
+        x_timestamp: Timestamp header used in signature
+        follow: Keep streaming new logs (like docker logs -f)
+        tail: Number of lines from end (like docker logs --tail)
+        since: Unix timestamp to filter logs
+        stdout: Include stdout logs
+        stderr: Include stderr logs
+
+    Returns:
+        StreamingResponse: Plain text stream of container logs
+    """
+    await verify_container_logs_signature(container_name, x_timestamp, x_signature)
+
+    client = docker.from_env()
+    container = client.containers.get(container_name)
+
+    def generate():
+        for log in container.logs(
+            stream=True,
+            follow=follow,
+            tail=tail if tail else "all",
+            since=since,
+            stdout=stdout,
+            stderr=stderr,
+        ):
+            yield log
+
+    return StreamingResponse(generate(), media_type="text/plain")

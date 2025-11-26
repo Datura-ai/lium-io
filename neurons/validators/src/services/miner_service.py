@@ -50,6 +50,7 @@ from payload_models.payloads import (
     JupyterServerInstalled,
     JupyterInstallationFailed,
 )
+from tenacity import RetryError
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -252,6 +253,12 @@ class MinerService:
                     )
                     msg = None
 
+                if msg is None:
+                    return self._build_failed_job_result(
+                        payload,
+                        "Miner did not respond after SSH key submission",
+                    )
+
                 if isinstance(msg, AcceptSSHKeyRequest):
                     logger.info(
                         _m(
@@ -262,7 +269,10 @@ class MinerService:
                         ),
                     )
                     if len(msg.executors) == 0:
-                        return None
+                        return self._build_failed_job_result(
+                            payload,
+                            "Miner returned zero executors in AcceptSSHKeyRequest",
+                        )
 
                     tasks = [
                         asyncio.create_task(
@@ -322,7 +332,10 @@ class MinerService:
                             extra=get_extra_info({**default_extra, "msg": str(msg)}),
                         ),
                     )
-                    return None
+                    return self._build_failed_job_result(
+                        payload,
+                        f"Miner returned FailedRequest: {msg.details or 'unknown reason'}",
+                    )
                 elif isinstance(msg, DeclineJobRequest):
                     logger.warning(
                         _m(
@@ -330,7 +343,10 @@ class MinerService:
                             extra=get_extra_info({**default_extra, "msg": str(msg)}),
                         ),
                     )
-                    return None
+                    return self._build_failed_job_result(
+                        payload,
+                        "Miner declined the job request",
+                    )
                 else:
                     logger.error(
                         _m(
@@ -338,17 +354,44 @@ class MinerService:
                             extra=get_extra_info({**default_extra, "msg": str(msg)}),
                         ),
                     )
-                    return None
+                    return self._build_failed_job_result(
+                        payload,
+                        f"Unexpected response from miner: {msg}",
+                    )
         except asyncio.CancelledError:
             logger.error(
                 _m("Requesting job to miner was cancelled", extra=get_extra_info(default_extra)),
             )
-            return None
+            return self._build_failed_job_result(
+                payload,
+                "Validator cancelled the request before completion",
+            )
         except asyncio.TimeoutError:
             logger.error(
                 _m("Requesting job to miner was timed out", extra=get_extra_info(default_extra)),
             )
-            return None
+            return self._build_failed_job_result(
+                payload,
+                "Request to miner timed out",
+            )
+        except RetryError as e:
+            last_attempt = getattr(e, "last_attempt", None)
+            root_exc = last_attempt.exception() if last_attempt else None
+            if isinstance(root_exc, AttributeError):
+                friendly_reason = "Failed to send SSH key because miner websocket never connected"
+            else:
+                friendly_reason = str(root_exc or e)
+
+            logger.error(
+                _m(
+                    "Requesting job to miner resulted in a retry exhaustion error",
+                    extra=get_extra_info({**default_extra, "error": friendly_reason}),
+                ),
+            )
+            return self._build_failed_job_result(
+                payload,
+                friendly_reason,
+            )
         except Exception as e:
             logger.error(
                 _m(
@@ -359,7 +402,42 @@ class MinerService:
                     }),
                 ),
             )
-            return None
+            return self._build_failed_job_result(
+                payload,
+                str(e),
+            )
+
+    def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
+        executor_info = ExecutorSSHInfo(
+            # Special uuid for failed miners
+            uuid="11111111-1111-1111-1111-111111111111",
+            address=payload.miner_address,
+            port=payload.miner_port,
+            ssh_username="unknown",
+            ssh_port=0,
+            python_path="",
+            root_dir="",
+        )
+
+        job_result = JobResult(
+            spec=None,
+            executor_info=executor_info,
+            score=0,
+            job_score=0,
+            collateral_deposited=False,
+            job_batch_id=payload.job_batch_id,
+            log_status="error",
+            log_text=reason,
+            gpu_model=None,
+            gpu_count=0,
+            sysbox_runtime=False,
+        )
+
+        return {
+            "miner_hotkey": payload.miner_hotkey,
+            "miner_coldkey": payload.miner_coldkey,
+            "results": [job_result],
+        }
 
     async def publish_machine_specs(
         self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str

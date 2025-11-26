@@ -67,7 +67,7 @@ class SubtensorClient:
 
         # Set debug miner if configured
         self.debug_miner = None
-        if settings.DEBUG:
+        if settings.debug.USE_LOCAL_MINER:
             self.debug_miner = settings.get_debug_miner()
 
         self.initialize_subtensor()

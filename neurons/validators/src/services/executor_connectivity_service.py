@@ -456,7 +456,7 @@ class ExecutorConnectivityService:
             'executor-db-1',
             'executor-autoheal-1',
         ]
-        if settings.DEBUG:
+        if settings.debug.ENABLED:
             command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
         else:
             command = '/usr/bin/docker ps -a --format "{{.Names}}"'
