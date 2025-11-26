@@ -1734,7 +1734,7 @@ class MinerService:
                             {**default_extra, "payload": str(payload)}
                         ),
                     )
-                    return self._handle_container_error(
+                    result = self._handle_container_error(
                         payload=payload,
                         msg=str(log_text),
                         error_code=FailedContainerErrorCodes.UnknownError,
