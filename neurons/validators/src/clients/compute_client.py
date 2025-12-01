@@ -166,54 +166,62 @@ class ComputeClient:
         asyncio.create_task(self.poll_executors_uptime())
         asyncio.create_task(self.poll_revenue_per_gpu_type())
 
-        try:
-            while True:
-                async for ws in self.connect():
-                    try:
-                        logger.info(
-                            _m(
-                                "Connected to backend app",
-                                extra=get_extra_info(self.logging_extra),
-                            )
-                        )
-                        await self.handle_connection(ws)
-                    except websockets.ConnectionClosed as exc:
-                        self.ws = None
-                        logger.warning(
-                            _m(
-                                f"validator connection to backend app closed with code {exc.code} and reason {exc.reason}, reconnecting...",
-                                extra=get_extra_info(self.logging_extra),
-                            )
-                        )
-                    except asyncio.exceptions.CancelledError:
-                        self.ws = None
-                        logger.warning(
-                            _m(
-                                "Facilitator client received cancel, stopping",
-                                extra=get_extra_info(self.logging_extra),
-                            )
-                        )
-                    except Exception as e:
-                        self.ws = None
-                        logger.error(
-                            _m(
-                                "Error in connecting to compute app",
-                                extra=get_extra_info({
-                                    **self.logging_extra,
-                                    "error": str(e),
-                                }),
-                            )
-                        )
+        reconnect_delay = 1
+        max_delay = 60
 
-        except Exception as exc:
-            self.ws = None
-            logger.error(
-                _m(
-                    "Connecting to compute app failed",
-                    extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
-                ),
-                exc_info=True,
-            )
+        while True:
+            try:
+                async for ws in self.connect():
+                    reconnect_delay = 1  # Reset on successful connection
+                    logger.info(
+                        _m(
+                            "Connected to backend app",
+                            extra=get_extra_info(self.logging_extra),
+                        )
+                    )
+                    await self.handle_connection(ws)
+            except websockets.ConnectionClosed as exc:
+                self.ws = None
+                logger.warning(
+                    _m(
+                        f"validator connection to backend app closed, reconnecting in {reconnect_delay}s...",
+                        extra=get_extra_info(
+                            {
+                                **self.logging_extra,
+                                "retry_in": reconnect_delay,
+                                "error": str(exc),
+                            }
+                        ),
+                    )
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_delay)
+            except asyncio.CancelledError:
+                self.ws = None
+                logger.warning(
+                    _m(
+                        "Facilitator client received cancel, stopping",
+                        extra=get_extra_info(self.logging_extra),
+                    )
+                )
+                raise
+            except Exception as exc:
+                self.ws = None
+                logger.error(
+                    _m(
+                        "Error connecting to compute app, retrying...",
+                        extra=get_extra_info(
+                            {
+                                **self.logging_extra,
+                                "error": str(exc),
+                                "retry_in": reconnect_delay,
+                            }
+                        ),
+                    ),
+                    exc_info=True,
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_delay)
 
     async def handle_connection(self, ws: ClientConnection):
         """handle a single websocket connection"""
@@ -290,7 +298,6 @@ class ComputeClient:
                             executor_ip=data["executor_ip"],
                             executor_port=data["executor_port"],
                             executor_ssh_port=data["executor_ssh_port"],
-                            executor_price=data["executor_price"],
                             price_per_gpu=data["price_per_gpu"],
                             collateral_deposited=data["collateral_deposited"],
                             ssh_pub_keys=data["ssh_pub_keys"],
