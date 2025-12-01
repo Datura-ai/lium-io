@@ -172,54 +172,61 @@ class ComputeClient:
         while True:
             try:
                 async for ws in self.connect():
-                    reconnect_delay = 1  # Reset on successful connection
-                    logger.info(
-                        _m(
-                            "Connected to backend app",
-                            extra=get_extra_info(self.logging_extra),
+                    try:
+                        logger.info(
+                            _m(
+                                "Connected to backend app",
+                                extra=get_extra_info(self.logging_extra),
+                            )
                         )
-                    )
-                    await self.handle_connection(ws)
-            except websockets.ConnectionClosed as exc:
-                self.ws = None
-                logger.warning(
-                    _m(
-                        f"validator connection to backend app closed, reconnecting in {reconnect_delay}s...",
-                        extra=get_extra_info(
-                            {
-                                **self.logging_extra,
-                                "retry_in": reconnect_delay,
-                                "error": str(exc),
-                            }
-                        ),
-                    )
-                )
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, max_delay)
-            except asyncio.CancelledError:
-                self.ws = None
-                logger.warning(
-                    _m(
-                        "Facilitator client received cancel, stopping",
-                        extra=get_extra_info(self.logging_extra),
-                    )
-                )
-                raise
+                        await self.handle_connection(ws)
+                    except websockets.ConnectionClosed as exc:
+                        self.ws = None
+                        logger.warning(
+                            _m(
+                                f"validator connection to backend app closed, reconnecting in {reconnect_delay}s...",
+                                extra=get_extra_info(
+                                    {
+                                        **self.logging_extra,
+                                        "retry_in": reconnect_delay,
+                                        "error": str(exc),
+                                    }
+                                ),
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        self.ws = None
+                        logger.warning(
+                            _m(
+                                "Facilitator client received cancel, stopping",
+                                extra=get_extra_info(self.logging_extra),
+                            )
+                        )
+                        raise
+                    except Exception as exc:
+                        self.ws = None
+                        logger.error(
+                            _m(
+                                "Error connecting to compute app, retrying...",
+                                extra=get_extra_info(
+                                    {
+                                        **self.logging_extra,
+                                        "error": str(exc),
+                                        "retry_in": reconnect_delay,
+                                    }
+                                ),
+                            ),
+                            exc_info=True,
+                        )
             except Exception as exc:
-                self.ws = None
                 logger.error(
                     _m(
                         "Error connecting to compute app, retrying...",
-                        extra=get_extra_info(
-                            {
-                                **self.logging_extra,
-                                "error": str(exc),
-                                "retry_in": reconnect_delay,
-                            }
-                        ),
+                        extra=get_extra_info(self.logging_extra),
                     ),
                     exc_info=True,
                 )
+
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, max_delay)
 
