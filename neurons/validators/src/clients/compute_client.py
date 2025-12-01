@@ -184,11 +184,12 @@ class ComputeClient:
                 self.ws = None
                 logger.warning(
                     _m(
-                        f"validator connection to backend app closed with code {exc.rcvd.code} and reason {exc.rcvd.reason}, reconnecting in {reconnect_delay}s...",
+                        f"validator connection to backend app closed, reconnecting in {reconnect_delay}s...",
                         extra=get_extra_info(
                             {
                                 **self.logging_extra,
                                 "retry_in": reconnect_delay,
+                                "error": str(exc),
                             }
                         ),
                     )

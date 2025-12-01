@@ -13,4 +13,5 @@ class ValidatorService:
     def is_valid_validator(self, validator_hotkey: str) -> bool:
         if settings.debug.SKIP_VALIDATOR_REGISTRATION_CHECK:
             return True
-        return not (not self.validator_dao.get_validator_by_hotkey(validator_hotkey))
+        
+        return settings.DEFAULT_VALIDATOR_HOTKEY == validator_hotkey
