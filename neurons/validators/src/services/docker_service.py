@@ -727,9 +727,10 @@ class DockerService:
                             for key, value in custom_options.environment.items()
                             if key and value and key.strip() and value.strip()
                         ]
+                        + ["-e NVIDIA_DRIVER_CAPABILITIES=all"]
                     )
                     if custom_options and custom_options.environment
-                    else ""
+                    else "-e NVIDIA_DRIVER_CAPABILITIES=all"
                 )
                 startup_commands = (
                     f"{custom_options.startup_commands}"

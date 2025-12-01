@@ -68,7 +68,6 @@ class ExecutorService:
                 validator=payload.executor.validator,
                 address=payload.executor.address,
                 port=payload.executor.port,
-                price_per_hour=payload.executor.price_per_hour,
                 price_per_gpu=payload.executor.price_per_gpu,
             )
             self.executor_dao.update_by_uuid(executor.uuid, executor)
@@ -106,7 +105,6 @@ class ExecutorService:
                     executor.validator = executor_payload.validator
                     executor.address = executor_payload.address
                     executor.port = executor_payload.port
-                    executor.price_per_hour = executor_payload.price_per_hour or executor.price_per_hour
                     executor.price_per_gpu = executor_payload.price_per_gpu or executor.price_per_gpu
                     self.executor_dao.update_by_uuid(executor.uuid, executor)
                     logger.info("Updated executor (id=%s)", str(executor.uuid))
@@ -118,7 +116,6 @@ class ExecutorService:
                             validator=executor_payload.validator,
                             address=executor_payload.address,
                             port=executor_payload.port,
-                            price_per_hour=executor_payload.price_per_hour,
                             price_per_gpu=executor_payload.price_per_gpu,
                         )
                     )
@@ -166,7 +163,7 @@ class ExecutorService:
             ),
         )
 
-        # Expected fields per executor from portal: uuid, validator, address, port, price_per_hour
+        # Expected fields per executor from portal: uuid, validator, address, port, price_per_gpu
         result: list[Executor] = []
         for item in data:
             try:
@@ -179,7 +176,6 @@ class ExecutorService:
                         validator=item.get("validator_hotkey"),
                         address=item.get("executor_ip_address"),
                         port=int(item.get("executor_ip_port")),
-                        price_per_hour=item.get("price_per_hour"),
                         price_per_gpu=item.get("price_per_gpu"),
                     )
                 )
@@ -251,7 +247,6 @@ class ExecutorService:
                     response_obj = {
                         **response_obj,
                         **executor.model_dump(mode="json"),
-                        "price": executor.price_per_hour,
                     }
                     return ExecutorSSHInfo.parse_obj(response_obj)
             except Exception as e:
