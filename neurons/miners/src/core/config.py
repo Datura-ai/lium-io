@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
     MINER_PORTAL_URI: str = Field(env="MINER_PORTAL_URI", default="wss://provider-api.lium.io")
     MINER_PORTAL_API_URL: str | None = Field(env="MINER_PORTAL_API_URL", default="https://provider-api.lium.io/api")
-    DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default="5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1")
+    DEFAULT_VALIDATOR_HOTKEY: str = Field(env="DEFAULT_VALIDATOR_HOTKEY", default="5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p")
     CENTRAL_MODE: bool = Field(env="CENTRAL_MODE", default=False)
     
     # Debug settings - loaded from DEBUG_* environment variables
