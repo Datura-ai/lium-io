@@ -14,7 +14,7 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
-POOL_SIZE = 20
+POOL_SIZE = 128
 
 # Create engine with conditional parameters based on environment
 if settings.ENV == "test":
@@ -30,8 +30,11 @@ else:
         echo=settings.ENV == "dev",
         future=True,
         poolclass=AsyncAdaptedQueuePool,
+        pool_timeout=30,
+        pool_recycle=1800,
         pool_size=POOL_SIZE,
-        max_overflow=30
+        max_overflow=256,
+        pool_pre_ping=True
     )
 
 AsyncSessionMaker = sessionmaker(
