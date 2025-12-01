@@ -166,10 +166,10 @@ class ComputeClient:
         asyncio.create_task(self.poll_executors_uptime())
         asyncio.create_task(self.poll_revenue_per_gpu_type())
 
-        reconnect_delay = 1
         max_delay = 60
 
         while True:
+            reconnect_delay = 1
             try:
                 async for ws in self.connect():
                     try:
@@ -218,6 +218,8 @@ class ComputeClient:
                             ),
                             exc_info=True,
                         )
+                        await asyncio.sleep(reconnect_delay)
+                        reconnect_delay = min(reconnect_delay * 2, max_delay)
             except Exception as exc:
                 logger.error(
                     _m(
