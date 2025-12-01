@@ -59,7 +59,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     executor_ip: str
     executor_port: int
     executor_ssh_port: int | None = None
-    executor_price: float | None = None
+    price_per_gpu: float | None = None
     specs: dict | None
     score: float | None
     synthetic_job_score: float | None
