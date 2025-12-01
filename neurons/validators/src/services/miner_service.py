@@ -447,7 +447,6 @@ class MinerService:
                         "executor_ip": result.executor_info.address,
                         "executor_port": result.executor_info.port,
                         "executor_ssh_port": result.executor_info.ssh_port,
-                        "executor_price": result.executor_info.price,
                         "price_per_gpu": result.executor_info.price_per_gpu,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,
@@ -1419,7 +1418,10 @@ class MinerService:
             )
 
             if status != 200 or response_data is None:
-                return None
+                return self._build_failed_job_result(
+                    payload,
+                    "Failed to submit SSH key to miner via REST API",
+                )
 
             msg = _parse_miner_response(response_data)
             
@@ -1514,12 +1516,18 @@ class MinerService:
             logger.error(
                 _m("Requesting job to miner via REST API was cancelled", extra=get_extra_info(default_extra)),
             )
-            return None
+            return self._build_failed_job_result(
+                payload,
+                "Requesting job to miner via REST API was cancelled",
+            )
         except asyncio.TimeoutError:
             logger.error(
                 _m("Requesting job to miner via REST API was timed out", extra=get_extra_info(default_extra)),
             )
-            return None
+            return self._build_failed_job_result(
+                payload,
+                "Requesting job to miner via REST API was timed out",
+            )
         except Exception as e:
             logger.error(
                 _m(
@@ -1530,7 +1538,10 @@ class MinerService:
                     }),
                 ),
             )
-            return None
+            return self._build_failed_job_result(
+                payload,
+                "Requesting job to miner via REST API resulted in an exception",
+            )
 
     async def _handle_container(self, payload: ContainerBaseRequest):
         """REST API version of handle_container."""

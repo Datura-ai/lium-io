@@ -23,7 +23,7 @@ class ExecutorDao(BaseDao):
         Update executor fields by address and port.
         :param address: Executor IP address
         :param port: Executor port
-        :param payload: Dictionary of fields to update (e.g., {'validator': 'new_validator', 'price_per_hour': 0.5})
+        :param payload: Dictionary of fields to update (e.g., {'validator': 'new_validator', 'price_per_gpu': 0.5})
         :return: Updated Executor object
         """
         existing_executor = self.findOne(address, port)
@@ -68,7 +68,6 @@ class ExecutorDao(BaseDao):
         existing_executor.validator = executor.validator
         existing_executor.address = executor.address
         existing_executor.port = executor.port
-        existing_executor.price_per_hour = executor.price_per_hour
         existing_executor.price_per_gpu = executor.price_per_gpu
         self.session.commit()
         self.session.refresh(existing_executor)
