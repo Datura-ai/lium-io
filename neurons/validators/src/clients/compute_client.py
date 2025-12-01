@@ -297,7 +297,6 @@ class ComputeClient:
                             executor_ip=data["executor_ip"],
                             executor_port=data["executor_port"],
                             executor_ssh_port=data["executor_ssh_port"],
-                            executor_price=data["executor_price"],
                             price_per_gpu=data["price_per_gpu"],
                             collateral_deposited=data["collateral_deposited"],
                             ssh_pub_keys=data["ssh_pub_keys"],
