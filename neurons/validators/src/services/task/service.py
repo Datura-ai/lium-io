@@ -103,22 +103,20 @@ class TaskService:
                 )
 
         except Exception as e:
-            logger.error(
-                _m(
-                    "Pipeline validation error",
-                    extra=get_extra_info({
-                        "job_batch_id": miner_info.job_batch_id,
-                        "miner_hotkey": miner_info.miner_hotkey,
-                        "executor_uuid": executor_info.uuid,
-                        "executor_ip_address": executor_info.address,
-                        "executor_port": executor_info.port,
-                        "ssh_user": executor_info.ssh_username,
-                        "ssh_port": executor_info.ssh_port,
-                        "error": str(e),
-                    })
-                ),
-                exc_info=True,
+            log_text = _m(
+                "Pipeline validation error",
+                extra=get_extra_info({
+                    "job_batch_id": miner_info.job_batch_id,
+                    "miner_hotkey": miner_info.miner_hotkey,
+                    "executor_uuid": executor_info.uuid,
+                    "executor_ip_address": executor_info.address,
+                    "executor_port": executor_info.port,
+                    "ssh_user": executor_info.ssh_username,
+                    "ssh_port": executor_info.ssh_port,
+                    "error": str(e),
+                })
             )
+            logger.error(log_text, exc_info=True)
             return JobResult(
                 spec=None,
                 executor_info=executor_info,
@@ -127,7 +125,7 @@ class TaskService:
                 collateral_deposited=False,
                 job_batch_id=miner_info.job_batch_id,
                 log_status="error",
-                log_text=str(e),
+                log_text=str(log_text),
                 gpu_model=None,
                 gpu_count=0,
                 sysbox_runtime=False,
