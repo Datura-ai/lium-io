@@ -183,7 +183,7 @@ class MinerPortalClient:
             return
 
         if isinstance(request, AddExecutorRequest):
-            result: Union[ExecutorAdded, AddExecutorFailed] = self.executor_service.create(
+            result: Union[ExecutorAdded, AddExecutorFailed] = await self.executor_service.create(
                 Executor(
                     uuid=request.executor_id,
                     address=request.payload.ip_address,
