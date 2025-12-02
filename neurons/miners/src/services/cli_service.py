@@ -248,7 +248,7 @@ class CliService:
         address: str,
         port: int,
         validator: str | None = None,
-        price_per_hour: float | None = None,
+        price_per_gpu: float | None = None,
         deposit_amount: float | None = None,
         gpu_type: str | None = None,
         gpu_count: int | None = None
@@ -257,7 +257,7 @@ class CliService:
         Add an executor to the database and deposit collateral.
         :param address: Executor IP address
         :param port: Executor port
-        :param price_per_hour: Executor price per hour
+        :param price_per_gpu: Executor price per GPU per hour in USD
         :param validator: Validator hotkey
         :param deposit_amount: Amount of TAO to deposit (optional)
         :param gpu_type: Type of GPU (optional)
@@ -269,7 +269,7 @@ class CliService:
 
         executor_uuid = uuid.uuid4()
         try:
-            executor = self.executor_dao.save(Executor(uuid=executor_uuid, address=address, port=port, validator=validator, price_per_hour=price_per_hour))
+            executor = self.executor_dao.save(Executor(uuid=executor_uuid, address=address, port=port, validator=validator, price_per_gpu=price_per_gpu))
             self.logger.info("Added executor (id=%s)", str(executor.uuid))
         except Exception as e:
             self.logger.error("❌ Failed to add executor: %s", str(e))
@@ -520,13 +520,12 @@ class CliService:
                     "address": executor.address,
                     "port": executor.port,
                     "validator": executor.validator,
-                    "price_per_hour": executor.price_per_hour,
                     "price_per_gpu": executor.price_per_gpu
                 }
                 for executor in executors
             ]
             for ex in result:
-                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> validator: {ex['validator']}, price_per_gpu (USD/gpu/h): {ex['price_per_gpu']}, price_per_hour (USD/h) (will be deprecated soon): {ex['price_per_hour']} ")
+                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> validator: {ex['validator']}, price_per_gpu (USD/gpu/h): {ex['price_per_gpu']}")
             return True
         except Exception as e:
             self.logger.error("Failed in showing an executor: %s", str(e))
@@ -580,30 +579,19 @@ class CliService:
         address: str,
         port: int,
         *,
-        price_per_hour: float | None = None,
         price_per_gpu: float | None = None,
     ) -> bool:
         """
         Update the price per hour for an executor by address and port.
         :param address: Executor IP address
         :param port: Executor port
-        :param price_per_hour: New price per hour in USD
         :param price_per_gpu: New price per GPU in USD
         :return: True if successful, False otherwise
         """
         try:
-            if price_per_hour is not None and price_per_gpu is not None:
-                self.logger.error("❌ Cannot update both price per hour and price per GPU at the same time.")
-                return False
-            if price_per_hour is not None:
-                payload = {'price_per_hour': price_per_hour}
-            elif price_per_gpu is not None:
-                payload = {'price_per_gpu': price_per_gpu}
-            else:
-                self.logger.error("❌ No price provided to update.")
-                return False
+            payload = {'price_per_gpu': price_per_gpu}
             self.executor_dao.update(address, port, payload)
-            self.logger.info(f"✅ Successfully updated price for executor {address}:{port} to {price_per_hour or price_per_gpu} USD/hour")
+            self.logger.info(f"✅ Successfully updated price for executor {address}:{port} to {price_per_gpu} USD/hour")
             return True
         except Exception as e:
             self.logger.error(f"Failed to update executor price: %s", str(e))

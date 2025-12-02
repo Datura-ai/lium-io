@@ -34,19 +34,15 @@ class AddExecutorPayload(BaseModel):
     gpu_type: str
     ip_address: str
     port: int
-    price_per_hour: float | None = None
-    price_per_gpu: float | None = None
+    price_per_gpu: float
     gpu_count: int
 
     @model_validator(mode="after")
     def validate_fields(self) -> Self:
         if self.gpu_count < 1:
             raise ValueError("Incorrect gpu_count")
-        if self.price_per_hour and self.price_per_hour < 0:
-            raise ValueError("Incorrect price_per_hour")
-        if self.price_per_gpu and self.price_per_gpu < 0:
-            raise ValueError("Incorrect price_per_gpu")
-
+        if self.price_per_gpu < 0:
+            raise ValueError("Incorrect price")
         return self
 
 
@@ -59,7 +55,6 @@ class SyncExecutorPayload(BaseModel):
     validator: str
     address: str
     port: int
-    price_per_hour: float | None = None
     price_per_gpu: float | None = None
 
 
