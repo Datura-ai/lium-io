@@ -360,6 +360,33 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
     success = asyncio.run(cli_service.finalize_reclaim_request(reclaim_request_id))
     if not success:
         logger.error("❌ Failed to finalize reclaim request.")
+        
+@cli.command()
+def migrate_validator_hotkey():
+    from core.config import settings
+    from core.db import get_db
+    from models.executor import Executor
+    from sqlmodel import func, select, update
+
+    old_validator_hotkey = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
+
+    session = next(get_db())
+    filters = [
+        Executor.validator == old_validator_hotkey,
+    ]
+    select_stmt = select(func.count(Executor.uuid)).where(*filters)
+    count = session.exec(select_stmt).one()
+    logger.info(f"Found {count} miners with validator {old_validator_hotkey}")
+    
+    update_stmt = (
+        update(Executor)
+        .where(*filters)
+        .values(validator=settings.DEFAULT_VALIDATOR_HOTKEY)
+    )
+    result = session.exec(update_stmt)
+    updated_count = result.rowcount
+    session.commit()
+    logger.info(f"Migration completed. Updated {updated_count} miners")
 
 
 if __name__ == "__main__":
