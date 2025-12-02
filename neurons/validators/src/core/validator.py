@@ -397,7 +397,10 @@ class Validator:
                             )
                             task.cancel()
 
-                    open_fd_count = len(os.listdir(f'/proc/self/fd'))
+                    try:
+                        open_fd_count = len(os.listdir('/proc/self/fd'))
+                    except FileNotFoundError:
+                        open_fd_count = -1  # /proc not available (macOS)
 
                     logger.info(
                         _m(

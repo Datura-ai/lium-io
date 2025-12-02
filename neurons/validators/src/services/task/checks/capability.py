@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from core.config import settings
 from ..messages import CapabilityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -16,6 +17,14 @@ class CapabilityCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
+        if settings.debug.SKIP_GPU_VALIDATION:
+            event = render_message(
+                Msg.VERIFY_OK,
+                ctx=ctx,
+                check_id=self.check_id,
+            )
+            return CheckResult(passed=True, event=event)
+
         specs = ctx.state.specs
         if not specs:
             event = render_message(

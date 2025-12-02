@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from typing import Any
 
+from core.config import settings
 from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
@@ -69,7 +70,15 @@ class MachineSpecScrapeCheck:
         script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
-        res = await runner.run(f"chmod +x {script_path} && {script_path}", timeout=timeout, retryable=False)
+        if settings.debug.SKIP_BINARY_COMPILATION:
+            # Install dependencies and run as Python script (macOS ARM compatibility)
+            install_cmd = "pip3 install --upgrade --user psutil cryptography"
+            await runner.run(install_cmd, timeout=60, retryable=False)
+            command = f"python3 {script_path}"
+        else:
+            command = f"chmod +x {script_path} && {script_path}"
+
+        res = await runner.run(command, timeout=timeout, retryable=False)
 
         if not res.success or not res.stdout.strip():
             event = render_message(

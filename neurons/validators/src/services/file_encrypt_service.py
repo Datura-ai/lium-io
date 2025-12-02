@@ -12,6 +12,7 @@ import PyInstaller.__main__
 from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles
 
+from core.config import settings
 from services.ssh_service import SSHService
 
 KEYS_FOR_ENCRYPTION_KEY_GENERATION = [
@@ -130,6 +131,15 @@ class FileEncryptService:
 
     def make_binary_file(self, tmp_directory: str, file_path: str):
         file_name = os.path.basename(file_path)
+
+        if settings.debug.SKIP_BINARY_COMPILATION:
+            # Copy Python file instead of compiling (macOS ARM compatibility)
+            if not file_name.endswith(".py"):
+                file_name = file_name + ".py"
+            os.makedirs(tmp_directory, exist_ok=True)
+            destination = os.path.join(tmp_directory, file_name)
+            shutil.copy2(file_path, destination)
+            return file_name
 
         PyInstaller.__main__.run(
             [

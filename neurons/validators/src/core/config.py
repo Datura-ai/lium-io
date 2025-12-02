@@ -34,6 +34,11 @@ class DebugSettings(BaseSettings):
 
     SKIP_STORAGE_CHECK: bool = Field(default=False, description="Skip storage check")
 
+    # Local development flags (macOS compatibility)
+    SKIP_MATRIX_VALIDATION: bool = Field(default=False, description="Skip DMCompVerify (no .so on macOS)")
+    SKIP_BINARY_COMPILATION: bool = Field(default=False, description="Copy .py instead of PyInstaller")
+    SKIP_GPU_VALIDATION: bool = Field(default=False, description="Skip GPU validation")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

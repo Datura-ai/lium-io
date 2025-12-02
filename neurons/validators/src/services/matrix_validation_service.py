@@ -1,10 +1,11 @@
 import time
 import random
 import logging
-import json 
+import json
 import os
 import uuid as uuid4
 from dataclasses import dataclass
+from core.config import settings
 from core.utils import _m, get_extra_info
 from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
 
@@ -123,8 +124,12 @@ class ValidationService:
         """
         Constructor, differentiate miner vs validator libs.
         """
-        self.wrapper = DMCompVerifyWrapper("/usr/lib/libdmcompverify.so")
-        self.verifier_ptr = self.wrapper.DMCompVerify_new(10, 10)
+        if settings.debug.SKIP_MATRIX_VALIDATION:
+            self.wrapper = None
+            self.verifier_ptr = None
+        else:
+            self.wrapper = DMCompVerifyWrapper("/usr/lib/libdmcompverify.so")
+            self.verifier_ptr = self.wrapper.DMCompVerify_new(10, 10)
 
     def encrypt_challenge(self, m_dim_n, m_dim_k, seed, machine_info, uuid):
         try:
