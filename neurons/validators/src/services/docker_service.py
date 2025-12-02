@@ -305,16 +305,19 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
+        pod_name: str,
         sleep: int = 0,
         clear_volume: bool = True
     ):
-        command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
+        command = f'/usr/bin/docker ps -a --format "{{{{.Names}}}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
             # wait until the docker connection check is finished.
             await asyncio.sleep(sleep)
 
-            container_names = " ".join(result.stdout.strip().split("\n"))
+            container_names = " ".join([container for container in result.stdout.strip().split("\n") if pod_name == container or 'container_' in container])
+            if not container_names:
+                return
 
             logger.info(
                 _m(
@@ -636,7 +639,7 @@ class DockerService:
                 )
 
             # add executor in pending status dict
-            await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id)
+            await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
@@ -737,11 +740,12 @@ class DockerService:
                     else ""
                 )
 
-                uuid = uuid4()
+                container_name = f"pod_{payload.pod_id}"
 
                 await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
+                    pod_name=container_name,
                     sleep=10,
                     clear_volume=False if local_volume else True,
                 )
@@ -752,7 +756,7 @@ class DockerService:
 
                 if not local_volume:
                     # create docker volume
-                    local_volume = f"volume_{uuid}"
+                    local_volume = f"volume_{payload.pod_id}"
                     command = f"/usr/bin/docker volume create {local_volume}"
                     await self.execute_and_stream_logs(
                         ssh_client=ssh_client,
@@ -785,14 +789,23 @@ class DockerService:
                         profilers.append({"name": "Docker volume creation step failed", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
 
-                container_name = f"container_{uuid}"
-
                 # Network permission flags (permission to create a network interface inside the container)
                 net_perm_flags = (
                     "--cap-add=NET_ADMIN "
                     "--sysctl net.ipv4.conf.all.src_valid_mark=1 "
                     "--device /dev/net/tun "
                 )
+
+                # GPU restriction flags
+                if payload.gpu_uuids:
+                    gpu_devices = ",".join(payload.gpu_uuids)
+                    gpu_flags = f'--gpus \'"device={gpu_devices}"\' '
+                else:
+                    gpu_flags = "--gpus all "
+
+                # CPU and memory restriction flags
+                cpu_flags = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
+                memory_flags = f"--memory {payload.memory} " if payload.memory else ""
 
                 command = (
                     f'/usr/bin/docker run -d '
@@ -803,7 +816,9 @@ class DockerService:
                     f'{entrypoint_flag} '
                     f'{env_flags} '
                     f'{shm_size_flag} '
-                    f'--gpus all '
+                    f'{gpu_flags}'  # GPU restriction flags
+                    f'{cpu_flags}'  # CPU restriction flags
+                    f'{memory_flags}'  # Memory restriction flags
                     f'--restart unless-stopped '
                     f'--name {container_name} '
                     f'{payload.docker_image} '
@@ -826,7 +841,7 @@ class DockerService:
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
-                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra)
+                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra, pod_name=container_name)
                     raise Exception("Run docker run command but container is not running")
 
                 # Add profiler for docker container creation
@@ -901,20 +916,7 @@ class DockerService:
 
                 await self.finish_stream_logs()
 
-                await self.redis_service.add_rented_machine(RentedMachine(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    executor_ip_address=executor_info.address,
-                    executor_ip_port=str(executor_info.port),
-                    container_name=container_name,
-                ))
-
-                rented_machine = await self.redis_service.get_rented_machine(executor_info)
-                if not rented_machine:
-                    logger.error(_m(
-                        "Not found rented pod from redis",
-                        extra=get_extra_info(default_extra),
-                    ))
+                await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
 
                 # Add profiler for ssh service installation
                 profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -942,7 +944,7 @@ class DockerService:
             logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id)
+            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
             
             # Release ports reserved for this pod
             await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
@@ -1117,7 +1119,7 @@ class DockerService:
                     ),
                 )
 
-                await self.redis_service.remove_rented_machine(executor_info)
+                await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
 
                 # Release ports reserved for this pod
                 await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
