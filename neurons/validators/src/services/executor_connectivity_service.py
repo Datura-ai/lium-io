@@ -448,18 +448,7 @@ class ExecutorConnectivityService:
             logger.error(_m(f"save to db failed: {e}", extra), exc_info=True)
 
     async def cleanup_docker_containers(self, ssh_client: SSHClientConnection, extra: dict = {}):
-        executor_containers = [
-            'executor-watchtower-1',
-            'executor-executor-runner-1',
-            'executor-executor-1',
-            'executor-monitor-1',
-            'executor-db-1',
-            'executor-autoheal-1',
-        ]
-        if settings.debug.ENABLED:
-            command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
-        else:
-            command = '/usr/bin/docker ps -a --format "{{.Names}}"'
+        command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
 
         result = await ssh_client.run(command)
         container_names = []
@@ -467,17 +456,14 @@ class ExecutorConnectivityService:
         if result.stdout.strip():
             container_names.extend(result.stdout.strip().split("\n"))
 
-        container_names = [container for container in container_names if container not in executor_containers]
-        logger.info(_m(f"cleanup: found {len(container_names)} containers {container_names}", extra))
-
         if container_names:
             container_names_str = " ".join(container_names)
+            logger.info(_m(f"cleanup: found {len(container_names)} containers {container_names_str}", extra))
             command = f"/usr/bin/docker rm {container_names_str} -f"
             await ssh_client.run(command)
             command = "/usr/bin/docker volume prune -af"
             await ssh_client.run(command)
-
-        logger.info(_m(f"cleanup: removed {len(container_names)} containers", extra))
+            logger.info(_m(f"cleanup: removed {len(container_names)} containers", extra))
 
     def get_available_port_maps(
         self, executor_info: ExecutorSSHInfo, batch_size: int = 1000, rented_external_ports: set[int] | None = None

@@ -217,6 +217,9 @@ class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_keys: list[str] = []
+    gpu_uuids: list[str]
+    cpu_count: int
+    memory: str
     custom_options: CustomOptions | None = None
     debug: bool | None = None
     local_volume: str | None = None
