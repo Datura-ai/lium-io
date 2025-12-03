@@ -172,3 +172,5 @@ testing/
 
 **/.python-version
 notebooks/
+
+.vscode/*

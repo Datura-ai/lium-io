@@ -54,25 +54,6 @@ class ExecutorConnectivityService:
         public_key: str,
         sysbox_runtime: bool = False,
     ) -> DockerConnectionCheckResult:
-        """
-        Verify executor port connectivity using batch and Docker-in-Docker verification.
-
-        Performs comprehensive port verification in two stages:
-        1. Batch verification: Tests multiple ports using batch-verifier container
-        2. DIND verification: Validates Docker-in-Docker capability on one port
-
-        Args:
-            ssh_client: SSH connection to executor machine
-            job_batch_id: Unique identifier for this verification job
-            miner_hotkey: Miner's Bittensor hotkey
-            executor_info: Executor SSH and port configuration
-            private_key: SSH private key for container access (PEM format)
-            public_key: SSH public key for container access
-            sysbox_runtime: Whether executor uses Sysbox runtime (default False)
-
-        Returns:
-            DockerConnectionCheckResult with verification status, message, and sysbox detection
-        """
         extra = {
             "job_batch_id": job_batch_id,
             "miner_hotkey": miner_hotkey,
@@ -84,6 +65,8 @@ class ExecutorConnectivityService:
             "version": settings.VERSION,
             "sysbox_runtime": sysbox_runtime,
         }
+
+        """Verify multiple ports concurrently."""
         try:
             t1 = time.monotonic()
             rented_external_ports = await self.port_mapping_dao.get_busy_external_ports()
@@ -161,25 +144,7 @@ class ExecutorConnectivityService:
         executor_info: ExecutorSSHInfo,
         extra: dict = {},
     ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-        """
-        Verify port connectivity using batch verification container.
-
-        Process:
-        1. Start batch-verifier Docker container with random API port
-        2. Wait for health check to confirm service is running
-        3. Request service to open internal ports and verify external access
-        4. Collect results and categorize ports as successful/failed
-        5. Clean up container regardless of outcome
-
-        Args:
-            ssh_client: SSH connection to executor machine
-            port_maps: List of (internal_port, external_port) tuples to verify
-            executor_info: Executor connection details
-            extra: Logging context dictionary
-
-        Returns:
-            Tuple of (successful_ports, failed_ports) where each is a list of port pairs
-        """
+        """Start docker on executor -> open ports there -> check ports -> close docker"""
         if not port_maps:
             return [], []
 
@@ -249,22 +214,7 @@ class ExecutorConnectivityService:
     async def _docker_start(
         self, api_external: int, api_internal: int, container_name: str, extra: dict, ssh_client: SSHClientConnection
     ):
-        """
-        Start batch port verifier container on executor.
-
-        Runs daturaai/batch-port-verifier container with host networking to enable
-        port forwarding tests. The container provides HTTP API for batch port verification.
-
-        Args:
-            api_external: External port for API access
-            api_internal: Internal port for API binding
-            container_name: Name to assign to the Docker container
-            extra: Logging context dictionary
-            ssh_client: SSH connection to executor
-
-        Raises:
-            Exception: If docker run fails with non-zero exit status
-        """
+        """Run the special container in the executor machine"""
         command = (
             f"/usr/bin/docker run -d --name {container_name} --network=host "
             f"-e API_PORT={api_internal} {BATCH_VERIFIER_IMAGE}"
@@ -280,20 +230,7 @@ class ExecutorConnectivityService:
     async def _diagnose_container_status(
         self, ssh_client: SSHClientConnection, container_name: str, extra: dict = {}
     ) -> dict[str, Any]:
-        """
-        Collect diagnostic information when container health check fails.
-
-        Gathers container status and recent logs to help debug why the batch
-        verifier service is not responding to health checks.
-
-        Args:
-            ssh_client: SSH connection to executor
-            container_name: Name of container to diagnose
-            extra: Logging context dictionary
-
-        Returns:
-            dict with keys: 'status' (container state), 'logs' (tail of output), 'is_running' (boolean)
-        """
+        """Diagnose container status with detailed information"""
         diagnosis = {
             "status": None,
             "logs": None,
@@ -330,20 +267,7 @@ class ExecutorConnectivityService:
         return diagnosis
 
     async def _docker_wait_for_health(self, external_ip: str, api_port: int, extra: dict = {}) -> bool:
-        """
-        Poll batch verifier /health endpoint until service is ready or timeout.
-
-        Continuously checks health endpoint every 0.5 seconds until the service
-        responds with {"status": "ok"} or BATCH_HEALTH_CHECK_TIMEOUT is reached.
-
-        Args:
-            external_ip: Executor public IP address
-            api_port: External port where batch verifier API is exposed
-            extra: Logging context dictionary
-
-        Returns:
-            True if service became healthy within timeout, False otherwise
-        """
+        """Wait for batch port verifier service to become healthy."""
         health_url = f"http://{external_ip}:{api_port}/health"
         timeout = BATCH_HEALTH_CHECK_TIMEOUT
         start_time = asyncio.get_event_loop().time()
@@ -372,21 +296,7 @@ class ExecutorConnectivityService:
     async def _check_port_on_executor(
         self, ssh_client: SSHClientConnection, port: int, extra: dict = {}
     ) -> dict[str, Any]:
-        """
-        Diagnose port accessibility from inside the executor machine.
-
-        Performs two checks via SSH:
-        1. netstat to verify port is bound and listening (LISTEN state)
-        2. curl localhost health endpoint if port is listening
-
-        Args:
-            ssh_client: SSH connection to executor
-            port: Port number to check
-            extra: Logging context dictionary
-
-        Returns:
-            dict with 'is_listening' (bool) and 'health_accessible' (bool)
-        """
+        """Check if port is listening on executor"""
         port_info: dict[str, Any] = {"is_listening": False, "health_accessible": False}
 
         try:
@@ -414,22 +324,7 @@ class ExecutorConnectivityService:
     async def _verify_port(
         self, host: str, external_port: int, expected_response: str, int_port: int, session: aiohttp.ClientSession,
     ) -> tuple[bool, int | None]:
-        """
-        Verify a single port responds with expected token.
-
-        Makes HTTP GET request to external port and validates response matches
-        the expected_response string (format: "{internal_port}_{secret}").
-
-        Args:
-            host: External IP address
-            external_port: Port to test
-            expected_response: Token string to match against response body
-            int_port: Internal port number (returned on success)
-            session: aiohttp session for connection pooling
-
-        Returns:
-            Tuple of (success_bool, internal_port_or_none)
-        """
+        """Verify remote port is responding correctly via HTTP GET."""
         url = f"http://{host}:{external_port}/"
 
         try:
@@ -445,20 +340,9 @@ class ExecutorConnectivityService:
         self, external_ip: str, api_port: int, port_maps: list[tuple[int, int]], extra: dict = {}
     ) -> dict[str, bool]:
         """
-        Verify port connectivity through batch verification service.
-
-        1. Send POST /start-ports to open internal ports with a secret token
-        2. Send parallel GET requests to all external ports to verify connectivity
-        3. Send POST /stop-ports to close ports after verification
-
-        Args:
-            external_ip: External IP address of the executor
-            api_port: Port where batch verifier API is exposed
-            port_maps: List of (internal_port, external_port) tuples to verify
-            extra: Logging context dictionary
-
-        Returns:
-            dict[str, bool]: Mapping of internal port (as string) to success status
+        will send POST /start-ports command to turn_on ports with list of internal ports
+        then in paralel will send GET request to every external port to check if it is open
+        Send Post /close-ports command to turn_off ports after all ports are checked
         """
         start_url = f"http://{external_ip}:{api_port}/start-ports"
         stop_url = f"http://{external_ip}:{api_port}/stop-ports"
@@ -528,19 +412,7 @@ class ExecutorConnectivityService:
         failed_ports: list[tuple[int, int]],
         extra: dict = {},
     ):
-        """
-        Save port verification results to database.
-
-        Stores both successful and failed port mappings with is_successful flag.
-        Also cleans up stale port records older than 24 hours for this executor.
-
-        Args:
-            executor_info: Executor identification details
-            miner_hotkey: Miner's Bittensor hotkey
-            successful_ports: List of verified working port pairs
-            failed_ports: List of non-working port pairs
-            extra: Logging context dictionary
-        """
+        """Save successful port verification results to database."""
         try:
             # Prepare database records for successful ports only
             db_records = [
@@ -597,26 +469,7 @@ class ExecutorConnectivityService:
     def get_available_port_maps(
         self, executor_info: ExecutorSSHInfo, batch_size: int = 1000, rented_external_ports: set[int] | None = None
     ) -> list[tuple[int, int]]:
-        """
-        Select available port mappings for verification with preferred ports prioritized.
-
-        Selection logic:
-        1. If executor has port_mappings (JSON), prioritize preferred ports from that list
-        2. If executor has port_range, generate ports and prioritize preferred ones
-        3. Otherwise use default range (20000-65535) with preferred ports first
-        4. Exclude SSH port and currently rented ports
-        5. Return up to batch_size port pairs
-
-        Preferred ports are those in PREFERRED_POD_PORTS constant (commonly used pod ports).
-
-        Args:
-            executor_info: Executor SSH and port configuration
-            batch_size: Maximum number of port pairs to return (default 1000)
-            rented_external_ports: Set of ports already in use by active rentals
-
-        Returns:
-            List of (internal_port, external_port) tuples, with preferred ports first
-        """
+        """Get a list of available port maps for batch verification. with priority for PREFERRED_POD_PORTS"""
         if rented_external_ports is None:
             rented_external_ports = set()
 
