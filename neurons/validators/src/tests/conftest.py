@@ -52,7 +52,7 @@ def sample_executor_info():
     # Create enough ports to avoid the hardcoded 1000 limit in line 349
     port_mappings = [[9000 + i, 9000 + i] for i in range(1005)]
     return ExecutorSSHInfo(
-        uuid="test-executor-123",
+        uuid="550e8400-e29b-41d4-a716-446655440000",
         address="192.168.1.100",
         port=8080,
         ssh_username="root",
