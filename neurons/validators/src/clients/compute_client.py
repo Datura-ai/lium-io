@@ -530,7 +530,7 @@ class ComputeClient:
             return
 
         try:
-            response = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
+            response: DuplicateExecutorsResponse = pydantic.TypeAdapter(DuplicateExecutorsResponse).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
         else:
@@ -568,7 +568,7 @@ class ComputeClient:
             return
 
         try:
-            response = pydantic.TypeAdapter(RevenuePerGpuTypeResponse).validate_json(raw_msg)
+            response: RevenuePerGpuTypeResponse = pydantic.TypeAdapter(RevenuePerGpuTypeResponse).validate_json(raw_msg)
         except pydantic.ValidationError:
             pass
         else:
@@ -765,7 +765,7 @@ class ComputeClient:
                 )
             )
 
-            await self.miner_service.redis_service.remove_pending_pod(job_request.miner_hotkey, job_request.executor_id)
+            await self.miner_service.redis_service.remove_pending_pod(job_request.miner_hotkey, job_request.executor_id, job_request.pod_id)
         elif isinstance(job_request, GetPodLogsRequestFromServer):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port

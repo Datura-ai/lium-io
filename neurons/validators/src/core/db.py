@@ -30,11 +30,11 @@ else:
         echo=settings.ENV == "dev",
         future=True,
         poolclass=AsyncAdaptedQueuePool,
-        pool_timeout=30,
-        pool_recycle=1800,
         pool_size=POOL_SIZE,
+        pool_pre_ping=True,
+        pool_recycle=3600,  # Recycle connections every hour to prevent stale connections
+        pool_timeout=30,  # Timeout for getting connection from pool
         max_overflow=256,
-        pool_pre_ping=True
     )
 
 AsyncSessionMaker = sessionmaker(
