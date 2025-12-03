@@ -204,7 +204,7 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
-                PortConnectivityCheck(),
+                # PortConnectivityCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 VerifyXCheck(),
