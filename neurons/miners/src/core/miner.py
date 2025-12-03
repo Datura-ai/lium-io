@@ -211,7 +211,8 @@ class Miner:
         )
         try:
             while not self.should_exit:
-                await self.sync()
+                if not settings.debug.SKIP_SYNC_FLOW:
+                    await self.sync()
 
                 # sync every 2 mins
                 await asyncio.sleep(SYNC_CYCLE)

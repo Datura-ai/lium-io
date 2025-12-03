@@ -163,16 +163,50 @@ class RedisService:
 
     async def add_rented_machine(self, machine: RentedMachine):
         await self.hset(RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json())
+    
+    async def add_rented_pod(self, executor: ExecutorSSHInfo, pod_id: str, container_name: str):
+        rented_machine = await self.get_rented_machine(executor)
+        if not rented_machine:
+            rented_machine = {"owner_flag": False, "containers": [{"name": container_name, "pod_id": pod_id}]}
+        else:
+            rented_machine["containers"].append({"name": container_name, "pod_id": pod_id})
+        
+        await self.hset(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}", json.dumps(rented_machine))
 
-    async def remove_rented_machine(self, executor: ExecutorSSHInfo):
-        await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
+    async def remove_rented_machine(self, executor: ExecutorSSHInfo, container_name: str | None = None):
+        if not container_name:
+            await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
+        else:
+            rented_machine = await self.get_rented_machine(executor)
+            if not rented_machine:
+                return
+            rented_machine["containers"] = [item for item in rented_machine["containers"] if item["name"] != container_name]
+            if not rented_machine["containers"]:
+                await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
+            else:
+                await self.hset(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}", json.dumps(rented_machine))
 
-    async def get_rented_machine(self, executor: ExecutorSSHInfo):
+    async def get_rented_machine(self, executor: ExecutorSSHInfo) -> dict | None:
         data = await self.hget(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
         if not data:
             return None
 
-        return json.loads(data)
+        data = json.loads(data)
+        
+        # check if the data is new structure
+        if "containers" in data:
+            containers = data.get("containers", [])
+            containers = [container for container in containers if container.get("name", "").strip()]
+            if not containers:
+                return None
+            return {"owner_flag": data.get("owner_flag", False), "containers": containers}
+        
+        # check if the data is old structure
+        container_name: str = data.get("container_name", "")
+        owner_flag: bool = data.get("owner_flag", False)
+        if not container_name or not container_name.strip():
+            return None
+        return {"owner_flag": owner_flag, "containers": [{"name": container_name}]}
 
     async def add_executor_uptime(self, machine: ExecutorUptimeResponse):
         await self.hset(EXECUTORS_UPTIME_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", str(machine.uptime_in_minutes))
@@ -187,25 +221,50 @@ class RedisService:
             logger.error(_m("Error getting executor uptime: {e}", extra={"error": e}), exc_info=True)
             return 0
 
-    async def add_pending_pod(self, miner_hotkey: str, executor_id: str):
+    async def add_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
         now = int(time.time())
-        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps({"time": now}))
+        
+        pending_pods.append({"time": now, "pod_id": pod_id})
+        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
 
-    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str):
-        await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
-
-    async def renting_in_progress(self, miner_hotkey: str, executor_id: str):
+    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        pending_pods = [item for item in pending_pods if item.get('pod_id', '') != pod_id]
+        if pending_pods:
+            await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        else:
+            await self.hdel(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
+    
+    async def get_pending_pods(self, miner_hotkey: str, executor_id: str) -> list[dict]:
         data = await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}")
         if not data:
-            return False
+            return []
 
-        now = int(time.time())
         data = json.loads(data)
-        if now - data.get('time', 0) >= 30 * 60:  # 30 mins
-            await self.remove_pending_pod(miner_hotkey, executor_id)
-            return False
+        if isinstance(data, dict):
+            data = [data]
+        elif not isinstance(data, list):
+            logger.warning(f"Unexpected data type in get_pending_pods: {type(data)}")
+            return []
+        
+        now = int(time.time())
+        pending_pods = []
+        
+        for item in data:
+            if now - item.get('time', 0) >= 30 * 60:  # 30 mins
+                continue
+            pending_pods.append(item)
+        
+        return pending_pods
 
-        return True
+    async def renting_in_progress(self, miner_hotkey: str, executor_id: str, pod_id: str | None = None) -> bool:
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+        
+        if pod_id:
+            pending_pods = [item for item in pending_pods if item.get('pod_id', '') == pod_id]
+        
+        return len(pending_pods) > 0
 
     async def set_verified_job_info(
         self,

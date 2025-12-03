@@ -135,7 +135,6 @@ class ValidationService:
             self.wrapper.generateChallenge(self.verifier_ptr, seed, machine_info, uuid)
 
             cipher_text = self.wrapper.getCipherText(self.verifier_ptr)
-            print("Encrypt Challenge Cipher Text:", cipher_text)
             return cipher_text
         except Exception as e:
             logger.error("Failed encrypt challenge request: %s", str(e))
@@ -210,7 +209,6 @@ class ValidationService:
                 verifier_params.uuid,
             )
 
-            print("verifier_params", verifier_params)
             command = f"{executor_info.python_path} {script_path} {verifier_params}"
 
             log_extra = {
@@ -241,7 +239,7 @@ class ValidationService:
 
             if result is None:
                 error_msg = "GPU model validation job failed: result is None"
-                logger.warning(_m(error_msg, extra=get_extra_info(log_extra)))
+                logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
                 return ValidationResult(
                     success=False,
                     expected_uuid=verifier_params.uuid,
@@ -289,7 +287,7 @@ class ValidationService:
                     )
                 else:
                     error_msg = f"UUID mismatch: expected '{verifier_params.uuid}', got '{uuid}'"
-                    logger.info(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "returned_uuid": uuid, "error": error_msg})))
+                    logger.error(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "returned_uuid": uuid, "error": error_msg})))
                     return ValidationResult(
                         success=False,
                         expected_uuid=verifier_params.uuid,

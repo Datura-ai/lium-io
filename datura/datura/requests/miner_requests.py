@@ -49,7 +49,6 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     root_dir: str
     port_range: str | None = None
     port_mappings: str | None = None
-    price: float | None = None
     price_per_gpu: float | None = None
 
 
