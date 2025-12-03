@@ -522,6 +522,45 @@ class DockerService:
             "Connection refused", "Port already in use", "Failed to start"
         ]):
             raise Exception(error)
+    
+    async def get_docker_root_dir(self, ssh_client: asyncssh.SSHClientConnection):
+        """Get Docker storage info using docker info command"""
+        command = f"/usr/bin/docker info --format '{{{{.DockerRootDir}}}}'"
+        result = await ssh_client.run(command)
+        return result.stdout.strip()
+    
+    async def create_local_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        local_volume: str,
+        log_tag: str,
+        log_text: str,
+        log_extra: dict,
+        limit: int | None = None,
+        timeout: int = 10,
+    ):
+        if limit:
+            # install loopback plugin
+            loopback_plugin_name = "vloopback"
+
+            docker_root_dir = await self.get_docker_root_dir(ssh_client)
+            logger.info(_m(f"Docker data root: {docker_root_dir}", extra=get_extra_info(log_extra)))
+            
+            command = f'/usr/bin/docker plugin install ashald/docker-volume-loopback --alias {loopback_plugin_name} --grant-all-permissions DATA_DIR="{docker_root_dir}/loopback"'
+            await ssh_client.run(command)
+            
+            command = f'/usr/bin/docker volume create -d {loopback_plugin_name} {local_volume} -o size={limit}g'
+        else:
+            command = f"/usr/bin/docker volume create {local_volume}"
+
+        await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text=log_text,
+            log_extra=log_extra,
+            timeout=timeout,
+        )
 
     async def create_container(
         self,
@@ -757,14 +796,13 @@ class DockerService:
                 if not local_volume:
                     # create docker volume
                     local_volume = f"volume_{payload.pod_id}"
-                    command = f"/usr/bin/docker volume create {local_volume}"
-                    await self.execute_and_stream_logs(
+                    await self.create_local_volume(
                         ssh_client=ssh_client,
-                        command=command,
+                        local_volume=local_volume,
                         log_tag=log_tag,
                         log_text=f"Creating docker volume {local_volume}",
                         log_extra=default_extra,
-                        timeout=10,
+                        limit=payload.volume_limit_gb,
                     )
 
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
@@ -806,6 +844,8 @@ class DockerService:
                 # CPU and memory restriction flags
                 cpu_flags = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
                 memory_flags = f"--memory {payload.memory} " if payload.memory else ""
+                
+                storage_flags = f"--storage-opt size={payload.storage_limit_gb}g " if payload.storage_limit_gb else ""
 
                 command = (
                     f'/usr/bin/docker run -d '
@@ -816,9 +856,10 @@ class DockerService:
                     f'{entrypoint_flag} '
                     f'{env_flags} '
                     f'{shm_size_flag} '
-                    f'{gpu_flags}'  # GPU restriction flags
-                    f'{cpu_flags}'  # CPU restriction flags
-                    f'{memory_flags}'  # Memory restriction flags
+                    f'{gpu_flags} '  # GPU restriction flags
+                    f'{cpu_flags} '  # CPU restriction flags
+                    f'{memory_flags} '  # Memory restriction flags
+                    f'{storage_flags} '  # Storage restriction flags
                     f'--restart unless-stopped '
                     f'--name {container_name} '
                     f'{payload.docker_image} '
@@ -935,6 +976,7 @@ class DockerService:
                     restore_path=payload.restore_path,
                     jupyter_url=jupyter_url,
                     warnings=warnings,
+                    local_volume_path=local_volume_path,
                 )
         except Exception as e:
             log_text = _m(

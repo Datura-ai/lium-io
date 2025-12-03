@@ -223,6 +223,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     custom_options: CustomOptions | None = None
     debug: bool | None = None
     local_volume: str | None = None
+    volume_limit_gb: int | None = None
+    storage_limit_gb: int | None = None
     external_volume_info: ExternalVolumeInfo | None = None
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
@@ -349,6 +351,7 @@ class ContainerCreated(ContainerBaseResponse):
     restore_path: str | None = None
     jupyter_url: str | None = None
     warnings: list[ContainerWarningCode] | None = None
+    local_volume_path: str | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
