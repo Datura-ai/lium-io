@@ -69,7 +69,7 @@ class ExecutorConnectivityService:
         """Verify multiple ports concurrently."""
         try:
             t1 = time.monotonic()
-            rented_external_ports = await self.port_mapping_dao.get_busy_external_ports()
+            rented_external_ports = await self.port_mapping_dao.get_busy_external_ports(UUID(executor_info.uuid))
             port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE, rented_external_ports)
             if not port_maps:
                 return DockerConnectionCheckResult(
