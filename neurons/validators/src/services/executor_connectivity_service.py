@@ -462,9 +462,9 @@ class ExecutorConnectivityService:
         try:
             command = f"/usr/bin/docker rm -f {container_name}"
             await ssh_client.run(command)
-            logger.debug(_m(f"cleanup: removed container {container_name}", extra))
+            logger.info(_m(f"cleanup: removed container {container_name}", extra))
         except Exception:
-            logger.debug(_m(f"cleanup: container {container_name} not found or already removed", extra))
+            logger.info(_m(f"cleanup: container {container_name} not found or already removed", extra))
 
     def get_available_port_maps(
         self, executor_info: ExecutorSSHInfo, batch_size: int = 1000, rented_external_ports: set[int] | None = None

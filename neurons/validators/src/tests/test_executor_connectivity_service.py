@@ -143,7 +143,7 @@ async def test_verify_ports_invalid_json_mappings(executor_service, mock_ssh_cli
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440001",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
