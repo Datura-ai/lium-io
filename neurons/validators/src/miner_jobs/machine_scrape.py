@@ -958,9 +958,9 @@ def get_machine_specs():
         data["data_sysbox_runtime_scrape_error"] = log_text
         
     is_supported, log_text = check_storage_limit_ability()
-    data["data_available_for_storage_limit"] = is_supported
+    data["data_storage_limit_supported"] = is_supported
     if not is_supported:
-        data["data_available_for_storage_limit_scrape_error"] = log_text
+        data["data_storage_limit_scrape_error"] = log_text
 
     try:
         lscpu_output = run_cmd("lscpu")

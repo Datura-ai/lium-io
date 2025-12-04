@@ -109,8 +109,8 @@ ORIGINAL_KEYS = {
     'each_name': "name",
     'data_sysbox_runtime': "sysbox_runtime",
     'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
-    'data_available_for_storage_limit': "available_for_storage_limit",
-    'data_available_for_storage_limit_scrape_error': "available_for_storage_limit_scrape_error",
+    'data_storage_limit_supported': "storage_limit_supported",
+    'data_storage_limit_scrape_error': "storage_limit_scrape_error",
 }
 
 
@@ -254,8 +254,8 @@ class FileEncryptService:
             'machine_specs': "",
             'data_sysbox_runtime_scrape_error': "",
             'data_sysbox_runtime': "",
-            'data_available_for_storage_limit_scrape_error': "",
-            'data_available_for_storage_limit': "",
+            'data_storage_limit_scrape_error': "",
+            'data_storage_limit_supported': "",
         }
 
         # Generate dictionary key mapping on validator side
