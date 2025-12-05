@@ -351,6 +351,8 @@ class ContainerCreated(ContainerBaseResponse):
     restore_path: str | None = None
     jupyter_url: str | None = None
     warnings: list[ContainerWarningCode] | None = None
+    storage_limit_gb: int | None = None
+    volume_limit_gb: int | None = None
     local_volume_path: str | None = None
 
 

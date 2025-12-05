@@ -976,6 +976,8 @@ class DockerService:
                     restore_path=payload.restore_path,
                     jupyter_url=jupyter_url,
                     warnings=warnings,
+                    storage_limit_gb=payload.storage_limit_gb,
+                    volume_limit_gb=payload.volume_limit_gb,
                     local_volume_path=local_volume_path,
                 )
         except Exception as e:
