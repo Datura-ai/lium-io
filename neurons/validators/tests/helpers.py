@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from neurons.validators.src.services.task.pipeline import (
+from services.task.pipeline import (
     Context,
     ContextConfig,
     ContextServices,
