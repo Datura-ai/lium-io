@@ -436,7 +436,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
     class RentedRedisService:
         async def get_rented_machine(self, executor):
             return {
-                "container_name": "tenant-container-123",
+                "containers": [{"name": "tenant-container-123", "pod_id": "pod-123"}],
                 "owner_flag": False,
             }
 
