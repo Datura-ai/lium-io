@@ -258,8 +258,8 @@ class CliService:
         self,
         address: str,
         port: int,
+        price_per_gpu: float,
         validator: str | None = None,
-        price_per_gpu: float | None = None,
         deposit_amount: float | None = None,
         gpu_type: str | None = None,
         gpu_count: int | None = None
@@ -268,7 +268,7 @@ class CliService:
         Add an executor to the database and deposit collateral.
         :param address: Executor IP address
         :param port: Executor port
-        :param price_per_gpu: Executor price per GPU per hour in USD
+        :param price_per_gpu: GPU price per hour in USD
         :param validator: Validator hotkey
         :param deposit_amount: Amount of TAO to deposit (optional)
         :param gpu_type: Type of GPU (optional)
@@ -595,7 +595,7 @@ class CliService:
         address: str,
         port: int,
         *,
-        price_per_gpu: float | None = None,
+        price_per_gpu: float,
     ) -> bool:
         """
         Update the price per hour for an executor by address and port.
