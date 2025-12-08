@@ -144,10 +144,10 @@ def get_balance_of_eth_address(private_key: str):
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 @click.option(
-    "--validator", required=False, help="Validator hotkey that executor opens to."
+    "--price", type=float, prompt="GPU price per hour (USD)", help="GPU price per hour in USD"
 )
 @click.option(
-    "--price", type=float, required=False, help="Price per hour in USD"
+    "--validator", required=False, help="Validator hotkey that executor opens to."
 )
 @click.option(
     "--gpu-type", help="Type of GPU", required=False
@@ -162,8 +162,8 @@ def get_balance_of_eth_address(private_key: str):
 def add_executor(
     address: str,
     port: int,
+    price: float,
     validator: str | None = None,
-    price: float | None = None,
     gpu_type: str | None = None,
     gpu_count: int | None = None,
     private_key: str | None = None,
@@ -177,7 +177,7 @@ def add_executor(
 
     cli_service = CliService(private_key=private_key, with_executor_db=True)
     success = asyncio.run(
-        cli_service.add_executor(address, port, validator, price, deposit_amount, gpu_type, gpu_count)
+        cli_service.add_executor(address, port, price, validator, deposit_amount, gpu_type, gpu_count)
     )
     if success:
         logger.info("✅ Added executor and deposited collateral successfully.")
@@ -291,32 +291,15 @@ def switch_validator(address: str, port: int, validator: str):
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option("--price", type=float, prompt="Price per hour (USD)", help="New price per hour in USD")
+@click.option("--price", type=float, prompt="GPU price per hour (USD)", help="New price per GPU in USD")
 def update_executor_price(address: str, port: int, price: float):
-    """Update the price per hour for an executor in USD"""
+    """Update the price per GPU for an executor in USD"""
     if price < 0:
         logger.error("❌ Price cannot be negative.")
         return
     
     cli_service = CliService(with_executor_db=True)
-    success = asyncio.run(cli_service.update_executor_price(address, port, price_per_hour=price))
-    if success:
-        logger.info("✅ Successfully updated executor price.")
-    else:
-        logger.error("❌ Failed to update executor price.")
-
-@cli.command()
-@click.option("--address", prompt="IP Address", help="IP address of executor")
-@click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option("--price_per_gpu", type=float, prompt="Price per GPU per hour (USD)", help="New price per GPU in USD")
-def update_executor_price_per_gpu(address: str, port: int, price_per_gpu: float):
-    """Update the price per GPU for an executor in USD"""
-    if price_per_gpu < 0:
-        logger.error("❌ Price cannot be negative.")
-        return
-    
-    cli_service = CliService(with_executor_db=True)
-    success = asyncio.run(cli_service.update_executor_price(address, port, price_per_gpu=price_per_gpu))
+    success = asyncio.run(cli_service.update_executor_price(address, port, price_per_gpu=price))
     if success:
         logger.info("✅ Successfully updated executor price.")
     else:
@@ -377,6 +360,33 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str):
     success = asyncio.run(cli_service.finalize_reclaim_request(reclaim_request_id))
     if not success:
         logger.error("❌ Failed to finalize reclaim request.")
+        
+@cli.command()
+def migrate_validator_hotkey():
+    from core.config import settings
+    from core.db import get_db
+    from models.executor import Executor
+    from sqlmodel import func, select, update
+
+    old_validator_hotkey = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
+
+    session = next(get_db())
+    filters = [
+        Executor.validator == old_validator_hotkey,
+    ]
+    select_stmt = select(func.count(Executor.uuid)).where(*filters)
+    count = session.exec(select_stmt).one()
+    logger.info(f"Found {count} miners with validator {old_validator_hotkey}")
+    
+    update_stmt = (
+        update(Executor)
+        .where(*filters)
+        .values(validator=settings.DEFAULT_VALIDATOR_HOTKEY)
+    )
+    result = session.exec(update_stmt)
+    updated_count = result.rowcount
+    session.commit()
+    logger.info(f"Migration completed. Updated {updated_count} miners")
 
 
 if __name__ == "__main__":

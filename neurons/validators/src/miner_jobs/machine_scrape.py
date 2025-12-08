@@ -960,7 +960,7 @@ def get_machine_specs():
 
     data["data_hard_disk"] = {}
     try:
-        disk_usage = shutil.disk_usage(".")
+        disk_usage = shutil.disk_usage("/")
         data["data_hard_disk"] = {
             "hard_disk_total": disk_usage.total // 1024,  # in kB
             "hard_disk_used": disk_usage.used // 1024,

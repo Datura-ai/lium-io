@@ -1,7 +1,7 @@
 from typing import Annotated, Optional
 
 import docker
-from fastapi import APIRouter, Depends, Query, Header
+from fastapi import APIRouter, Depends, Query, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
@@ -18,6 +18,9 @@ apis_router = APIRouter()
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
+    if payload.public_key != payload.data_to_sign:
+        raise HTTPException(status_code=400, detail="Public key mismatch")
+
     return await miner_service.upload_ssh_key(payload)
 
 

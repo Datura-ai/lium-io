@@ -69,7 +69,7 @@ class ExecutorConnectivityService:
         """Verify multiple ports concurrently."""
         try:
             t1 = time.monotonic()
-            await self.cleanup_docker_containers(ssh_client, extra)
+            await self.cleanup_docker_containers(ssh_client, executor_info, extra)
             rented_external_ports = await self.port_mapping_dao.get_busy_external_ports(UUID(executor_info.uuid))
             port_maps = self.get_available_port_maps(executor_info, BATCH_PORT_VERIFICATION_SIZE, rented_external_ports)
             if not port_maps:
@@ -447,37 +447,33 @@ class ExecutorConnectivityService:
         except Exception as e:
             logger.error(_m(f"save to db failed: {e}", extra), exc_info=True)
 
-    async def cleanup_docker_containers(self, ssh_client: SSHClientConnection, extra: dict = {}):
-        executor_containers = [
-            'executor-watchtower-1',
-            'executor-executor-runner-1',
-            'executor-executor-1',
-            'executor-monitor-1',
-            'executor-db-1',
-            'executor-autoheal-1',
-        ]
-        if settings.debug.ENABLED:
+    async def cleanup_docker_containers(self, ssh_client: SSHClientConnection, executor_info: ExecutorSSHInfo, extra: dict = {}):
+        try:
+            # get all pod names from rented machine
+            pod_names = []
+            rented_machine = await self.redis_service.get_rented_machine(executor_info)
+            if rented_machine:
+                pod_names = [pod.get("name", "") for pod in rented_machine.get("containers", [])]
+            
             command = '/usr/bin/docker ps -a --filter "name=^/container_" --format "{{.Names}}"'
-        else:
-            command = '/usr/bin/docker ps -a --format "{{.Names}}"'
 
-        result = await ssh_client.run(command)
-        container_names = []
+            result = await ssh_client.run(command)
+            container_names = []
 
-        if result.stdout.strip():
-            container_names.extend(result.stdout.strip().split("\n"))
+            if result.stdout.strip():
+                container_names.extend(result.stdout.strip().split("\n"))
 
-        container_names = [container for container in container_names if container not in executor_containers]
-        logger.info(_m(f"cleanup: found {len(container_names)} containers {container_names}", extra))
-
-        if container_names:
-            container_names_str = " ".join(container_names)
-            command = f"/usr/bin/docker rm {container_names_str} -f"
-            await ssh_client.run(command)
-            command = "/usr/bin/docker volume prune -af"
-            await ssh_client.run(command)
-
-        logger.info(_m(f"cleanup: removed {len(container_names)} containers", extra))
+            container_names = [container for container in container_names if container not in pod_names]
+            if container_names:
+                container_names_str = " ".join(container_names)
+                logger.info(_m(f"cleanup: found {len(container_names)} containers {container_names_str}", extra))
+                command = f"/usr/bin/docker rm {container_names_str} -f"
+                await ssh_client.run(command)
+                command = "/usr/bin/docker volume prune -af"
+                await ssh_client.run(command)
+                logger.info(_m(f"cleanup: removed {len(container_names)} containers", extra))
+        except Exception as e:
+            logger.error(_m(f"cleanup docker containers failed: {e}", extra), exc_info=True)
 
     def get_available_port_maps(
         self, executor_info: ExecutorSSHInfo, batch_size: int = 1000, rented_external_ports: set[int] | None = None
