@@ -18,6 +18,9 @@ apis_router = APIRouter()
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
+    if payload.public_key != payload.data_to_sign:
+        raise HTTPException(status_code=400, detail="Public key mismatch")
+
     return await miner_service.upload_ssh_key(payload)
 
 
