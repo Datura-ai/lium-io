@@ -113,12 +113,12 @@ class DummyScoreCalculator:
     [
         # Not rented - should pass and continue
         (None, True, [], False, [], [], 0, [], True, Msg.NOT_RENTED.reason, False),
-        # Not rented (no container_name) - should pass and continue
-        ({"container_name": ""}, True, [], False, [], [], 0, [], True, Msg.NOT_RENTED.reason, False),
+        # Not rented (no containers) - should pass and continue
+        ({"containers": []}, True, [], False, [], [], 0, [], True, Msg.NOT_RENTED.reason, False),
 
         # Rented but pod not running - should fail
         (
-            {"container_name": "tenant-123"},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}]},
             False,
             [],
             False,
@@ -133,7 +133,7 @@ class DummyScoreCalculator:
 
         # Rented, pod running, no GPU processes outside - should pass with halt
         (
-            {"container_name": "tenant-123", "owner_flag": False},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": False},
             True,
             ["ssh-rsa AAA..."],
             False,
@@ -148,7 +148,7 @@ class DummyScoreCalculator:
 
         # Rented, pod running, GPU process outside but owner_flag=True - should pass with halt
         (
-            {"container_name": "tenant-123", "owner_flag": True},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": True},
             True,
             [],
             True,
@@ -163,7 +163,7 @@ class DummyScoreCalculator:
 
         # Rented, pod running, GPU process outside, high utilization - should fail
         (
-            {"container_name": "tenant-123", "owner_flag": False},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": False},
             True,
             ["ssh-rsa AAA..."],
             False,
@@ -178,7 +178,7 @@ class DummyScoreCalculator:
 
         # Rented, pod running, GPU process outside but usage within limits - should pass with halt
         (
-            {"container_name": "tenant-123", "owner_flag": False},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": False},
             True,
             [],
             False,
@@ -193,7 +193,7 @@ class DummyScoreCalculator:
 
         # Rented, fallback to Redis port maps
         (
-            {"container_name": "tenant-123", "owner_flag": False},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": False},
             True,
             [],
             False,
@@ -280,30 +280,32 @@ async def test_tenant_enforcement_check(
     assert redis_service.get_rented_called is True
 
     # Verify SSH interactions for rented machines
-    if rented_machine and rented_machine.get("container_name"):
-        container_name = rented_machine.get("container_name")
-        # Should check if pod is running
-        assert any("docker ps" in cmd for cmd in ssh_client.commands_called)
+    if rented_machine and rented_machine.get("containers"):
+        containers = rented_machine.get("containers", [])
+        if containers:
+            container_name = containers[0].get("name")
+            # Should check if pod is running
+            assert any("docker ps" in cmd for cmd in ssh_client.commands_called)
 
-        if pod_running:
-            # Should check SSH keys
-            assert any("authorized_keys" in cmd for cmd in ssh_client.commands_called)
+            if pod_running:
+                # Should check SSH keys
+                assert any("authorized_keys" in cmd for cmd in ssh_client.commands_called)
 
-            # If passed and halted, verify score was calculated
-            if expected_pass and expect_halt:
-                assert score_calculator.called_with is not None
-                assert score_calculator.called_with["rented"] is True
+                # If passed and halted, verify score was calculated
+                if expected_pass and expect_halt:
+                    assert score_calculator.called_with is not None
+                    assert score_calculator.called_with["rented"] is True
 
-                # Verify updates
-                assert "rented" in result.updates
-                assert result.updates["rented"] is True
-                assert "score" in result.updates
-                assert "job_score" in result.updates
-                assert "success" in result.updates
-                assert result.updates["success"] is True
+                    # Verify updates
+                    assert "rented" in result.updates
+                    assert result.updates["rented"] is True
+                    assert "score" in result.updates
+                    assert "job_score" in result.updates
+                    assert "success" in result.updates
+                    assert result.updates["success"] is True
 
     # Verify updates for not rented case
-    if not rented_machine or not rented_machine.get("container_name"):
+    if not rented_machine or not rented_machine.get("containers"):
         assert "rented" in result.updates
         assert result.updates["rented"] is False
         assert result.updates["ssh_pub_keys"] is None

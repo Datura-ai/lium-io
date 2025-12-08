@@ -50,8 +50,6 @@ class StartGPUMonitorCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        # await runner.run("pip install aiohttp click pynvml psutil", timeout=30, retryable=True)
-
         program_id = str(uuid.uuid4())
         command_args: Dict[str, Any] = {
             "program_id": program_id,
