@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     SUBTENSOR_EVM_RPC_URL: str | None = Field(env="SUBTENSOR_EVM_RPC_URL", default=None)
 
     SQLALCHEMY_DATABASE_URI: str = Field(env="SQLALCHEMY_DATABASE_URI")
+    PROD_DATABASE_URL: str | None = Field(env="PROD_DATABASE_URL", default=None)
 
     EXTERNAL_IP_ADDRESS: str = Field(env="EXTERNAL_IP_ADDRESS")
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)

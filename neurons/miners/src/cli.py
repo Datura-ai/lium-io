@@ -144,10 +144,10 @@ def get_balance_of_eth_address(private_key: str):
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
 @click.option(
-    "--validator", required=False, help="Validator hotkey that executor opens to."
+    "--price", type=float, prompt="GPU price per hour (USD)", help="GPU price per hour in USD"
 )
 @click.option(
-    "--price", type=float, required=False, help="Price per hour in USD"
+    "--validator", required=False, help="Validator hotkey that executor opens to."
 )
 @click.option(
     "--gpu-type", help="Type of GPU", required=False
@@ -162,8 +162,8 @@ def get_balance_of_eth_address(private_key: str):
 def add_executor(
     address: str,
     port: int,
+    price: float,
     validator: str | None = None,
-    price: float | None = None,
     gpu_type: str | None = None,
     gpu_count: int | None = None,
     private_key: str | None = None,
@@ -177,7 +177,7 @@ def add_executor(
 
     cli_service = CliService(private_key=private_key, with_executor_db=True)
     success = asyncio.run(
-        cli_service.add_executor(address, port, validator, price, deposit_amount, gpu_type, gpu_count)
+        cli_service.add_executor(address, port, price, validator, deposit_amount, gpu_type, gpu_count)
     )
     if success:
         logger.info("✅ Added executor and deposited collateral successfully.")
@@ -291,15 +291,15 @@ def switch_validator(address: str, port: int, validator: str):
 @cli.command()
 @click.option("--address", prompt="IP Address", help="IP address of executor")
 @click.option("--port", type=int, prompt="Port", help="Port of executor")
-@click.option("--price_per_gpu", type=float, prompt="Price per GPU per hour (USD)", help="New price per GPU in USD")
-def update_executor_price_per_gpu(address: str, port: int, price_per_gpu: float):
+@click.option("--price", type=float, prompt="GPU price per hour (USD)", help="New price per GPU in USD")
+def update_executor_price(address: str, port: int, price: float):
     """Update the price per GPU for an executor in USD"""
-    if price_per_gpu < 0:
+    if price < 0:
         logger.error("❌ Price cannot be negative.")
         return
     
     cli_service = CliService(with_executor_db=True)
-    success = asyncio.run(cli_service.update_executor_price(address, port, price_per_gpu=price_per_gpu))
+    success = asyncio.run(cli_service.update_executor_price(address, port, price_per_gpu=price))
     if success:
         logger.info("✅ Successfully updated executor price.")
     else:

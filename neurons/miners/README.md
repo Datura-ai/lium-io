@@ -143,16 +143,16 @@ Executors are machines running on GPUs that you can add to your central miner. T
 2. Use the following command to add an executor to the central miner:
 
     ```bash
-    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --validator <validator-hotkey> [--price <price-per-hour>] [--gpu-type <gpu-type>] [--gpu-count <gpu-count>] [--deposit-amount <deposit-amount>] [--private-key <ethereum-private-key>]
+    docker exec -it <container-id or name> pdm run /root/app/src/cli.py add-executor --address <executor-ip-address> --port <executor-port> --price <gpu-price> [--validator <validator-hotkey>] [--gpu-type <gpu-type>] [--gpu-count <gpu-count>] [--deposit-amount <deposit-amount>] [--private-key <ethereum-private-key>]
     ```
 
     **Required parameters:**
     - `<executor-ip-address>`: The IP address of the executor machine.
     - `<executor-port>`: The port number used for the executor (default: `8001`).
+    - `<gpu-price>`: GPU price per hour in USD for the executor.
 
     **Optional parameters:**
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, our validator_hotkey will be used as default.
-    - `<price-per-hour>`: Price per hour in USD for the executor.
     - `<gpu-type>`: Type of GPU available on the executor.
     - `<gpu-count>`: Number of GPUs available on the executor.
     - `<deposit-amount>`: The amount of TAO to deposit as collateral for this executor (must meet minimum required collateral).
@@ -180,41 +180,29 @@ docker exec -it <docker instance> pdm run /root/app/src/cli.py switch-validator 
 - `<executor-port>`: The port number used for the executor.
 - `<validator-hotkey>`: The validator hotkey you want to switch
 
-### Set/Update Executor Price per GPU
+### Set/Update Executor GPU Price
 
 Run the following command to set or update the executor price:
 
 ```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py update-executor-price-per-gpu --address <executor public ip> --port <executor external port> --price_per_gpu <price per gpu>
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py update-executor-price --address <executor-ip-address> --port <executor-port> --price <gpu-price>
 ```
 
-- `<executor public ip>`: The public IP address of the executor machine.
-- `<executor external port>`: The external port number used for the executor.
-- `<price per gpu>`: Price per gpu per hour in USD for the executor.
-
-### Set/Update Executor Price (Will be deprecated soon)
-
-Run the following command to set or update the executor price:
-
-```bash
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py update-executor-price --address <executor public ip> --port <executor external port> --price <executor price>
-```
-
-- `<executor public ip>`: The public IP address of the executor machine.
-- `<executor external port>`: The external port number used for the executor.
-- `<executor price>`: Price per hour in USD for the executor.
+- `<executor-ip-address>`: The IP address of the executor machine.
+- `<executor-port>`: The port number used for the executor.
+- `<gpu-price>`: GPU price per hour in USD for the executor.
 
 ### Removing an Executor
 
 To remove an executor from the central miner, follow these steps:
 1. Run the following command to remove the executor:
 
-    ```bash
-    docker exec -it <container-id or name> pdm run /root/app/src/cli.py remove-executor --address <executor public ip> --port <executor external port>
-    ```
+```bash
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py remove-executor --address <executor-ip-address> --port <executor-port>
+```
 
-    - `<executor public ip>`: The public IP address of the executor machine.
-    - `<executor external port>`: The external port number used for the executor.
+- `<executor-ip-address>`: The IP address of the executor machine.
+- `<executor-port>`: The port number used for the executor.
 
 2. Type "y" and click enter in the interactive shell.
 
