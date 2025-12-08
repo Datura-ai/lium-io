@@ -7,6 +7,7 @@ authors = [
 ]
 dependencies = [
     "alembic>=1.16.5",
+    "asyncssh>=2.21.0",
     "asgiref>=3.9.1",
     "bittensor==9.10.1",
     "bittensor-cli==9.11.0",
