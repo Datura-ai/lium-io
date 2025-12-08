@@ -9,11 +9,14 @@ from typing import Optional, Any
 from core.config import settings
 from core.db import get_db
 from daos.executor import ExecutorDao
+from services.executor_service import ExecutorService
+from services.ssh_service import MinerSSHService
 from models.executor import Executor
 from core.utils import get_collateral_contract, _m
 from core.const import REQUIRED_DEPOSIT_AMOUNT
 from celium_collateral_contracts.address_conversion import h160_to_ss58
 from bittensor.utils.balance import Balance
+from protocol.miner_portal_request import AddExecutorFailed
 
 logging.basicConfig(level=logging.INFO)
 
@@ -44,6 +47,14 @@ class CliService:
             if private_key else get_collateral_contract(version=version)
         )
         self.executor_dao = ExecutorDao(session=next(get_db())) if with_executor_db else None
+
+        # Create executor_service if with_executor_db is True
+        if with_executor_db and self.executor_dao is not None:
+            ssh_service = MinerSSHService()
+            self.executor_service = ExecutorService(executor_dao=self.executor_dao, ssh_service=ssh_service)
+        else:
+            self.executor_service = None
+
         self.logger = logging.getLogger()
 
         self.default_extra = {
@@ -247,8 +258,8 @@ class CliService:
         self,
         address: str,
         port: int,
+        price_per_gpu: float,
         validator: str | None = None,
-        price_per_gpu: float | None = None,
         deposit_amount: float | None = None,
         gpu_type: str | None = None,
         gpu_count: int | None = None
@@ -257,7 +268,7 @@ class CliService:
         Add an executor to the database and deposit collateral.
         :param address: Executor IP address
         :param port: Executor port
-        :param price_per_gpu: Executor price per GPU per hour in USD
+        :param price_per_gpu: GPU price per hour in USD
         :param validator: Validator hotkey
         :param deposit_amount: Amount of TAO to deposit (optional)
         :param gpu_type: Type of GPU (optional)
@@ -268,11 +279,16 @@ class CliService:
             validator = settings.DEFAULT_VALIDATOR_HOTKEY
 
         executor_uuid = uuid.uuid4()
-        try:
-            executor = self.executor_dao.save(Executor(uuid=executor_uuid, address=address, port=port, validator=validator, price_per_gpu=price_per_gpu))
-            self.logger.info("Added executor (id=%s)", str(executor.uuid))
-        except Exception as e:
-            self.logger.error("❌ Failed to add executor: %s", str(e))
+        result = await self.executor_service.create(
+            Executor(
+                uuid=executor_uuid,
+                address=address,
+                port=port,
+                validator=validator,
+                price_per_gpu=price_per_gpu
+            )
+        )
+        if isinstance(result, AddExecutorFailed):
             return False
 
         if deposit_amount is None and gpu_type is None and gpu_count is None:
@@ -579,7 +595,7 @@ class CliService:
         address: str,
         port: int,
         *,
-        price_per_gpu: float | None = None,
+        price_per_gpu: float,
     ) -> bool:
         """
         Update the price per hour for an executor by address and port.

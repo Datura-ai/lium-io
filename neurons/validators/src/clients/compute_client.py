@@ -13,7 +13,7 @@ from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
     RestoreContainerRequest,
-    ContainerBaseRequest,
+    BaseServerRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
@@ -110,8 +110,8 @@ class ComputeClient:
         # initiate handlers
         self.backup_handler = BackupHandler(self)
 
-    def accepted_request_type(self) -> type[BaseRequest]:
-        return ContainerBaseRequest
+    def accepted_request_type(self) -> type[BaseServerRequest]:
+        return BaseServerRequest
 
     def connect(self):
         """Create an awaitable/async-iterable websockets.connect() object"""
