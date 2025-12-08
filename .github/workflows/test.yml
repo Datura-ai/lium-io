@@ -46,6 +46,11 @@ jobs:
         run: pdm install
 
       - name: Run tests
+        env:
+          BITTENSOR_WALLET_NAME: test_wallet
+          BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
+          SQLALCHEMY_DATABASE_URI: sqlite:///test.db
+          ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
         run: pdm run pytest tests/ -v --tb=short
 
   # Executor tests - no external services needed
@@ -77,7 +82,7 @@ jobs:
         run: pdm install
 
       - name: Run tests
-        run: pdm run pytest src/tests/ -v --tb=short
+        run: pdm run pytest tests/ -v --tb=short
 
   # Miners tests - requires PostgreSQL
   miners:
@@ -124,5 +129,8 @@ jobs:
 
       - name: Run tests
         env:
-          DATABASE_URL: postgresql://postgres:password@localhost:5433/miner_test
+          BITTENSOR_WALLET_NAME: test_wallet
+          BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
+          SQLALCHEMY_DATABASE_URI: postgresql://postgres:password@localhost:5433/miner_test
+          EXTERNAL_IP_ADDRESS: 127.0.0.1
         run: pdm run pytest tests/ -v --tb=short
