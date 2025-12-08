@@ -4,7 +4,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 import bittensor
-from pydantic import Field
+from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -109,7 +109,15 @@ class Settings(BaseSettings):
     # Use REST API instead of WebSocket for miner communication
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
 
-    debug: DebugSettings = Field(default_factory=DebugSettings)
+    @computed_field
+    @property
+    def debug(self) -> DebugSettings:
+        """Debug settings - computed property to avoid environment parsing conflicts.
+        
+        This ensures debug settings are not parsed from a top-level DEBUG env var,
+        but instead use the DEBUG_ prefix as configured in DebugSettings.
+        """
+        return DebugSettings()
 
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
