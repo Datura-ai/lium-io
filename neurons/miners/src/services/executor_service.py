@@ -1,10 +1,12 @@
 import asyncio
 import json
 import logging
+import uuid
 from typing import Annotated, Optional, Union
 from uuid import UUID
 
 import aiohttp
+import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo, PodLog
 from fastapi import Depends
@@ -13,6 +15,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from daos.executor import ExecutorDao
 from models.executor import Executor
+from services.ssh_service import MinerSSHService
 
 from protocol.miner_portal_request import (
     ExecutorAdded,
@@ -34,17 +37,108 @@ logger = logging.getLogger(__name__)
 
 
 class ExecutorService:
-    def __init__(self, executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)]):
+    def __init__(self, executor_dao: Annotated[ExecutorDao, Depends(ExecutorDao)], ssh_service: Annotated[MinerSSHService, Depends(MinerSSHService)]):
         self.executor_dao = executor_dao
+        self.ssh_service = ssh_service
 
-    def create(self, executor: Executor) -> Union[ExecutorAdded, AddExecutorFailed]:
+    async def test_executor_connectivity(self, executor: Executor) -> tuple[bool, str]:
+        """
+        Test executor connectivity by adding a test SSH key, connecting to it, and then removing the key.
+
+        :param executor: Executor to test
+        :return: True if connectivity test passed, False otherwise
+        """
+        keypair = settings.get_bittensor_wallet().get_hotkey()
+        hotkey = keypair.ss58_address
+
+        # Generate a temporary SSH key pair for testing
+        encrypted_private_key, public_key = self.ssh_service.generate_ssh_key(hotkey)
+
         try:
+            # Step 1: Send the test public key to executor
+            executor_ssh_info = await self.send_pubkey_to_executor(
+                executor,
+                public_key.decode('utf-8')
+            )
+
+            if not executor_ssh_info:
+                log_text = "Failed to send SSH key - Please check if executor ip address and port are correct"
+                
+                logger.error(log_text)
+                return False, str(log_text)
+
+            # Step 2: Try to connect via SSH
+            decrypted_private_key_str = self.ssh_service.decrypt_payload(
+                hotkey,
+                encrypted_private_key.decode('utf-8')
+            )
+
+            try:
+                # Import the decrypted private key for asyncssh
+                private_key_obj = asyncssh.import_private_key(decrypted_private_key_str)
+
+                async with asyncssh.connect(
+                    host=executor_ssh_info.address,
+                    port=executor_ssh_info.ssh_port,
+                    username=executor_ssh_info.ssh_username,
+                    client_keys=[private_key_obj],
+                    known_hosts=None,
+                    connect_timeout=10,
+                ) as ssh_conn:
+                    pass
+            except asyncssh.Error as e:
+                # Still try to clean up the key
+                await self.remove_pubkey_from_executor(executor, public_key.decode('utf-8'))
+                return False, "Failed to connect to executor via SSH"
+            except Exception as e:
+                # Still try to clean up the key
+                await self.remove_pubkey_from_executor(executor, public_key.decode('utf-8'))
+                return False, "Failed to connect to executor via SSH"
+
+            # Step 3: Clean up - remove the test SSH key
+            await self.remove_pubkey_from_executor(executor, public_key.decode('utf-8'))
+
+            return True, "Connectivity test passed - proceeding to save executor"
+
+        except Exception as e:
+            return False, f"Connectivity test failed: {str(e)}"
+
+    async def create(self, executor: Executor) -> Union[ExecutorAdded, AddExecutorFailed]:
+        try:
+            # Check if executor with same address:port already exists
+            try:
+                existing_executor = self.executor_dao.findOne(executor.address, executor.port)
+                if existing_executor:
+                    return AddExecutorFailed(
+                        executor_id=executor.uuid,
+                        error=f"Executor with address {executor.address}:{executor.port} already exists",
+                    )
+            except Exception:
+                # No existing executor found, proceed with creation
+                pass
+
+            # Test executor connectivity before saving to database
+            logger.info("Testing executor connectivity at %s:%d...", executor.address, executor.port)
+
+            connectivity_ok, log_text = await self.test_executor_connectivity(executor)
+
+            if not connectivity_ok:
+                return AddExecutorFailed(
+                    executor_id=executor.uuid,
+                    error=str(log_text),
+                )
+
+            logger.info("✅ Connectivity test passed - proceeding to save executor")
+
             self.executor_dao.save(executor)
             logger.info("Added executor (id=%s)", str(executor.uuid))
             return ExecutorAdded(
                 executor_id=executor.uuid,
             )
         except Exception as e:
+            # Rollback the session if there was an error
+            self.executor_dao.session.rollback()
+
             log_text = _m(
                 "❌ Failed to add executor",
                 extra={
