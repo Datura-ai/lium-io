@@ -245,43 +245,46 @@ class ExecutorService:
         if not settings.CENTRAL_MODE:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
 
-        # Central mode: fetch from portal
-        from clients.miner_portal_api import MinerPortalAPI
+        # Central mode: query production DB
+        from core.db import get_prod_db
+        from daos.miner_executor import MinerExecutorDao
 
-        # Properly await the async HTTP call
-        data = await MinerPortalAPI.fetch_executors(miner_hotkey, executor_id)
-        logger.info(
-            _m(
-                "Fetched executors from portal",
-                extra=get_extra_info({"miner_hotkey": miner_hotkey, "executor_id": executor_id, "data": data}),
-            ),
-        )
+        # Get production DB session (separate connection)
+        prod_db_session = next(get_prod_db())
+        try:
+            miner_executor_dao = MinerExecutorDao(prod_db_session)
+            miner_executors = miner_executor_dao.get_by_miner_and_validator(
+                miner_hotkey, validator_hotkey, executor_id
+            )
 
-        # Expected fields per executor from portal: uuid, validator, address, port, price_per_gpu
-        result: list[Executor] = []
-        for item in data:
-            try:
-                if item.get("validator_hotkey") != validator_hotkey:
-                    continue
+            logger.info(
+                _m(
+                    "Fetched executors from production DB",
+                    extra=get_extra_info({
+                        "miner_hotkey": miner_hotkey,
+                        "validator_hotkey": validator_hotkey,
+                        "executor_id": executor_id,
+                        "count": len(miner_executors)
+                    }),
+                ),
+            )
 
+            # Convert MinerExecutor to Executor format
+            result: list[Executor] = []
+            for me in miner_executors:
                 result.append(
                     Executor(
-                        uuid=UUID(item.get("id")),
-                        validator=item.get("validator_hotkey"),
-                        address=item.get("executor_ip_address"),
-                        port=int(item.get("executor_ip_port")),
-                        price_per_gpu=item.get("price_per_gpu"),
-                    )
-                )
-            except Exception as e:
-                logger.error(
-                    _m(
-                        "Failed to parse executor from portal",
-                        extra=get_extra_info({"error": str(e), "item": str(item)}),
+                        uuid=me.id,
+                        validator=me.validator_hotkey,
+                        address=me.executor_ip_address,
+                        port=int(me.executor_ip_port),
+                        price_per_gpu=me.price_per_gpu,
                     )
                 )
 
-        return result
+            return result
+        finally:
+            prod_db_session.close()
 
     async def send_pubkey_to_executor(
         self, executor: Executor, pubkey: str
