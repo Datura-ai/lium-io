@@ -264,6 +264,8 @@ class MinerService:
                                     private_key=private_key.decode("utf-8"),
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
+                                    root_ssh_private_key_path=settings.ROOT_SSH_PRIVATE_KEY_PATH,
+                                    root_ssh_public_key_path=settings.ROOT_SSH_PUBLIC_KEY_PATH
                                 ),
                                 timeout=settings.JOB_TIME_OUT - 120
                             )
@@ -1454,6 +1456,8 @@ class MinerService:
                                 private_key=private_key.decode("utf-8"),
                                 public_key=public_key.decode("utf-8"),
                                 encrypted_files=encrypted_files,
+                                root_ssh_private_key_path=settings.ROOT_SSH_PRIVATE_KEY_PATH,
+                                root_ssh_public_key_path=settings.ROOT_SSH_PUBLIC_KEY_PATH
                             ),
                             timeout=settings.JOB_TIME_OUT - 120
                         )

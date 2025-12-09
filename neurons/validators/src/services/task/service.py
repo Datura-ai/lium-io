@@ -57,6 +57,8 @@ class TaskService:
         private_key: str,
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
+        root_ssh_private_key_path: str | None = None,
+        root_ssh_public_key_path: str | None = None,
     ):
         """New pipeline-based validation task implementation."""
         try:
@@ -78,6 +80,8 @@ class TaskService:
                     private_key=private_key,
                     public_key=public_key,
                     encrypted_files=encrypted_files,
+                    root_ssh_private_key_path=root_ssh_private_key_path,
+                    root_ssh_public_key_path=root_ssh_public_key_path,
                 )
 
                 # Build and run validation pipeline

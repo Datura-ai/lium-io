@@ -1,3 +1,4 @@
+import os
 import argparse
 import pathlib
 from enum import Enum
@@ -56,6 +57,15 @@ class Settings(BaseSettings):
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     BLOCKS_FOR_JOB: int = 75  # 15 minutes
     JOB_TIME_OUT: int = 60 * 15  # 15 minutes
+
+    ROOT_SSH_PRIVATE_KEY_PATH: str= Field(
+        env="ROOT_SSH_PRIVATE_KEY_PATH", 
+        default=os.path.expanduser("~/.ssh/id_test")
+    )
+    ROOT_SSH_PUBLIC_KEY_PATH: str= Field(
+        env="ROOT_SSH_PUBLIC_KEY_PATH", 
+        default=os.path.expanduser("~/.ssh/id_test.pub")
+    )
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)

@@ -187,6 +187,57 @@ class InteractiveShellService:
         file_content = await self.read_file_content_over_scp(file_path)
         return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
 
+    async def test_ssh_connection(self, host: str, port: int, user: str, private_key_path: str) -> tuple[bool, str]:
+        """Test SSH connection with given credentials.
+
+        Args:
+            host: The host to connect to
+            port: The SSH port
+            user: The username to connect as
+            private_key_path: Path to the private key file
+
+        Returns:
+            Tuple of (success: bool, uid: str) - success indicates if connection worked, uid is the user ID
+        """
+        try:
+            # Read private key from file
+            with open(private_key_path, "r") as f:
+                private_key_content = f.read()
+
+            # Import the private key
+            pkey = asyncssh.import_private_key(private_key_content)
+
+            # Create new SSH connection
+            conn = await asyncssh.connect(
+                host=host,
+                port=port,
+                username=user,
+                client_keys=[pkey],
+                known_hosts=None,
+            )
+
+            # Test the connection by running id -u
+            result = await conn.run("id -u")
+            uid = result.stdout.strip() if result.stdout else ""
+
+            # Close connection
+            conn.close()
+            await conn.wait_closed()
+
+            return True, uid
+
+        except Exception as e:
+            logger.error(_m(
+                "SSH connection test failed",
+                extra=get_extra_info({
+                    "host": host,
+                    "port": port,
+                    "user": user,
+                    "error": str(e),
+                }),
+            ))
+            return False, str(e)
+
     # async def get_checksums_by_path(self, file_path: str):
     #     md5_output = await self.exec_shell_command(f'md5sum {file_path}')
     #     sha256_output = await self.exec_shell_command(f'sha256sum {file_path}')
