@@ -170,30 +170,8 @@ class TenantEnforcementCheck:
                     updates={"default_extra": extra, "ssh_pub_keys": ssh_pub_keys},
                 )
 
-        port_count = await _compute_port_count(ctx)
-                
-        extra = {
-            **extra,
-            "available_port_count": port_count,
-        }
-        
-        updated_state = replace(
-            ctx.state,
-            specs={
-                **ctx.state.specs,
-                "available_port_count": port_count,
-            },
-        )
-
         score_calculator = ctx.services.score_calculator
-        actual_score, job_score, warning_message = score_calculator(
-            ctx.state.gpu_model or "",
-            ctx.collateral_deposited,
-            ctx.is_rental_succeed,
-            ctx.contract_version or "",
-            True,
-            port_count,
-        )
+        actual_score, job_score, warning_message = score_calculator(ctx, True)
 
         event = render_message(
             Msg.ALREADY_RENTED,
@@ -214,11 +192,9 @@ class TenantEnforcementCheck:
             passed=True,
             event=event,
             updates={
-                "state": updated_state,
                 "default_extra": extra,
                 "rented": True,
                 "ssh_pub_keys": ssh_pub_keys,
-                "port_count": port_count,
                 "score": actual_score,
                 "job_score": job_score,
                 "score_warning": warning_message or None,
@@ -246,15 +222,3 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
         ssh_keys = []
 
     return pod_running, ssh_keys
-
-
-async def _compute_port_count(ctx: Context) -> int:
-    port_mapping = ctx.services.port_mapping
-    executor_uuid = ctx.executor.uuid
-
-    try:
-        port_count = await port_mapping.get_successful_ports_count(executor_uuid)
-    except Exception:
-        port_count = 0
-
-    return port_count
