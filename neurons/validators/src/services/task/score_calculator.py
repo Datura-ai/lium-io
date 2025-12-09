@@ -7,27 +7,21 @@ based on collateral status, port availability, rental state, and contract versio
 from typing import Tuple
 
 from core.config import settings
-from services.const import MIN_PORT_COUNT
+from services.const import MIN_PORT_COUNT, MACHINE_PRICES
+from services.task.pipeline import Context
 
 
 SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
 
 def calculate_scores(
-    gpu_model: str,
-    collateral_deposited: bool,
-    is_rental_succeed: bool,
-    contract_version: str,
+    ctx: Context,
     rented: bool = False,
-    port_count: int = 0,
 ) -> Tuple[float, float, str]:
     """Calculate actual and job scores for an executor validation.
 
     Args:
-        gpu_model: GPU model identifier
-        collateral_deposited: Whether collateral has been deposited
-        is_rental_succeed: Whether rental verification succeeded
-        contract_version: Version of the collateral contract
+        ctx: pipeline context
         rented: Whether the executor is currently rented
         port_count: Number of available ports
 
@@ -37,6 +31,13 @@ def calculate_scores(
         - job_score: Score reported in logs (1.0 for rented machines)
         - warning_message: Empty string or warning message with leading " WARNING: "
     """
+    gpu_model = ctx.state.gpu_model or ""
+    collateral_deposited = ctx.collateral_deposited
+    is_rental_succeed = ctx.is_rental_succeed
+    contract_version = ctx.contract_version or ""
+    price_per_gpu = ctx.executor.price_per_gpu
+    port_count = ctx.port_count or 0
+
     warning_messages = []
     job_score = 1.0
     actual_score = 1.0
@@ -50,6 +51,14 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append(
             f"Insufficient ports: {port_count} available, {MIN_PORT_COUNT} required"
+        )
+
+    # Machine price check
+    base_price = MACHINE_PRICES.get(gpu_model, 0)
+    if price_per_gpu > base_price * settings.MACHINE_MAX_PRICE_RATE:
+        job_score = 0.0
+        warning_messages.append(
+            f"Machine price exceeds limit: {price_per_gpu} > {base_price * settings.MACHINE_MAX_PRICE_RATE}"
         )
 
     # Early return for collateral-excluded GPU types
