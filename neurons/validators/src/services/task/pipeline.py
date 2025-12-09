@@ -49,6 +49,8 @@ class ContextConfig:
     verifyx_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
+    root_ssh_private_key_path: Optional[str] = None
+    root_ssh_public_key_path: Optional[str] = None
     job_batch_id: Optional[str] = None
 
 

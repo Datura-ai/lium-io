@@ -11,6 +11,7 @@ from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
 from .port_count import PortCountCheck
+from .root_access import RootAccessCheck
 from .rented_machine import TenantEnforcementCheck
 from .score import ScoreCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
@@ -32,6 +33,7 @@ __all__ = [
     "NvmlDigestCheck",
     "PortConnectivityCheck",
     "PortCountCheck",
+    "RootAccessCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
     "StartGPUMonitorCheck",

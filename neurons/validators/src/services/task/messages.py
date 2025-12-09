@@ -494,6 +494,24 @@ class VerifyXMessages:
     )
 
 
+class RootAccessMessages:
+    ROOT_OK = MessageTemplate(
+        event="Root access confirmed via SSH session",
+        reason="ROOT_ACCESS_OK",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    ROOT_FAILED = MessageTemplate(
+        event="Root access check failed",
+        reason="ROOT_ACCESS_FAILED",
+        severity="warning",
+        category="prep",
+        impact="Validation continues (root check only)",
+        remediation="Ensure validator SSH user can read /root; confirm authorized_keys and SSH settings.",
+    )
+
+
 class CapabilityMessages:
     NO_SPECS = MessageTemplate(
         event="GPU capability verification skipped (no specs)",
