@@ -842,10 +842,10 @@ class DockerService:
                     gpu_flags = "--gpus all "
 
                 # CPU and memory restriction flags
-                cpu_flags = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
-                memory_flags = f"--memory {payload.memory} " if payload.memory else ""
+                cpu_flag = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
+                memory_flag = f"--memory {payload.memory_gb}g " if payload.memory_gb else ""
                 
-                storage_flags = f"--storage-opt size={payload.storage_limit_gb}g " if payload.storage_limit_gb else ""
+                storage_flag = f"--storage-opt size={payload.storage_limit_gb}g " if payload.storage_limit_gb else ""
 
                 command = (
                     f'/usr/bin/docker run -d '
@@ -857,9 +857,9 @@ class DockerService:
                     f'{env_flags} '
                     f'{shm_size_flag} '
                     f'{gpu_flags} '  # GPU restriction flags
-                    f'{cpu_flags} '  # CPU restriction flags
-                    f'{memory_flags} '  # Memory restriction flags
-                    f'{storage_flags} '  # Storage restriction flags
+                    f'{cpu_flag} '  # CPU restriction flags
+                    f'{memory_flag} '  # Memory restriction flags
+                    f'{storage_flag} '  # Storage restriction flags
                     f'--restart unless-stopped '
                     f'--name {container_name} '
                     f'{payload.docker_image} '
