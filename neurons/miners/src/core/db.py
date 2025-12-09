@@ -3,6 +3,7 @@ from typing import Annotated, Optional
 
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlmodel import Session, create_engine
 
 from core.config import settings
@@ -18,6 +19,8 @@ if settings.PROD_DATABASE_URL:
 # Async engine and session maker for production DB
 _async_prod_engine = None
 _async_prod_session_maker: Optional[async_sessionmaker[AsyncSession]] = None
+
+POOL_SIZE = 128
 
 
 def get_async_prod_engine():
@@ -36,8 +39,13 @@ def get_async_prod_engine():
         _async_prod_engine = create_async_engine(
             async_url,
             echo=False,
-            pool_size=10,
-            max_overflow=20,
+            future=True,
+            poolclass=AsyncAdaptedQueuePool,
+            pool_size=POOL_SIZE,
+            pool_pre_ping=True,
+            pool_recycle=3600,  # Recycle connections every hour to prevent stale connections
+            pool_timeout=30,  # Timeout for getting connection from pool
+            max_overflow=256,
         )
 
     return _async_prod_engine
