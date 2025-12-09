@@ -26,6 +26,11 @@ async def app_lifespan(app: FastAPI):
     finally:
         await miner.stop()  # Ensure proper cleanup
         await task  # Wait for the background task to complete
+
+        # Close async database engine
+        from core.db import close_async_engine
+        await close_async_engine()
+
         logging.info("Miner exited successfully.")
 
 

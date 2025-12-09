@@ -245,15 +245,15 @@ class ExecutorService:
         if not settings.CENTRAL_MODE:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
 
-        # Central mode: query production DB
-        from core.db import get_prod_db
+        # Central mode: query production DB using async session
+        from core.db import get_async_prod_session_maker
         from daos.miner_executor import MinerExecutorDao
 
-        # Get production DB session (separate connection)
-        prod_db_session = next(get_prod_db())
-        try:
-            miner_executor_dao = MinerExecutorDao(prod_db_session)
-            miner_executors = miner_executor_dao.get_by_miner_and_validator(
+        # Get async session from session maker
+        session_maker = get_async_prod_session_maker()
+        async with session_maker() as session:
+            miner_executor_dao = MinerExecutorDao(session)
+            miner_executors = await miner_executor_dao.get_by_miner_and_validator(
                 miner_hotkey, validator_hotkey, executor_id
             )
 
@@ -283,8 +283,6 @@ class ExecutorService:
                 )
 
             return result
-        finally:
-            prod_db_session.close()
 
     async def send_pubkey_to_executor(
         self, executor: Executor, pubkey: str
