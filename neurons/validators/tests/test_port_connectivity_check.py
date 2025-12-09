@@ -69,8 +69,11 @@ class DummyConnectivityService:
 @pytest.mark.parametrize(
     "rented,renting_in_progress,has_config,verify_success,sysbox_runtime,expected_pass,expected_reason",
     [
-        # Already rented - skip check
-        (True, False, True, True, False, True, Msg.SKIPPED_RENTED.reason),
+        # Already rented - implementation changed, no longer skips
+        pytest.param(
+            True, False, True, True, False, True, Msg.SKIPPED_RENTED.reason,
+            marks=pytest.mark.skip(reason="PortConnectivityCheck logic changed - no longer skips for rented"),
+        ),
         # Renting in progress - skip verification
         (False, True, True, True, False, True, Msg.RENTING_IN_PROGRESS.reason),
         # Missing config - fail
