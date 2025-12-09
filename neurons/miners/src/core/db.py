@@ -28,9 +28,6 @@ def get_async_prod_engine():
     global _async_prod_engine
 
     if _async_prod_engine is None:
-        if not settings.PROD_DATABASE_URL:
-            raise RuntimeError("Production database not configured. Set PROD_DATABASE_URL environment variable.")
-
         # Convert postgresql:// to postgresql+asyncpg://
         async_url = str(settings.PROD_DATABASE_URL).replace(
             "postgresql://", "postgresql+asyncpg://"
