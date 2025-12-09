@@ -1,18 +1,21 @@
 from typing import Optional
 
-from sqlmodel import select
-from daos.base import BaseDao
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from models.miner import Miner
 from models.miner_executor import MinerExecutor
 
 
-class MinerExecutorDao(BaseDao):
-    """DAO for MinerExecutor (production DB in central mode)"""
+class MinerExecutorDao:
+    """DAO for MinerExecutor (production DB in central mode) - Async version"""
 
-    def get_by_miner_hotkey(
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get_by_miner_hotkey(
         self, miner_hotkey: str, executor_id: Optional[str] = None
     ) -> list[MinerExecutor]:
-        """Get executors by miner hotkey
+        """Get executors by miner hotkey (async)
 
         Args:
             miner_hotkey: The miner's hotkey
@@ -29,12 +32,13 @@ class MinerExecutorDao(BaseDao):
         if executor_id:
             stmt = stmt.where(MinerExecutor.id == executor_id)
 
-        return list(self.session.exec(stmt).all())
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
 
-    def get_by_miner_and_validator(
+    async def get_by_miner_and_validator(
         self, miner_hotkey: str, validator_hotkey: str, executor_id: Optional[str] = None
     ) -> list[MinerExecutor]:
-        """Get executors by miner hotkey and validator hotkey
+        """Get executors by miner hotkey and validator hotkey (async)
 
         Args:
             miner_hotkey: The miner's hotkey
@@ -55,4 +59,5 @@ class MinerExecutorDao(BaseDao):
         if executor_id:
             stmt = stmt.where(MinerExecutor.id == executor_id)
 
-        return list(self.session.exec(stmt).all())
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
