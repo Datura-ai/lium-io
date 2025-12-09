@@ -1648,7 +1648,7 @@ class MinerService:
                         error_code=FailedContainerErrorCodes.InvalidExecutorId
                     )
 
-                renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id)
+                renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id, payload.pod_id)
                 if renting_in_progress:
                     log_text = _m(
                         "Decline renting pod request. Renting is still in progress",
