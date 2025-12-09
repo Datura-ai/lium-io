@@ -58,7 +58,7 @@ def calculate_scores(
     if price_per_gpu > base_price * settings.MACHINE_MAX_PRICE_RATE:
         job_score = 0.0
         warning_messages.append(
-            f"Machine price exceeds limit: {price_per_gpu} > {base_price * settings.MACHINE_MAX_PRICE_RATE}"
+            f"GPU price exceeds the limit. limit: {base_price * settings.MACHINE_MAX_PRICE_RATE}, actual: {price_per_gpu}"
         )
 
     # Early return for collateral-excluded GPU types
