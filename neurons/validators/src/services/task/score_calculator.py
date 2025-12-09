@@ -55,7 +55,7 @@ def calculate_scores(
 
     # Machine price check
     base_price = MACHINE_PRICES.get(gpu_model, 0)
-    if price_per_gpu > base_price * settings.MACHINE_MAX_PRICE_RATE:
+    if price_per_gpu and price_per_gpu > base_price * settings.MACHINE_MAX_PRICE_RATE:
         actual_score = 0.0
         warning_messages.append(
             f"GPU price exceeds the limit. limit: {base_price * settings.MACHINE_MAX_PRICE_RATE}, actual: {price_per_gpu}"
