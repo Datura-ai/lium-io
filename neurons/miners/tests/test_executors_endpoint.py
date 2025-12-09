@@ -1,6 +1,7 @@
 """Unit tests for /executors endpoint with simple signature validation."""
 
-from unittest.mock import MagicMock
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import bittensor
@@ -19,9 +20,10 @@ def mock_validator_service():
 
 @pytest.fixture
 def mock_executor_service():
-    """Mock ExecutorService for testing."""
+    """Mock ExecutorService for testing with async methods."""
     service = MagicMock()
-    service.get_executors_for_validator.return_value = []
+    # get_executors_for_validator is async - use AsyncMock
+    service.get_executors_for_validator = AsyncMock(return_value=[])
     return service
 
 
@@ -35,14 +37,30 @@ def mock_keypair():
 
 @pytest.fixture
 def app():
-    """Get FastAPI app instance."""
-    from miner import app
-    return app
+    """Get FastAPI app instance with mocked services."""
+    # Remove miner from cache if previously imported
+    modules_to_remove = [k for k in sys.modules.keys() if k.startswith('miner') or k == 'miner']
+    for mod in modules_to_remove:
+        del sys.modules[mod]
+
+    # Patch wait_for_services_sync before importing miner
+    with patch('core.utils.wait_for_services_sync'):
+        from miner import app
+        return app
 
 
 @pytest.fixture
-def client(app, mock_validator_service, mock_executor_service, mock_keypair, monkeypatch):
+def mock_wallet():
+    """Mock bittensor wallet for settings.get_bittensor_wallet()."""
+    wallet = MagicMock()
+    wallet.get_hotkey.return_value.ss58_address = "5MockMinerHotkey"
+    return wallet
+
+
+@pytest.fixture
+def client(app, mock_validator_service, mock_executor_service, mock_keypair, mock_wallet, monkeypatch):
     """Create test client with mocked dependencies."""
+    from core.config import Settings
     from services.validator_service import ValidatorService
     from services.executor_service import ExecutorService
 
@@ -50,10 +68,12 @@ def client(app, mock_validator_service, mock_executor_service, mock_keypair, mon
     app.dependency_overrides[ValidatorService] = lambda: mock_validator_service
     app.dependency_overrides[ExecutorService] = lambda: mock_executor_service
 
-    # Mock bittensor.Keypair
+    # Mock bittensor.Keypair for signature verification
     monkeypatch.setattr(bittensor, "Keypair", lambda ss58_address: mock_keypair)
 
-    yield TestClient(app)
+    # Mock Settings.get_bittensor_wallet at class level to avoid wallet file access
+    with patch.object(Settings, "get_bittensor_wallet", return_value=mock_wallet):
+        yield TestClient(app)
 
     # Cleanup
     app.dependency_overrides.clear()

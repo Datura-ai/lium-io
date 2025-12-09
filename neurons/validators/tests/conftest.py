@@ -72,7 +72,7 @@ def sample_executor_info():
     """Sample ExecutorSSHInfo for testing."""
     port_mappings = [[9000 + i, 9000 + i] for i in range(1005)]
     return ExecutorSSHInfo(
-        uuid="test-executor-123",
+        uuid="a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         address="192.168.1.100",
         port=8080,
         ssh_username="root",
