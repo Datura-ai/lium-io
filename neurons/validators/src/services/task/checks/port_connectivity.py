@@ -69,7 +69,11 @@ class PortConnectivityCheck:
                 Msg.VERIFY_FAILED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"details": result.log_text},
+                what={
+                    "details": result.log_text,
+                    "port_range": ctx.executor.port_range,
+                    "port_mappings": ctx.executor.port_mappings,
+                },
                 extra=extra_info,
             )
             return CheckResult(
