@@ -1,7 +1,7 @@
 MIN_JOB_TAKEN_TIME = 20
 
 GPU_MODEL_RATES = {
-    "NVIDIA B300": .5,
+    "NVIDIA B300": .05,
     "NVIDIA B200": .05,
     "NVIDIA H200": .56,
     "NVIDIA H200 NVL": .49,
