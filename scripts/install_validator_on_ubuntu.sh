@@ -66,8 +66,8 @@ wait_for_user() {
 
 #install pre
 install_pre() {
-    sudo apt update
-    sudo apt install --no-install-recommends --no-install-suggests -y sudo apt-utils curl git cmake build-essential
+    sudo apt-get update
+    sudo apt-get install --no-install-recommends --no-install-suggests -y sudo apt-utils curl git cmake build-essential
     exit_on_error $?
 }
 
@@ -89,7 +89,7 @@ install_python() {
     else
         ohai "Installing Python 3.11"
         add-apt-repository ppa:deadsnakes/ppa
-        sudo apt install python3.11
+        sudo apt-get install -y python3.11
         sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
         python -m pip install cffi
         python -m pip install cryptography
@@ -103,7 +103,7 @@ install_python() {
         pdm --version
     else
         ohai "Installing PDM..."
-        sudo apt install -y python3.12-venv
+        sudo apt-get install -y python3.12-venv
         curl -sSL https://pdm-project.org/install-pdm.py | python3 -
 
         local bashrc_file="/root/.bashrc"
@@ -133,7 +133,7 @@ install_redis() {
     else
         ohai "Installing Redis..."
 
-        sudo apt install -y redis-server
+        sudo apt-get install -y redis-server
 
         echo "Starting Redis server..."
         sudo systemctl start redis-server.service
@@ -161,7 +161,7 @@ install_postgresql() {
         fi
     else
         echo "Installing PostgreSQL..."
-        sudo apt install -y postgresql postgresql-contrib
+        sudo apt-get install -y postgresql postgresql-contrib
 
         echo "Starting PostgreSQL server..."
         sudo systemctl start postgresql.service
@@ -182,7 +182,7 @@ install_btcli() {
     else
         ohai "Installing BtCLI..."
 
-        sudo apt install -y pipx 
+        sudo apt-get install -y pipx 
         pipx install bittensor
         source ~/.bashrc
     fi
