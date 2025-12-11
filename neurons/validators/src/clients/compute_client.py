@@ -75,6 +75,7 @@ from services.redis_service import (
     NORMALIZED_SCORE_CHANNEL,
 )
 from clients.handlers.backup_handler import BackupHandler
+from services.sync_rented_ports import sync_rented_ports
 
 logger = logging.getLogger(__name__)
 
@@ -527,6 +528,10 @@ class ComputeClient:
             for machine in response.machines:
                 await redis_service.add_rented_machine(machine)
             await redis_service.set_banned_guids(response.banned_guids)
+
+            # Sync local port rental state with backend
+            await sync_rented_ports(response, self.miner_service.port_mapping_dao)
+
             return
 
         try:
