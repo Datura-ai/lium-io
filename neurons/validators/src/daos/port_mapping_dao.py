@@ -259,6 +259,38 @@ class PortMappingDao(BaseDao):
                 )
                 return {}
 
+    async def get_rented_pod_ids_older_than(self, minutes: int = 10) -> set[UUID]:
+        """
+        Get unique pod_ids that have ports rented for more than N minutes.
+
+        Used for sync with backend to detect stale rentals that should be released.
+        The time filter helps avoid race conditions with newly created rentals.
+
+        Args:
+            minutes: Only return pod_ids with ports rented longer than this
+
+        Returns:
+            Set of pod UUIDs that have been renting ports for > N minutes
+        """
+        async with self.get_session() as session:
+            try:
+                from sqlalchemy import text, distinct
+
+                stmt = (
+                    select(distinct(PortMapping.rented_for_pod_id))
+                    .where(
+                        PortMapping.rented_for_pod_id.isnot(None),
+                        PortMapping.verification_time
+                        < text(f"now() - interval '{minutes} minutes'"),
+                    )
+                )
+                result = await session.exec(stmt)
+                pod_ids = result.scalars().all()
+                return set(pod_ids)
+            except Exception as e:
+                logger.error(f"Error getting rented pod_ids older than {minutes} min: {e}", exc_info=True)
+                return set()
+
     async def get_busy_external_ports(self, executor_id: UUID) -> set[int]:
         """Get set of external ports that are currently rented (rented_for_pod_id IS NOT NULL)."""
         async with self.get_session() as session:
