@@ -46,7 +46,7 @@ def app():
     # Patch wait_for_services_sync before importing miner
     with patch('core.utils.wait_for_services_sync'):
         from miner import app
-        return app
+        yield app
 
 
 @pytest.fixture
