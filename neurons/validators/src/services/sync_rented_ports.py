@@ -31,7 +31,7 @@ class SyncRentedPortsResult:
 async def sync_rented_ports(
     response: RentedMachineResponse,
     port_mapping_dao: "PortMappingDao",
-    threshold_minutes: int = 10,
+    threshold_minutes: int = 30,
 ) -> SyncRentedPortsResult | None:
     """
     Synchronize local port rental state with backend.
