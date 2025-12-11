@@ -1,11 +1,10 @@
 import logging
-import time
 from asyncio import Semaphore
 from uuid import UUID
+
+from sqlalchemy import func, select, update
+
 from core.db import POOL_SIZE
-
-from sqlalchemy import select, update
-
 from daos.base import BaseDao
 from models.port_mapping import PortMapping
 
@@ -44,12 +43,14 @@ class PortMappingDao(BaseDao):
                         for port_num, new_port in ports_dict.items():
                             if port_num in existing_ports:
                                 # Prepare bulk update
-                                updates.append({
-                                    'uuid': existing_ports[port_num],
-                                    'verification_time': new_port.verification_time,
-                                    'is_successful': new_port.is_successful,
-                                    'miner_hotkey': new_port.miner_hotkey,
-                                })
+                                updates.append(
+                                    {
+                                        "uuid": existing_ports[port_num],
+                                        "verification_time": new_port.verification_time,
+                                        "is_successful": new_port.is_successful,
+                                        "miner_hotkey": new_port.miner_hotkey,
+                                    }
+                                )
                             else:
                                 # Add new
                                 new_ports.append(new_port)
@@ -78,7 +79,7 @@ class PortMappingDao(BaseDao):
                 # Bulk DELETE operation
                 stmt = delete(PortMapping).where(
                     PortMapping.executor_id == executor_id,
-                    PortMapping.rented_for_pod_id==None,
+                    PortMapping.rented_for_pod_id.is_(None),
                     PortMapping.verification_time
                     < text(f"now() - interval '{period_minutes} minutes'"),
                 )
@@ -89,7 +90,9 @@ class PortMappingDao(BaseDao):
                 logger.error(f"Error cleaning ports: {e}", exc_info=True)
                 return 0
 
-    async def get_successful_ports(self, executor_id: UUID, limit: int | None = None) -> dict[int, PortMapping]:
+    async def get_successful_ports(
+        self, executor_id: UUID, limit: int | None = None
+    ) -> dict[int, PortMapping]:
         """Get successful ports as dictionary {external_port: PortMapping} for fast lookup."""
         async with self.get_session() as session:
             try:
@@ -184,7 +187,9 @@ class PortMappingDao(BaseDao):
                     .where(
                         PortMapping.executor_id == executor_id,
                         PortMapping.rented_for_pod_id == pod_id,
-                        PortMapping.external_port.notin_(external_ports) if external_ports else True,
+                        PortMapping.external_port.notin_(external_ports)
+                        if external_ports
+                        else True,
                     )
                     .values(rented_for_pod_id=None, docker_port=None)
                 )
@@ -199,7 +204,11 @@ class PortMappingDao(BaseDao):
                             PortMapping.executor_id == executor_id,
                             PortMapping.external_port == external_port,
                         )
-                        .values(rented_for_pod_id=pod_id, docker_port=docker_port)
+                        .values(
+                            rented_for_pod_id=pod_id,
+                            docker_port=docker_port,
+                            verification_time=func.now(),
+                        )
                     )
                     await session.exec(reserve_stmt)
 
@@ -254,9 +263,7 @@ class PortMappingDao(BaseDao):
                 ports = result.scalars().all()
                 return {port.external_port: port for port in ports}
             except Exception as e:
-                logger.error(
-                    f"Error getting available ports excluding rented: {e}", exc_info=True
-                )
+                logger.error(f"Error getting available ports excluding rented: {e}", exc_info=True)
                 return {}
 
     async def get_rented_pod_ids_older_than(self, minutes: int = 10) -> set[UUID]:
@@ -264,13 +271,10 @@ class PortMappingDao(BaseDao):
         Get unique pod_ids that have ports rented for more than N minutes.
 
         Used for sync with backend to detect stale rentals that should be released.
-        The time filter helps avoid race conditions with newly created rentals.
+        The time filter helps avoid race conditions with newly reserved ports.
 
-        Args:
-            minutes: Only return pod_ids with ports rented longer than this
-
-        Returns:
-            Set of pod UUIDs that have been renting ports for > N minutes
+        Note: verification_time is updated when ports are reserved (reserve_ports_for_pod),
+        so this effectively filters by rental time.
         """
         async with self.get_session() as session:
             try:
