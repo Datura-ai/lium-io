@@ -1,4 +1,6 @@
-from datetime import datetime, timedelta
+"""Factory functions for creating test PortMapping instances."""
+
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from models.port_mapping import PortMapping
@@ -19,7 +21,7 @@ def create_port_mapping(
         executor_id = uuid4()
 
     if verification_time is None:
-        verification_time = datetime.utcnow()
+        verification_time = datetime.now(UTC)
 
     return PortMapping(
         miner_hotkey=miner_hotkey,
@@ -48,7 +50,7 @@ def create_port_mappings_batch(
     mappings = []
     for i in range(count):
         port = base_port + i
-        verification_time = datetime.utcnow() - timedelta(minutes=time_offset_minutes + i)
+        verification_time = datetime.now(UTC) - timedelta(minutes=time_offset_minutes + i)
 
         mappings.append(
             create_port_mapping(

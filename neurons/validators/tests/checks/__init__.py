@@ -1,0 +1,1 @@
+"""Pipeline check tests."""
