@@ -295,6 +295,29 @@ class PortMappingDao(BaseDao):
                 logger.error(f"Error getting rented pod_ids older than {minutes} min: {e}", exc_info=True)
                 return set()
 
+    async def get_executor_info_for_pod(self, pod_id: UUID) -> tuple[str, str] | None:
+        """
+        Get (miner_hotkey, executor_id) for a pod.
+
+        Returns None if no ports found for this pod.
+        Used for checking renting_in_progress status before releasing ports.
+        """
+        async with self.get_session() as session:
+            try:
+                stmt = (
+                    select(PortMapping.miner_hotkey, PortMapping.executor_id)
+                    .where(PortMapping.rented_for_pod_id == pod_id)
+                    .limit(1)
+                )
+                result = await session.exec(stmt)
+                row = result.first()
+                if row:
+                    return (row[0], str(row[1]))
+                return None
+            except Exception as e:
+                logger.error(f"Error getting executor info for pod {pod_id}: {e}", exc_info=True)
+                return None
+
     async def get_busy_external_ports(self, executor_id: UUID) -> set[int]:
         """Get set of external ports that are currently rented (rented_for_pod_id IS NOT NULL)."""
         async with self.get_session() as session:

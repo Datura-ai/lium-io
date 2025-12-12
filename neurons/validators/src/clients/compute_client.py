@@ -530,7 +530,7 @@ class ComputeClient:
             await redis_service.set_banned_guids(response.banned_guids)
 
             # Sync local port rental state with backend
-            await sync_rented_ports(response, self.miner_service.port_mapping_dao)
+            await sync_rented_ports(response, self.miner_service.port_mapping_dao, redis_service)
 
             return
 
