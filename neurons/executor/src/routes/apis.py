@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated, Optional
 
 import docker
@@ -11,16 +12,37 @@ from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
 from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature
 
+logger = logging.getLogger(__name__)
+
 apis_router = APIRouter()
+
+
+def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
+    """
+    Validate that public_key matches data_to_sign to prevent SSH key substitution attacks.
+    
+    Security: Issue #744 - Without this check, an attacker could intercept a request
+    and substitute a different public_key while keeping the valid signature for data_to_sign.
+    
+    Raises:
+        HTTPException: 400 if keys don't match after normalization
+    """
+    pk_normalized = payload.public_key.strip()
+    dts_normalized = payload.data_to_sign.strip()
+    
+    if pk_normalized != dts_normalized:
+        logger.warning(
+            "SSH key substitution attack detected or key mismatch: "
+            f"public_key length={len(pk_normalized)}, data_to_sign length={len(dts_normalized)}"
+        )
+        raise HTTPException(status_code=400, detail="Public key mismatch")
 
 
 @apis_router.post("/upload_ssh_key")
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
-    if payload.public_key != payload.data_to_sign:
-        raise HTTPException(status_code=400, detail="Public key mismatch")
-
+    _validate_ssh_key_consistency(payload)
     return await miner_service.upload_ssh_key(payload)
 
 
@@ -28,6 +50,7 @@ async def upload_ssh_key(
 async def remove_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
+    _validate_ssh_key_consistency(payload)
     return await miner_service.remove_ssh_key(payload)
 
 

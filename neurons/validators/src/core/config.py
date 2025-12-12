@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     
     # Use REST API instead of WebSocket for miner communication
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
+    
+    # Machine Price Limit
+    MACHINE_MAX_PRICE_RATE: float = Field(env="MACHINE_MAX_PRICE_RATE", default=2.0)
 
     debug: DebugSettings = Field(default_factory=DebugSettings)
 

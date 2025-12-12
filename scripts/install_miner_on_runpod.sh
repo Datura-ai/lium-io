@@ -66,9 +66,9 @@ wait_for_user() {
 
 #install pre
 install_pre() {
-    apt update
-    apt upgrade
-    apt install --no-install-recommends --no-install-suggests -y apt-utils curl git cmake build-essential nano
+    apt-get update
+    apt-get upgrade -y
+    apt-get install --no-install-recommends --no-install-suggests -y apt-utils curl git cmake build-essential nano
     exit_on_error $?
 }
 
@@ -100,8 +100,8 @@ install_python() {
     else
         ohai "Installing Python 3.11..."
         add-apt-repository ppa:deadsnakes/ppa
-        apt update
-        apt install -y python3.11 python3.11-venv python3.11-dev
+        apt-get update
+        apt-get install -y python3.11 python3.11-venv python3.11-dev
         
         echo "Linking python to python 3.11"
         update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
@@ -165,7 +165,7 @@ install_postgresql() {
     else
         ohai "Installing PostgreSQL..."
 
-        apt install -y postgresql postgresql-contrib
+        apt-get install -y postgresql postgresql-contrib
 
         echo "Starting PostgreSQL server..."
         service postgresql start
