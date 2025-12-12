@@ -95,6 +95,12 @@ COMMANDS = {
         "--gpus", "all",
         "daturaai/compute-subnet-executor:latest", "nvidia-smi"
     ],
+    "CHECK_STORAGE_LIMIT_ABILITY": [
+        "docker", "run", "--rm",
+        "--storage-opt", "size=1g",
+        "--gpus", "all",
+        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
+    ],
 }
 
 
@@ -825,6 +831,34 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
         return False, f"An unexpected error occurred: {e}"
 
 
+
+def check_storage_limit_ability() -> tuple[bool, str]:
+    """
+    Checks if the system supports limiting the storage size of a container.
+    """
+    test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
+
+    try:
+        result = subprocess.run(
+            test_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            return True, "Storage limit is supported."
+        else:
+            return False, "Storage limit is not supported."
+
+    except subprocess.TimeoutExpired:
+        return False, "Test command timed out."
+
+    except Exception as e:
+        return False, f"An unexpected error occurred: {e}"
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -922,6 +956,11 @@ def get_machine_specs():
     data["data_sysbox_runtime"] = is_supported
     if not is_supported:
         data["data_sysbox_runtime_scrape_error"] = log_text
+        
+    is_supported, log_text = check_storage_limit_ability()
+    data["data_storage_limit_supported"] = is_supported
+    if not is_supported:
+        data["data_storage_limit_scrape_error"] = log_text
 
     try:
         lscpu_output = run_cmd("lscpu")
