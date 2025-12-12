@@ -20,9 +20,9 @@ install_dependencies() {
     # Function to install packages on Ubuntu/Debian
     install_ubuntu() {
         echo "Updating system packages..."
-        sudo apt update
+        sudo apt-get update
         echo "Installing required packages..."
-        sudo apt install --assume-yes make build-essential git clang curl libssl-dev llvm libudev-dev protobuf-compiler tmux
+        sudo apt-get install --assume-yes make build-essential git clang curl libssl-dev llvm libudev-dev protobuf-compiler tmux
     }
 
     # Detect OS and call the appropriate function
