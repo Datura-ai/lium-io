@@ -15,6 +15,7 @@ from protocol.vc_protocol.compute_requests import RentedMachineResponse
 
 if TYPE_CHECKING:
     from daos.port_mapping_dao import PortMappingDao
+    from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +26,14 @@ class SyncRentedPortsResult:
 
     released_port_count: int
     stale_pod_ids: set[UUID]
+    skipped_pod_ids: set[UUID]  # Pods skipped due to renting_in_progress
     unknown_pod_ids: set[UUID]
 
 
 async def sync_rented_ports(
     response: RentedMachineResponse,
     port_mapping_dao: "PortMappingDao",
+    redis_service: "RedisService",
     threshold_minutes: int = 30,
 ) -> SyncRentedPortsResult | None:
     """
@@ -59,11 +62,24 @@ async def sync_rented_ports(
         # 4. Find unknown pods (on backend but not in local DB)
         unknown_pod_ids = backend_pod_ids - local_pod_ids
 
-        # 5. Release ports for stale pods
+        # 5. Release ports for stale pods (skip if renting in progress)
         released_port_count = 0
+        skipped_pod_ids: set[UUID] = set()
         for pod_id in stale_pod_ids:
+            # Check if renting is in progress for this pod
+            executor_info = await port_mapping_dao.get_executor_info_for_pod(pod_id)
+            if executor_info:
+                miner_hotkey, executor_id = executor_info
+                if await redis_service.renting_in_progress(miner_hotkey, executor_id, str(pod_id)):
+                    logger.info(f"sync_rented_ports: skipping pod {pod_id} - renting in progress")
+                    skipped_pod_ids.add(pod_id)
+                    continue
+
             released = await port_mapping_dao.release_ports_for_pod(pod_id)
             released_port_count += released
+
+        # Remove skipped pods from stale_pod_ids for accurate reporting
+        stale_pod_ids = stale_pod_ids - skipped_pod_ids
 
         # 6. Log results
         if stale_pod_ids:
@@ -81,6 +97,7 @@ async def sync_rented_ports(
         return SyncRentedPortsResult(
             released_port_count=released_port_count,
             stale_pod_ids=stale_pod_ids,
+            skipped_pod_ids=skipped_pod_ids,
             unknown_pod_ids=unknown_pod_ids,
         )
 

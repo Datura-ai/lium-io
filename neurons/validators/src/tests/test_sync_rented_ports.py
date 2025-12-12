@@ -22,9 +22,11 @@ class DummyPortMappingDao:
         self,
         rented_pod_ids: set[UUID] | None = None,
         release_counts: dict[UUID, int] | None = None,
+        executor_info: dict[UUID, tuple[str, str]] | None = None,
     ):
         self.rented_pod_ids = rented_pod_ids or set()
         self.release_counts = release_counts or {}
+        self.executor_info = executor_info or {}
         self.released_pods: list[UUID] = []
 
     async def get_rented_pod_ids_older_than(self, minutes: int = 10) -> set[UUID]:
@@ -33,6 +35,23 @@ class DummyPortMappingDao:
     async def release_ports_for_pod(self, pod_id: UUID) -> int:
         self.released_pods.append(pod_id)
         return self.release_counts.get(pod_id, 0)
+
+    async def get_executor_info_for_pod(self, pod_id: UUID) -> tuple[str, str] | None:
+        return self.executor_info.get(pod_id)
+
+
+class DummyRedisService:
+    """Mock Redis service for renting_in_progress checks."""
+
+    def __init__(self, renting_pods: set[str] | None = None):
+        self.renting_pods = renting_pods or set()
+
+    async def renting_in_progress(
+        self, miner_hotkey: str, executor_id: str, pod_id: str | None = None
+    ) -> bool:
+        if pod_id:
+            return pod_id in self.renting_pods
+        return False
 
 
 def make_rented_machine_response(
@@ -70,14 +89,16 @@ async def test_sync_no_stale_pods():
         rented_pod_ids={pod_id_1, pod_id_2},
         release_counts={},
     )
+    redis = DummyRedisService()
 
     # Act
-    result = await sync_rented_ports(backend_response, dao)
+    result = await sync_rented_ports(backend_response, dao, redis)
 
     # Assert
     # No ports released because all local pods exist on backend
     assert result.released_port_count == 0
     assert result.stale_pod_ids == set()
+    assert result.skipped_pod_ids == set()
     assert result.unknown_pod_ids == set()
     assert dao.released_pods == []
 
@@ -94,14 +115,16 @@ async def test_sync_releases_stale_pods():
         rented_pod_ids={pod_id_active, pod_id_stale_1, pod_id_stale_2},
         release_counts={pod_id_stale_1: 5, pod_id_stale_2: 3},
     )
+    redis = DummyRedisService()
 
     # Act
-    result = await sync_rented_ports(backend_response, dao)
+    result = await sync_rented_ports(backend_response, dao, redis)
 
     # Assert
     # 8 ports released (5 + 3) for 2 stale pods
     assert result.released_port_count == 8
     assert result.stale_pod_ids == {pod_id_stale_1, pod_id_stale_2}
+    assert result.skipped_pod_ids == set()
     assert result.unknown_pod_ids == set()
     assert set(dao.released_pods) == {pod_id_stale_1, pod_id_stale_2}
 
@@ -114,14 +137,16 @@ async def test_sync_warns_about_unknown_pods():
     pod_id_unknown = uuid4()
     backend_response = make_rented_machine_response(pod_ids=[str(pod_id_known), str(pod_id_unknown)])
     dao = DummyPortMappingDao(rented_pod_ids={pod_id_known})
+    redis = DummyRedisService()
 
     # Act
-    result = await sync_rented_ports(backend_response, dao)
+    result = await sync_rented_ports(backend_response, dao, redis)
 
     # Assert
     # No releases, but unknown pod detected (backend has pod we don't know about)
     assert result.released_port_count == 0
     assert result.stale_pod_ids == set()
+    assert result.skipped_pod_ids == set()
     assert result.unknown_pod_ids == {pod_id_unknown}
 
 
@@ -137,14 +162,16 @@ async def test_sync_handles_stale_and_unknown_pods():
         rented_pod_ids={pod_id_synced, pod_id_stale},
         release_counts={pod_id_stale: 10},
     )
+    redis = DummyRedisService()
 
     # Act
-    result = await sync_rented_ports(backend_response, dao)
+    result = await sync_rented_ports(backend_response, dao, redis)
 
     # Assert
     # Stale pod released, unknown pod detected
     assert result.released_port_count == 10
     assert result.stale_pod_ids == {pod_id_stale}
+    assert result.skipped_pod_ids == set()
     assert result.unknown_pod_ids == {pod_id_unknown}
     assert dao.released_pods == [pod_id_stale]
 
@@ -160,14 +187,16 @@ async def test_sync_empty_backend_releases_all():
         rented_pod_ids={pod_id_1, pod_id_2},
         release_counts={pod_id_1: 2, pod_id_2: 3},
     )
+    redis = DummyRedisService()
 
     # Act
-    result = await sync_rented_ports(backend_response, dao)
+    result = await sync_rented_ports(backend_response, dao, redis)
 
     # Assert
     # All local pods are stale because backend has none
     assert result.released_port_count == 5
     assert result.stale_pod_ids == {pod_id_1, pod_id_2}
+    assert result.skipped_pod_ids == set()
 
 
 @pytest.mark.asyncio
@@ -177,14 +206,16 @@ async def test_sync_empty_local_db():
     pod_id_unknown = uuid4()
     backend_response = make_rented_machine_response(pod_ids=[str(pod_id_unknown)])
     dao = DummyPortMappingDao(rented_pod_ids=set())
+    redis = DummyRedisService()
 
     # Act
-    result = await sync_rented_ports(backend_response, dao)
+    result = await sync_rented_ports(backend_response, dao, redis)
 
     # Assert
     # No releases, but unknown pod detected
     assert result.released_port_count == 0
     assert result.stale_pod_ids == set()
+    assert result.skipped_pod_ids == set()
     assert result.unknown_pod_ids == {pod_id_unknown}
 
 
@@ -202,9 +233,10 @@ async def test_sync_custom_threshold():
             return set()
 
     dao = TrackingDao()
+    redis = DummyRedisService()
 
     # Act
-    await sync_rented_ports(backend_response, dao, threshold_minutes=30)
+    await sync_rented_ports(backend_response, dao, redis, threshold_minutes=30)
 
     # Assert
     # Custom threshold was passed to DAO
@@ -237,14 +269,16 @@ async def test_sync_multiple_containers_per_machine():
         rented_pod_ids={pod_id_1, pod_id_2, pod_id_3, pod_id_stale},
         release_counts={pod_id_stale: 7},
     )
+    redis = DummyRedisService()
 
     # Act
-    result = await sync_rented_ports(backend_response, dao)
+    result = await sync_rented_ports(backend_response, dao, redis)
 
     # Assert
     # Only stale pod released, all 3 backend pods recognized
     assert result.released_port_count == 7
     assert result.stale_pod_ids == {pod_id_stale}
+    assert result.skipped_pod_ids == set()
     assert result.unknown_pod_ids == set()
 
 
@@ -276,11 +310,70 @@ async def test_sync_multiple_machines():
         rented_pod_ids={pod_id_1, pod_id_2, pod_id_stale},
         release_counts={pod_id_stale: 4},
     )
+    redis = DummyRedisService()
 
     # Act
-    result = await sync_rented_ports(backend_response, dao)
+    result = await sync_rented_ports(backend_response, dao, redis)
 
     # Assert
     # Pods from both machines recognized, only stale pod released
     assert result.released_port_count == 4
     assert result.stale_pod_ids == {pod_id_stale}
+    assert result.skipped_pod_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_sync_skips_renting_in_progress():
+    """Pods with renting_in_progress should be skipped (not released)."""
+    # Arrange
+    pod_id_stale = uuid4()
+    pod_id_renting = uuid4()
+    backend_response = make_rented_machine_response(pod_ids=[])
+    dao = DummyPortMappingDao(
+        rented_pod_ids={pod_id_stale, pod_id_renting},
+        release_counts={pod_id_stale: 3, pod_id_renting: 5},
+        executor_info={
+            pod_id_stale: ("miner-1", "executor-1"),
+            pod_id_renting: ("miner-2", "executor-2"),
+        },
+    )
+    # Only pod_id_renting is in renting_in_progress
+    redis = DummyRedisService(renting_pods={str(pod_id_renting)})
+
+    # Act
+    result = await sync_rented_ports(backend_response, dao, redis)
+
+    # Assert
+    # Only stale pod released, renting pod skipped
+    assert result.released_port_count == 3
+    assert result.stale_pod_ids == {pod_id_stale}
+    assert result.skipped_pod_ids == {pod_id_renting}
+    assert dao.released_pods == [pod_id_stale]
+
+
+@pytest.mark.asyncio
+async def test_sync_skips_all_renting_in_progress():
+    """When all stale pods are renting_in_progress, nothing should be released."""
+    # Arrange
+    pod_id_renting_1 = uuid4()
+    pod_id_renting_2 = uuid4()
+    backend_response = make_rented_machine_response(pod_ids=[])
+    dao = DummyPortMappingDao(
+        rented_pod_ids={pod_id_renting_1, pod_id_renting_2},
+        release_counts={pod_id_renting_1: 3, pod_id_renting_2: 5},
+        executor_info={
+            pod_id_renting_1: ("miner-1", "executor-1"),
+            pod_id_renting_2: ("miner-2", "executor-2"),
+        },
+    )
+    redis = DummyRedisService(renting_pods={str(pod_id_renting_1), str(pod_id_renting_2)})
+
+    # Act
+    result = await sync_rented_ports(backend_response, dao, redis)
+
+    # Assert
+    # No pods released, all skipped due to renting_in_progress
+    assert result.released_port_count == 0
+    assert result.stale_pod_ids == set()
+    assert result.skipped_pod_ids == {pod_id_renting_1, pod_id_renting_2}
+    assert dao.released_pods == []
