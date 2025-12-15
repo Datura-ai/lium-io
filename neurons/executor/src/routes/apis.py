@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics, get_container_metrics
+from services.health_service import get_health_status, get_liveness_status, get_readiness_status
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
@@ -15,6 +16,68 @@ from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signa
 logger = logging.getLogger(__name__)
 
 apis_router = APIRouter()
+
+
+# ============================================================================
+# Health Check Endpoints (No Authentication Required)
+# ============================================================================
+
+@apis_router.get("/health")
+async def health_check():
+    """
+    Comprehensive health check endpoint for executor monitoring.
+    
+    Returns detailed health status including:
+    - Overall health status (healthy/degraded/unhealthy)
+    - Docker daemon status and container counts
+    - GPU availability and details
+    - System resources (CPU, memory, disk)
+    - Executor uptime
+    
+    This endpoint does not require authentication and is suitable for:
+    - Load balancer health checks
+    - Monitoring systems (Prometheus, Datadog, etc.)
+    - Container orchestration health probes
+    - Manual diagnostics
+    
+    Returns:
+        dict: Comprehensive health status report
+    """
+    return get_health_status()
+
+
+@apis_router.get("/health/live")
+async def liveness_probe():
+    """
+    Kubernetes-style liveness probe endpoint.
+    
+    This is a lightweight check that only verifies the service is running
+    and can respond to requests. Use this for Kubernetes liveness probes
+    or simple availability monitoring.
+    
+    Returns:
+        dict: {"alive": true, "timestamp": "..."}
+    """
+    return get_liveness_status()
+
+
+@apis_router.get("/health/ready")
+async def readiness_probe():
+    """
+    Kubernetes-style readiness probe endpoint.
+    
+    Checks if the executor is ready to accept work by verifying
+    critical components (Docker daemon) are available.
+    
+    Returns:
+        dict: {"ready": bool, "timestamp": "...", "checks": {...}}
+    """
+    return get_readiness_status()
+
+
+# ============================================================================
+# SSH Key Management Endpoints
+# ============================================================================
 
 
 def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
