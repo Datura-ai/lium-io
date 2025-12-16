@@ -1,0 +1,133 @@
+name: "CD: Miner (staging)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - staging
+      - feature/DAH-1676-prepare-staging-cd
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: datura-ai/lium-io
+
+concurrency:
+  group: staging-miner-deploy
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./neurons/miners
+          build-contexts: |
+            datura=./datura
+          push: false
+          load: true
+          tags: local-build:miner-staging
+          cache-from: type=gha,scope=miner
+          cache-to: type=gha,mode=max,scope=miner
+
+      - name: Save image to tar
+        run: docker save local-build:miner-staging -o /tmp/image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-miner
+          path: /tmp/image.tar
+          retention-days: 1
+
+  push:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-miner
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load --input /tmp/image.tar
+
+      - name: Log in to Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=miner-staging
+            type=sha,prefix=miner-staging-
+
+      - name: Tag and push Docker image
+        env:
+          DOCKER_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && docker tag local-build:miner-staging "$tag" && docker push "$tag"
+          done <<< "$DOCKER_TAGS"
+
+      - name: Summary
+        env:
+          DOCKER_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "### Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** $REGISTRY" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** $IMAGE_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo "$DOCKER_TAGS" >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    needs: [build, push]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Deployment Summary
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUSH_RESULT: ${{ needs.push.result }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "### Staging Miner Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | $BUILD_RESULT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Push | $PUSH_RESULT |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`$COMMIT_SHA\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`$BRANCH\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Actor:** $ACTOR" >> $GITHUB_STEP_SUMMARY
