@@ -108,6 +108,20 @@ class InteractiveShellService:
         except:
             pass
 
+        # Close the SSH connection to prevent file descriptor leaks
+        try:
+            if self.ssh_client:
+                self.ssh_client.close()
+                await self.ssh_client.wait_closed()
+        except Exception as e:
+            logger.error(_m(
+                "Error: closing SSH connection",
+                extra=get_extra_info({
+                    **self.log_extra,
+                    "error": str(e),
+                }),
+            ))
+
         # try:
         #     if self.i_shell:
         #         if await asyncio.to_thread(self.i_shell.isalive):
