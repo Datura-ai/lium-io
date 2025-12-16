@@ -232,7 +232,7 @@ class PipelineFactory:
             list[Check],
             [
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
-                # UploadFilesCheck(),      # SKIP: Uploads files to executor
+                UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
