@@ -9,7 +9,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: datura-ai/lium-io
+  IMAGE_NAME: datura-ai/lium-miner
 
 concurrency:
   group: staging-miner-deploy
@@ -45,14 +45,14 @@ jobs:
             datura=./datura
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:miner-staging
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:miner-staging-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ github.sha }}
           cache-from: type=gha,scope=miner
           cache-to: type=gha,mode=max,scope=miner
 
       - name: Summary
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:miner-staging
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging
           COMMIT: ${{ github.sha }}
           BRANCH: ${{ github.ref_name }}
         run: |
