@@ -135,24 +135,19 @@ async def test_start_gpu_monitor_check(
         assert runner.commands_called[0]["timeout"] == 10
         assert runner.commands_called[0]["retryable"] is False
     else:
-        # Should check, install deps, then start
-        assert len(runner.commands_called) == 3
+        # Should check then start (no pip install anymore)
+        assert len(runner.commands_called) == 2
 
         # First: check if running
         assert "ps aux | grep" in runner.commands_called[0]["command"]
 
-        # Second: install dependencies
-        assert "pip install" in runner.commands_called[1]["command"]
-        assert "aiohttp" in runner.commands_called[1]["command"]
-        assert runner.commands_called[1]["retryable"] is True
-
-        # Third: start the monitor with nohup
-        assert "nohup" in runner.commands_called[2]["command"]
-        assert "/src/gpus_utility.py" in runner.commands_called[2]["command"]
-        assert "--program_id" in runner.commands_called[2]["command"]
-        assert "--signature 0x" in runner.commands_called[2]["command"]
-        assert f"--executor_id {ctx.executor.uuid}" in runner.commands_called[2]["command"]
-        assert "--validator_hotkey 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" in runner.commands_called[2]["command"]
-        assert "--compute_rest_app_url http://validator:8000" in runner.commands_called[2]["command"]
-        assert runner.commands_called[2]["timeout"] == 50
-        assert runner.commands_called[2]["retryable"] is False
+        # Second: start the monitor with nohup
+        assert "nohup" in runner.commands_called[1]["command"]
+        assert "/src/gpus_utility.py" in runner.commands_called[1]["command"]
+        assert "--program_id" in runner.commands_called[1]["command"]
+        assert "--signature 0x" in runner.commands_called[1]["command"]
+        assert f"--executor_id {ctx.executor.uuid}" in runner.commands_called[1]["command"]
+        assert "--validator_hotkey 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" in runner.commands_called[1]["command"]
+        assert "--compute_rest_app_url http://validator:8000" in runner.commands_called[1]["command"]
+        assert runner.commands_called[1]["timeout"] == 50
+        assert runner.commands_called[1]["retryable"] is False

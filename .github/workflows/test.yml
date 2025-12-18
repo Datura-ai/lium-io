@@ -1,0 +1,136 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'neurons/**'
+      - 'datura/**'
+      - '.github/workflows/test.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'neurons/**'
+      - 'datura/**'
+
+permissions:
+  contents: read
+
+jobs:
+  # Validators tests - no external services needed
+  validators:
+    name: Validators Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: neurons/validators
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pdm
+        uses: pdm-project/setup-pdm@v4
+        with:
+          cache: true
+          cache-dependency-path: neurons/validators/pdm.lock
+
+      - name: Install dependencies
+        run: pdm install
+
+      - name: Run tests
+        env:
+          BITTENSOR_WALLET_NAME: test_wallet
+          BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
+          SQLALCHEMY_DATABASE_URI: sqlite:///test.db
+          ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
+        run: pdm run pytest tests/ -v --tb=short --strict-markers
+
+  # Executor tests - no external services needed
+  executor:
+    name: Executor Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: neurons/executor
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pdm
+        uses: pdm-project/setup-pdm@v4
+        with:
+          cache: true
+          cache-dependency-path: neurons/executor/pdm.lock
+
+      - name: Install dependencies
+        run: pdm install
+
+      - name: Run tests
+        run: pdm run pytest tests/ -v --tb=short --strict-markers
+
+  # Miners tests - requires PostgreSQL
+  miners:
+    name: Miners Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: miner_test
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: neurons/miners
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pdm
+        uses: pdm-project/setup-pdm@v4
+        with:
+          cache: true
+          cache-dependency-path: neurons/miners/pdm.lock
+
+      - name: Install dependencies
+        run: pdm install
+
+      - name: Run tests
+        env:
+          BITTENSOR_WALLET_NAME: test_wallet
+          BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
+          SQLALCHEMY_DATABASE_URI: postgresql://postgres:password@localhost:5433/miner_test
+          EXTERNAL_IP_ADDRESS: 127.0.0.1
+        run: pdm run pytest tests/ -v --tb=short --strict-markers

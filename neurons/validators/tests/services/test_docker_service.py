@@ -7,7 +7,7 @@ import pytest_asyncio
 
 from services.docker_service import DockerService
 from models.port_mapping import PortMapping
-from .factories import create_port_mapping, create_port_mappings_batch
+from tests.factories import create_port_mapping, create_port_mappings_batch
 
 
 def create_mock_port_dict(
@@ -69,7 +69,7 @@ def test_miner_hotkey():
 
 
 @pytest.mark.asyncio
-async def test_generate_portMappings_exact_matches(docker_service, test_executor_id, test_miner_hotkey):
+async def test_generate_port_mappings_exact_matches(docker_service, test_executor_id, test_miner_hotkey):
     """Test port mappings with exact docker_port == external_port matches."""
     docker_ports = [22, 20000, 20001]
 
@@ -94,7 +94,7 @@ async def test_generate_portMappings_exact_matches(docker_service, test_executor
 
 
 @pytest.mark.asyncio
-async def test_generate_portMappings_mixed_scenario(docker_service, test_executor_id, test_miner_hotkey):
+async def test_generate_port_mappings_mixed_scenario(docker_service, test_executor_id, test_miner_hotkey):
     """Test port mappings with both exact matches and random selection."""
     docker_ports = [22, 20000, 20001]
 

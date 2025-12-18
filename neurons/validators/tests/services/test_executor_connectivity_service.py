@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -254,18 +254,22 @@ def test_get_available_port_maps_preferred_mappings_priority(executor_service):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
+async def test_cleanup_docker_containers(executor_service, mock_ssh_client, mock_redis_service, sample_executor_info):
     """Test cleanup of Docker containers with 'container_' prefix."""
     # Arrange
+    # Mock redis to return no rented machine (no pods to preserve)
+    mock_redis_service.get_rented_machine = AsyncMock(return_value=None)
+
     # Mock responses: 1) list containers command, 2) rm command, 3) prune command
+    # Docker filter returns only containers matching "^/container_" prefix
     mock_ssh_client.run.side_effect = [
-        AsyncMock(stdout="container_test1\ncontainer_test2\nexecutor-executor-1", exit_status=0),
-        AsyncMock(stdout="", exit_status=0),  # docker rm response
-        AsyncMock(stdout="", exit_status=0),  # docker volume prune response
+        MagicMock(stdout="container_test1\ncontainer_test2", exit_status=0),
+        MagicMock(stdout="", exit_status=0),  # docker rm response
+        MagicMock(stdout="", exit_status=0),  # docker volume prune response
     ]
 
     # Act
-    await executor_service.cleanup_docker_containers(mock_ssh_client)
+    await executor_service.cleanup_docker_containers(mock_ssh_client, sample_executor_info)
 
     # Assert
     # Expect 3 SSH commands: list, rm, prune
@@ -276,7 +280,7 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
     # Expect first call to list containers with name filter
     assert "docker ps" in all_calls[0]
     # Expect second call to remove found containers
-    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1] and "executor-executor-1" not in all_calls[1]
+    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1]
     # Expect third call to prune volumes
     assert "docker volume prune" in all_calls[2]
 
@@ -398,13 +402,15 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert "verification complete" in result.log_text
         assert "available" in result.log_text
 
-        # Expect cleanup was called first with ssh_client and extra dict
+        # Expect cleanup was called first with ssh_client, executor_info, and extra
         mock_cleanup.assert_called_once()
         cleanup_args = mock_cleanup.call_args
         assert cleanup_args[0][0] == mock_ssh_client
-        # Expect extra dict contains job metadata
-        assert "job_batch_id" in cleanup_args[0][1]
-        assert "miner_hotkey" in cleanup_args[0][1]
+        assert cleanup_args[0][1] == sample_executor_info
+        # Expect extra dict (3rd positional arg) contains job metadata
+        extra_dict = cleanup_args[0][2]
+        assert "job_batch_id" in extra_dict
+        assert "miner_hotkey" in extra_dict
 
         # Expect get_available_port_maps was called with correct batch size and rented ports
         from services.const import BATCH_PORT_VERIFICATION_SIZE
