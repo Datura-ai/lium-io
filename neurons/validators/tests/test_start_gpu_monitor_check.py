@@ -135,7 +135,7 @@ async def test_start_gpu_monitor_check(
         assert runner.commands_called[0]["timeout"] == 10
         assert runner.commands_called[0]["retryable"] is False
     else:
-        # Should check, then start (pip install is commented out in code)
+        # Should check, then start (pip install is disabled)
         assert len(runner.commands_called) == 2
 
         # First: check if running

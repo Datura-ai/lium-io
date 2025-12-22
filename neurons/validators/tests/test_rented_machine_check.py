@@ -96,15 +96,10 @@ class DummyScoreCalculator:
         self.warning = warning
         self.called_with: dict | None = None
 
-    def __call__(self, ctx, rented: bool = False):
-        """Mock score calculator matching real calculate_scores(ctx, rented) signature."""
+    def __call__(self, ctx, rented: bool):
         self.called_with = {
-            "gpu_model": ctx.state.gpu_model,
-            "collateral_deposited": ctx.collateral_deposited,
-            "is_rental_succeed": ctx.is_rental_succeed,
-            "contract_version": ctx.contract_version,
+            "ctx": ctx,
             "rented": rented,
-            "port_count": ctx.port_count,
         }
         return self.actual_score, self.job_score, self.warning
 
@@ -114,12 +109,12 @@ class DummyScoreCalculator:
     [
         # Not rented - should pass and continue
         (None, True, [], False, [], [], 0, [], True, Msg.NOT_RENTED.reason, False),
-        # Not rented (no containers) - should pass and continue
+        # Not rented (empty containers) - should pass and continue
         ({"containers": []}, True, [], False, [], [], 0, [], True, Msg.NOT_RENTED.reason, False),
 
         # Rented but pod not running - should fail
         (
-            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}]},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}]},
             False,
             [],
             False,
@@ -134,7 +129,7 @@ class DummyScoreCalculator:
 
         # Rented, pod running, no GPU processes outside - should pass with halt
         (
-            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": False},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False},
             True,
             ["ssh-rsa AAA..."],
             False,
@@ -149,7 +144,7 @@ class DummyScoreCalculator:
 
         # Rented, pod running, GPU process outside but owner_flag=True - should pass with halt
         (
-            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": True},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": True},
             True,
             [],
             True,
@@ -164,7 +159,7 @@ class DummyScoreCalculator:
 
         # Rented, pod running, GPU process outside, high utilization - should fail
         (
-            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": False},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False},
             True,
             ["ssh-rsa AAA..."],
             False,
@@ -179,7 +174,7 @@ class DummyScoreCalculator:
 
         # Rented, pod running, GPU process outside but usage within limits - should pass with halt
         (
-            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": False},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False},
             True,
             [],
             False,
@@ -194,7 +189,7 @@ class DummyScoreCalculator:
 
         # Rented, fallback to Redis port maps
         (
-            {"containers": [{"name": "tenant-123", "pod_id": "pod-123"}], "owner_flag": False},
+            {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False},
             True,
             [],
             False,
@@ -281,7 +276,8 @@ async def test_tenant_enforcement_check(
     assert redis_service.get_rented_called is True
 
     # Verify SSH interactions for rented machines
-    if rented_machine and rented_machine.get("containers"):
+    containers = rented_machine.get("containers", []) if rented_machine else []
+    if containers:
         # Should check if pod is running
         assert any("docker ps" in cmd for cmd in ssh_client.commands_called)
 
@@ -303,7 +299,7 @@ async def test_tenant_enforcement_check(
                 assert result.updates["success"] is True
 
     # Verify updates for not rented case
-    if not rented_machine or not rented_machine.get("containers"):
+    if not containers:
         assert "rented" in result.updates
         assert result.updates["rented"] is False
         assert result.updates["ssh_pub_keys"] is None
