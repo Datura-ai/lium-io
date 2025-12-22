@@ -82,12 +82,8 @@ class ExecutorConnectivityService:
             await self.cleanup_docker_containers(ssh_client, executor_info, extra)
             # Fetch rented ports from backend API
             rented_external_ports = await self.backend_port_client.get_rented_ports(executor_info.uuid, extra)
-            port_maps = get_all_ports(
-                executor_info.port_range,
-                executor_info.port_mappings,
-                executor_info.ssh_port,
-                rented_external_ports,
-            )[:BATCH_PORT_VERIFICATION_SIZE]
+            all_ports = get_all_ports(executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port)
+            port_maps = [(i, e) for i, e in all_ports[:BATCH_PORT_VERIFICATION_SIZE] if e not in rented_external_ports]
             if not port_maps:
                 return DockerConnectionCheckResult(
                     success=False, log_text="No port available for docker container", sysbox_runtime=sysbox_runtime,
@@ -148,7 +144,7 @@ class ExecutorConnectivityService:
             failed_sample = sorted(failed_internal_ports)[:5]
 
             total_time = time.monotonic() - t1
-            success_msg = f"verification complete {total_time=:.2f}s {success_percentage:.0f}% available, dind={dind_status} batch={batch_status} ok={len(successful_ports)}{success_sample}"
+            success_msg = f"verification complete {total_time=:.2f}s {success_percentage:.0f}% available, dind={dind_status} batch={batch_status} rented={len(rented_external_ports)} ok={len(successful_ports)}{success_sample}"
             if failed_ports:
                 success_msg += f" fail={len(failed_ports)}{failed_sample}"
             logger.info(_m(success_msg, extra))
