@@ -4,7 +4,7 @@ from neurons.validators.src.services.task.checks.capability import CapabilityChe
 from neurons.validators.src.services.task.messages import CapabilityMessages as Msg
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 # Mock validation service - mimics the real ValidationService interface

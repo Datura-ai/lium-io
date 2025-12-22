@@ -3,7 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFingerprintCheck
 from neurons.validators.src.services.task.messages import GpuFingerprintMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 @pytest.mark.parametrize(

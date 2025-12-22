@@ -1,14 +1,11 @@
-import aiohttp
-import asyncio
-import json
 import logging
 import time
 
+import aiohttp
 import bittensor
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +66,7 @@ class ValidatorPortalAPI:
 
                         data = await resp.json()
                         return data if isinstance(data, list) else []
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.error(_m("Timeout fetching opted-in miners from portal", extra=get_extra_info({"url": url})))
                     return []
                 except Exception as e:
