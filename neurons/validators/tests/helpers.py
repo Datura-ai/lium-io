@@ -71,7 +71,7 @@ def build_services(**overrides) -> ContextServices:
 
 
 def build_state(**overrides) -> ContextState:
-    base = dict(specs={})
+    base = dict(specs={}, verified_port_count=0)
     base.update(overrides)
     return ContextState(**base)
 

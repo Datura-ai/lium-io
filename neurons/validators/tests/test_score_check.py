@@ -3,7 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.score import ScoreCheck
 from neurons.validators.src.services.task.messages import ScoreMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 class DummyScoreCalculator:

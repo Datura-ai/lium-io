@@ -3,7 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 # Mock VerifyX response matching the real VerifyXResponse
