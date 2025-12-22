@@ -139,3 +139,11 @@ def port_mapping_dao(mock_async_session_maker):
     """Create PortMappingDao for testing with test database."""
     from daos.port_mapping_dao import PortMappingDao
     return PortMappingDao()
+
+
+@pytest.fixture
+def mock_backend_port_client():
+    """Mock BackendPortClient for testing."""
+    client = AsyncMock()
+    client.get_rented_ports = AsyncMock(return_value=set())
+    return client

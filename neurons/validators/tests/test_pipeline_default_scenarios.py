@@ -32,7 +32,7 @@ from neurons.validators.src.services.task.checks import (
     VerifyXCheck,
 )
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 class DummyLogger:

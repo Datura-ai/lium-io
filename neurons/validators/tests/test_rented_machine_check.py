@@ -5,7 +5,7 @@ from neurons.validators.src.services.task.checks.rented_machine import TenantEnf
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 class DummyRedisService:
