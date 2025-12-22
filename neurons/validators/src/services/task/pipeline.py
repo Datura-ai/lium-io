@@ -65,6 +65,7 @@ class ContextState:
     sysbox_runtime: bool = False
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
+    verified_port_count: int = 0
 
 
 class CheckResult(BaseModel):

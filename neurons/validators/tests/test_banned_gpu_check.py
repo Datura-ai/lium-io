@@ -3,7 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.banned_gpu import BannedGpuCheck
 from neurons.validators.src.services.task.messages import BannedGpuMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 class DummyRedis:

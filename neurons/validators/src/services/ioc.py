@@ -1,22 +1,33 @@
 import asyncio
 
+from clients.backend_client import BackendClient
+from clients.backend_port_client import BackendPortClient
+from core.config import settings
 from daos.port_mapping_dao import PortMappingDao
+from services.collateral_contract_service import CollateralContractService
 from services.docker_service import DockerService
 from services.executor_connectivity_service import ExecutorConnectivityService
-from services.miner_service import MinerService
-from services.ssh_service import SSHService
-from services.task_service import TaskService
-from services.redis_service import RedisService
 from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
+from services.miner_service import MinerService
+from services.redis_service import RedisService
+from services.ssh_service import SSHService
+from services.task_service import TaskService
 from services.verifyx_validation_service import VerifyXValidationService
-from services.collateral_contract_service import CollateralContractService
 
 ioc = {}
 
 
 async def initiate_services():
     ioc["PortMappingDao"] = PortMappingDao()
+
+    # Backend clients
+    keypair = settings.get_bittensor_wallet().get_hotkey()
+    ioc["BackendClient"] = BackendClient(
+        base_url=settings.COMPUTE_REST_API_URL or "",
+        keypair=keypair,
+    )
+    ioc["BackendPortClient"] = BackendPortClient(backend_client=ioc["BackendClient"])
 
     ioc["SSHService"] = SSHService()
     ioc["RedisService"] = RedisService()
@@ -29,6 +40,7 @@ async def initiate_services():
     ioc["ExecutorConnectivityService"] = ExecutorConnectivityService(
         redis_service=ioc["RedisService"],
         port_mapping_dao=ioc["PortMappingDao"],
+        backend_port_client=ioc["BackendPortClient"],
     )
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
