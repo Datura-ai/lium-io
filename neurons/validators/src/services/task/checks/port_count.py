@@ -24,6 +24,8 @@ class PortCountCheck:
             specs={
                 **ctx.state.specs,
                 "available_port_count": port_count,
+                "port_range": ctx.executor.port_range,
+                "port_mappings": ctx.executor.port_mappings,
             },
         )
 
