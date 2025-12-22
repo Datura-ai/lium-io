@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 # Mock result class matching DockerConnectionCheckResult
@@ -13,6 +13,7 @@ class MockConnectivityResult:
     success: bool
     log_text: str | None = None
     sysbox_runtime: bool = False
+    verified_port_count: int = 0
 
 
 # Mock Redis service
@@ -26,16 +27,25 @@ class DummyRedis:
 
 # Mock connectivity service
 class DummyConnectivityService:
-    def __init__(self, *, success: bool, log_text: str = "", sysbox_runtime: bool = False):
+    def __init__(
+        self,
+        *,
+        success: bool,
+        log_text: str = "",
+        sysbox_runtime: bool = False,
+        verified_port_count: int = 0,
+    ):
         """
         Args:
             success: Whether verify_ports returns success
             log_text: The log message from verification
             sysbox_runtime: The sysbox runtime state to return
+            verified_port_count: Number of verified working ports
         """
         self.success = success
         self.log_text = log_text
         self.sysbox_runtime = sysbox_runtime
+        self.verified_port_count = verified_port_count
         self.called_with: dict | None = None
 
     async def verify_ports(
@@ -63,6 +73,7 @@ class DummyConnectivityService:
             success=self.success,
             log_text=self.log_text,
             sysbox_runtime=self.sysbox_runtime,
+            verified_port_count=self.verified_port_count,
         )
 
 
@@ -98,6 +109,7 @@ async def test_port_connectivity_check(
         success=verify_success,
         log_text="Port verification completed" if verify_success else "Port verification failed",
         sysbox_runtime=sysbox_runtime,
+        verified_port_count=100 if verify_success else 0,
     )
 
     services = build_services(
@@ -152,6 +164,10 @@ async def test_port_connectivity_check(
         assert connectivity_service.called_with["private_key"] == "private-key-data"
         assert connectivity_service.called_with["public_key"] == "public-key-data"
 
-        # Verify state update with sysbox_runtime
+        # Verify state update with sysbox_runtime and verified_port_count
         if "state" in result.updates:
             assert result.updates["state"].sysbox_runtime == sysbox_runtime
+            if verify_success:
+                assert result.updates["state"].verified_port_count == 100
+            else:
+                assert result.updates["state"].verified_port_count == 0

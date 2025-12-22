@@ -6,7 +6,7 @@ from neurons.validators.src.services.task.checks.machine_spec_scrape import Mach
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 # Mock SSH command result matching the real SSHCommandResult
