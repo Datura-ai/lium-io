@@ -3,7 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.nvml_digest import NvmlDigestCheck
 from neurons.validators.src.services.task.messages import NvmlDigestMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 @pytest.mark.parametrize(
