@@ -32,6 +32,7 @@ from neurons.validators.src.services.task.checks import (
     VerifyXCheck,
 )
 
+from datura.requests.miner_requests import ExecutorSSHInfo
 from helpers import build_context_config, build_services, build_state
 
 
@@ -98,6 +99,13 @@ class DummySFTPClient:
         pass
 
 
+class SimpleSSHResult:
+    """Simple SSH result that is JSON serializable."""
+
+    def __init__(self, stdout: str = ""):
+        self.stdout = stdout
+
+
 class DummySSHClient:
     """Mock SSH client with SFTP support."""
 
@@ -115,15 +123,10 @@ class DummySSHClient:
 
     async def run(self, command: str):
         """Mock SSH run for various commands."""
-        result = Mock()
-
         # Docker container checks for rented machines
         if "docker ps" in command:
-            result.stdout = ""  # Not rented
-        else:
-            result.stdout = ""
-
-        return result
+            return SimpleSSHResult(stdout="")  # Not rented
+        return SimpleSSHResult(stdout="")
 
 
 class DummySSHService:
@@ -188,30 +191,41 @@ class DummyValidationService:
         )
 
 
-class DummyVerifyXService:
-    """Mock VerifyX validation service."""
+class SimpleVerifyXResult:
+    """Simple VerifyX result that is JSON serializable."""
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
-        result = Mock()
-        result.data = {
+    def __init__(self):
+        self.data = {
             "success": True,
             "ram": 128000,
             "hard_disk": 1000000,
             "network": {"download_speed": 10000},
         }
-        result.error = None
-        return result
+        self.error = None
+
+
+class DummyVerifyXService:
+    """Mock VerifyX validation service."""
+
+    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
+        return SimpleVerifyXResult()
+
+
+class SimpleConnectivityResult:
+    """Simple connectivity result that is JSON serializable."""
+
+    def __init__(self, sysbox_runtime: bool = True):
+        self.success = True
+        self.sysbox_runtime = sysbox_runtime
+        self.log_text = "Port connectivity verified"
+        self.verified_port_count = 10
 
 
 class DummyConnectivityService:
     """Mock executor connectivity service."""
 
     async def verify_ports(self, *args, **kwargs):
-        result = Mock()
-        result.success = True
-        result.sysbox_runtime = kwargs.get("sysbox_runtime", True)
-        result.log_text = "Port connectivity verified"
-        return result
+        return SimpleConnectivityResult(sysbox_runtime=kwargs.get("sysbox_runtime", True))
 
 
 class DummyPortMappingService:
@@ -221,7 +235,17 @@ class DummyPortMappingService:
         return 10  # Sufficient ports
 
 
-def dummy_score_calculator(gpu_model: str, collateral: bool, rental_succeed: bool, contract_version: str, rented: bool, port_count: int):
+class DummyKeypair:
+    """Mock keypair that is JSON serializable."""
+
+    def __init__(self, ss58_address: str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"):
+        self.ss58_address = ss58_address
+
+    def sign(self, data: bytes) -> bytes:
+        return b"\x00" * 64
+
+
+def dummy_score_calculator(ctx, rented: bool):
     """Mock score calculator."""
     return 1.0, 1.0, ""  # actual_score, job_score, warning
 
@@ -239,16 +263,19 @@ async def test_successful_unrented_pipeline_flow(context_factory):
 
     Use this as a template for testing your own scenarios.
     """
-    # Setup mock keypair
-    mock_keypair = Mock()
-    mock_keypair.sign.return_value = b"\x00" * 64
-    mock_keypair.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    # Setup keypair
+    keypair = DummyKeypair()
 
-    # Setup mock executor
-    mock_executor = Mock()
-    mock_executor.uuid = "executor-123"
-    mock_executor.root_dir = "/root/app"
-    mock_executor.python_path = "/usr/bin/python3"
+    # Setup executor
+    executor = ExecutorSSHInfo(
+        uuid="executor-123",
+        address="192.168.1.100",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
 
     # Create encrypted payload
     encrypted_payload = "encrypted_machine_specs_here"
@@ -278,7 +305,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
 
     # Setup config with all required fields
     config = build_context_config(
-        validator_keypair=mock_keypair,
+        validator_keypair=keypair,
         compute_rest_app_url="http://validator:8000",
         gpu_monitor_script_relative="src/gpus_utility.py",
         machine_scrape_filename="scrape.sh",
@@ -301,7 +328,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
 
     # Create context
     ctx = context_factory(
-        executor=mock_executor,
+        executor=executor,
         miner_hotkey="miner-hotkey-123",
         ssh=ssh_client,
         runner=runner,
@@ -391,16 +418,19 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
     Note: Remaining checks (GpuUsage, PortConnectivity, etc.) don't run.
     """
-    # Setup mock keypair
-    mock_keypair = Mock()
-    mock_keypair.sign.return_value = b"\x00" * 64
-    mock_keypair.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    # Setup keypair
+    keypair = DummyKeypair()
 
-    # Setup mock executor
-    mock_executor = Mock()
-    mock_executor.uuid = "executor-123"
-    mock_executor.root_dir = "/root/app"
-    mock_executor.python_path = "/usr/bin/python3"
+    # Setup executor
+    executor = ExecutorSSHInfo(
+        uuid="executor-123",
+        address="192.168.1.100",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
 
     # Setup SSH client that returns rented container info
     class RentedSSHClient:
@@ -418,14 +448,11 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
         async def run(self, command: str):
             """Mock SSH run for various commands."""
-            result = Mock()
             if "docker ps" in command:
-                result.stdout = "container-id-123"  # Container is running
+                return SimpleSSHResult(stdout="container-id-123")  # Container is running
             elif "authorized_keys" in command:
-                result.stdout = "ssh-rsa AAA..."  # SSH keys present
-            else:
-                result.stdout = ""
-            return result
+                return SimpleSSHResult(stdout="ssh-rsa AAA...")  # SSH keys present
+            return SimpleSSHResult(stdout="")
 
     ssh_client = RentedSSHClient()
 
@@ -436,7 +463,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
     class RentedRedisService:
         async def get_rented_machine(self, executor):
             return {
-                "container_name": "tenant-container-123",
+                "containers": [{"name": "tenant-container-123", "pod_id": "pod-1"}],
                 "owner_flag": False,
             }
 
@@ -469,7 +496,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
     # Setup config
     config = build_context_config(
-        validator_keypair=mock_keypair,
+        validator_keypair=keypair,
         compute_rest_app_url="http://validator:8000",
         gpu_monitor_script_relative="src/gpus_utility.py",
         machine_scrape_filename="scrape.sh",
@@ -493,7 +520,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
     # Create context
     ctx = context_factory(
-        executor=mock_executor,
+        executor=executor,
         miner_hotkey="miner-hotkey-123",
         ssh=ssh_client,
         runner=runner,

@@ -21,23 +21,15 @@ class DummyScoreCalculator:
         self.warning_message = warning_message
         self.called_with: dict | None = None
 
-    def __call__(
-        self,
-        gpu_model: str,
-        collateral_deposited: bool,
-        is_rental_succeed: bool,
-        contract_version: str,
-        rented: bool,
-        port_count: int,
-    ) -> tuple[float, float, str]:
+    def __call__(self, ctx, rented: bool) -> tuple[float, float, str]:
         """Mock score calculator that tracks calls and returns configured scores."""
         self.called_with = {
-            "gpu_model": gpu_model,
-            "collateral_deposited": collateral_deposited,
-            "is_rental_succeed": is_rental_succeed,
-            "contract_version": contract_version,
+            "gpu_model": ctx.state.gpu_model,
+            "collateral_deposited": ctx.collateral_deposited,
+            "is_rental_succeed": ctx.is_rental_succeed,
+            "contract_version": ctx.contract_version,
             "rented": rented,
-            "port_count": port_count,
+            "port_count": ctx.port_count,
         }
         return self.actual_score, self.job_score, self.warning_message
 
