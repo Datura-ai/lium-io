@@ -4,6 +4,8 @@ import os
 
 from daos.port_mapping_dao import PortMappingDao
 from payload_models.payloads import MinerJobRequestPayload
+from clients.backend_client import BackendClient
+from clients.backend_port_client import BackendPortClient
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
@@ -48,9 +50,19 @@ class Validator:
         self.verifyx_validation_service = VerifyXValidationService()
         self.collateral_contract_service = CollateralContractService()
         self.port_mapping_dao = PortMappingDao()
+
+        # Backend clients for port mapping
+        keypair = settings.get_bittensor_wallet().get_hotkey()
+        backend_client = BackendClient(
+            base_url=settings.COMPUTE_REST_API_URL or "",
+            keypair=keypair,
+        )
+        backend_port_client = BackendPortClient(backend_client=backend_client)
+
         self.executor_connectivity_service = ExecutorConnectivityService(
             redis_service=self.redis_service,
             port_mapping_dao=self.port_mapping_dao,
+            backend_port_client=backend_port_client,
         )
 
         task_service = TaskService(
