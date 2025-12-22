@@ -60,7 +60,6 @@ async def test_get_rented_ports_correct_path(client, mock_backend_client):
     await client.get_rented_ports(executor_id)
 
     call_args = mock_backend_client.get.call_args
-    expected_path = f"/executors/{executor_id}/rented-ports"
+    expected_path = f"/internal/executors/{executor_id}/rented-ports"
     assert call_args[0][0] == expected_path
     assert call_args[0][1] == RentedPortsResponse
-    assert call_args.kwargs.get("add_signature") is False

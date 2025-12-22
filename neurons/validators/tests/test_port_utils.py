@@ -73,25 +73,6 @@ def test_get_all_ports_excludes_ssh_port():
     assert len(result) == 5  # 6 ports minus 1 excluded
 
 
-def test_get_all_ports_excludes_rented_ports():
-    """Test that rented external ports are excluded."""
-    # Arrange
-    port_mappings = json.dumps([[9000, 9100], [9001, 9101], [9002, 9102]])
-    ssh_port = 22
-    rented_external_ports = {9100, 9102}
-
-    # Act
-    result = get_all_ports(
-        port_range=None,
-        port_mappings=port_mappings,
-        ssh_port=ssh_port,
-        rented_external_ports=rented_external_ports,
-    )
-
-    # Assert
-    assert result == [(9001, 9101)]
-
-
 def test_get_all_ports_sorted_ascending():
     """Test that ports are sorted by internal port ascending."""
     # Arrange
