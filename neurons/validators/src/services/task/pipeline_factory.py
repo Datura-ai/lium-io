@@ -204,7 +204,7 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
-                PortConnectivityCheck(),
+                PortConnectivityCheck(),  # check that ports are open -> save info to db
                 PortCountCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),

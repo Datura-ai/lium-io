@@ -54,6 +54,7 @@ class PortConnectivityCheck:
         )
         extra_info = {
             "sysbox_runtime": result.sysbox_runtime,
+            "verified_port_count": result.verified_port_count,
         }
         updated_state = replace(
             ctx.state,
@@ -61,7 +62,8 @@ class PortConnectivityCheck:
                 **ctx.state.specs,
                 "sysbox_runtime": result.sysbox_runtime,
             },
-            sysbox_runtime=result.sysbox_runtime
+            sysbox_runtime=result.sysbox_runtime,
+            verified_port_count=result.verified_port_count,
         )
 
         if not result.success:
