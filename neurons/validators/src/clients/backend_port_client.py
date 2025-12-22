@@ -23,12 +23,13 @@ class BackendPortClient:
         self, executor_id: str | UUID, context: dict | None = None
     ) -> set[int]:
         executor_id_str = str(executor_id)
-        path = f"/executors/{executor_id_str}/rented-ports"
+        path = f"/internal/executors/{executor_id_str}/rented-ports"
 
-        response = await self.backend_client.get(path, RentedPortsResponse, add_signature=False)
+        response = await self.backend_client.get(path, RentedPortsResponse)
         if response is None:
+            logger.warning(_m("Failed to fetch rented ports from backend", extra=context or {}))
             return set()
 
         ports = set(response.rented_external_ports)
-        logger.debug(_m(f"Fetched {len(ports)} rented ports", extra=context or {}))
+        logger.info(_m(f"Fetched {len(ports)} rented ports", extra=context or {}))
         return ports
