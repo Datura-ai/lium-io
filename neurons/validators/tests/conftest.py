@@ -9,7 +9,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 import logging
 import sys
 
-from tests.helpers import make_context
+from helpers import make_context
 
 
 @pytest.fixture(scope="session", autouse=True)
