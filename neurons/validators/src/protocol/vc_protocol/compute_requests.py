@@ -15,21 +15,26 @@ class Response(BaseModel, extra="forbid"):
     status: Literal["error", "success"]
     errors: list[Error] = []
 
-class RentedContainer(BaseModel):
-    name: str
+class RentedPod(BaseModel):
+    """Pod data within an executor."""
     pod_id: str
+    name: str
+    rented_ports: list[int] = []
 
-class RentedMachine(BaseModel):
+
+class RentedExecutor(BaseModel):
+    """Executor with its rented pods."""
     miner_hotkey: str
-    executor_id: str
     executor_ip_address: str
     executor_ip_port: str
-    containers: list[RentedContainer]
+    pods: list[RentedPod]
     owner_flag: bool = False
+    rented_ports: list[int] = []
 
 
-class RentedMachineResponse(BaseModel):
-    machines: list[RentedMachine]
+class RentedExecutorsResponse(BaseModel):
+    """Response with executors dict and banned GUIDs."""
+    executors: dict[str, RentedExecutor]  # key = executor_id
     banned_guids: list[str] = []
 
 

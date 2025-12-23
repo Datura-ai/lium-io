@@ -17,6 +17,7 @@ from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
 
@@ -66,6 +67,7 @@ class ContextState:
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
     verified_port_count: int = 0
+    rented_data: RentedExecutorsResponse | None = None
 
 
 class CheckResult(BaseModel):

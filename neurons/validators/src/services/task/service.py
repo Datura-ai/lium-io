@@ -9,6 +9,7 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from core.config import settings
 from core.utils import _m, get_extra_info
 from daos.port_mapping_dao import PortMappingDao
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
@@ -57,6 +58,7 @@ class TaskService:
         private_key: str,
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
     ):
         """New pipeline-based validation task implementation."""
         try:
@@ -78,6 +80,7 @@ class TaskService:
                     private_key=private_key,
                     public_key=public_key,
                     encrypted_files=encrypted_files,
+                    rented_data=rented_data,
                 )
 
                 # Build and run validation pipeline
