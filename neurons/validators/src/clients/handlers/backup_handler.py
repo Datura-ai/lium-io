@@ -1,7 +1,5 @@
 from typing import TYPE_CHECKING
-
 from payload_models.payloads import BackupContainerRequest, RestoreContainerRequest
-
 if TYPE_CHECKING:
     from clients.compute_client import ComputeClient
 

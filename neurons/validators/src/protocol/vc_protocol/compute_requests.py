@@ -15,6 +15,10 @@ class Response(BaseModel, extra="forbid"):
     status: Literal["error", "success"]
     errors: list[Error] = []
 
+class RentedContainer(BaseModel):
+    name: str
+    pod_id: str
+
 class RentedPod(BaseModel):
     """Pod data within an executor."""
     pod_id: str
@@ -39,6 +43,8 @@ class RentedMachine(BaseModel):
     executor_ip_address: str
     executor_ip_port: str
     container_name: str
+    containers: list[RentedContainer]
+    owner_flag: bool = False
 
 
 class RentedMachineResponse(BaseModel):
