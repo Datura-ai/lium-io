@@ -56,6 +56,7 @@ from tenacity import RetryError
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
@@ -155,6 +156,7 @@ class MinerService:
         self,
         payload: MinerJobRequestPayload,
         encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
     ):
         """Request job to miner - uses REST API if configured, otherwise WebSocket."""
         if settings.USE_REST_API:
@@ -167,7 +169,7 @@ class MinerService:
                     }),
                 ),
             )
-            return await self._request_job_to_miner(payload, encrypted_files)
+            return await self._request_job_to_miner(payload, encrypted_files, rented_data)
         else:
             logger.info(
                 _m(
@@ -264,6 +266,7 @@ class MinerService:
                                     private_key=private_key.decode("utf-8"),
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
+                                    rented_data=rented_data,
                                 ),
                                 timeout=settings.JOB_TIME_OUT - 120
                             )
@@ -1389,6 +1392,7 @@ class MinerService:
         self,
         payload: MinerJobRequestPayload,
         encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
     ):
         """REST API version of request_job_to_miner."""
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -1463,6 +1467,7 @@ class MinerService:
                                 private_key=private_key.decode("utf-8"),
                                 public_key=public_key.decode("utf-8"),
                                 encrypted_files=encrypted_files,
+                                rented_data=rented_data,
                             ),
                             timeout=settings.JOB_TIME_OUT - 120
                         )

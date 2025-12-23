@@ -44,6 +44,7 @@ from .checks import (
     UploadFilesCheck,
     VerifyXCheck,
 )
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .pipeline import (
     Check,
     Context,
@@ -102,6 +103,7 @@ class PipelineFactory:
         private_key: str,
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -179,7 +181,10 @@ class PipelineFactory:
                 port_public_key=public_key,
                 job_batch_id=miner_info.job_batch_id,
             ),
-            state=ContextState(upload_local_dir=encrypted_files.tmp_directory),
+            state=ContextState(
+                upload_local_dir=encrypted_files.tmp_directory,
+                rented_data=rented_data,
+            ),
             is_rental_succeed=is_rental_succeed,
         )
 
