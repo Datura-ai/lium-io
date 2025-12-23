@@ -114,11 +114,11 @@ class TenantEnforcementCheck:
         extra = {
             **ctx.default_extra,
             "rented": True,
-            "rented_pods": [{"name": p.name, "pod_id": p.pod_id} for p in rented_pods],
+            "rented_pods": [{"name": p.container_name, "pod_id": p.pod_id} for p in rented_pods],
         }
 
         for pod in rented_pods:
-            pod_name = pod.name
+            pod_name = pod.container_name
             pod_id = pod.pod_id
             pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_name)
             if not pod_running:
@@ -144,7 +144,7 @@ class TenantEnforcementCheck:
                     },
                 )
 
-        pod_names = [pod.name for pod in rented_pods]
+        pod_names = [pod.container_name for pod in rented_pods]
         gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(pod_names, gpu_processes)
 
