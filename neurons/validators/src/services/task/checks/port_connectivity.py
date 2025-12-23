@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ..messages import PortConnectivityMessages as Msg, render_message
+from ..messages import PortConnectivityMessages as Msg
+from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -42,6 +43,12 @@ class PortConnectivityCheck:
             )
             return CheckResult(passed=False, event=event)
 
+        # Extract rented ports and pod names from context
+        rented_data = ctx.state.rented_data
+        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_ports = rented_executor.rented_ports if rented_executor else []
+        rented_pod_names = [p.name for p in rented_executor.pods] if rented_executor else []
+
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
@@ -51,6 +58,8 @@ class PortConnectivityCheck:
             ctx.config.port_private_key or "",
             ctx.config.port_public_key or "",
             ctx.state.sysbox_runtime,
+            rented_ports=rented_ports,
+            rented_pod_names=rented_pod_names,
         )
         extra_info = {
             "sysbox_runtime": result.sysbox_runtime,
