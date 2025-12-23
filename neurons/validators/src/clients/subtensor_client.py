@@ -1,22 +1,23 @@
 import asyncio
-import json
-import random
-from datetime import datetime
-from typing import TYPE_CHECKING, Self
-
-import aiohttp
 import bittensor
 import numpy as np
+from typing import Self, TYPE_CHECKING
 from bittensor.utils.weight_utils import (
     convert_weights_and_uids_for_emit,
     process_weights_for_netuid,
 )
+from websockets.protocol import State as WebSocketClientState
+import random
+from datetime import datetime
+import json
+import aiohttp
 
-from clients.validator_portal_api import ValidatorPortalAPI
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
-from services.const import BURNER_EMISSION, TOTAL_BURN_EMISSION
+
+from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
+from clients.validator_portal_api import ValidatorPortalAPI
 
 if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet

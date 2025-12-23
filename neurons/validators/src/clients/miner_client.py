@@ -3,9 +3,12 @@ import asyncio
 import logging
 import random
 import time
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 import bittensor
 import websockets
+from websockets.asyncio.client import ClientConnection
+from websockets.protocol import State as WebSocketClientState
 from datura.errors.protocol import UnsupportedMessageReceived
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import (
@@ -15,14 +18,11 @@ from datura.requests.miner_requests import (
     DeclineJobRequest,
     FailedRequest,
     GenericError,
-    PodLogsResponse,
     SSHKeyRemoved,
     UnAuthorizedRequest,
+    PodLogsResponse,
 )
 from datura.requests.validator_requests import AuthenticateRequest, AuthenticationPayload
-from tenacity import retry, stop_after_attempt, wait_fixed
-from websockets.asyncio.client import ClientConnection
-from websockets.protocol import State as WebSocketClientState
 
 from core.utils import _m, get_extra_info
 
@@ -141,7 +141,7 @@ class MinerClient(abc.ABC):
 
                     async for raw_msg in self.ws:
                         await self.read_messages(raw_msg)
-            except (websockets.WebSocketException, OSError):
+            except (websockets.WebSocketException, OSError) as ex:
                 self.debounce_counter += 1
 
                 if (
