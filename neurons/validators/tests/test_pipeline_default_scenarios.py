@@ -520,7 +520,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
                 miner_hotkey="miner-hotkey-123",
                 executor_ip_address="192.168.1.100",
                 executor_ip_port="8080",
-                pods=[RentedPod(pod_id="pod-1", name="tenant-container-123")],
+                pods=[RentedPod(pod_id="pod-1", container_name="tenant-container-123")],
                 owner_flag=False,
                 rented_ports=[],
             )
