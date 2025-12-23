@@ -9,8 +9,10 @@ from typing import Any, ClassVar, TypeVar
 import aiohttp
 import bittensor
 from pydantic import BaseModel, ValidationError
+from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
 from core.utils import _m, get_extra_info
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
 logger = logging.getLogger(__name__)
 
@@ -171,3 +173,16 @@ class BackendClient:
                 _m("POST error", extra=get_extra_info({**context, "error": str(e)})), exc_info=True
             )
             return None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_fixed(30),
+        retry=retry_if_result(lambda x: x is None),
+    )
+    async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
+        """Fetch all rented executors with their ports from the backend."""
+        return await self.get(
+            "/internal/executors/rented",
+            RentedExecutorsResponse,
+            timeout=30,
+        )
