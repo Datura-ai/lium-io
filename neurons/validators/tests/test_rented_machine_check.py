@@ -4,28 +4,65 @@ from unittest.mock import Mock
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
+from protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedPod,
+)
 
 from helpers import build_context_config, build_services, build_state
 
 
-class DummyRedisService:
-    """Mock Redis service for rental status and port maps."""
+def convert_rented_machine_to_rented_data(
+    rented_machine: dict | None,
+    executor_uuid: str = "executor-123",
+) -> RentedExecutorsResponse | None:
+    """Convert old rented_machine dict format to new RentedExecutorsResponse.
 
-    def __init__(self, *, rented_machine: dict | None = None, port_maps: list[bytes] | None = None):
+    Args:
+        rented_machine: Old format dict with "containers" and "owner_flag" keys
+        executor_uuid: The executor UUID to use as key
+
+    Returns:
+        RentedExecutorsResponse or None if rented_machine is None or empty
+    """
+    if not rented_machine:
+        return None
+
+    containers = rented_machine.get("containers", [])
+    if not containers:
+        return None
+
+    pods = [
+        RentedPod(pod_id=c.get("pod_id", ""), name=c.get("name", ""))
+        for c in containers
+    ]
+
+    return RentedExecutorsResponse(
+        executors={
+            executor_uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8080",
+                pods=pods,
+                owner_flag=rented_machine.get("owner_flag", False),
+                rented_ports=[],
+            )
+        },
+        banned_guids=[],
+    )
+
+
+class DummyRedisService:
+    """Mock Redis service for port maps."""
+
+    def __init__(self, *, port_maps: list[bytes] | None = None):
         """
         Args:
-            rented_machine: The rental info to return from get_rented_machine
             port_maps: The port map bytes to return from lrange
         """
-        self.rented_machine = rented_machine
         self.port_maps = port_maps or []
-        self.get_rented_called = False
         self.lrange_called_with: str | None = None
-
-    async def get_rented_machine(self, executor):
-        """Mock get_rented_machine."""
-        self.get_rented_called = True
-        return self.rented_machine
 
     async def lrange(self, key: str):
         """Mock lrange for port maps."""
@@ -218,11 +255,8 @@ async def test_tenant_enforcement_check(
     expect_halt,
     context_factory,
 ):
-    # Create mock Redis service
-    redis_service = DummyRedisService(
-        rented_machine=rented_machine,
-        port_maps=port_maps,
-    )
+    # Create mock Redis service (only for port maps now)
+    redis_service = DummyRedisService(port_maps=port_maps)
 
     # Create mock SSH client
     ssh_client = DummySSHClient(
@@ -246,11 +280,15 @@ async def test_tenant_enforcement_check(
     # Setup config
     config = build_context_config()
 
-    # Setup state with GPU info
+    # Convert rented_machine to rented_data for state
+    rented_data = convert_rented_machine_to_rented_data(rented_machine)
+
+    # Setup state with GPU info and rented_data
     state = build_state(
         gpu_processes=gpu_processes,
         gpu_details=gpu_details,
         gpu_model="NVIDIA RTX 4090",
+        rented_data=rented_data,
     )
 
     # Create context
@@ -271,9 +309,6 @@ async def test_tenant_enforcement_check(
     assert result.passed is expected_pass
     assert result.event.reason_code == expected_reason
     assert result.halt is expect_halt
-
-    # Verify Redis was called
-    assert redis_service.get_rented_called is True
 
     # Verify SSH interactions for rented machines
     containers = rented_machine.get("containers", []) if rented_machine else []
