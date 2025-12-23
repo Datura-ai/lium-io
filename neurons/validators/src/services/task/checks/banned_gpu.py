@@ -28,8 +28,9 @@ class BannedGpuCheck:
 
         uuids = [u for u in current_uuids.split(",") if u]
 
-        redis_service = ctx.services.redis
-        banned_guids = await redis_service.get_banned_guids()
+        # Get banned GUIDs from backend API response
+        rented_data = ctx.state.rented_data
+        banned_guids = rented_data.banned_guids if rented_data else []
         is_banned = any(guid in banned_guids for guid in uuids)
 
         if is_banned:
