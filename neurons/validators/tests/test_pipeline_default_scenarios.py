@@ -34,6 +34,11 @@ from neurons.validators.src.services.task.checks import (
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from helpers import build_context_config, build_services, build_state
+from protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedPod,
+)
 
 
 class DummyLogger:
@@ -507,6 +512,22 @@ async def test_successful_rented_pipeline_flow(context_factory):
         nvml_digest_map={"535.104.05": "expected_digest_for_535.104.05"},
     )
 
+    # Setup rented_data with executor info (replaces Redis get_rented_machine)
+    # Note: key must match executor.uuid = "executor-123"
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey-123",
+                executor_ip_address="192.168.1.100",
+                executor_ip_port="8080",
+                pods=[RentedPod(pod_id="pod-1", name="tenant-container-123")],
+                owner_flag=False,
+                rented_ports=[],
+            )
+        },
+        banned_guids=[],
+    )
+
     # Setup state with GPU processes in the correct container
     state = build_state(
         upload_local_dir="/tmp/validator/files",
@@ -516,6 +537,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
         gpu_details=[
             {"gpu_utilization": 50, "memory_utilization": 60}
         ],
+        rented_data=rented_data,
     )
 
     # Create context
