@@ -34,7 +34,7 @@ def convert_rented_machine_to_rented_data(
         return None
 
     pods = [
-        RentedPod(pod_id=c.get("pod_id", ""), name=c.get("name", ""))
+        RentedPod(pod_id=c.get("pod_id", ""), container_name=c.get("name", ""))
         for c in containers
     ]
 
