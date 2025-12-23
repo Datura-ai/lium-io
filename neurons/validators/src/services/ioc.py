@@ -1,7 +1,6 @@
 import asyncio
 
 from clients.backend_client import BackendClient
-from clients.backend_port_client import BackendPortClient
 from core.config import settings
 from daos.port_mapping_dao import PortMappingDao
 from services.collateral_contract_service import CollateralContractService
@@ -27,7 +26,6 @@ async def initiate_services():
         base_url=settings.COMPUTE_REST_API_URL or "",
         keypair=keypair,
     )
-    ioc["BackendPortClient"] = BackendPortClient(backend_client=ioc["BackendClient"])
 
     ioc["SSHService"] = SSHService()
     ioc["RedisService"] = RedisService()
@@ -40,7 +38,6 @@ async def initiate_services():
     ioc["ExecutorConnectivityService"] = ExecutorConnectivityService(
         redis_service=ioc["RedisService"],
         port_mapping_dao=ioc["PortMappingDao"],
-        backend_port_client=ioc["BackendPortClient"],
     )
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
