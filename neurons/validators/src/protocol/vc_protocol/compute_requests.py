@@ -32,6 +32,20 @@ class RentedExecutor(BaseModel):
     rented_ports: list[int] = []
 
 
+class RentedMachine(BaseModel):
+    """Machine rental information for Redis storage."""
+    miner_hotkey: str
+    executor_id: str
+    executor_ip_address: str
+    executor_ip_port: str
+    container_name: str
+
+
+class RentedMachineResponse(BaseModel):
+    machines: list[RentedMachine]
+    banned_guids: list[str] = []
+
+
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
