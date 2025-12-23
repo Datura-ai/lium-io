@@ -57,6 +57,8 @@ class DummyConnectivityService:
         private_key: str,
         public_key: str,
         sysbox_runtime: bool,
+        rented_ports: list[int] | None = None,
+        rented_pod_names: list[str] | None = None,
     ) -> MockConnectivityResult:
         """Mock method that mimics the real connectivity service."""
         # Track what parameters we were called with

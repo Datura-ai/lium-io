@@ -6,9 +6,9 @@ from services.executor_connectivity_service import ExecutorConnectivityService
 
 
 @pytest.fixture
-def executor_service(mock_redis_service, port_mapping_dao, mock_backend_port_client):
+def executor_service(mock_redis_service, port_mapping_dao):
     """Create ExecutorConnectivityService for testing."""
-    return ExecutorConnectivityService(mock_redis_service, port_mapping_dao, mock_backend_port_client)
+    return ExecutorConnectivityService(mock_redis_service, port_mapping_dao)
 
 
 # ========================================================================================
@@ -57,9 +57,6 @@ async def test_verify_ports_invalid_json_mappings(executor_service, mock_ssh_cli
 async def test_cleanup_docker_containers(executor_service, mock_ssh_client, sample_executor_info):
     """Test cleanup of Docker containers with 'container_' prefix."""
     # Arrange
-    # Mock redis_service.get_rented_machine to return None
-    executor_service.redis_service.get_rented_machine = AsyncMock(return_value=None)
-
     # Mock responses: 1) list containers command, 2) rm command, 3) prune command
     # Note: docker ps --filter "name=^/container_" only returns container_* names
     mock_ssh_client.run.side_effect = [
@@ -68,8 +65,8 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client, samp
         AsyncMock(stdout="", exit_status=0),  # docker volume prune response
     ]
 
-    # Act
-    await executor_service.cleanup_docker_containers(mock_ssh_client, sample_executor_info)
+    # Act - pod_names is now passed as parameter instead of fetched from redis
+    await executor_service.cleanup_docker_containers(mock_ssh_client, sample_executor_info, [])
 
     # Assert
     # Expect 3 SSH commands: list, rm, prune
@@ -201,14 +198,16 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert "verification complete" in result.log_text
         assert "available" in result.log_text
 
-        # Expect cleanup was called first with ssh_client, executor_info and extra dict
+        # Expect cleanup was called first with ssh_client, executor_info, pod_names and extra dict
         mock_cleanup.assert_called_once()
         cleanup_args = mock_cleanup.call_args
         assert cleanup_args[0][0] == mock_ssh_client
         assert cleanup_args[0][1] == sample_executor_info
-        # Expect extra dict contains job metadata
-        assert "job_batch_id" in cleanup_args[0][2]
-        assert "miner_hotkey" in cleanup_args[0][2]
+        # Third arg is pod_names list (empty by default)
+        assert cleanup_args[0][2] == []
+        # Expect extra dict (4th arg) contains job metadata
+        assert "job_batch_id" in cleanup_args[0][3]
+        assert "miner_hotkey" in cleanup_args[0][3]
 
         # Expect get_all_ports was called
         mock_get_ports.assert_called_once()
