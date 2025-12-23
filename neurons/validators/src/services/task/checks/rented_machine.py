@@ -118,18 +118,18 @@ class TenantEnforcementCheck:
         }
 
         for pod in rented_pods:
-            pod_name = pod.container_name
+            pod_container_name = pod.container_name
             pod_id = pod.pod_id
-            pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_name)
+            pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_container_name)
             if not pod_running:
                 event = render_message(
                     Msg.POD_NOT_RUNNING,
                     ctx=ctx,
                     check_id=self.check_id,
-                    remediation=f"Start container {pod_name} and ensure it stays healthy.",
+                    remediation=f"Start container {pod_container_name} and ensure it stays healthy.",
                     what={
                         "pod_id": pod_id,
-                        "container_name": pod_name,
+                        "container_name": pod_container_name,
                         "executor_uuid": ctx.executor.uuid,
                     },
                     extra=extra,
@@ -144,9 +144,9 @@ class TenantEnforcementCheck:
                     },
                 )
 
-        pod_names = [pod.container_name for pod in rented_pods]
+        container_names = [pod.container_name for pod in rented_pods]
         gpu_processes = list(ctx.state.gpu_processes)
-        gpu_running_outside = _has_gpu_process_outside_container(pod_names, gpu_processes)
+        gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
 
         if not rented_executor.owner_flag and gpu_running_outside:
             gpu_details = ctx.state.gpu_details
@@ -157,7 +157,7 @@ class TenantEnforcementCheck:
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
-                        "expected_containers": pod_names,
+                        "expected_containers": container_names,
                         "process_count": observation["process_count"],
                         "gpu_utilization": observation["gpu_utilization"],
                         "vram_utilization": observation["vram_utilization"],

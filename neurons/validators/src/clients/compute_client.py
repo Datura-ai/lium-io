@@ -9,42 +9,36 @@ import bittensor
 import pydantic
 import tenacity
 import websockets
+from datura.requests.base import BaseRequest
 from payload_models.payloads import (
-    AddDebugSshKeyRequest,
-    AddSshPublicKeyRequest,
     BackupContainerRequest,
-    BaseServerRequest,
-    ContainerCreated,
-    ContainerCreateRequest,
-    ContainerDeleted,
-    ContainerDeleteRequest,
-    ContainerStarted,
-    ContainerStartRequest,
-    ContainerStopped,
-    ContainerStopRequest,
-    DebugSshKeyAdded,
-    DuplicateExecutorsResponse,
-    ExecutorRentFinishedRequest,
-    FailedAddDebugSshKey,
-    FailedContainerRequest,
-    FailedGetPodLogs,
-    GetPodLogsRequestFromServer,
-    InstallJupyterServerRequest,
-    JupyterInstallationFailed,
-    JupyterServerInstalled,
-    PodLogsResponseToServer,
-    RemoveSshPublicKeysRequest,
     RestoreContainerRequest,
+    BaseServerRequest,
+    ContainerCreateRequest,
+    ContainerDeleteRequest,
+    ContainerStartRequest,
+    ContainerStopRequest,
+    AddSshPublicKeyRequest,
+    RemoveSshPublicKeysRequest,
+    ContainerCreated,
+    ContainerStarted,
+    ContainerStopped,
     SshPubKeyAdded,
     SshPubKeyRemoved,
+    ContainerDeleted,
+    DuplicateExecutorsResponse,
+    FailedContainerRequest,
+    ExecutorRentFinishedRequest,
+    GetPodLogsRequestFromServer,
+    PodLogsResponseToServer,
+    FailedGetPodLogs,
+    AddDebugSshKeyRequest,
+    DebugSshKeyAdded,
+    FailedAddDebugSshKey,
+    InstallJupyterServerRequest,
+    JupyterServerInstalled,
+    JupyterInstallationFailed,
 )
-from pydantic import BaseModel
-from websockets.asyncio.client import ClientConnection
-
-from clients.handlers.backup_handler import BackupHandler
-from clients.subtensor_client import SubtensorClient
-from core.config import settings
-from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import (
     Error,
     ExecutorUptimeResponse,
@@ -57,23 +51,30 @@ from protocol.vc_protocol.validator_requests import (
     DuplicateExecutorsRequest,
     ExecutorSpecRequest,
     LogStreamRequest,
-    NormalizedScoreRequest,
     RentedMachineRequest,
     ResetVerifiedJobRequest,
+    NormalizedScoreRequest,
     RevenuePerGpuTypeRequest,
     ScorePortionPerGpuTypeRequest,
 )
+from pydantic import BaseModel
+from websockets.asyncio.client import ClientConnection
+
+from core.config import settings
+from core.utils import _m, get_extra_info
+from clients.subtensor_client import SubtensorClient
 from services.miner_service import MinerService
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     EXECUTORS_UPTIME_PREFIX,
-    MACHINE_SPEC_CHANNEL,
-    NORMALIZED_SCORE_CHANNEL,
     RENTAL_SUCCEED_MACHINE_SET,
+    MACHINE_SPEC_CHANNEL,
     RENTED_MACHINE_PREFIX,
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
+    NORMALIZED_SCORE_CHANNEL,
 )
+from clients.handlers.backup_handler import BackupHandler
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +220,7 @@ class ComputeClient:
                         )
                         await asyncio.sleep(reconnect_delay)
                         reconnect_delay = min(reconnect_delay * 2, max_delay)
-            except Exception:
+            except Exception as exc:
                 logger.error(
                     _m(
                         "Error connecting to compute app, retrying...",
@@ -265,7 +266,7 @@ class ComputeClient:
                     try:
                         channel = message['channel'].decode('utf-8')
                         data = json.loads(message['data'])
-                    except Exception:
+                    except Exception as exc:
                         continue
 
                     logger.info(
