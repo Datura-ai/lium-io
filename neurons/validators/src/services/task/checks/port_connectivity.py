@@ -47,7 +47,7 @@ class PortConnectivityCheck:
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         rented_ports = rented_executor.rented_ports if rented_executor else []
-        rented_pod_names = [p.name for p in rented_executor.pods] if rented_executor else []
+        rented_pod_names = [p.container_name for p in rented_executor.pods] if rented_executor else []
 
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
