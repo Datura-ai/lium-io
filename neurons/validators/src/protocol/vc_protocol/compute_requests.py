@@ -18,7 +18,7 @@ class Response(BaseModel, extra="forbid"):
 class RentedPod(BaseModel):
     """Pod data within an executor."""
     pod_id: str
-    name: str
+    container_name: str
     rented_ports: list[int] = []
 
 
