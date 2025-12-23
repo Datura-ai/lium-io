@@ -145,9 +145,3 @@ def port_mapping_dao(mock_async_session_maker):
     return PortMappingDao()
 
 
-@pytest.fixture
-def mock_backend_port_client():
-    """Mock BackendPortClient for testing."""
-    client = AsyncMock()
-    client.get_rented_ports = AsyncMock(return_value=set())
-    return client

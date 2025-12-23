@@ -5,7 +5,6 @@ import os
 from daos.port_mapping_dao import PortMappingDao
 from payload_models.payloads import MinerJobRequestPayload
 from clients.backend_client import BackendClient
-from clients.backend_port_client import BackendPortClient
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
@@ -51,18 +50,16 @@ class Validator:
         self.collateral_contract_service = CollateralContractService()
         self.port_mapping_dao = PortMappingDao()
 
-        # Backend clients for port mapping
+        # Backend client for API requests
         keypair = settings.get_bittensor_wallet().get_hotkey()
-        backend_client = BackendClient(
+        self.backend_client = BackendClient(
             base_url=settings.COMPUTE_REST_API_URL or "",
             keypair=keypair,
         )
-        backend_port_client = BackendPortClient(backend_client=backend_client)
 
         self.executor_connectivity_service = ExecutorConnectivityService(
             redis_service=self.redis_service,
             port_mapping_dao=self.port_mapping_dao,
-            backend_port_client=backend_port_client,
         )
 
         task_service = TaskService(
@@ -193,6 +190,17 @@ class Validator:
             # fetch miners
             miners = await self.subtensor_client.get_miners()
 
+            # Fetch all rented executors from backend API
+            rented_executors = await self.backend_client.get_all_rented_executors()
+            if rented_executors is None:
+                logger.error(
+                    _m(
+                        "[sync] Failed to fetch rented executors, skipping this iteration",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+                return
+
             try:
                 if await self.subtensor_client.should_set_weights():
                     await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
@@ -259,6 +267,7 @@ class Validator:
                                 miner_port=miner.axon_info.port,
                             ),
                             encrypted_files=encrypted_files,
+                            rented_data=rented_executors,
                         )
                     )
                     for miner in miners

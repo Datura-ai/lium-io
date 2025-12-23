@@ -87,10 +87,11 @@ class TenantEnforcementCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        redis_service = ctx.services.redis
-        rented_machine = await redis_service.get_rented_machine(ctx.executor)
+        # Get rented executor from context instead of Redis
+        rented_data = ctx.state.rented_data
+        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
 
-        if not rented_machine or not rented_machine.get("containers", None):
+        if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}
             event = render_message(
                 Msg.NOT_RENTED,
@@ -109,29 +110,29 @@ class TenantEnforcementCheck:
                 },
             )
 
-        rented_pods = rented_machine.get("containers", [])
+        rented_pods = rented_executor.pods
         extra = {
             **ctx.default_extra,
             "rented": True,
-            "rented_pods": rented_pods,
+            "rented_pods": [{"name": p.name, "pod_id": p.pod_id} for p in rented_pods],
         }
 
         for pod in rented_pods:
-            container_name = pod.get("name", "")
-            pod_id = pod.get("pod_id", "")
-            pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
+            pod_name = pod.name
+            pod_id = pod.pod_id
+            pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_name)
             if not pod_running:
                 event = render_message(
                     Msg.POD_NOT_RUNNING,
                     ctx=ctx,
                     check_id=self.check_id,
-                    remediation=f"Start container {container_name} and ensure it stays healthy.",
+                    remediation=f"Start container {pod_name} and ensure it stays healthy.",
                     what={
                         "pod_id": pod_id,
-                        "container_name": container_name,
+                        "container_name": pod_name,
                         "executor_uuid": ctx.executor.uuid,
                     },
-                    extra=extra
+                    extra=extra,
                 )
                 return CheckResult(
                     passed=False,
@@ -143,11 +144,11 @@ class TenantEnforcementCheck:
                     },
                 )
 
-        container_names = [pod.get("name", "") for pod in rented_pods]
+        pod_names = [pod.name for pod in rented_pods]
         gpu_processes = list(ctx.state.gpu_processes)
-        gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
+        gpu_running_outside = _has_gpu_process_outside_container(pod_names, gpu_processes)
 
-        if not rented_machine.get("owner_flag", False) and gpu_running_outside:
+        if not rented_executor.owner_flag and gpu_running_outside:
             gpu_details = ctx.state.gpu_details
             if not _is_gpu_usage_within_limits(gpu_details, gpu_processes):
                 observation = _gpu_usage_violation_details(gpu_details, gpu_processes)
@@ -156,7 +157,7 @@ class TenantEnforcementCheck:
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
-                        "expected_containers": container_names,
+                        "expected_containers": pod_names,
                         "process_count": observation["process_count"],
                         "gpu_utilization": observation["gpu_utilization"],
                         "vram_utilization": observation["vram_utilization"],
