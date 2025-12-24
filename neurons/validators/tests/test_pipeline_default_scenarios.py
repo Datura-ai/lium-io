@@ -221,8 +221,8 @@ class DummyPortMappingService:
         return 10  # Sufficient ports
 
 
-def dummy_score_calculator(gpu_model: str, collateral: bool, rental_succeed: bool, contract_version: str, rented: bool, port_count: int):
-    """Mock score calculator."""
+def dummy_score_calculator(ctx, rented: bool = False):
+    """Mock score calculator matching real calculate_scores(ctx, rented) signature."""
     return 1.0, 1.0, ""  # actual_score, job_score, warning
 
 
@@ -436,7 +436,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
     class RentedRedisService:
         async def get_rented_machine(self, executor):
             return {
-                "container_name": "tenant-container-123",
+                "containers": [{"name": "tenant-container-123", "pod_id": "pod-123"}],
                 "owner_flag": False,
             }
 
