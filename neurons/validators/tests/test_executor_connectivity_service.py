@@ -42,7 +42,7 @@ def test_get_available_port_maps_from_range(executor_service):
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440001",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -75,7 +75,7 @@ def test_get_available_port_maps_default_range(executor_service):
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440002",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -108,7 +108,7 @@ def test_get_available_port_maps_empty_range(executor_service):
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440003",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -143,7 +143,7 @@ async def test_verify_ports_invalid_json_mappings(executor_service, mock_ssh_cli
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440004",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -175,7 +175,7 @@ def test_get_available_port_maps_preferred_ports_priority(executor_service):
 
     # Create port range that includes some preferred ports (20000-20009 are preferred)
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440005",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -222,7 +222,7 @@ def test_get_available_port_maps_preferred_mappings_priority(executor_service):
     ]
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440006",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -254,18 +254,18 @@ def test_get_available_port_maps_preferred_mappings_priority(executor_service):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
+async def test_cleanup_docker_containers(executor_service, mock_ssh_client, sample_executor_info):
     """Test cleanup of Docker containers with 'container_' prefix."""
     # Arrange
-    # Mock responses: 1) list containers command, 2) rm command, 3) prune command
+    # Mock responses: 1) list containers command (only returns containers matching filter), 2) rm command, 3) prune command
     mock_ssh_client.run.side_effect = [
-        AsyncMock(stdout="container_test1\ncontainer_test2\nexecutor-executor-1", exit_status=0),
+        AsyncMock(stdout="container_test1\ncontainer_test2", exit_status=0),  # Only containers with 'container_' prefix
         AsyncMock(stdout="", exit_status=0),  # docker rm response
         AsyncMock(stdout="", exit_status=0),  # docker volume prune response
     ]
 
     # Act
-    await executor_service.cleanup_docker_containers(mock_ssh_client)
+    await executor_service.cleanup_docker_containers(mock_ssh_client, sample_executor_info, {})
 
     # Assert
     # Expect 3 SSH commands: list, rm, prune
@@ -275,8 +275,8 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
 
     # Expect first call to list containers with name filter
     assert "docker ps" in all_calls[0]
-    # Expect second call to remove found containers
-    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1] and "executor-executor-1" not in all_calls[1]
+    # Expect second call to remove found containers (both with container_ prefix)
+    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1] and "container_test2" in all_calls[1]
     # Expect third call to prune volumes
     assert "docker volume prune" in all_calls[2]
 
@@ -309,7 +309,8 @@ async def test_verify_port_dind_successful_connection(executor_service, mock_ssh
     mock_container_ssh = AsyncMock()
 
     with patch('asyncssh.import_private_key', return_value=mock_pkey) as mock_import_key, \
-         patch('asyncssh.connect') as mock_connect:
+         patch('asyncssh.connect') as mock_connect, \
+         patch('asyncio.sleep', new=AsyncMock()) as mock_sleep:
 
         # Setup asyncssh.connect as async context manager
         mock_connect.return_value.__aenter__.return_value = mock_container_ssh
@@ -398,13 +399,14 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert "verification complete" in result.log_text
         assert "available" in result.log_text
 
-        # Expect cleanup was called first with ssh_client and extra dict
+        # Expect cleanup was called first with ssh_client, executor_info, and extra dict
         mock_cleanup.assert_called_once()
         cleanup_args = mock_cleanup.call_args
         assert cleanup_args[0][0] == mock_ssh_client
+        assert cleanup_args[0][1] == sample_executor_info
         # Expect extra dict contains job metadata
-        assert "job_batch_id" in cleanup_args[0][1]
-        assert "miner_hotkey" in cleanup_args[0][1]
+        assert "job_batch_id" in cleanup_args[0][2]
+        assert "miner_hotkey" in cleanup_args[0][2]
 
         # Expect get_available_port_maps was called with correct batch size and rented ports
         from services.const import BATCH_PORT_VERIFICATION_SIZE
