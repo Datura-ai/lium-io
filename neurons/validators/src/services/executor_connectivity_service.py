@@ -4,7 +4,6 @@ import logging
 import random
 import time
 import uuid
-from typing import Any
 from uuid import UUID
 
 import aiohttp
@@ -21,15 +20,9 @@ from services.const import (
     BATCH_PORT_VERIFICATION_SIZE,
     DOCKER_DIND_IMAGE,
     PREFERRED_POD_PORTS,
-    BATCH_PORT_TIMEOUT,
     BATCH_PORT_CONCURRENCY,
-    BATCH_HEALTH_CHECK_TIMEOUT,
 )
 from services.redis_service import RedisService
-
-# Constants
-BATCH_VERIFIER_CONTAINER_PREFIX = "container_batch_verifier"
-BATCH_VERIFIER_IMAGE = "daturaai/batch-port-verifier:0.0.1"
 
 logger = logging.getLogger(__name__)
 
@@ -362,131 +355,6 @@ echo "Batch {idx}: completed" >&2
 
         return [], port_maps
 
-    async def _docker_start(
-        self, api_external: int, api_internal: int, container_name: str, extra: dict, ssh_client: SSHClientConnection
-    ):
-        """Run the special container in the executor machine"""
-        command = (
-            f"/usr/bin/docker run -d --name {container_name} --network=host "
-            f"-e API_PORT={api_internal} {BATCH_VERIFIER_IMAGE}"
-        )
-
-        logger.debug(_m(f"run: {command[:200]}...", extra))
-
-        result = await ssh_client.run(command)
-        if result.exit_status != 0:
-            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-            raise Exception(f"batch docker start failed: {error_msg} port={api_external}")
-
-    async def _diagnose_container_status(
-        self, ssh_client: SSHClientConnection, container_name: str, extra: dict = {}
-    ) -> dict[str, Any]:
-        """Diagnose container status with detailed information"""
-        diagnosis = {
-            "status": None,
-            "logs": None,
-            "is_running": False,
-        }
-
-        try:
-            # Check container status
-            status_cmd = f'/usr/bin/docker ps -a --filter name={container_name} --format "{{{{.Status}}}}"'
-            status_result = await ssh_client.run(status_cmd)
-            if status_result.exit_status == 0 and status_result.stdout.strip():
-                diagnosis["status"] = status_result.stdout.strip()
-                diagnosis["is_running"] = "Up" in diagnosis["status"]
-                logger.info(_m(f"container status: {diagnosis['status']}", extra))
-            else:
-                logger.error(_m(f"failed to get container status", extra))
-
-            # Get container logs (last 50 lines)
-            logs_cmd = f"/usr/bin/docker logs --tail 50 {container_name}"
-            logs_result = await ssh_client.run(logs_cmd)
-            if logs_result.exit_status == 0:
-                diagnosis["logs"] = f"logs: {logs_result.stdout.strip()[-250:]}"
-                diagnosis["logs"] += f"errors: {logs_result.stderr.strip()[-250:]}" if logs_result.stderr else ""
-                if diagnosis["logs"]:
-                    logger.info(_m(diagnosis["logs"], extra))
-                else:
-                    logger.warning(_m(f"container has no logs", extra))
-            else:
-                logger.error(_m(f"failed to get container logs: {logs_result.stderr}", extra))
-
-        except Exception as e:
-            logger.error(_m(f"diagnosis failed: {e}", extra), exc_info=True)
-
-        return diagnosis
-
-    async def _docker_wait_for_health(self, external_ip: str, api_port: int, extra: dict = {}) -> bool:
-        """Wait for batch port verifier service to become healthy."""
-        health_url = f"http://{external_ip}:{api_port}/health"
-        timeout = BATCH_HEALTH_CHECK_TIMEOUT
-        start_time = asyncio.get_event_loop().time()
-        last_error = None
-
-        async with aiohttp.ClientSession() as session:
-            while asyncio.get_event_loop().time() - start_time < timeout:
-                try:
-                    async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=4)) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            if data.get("status") == "ok":
-                                elapsed = asyncio.get_event_loop().time() - start_time
-                                logger.info(_m(f"health check ok after {elapsed:.1f}s", extra))
-                                return True
-                except Exception as e:
-                    last_error = str(e)[:100]
-
-                await asyncio.sleep(0.5)
-
-        # Health check failed
-        elapsed = asyncio.get_event_loop().time() - start_time
-        logger.error(_m(f"health check failed after {elapsed:.1f}s, last error: {last_error}", extra))
-        return False
-
-    async def _check_port_on_executor(
-        self, ssh_client: SSHClientConnection, port: int, extra: dict = {}
-    ) -> dict[str, Any]:
-        """Check if port is listening on executor"""
-        port_info: dict[str, Any] = {"is_listening": False, "health_accessible": False}
-
-        try:
-            # Check with netstat if port is listening
-            netstat_cmd = f"netstat -tuln | grep ':{port} '"
-            netstat_result = await ssh_client.run(netstat_cmd)
-            if netstat_result.exit_status == 0 and netstat_result.stdout.strip():
-                port_info["is_listening"] = True
-                logger.info(_m(f"port {port} is listening", extra))
-
-                # Only try curl if port is listening
-                curl_cmd = f"curl -s -m 2 http://localhost:{port}/health"
-                curl_result = await ssh_client.run(curl_cmd)
-                port_info["health_accessible"] = curl_result.exit_status == 0
-                if port_info["health_accessible"]:
-                    logger.info(_m(f"port {port} health check accessible", extra))
-            else:
-                logger.warning(_m(f"port {port} is NOT listening internally", extra))
-
-        except Exception as e:
-            logger.error(_m(f"port check failed: {e}", extra))
-
-        return port_info
-
-    async def _verify_port(
-        self, host: str, external_port: int, expected_response: str, int_port: int, session: aiohttp.ClientSession,
-    ) -> tuple[bool, int | None]:
-        """Verify remote port is responding correctly via HTTP GET."""
-        url = f"http://{host}:{external_port}/"
-
-        try:
-            t1 = time.monotonic()
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=BATCH_PORT_TIMEOUT)) as response:
-                response_text = await response.text()
-                is_valid = response_text.strip() == expected_response
-                return is_valid, int_port
-        except Exception:
-            return False, None
-
     async def _test_single_port_with_session(
         self,
         session: aiohttp.ClientSession,
@@ -513,89 +381,6 @@ echo "Batch {idx}: completed" >&2
         except Exception as e:
             logger.warning(_m(f"port {internal_port} failed: {str(e)[:100]}", extra))
             return False
-
-    async def _test_single_port(
-        self,
-        host: str,
-        internal_port: int,
-        external_port: int,
-        token: str,
-        extra: dict = {},
-    ) -> bool:
-        """Test a single port expecting token:port response via HTTP."""
-        async with aiohttp.ClientSession() as session:
-            return await self._test_single_port_with_session(
-                session, host, internal_port, external_port, token, extra
-            )
-
-    async def _start_and_check_ports(
-        self, external_ip: str, api_port: int, port_maps: list[tuple[int, int]], extra: dict = {}
-    ) -> dict[str, bool]:
-        """
-        will send POST /start-ports command to turn_on ports with list of internal ports
-        then in paralel will send GET request to every external port to check if it is open
-        Send Post /close-ports command to turn_off ports after all ports are checked
-        """
-        """Send HTTP request to check ports."""
-        start_url = f"http://{external_ip}:{api_port}/start-ports"
-        stop_url = f"http://{external_ip}:{api_port}/stop-ports"
-        if not port_maps:
-            logger.debug(_m("no ports to check, skip", extra))
-            return {}
-
-        # Prepare request payload
-        internal_ports, external_ports = zip(*port_maps)
-        external_dict = {
-            external_port: internal_port for external_port, internal_port in zip(external_ports, internal_ports)
-        }
-        secret = str(random.randint(100000, 999999))
-        payload = {"ports": internal_ports, "secret": secret}
-
-        # Create session with connection pool
-        concurrency = min(len(external_dict), BATCH_PORT_CONCURRENCY)
-        connector = aiohttp.TCPConnector(# 300 executors * 200 concurrency. (in paralel)
-            limit=concurrency, limit_per_host=concurrency, force_close=False, enable_cleanup_closed=True,
-        )
-
-        # start ports.
-        t1 = time.monotonic()
-        try:
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.post(start_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        logger.info(_m("response", {**extra, "data": str(data)[:200]}))
-                    else:
-                        logger.error(_m(f"port check failed status={response.status}", extra))
-                        return {}
-
-                started = time.monotonic() - t1
-                # Run verify_port in parallel for all ports
-                tasks = []
-                for external_port, internal_port in external_dict.items():
-                    expected_response = f"{internal_port}_{secret}"
-                    tasks.append(
-                        self._verify_port(external_ip, external_port, expected_response, internal_port, session,)
-                    )
-
-                results = await asyncio.gather(*tasks)
-                results_dict = {
-                    str(internal_port): success for success, internal_port in results if internal_port is not None
-                }
-                check_time = time.monotonic() - t1 - started
-
-                # stop_ports
-                async with session.post(stop_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status != 200:
-                        logger.error(_m(f"port check failed status={response.status}", extra))
-                stop_time = time.monotonic() - t1 - started - check_time
-
-        except Exception as e:
-            logger.error(_m(f"port check request failed: {e}", extra), exc_info=True)
-            return {}
-
-        logger.info(_m(f"port check complete {started:.2f}s {check_time:.2f}s {stop_time:.2f}s", extra))
-        return results_dict
 
     async def save_to_db(
         self,
