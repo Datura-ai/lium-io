@@ -22,13 +22,15 @@ logger = logging.getLogger(__name__)
 class ResultHandler:
     """Handles post-pipeline result processing and persistence."""
 
-    def __init__(self, redis_service: RedisService):
+    def __init__(self, redis_service: RedisService, dry_run: bool = False):
         """Initialize result handler with Redis service.
 
         Args:
             redis_service: Redis service for persisting verification data
+            dry_run: If True, skip Redis writes
         """
         self.redis_service = redis_service
+        self.dry_run = dry_run
 
     async def handle_result(
         self,
@@ -74,14 +76,17 @@ class ResultHandler:
             log_status = "warning"
             logger.warning(log_text)
 
-        # Persist verification data to Redis
-        await self._persist_verification_data(
-            miner_hotkey=miner_info.miner_hotkey,
-            executor_id=executor_info.uuid,
-            verified_job_info=verified_job_info,
-            context=context,
-            success=success,
-        )
+        # Persist verification data to Redis (unless in DRY_RUN mode)
+        if not self.dry_run:
+            await self._persist_verification_data(
+                miner_hotkey=miner_info.miner_hotkey,
+                executor_id=executor_info.uuid,
+                verified_job_info=verified_job_info,
+                context=context,
+                success=success,
+            )
+        else:
+            logger.info("DRY_RUN: Skipping Redis persistence")
 
         # Parse GPU model and count from gpu_model_count string
         gpu_model: Optional[str] = None
