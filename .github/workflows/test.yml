@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'neurons/validators/**'
+      - 'datura/**'
+      - '.github/workflows/test.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'neurons/validators/**'
+      - 'datura/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validators:
+    name: Validators Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: neurons/validators
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pdm
+        uses: pdm-project/setup-pdm@v4
+        with:
+          cache: true
+          cache-dependency-path: neurons/validators/pdm.lock
+
+      - name: Install dependencies
+        run: pdm install
+
+      - name: Run tests
+        env:
+          BITTENSOR_WALLET_NAME: test_wallet
+          BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
+          SQLALCHEMY_DATABASE_URI: sqlite:///test.db
+          ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
+        run: pdm run pytest tests/ -v --tb=short --strict-markers
