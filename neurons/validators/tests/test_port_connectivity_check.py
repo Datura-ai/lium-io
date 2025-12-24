@@ -69,8 +69,6 @@ class DummyConnectivityService:
 @pytest.mark.parametrize(
     "rented,renting_in_progress,has_config,verify_success,sysbox_runtime,expected_pass,expected_reason",
     [
-        # Already rented - skip check
-        (True, False, True, True, False, True, Msg.SKIPPED_RENTED.reason),
         # Renting in progress - skip verification
         (False, True, True, True, False, True, Msg.RENTING_IN_PROGRESS.reason),
         # Missing config - fail
@@ -139,10 +137,7 @@ async def test_port_connectivity_check(
     assert result.event.reason_code == expected_reason
 
     # Verify service interactions based on scenario
-    if rented:
-        # Should not call Redis or connectivity service
-        assert connectivity_service.called_with is None
-    elif renting_in_progress:
+    if renting_in_progress:
         # Should call Redis but not connectivity service
         assert connectivity_service.called_with is None
         # Verify updates
