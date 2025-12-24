@@ -190,17 +190,6 @@ class Validator:
             # fetch miners
             miners = await self.subtensor_client.get_miners()
 
-            # Fetch all rented executors from backend API
-            rented_executors = await self.backend_client.get_all_rented_executors()
-            if rented_executors is None:
-                logger.error(
-                    _m(
-                        "[sync] Failed to fetch rented executors, skipping this iteration",
-                        extra=get_extra_info(self.default_extra),
-                    ),
-                )
-                return
-
             try:
                 if await self.subtensor_client.should_set_weights():
                     if settings.DRY_RUN:
@@ -242,6 +231,17 @@ class Validator:
             if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
+
+                # Fetch all rented executors from backend API
+                rented_executors = await self.backend_client.get_all_rented_executors()
+                if rented_executors is None:
+                    logger.error(
+                        _m(
+                            "[sync] Failed to fetch rented executors, skipping this iteration",
+                            extra=get_extra_info(self.default_extra),
+                        ),
+                    )
+                    return
 
                 logger.info(
                     _m(
