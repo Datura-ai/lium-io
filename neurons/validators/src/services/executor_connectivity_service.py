@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import time
+import uuid
 from typing import Any
 from uuid import UUID
 
@@ -138,6 +139,151 @@ class ExecutorConnectivityService:
                 success=False, log_text=f"Verification failed: {str(e)}", sysbox_runtime=sysbox_runtime,
             )
 
+    def _build_netcat_script(self, port_maps: list[tuple[int, int]], token: str) -> str:
+        """Build bash script that uses netcat to listen on multiple ports with unique token."""
+        # Split ports into batches
+        port_batches = []
+        for i in range(0, len(port_maps), BATCH_PORT_CONCURRENCY):
+            batch = port_maps[i:i + BATCH_PORT_CONCURRENCY]
+            batch_ports = ' '.join([str(internal_port) for internal_port, _ in batch])
+            port_batches.append(batch_ports)
+
+        # Build netcat commands for each batch
+        batch_commands = []
+        for idx, batch_ports in enumerate(port_batches):
+            batch_cmd = f'''
+echo "Batch {idx}: starting ports {batch_ports}" >&2
+for port in {batch_ports}; do
+    (
+        echo "Binding port $port" >&2
+        body="{token}:$port"
+        printf "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: ${{#body}}\\r\\nConnection: close\\r\\n\\r\\n$body" | nc -l -p $port
+        echo "Port $port served" >&2
+    ) &
+done
+wait
+echo "Batch {idx}: completed" >&2
+'''
+            batch_commands.append(batch_cmd)
+
+        return '\n'.join(batch_commands) + '\necho "All batches completed" >&2'
+
+    async def _start_port_test_container(
+        self, ssh_client: SSHClientConnection, container_name: str, nc_script: str, extra: dict
+    ) -> bool:
+        """Start Alpine container with netcat script and verify it's running.
+
+        Returns:
+            True if container started successfully, False otherwise
+        """
+        command = (
+            f"/usr/bin/docker run -d --rm --name {container_name} "
+            f"--network=host docker.io/library/alpine:3.19 sh -c '{nc_script}'"
+        )
+
+        logger.debug(_m(f"starting container: {container_name}", extra))
+        logger.debug(_m(f"nc_script: {nc_script[:200]}...", extra))
+
+        result = await ssh_client.run(command)
+        if result.exit_status != 0:
+            logger.error(_m(f"container start failed: {result.stderr.strip()}", extra))
+            return False
+
+        # Give container time to start
+        await asyncio.sleep(0.5)
+
+        # Verify container is still running
+        check_cmd = f"/usr/bin/docker ps --filter name={container_name} --format '{{{{.Status}}}}'"
+        check_result = await ssh_client.run(check_cmd)
+
+        if check_result.stdout.strip():
+            logger.info(_m(f"container status: {check_result.stdout.strip()}", extra))
+            return True
+
+        # Container not running - get logs
+        logger.error(_m(f"container not running! checking logs...", extra))
+        logs_cmd = f"/usr/bin/docker logs {container_name} 2>&1 || echo 'no logs'"
+        logs_result = await ssh_client.run(logs_cmd)
+        logger.error(_m(f"container logs: {logs_result.stdout.strip()}", extra))
+        return False
+
+    async def _test_ports_in_batches(
+        self,
+        port_maps: list[tuple[int, int]],
+        executor_host: str,
+        token: str,
+        extra: dict,
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """Test all ports in batches and return results.
+
+        Returns:
+            Tuple of (successful_ports, failed_ports)
+        """
+        successful_ports = []
+        failed_ports = []
+
+        async with aiohttp.ClientSession() as session:
+            for batch_idx in range(0, len(port_maps), BATCH_PORT_CONCURRENCY):
+                batch = port_maps[batch_idx:batch_idx + BATCH_PORT_CONCURRENCY]
+
+                # Small delay between batches to let container bind ports
+                if batch_idx > 0:
+                    await asyncio.sleep(0.1)
+
+                logger.debug(_m(f"testing batch {batch_idx // BATCH_PORT_CONCURRENCY}: {len(batch)} ports", extra))
+
+                # Test all ports in this batch concurrently
+                tasks = [
+                    self._test_single_port_with_session(session, executor_host, int_port, ext_port, token, extra)
+                    for int_port, ext_port in batch
+                ]
+                results = await asyncio.gather(*tasks)
+
+                # Separate successful and failed ports
+                for (int_port, ext_port), success in zip(batch, results):
+                    if success:
+                        successful_ports.append((int_port, ext_port))
+                    else:
+                        failed_ports.append((int_port, ext_port))
+
+                # Log progress
+                if (batch_idx + len(batch)) % BATCH_PORT_CONCURRENCY == 0 or (batch_idx + len(batch)) >= len(port_maps):
+                    logger.info(_m(f"progress: {len(successful_ports)}/{len(port_maps)} verified", extra))
+
+        return successful_ports, failed_ports
+
+    async def _cleanup_port_test_container(self, ssh_client: SSHClientConnection, container_name: str):
+        """Remove port test container."""
+        cleanup_cmd = f"/usr/bin/docker rm -f {container_name} 2>/dev/null || true"
+        await ssh_client.run(cleanup_cmd)
+
+    async def _verify_ports_bulk_attempt(
+        self,
+        ssh_client: SSHClientConnection,
+        port_maps: list[tuple[int, int]],
+        executor_host: str,
+        token: str,
+        container_name: str,
+        extra: dict,
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """Single attempt to verify ports. Returns (successful_ports, failed_ports)."""
+        # Build netcat script
+        nc_script = self._build_netcat_script(port_maps, token)
+
+        # Start container
+        if not await self._start_port_test_container(ssh_client, container_name, nc_script, extra):
+            return [], port_maps
+
+        # Test all ports
+        successful_ports, failed_ports = await self._test_ports_in_batches(
+            port_maps, executor_host, token, extra
+        )
+
+        # Cleanup
+        await self._cleanup_port_test_container(ssh_client, container_name)
+
+        return successful_ports, failed_ports
+
     async def verify_ports_bulk(
         self,
         ssh_client: SSHClientConnection,
@@ -145,73 +291,76 @@ class ExecutorConnectivityService:
         executor_info: ExecutorSSHInfo,
         extra: dict = {},
     ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-        """Start docker on executor -> open ports there -> check ports -> close docker"""
+        """Test ports using Alpine container with netcat and unique UUID token.
+
+        This method prevents conflicts when multiple validators test the same executor
+        by using a unique token per verification session. Retries once if first attempt fails.
+        Has a 60-second timeout per attempt to prevent hanging.
+        """
         if not port_maps:
             return [], []
 
-        # Use random port as API_PORT for checker container
-        api_internal, api_external = random.choice(port_maps)
-        ports_to_check = [p for p in port_maps if p != (api_internal, api_external)]
-        container_name = f"{BATCH_VERIFIER_CONTAINER_PREFIX}_{api_external}"
+        max_attempts = 2
+        timeout_seconds = 60  # 1 minute timeout per attempt
 
-        logger.info(_m(f"batch: start docker {api_internal}:{api_external}", extra))
+        for attempt in range(1, max_attempts + 1):
+            # Generate unique token and container name for each attempt
+            token = uuid.uuid4().hex
+            container_name = f"port_test_{token[:8]}"
 
-        try:
-            # Start Docker container
-            await self._docker_start(api_external, api_internal, container_name, extra, ssh_client)
+            logger.info(_m(
+                f"testing {len(port_maps)} ports in batches of {BATCH_PORT_CONCURRENCY} with token {token[:8]} (attempt {attempt}/{max_attempts}, timeout={timeout_seconds}s)",
+                extra
+            ))
 
-            logger.info(_m(f"batch: docker started {api_external}, wait health", extra))
-            if not await self._docker_wait_for_health(executor_info.address, api_external, extra):
-                # Health check failed - run diagnostics
-                logger.error(_m(f"batch: health check failed, running diagnostics port={api_external}", extra))
-
-                diagnosis = await self._diagnose_container_status(ssh_client, container_name, extra)
-                port_info = await self._check_port_on_executor(ssh_client, api_internal, extra)
-
-                error_msg = (
-                    f"batch health check failed port={api_external} "
-                    f"container_running={diagnosis.get('is_running', False)} "
-                    f"port_listening={port_info.get('is_listening', False)}"
-                )
-                raise Exception(error_msg)
-
-            logger.info(_m(f"batch: healthy {api_external}, verify {len(ports_to_check)} ports", extra))
-            batch_size = 100
-            results = {}
-            for i in range(0, len(ports_to_check), batch_size):
-                batch_ports = ports_to_check[i : i + batch_size]
-                results.update(
-                    await self._start_and_check_ports(executor_info.address, api_external, batch_ports, extra)
-                )
-
-            # Process results into port pairs
-            successful_ports = []
-            failed_ports = []
-
-            # Add api_port to successful ports (it was used for the service)
-            api_port_pair = (api_internal, api_external)
-            successful_ports.append(api_port_pair)
-
-            # Process other ports based on results
-            for port_pair in ports_to_check:
-                if results.get(str(port_pair[0]), False):
-                    successful_ports.append(port_pair)
-                else:
-                    failed_ports.append(port_pair)
-
-            status = "ok" if len(successful_ports) > 1 else "fail"
-            logger.info(_m(f"batch: complete {status} {successful_ports[:10]}/{len(port_maps)} + api", extra))
-            return successful_ports, failed_ports
-
-        except Exception as e:
-            logger.error(_m(f"batch verification failed: {str(e)} port={api_external}", extra), exc_info=True)
-            return [], []
-        finally:
             try:
-                cleanup_command = f"/usr/bin/docker rm -f {container_name}"
-                await ssh_client.run(cleanup_command)
+                # Wrap in timeout to prevent hanging
+                successful_ports, failed_ports = await asyncio.wait_for(
+                    self._verify_ports_bulk_attempt(
+                        ssh_client, port_maps, executor_info.address, token, container_name, extra
+                    ),
+                    timeout=timeout_seconds
+                )
+
+                # If we got any successful ports, return immediately
+                if successful_ports:
+                    logger.info(_m(f"complete: {len(successful_ports)}/{len(port_maps)} ports verified", extra))
+                    return successful_ports, failed_ports
+
+                # First attempt failed completely - retry after delay
+                if attempt < max_attempts:
+                    retry_delay = 2
+                    logger.warning(_m(f"attempt {attempt} failed, retrying in {retry_delay}s...", extra))
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error(_m(f"all {max_attempts} attempts failed", extra))
+                    return [], port_maps
+
+            except asyncio.TimeoutError:
+                logger.error(_m(f"port verification attempt {attempt} timed out after {timeout_seconds}s", extra))
+                await self._cleanup_port_test_container(ssh_client, container_name)
+
+                # Retry after delay if not last attempt
+                if attempt < max_attempts:
+                    retry_delay = 2
+                    logger.warning(_m(f"timeout on attempt {attempt}, retrying in {retry_delay}s...", extra))
+                    await asyncio.sleep(retry_delay)
+                else:
+                    return [], port_maps
+
             except Exception as e:
-                logger.debug(_m(f"cleanup warning: {e}", extra))
+                logger.error(_m(f"port verification attempt {attempt} failed: {e}", extra), exc_info=True)
+                await self._cleanup_port_test_container(ssh_client, container_name)
+
+                # Retry after delay if not last attempt
+                if attempt < max_attempts:
+                    retry_delay = 2
+                    logger.warning(_m(f"exception on attempt {attempt}, retrying in {retry_delay}s...", extra))
+                    await asyncio.sleep(retry_delay)
+                else:
+                    return [], port_maps
+
+        return [], port_maps
 
     async def _docker_start(
         self, api_external: int, api_internal: int, container_name: str, extra: dict, ssh_client: SSHClientConnection
@@ -337,6 +486,47 @@ class ExecutorConnectivityService:
                 return is_valid, int_port
         except Exception:
             return False, None
+
+    async def _test_single_port_with_session(
+        self,
+        session: aiohttp.ClientSession,
+        host: str,
+        internal_port: int,
+        external_port: int,
+        token: str,
+        extra: dict = {},
+    ) -> bool:
+        """Test a single port expecting token:port response via HTTP using provided session."""
+        url = f"http://{host}:{external_port}/"
+        expected = f"{token}:{internal_port}"
+
+        try:
+            # Use 3 second timeout instead of 40 - we just need to know if port is open
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                text = await resp.text()
+                if text.strip() == expected:
+                    logger.debug(_m(f"port {internal_port} ok", extra))
+                    return True
+                else:
+                    logger.warning(_m(f"port {internal_port} wrong response: {text[:50]}", extra))
+                    return False
+        except Exception as e:
+            logger.warning(_m(f"port {internal_port} failed: {str(e)[:100]}", extra))
+            return False
+
+    async def _test_single_port(
+        self,
+        host: str,
+        internal_port: int,
+        external_port: int,
+        token: str,
+        extra: dict = {},
+    ) -> bool:
+        """Test a single port expecting token:port response via HTTP."""
+        async with aiohttp.ClientSession() as session:
+            return await self._test_single_port_with_session(
+                session, host, internal_port, external_port, token, extra
+            )
 
     async def _start_and_check_ports(
         self, external_ip: str, api_port: int, port_maps: list[tuple[int, int]], extra: dict = {}
