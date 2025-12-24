@@ -73,9 +73,17 @@ class BackendClient:
                 headers.update(extra_headers)
 
             session = await self.get_session()
+            start_time = time.perf_counter()
             async with session.get(
                 url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(
+                    _m(
+                        "HTTP GET completed",
+                        extra=get_extra_info({**context, "status": resp.status, "elapsed_ms": round(elapsed_ms, 1)}),
+                    )
+                )
                 if resp.status != 200:
                     logger.error(
                         _m(
@@ -132,9 +140,17 @@ class BackendClient:
                 headers.update(extra_headers)
 
             session = await self.get_session()
+            start_time = time.perf_counter()
             async with session.post(
                 url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                logger.info(
+                    _m(
+                        "HTTP POST completed",
+                        extra=get_extra_info({**context, "status": resp.status, "elapsed_ms": round(elapsed_ms, 1)}),
+                    )
+                )
                 if resp.status != 200:
                     logger.error(
                         _m(
