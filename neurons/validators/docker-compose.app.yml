@@ -51,10 +51,6 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - DRY_RUN=true
-    ports:
-      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
-    expose:
-      - ${INTERNAL_PORT}
     volumes:
       - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
