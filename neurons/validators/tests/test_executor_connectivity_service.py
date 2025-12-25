@@ -12,43 +12,6 @@ def executor_service(mock_redis_service, port_mapping_dao):
 
 
 # ========================================================================================
-# Tests for verify_ports method
-# ========================================================================================
-
-
-@pytest.mark.asyncio
-async def test_verify_ports_invalid_json_mappings(executor_service, mock_ssh_client):
-    """Test that verify_ports fails when port_mappings contains invalid JSON."""
-    # Arrange
-    from datura.requests.miner_requests import ExecutorSSHInfo
-
-    executor_info = ExecutorSSHInfo(
-        uuid="550e8400-e29b-41d4-a716-446655440004",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        port_mappings="invalid json",
-        port_range=None,
-        python_path="/usr/bin/python3",
-        root_dir="/tmp",
-    )
-    # Mock SSH cleanup to return empty container list
-    mock_ssh_client.run.return_value.stdout = ""
-
-    # Act
-    result = await executor_service.verify_ports(
-        mock_ssh_client, "job_123", "miner_key", executor_info, "private_key", "public_key"
-    )
-
-    # Assert
-    # Expect failure because invalid JSON will cause json.loads() to fail
-    assert result.success is False
-    # Expect error message about JSON parsing failure
-    assert "Expecting value" in result.log_text or "Verification failed" in result.log_text
-
-
-# ========================================================================================
 # Tests for cleanup_docker_containers method
 # ========================================================================================
 
@@ -65,7 +28,7 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client, samp
         AsyncMock(stdout="", exit_status=0),  # docker volume prune response
     ]
 
-    # Act - pod_names is now passed as parameter instead of fetched from redis
+    # Act
     await executor_service.cleanup_docker_containers(mock_ssh_client, sample_executor_info, [])
 
     # Assert
@@ -169,18 +132,17 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
     miner_hotkey = "test_miner"
     private_key = "test_private_key"
     public_key = "test_public_key"
+    rented_ports = [8000, 8001]
+    rented_pod_names = ["pod_1", "pod_2"]
 
     # Mock all methods in the verification flow
-    port_maps = [(9000, 9000), (9001, 9001), (9002, 9002)]
     successful_bulk_ports = [(9001, 9001), (9002, 9002)]
     failed_bulk_ports = []
 
     with patch.object(executor_service, 'cleanup_docker_containers', new=AsyncMock()) as mock_cleanup, \
-         patch('services.executor_connectivity_service.get_all_ports', return_value=port_maps) as mock_get_ports, \
          patch.object(executor_service, 'verify_ports_bulk', new=AsyncMock(return_value=(successful_bulk_ports, failed_bulk_ports))) as mock_bulk, \
          patch.object(executor_service, 'verify_port_dind', new=AsyncMock(return_value=DockerConnectionCheckResult(success=True, log_text="dind ok", sysbox_runtime=False))) as mock_dind, \
-         patch.object(executor_service, 'save_to_db', new=AsyncMock()) as mock_save_db, \
-         patch.object(executor_service.port_mapping_dao, 'get_busy_external_ports', new=AsyncMock(return_value=set())) as mock_get_busy_ports:
+         patch.object(executor_service, 'save_to_db', new=AsyncMock()) as mock_save_db:
 
         # Act
         result = await executor_service.verify_ports(
@@ -190,6 +152,8 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
             sample_executor_info,
             private_key,
             public_key,
+            rented_ports=rented_ports,
+            rented_pod_names=rented_pod_names,
         )
 
         # Assert
@@ -199,19 +163,17 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert "verification complete" in result.log_text
         assert "available" in result.log_text
 
-        # Expect cleanup was called first with ssh_client, executor_info, pod_names and extra dict
+        # Expect cleanup was called first with ssh_client, executor_info, pod_names, and extra dict
         mock_cleanup.assert_called_once()
         cleanup_args = mock_cleanup.call_args
         assert cleanup_args[0][0] == mock_ssh_client
         assert cleanup_args[0][1] == sample_executor_info
-        # Third arg is pod_names list (empty by default)
-        assert cleanup_args[0][2] == []
-        # Expect extra dict (4th arg) contains job metadata
-        assert "job_batch_id" in cleanup_args[0][3]
-        assert "miner_hotkey" in cleanup_args[0][3]
-
-        # Expect get_all_ports was called
-        mock_get_ports.assert_called_once()
+        # Third argument is pod_names list
+        assert cleanup_args[0][2] == rented_pod_names
+        # Fourth argument (extra dict) contains job metadata
+        extra_dict = cleanup_args[0][3]
+        assert "job_batch_id" in extra_dict
+        assert "miner_hotkey" in extra_dict
 
         # Expect verify_ports_bulk was called
         mock_bulk.assert_called_once()
