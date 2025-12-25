@@ -4,11 +4,7 @@ from unittest.mock import Mock
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
-from protocol.vc_protocol.compute_requests import (
-    RentedExecutor,
-    RentedExecutorsResponse,
-    RentedPod,
-)
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
 
 from helpers import build_context_config, build_services, build_state
 
@@ -53,21 +49,40 @@ def convert_rented_machine_to_rented_data(
     )
 
 
-class DummyRedisService:
-    """Mock Redis service for port maps."""
+def build_rented_data(
+    executor_uuid: str,
+    rented_machine: dict | None,
+) -> RentedExecutorsResponse | None:
+    """Convert old rented_machine dict format to RentedExecutorsResponse."""
+    if not rented_machine:
+        return None
 
-    def __init__(self, *, port_maps: list[bytes] | None = None):
-        """
-        Args:
-            port_maps: The port map bytes to return from lrange
-        """
-        self.port_maps = port_maps or []
-        self.lrange_called_with: str | None = None
+    containers = rented_machine.get("containers", [])
+    if not containers:
+        return RentedExecutorsResponse(executors={}, banned_guids=[])
 
-    async def lrange(self, key: str):
-        """Mock lrange for port maps."""
-        self.lrange_called_with = key
-        return self.port_maps
+    pods = [
+        RentedPod(
+            pod_id=c.get("pod_id", "pod-123"),
+            container_name=c.get("name", "container"),
+            rented_ports=[],
+        )
+        for c in containers
+    ]
+
+    executor = RentedExecutor(
+        miner_hotkey="test-miner",
+        executor_ip_address="127.0.0.1",
+        executor_ip_port="22",
+        pods=pods,
+        owner_flag=rented_machine.get("owner_flag", False),
+        rented_ports=[],
+    )
+
+    return RentedExecutorsResponse(
+        executors={executor_uuid: executor},
+        banned_guids=[],
+    )
 
 
 class DummySSHClient:
@@ -101,27 +116,6 @@ class DummySSHClient:
             result.stdout = ""
 
         return result
-
-
-class DummyPortMappingService:
-    """Mock port mapping service."""
-
-    def __init__(self, *, port_count: int = 0, should_raise: bool = False):
-        """
-        Args:
-            port_count: Number of successful ports
-            should_raise: Whether to raise an exception
-        """
-        self.port_count = port_count
-        self.should_raise = should_raise
-        self.get_called_with: str | None = None
-
-    async def get_successful_ports_count(self, executor_uuid: str) -> int:
-        """Mock get_successful_ports_count."""
-        self.get_called_with = executor_uuid
-        if self.should_raise:
-            raise RuntimeError("Port mapping error")
-        return self.port_count
 
 
 class DummyScoreCalculator:
@@ -255,8 +249,10 @@ async def test_tenant_enforcement_check(
     expect_halt,
     context_factory,
 ):
-    # Create mock Redis service (only for port maps now)
-    redis_service = DummyRedisService(port_maps=port_maps)
+    executor_uuid = "executor-123"
+
+    # Build rented_data from old rented_machine format
+    rented_data = build_rented_data(executor_uuid, rented_machine)
 
     # Create mock SSH client
     ssh_client = DummySSHClient(
@@ -264,24 +260,16 @@ async def test_tenant_enforcement_check(
         ssh_keys=ssh_keys,
     )
 
-    # Create mock port mapping service
-    port_mapping_service = DummyPortMappingService(port_count=port_count_db)
-
     # Create mock score calculator
     score_calculator = DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning="")
 
     # Setup services
     services = build_services(
-        redis=redis_service,
-        port_mapping=port_mapping_service,
         score_calculator=score_calculator,
     )
 
     # Setup config
     config = build_context_config()
-
-    # Convert rented_machine to rented_data for state
-    rented_data = convert_rented_machine_to_rented_data(rented_machine)
 
     # Setup state with GPU info and rented_data
     state = build_state(
