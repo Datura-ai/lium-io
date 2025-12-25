@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
-from helpers import build_context_config, build_services, build_state
+from tests.helpers import build_context_config, build_services, build_state
 
 
 # Mock result class matching DockerConnectionCheckResult

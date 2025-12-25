@@ -3,7 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
 from neurons.validators.src.services.task.messages import SpecChangeMessages as Msg
 
-from helpers import build_context_config, build_services, build_state
+from tests.helpers import build_context_config, build_services, build_state
 
 
 @pytest.mark.parametrize(
