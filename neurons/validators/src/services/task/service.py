@@ -84,7 +84,11 @@ class TaskService:
                 )
 
                 # Build and run validation pipeline
-                checks = self.pipeline_factory.build_checks()
+                # Use dry run pipeline if DRY_RUN mode is enabled to avoid state changes
+                if settings.DRY_RUN:
+                    checks = self.pipeline_factory.build_dry_run_checks()
+                else:
+                    checks = self.pipeline_factory.build_checks()
                 pipeline = self.pipeline_factory.build_pipeline(checks)
                 ok, events, last_context = await pipeline.run(base_ctx)
 
@@ -95,7 +99,7 @@ class TaskService:
                 success = False if not ok else last_context.success
 
                 # Handle result using ResultHandler
-                result_handler = ResultHandler(self.redis_service)
+                result_handler = ResultHandler(self.redis_service, dry_run=settings.DRY_RUN)
                 return await result_handler.handle_result(
                     context=last_context,
                     miner_info=miner_info,

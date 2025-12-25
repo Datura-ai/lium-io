@@ -1,5 +1,3 @@
-import logging
-import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -8,8 +6,27 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
+import logging
+import sys
 
-from helpers import make_context
+from tests.helpers import make_context
+
+
+@pytest.fixture(scope="session", autouse=True)
+def setup_sql_logging():
+    """Enable SQL query logging for all tests."""
+    # Configure root logging to show INFO level
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
+
+    # Enable SQLAlchemy engine logging - just set level, let basicConfig handle output
+    sql_logger = logging.getLogger('sqlalchemy.engine')
+    sql_logger.setLevel(logging.INFO)
+
+    # Also enable pool logging for connection monitoring
+    pool_logger = logging.getLogger('sqlalchemy.pool')
+    pool_logger.setLevel(logging.DEBUG)
+
+    print("✅ SQL logging enabled for all tests")
 
 
 @pytest.fixture
@@ -18,18 +35,6 @@ def context_factory():
         return make_context(**overrides)
 
     return _factory
-
-
-@pytest.fixture(scope="session", autouse=True)
-def setup_sql_logging():
-    """Enable SQL query logging for all tests."""
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout, force=True)
-
-    sql_logger = logging.getLogger("sqlalchemy.engine")
-    sql_logger.setLevel(logging.INFO)
-
-    pool_logger = logging.getLogger("sqlalchemy.pool")
-    pool_logger.setLevel(logging.DEBUG)
 
 
 @pytest.fixture
@@ -48,15 +53,17 @@ def mock_redis_service():
     service.lrem = AsyncMock()
     service.lrange = AsyncMock(return_value=[])
     service.rpop = AsyncMock()
+    service.get_rented_machine = AsyncMock(return_value=None)
     return service
 
 
 @pytest.fixture
 def sample_executor_info():
     """Sample ExecutorSSHInfo for testing."""
+    # Create enough ports to avoid the hardcoded 1000 limit in line 349
     port_mappings = [[9000 + i, 9000 + i] for i in range(1005)]
     return ExecutorSSHInfo(
-        uuid="test-executor-123",
+        uuid="550e8400-e29b-41d4-a716-446655440000",  # Valid UUID format
         address="192.168.1.100",
         port=8080,
         ssh_username="root",
@@ -75,6 +82,7 @@ def mock_aiohttp_session():
         session = AsyncMock()
         mock_session_class.return_value.__aenter__.return_value = session
 
+        # Configure default response
         response = AsyncMock()
         response.status = 200
         response.json = AsyncMock(return_value={"status": "ok"})
@@ -89,7 +97,7 @@ async def test_engine():
     """Create an async engine for testing with SQLite in-memory database."""
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
-        echo=True,
+        echo=True,  # Enable SQL query logging
         future=True,
     )
 
@@ -132,7 +140,7 @@ def mock_async_session_maker(test_db_session):
             if exc_type:
                 await self._session.rollback()
 
-    with patch("daos.base.AsyncSessionMaker") as mock_maker:
+    with patch('daos.base.AsyncSessionMaker') as mock_maker:
         mock_maker.return_value = MockContextManager(test_db_session)
         yield mock_maker
 
@@ -141,7 +149,4 @@ def mock_async_session_maker(test_db_session):
 def port_mapping_dao(mock_async_session_maker):
     """Create PortMappingDao for testing with test database."""
     from daos.port_mapping_dao import PortMappingDao
-
     return PortMappingDao()
-
-
