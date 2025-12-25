@@ -5,8 +5,9 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from neurons.validators.src.services.task.checks.port_count import PortCountCheck
 from neurons.validators.src.services.task.messages import PortCountMessages as Msg
+from services.const import MIN_PORT_COUNT
 
-from helpers import build_context_config, build_services, build_state
+from tests.helpers import build_context_config, build_services, build_state
 
 
 @pytest.mark.parametrize(
@@ -24,8 +25,7 @@ async def test_port_count_check_reads_from_state(
     expected_count,
     context_factory,
 ):
-    """Port count should be read from ctx.state.verified_port_count."""
-    # Arrange
+    # PortCountCheck now reads verified_port_count from ctx.state
     services = build_services()
     config = build_context_config()
     state = build_state(verified_port_count=verified_port_count)
