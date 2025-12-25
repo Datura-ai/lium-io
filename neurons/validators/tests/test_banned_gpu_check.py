@@ -4,7 +4,7 @@ from neurons.validators.src.services.task.checks.banned_gpu import BannedGpuChec
 from neurons.validators.src.services.task.messages import BannedGpuMessages as Msg
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
-from helpers import build_context_config, build_services, build_state
+from tests.helpers import build_context_config, build_services, build_state
 
 
 def build_rented_data_with_banned_guids(banned_guids: list[str]) -> RentedExecutorsResponse:
