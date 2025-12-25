@@ -13,242 +13,6 @@ def executor_service(mock_redis_service, port_mapping_dao):
 
 
 # ========================================================================================
-# Tests for get_available_port_maps method
-# ========================================================================================
-
-
-def test_get_available_port_maps_from_mappings(executor_service, sample_executor_info):
-    """Test port extraction from JSON port_mappings."""
-    # Arrange
-    batch_size = 2
-
-    # Act
-    result = executor_service.get_available_port_maps(sample_executor_info, batch_size)
-
-    # Assert
-    # Expect exactly 2 port pairs because batch_size=2 limits the result
-    assert len(result) == 2
-    # Expect all ports to be from sample_executor_info range (9000-10004) and match internal=external
-    for internal_port, external_port in result:
-        assert 9000 <= internal_port <= 10004
-        assert internal_port == external_port
-        # Expect SSH port 22 to be excluded from available ports
-        assert internal_port != 22
-
-
-def test_get_available_port_maps_from_range(executor_service):
-    """Test port generation from port_range string."""
-    # Arrange
-    from datura.requests.miner_requests import ExecutorSSHInfo
-
-    executor_info = ExecutorSSHInfo(
-        uuid="550e8400-e29b-41d4-a716-446655440001",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        port_mappings=None,
-        port_range="9000-9005",
-        python_path="/usr/bin/python3",
-        root_dir="/tmp",
-    )
-    batch_size = 3
-
-    # Act
-    result = executor_service.get_available_port_maps(executor_info, batch_size)
-
-    # Assert
-    # Expect exactly batch_size ports because we requested 3 and have 6 available
-    assert len(result) == batch_size
-    # Expect all ports to be from the specified range 9000-9005
-    valid_ports = {9000, 9001, 9002, 9003, 9004, 9005}
-    for internal_port, external_port in result:
-        # Expect internal and external ports to be identical (no NAT mapping)
-        assert internal_port == external_port
-        # Expect selected ports to be from the specified range
-        assert internal_port in valid_ports
-
-
-def test_get_available_port_maps_default_range(executor_service):
-    """Test fallback to default port range when no mappings or range provided."""
-    # Arrange
-    from datura.requests.miner_requests import ExecutorSSHInfo
-
-    executor_info = ExecutorSSHInfo(
-        uuid="550e8400-e29b-41d4-a716-446655440002",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        port_mappings=None,
-        port_range=None,
-        python_path="/usr/bin/python3",
-        root_dir="/tmp",
-    )
-    batch_size = 5
-
-    # Act
-    result = executor_service.get_available_port_maps(executor_info, batch_size)
-
-    # Assert
-    # Expect exactly batch_size ports because we requested 5
-    assert len(result) == batch_size
-    for internal_port, external_port in result:
-        # Expect ports from default range 20000-65535 when no range specified
-        assert 20000 <= internal_port <= 65535
-        # Expect internal and external ports to be identical
-        assert internal_port == external_port
-        # Expect SSH port 22 to be excluded
-        assert internal_port != 22
-
-
-def test_get_available_port_maps_empty_range(executor_service):
-    """Test fallback to default range when port_range is empty string."""
-    # Arrange
-    from datura.requests.miner_requests import ExecutorSSHInfo
-
-    executor_info = ExecutorSSHInfo(
-        uuid="550e8400-e29b-41d4-a716-446655440003",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        port_mappings=None,
-        port_range="",
-        python_path="/usr/bin/python3",
-        root_dir="/tmp",
-    )
-    batch_size = 5
-
-    # Act
-    result = executor_service.get_available_port_maps(executor_info, batch_size)
-
-    # Assert
-    # Expect exactly batch_size ports
-    assert len(result) == batch_size
-    for internal_port, external_port in result:
-        # Expect default range 20000-65535 when port_range is empty string
-        assert 20000 <= internal_port <= 65535
-
-
-# ========================================================================================
-# Tests for verify_ports method
-# ========================================================================================
-
-
-@pytest.mark.asyncio
-async def test_verify_ports_invalid_json_mappings(executor_service, mock_ssh_client):
-    """Test that verify_ports fails when port_mappings contains invalid JSON."""
-    # Arrange
-    from datura.requests.miner_requests import ExecutorSSHInfo
-
-    executor_info = ExecutorSSHInfo(
-        uuid="550e8400-e29b-41d4-a716-446655440004",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        port_mappings="invalid json",
-        port_range=None,
-        python_path="/usr/bin/python3",
-        root_dir="/tmp",
-    )
-    # Mock SSH cleanup to return empty container list
-    mock_ssh_client.run.return_value.stdout = ""
-
-    # Act
-    result = await executor_service.verify_ports(
-        mock_ssh_client, "job_123", "miner_key", executor_info, "private_key", "public_key"
-    )
-
-    # Assert
-    # Expect failure because invalid JSON will cause json.loads() to fail
-    assert result.success is False
-    # Expect error message about JSON parsing failure
-    assert "Expecting value" in result.log_text or "Verification failed" in result.log_text
-
-
-def test_get_available_port_maps_preferred_ports_priority(executor_service):
-    """Test that preferred ports are prioritized when available in port_range."""
-    # Arrange
-    from datura.requests.miner_requests import ExecutorSSHInfo
-
-    # Create port range that includes some preferred ports (20000-20009 are preferred)
-    executor_info = ExecutorSSHInfo(
-        uuid="550e8400-e29b-41d4-a716-446655440005",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        port_mappings=None,
-        port_range="20000-20090",  # Includes preferred ports 20000-20009
-        python_path="/usr/bin/python3",
-        root_dir="/tmp",
-    )
-    batch_size = 15
-
-    # Act
-    result = executor_service.get_available_port_maps(executor_info, batch_size)
-
-    # Assert
-    # Expect exactly batch_size ports
-    assert len(result) == batch_size
-
-    selected_ports = [port_pair[0] for port_pair in result]
-    preferred_in_range = [port for port in PREFERRED_POD_PORTS if (20000 <= port <= 20090)]
-    preferred_selected = [port for port in selected_ports if port in PREFERRED_POD_PORTS]
-
-    # Expect at least some preferred ports to be selected
-    assert len(preferred_selected) > 0
-
-    # Expect all preferred ports within range to be included (they should be prioritized)
-    for preferred_port in preferred_in_range:
-        assert preferred_port in selected_ports
-
-
-def test_get_available_port_maps_preferred_mappings_priority(executor_service):
-    """Test that preferred port mappings are prioritized from JSON mappings."""
-    # Arrange
-    from datura.requests.miner_requests import ExecutorSSHInfo
-    import json
-
-    # Create mappings with preferred (20000-20009) and non-preferred ports
-    port_mappings = [
-        [20000, 20000],  # Preferred port
-        [20001, 20001],  # Preferred port
-        [9000, 9000],  # Non-preferred
-        [9001, 9001],  # Non-preferred
-        [9002, 9002],  # Non-preferred
-    ]
-
-    executor_info = ExecutorSSHInfo(
-        uuid="550e8400-e29b-41d4-a716-446655440006",
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=22,
-        port_mappings=json.dumps(port_mappings),
-        port_range=None,
-        python_path="/usr/bin/python3",
-        root_dir="/tmp",
-    )
-    batch_size = 3
-
-    # Act
-    result = executor_service.get_available_port_maps(executor_info, batch_size)
-
-    # Assert
-    # Expect exactly batch_size ports
-    assert len(result) == batch_size
-
-    selected_ports = [port_pair[0] for port_pair in result]
-
-    # Expect preferred ports 20000 and 20001 to be included because they are prioritized
-    assert 20000 in selected_ports
-    assert 20001 in selected_ports
-
-
-# ========================================================================================
 # Tests for cleanup_docker_containers method
 # ========================================================================================
 
@@ -265,7 +29,7 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client, samp
     ]
 
     # Act
-    await executor_service.cleanup_docker_containers(mock_ssh_client, sample_executor_info, {})
+    await executor_service.cleanup_docker_containers(mock_ssh_client, sample_executor_info, [])
 
     # Assert
     # Expect 3 SSH commands: list, rm, prune
@@ -368,19 +132,17 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
     miner_hotkey = "test_miner"
     private_key = "test_private_key"
     public_key = "test_public_key"
+    rented_ports = [8000, 8001]
+    rented_pod_names = ["pod_1", "pod_2"]
 
     # Mock all methods in the verification flow
-    port_maps = [(9000, 9000), (9001, 9001), (9002, 9002)]
     successful_bulk_ports = [(9001, 9001), (9002, 9002)]
     failed_bulk_ports = []
-    dind_port = (9000, 9000)
 
     with patch.object(executor_service, 'cleanup_docker_containers', new=AsyncMock()) as mock_cleanup, \
-         patch.object(executor_service, 'get_available_port_maps', return_value=port_maps) as mock_get_ports, \
          patch.object(executor_service, 'verify_ports_bulk', new=AsyncMock(return_value=(successful_bulk_ports, failed_bulk_ports))) as mock_bulk, \
          patch.object(executor_service, 'verify_port_dind', new=AsyncMock(return_value=DockerConnectionCheckResult(success=True, log_text="dind ok", sysbox_runtime=False))) as mock_dind, \
-         patch.object(executor_service, 'save_to_db', new=AsyncMock()) as mock_save_db, \
-         patch.object(executor_service.port_mapping_dao, 'get_busy_external_ports', new=AsyncMock(return_value=set())) as mock_get_busy_ports:
+         patch.object(executor_service, 'save_to_db', new=AsyncMock()) as mock_save_db:
 
         # Act
         result = await executor_service.verify_ports(
@@ -390,6 +152,8 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
             sample_executor_info,
             private_key,
             public_key,
+            rented_ports=rented_ports,
+            rented_pod_names=rented_pod_names,
         )
 
         # Assert
@@ -399,18 +163,17 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert "verification complete" in result.log_text
         assert "available" in result.log_text
 
-        # Expect cleanup was called first with ssh_client, executor_info, and extra dict
+        # Expect cleanup was called first with ssh_client, executor_info, pod_names, and extra dict
         mock_cleanup.assert_called_once()
         cleanup_args = mock_cleanup.call_args
         assert cleanup_args[0][0] == mock_ssh_client
         assert cleanup_args[0][1] == sample_executor_info
-        # Expect extra dict contains job metadata
-        assert "job_batch_id" in cleanup_args[0][2]
-        assert "miner_hotkey" in cleanup_args[0][2]
-
-        # Expect get_available_port_maps was called with correct batch size and rented ports
-        from services.const import BATCH_PORT_VERIFICATION_SIZE
-        mock_get_ports.assert_called_once_with(sample_executor_info, BATCH_PORT_VERIFICATION_SIZE, set())
+        # Third argument is pod_names list
+        assert cleanup_args[0][2] == rented_pod_names
+        # Fourth argument (extra dict) contains job metadata
+        extra_dict = cleanup_args[0][3]
+        assert "job_batch_id" in extra_dict
+        assert "miner_hotkey" in extra_dict
 
         # Expect verify_ports_bulk was called
         mock_bulk.assert_called_once()
