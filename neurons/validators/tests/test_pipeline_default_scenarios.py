@@ -8,6 +8,7 @@ complete validation flow.
 import pytest
 from unittest.mock import Mock
 
+from datura.requests.miner_requests import ExecutorSSHInfo
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
 from neurons.validators.src.services.task.pipeline import Pipeline, LoggerSink
 from neurons.validators.src.services.task.checks import (
@@ -31,8 +32,32 @@ from neurons.validators.src.services.task.checks import (
     UploadFilesCheck,
     VerifyXCheck,
 )
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
 
 from tests.helpers import build_context_config, build_services, build_state
+
+
+def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
+    """Create a real ExecutorSSHInfo for tests."""
+    return ExecutorSSHInfo(
+        uuid=uuid,
+        address="192.168.1.100",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+
+
+class DummyKeypair:
+    """Keypair that can be serialized (unlike Mock)."""
+
+    def __init__(self):
+        self.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+    def sign(self, data: bytes) -> bytes:
+        return b"\x00" * 64
 
 
 class DummyLogger:
@@ -188,30 +213,41 @@ class DummyValidationService:
         )
 
 
-class DummyVerifyXService:
-    """Mock VerifyX validation service."""
+class VerifyXResult:
+    """Result from VerifyX validation (serializable)."""
 
-    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
-        result = Mock()
-        result.data = {
+    def __init__(self):
+        self.data = {
             "success": True,
             "ram": 128000,
             "hard_disk": 1000000,
             "network": {"download_speed": 10000},
         }
-        result.error = None
-        return result
+        self.error = None
+
+
+class DummyVerifyXService:
+    """Mock VerifyX validation service."""
+
+    async def validate_verifyx_and_process_job(self, *, shell, executor_info, default_extra, machine_spec):
+        return VerifyXResult()
+
+
+class ConnectivityResult:
+    """Result from port connectivity check (serializable)."""
+
+    def __init__(self, sysbox_runtime: bool = True):
+        self.success = True
+        self.sysbox_runtime = sysbox_runtime
+        self.log_text = "Port connectivity verified"
+        self.verified_port_count = 10
 
 
 class DummyConnectivityService:
     """Mock executor connectivity service."""
 
     async def verify_ports(self, *args, **kwargs):
-        result = Mock()
-        result.success = True
-        result.sysbox_runtime = kwargs.get("sysbox_runtime", True)
-        result.log_text = "Port connectivity verified"
-        return result
+        return ConnectivityResult(kwargs.get("sysbox_runtime", True))
 
 
 class DummyPortMappingService:
@@ -239,16 +275,11 @@ async def test_successful_unrented_pipeline_flow(context_factory):
 
     Use this as a template for testing your own scenarios.
     """
-    # Setup mock keypair
-    mock_keypair = Mock()
-    mock_keypair.sign.return_value = b"\x00" * 64
-    mock_keypair.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    # Setup keypair (not Mock - to avoid Pydantic serialization issues)
+    keypair = DummyKeypair()
 
-    # Setup mock executor
-    mock_executor = Mock()
-    mock_executor.uuid = "executor-123"
-    mock_executor.root_dir = "/root/app"
-    mock_executor.python_path = "/usr/bin/python3"
+    # Setup real executor (not Mock - to avoid Pydantic serialization issues)
+    executor = make_executor("executor-123")
 
     # Create encrypted payload
     encrypted_payload = "encrypted_machine_specs_here"
@@ -278,7 +309,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
 
     # Setup config with all required fields
     config = build_context_config(
-        validator_keypair=mock_keypair,
+        validator_keypair=keypair,
         compute_rest_app_url="http://validator:8000",
         gpu_monitor_script_relative="src/gpus_utility.py",
         machine_scrape_filename="scrape.sh",
@@ -294,14 +325,16 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         job_batch_id="batch-123",
     )
 
-    # Setup state
+    # Setup state with rented_data (not rented = empty executors)
+    rented_data = RentedExecutorsResponse(executors={}, banned_guids=[])
     state = build_state(
         upload_local_dir="/tmp/validator/files",
+        rented_data=rented_data,
     )
 
     # Create context
     ctx = context_factory(
-        executor=mock_executor,
+        executor=executor,
         miner_hotkey="miner-hotkey-123",
         ssh=ssh_client,
         runner=runner,
@@ -391,16 +424,13 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
     Note: Remaining checks (GpuUsage, PortConnectivity, etc.) don't run.
     """
-    # Setup mock keypair
-    mock_keypair = Mock()
-    mock_keypair.sign.return_value = b"\x00" * 64
-    mock_keypair.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+    executor_uuid = "executor-123"
 
-    # Setup mock executor
-    mock_executor = Mock()
-    mock_executor.uuid = "executor-123"
-    mock_executor.root_dir = "/root/app"
-    mock_executor.python_path = "/usr/bin/python3"
+    # Setup keypair (not Mock - to avoid Pydantic serialization issues)
+    keypair = DummyKeypair()
+
+    # Setup real executor (not Mock - to avoid Pydantic serialization issues)
+    executor = make_executor(executor_uuid)
 
     # Setup SSH client that returns rented container info
     class RentedSSHClient:
@@ -432,29 +462,30 @@ async def test_successful_rented_pipeline_flow(context_factory):
     # Setup SSH service
     ssh_service = DummySSHService()
 
-    # Setup Redis service that returns rental info
-    class RentedRedisService:
-        async def get_rented_machine(self, executor):
-            return {
-                "containers": [{"name": "tenant-container-123", "pod_id": "pod-123"}],
-                "owner_flag": False,
-            }
-
-        async def lrange(self, key: str):
-            return []
-
-        async def get_banned_guids(self):
-            return set()  # No banned GPUs
-
-        async def is_elem_exists_in_set(self, set_name: str, value: str):
-            return False  # Not a duplicate
-
-        async def renting_in_progress(self, miner_hotkey: str, executor_uuid: str):
-            return False  # Not renting in progress
+    # Build rented_data for this executor
+    rented_data = RentedExecutorsResponse(
+        executors={
+            executor_uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey-123",
+                executor_ip_address="192.168.1.100",
+                executor_ip_port="8080",
+                pods=[
+                    RentedPod(
+                        pod_id="pod-123",
+                        container_name="tenant-container-123",
+                        rented_ports=[],
+                    )
+                ],
+                owner_flag=False,
+                rented_ports=[],
+            )
+        },
+        banned_guids=[],
+    )
 
     # Create runner and other services
     runner = DummySSHCommandRunner()
-    redis_service = RentedRedisService()
+    redis_service = DummyRedisService()
     collateral_service = DummyCollateralService()
     port_mapping_service = DummyPortMappingService()
 
@@ -469,7 +500,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
     # Setup config
     config = build_context_config(
-        validator_keypair=mock_keypair,
+        validator_keypair=keypair,
         compute_rest_app_url="http://validator:8000",
         gpu_monitor_script_relative="src/gpus_utility.py",
         machine_scrape_filename="scrape.sh",
@@ -480,7 +511,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
         nvml_digest_map={"535.104.05": "expected_digest_for_535.104.05"},
     )
 
-    # Setup state with GPU processes in the correct container
+    # Setup state with GPU processes in the correct container and rented_data
     state = build_state(
         upload_local_dir="/tmp/validator/files",
         gpu_processes=[
@@ -489,11 +520,12 @@ async def test_successful_rented_pipeline_flow(context_factory):
         gpu_details=[
             {"gpu_utilization": 50, "memory_utilization": 60}
         ],
+        rented_data=rented_data,
     )
 
     # Create context
     ctx = context_factory(
-        executor=mock_executor,
+        executor=executor,
         miner_hotkey="miner-hotkey-123",
         ssh=ssh_client,
         runner=runner,
