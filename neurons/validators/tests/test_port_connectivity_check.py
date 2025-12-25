@@ -1,5 +1,5 @@
 import pytest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
@@ -14,6 +14,7 @@ class MockConnectivityResult:
     log_text: str | None = None
     sysbox_runtime: bool = False
     verified_port_count: int = 0
+    verified_ports: list[int] = field(default_factory=list)
 
 
 # Mock Redis service
@@ -76,6 +77,7 @@ class DummyConnectivityService:
             log_text=self.log_text,
             sysbox_runtime=self.sysbox_runtime,
             verified_port_count=self.verified_port_count,
+            verified_ports=list(range(20000, 20000 + self.verified_port_count)),
         )
 
 

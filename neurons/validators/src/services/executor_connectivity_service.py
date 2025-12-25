@@ -35,6 +35,7 @@ class DockerConnectionCheckResult(BaseModel):
     log_text: str | None = None
     sysbox_runtime: bool
     verified_port_count: int = 0
+    verified_ports: list[int] = []
 
 
 class ExecutorConnectivityService:
@@ -138,7 +139,6 @@ class ExecutorConnectivityService:
                     success=False,
                     log_text=failure_msg,
                     sysbox_runtime=sysbox_runtime,
-                    verified_port_count=0,
                 )
 
             # TODO(stage2): Remove save_to_db call - backend will be source of truth for verified ports
@@ -159,11 +159,13 @@ class ExecutorConnectivityService:
                 success_msg += f" fail={len(failed_ports)}{failed_sample}"
             logger.info(_m(success_msg, extra))
 
+            verified_external_ports = [external_port for _, external_port in successful_ports]
             return DockerConnectionCheckResult(
                 success=True,
                 log_text=success_msg,
                 sysbox_runtime=sysbox_runtime,
                 verified_port_count=verified_port_count,
+                verified_ports=verified_external_ports,
             )
         except Exception as e:
             logger.error(

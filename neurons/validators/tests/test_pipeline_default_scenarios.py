@@ -241,6 +241,7 @@ class ConnectivityResult:
         self.sysbox_runtime = sysbox_runtime
         self.log_text = "Port connectivity verified"
         self.verified_port_count = 10
+        self.verified_ports = list(range(20000, 20000 + self.verified_port_count))
 
 
 class DummyConnectivityService:

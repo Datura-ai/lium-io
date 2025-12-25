@@ -70,6 +70,7 @@ class PortConnectivityCheck:
             specs={
                 **ctx.state.specs,
                 "sysbox_runtime": result.sysbox_runtime,
+                "verified_ports": result.verified_ports,
             },
             sysbox_runtime=result.sysbox_runtime,
             verified_port_count=result.verified_port_count,
