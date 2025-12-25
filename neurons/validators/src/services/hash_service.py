@@ -208,8 +208,10 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    cmd = f"python src/miner_jobs/score.py '{hash_service.payload}'"
-    result = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+    # Use shlex.split to safely parse command and prevent command injection
+    import shlex
+    cmd = ["python", "src/miner_jobs/score.py", hash_service.payload]
+    result = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
     end_time = time.time()
     print('result ===>', result)
     print(end_time - start_time)

@@ -1,5 +1,6 @@
 import logging
 import subprocess
+import shlex
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -9,7 +10,12 @@ plugin_name = "s3fs-restore"
 
 
 def run_command(command):
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    # Use shlex.split to safely parse command string and prevent command injection
+    if isinstance(command, str):
+        cmd_list = shlex.split(command)
+    else:
+        cmd_list = command
+    result = subprocess.run(cmd_list, shell=False, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"Command failed: {command}")
         logger.error(f"stdout: {result.stdout}")
@@ -46,17 +52,26 @@ def pull_aws_cli():
 def aws_restore(args):
     # aws s3 cp s3://$BUCKET_NAME/backups/my-folder-2025-09-02.tar.gz - \
     # | tar -xzpf - -C $RESTORE_PATH
-    command = (
-        "docker run --rm "
-        f"-v {args.target_volume}:{args.target_volume_path} "
-        f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
-        f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
-        f"-e AWS_DEFAULT_REGION=us-east-1 "
-        "--entrypoint sh "
-        "daturaai/aws-cli  -lc "
-        f'"aws s3 cp s3://{args.backup_volume_name}/{args.backup_source_path} - '
-        f'| tar --xattrs --acls -xzpf - -C {args.restore_path} --strip-components=1 "'
-    )
+    # Use shlex.quote to safely escape all user inputs to prevent command injection
+    target_volume_quoted = shlex.quote(args.target_volume)
+    target_volume_path_quoted = shlex.quote(args.target_volume_path)
+    access_key_quoted = shlex.quote(args.backup_volume_iam_user_access_key)
+    secret_key_quoted = shlex.quote(args.backup_volume_iam_user_secret_key)
+    backup_volume_name_quoted = shlex.quote(args.backup_volume_name)
+    backup_source_path_quoted = shlex.quote(args.backup_source_path)
+    restore_path_quoted = shlex.quote(args.restore_path)
+    
+    # Build command as a list to avoid shell injection
+    command = [
+        "docker", "run", "--rm",
+        "-v", f"{target_volume_quoted}:{target_volume_path_quoted}",
+        "-e", f"AWS_ACCESS_KEY_ID={access_key_quoted}",
+        "-e", f"AWS_SECRET_ACCESS_KEY={secret_key_quoted}",
+        "-e", "AWS_DEFAULT_REGION=us-east-1",
+        "--entrypoint", "sh",
+        "daturaai/aws-cli", "-lc",
+        f"aws s3 cp s3://{backup_volume_name_quoted}/{backup_source_path_quoted} - | tar --xattrs --acls -xzpf - -C {restore_path_quoted} --strip-components=1"
+    ]
     run_command(command)
 
 

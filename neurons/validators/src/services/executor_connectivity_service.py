@@ -536,11 +536,15 @@ echo "Batch {idx}: completed" >&2
         try:
             logger.info(_m(f"dind: start docker port={internal_port}", extra))
 
-            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo \"{public_key}\" >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
+            # Use shlex.quote to safely escape public_key and container_name to prevent command injection
+            import shlex
+            public_key_quoted = shlex.quote(public_key)
+            container_name_quoted = shlex.quote(container_name)
+            docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo {public_key_quoted} >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"
             command = (
                 f"/usr/bin/docker run -d "
                 f'{"--runtime=sysbox-runc " if sysbox_runtime else ""}'
-                f"--name {container_name} --gpus all "
+                f"--name {container_name_quoted} --gpus all "
                 f"-p {internal_port}:22 "
                 f"{DOCKER_DIND_IMAGE} "
                 f"{docker_cmd}"

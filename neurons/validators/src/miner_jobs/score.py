@@ -34,10 +34,30 @@ def run_hashcat(device_id: int, job: dict) -> list[str]:
             os.fsync(payload_file.fileno())
 
             if not os.path.exists(f"/usr/bin/hashcat{device_id}"):
-                subprocess.check_output(f"cp /usr/bin/hashcat /usr/bin/hashcat{device_id}", shell=True)
+                # Use list form instead of shell=True to prevent command injection
+                subprocess.check_output(["cp", "/usr/bin/hashcat", f"/usr/bin/hashcat{device_id}"])
 
-            cmd = f'hashcat{device_id} --session=hashcat{device_id} --potfile-disable --restore-disable --attack-mode 3 -d {device_id} --workload-profile 3 --optimized-kernel-enable --hash-type {algorithm} --hex-salt -1 "?l?d?u" --outfile-format 2 --quiet --hwmon-disable {payload_file.name} "{mask}"'
-            stdout = subprocess.check_output(cmd, shell=True, text=True)
+            # Use list form instead of shell=True to prevent command injection
+            # Note: mask may contain special characters, so we pass it as a separate argument
+            cmd = [
+                f'hashcat{device_id}',
+                f'--session=hashcat{device_id}',
+                '--potfile-disable',
+                '--restore-disable',
+                '--attack-mode', '3',
+                '-d', str(device_id),
+                '--workload-profile', '3',
+                '--optimized-kernel-enable',
+                '--hash-type', str(algorithm),
+                '--hex-salt',
+                '-1', '?l?d?u',
+                '--outfile-format', '2',
+                '--quiet',
+                '--hwmon-disable',
+                payload_file.name,
+                mask
+            ]
+            stdout = subprocess.check_output(cmd, text=True)
             if stdout:
                 passwords = [p for p in sorted(stdout.split("\n")) if p != ""]
                 answers.append(passwords)

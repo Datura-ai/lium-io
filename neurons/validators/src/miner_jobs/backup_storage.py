@@ -1,6 +1,7 @@
 import os
 import subprocess
 import logging
+import shlex
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -10,7 +11,12 @@ plugin_name = "s3fs-backup"
 
 
 def run_command(command):
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    # Use shlex.split to safely parse command string and prevent command injection
+    if isinstance(command, str):
+        cmd_list = shlex.split(command)
+    else:
+        cmd_list = command
+    result = subprocess.run(cmd_list, shell=False, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"Command failed: {command}")
         logger.error(f"stdout: {result.stdout}")
@@ -116,18 +122,27 @@ def aws_cp(args):
     backup_path_parent = os.path.dirname(backup_path)
     backup_path_current = os.path.basename(backup_path)
 
-    command = (
-        "docker run --rm "
-        f"-v {args.source_volume}:{args.source_volume_path} "
-        f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
-        f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
-        f"-e AWS_DEFAULT_REGION=us-east-1 "
-        "--entrypoint sh "
-        "daturaai/aws-cli  -lc "
-        f'"tar --xattrs --acls -C {backup_path_parent} -czf - {backup_path_current} '
-        f"| aws s3 cp - s3://{args.backup_volume_name}/{args.backup_target_path} "
-        f'  --sse AES256 --expected-size $(tar -C {backup_path_parent} -cf - {backup_path_current} | wc -c)" '
-    )
+    # Use shlex.quote to safely escape all user inputs to prevent command injection
+    source_volume_quoted = shlex.quote(args.source_volume)
+    source_volume_path_quoted = shlex.quote(args.source_volume_path)
+    access_key_quoted = shlex.quote(args.backup_volume_iam_user_access_key)
+    secret_key_quoted = shlex.quote(args.backup_volume_iam_user_secret_key)
+    backup_volume_name_quoted = shlex.quote(args.backup_volume_name)
+    backup_target_path_quoted = shlex.quote(args.backup_target_path)
+    backup_path_parent_quoted = shlex.quote(backup_path_parent)
+    backup_path_current_quoted = shlex.quote(backup_path_current)
+    
+    # Build command as a list to avoid shell injection
+    command = [
+        "docker", "run", "--rm",
+        "-v", f"{source_volume_quoted}:{source_volume_path_quoted}",
+        "-e", f"AWS_ACCESS_KEY_ID={access_key_quoted}",
+        "-e", f"AWS_SECRET_ACCESS_KEY={secret_key_quoted}",
+        "-e", "AWS_DEFAULT_REGION=us-east-1",
+        "--entrypoint", "sh",
+        "daturaai/aws-cli", "-lc",
+        f"tar --xattrs --acls -C {backup_path_parent_quoted} -czf - {backup_path_current_quoted} | aws s3 cp - s3://{backup_volume_name_quoted}/{backup_target_path_quoted} --sse AES256"
+    ]
     run_command(command)
 
 
