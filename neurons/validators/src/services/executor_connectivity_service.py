@@ -414,6 +414,7 @@ sleep 60
                     return [], port_maps
 
             except Exception as e:
+
                 logger.error(_m(f"port verification attempt {attempt} failed: {e}", extra), exc_info=True)
                 await self._cleanup_port_test_container(ssh_client, container_name)
 
