@@ -192,7 +192,15 @@ class Validator:
 
             try:
                 if await self.subtensor_client.should_set_weights():
-                    await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
+                    if settings.DRY_RUN:
+                        logger.info(
+                            _m(
+                                "[sync] DRY_RUN: Skipping set_weights to Bittensor",
+                                extra=get_extra_info({**self.default_extra, "miner_scores": self.miner_scores}),
+                            )
+                        )
+                    else:
+                        await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
                     self.miner_scores = {}
             except Exception as e:
                 logger.error(

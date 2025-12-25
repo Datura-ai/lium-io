@@ -220,6 +220,44 @@ class PipelineFactory:
             ],
         )
 
+    @staticmethod
+    def build_dry_run_checks() -> list[Check]:
+        """Build a dry run validation pipeline that excludes state-changing checks.
+
+        This pipeline skips checks that would modify executor state or interfere with
+        production operations:
+        - StartGPUMonitorCheck: Would start processes on the executor
+        - UploadFilesCheck: Would upload files to the executor
+        - PortConnectivityCheck: Would perform connectivity tests that could affect production
+
+        Returns:
+            Ordered list of validation checks safe for dry run mode
+        """
+        return cast(
+            list[Check],
+            [
+                # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
+                UploadFilesCheck(),
+                MachineSpecScrapeCheck(),
+                GpuCountCheck(),
+                GpuModelValidCheck(),
+                NvmlDigestCheck(),
+                SpecChangeCheck(),
+                GpuFingerprintCheck(),
+                BannedGpuCheck(),
+                DuplicateExecutorCheck(),
+                CollateralCheck(),
+                # PortConnectivityCheck(), # SKIP: Port connectivity tests could affect production
+                PortCountCheck(),
+                TenantEnforcementCheck(),
+                GpuUsageCheck(),
+                # VerifyXCheck(),
+                CapabilityCheck(),
+                ScoreCheck(),
+                FinalizeCheck(),
+            ],
+        )
+
     def build_pipeline(self, checks: list[Check]) -> Pipeline:
         """Build a pipeline with the given checks.
 
