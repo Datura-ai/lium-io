@@ -43,6 +43,8 @@ class CustomOptions(BaseModel):
             initial_port_count=custom_options.initial_port_count,
             startup_commands=custom_options.startup_commands,
             shm_size=shm_size,
+            docker_port_pairs=custom_options.docker_port_pairs,
+            jupyter_port_pair=custom_options.jupyter_port_pair
         )
 
     @staticmethod
