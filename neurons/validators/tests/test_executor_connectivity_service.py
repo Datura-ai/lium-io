@@ -42,7 +42,7 @@ def test_get_available_port_maps_from_range(executor_service):
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440001",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -75,7 +75,7 @@ def test_get_available_port_maps_default_range(executor_service):
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440002",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -108,7 +108,7 @@ def test_get_available_port_maps_empty_range(executor_service):
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440003",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -143,7 +143,7 @@ async def test_verify_ports_invalid_json_mappings(executor_service, mock_ssh_cli
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440004",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -175,7 +175,7 @@ def test_get_available_port_maps_preferred_ports_priority(executor_service):
 
     # Create port range that includes some preferred ports (20000-20009 are preferred)
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440005",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -222,7 +222,7 @@ def test_get_available_port_maps_preferred_mappings_priority(executor_service):
     ]
 
     executor_info = ExecutorSSHInfo(
-        uuid="test",
+        uuid="550e8400-e29b-41d4-a716-446655440006",
         address="127.0.0.1",
         port=8080,
         ssh_username="root",
@@ -254,18 +254,18 @@ def test_get_available_port_maps_preferred_mappings_priority(executor_service):
 
 
 @pytest.mark.asyncio
-async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
+async def test_cleanup_docker_containers(executor_service, mock_ssh_client, sample_executor_info):
     """Test cleanup of Docker containers with 'container_' prefix."""
     # Arrange
-    # Mock responses: 1) list containers command, 2) rm command, 3) prune command
+    # Mock responses: 1) list containers command (only returns containers matching filter), 2) rm command, 3) prune command
     mock_ssh_client.run.side_effect = [
-        AsyncMock(stdout="container_test1\ncontainer_test2\nexecutor-executor-1", exit_status=0),
+        AsyncMock(stdout="container_test1\ncontainer_test2", exit_status=0),  # Only containers with 'container_' prefix
         AsyncMock(stdout="", exit_status=0),  # docker rm response
         AsyncMock(stdout="", exit_status=0),  # docker volume prune response
     ]
 
     # Act
-    await executor_service.cleanup_docker_containers(mock_ssh_client)
+    await executor_service.cleanup_docker_containers(mock_ssh_client, sample_executor_info, {})
 
     # Assert
     # Expect 3 SSH commands: list, rm, prune
@@ -275,8 +275,8 @@ async def test_cleanup_docker_containers(executor_service, mock_ssh_client):
 
     # Expect first call to list containers with name filter
     assert "docker ps" in all_calls[0]
-    # Expect second call to remove found containers
-    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1] and "executor-executor-1" not in all_calls[1]
+    # Expect second call to remove found containers (both with container_ prefix)
+    assert "docker rm" in all_calls[1] and "container_test1" in all_calls[1] and "container_test2" in all_calls[1]
     # Expect third call to prune volumes
     assert "docker volume prune" in all_calls[2]
 
@@ -309,7 +309,8 @@ async def test_verify_port_dind_successful_connection(executor_service, mock_ssh
     mock_container_ssh = AsyncMock()
 
     with patch('asyncssh.import_private_key', return_value=mock_pkey) as mock_import_key, \
-         patch('asyncssh.connect') as mock_connect:
+         patch('asyncssh.connect') as mock_connect, \
+         patch('asyncio.sleep', new=AsyncMock()) as mock_sleep:
 
         # Setup asyncssh.connect as async context manager
         mock_connect.return_value.__aenter__.return_value = mock_container_ssh
@@ -398,13 +399,14 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert "verification complete" in result.log_text
         assert "available" in result.log_text
 
-        # Expect cleanup was called first with ssh_client and extra dict
+        # Expect cleanup was called first with ssh_client, executor_info, and extra dict
         mock_cleanup.assert_called_once()
         cleanup_args = mock_cleanup.call_args
         assert cleanup_args[0][0] == mock_ssh_client
+        assert cleanup_args[0][1] == sample_executor_info
         # Expect extra dict contains job metadata
-        assert "job_batch_id" in cleanup_args[0][1]
-        assert "miner_hotkey" in cleanup_args[0][1]
+        assert "job_batch_id" in cleanup_args[0][2]
+        assert "miner_hotkey" in cleanup_args[0][2]
 
         # Expect get_available_port_maps was called with correct batch size and rented ports
         from services.const import BATCH_PORT_VERIFICATION_SIZE
@@ -431,3 +433,195 @@ async def test_verify_ports_successful_flow(executor_service, mock_ssh_client, s
         assert len(db_successful_ports) == 2
         # Expect 0 failed ports because all verifications succeeded
         assert len(db_failed_ports) == 0
+
+
+# ========================================================================================
+# Tests for verify_ports_bulk helper methods
+# ========================================================================================
+
+
+def test_build_netcat_script(executor_service):
+    """Test netcat script generation - pure function, no mocking needed!"""
+    port_maps = [(9000, 9000), (9001, 9001)]
+    token = "abc123"
+
+    script = executor_service._build_netcat_script(port_maps, token)
+
+    # Verify script contains token
+    assert token in script
+    # Verify script contains all ports
+    assert "9000" in script
+    assert "9001" in script
+    # Verify script has batch structure
+    assert "Batch" in script
+    assert "nc -l -p" in script
+
+
+@pytest.mark.asyncio
+async def test_start_port_test_container_success(executor_service, mock_ssh_client):
+    """Test container starts successfully."""
+    from unittest.mock import patch
+
+    mock_ssh_client.run.side_effect = [
+        AsyncMock(exit_status=0, stdout="container_abc12345\n"),  # docker run
+        AsyncMock(exit_status=0, stdout="Up 2 seconds"),  # docker ps
+    ]
+
+    with patch('asyncio.sleep', new=AsyncMock()):
+        result = await executor_service._start_port_test_container(
+            mock_ssh_client, "port_test_abc12345", "echo 'test'", {}
+        )
+
+    assert result is True
+    assert "docker.io/library/alpine:3.19" in mock_ssh_client.run.call_args_list[0][0][0]
+
+
+@pytest.mark.asyncio
+async def test_start_port_test_container_fails_to_start(executor_service, mock_ssh_client):
+    """Test container fails to start."""
+    mock_ssh_client.run.return_value = AsyncMock(exit_status=1, stderr="Error: unable to start")
+
+    result = await executor_service._start_port_test_container(
+        mock_ssh_client, "port_test_fail", "echo 'test'", {}
+    )
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_start_port_test_container_exits_immediately(executor_service, mock_ssh_client):
+    """Test container starts but exits immediately."""
+    from unittest.mock import patch
+
+    mock_ssh_client.run.side_effect = [
+        AsyncMock(exit_status=0, stdout="container_dead\n"),  # docker run
+        AsyncMock(exit_status=0, stdout=""),  # docker ps (empty = not running)
+        AsyncMock(exit_status=0, stdout="Error: nc failed"),  # docker logs
+    ]
+
+    with patch('asyncio.sleep', new=AsyncMock()):
+        result = await executor_service._start_port_test_container(
+            mock_ssh_client, "port_test_dead", "echo 'test'", {}
+        )
+
+    assert result is False
+    assert "docker logs" in mock_ssh_client.run.call_args_list[2][0][0]
+
+
+@pytest.mark.asyncio
+async def test_test_ports_in_batches_all_success(executor_service):
+    """Test port testing with all ports successful."""
+    from unittest.mock import patch
+
+    port_maps = [(9000, 9000), (9001, 9001)]
+    token = "test123"
+
+    # Mock the HTTP session
+    async def mock_test_port(session, host, int_port, ext_port, tok, extra):
+        return True  # All succeed
+
+    with patch.object(executor_service, '_test_single_port_with_session', side_effect=mock_test_port), \
+         patch('asyncio.sleep', new=AsyncMock()):
+
+        successful, failed = await executor_service._test_ports_in_batches(
+            port_maps, "192.168.1.1", token, {}
+        )
+
+    assert successful == port_maps
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_test_ports_in_batches_mixed_results(executor_service):
+    """Test port testing with mixed success/failure."""
+    from unittest.mock import patch
+
+    port_maps = [(9000, 9000), (9001, 9001), (9002, 9002)]
+    token = "test456"
+
+    # Mock: first port succeeds, others fail
+    call_count = 0
+    async def mock_test_port(session, host, int_port, ext_port, tok, extra):
+        nonlocal call_count
+        call_count += 1
+        return call_count == 1  # Only first call succeeds
+
+    with patch.object(executor_service, '_test_single_port_with_session', side_effect=mock_test_port), \
+         patch('asyncio.sleep', new=AsyncMock()):
+
+        successful, failed = await executor_service._test_ports_in_batches(
+            port_maps, "192.168.1.1", token, {}
+        )
+
+    assert successful == [(9000, 9000)]
+    assert failed == [(9001, 9001), (9002, 9002)]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_port_test_container(executor_service, mock_ssh_client):
+    """Test container cleanup."""
+    await executor_service._cleanup_port_test_container(mock_ssh_client, "port_test_xyz")
+
+    assert mock_ssh_client.run.called
+    assert "docker rm -f port_test_xyz" in mock_ssh_client.run.call_args[0][0]
+
+
+# ========================================================================================
+# Integration tests for verify_ports_bulk
+# ========================================================================================
+
+
+@pytest.mark.asyncio
+async def test_verify_ports_bulk_integration_success(executor_service, sample_executor_info):
+    """Test full verify_ports_bulk flow by mocking only the helper methods."""
+    from unittest.mock import patch, AsyncMock
+
+    port_maps = [(9000, 9000), (9001, 9001)]
+
+    # Mock helper methods (not internals!)
+    with patch.object(executor_service, '_build_netcat_script', return_value="mock_script"), \
+         patch.object(executor_service, '_start_port_test_container', return_value=True), \
+         patch.object(executor_service, '_test_ports_in_batches', return_value=(port_maps, [])), \
+         patch.object(executor_service, '_cleanup_port_test_container', new=AsyncMock()), \
+         patch('uuid.uuid4') as mock_uuid:
+
+        mock_uuid.return_value.hex = "testtoken123"
+
+        successful, failed = await executor_service.verify_ports_bulk(
+            AsyncMock(), port_maps, sample_executor_info, {}
+        )
+
+    assert successful == port_maps
+    assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_verify_ports_bulk_integration_container_fails(executor_service, sample_executor_info):
+    """Test verify_ports_bulk when container fails to start."""
+    from unittest.mock import patch, AsyncMock
+
+    port_maps = [(9000, 9000)]
+
+    with patch.object(executor_service, '_build_netcat_script', return_value="mock_script"), \
+         patch.object(executor_service, '_start_port_test_container', return_value=False), \
+         patch('uuid.uuid4') as mock_uuid:
+
+        mock_uuid.return_value.hex = "failtoken"
+
+        successful, failed = await executor_service.verify_ports_bulk(
+            AsyncMock(), port_maps, sample_executor_info, {}
+        )
+
+    assert successful == []
+    assert failed == port_maps
+
+
+@pytest.mark.asyncio
+async def test_verify_ports_bulk_empty_ports(executor_service, sample_executor_info):
+    """Test verify_ports_bulk with empty port list."""
+    successful, failed = await executor_service.verify_ports_bulk(
+        AsyncMock(), [], sample_executor_info, {}
+    )
+
+    assert successful == []
+    assert failed == []

@@ -183,7 +183,15 @@ class Validator:
 
             try:
                 if await self.subtensor_client.should_set_weights():
-                    await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
+                    if settings.DRY_RUN:
+                        logger.info(
+                            _m(
+                                "[sync] DRY_RUN: Skipping set_weights to Bittensor",
+                                extra=get_extra_info({**self.default_extra, "miner_scores": self.miner_scores}),
+                            )
+                        )
+                    else:
+                        await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
                     self.miner_scores = {}
             except Exception as e:
                 logger.error(
@@ -364,11 +372,21 @@ class Validator:
                         ),
                     )
 
+                    total_executors = 0
+                    successful_executors = 0
+                    failed_executors = 0
+
                     for miner_hotkey, results in all_job_results.items():
                         for result in results:
+                            total_executors += 1
                             score = await self.calc_job_score(total_gpu_model_count_map, result)
                             result.score = score
                             self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+
+                            if score > 0:
+                                successful_executors += 1
+                            else:
+                                failed_executors += 1
 
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
@@ -383,6 +401,9 @@ class Validator:
                                     "job_batch_id": job_batch_id,
                                     "miner_scores": self.miner_scores,
                                     "open_fd_count": open_fd_count,
+                                    "total_executors": total_executors,
+                                    "successful_executors": successful_executors,
+                                    "failed_executors": failed_executors,
                                 }
                             ),
                         ),
@@ -437,7 +458,7 @@ class Validator:
         logger.info(
             _m(
                 "[start] Starting Validator in background",
-                extra=get_extra_info(self.default_extra),
+                extra=get_extra_info({**self.default_extra, "dry_run": settings.DRY_RUN}),
             ),
         )
         try:
@@ -446,9 +467,9 @@ class Validator:
 
             while not self.should_exit:
                 await self.sync()
-
-                # sync every 12 seconds
-                await asyncio.sleep(SYNC_CYCLE)
+                self.should_exit = settings.DRY_RUN
+                if not settings.DRY_RUN:
+                    await asyncio.sleep(SYNC_CYCLE)
 
         except KeyboardInterrupt:
             logger.info(

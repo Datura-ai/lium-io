@@ -429,6 +429,15 @@ class MinerService:
         if not results:
             return
 
+        if settings.DRY_RUN:
+            logger.info(
+                _m(
+                    "DRY_RUN: Skipping publish_machine_specs to compute app",
+                    extra=get_extra_info({**default_extra, "job_batch_id": results[0].job_batch_id, "results": len(results)}),
+                ),
+            )
+            return
+
         logger.info(
             _m(
                 "Publishing machine specs to compute app connector process",
