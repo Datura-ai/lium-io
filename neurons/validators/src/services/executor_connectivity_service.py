@@ -132,34 +132,30 @@ class ExecutorConnectivityService:
                 success=False, log_text=f"Verification failed: {str(e)}", sysbox_runtime=sysbox_runtime,
             )
 
-    def _build_netcat_script(self, port_maps: list[tuple[int, int]], token: str) -> str:
-        """Build bash script that uses netcat to listen on multiple ports with unique token."""
-        # Split ports into batches
-        port_batches = []
-        for i in range(0, len(port_maps), BATCH_PORT_CONCURRENCY):
-            batch = port_maps[i:i + BATCH_PORT_CONCURRENCY]
-            batch_ports = ' '.join([str(internal_port) for internal_port, _ in batch])
-            port_batches.append(batch_ports)
+    def _build_netcat_script(self, port_maps: list[tuple[int, int]], token: str, batch_idx: int) -> str:
+        """Build shell script that uses netcat to listen on multiple ports with unique token."""
+        batch_ports = ' '.join([str(internal_port) for internal_port, _ in port_maps])
 
-        # Build netcat commands for each batch
-        batch_commands = []
-        for idx, batch_ports in enumerate(port_batches):
-            batch_cmd = f'''
-echo "Batch {idx}: starting ports {batch_ports}" >&2
+        return f'''
+echo "Batch {batch_idx}: starting ports {batch_ports}" >&2
 for port in {batch_ports}; do
     (
         echo "Binding port $port" >&2
         body="{token}:$port"
         printf "HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: ${{#body}}\\r\\nConnection: close\\r\\n\\r\\n$body" | nc -l -p $port
-        echo "Port $port served" >&2
+        nc_status=$?
+        if [ $nc_status -eq 0 ]; then
+            echo "Port $port served" >&2
+        else
+            echo "Port $port failed (nc exit $nc_status)" >&2
+        fi
     ) &
 done
 wait
-echo "Batch {idx}: completed" >&2
+echo "Batch {batch_idx}: completed" >&2
+echo "All batches completed" >&2
+sleep 60
 '''
-            batch_commands.append(batch_cmd)
-
-        return '\n'.join(batch_commands) + '\necho "All batches completed" >&2'
 
     async def _start_port_test_container(
         self, ssh_client: SSHClientConnection, container_name: str, nc_script: str, extra: dict
@@ -169,9 +165,14 @@ echo "Batch {idx}: completed" >&2
         Returns:
             True if container started successfully, False otherwise
         """
+        heredoc_marker = "__NC_EOF__"
         command = (
-            f"/usr/bin/docker run -d --rm --name {container_name} "
-            f"--network=host docker.io/library/alpine:3.19 sh -c '{nc_script}'"
+            f"/usr/bin/docker run -d --name {container_name} "
+            f"--network=host docker.io/library/alpine:3.19 sh -c "
+            f"'cat << \"{heredoc_marker}\" > /tmp/nc.sh\n"
+            f"{nc_script}\n"
+            f"{heredoc_marker}\n"
+            f"timeout 60 sh /tmp/nc.sh'"
         )
 
         logger.debug(_m(f"starting container: {container_name}", extra))
@@ -182,22 +183,36 @@ echo "Batch {idx}: completed" >&2
             logger.error(_m(f"container start failed: {result.stderr.strip()}", extra))
             return False
 
-        # Give container time to start
-        await asyncio.sleep(0.5)
+        container_id = result.stdout.strip()
+        logger.debug(_m(f"container started: {container_id[:12]}", extra))
 
-        # Verify container is still running
-        check_cmd = f"/usr/bin/docker ps --filter name={container_name} --format '{{{{.Status}}}}'"
+        # Give container time to start and bind ports
+        await asyncio.sleep(1.0)
+
+        # Check container status
+        check_cmd = f"/usr/bin/docker ps -a --filter id={container_id} --format '{{{{.Status}}}}|||{{{{.State}}}}' 2>&1"
         check_result = await ssh_client.run(check_cmd)
+        status_output = check_result.stdout.strip()
 
-        if check_result.stdout.strip():
-            logger.info(_m(f"container status: {check_result.stdout.strip()}", extra))
+        # If container is running, we're good
+        if "Up" in status_output:
+            logger.info(_m(f"container running: {status_output}", extra))
             return True
 
-        # Container not running - get logs
-        logger.error(_m(f"container not running! checking logs...", extra))
-        logs_cmd = f"/usr/bin/docker logs {container_name} 2>&1 || echo 'no logs'"
+        # Container exited - get logs and details
+        logger.error(_m(f"container not running: {status_output}", extra))
+
+        # Get logs quickly before --rm removes the container
+        logs_cmd = f"/usr/bin/docker logs {container_id} 2>&1 | head -20"
         logs_result = await ssh_client.run(logs_cmd)
-        logger.error(_m(f"container logs: {logs_result.stdout.strip()}", extra))
+        logs_output = logs_result.stdout.strip() if logs_result.exit_status == 0 else "no logs"
+
+        # Get exit code
+        inspect_cmd = f"/usr/bin/docker inspect {container_id} --format '{{{{.State.ExitCode}}}}' 2>&1"
+        inspect_result = await ssh_client.run(inspect_cmd)
+        exit_code = inspect_result.stdout.strip() if inspect_result.exit_status == 0 else "unknown"
+
+        logger.error(_m(f"container failed exit_code={exit_code} logs={logs_output[:500]}", extra))
         return False
 
     async def _test_ports_in_batches(
@@ -260,20 +275,28 @@ echo "Batch {idx}: completed" >&2
         extra: dict,
     ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
         """Single attempt to verify ports. Returns (successful_ports, failed_ports)."""
-        # Build netcat script
-        nc_script = self._build_netcat_script(port_maps, token)
+        successful_ports = []
+        failed_ports = []
 
-        # Start container
-        if not await self._start_port_test_container(ssh_client, container_name, nc_script, extra):
-            return [], port_maps
+        for batch_idx in range(0, len(port_maps), BATCH_PORT_CONCURRENCY):
+            batch = port_maps[batch_idx:batch_idx + BATCH_PORT_CONCURRENCY]
+            batch_number = batch_idx // BATCH_PORT_CONCURRENCY
+            batch_container_name = f"{container_name}_b{batch_number}"
 
-        # Test all ports
-        successful_ports, failed_ports = await self._test_ports_in_batches(
-            port_maps, executor_host, token, extra
-        )
+            nc_script = self._build_netcat_script(batch, token, batch_number)
 
-        # Cleanup
-        await self._cleanup_port_test_container(ssh_client, container_name)
+            if not await self._start_port_test_container(ssh_client, batch_container_name, nc_script, extra):
+                failed_ports.extend(batch)
+                continue
+
+            try:
+                batch_successful, batch_failed = await self._test_ports_in_batches(
+                    batch, executor_host, token, extra
+                )
+                successful_ports.extend(batch_successful)
+                failed_ports.extend(batch_failed)
+            finally:
+                await self._cleanup_port_test_container(ssh_client, batch_container_name)
 
         return successful_ports, failed_ports
 
@@ -294,7 +317,8 @@ echo "Batch {idx}: completed" >&2
             return [], []
 
         max_attempts = 2
-        timeout_seconds = 60  # 1 minute timeout per attempt
+        total_batches = (len(port_maps) + BATCH_PORT_CONCURRENCY - 1) // BATCH_PORT_CONCURRENCY
+        timeout_seconds = 60 * max(1, total_batches)
 
         for attempt in range(1, max_attempts + 1):
             # Generate unique token and container name for each attempt
