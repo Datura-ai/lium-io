@@ -445,7 +445,7 @@ def test_build_netcat_script(executor_service):
     port_maps = [(9000, 9000), (9001, 9001)]
     token = "abc123"
 
-    script = executor_service._build_netcat_script(port_maps, token)
+    script = executor_service._build_netcat_script(port_maps, token, 0)
 
     # Verify script contains token
     assert token in script
@@ -453,7 +453,7 @@ def test_build_netcat_script(executor_service):
     assert "9000" in script
     assert "9001" in script
     # Verify script has batch structure
-    assert "Batch" in script
+    assert "Batch 0" in script
     assert "nc -l -p" in script
 
 
@@ -497,6 +497,7 @@ async def test_start_port_test_container_exits_immediately(executor_service, moc
         AsyncMock(exit_status=0, stdout="container_dead\n"),  # docker run
         AsyncMock(exit_status=0, stdout=""),  # docker ps (empty = not running)
         AsyncMock(exit_status=0, stdout="Error: nc failed"),  # docker logs
+        AsyncMock(exit_status=0, stdout="2"),  # docker inspect exit code
     ]
 
     with patch('asyncio.sleep', new=AsyncMock()):

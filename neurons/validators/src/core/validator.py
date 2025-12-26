@@ -383,7 +383,7 @@ class Validator:
                             result.score = score
                             self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
 
-                            if score > 0:
+                            if result.job_score == 1.0:
                                 successful_executors += 1
                             else:
                                 failed_executors += 1
