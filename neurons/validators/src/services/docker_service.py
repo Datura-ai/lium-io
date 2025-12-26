@@ -610,15 +610,14 @@ class DockerService:
         try:
             custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
-            port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, UUID(payload.pod_id), custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
-            )
+            docker_port_pairs = custom_options.docker_port_pairs
+            jupyter_port_pair = custom_options.jupyter_port_pair if payload.enable_jupyter else None
 
             # Add profiler for port mappings generation
             profilers.append({"name": "Port mappings generated", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
             prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
-            if not port_maps:
+            if not docker_port_pairs:
                 log_text = _m(
                     "No port mappings found",
                     extra=get_extra_info(default_extra),
@@ -636,10 +635,10 @@ class DockerService:
 
             default_extra = {
                 **default_extra,
-                "jupyter_port_map": jupyter_port_map,
+                "jupyter_port_map": jupyter_port_pair,
             }
 
-            if payload.enable_jupyter and not jupyter_port_map:
+            if payload.enable_jupyter and not jupyter_port_pair:
                 log_text = _m(
                     "No Jupyter port mapping found",
                     extra=get_extra_info(default_extra),
@@ -741,7 +740,7 @@ class DockerService:
                 port_flags = " ".join(
                     [
                         f"-p {internal_port}:{docker_port}"
-                        for docker_port, internal_port, _ in port_maps
+                        for internal_port, docker_port in docker_port_pairs
                     ]
                 )
 
@@ -915,19 +914,19 @@ class DockerService:
                 )
 
                 jupyter_url = None
-                if payload.enable_jupyter and jupyter_port_map:
+                if payload.enable_jupyter and jupyter_port_pair:
                     jupyter_token = secrets.token_hex(16)
                     await self.run_jupyter(
                         ssh_client=ssh_client,
                         container_name=container_name,
                         jupyter_token=jupyter_token,
-                        jupyter_port=jupyter_port_map[0],
+                        jupyter_port=jupyter_port_pair[0],
                         log_tag=log_tag,
                         log_extra=default_extra,
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
                     )
-                    jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
+                    jupyter_url = f"http://{executor_info.address}:{jupyter_port_pair[1]}/lab?token={jupyter_token}"
 
                 # Add profiler for ssh service installation
                 profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -968,9 +967,6 @@ class DockerService:
                     pod_id=payload.pod_id,
                     container_name=container_name,
                     volume_name=local_volume,
-                    port_maps=[
-                        (docker_port, external_port) for docker_port, _, external_port in port_maps
-                    ],
                     profilers=profilers,
                     backup_log_id=payload.backup_log_id,
                     restore_path=payload.restore_path,

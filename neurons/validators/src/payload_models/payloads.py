@@ -13,6 +13,9 @@ class CustomOptions(BaseModel):
     startup_commands: str | None = None
     shm_size: str | None = None
     initial_port_count: int | None = None
+    docker_port_pairs: list[tuple[int, int]] | None = None  # [(internal, docker), ...]
+    jupyter_port_pair: tuple[int, int] | None = None
+
 
     @classmethod
     def sanitize(cls, custom_options: 'CustomOptions | None') -> 'CustomOptions':
@@ -345,11 +348,11 @@ class ContainerCreated(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
     container_name: str
     volume_name: str
-    port_maps: list[tuple[int, int]]
     profilers: list[dict] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
     jupyter_url: str | None = None
+    port_maps: list[tuple[int, int]] = []
     warnings: list[ContainerWarningCode] | None = None
     storage_limit_gb: int | None = None
     volume_limit_gb: int | None = None
