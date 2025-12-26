@@ -483,13 +483,9 @@ class DockerService:
 
             # Use shlex.quote to safely escape all user inputs to prevent command injection
             container_name_quoted = shlex.quote(container_name)
-            local_volume_path_quoted = shlex.quote(local_volume_path)
-            jupyter_token_quoted = shlex.quote(jupyter_token)
-            jupyter_port_quoted = shlex.quote(str(jupyter_port))
-            command = (
-                f"/usr/bin/docker exec {container_name_quoted} sh -c "
-                f"{shlex.quote(f'{local_volume_path_quoted}/run_jupyter.sh --password={jupyter_token_quoted} --port={jupyter_port_quoted}')}"
-            )
+            # Build shell command with proper escaping (no double-quoting)
+            shell_cmd = f"{shlex.quote(local_volume_path)}/run_jupyter.sh --password={shlex.quote(jupyter_token)} --port={shlex.quote(str(jupyter_port))}"
+            command = f"/usr/bin/docker exec {container_name_quoted} sh -c {shlex.quote(shell_cmd)}"
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
@@ -523,9 +519,9 @@ class DockerService:
             )
             # Use shlex.quote to safely escape all user inputs to prevent command injection
             container_name_quoted = shlex.quote(container_name)
-            jupyter_token_quoted = shlex.quote(jupyter_token)
-            jupyter_port_quoted = shlex.quote(str(jupyter_port))
-            command = f"/usr/bin/docker exec {container_name_quoted} sh -c {shlex.quote(f'/root/run_jupyter.sh --password={jupyter_token_quoted} --port={jupyter_port_quoted}')}"
+            # Build shell command with proper escaping (no double-quoting)
+            shell_cmd = f"/root/run_jupyter.sh --password={shlex.quote(jupyter_token)} --port={shlex.quote(str(jupyter_port))}"
+            command = f"/usr/bin/docker exec {container_name_quoted} sh -c {shlex.quote(shell_cmd)}"
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
@@ -1365,8 +1361,6 @@ class DockerService:
                     # Remove the public key from authorized_keys
                     # Properly escape slashes and pluses in pubkey for sed
                     # Use Python's shlex.quote to safely quote the pubkey for shell usage
-                    import shlex
-
                     # Remove the public key from authorized_keys by matching the exact line
                     # This approach is safer and more reliable than trying to escape characters for sed
                     quoted_pubkey = shlex.quote(pubkey)

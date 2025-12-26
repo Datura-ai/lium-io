@@ -52,25 +52,22 @@ def pull_aws_cli():
 def aws_restore(args):
     # aws s3 cp s3://$BUCKET_NAME/backups/my-folder-2025-09-02.tar.gz - \
     # | tar -xzpf - -C $RESTORE_PATH
-    # Use shlex.quote to safely escape all user inputs to prevent command injection
-    target_volume_quoted = shlex.quote(args.target_volume)
-    target_volume_path_quoted = shlex.quote(args.target_volume_path)
-    access_key_quoted = shlex.quote(args.backup_volume_iam_user_access_key)
-    secret_key_quoted = shlex.quote(args.backup_volume_iam_user_secret_key)
-    backup_volume_name_quoted = shlex.quote(args.backup_volume_name)
-    backup_source_path_quoted = shlex.quote(args.backup_source_path)
-    restore_path_quoted = shlex.quote(args.restore_path)
+    # Build command as a list - no need for shlex.quote() as list form is already safe
+    # Only the shell command string needs escaping
+    shell_cmd = (
+        f"aws s3 cp s3://{shlex.quote(args.backup_volume_name)}/{shlex.quote(args.backup_source_path)} - | "
+        f"tar --xattrs --acls -xzpf - -C {shlex.quote(args.restore_path)} --strip-components=1"
+    )
     
-    # Build command as a list to avoid shell injection
     command = [
         "docker", "run", "--rm",
-        "-v", f"{target_volume_quoted}:{target_volume_path_quoted}",
-        "-e", f"AWS_ACCESS_KEY_ID={access_key_quoted}",
-        "-e", f"AWS_SECRET_ACCESS_KEY={secret_key_quoted}",
+        "-v", f"{args.target_volume}:{args.target_volume_path}",
+        "-e", f"AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key}",
+        "-e", f"AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key}",
         "-e", "AWS_DEFAULT_REGION=us-east-1",
         "--entrypoint", "sh",
         "daturaai/aws-cli", "-lc",
-        f"aws s3 cp s3://{backup_volume_name_quoted}/{backup_source_path_quoted} - | tar --xattrs --acls -xzpf - -C {restore_path_quoted} --strip-components=1"
+        shell_cmd
     ]
     run_command(command)
 

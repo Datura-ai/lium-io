@@ -1,49 +1,48 @@
 ## Describe your changes
 
-This PR fixes multiple critical command injection vulnerabilities across the codebase by implementing proper input sanitization and escaping.
+This PR addresses review feedback on the command injection security fixes by correcting double-quoting issues and improving code organization.
 
-### Key Changes:
+### Key Fixes:
 
-1. **Command Injection Fixes**
-   - Applied `shlex.quote()` to all user-controlled inputs in shell commands
-   - Fixed vulnerabilities in SSH operations (`interactive_shell_service.py`)
-   - Fixed vulnerabilities in Docker operations (`docker_service.py`)
-   - Fixed vulnerabilities in VerifyX validation (`verifyx_validation_service.py`)
-   - Fixed vulnerabilities in executor connectivity (`executor_connectivity_service.py`)
-   - Fixed vulnerabilities in rented machine checks (`rented_machine.py`)
+1. **Fixed Double-Quoting in Subprocess Calls**
+   - Removed `shlex.quote()` from list-based subprocess calls in `backup_storage.py` and `restore_storage.py`
+   - List form is already safe; adding quotes inserts literal quote characters causing command failures
 
-2. **Subprocess Security**
-   - Removed `shell=True` from all subprocess calls to prevent shell injection
-   - Converted command strings to command lists for safer execution
-   - Applied `shlex.split()` for safe command parsing
-   - Fixed in: `hash_service.py`, `score.py`, `machine_scrape.py`, `backup_storage.py`, `restore_storage.py`
+2. **Fixed Nested Quoting Issues**
+   - Corrected double-quoting in `docker_service.py` where values were quoted multiple times
+   - Properly escape shell commands without nested quotes
 
-3. **Input Sanitization**
-   - Added `_sanitize_startup_commands()` method to filter dangerous shell metacharacters
-   - Enhanced `CustomOptions.sanitize()` to include startup_commands validation
+3. **Code Organization Improvements**
+   - Moved `import shlex` from function bodies to file top (per project conventions)
+   - Affected files: `machine_scrape.py`, `verifyx_validation_service.py`, `rented_machine.py`, `executor_connectivity_service.py`
 
-### Security Impact:
-- **Before:** Attackers could potentially execute arbitrary commands by injecting malicious input
-- **After:** All user inputs are properly escaped and validated, preventing command injection attacks
+4. **Added Centralized Helper**
+   - Created `command_utils.py` with `prepare_shell_command()` function
+   - Added tests in `test_command_utils.py` to prevent future mistakes
+   - Provides a single, testable place for command construction logic
 
-### Testing:
-- All changes maintain backward compatibility
-- Functionality remains unchanged
-- No breaking changes introduced
+### Technical Details:
 
-See `SECURITY_IMPROVEMENTS.md` for detailed vulnerability analysis and fix descriptions.
+**Before (broken):**
+```python
+source_volume_quoted = shlex.quote(args.source_volume)
+command = ["docker", "run", "-v", f"{source_volume_quoted}:{path_quoted}"]
+# Docker receives: -v '/data/vol':'/mnt' — fails
+```
 
-## Issue ticket number and link
-
-[Security: Fix Command Injection Vulnerabilities](https://www.notion.so/Compute-SN-c27d35dd084e4c4d92374f55cdd293f2?p=f9b26856f1a6406892b5db46446260da&pm=s)
+**After (correct):**
+```python
+command = ["docker", "run", "-v", f"{args.source_volume}:{args.source_volume_path}"]
+# List form is safe, no quoting needed
+```
 
 ## Checklist before requesting a review
 
 - [x] I have performed a self-review of my code
-- [ ] I wrote tests.
-- [ ] Need to take care of performance?
+- [x] I wrote tests.
+- [x] Need to take care of performance?
 
 ### Notes:
-- **Tests:** Security fixes maintain existing functionality. Integration tests should verify that command execution still works correctly with escaped inputs.
-- **Performance:** Minimal impact. `shlex.quote()` and `shlex.split()` are lightweight operations. No significant performance degradation expected.
+- **Tests:** Added tests for `command_utils.py` to ensure proper escaping behavior
+- **Performance:** No performance impact; fixes prevent command failures
 

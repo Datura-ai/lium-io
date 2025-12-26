@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import shlex
 import threading
 import psutil
 from functools import wraps
@@ -606,7 +607,6 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
 def run_cmd(cmd):
     # Use shlex.split to safely parse command string and prevent command injection
     # This prevents shell injection attacks by properly escaping arguments
-    import shlex
     if isinstance(cmd, str):
         cmd_list = shlex.split(cmd)
     else:

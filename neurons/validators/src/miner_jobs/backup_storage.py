@@ -122,26 +122,23 @@ def aws_cp(args):
     backup_path_parent = os.path.dirname(backup_path)
     backup_path_current = os.path.basename(backup_path)
 
-    # Use shlex.quote to safely escape all user inputs to prevent command injection
-    source_volume_quoted = shlex.quote(args.source_volume)
-    source_volume_path_quoted = shlex.quote(args.source_volume_path)
-    access_key_quoted = shlex.quote(args.backup_volume_iam_user_access_key)
-    secret_key_quoted = shlex.quote(args.backup_volume_iam_user_secret_key)
-    backup_volume_name_quoted = shlex.quote(args.backup_volume_name)
-    backup_target_path_quoted = shlex.quote(args.backup_target_path)
-    backup_path_parent_quoted = shlex.quote(backup_path_parent)
-    backup_path_current_quoted = shlex.quote(backup_path_current)
+    # Build command as a list - no need for shlex.quote() as list form is already safe
+    # Only the shell command string needs escaping
+    shell_cmd = (
+        f"tar --xattrs --acls -C {shlex.quote(backup_path_parent)} -czf - "
+        f"{shlex.quote(backup_path_current)} | aws s3 cp - "
+        f"s3://{shlex.quote(args.backup_volume_name)}/{shlex.quote(args.backup_target_path)} --sse AES256"
+    )
     
-    # Build command as a list to avoid shell injection
     command = [
         "docker", "run", "--rm",
-        "-v", f"{source_volume_quoted}:{source_volume_path_quoted}",
-        "-e", f"AWS_ACCESS_KEY_ID={access_key_quoted}",
-        "-e", f"AWS_SECRET_ACCESS_KEY={secret_key_quoted}",
+        "-v", f"{args.source_volume}:{args.source_volume_path}",
+        "-e", f"AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key}",
+        "-e", f"AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key}",
         "-e", "AWS_DEFAULT_REGION=us-east-1",
         "--entrypoint", "sh",
         "daturaai/aws-cli", "-lc",
-        f"tar --xattrs --acls -C {backup_path_parent_quoted} -czf - {backup_path_current_quoted} | aws s3 cp - s3://{backup_volume_name_quoted}/{backup_target_path_quoted} --sse AES256"
+        shell_cmd
     ]
     run_command(command)
 

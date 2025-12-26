@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import shlex
 import time
 import uuid
 from uuid import UUID
@@ -537,7 +538,6 @@ echo "Batch {idx}: completed" >&2
             logger.info(_m(f"dind: start docker port={internal_port}", extra))
 
             # Use shlex.quote to safely escape public_key and container_name to prevent command injection
-            import shlex
             public_key_quoted = shlex.quote(public_key)
             container_name_quoted = shlex.quote(container_name)
             docker_cmd = f"sh -c 'mkdir -p ~/.ssh && echo {public_key_quoted} >> ~/.ssh/authorized_keys && ssh-keygen -A && service ssh start && tail -f /dev/null'"

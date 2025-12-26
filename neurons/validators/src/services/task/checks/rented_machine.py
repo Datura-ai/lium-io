@@ -1,5 +1,6 @@
 from typing import Iterable
 from dataclasses import replace
+import shlex
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ..messages import TenantEnforcementMessages as Msg, render_message
@@ -207,7 +208,6 @@ class TenantEnforcementCheck:
 
 
 async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str]]:
-    import shlex
     # Use shlex.quote to safely escape container_name to prevent command injection
     container_name_quoted = shlex.quote(container_name)
     try:
