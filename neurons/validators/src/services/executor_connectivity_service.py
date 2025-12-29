@@ -38,7 +38,6 @@ class DockerConnectionCheckResult(BaseModel):
     log_text: str | None = None
     sysbox_runtime: bool
     verified_port_count: int = 0
-    verified_ports: list[int] = []
 
 
 class ExecutorConnectivityService:
@@ -142,7 +141,7 @@ class ExecutorConnectivityService:
                     success=False,
                     log_text=failure_msg,
                     sysbox_runtime=sysbox_runtime,
-                verified_port_count=0,
+                    verified_port_count=0,
                 )
 
             # TODO(stage2): Remove save_to_db call - backend will be source of truth for verified ports
@@ -163,7 +162,12 @@ class ExecutorConnectivityService:
                 success_msg += f" fail={len(failed_ports)}{failed_sample}"
             logger.info(_m(success_msg, extra))
 
-            return DockerConnectionCheckResult(success=True, log_text=success_msg, sysbox_runtime=sysbox_runtime,)
+            return DockerConnectionCheckResult(
+                success=True,
+                log_text=success_msg,
+                sysbox_runtime=sysbox_runtime,
+                verified_port_count=verified_port_count,
+            )
         except Exception as e:
             logger.error(
                 _m(f"verification failed: {str(e)} executor={executor_info.address}", extra),
@@ -385,12 +389,7 @@ sleep 60
 
                 # If we got any successful ports, return immediately
                 if successful_ports:
-                    logger.info(
-                _m(
-                    f"complete: {len(successful_ports)}/{len(port_maps)} ports verified",
-                    extra,
-                )
-            )
+                    logger.info(_m(f"complete: {len(successful_ports)}/{len(port_maps)} ports verified", extra))
                     return successful_ports, failed_ports
 
                 # First attempt failed completely - retry after delay
@@ -431,8 +430,10 @@ sleep 60
 
     async def _test_single_port_with_session(
         self,
-       session: aiohttp.ClientSession, host: str,
-       internal_port: int, external_port: int,
+        session: aiohttp.ClientSession,
+        host: str,
+        internal_port: int,
+        external_port: int,
         token: str,
         extra: dict = {},
     ) -> bool:
@@ -451,9 +452,8 @@ sleep 60
                     logger.warning(_m(f"port {internal_port} wrong response: {text[:50]}", extra))
                     return False
         except Exception as e:
-            logger.warning(_m(f"port {internal_port} failed: {str(e)[:100]}", extra)
-        )
-        return False
+            logger.warning(_m(f"port {internal_port} failed: {str(e)[:100]}", extra))
+            return False
 
     async def save_to_db(
         self,
