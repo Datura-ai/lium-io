@@ -25,6 +25,13 @@ async def app_lifespan(app: FastAPI):
         logging.info("Validator exited successfully.")
 
 
+async def run_dry_run():
+    """Run validator once in DRY_RUN mode without FastAPI server."""
+    validator = Validator()
+    await validator.start()
+    await validator.stop()
+
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     lifespan=app_lifespan,
@@ -33,4 +40,7 @@ app = FastAPI(
 reload = True if settings.ENV == "dev" else False
 
 if __name__ == "__main__":
-    uvicorn.run("validator:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=reload)
+    if settings.DRY_RUN:
+        asyncio.run(run_dry_run())
+    else:
+        uvicorn.run("validator:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=reload)
