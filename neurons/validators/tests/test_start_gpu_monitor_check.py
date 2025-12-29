@@ -6,7 +6,7 @@ from neurons.validators.src.services.task.checks.start_gpu_monitor import StartG
 from neurons.validators.src.services.task.messages import StartGpuMonitorMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 def make_command_result(success: bool, stdout: str = "", stderr: str = "") -> SSHCommandResult:
@@ -135,7 +135,7 @@ async def test_start_gpu_monitor_check(
         assert runner.commands_called[0]["timeout"] == 10
         assert runner.commands_called[0]["retryable"] is False
     else:
-        # Should check, then start (pip install is commented out in code)
+        # Should check, then start (pip install is disabled)
         assert len(runner.commands_called) == 2
 
         # First: check if running

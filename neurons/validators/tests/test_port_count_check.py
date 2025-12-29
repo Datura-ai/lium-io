@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from datura.requests.miner_requests import ExecutorSSHInfo
 
 from neurons.validators.src.services.task.checks.port_count import PortCountCheck
 from neurons.validators.src.services.task.messages import PortCountMessages as Msg
@@ -14,13 +15,17 @@ from services.const import MIN_PORT_COUNT
 from tests.helpers import build_state
 
 
+
+
 @pytest.mark.asyncio
 async def test_port_count_sufficient_passes(context_factory):
     """Check passes when port count >= MIN_PORT_COUNT."""
     ctx = context_factory(state=build_state(verified_port_count=MIN_PORT_COUNT + 1))
 
+    # Act
     result = await PortCountCheck().run(ctx)
 
+    # Assert
     assert result.passed is True
     assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
     assert result.updates["port_count"] == MIN_PORT_COUNT + 1
@@ -36,7 +41,10 @@ async def test_port_count_insufficient_fails_when_not_rented(context_factory, po
 
     assert result.passed is False
     assert result.event.reason_code == Msg.INSUFFICIENT_PORTS.reason
-    assert result.updates["port_count"] == port_count
+    assert result.updates["port_count"] == expected_count
+    assert result.updates["state"].specs["available_port_count"] == expected_count
+    assert result.updates["state"].specs["port_range"] == "40000-40100"
+    assert result.updates["state"].specs["port_mappings"] == "[[46681, 56681], [46682, 56682]]"
 
 
 @pytest.mark.asyncio
