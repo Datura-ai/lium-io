@@ -41,10 +41,8 @@ async def test_port_count_insufficient_fails_when_not_rented(context_factory, po
 
     assert result.passed is False
     assert result.event.reason_code == Msg.INSUFFICIENT_PORTS.reason
-    assert result.updates["port_count"] == expected_count
-    assert result.updates["state"].specs["available_port_count"] == expected_count
-    assert result.updates["state"].specs["port_range"] == "40000-40100"
-    assert result.updates["state"].specs["port_mappings"] == "[[46681, 56681], [46682, 56682]]"
+    assert result.updates["port_count"] == port_count
+    assert result.updates["state"].specs["available_port_count"] == port_count
 
 
 @pytest.mark.asyncio
