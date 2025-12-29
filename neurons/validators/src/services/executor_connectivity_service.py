@@ -158,7 +158,7 @@ sleep 60
 '''
 
     async def _start_port_test_container(
-        self, ssh_client: SSHClientConnection, container_name: str, nc_script: str, extra: dict
+        self, ssh_client: SSHClientConnection, container_name: str, nc_script: str, port_maps: list[tuple[int, int]], extra: dict
     ) -> bool:
         """Start Alpine container with netcat script and verify it's running.
 
@@ -166,9 +166,11 @@ sleep 60
             True if container started successfully, False otherwise
         """
         heredoc_marker = "__NC_EOF__"
+        # Build port mappings: -p internal:internal for each port in batch
+        port_mappings = ' '.join([f"-p {internal}:{internal}" for internal, _ in port_maps])
         command = (
             f"/usr/bin/docker run -d --name {container_name} "
-            f"--network=host docker.io/library/alpine:3.19 sh -c "
+            f"{port_mappings} docker.io/library/alpine:3.19 sh -c "
             f"'cat << \"{heredoc_marker}\" > /tmp/nc.sh\n"
             f"{nc_script}\n"
             f"{heredoc_marker}\n"
@@ -285,7 +287,7 @@ sleep 60
 
             nc_script = self._build_netcat_script(batch, token, batch_number)
 
-            if not await self._start_port_test_container(ssh_client, batch_container_name, nc_script, extra):
+            if not await self._start_port_test_container(ssh_client, batch_container_name, nc_script, batch, extra):
                 failed_ports.extend(batch)
                 continue
 
