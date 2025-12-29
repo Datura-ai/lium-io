@@ -227,7 +227,7 @@ class PipelineFactory:
         This pipeline skips checks that would modify executor state or interfere with
         production operations:
         - StartGPUMonitorCheck: Would start processes on the executor
-        - UploadFilesCheck: Would upload files to the executor
+        - VerifyXCheck: Would use GPU to run some tests and interfere with prod validation
 
 
         Returns:

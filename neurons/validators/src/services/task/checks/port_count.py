@@ -12,7 +12,7 @@ class PortCountCheck:
     """Verify minimum port availability and record port count for scoring.
 
     Reads the verified port count from ctx.state (set by PortConnectivityCheck)
-    and enforces MIN_PORT_COUNT policy for non-rented executors.
+    instead of querying the database.
     """
 
     check_id = "executor.validate.port_count"
@@ -51,7 +51,6 @@ class PortCountCheck:
                 event=event,
                 updates={"port_count": port_count, "state": updated_state},
             )
-
         event = render_message(
             Msg.PORT_COUNT_RECORDED,
             ctx=ctx,

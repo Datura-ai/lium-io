@@ -3,7 +3,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from services.executor_connectivity_service import ExecutorConnectivityService
-from services.const import PREFERRED_POD_PORTS
 
 
 @pytest.fixture
@@ -21,9 +20,10 @@ def executor_service(mock_redis_service, port_mapping_dao):
 async def test_cleanup_docker_containers(executor_service, mock_ssh_client, sample_executor_info):
     """Test cleanup of Docker containers with 'container_' prefix."""
     # Arrange
-    # Mock responses: 1) list containers command (only returns containers matching filter), 2) rm command, 3) prune command
+    # Mock responses: 1) list containers command, 2) rm command, 3) prune command
+    # Note: docker ps --filter "name=^/container_" only returns container_* names
     mock_ssh_client.run.side_effect = [
-        AsyncMock(stdout="container_test1\ncontainer_test2", exit_status=0),  # Only containers with 'container_' prefix
+        AsyncMock(stdout="container_test1\ncontainer_test2", exit_status=0),
         AsyncMock(stdout="", exit_status=0),  # docker rm response
         AsyncMock(stdout="", exit_status=0),  # docker volume prune response
     ]
@@ -208,7 +208,7 @@ def test_build_netcat_script(executor_service):
     port_maps = [(9000, 9000), (9001, 9001)]
     token = "abc123"
 
-    script = executor_service._build_netcat_script(port_maps, token)
+    script = executor_service._build_netcat_script(port_maps, token, 0)
 
     # Verify script contains token
     assert token in script
@@ -216,7 +216,7 @@ def test_build_netcat_script(executor_service):
     assert "9000" in script
     assert "9001" in script
     # Verify script has batch structure
-    assert "Batch" in script
+    assert "Batch 0" in script
     assert "nc -l -p" in script
 
 
@@ -260,6 +260,7 @@ async def test_start_port_test_container_exits_immediately(executor_service, moc
         AsyncMock(exit_status=0, stdout="container_dead\n"),  # docker run
         AsyncMock(exit_status=0, stdout=""),  # docker ps (empty = not running)
         AsyncMock(exit_status=0, stdout="Error: nc failed"),  # docker logs
+        AsyncMock(exit_status=0, stdout="2"),  # docker inspect exit code
     ]
 
     with patch('asyncio.sleep', new=AsyncMock()):
