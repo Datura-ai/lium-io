@@ -228,7 +228,7 @@ class PipelineFactory:
         production operations:
         - StartGPUMonitorCheck: Would start processes on the executor
         - UploadFilesCheck: Would upload files to the executor
-        - PortConnectivityCheck: Would perform connectivity tests that could affect production
+
 
         Returns:
             Ordered list of validation checks safe for dry run mode
@@ -247,7 +247,7 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
-                # PortConnectivityCheck(), # SKIP: Port connectivity tests could affect production
+                PortConnectivityCheck(),
                 PortCountCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
