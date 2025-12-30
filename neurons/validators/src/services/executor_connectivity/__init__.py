@@ -1,11 +1,3 @@
-from services.executor_connectivity.contracts import (
-    ContainerCleanupProtocol,
-    DindProbeProtocol,
-    OrchestratorProtocol,
-    PortProbeProtocol,
-    PortSelectorProtocol,
-    ResultPersisterProtocol,
-)
 from services.executor_connectivity.cleanup_service import ContainerCleanupService
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind import DindProbe, DindVerifier
@@ -29,27 +21,21 @@ from services.executor_connectivity.service import ExecutorConnectivityService
 __all__ = [
     "ContainerRunner",
     "BatchVerifier",
-    "ContainerCleanupProtocol",
     "ContainerCleanupService",
     "ContainerStartResult",
     "ConnectivityOrchestrator",
     "DindProbe",
-    "DindProbeProtocol",
     "DindProbeResult",
     "DindVerifier",
     "DockerCommand",
     "ExecutorConnectivityService",
     "FallbackVerifier",
     "NetcatScript",
-    "OrchestratorProtocol",
     "PortPair",
-    "PortProbeProtocol",
     "PortProbe",
     "PortProbeResult",
     "PortSelector",
-    "PortSelectorProtocol",
     "PortTester",
     "PortVerificationResult",
     "PortResultPersister",
-    "ResultPersisterProtocol",
 ]
