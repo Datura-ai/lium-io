@@ -1,6 +1,6 @@
 from services.executor_connectivity.cleanup_service import ContainerCleanupService
 from services.executor_connectivity.container_runner import ContainerRunner
-from services.executor_connectivity.dind import DindProbe, DindVerifier
+from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.docker_command import DockerCommand
 from services.executor_connectivity.models import (
     ContainerStartResult,
