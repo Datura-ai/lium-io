@@ -7,7 +7,7 @@ from services.collateral_contract_service import CollateralContractService
 from services.docker_service import DockerService
 from services.executor_connectivity import ContainerCleanupService
 from services.executor_connectivity.container_runner import ContainerRunner
-from services.executor_connectivity.dind import DindProbe, DindVerifier
+from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
