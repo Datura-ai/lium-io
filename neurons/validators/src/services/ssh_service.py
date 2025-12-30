@@ -60,3 +60,20 @@ class SSHService:
         return self._encrypt(encryption_key, private_key_bytes.decode("utf-8")).encode(
             "utf-8"
         ), public_key_bytes
+
+    def generate_keypair(self) -> tuple[str, str]:
+        """Generate an unencrypted SSH key pair for ephemeral use."""
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        public_key = private_key.public_key()
+
+        private_key_bytes = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.OpenSSH,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        public_key_bytes = public_key.public_bytes(
+            encoding=serialization.Encoding.OpenSSH,
+            format=serialization.PublicFormat.OpenSSH,
+        )
+
+        return private_key_bytes.decode("utf-8"), public_key_bytes.decode("utf-8")
