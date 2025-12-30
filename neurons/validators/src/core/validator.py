@@ -12,7 +12,7 @@ from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
 from services.executor_connectivity import ContainerCleanupService
 from services.executor_connectivity.container_runner import ContainerRunner
-from services.executor_connectivity.dind import DindProbe, DindVerifier
+from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
@@ -69,9 +69,6 @@ class Validator:
         port_tester = PortTester()
         runner = ContainerRunner()
         self.executor_connectivity_service = ExecutorConnectivityService(
-            redis_service=self.redis_service,
-            port_mapping_dao=self.port_mapping_dao,
-            ssh_service=ssh_service,
             orchestrator=ConnectivityOrchestrator(
                 PortSelector(),
                 PortProbe(
