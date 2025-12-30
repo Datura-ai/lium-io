@@ -1,6 +1,6 @@
 import pytest
 
-from services.executor_connectivity.dind import DindVerifier
+from services.executor_connectivity.dind_probe import DindVerifier
 from services.executor_connectivity.models import PortPair
 
 
@@ -27,13 +27,16 @@ async def test_dind_verifier_sysbox_failure_sets_false(mocker):
         ]
     )
 
-    mocker.patch("services.executor_connectivity.dind.asyncio.sleep", new=mocker.AsyncMock())
-    mocker.patch("services.executor_connectivity.dind.asyncssh.import_private_key", return_value=mocker.Mock())
+    mocker.patch("services.executor_connectivity.dind_probe.asyncio.sleep", new=mocker.AsyncMock())
+    mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.import_private_key",
+        return_value=mocker.Mock(),
+    )
 
     ssh_session = mocker.AsyncMock()
     ssh_session.run = mocker.AsyncMock(return_value=_run_result(mocker, exit_status=1, stderr="fail"))
 
-    connect = mocker.patch("services.executor_connectivity.dind.asyncssh.connect")
+    connect = mocker.patch("services.executor_connectivity.dind_probe.asyncssh.connect")
     connect.return_value.__aenter__.return_value = ssh_session
     connect.return_value.__aexit__.return_value = mocker.AsyncMock()
 
@@ -68,7 +71,7 @@ async def test_dind_verifier_docker_run_fails(mocker):
         ]
     )
 
-    connect = mocker.patch("services.executor_connectivity.dind.asyncssh.connect")
+    connect = mocker.patch("services.executor_connectivity.dind_probe.asyncssh.connect")
 
     verifier = DindVerifier(ssh_service)
 
