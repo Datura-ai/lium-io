@@ -73,6 +73,22 @@ class PortConnectivityCheck:
             verified_port_count=verified_port_count,
         )
 
+        total = len(result.successful_ports) + len(result.failed_ports)
+        pct = (len(result.successful_ports) / total * 100) if total > 0 else 0
+        dind_status = "ok" if result.dind_ok else "failed"
+        batch_count = len(result.successful_ports) - (1 if result.dind_ok else 0)
+        batch_status = "ok" if batch_count > 0 else "failed"
+        ok_sample = sorted([p.internal for p in result.successful_ports])[:5]
+        fail_sample = sorted([p.internal for p in result.failed_ports])[:5]
+        elapsed = result.elapsed_sec or 0.0
+
+        msg = (
+            f"verification complete total_time={elapsed:.2f}s {pct:.0f}% available, "
+            f"dind={dind_status} batch={batch_status} ok={len(result.successful_ports)}{ok_sample}"
+        )
+        if result.failed_ports:
+            msg += f" fail={len(result.failed_ports)}{fail_sample}"
+
         if result.status != "ok":
             if result.status == "no_ports":
                 details = "No port available for docker container"
@@ -89,6 +105,7 @@ class PortConnectivityCheck:
                 check_id=self.check_id,
                 what={
                     "details": details,
+                    "message": msg,
                     "port_range": ctx.executor.port_range,
                     "port_mappings": ctx.executor.port_mappings,
                 },
@@ -99,21 +116,6 @@ class PortConnectivityCheck:
                 event=event,
                 updates={"default_extra": extra, "state": updated_state},
             )
-
-        total = len(result.successful_ports) + len(result.failed_ports)
-        pct = (len(result.successful_ports) / total * 100) if total > 0 else 0
-        dind_status = "ok" if result.dind_ok else "failed"
-        batch_count = len(result.successful_ports) - (1 if result.dind_ok else 0)
-        batch_status = "ok" if batch_count > 0 else "failed"
-        ok_sample = sorted([p.internal for p in result.successful_ports])[:5]
-        fail_sample = sorted([p.internal for p in result.failed_ports])[:5]
-
-        msg = (
-            f"verification complete total_time={result.elapsed_sec:.2f}s {pct:.0f}% available, "
-            f"dind={dind_status} batch={batch_status} ok={len(result.successful_ports)}{ok_sample}"
-        )
-        if result.failed_ports:
-            msg += f" fail={len(result.failed_ports)}{fail_sample}"
 
         event = render_message(
             Msg.VERIFY_OK,
