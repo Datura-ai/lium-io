@@ -3,7 +3,7 @@ import random
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from services.const import BATCH_PORT_VERIFICATION_SIZE
-from services.executor_connectivity.dind import DindProbe
+from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
