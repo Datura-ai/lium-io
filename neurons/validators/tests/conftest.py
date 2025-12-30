@@ -53,7 +53,6 @@ def mock_redis_service():
     service.lrem = AsyncMock()
     service.lrange = AsyncMock(return_value=[])
     service.rpop = AsyncMock()
-    service.get_rented_machine = AsyncMock(return_value=None)
     return service
 
 
