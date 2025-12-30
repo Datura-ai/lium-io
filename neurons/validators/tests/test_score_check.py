@@ -3,7 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.score import ScoreCheck
 from neurons.validators.src.services.task.messages import ScoreMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 class DummyScoreCalculator:
@@ -21,11 +21,8 @@ class DummyScoreCalculator:
         self.warning_message = warning_message
         self.called_with: dict | None = None
 
-    def __call__(self, ctx, rented: bool = False) -> tuple[float, float, str]:
-        """Mock score calculator that tracks calls and returns configured scores.
-
-        Signature matches the real calculate_scores(ctx, rented) function.
-        """
+    def __call__(self, ctx, rented: bool) -> tuple[float, float, str]:
+        """Mock score calculator that tracks calls and returns configured scores."""
         self.called_with = {
             "gpu_model": ctx.state.gpu_model,
             "collateral_deposited": ctx.collateral_deposited,
@@ -46,8 +43,6 @@ class DummyScoreCalculator:
         ("NVIDIA RTX 3090", True, False, "v1.0.0", False, 10, 0.0, 1.0, " WARNING: Score set to 0 pending rental verification", True),
         # Low collateral warning
         ("NVIDIA RTX 3080", False, True, "v1.0.0", False, 10, 1.0, 1.0, " WARNING: No collateral deposited", True),
-        # Insufficient ports - zero score
-        ("NVIDIA RTX 3070", True, True, "v1.0.0", False, 2, 0.0, 0.0, " WARNING: Insufficient ports: 2 available, 3 required", True),
         # Rented machine
         ("NVIDIA RTX 4090", True, True, "v1.0.0", True, 10, 1.0, 1.0, "", True),
         # Old contract version

@@ -34,7 +34,37 @@ from neurons.validators.src.services.task.checks import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
 
-from tests.helpers import build_context_config, build_services, build_state
+from datura.requests.miner_requests import ExecutorSSHInfo
+from helpers import build_context_config, build_services, build_state
+from protocol.vc_protocol.compute_requests import (
+    RentedExecutor,
+    RentedExecutorsResponse,
+    RentedPod,
+)
+
+
+def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
+    """Create a real ExecutorSSHInfo for tests."""
+    return ExecutorSSHInfo(
+        uuid=uuid,
+        address="192.168.1.100",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
+
+class DummyKeypair:
+    """Keypair that can be serialized (unlike Mock)."""
+
+    def __init__(self):
+        self.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+    def sign(self, data: bytes) -> bytes:
+        return b"\x00" * 64
 
 
 def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
@@ -123,6 +153,13 @@ class DummySFTPClient:
         pass
 
 
+class SimpleSSHResult:
+    """Simple SSH result that is JSON serializable."""
+
+    def __init__(self, stdout: str = ""):
+        self.stdout = stdout
+
+
 class DummySSHClient:
     """Mock SSH client with SFTP support."""
 
@@ -140,15 +177,10 @@ class DummySSHClient:
 
     async def run(self, command: str):
         """Mock SSH run for various commands."""
-        result = Mock()
-
         # Docker container checks for rented machines
         if "docker ps" in command:
-            result.stdout = ""  # Not rented
-        else:
-            result.stdout = ""
-
-        return result
+            return SimpleSSHResult(stdout="")  # Not rented
+        return SimpleSSHResult(stdout="")
 
 
 class DummySSHService:
@@ -237,18 +269,30 @@ class ConnectivityResult:
     """Result from port connectivity check (serializable)."""
 
     def __init__(self, sysbox_runtime: bool = True):
-        self.success = True
-        self.sysbox_runtime = sysbox_runtime
-        self.log_text = "Port connectivity verified"
-        self.verified_port_count = 10
-        self.verified_ports = list(range(20000, 20000 + self.verified_port_count))
+        from neurons.validators.src.services.executor_connectivity.models import (
+            PortPair,
+            PortVerificationResult,
+        )
+
+        ports = (PortPair(8000, 8000),)
+        self.result = PortVerificationResult(
+            selected_ports=ports,
+            successful_ports=ports,
+            failed_ports=tuple(),
+            dind_port=ports[0],
+            dind_ok=True,
+            sysbox_runtime=sysbox_runtime,
+            status="ok",
+            error=None,
+            elapsed_sec=1.0,
+        )
 
 
 class DummyConnectivityService:
     """Mock executor connectivity service."""
 
     async def verify_ports(self, *args, **kwargs):
-        return ConnectivityResult(kwargs.get("sysbox_runtime", True))
+        return ConnectivityResult(kwargs.get("sysbox_runtime", True)).result
 
 
 class DummyPortMappingService:
@@ -258,8 +302,18 @@ class DummyPortMappingService:
         return 10  # Sufficient ports
 
 
-def dummy_score_calculator(ctx, rented: bool = False):
-    """Mock score calculator matching real calculate_scores(ctx, rented) signature."""
+class DummyKeypair:
+    """Mock keypair that is JSON serializable."""
+
+    def __init__(self, ss58_address: str = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"):
+        self.ss58_address = ss58_address
+
+    def sign(self, data: bytes) -> bytes:
+        return b"\x00" * 64
+
+
+def dummy_score_calculator(ctx, rented: bool):
+    """Mock score calculator."""
     return 1.0, 1.0, ""  # actual_score, job_score, warning
 
 
@@ -449,14 +503,11 @@ async def test_successful_rented_pipeline_flow(context_factory):
 
         async def run(self, command: str):
             """Mock SSH run for various commands."""
-            result = Mock()
             if "docker ps" in command:
-                result.stdout = "container-id-123"  # Container is running
+                return SimpleSSHResult(stdout="container-id-123")  # Container is running
             elif "authorized_keys" in command:
-                result.stdout = "ssh-rsa AAA..."  # SSH keys present
-            else:
-                result.stdout = ""
-            return result
+                return SimpleSSHResult(stdout="ssh-rsa AAA...")  # SSH keys present
+            return SimpleSSHResult(stdout="")
 
     ssh_client = RentedSSHClient()
 

@@ -10,6 +10,15 @@ from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
+from services.executor_connectivity import ContainerCleanupService
+from services.executor_connectivity.container_runner import ContainerRunner
+from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
+from services.executor_connectivity.port_probe import PortProbe
+from services.executor_connectivity.port_selector import PortSelector
+from services.executor_connectivity.port_tester import PortTester
+from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
+from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
+from services.executor_connectivity.persister import PortResultPersister
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
@@ -57,9 +66,19 @@ class Validator:
             keypair=keypair,
         )
 
+        port_tester = PortTester()
+        runner = ContainerRunner()
         self.executor_connectivity_service = ExecutorConnectivityService(
-            redis_service=self.redis_service,
-            port_mapping_dao=self.port_mapping_dao,
+            orchestrator=ConnectivityOrchestrator(
+                PortSelector(),
+                PortProbe(
+                    BatchVerifier(port_tester, runner),
+                    FallbackVerifier(port_tester, runner),
+                ),
+                DindProbe(DindVerifier(ssh_service)),
+            ),
+            persister=PortResultPersister(self.port_mapping_dao),
+            cleanup_service=ContainerCleanupService(),
         )
 
         task_service = TaskService(
@@ -393,11 +412,21 @@ class Validator:
                         ),
                     )
 
+                    total_executors = 0
+                    successful_executors = 0
+                    failed_executors = 0
+
                     for miner_hotkey, results in all_job_results.items():
                         for result in results:
+                            total_executors += 1
                             score = await self.calc_job_score(total_gpu_model_count_map, result)
                             result.score = score
                             self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+
+                            if result.job_score == 1.0:
+                                successful_executors += 1
+                            else:
+                                failed_executors += 1
 
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
@@ -412,6 +441,9 @@ class Validator:
                                     "job_batch_id": job_batch_id,
                                     "miner_scores": self.miner_scores,
                                     "open_fd_count": open_fd_count,
+                                    "total_executors": total_executors,
+                                    "successful_executors": successful_executors,
+                                    "failed_executors": failed_executors,
                                 }
                             ),
                         ),
@@ -466,7 +498,7 @@ class Validator:
         logger.info(
             _m(
                 "[start] Starting Validator in background",
-                extra=get_extra_info(self.default_extra),
+                extra=get_extra_info({**self.default_extra, "dry_run": settings.DRY_RUN}),
             ),
         )
         try:
@@ -475,9 +507,9 @@ class Validator:
 
             while not self.should_exit:
                 await self.sync()
-
-                # sync every 12 seconds
-                await asyncio.sleep(SYNC_CYCLE)
+                self.should_exit = settings.DRY_RUN
+                if not settings.DRY_RUN:
+                    await asyncio.sleep(SYNC_CYCLE)
 
         except KeyboardInterrupt:
             logger.info(
