@@ -69,9 +69,6 @@ class Validator:
         port_tester = PortTester()
         runner = ContainerRunner()
         self.executor_connectivity_service = ExecutorConnectivityService(
-            redis_service=self.redis_service,
-            port_mapping_dao=self.port_mapping_dao,
-            ssh_service=ssh_service,
             orchestrator=ConnectivityOrchestrator(
                 PortSelector(),
                 PortProbe(

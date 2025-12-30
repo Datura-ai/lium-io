@@ -3,8 +3,9 @@ import random
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from services.const import BATCH_PORT_VERIFICATION_SIZE
-from services.executor_connectivity.contracts import DindProbeProtocol, PortProbeProtocol
+from services.executor_connectivity.dind import DindProbe
 from services.executor_connectivity.models import PortVerificationResult
+from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 
 
@@ -14,8 +15,8 @@ class ConnectivityOrchestrator:
     def __init__(
         self,
         port_selector: PortSelector,
-        port_probe: PortProbeProtocol,
-        dind_probe: DindProbeProtocol,
+        port_probe: PortProbe,
+        dind_probe: DindProbe,
     ):
         self.port_selector = port_selector
         self.port_probe = port_probe

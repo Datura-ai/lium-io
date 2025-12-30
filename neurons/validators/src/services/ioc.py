@@ -47,9 +47,6 @@ async def initiate_services():
     port_tester = PortTester()
     runner = ContainerRunner()
     ioc["ExecutorConnectivityService"] = ExecutorConnectivityService(
-        redis_service=ioc["RedisService"],
-        port_mapping_dao=ioc["PortMappingDao"],
-        ssh_service=ioc["SSHService"],
         orchestrator=ConnectivityOrchestrator(
             PortSelector(),
             PortProbe(
