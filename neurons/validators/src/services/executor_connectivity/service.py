@@ -3,19 +3,10 @@ import time
 
 import asyncssh
 from datura.requests.miner_requests import ExecutorSSHInfo
-from daos.port_mapping_dao import PortMappingDao
-
 from services.executor_connectivity.cleanup_service import ContainerCleanupService
-from services.executor_connectivity.contracts import (
-    ContainerCleanupProtocol,
-    OrchestratorProtocol,
-    ResultPersisterProtocol,
-)
-from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.persister import PortResultPersister
-from services.redis_service import RedisService
-from services.ssh_service import SSHService
+from services.executor_connectivity.models import PortVerificationResult
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +20,10 @@ class ExecutorConnectivityService:
 
     def __init__(
         self,
-        redis_service: "RedisService",
-        port_mapping_dao: PortMappingDao,
-        ssh_service: SSHService,
-        orchestrator: OrchestratorProtocol,
-        persister: ResultPersisterProtocol,
-        cleanup_service: ContainerCleanupProtocol,
+        orchestrator: ConnectivityOrchestrator,
+        persister: PortResultPersister,
+        cleanup_service: ContainerCleanupService,
     ):
-        self.redis = redis_service
-        self.dao = port_mapping_dao
-        self.ssh_service = ssh_service
         self.orchestrator = orchestrator
         self.persister = persister
         self.cleanup_service = cleanup_service
