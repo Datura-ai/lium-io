@@ -2,7 +2,7 @@ import pytest
 
 from services.executor_connectivity.models import DindProbeResult, PortPair, PortProbeResult
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
-from services.executor_connectivity.dind import DindProbe
+from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 
