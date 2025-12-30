@@ -35,7 +35,7 @@ class PortConnectivityCheck:
                 updates={"default_extra": extra, "renting_in_progress": True},
             )
 
-        if not all([ctx.config.job_batch_id, ctx.config.port_private_key, ctx.config.port_public_key]):
+        if not ctx.config.job_batch_id:
             event = render_message(
                 Msg.CONFIG_MISSING,
                 ctx=ctx,
@@ -52,18 +52,16 @@ class PortConnectivityCheck:
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
             ctx.ssh,
-            ctx.config.job_batch_id or "",
             ctx.miner_hotkey,
             ctx.executor,
-            ctx.config.port_private_key or "",
-            ctx.config.port_public_key or "",
             ctx.state.sysbox_runtime,
             rented_ports=rented_ports,
             rented_pod_names=rented_pod_names,
         )
+        verified_port_count = len(result.successful_ports)
         extra_info = {
             "sysbox_runtime": result.sysbox_runtime,
-            "verified_port_count": result.verified_port_count,
+            "verified_port_count": verified_port_count,
         }
         updated_state = replace(
             ctx.state,
@@ -73,16 +71,25 @@ class PortConnectivityCheck:
                 "verified_ports": result.verified_ports,
             },
             sysbox_runtime=result.sysbox_runtime,
-            verified_port_count=result.verified_port_count,
+            verified_port_count=verified_port_count,
         )
 
-        if not result.success:
+        if result.status != "ok":
+            if result.status == "no_ports":
+                details = "No port available for docker container"
+            elif result.status == "no_working_ports":
+                details = "No working ports found"
+            elif result.status == "error":
+                details = f"Verification failed: {result.error}" if result.error else "Verification failed"
+            else:
+                details = "Verification failed"
+
             event = render_message(
                 Msg.VERIFY_FAILED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what={
-                    "details": result.log_text,
+                    "details": details,
                     "port_range": ctx.executor.port_range,
                     "port_mappings": ctx.executor.port_mappings,
                 },
@@ -94,11 +101,26 @@ class PortConnectivityCheck:
                 updates={"default_extra": extra, "state": updated_state},
             )
 
+        total = len(result.successful_ports) + len(result.failed_ports)
+        pct = (len(result.successful_ports) / total * 100) if total > 0 else 0
+        dind_status = "ok" if result.dind_ok else "failed"
+        batch_count = len(result.successful_ports) - (1 if result.dind_ok else 0)
+        batch_status = "ok" if batch_count > 0 else "failed"
+        ok_sample = sorted([p.internal for p in result.successful_ports])[:5]
+        fail_sample = sorted([p.internal for p in result.failed_ports])[:5]
+
+        msg = (
+            f"verification complete total_time={result.elapsed_sec:.2f}s {pct:.0f}% available, "
+            f"dind={dind_status} batch={batch_status} ok={len(result.successful_ports)}{ok_sample}"
+        )
+        if result.failed_ports:
+            msg += f" fail={len(result.failed_ports)}{fail_sample}"
+
         event = render_message(
             Msg.VERIFY_OK,
             ctx=ctx,
             check_id=self.check_id,
-            what={"message": result.log_text},
+            what={"message": msg},
             extra=extra_info,
         )
         return CheckResult(
