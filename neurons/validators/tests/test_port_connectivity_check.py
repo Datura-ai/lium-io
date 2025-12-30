@@ -76,7 +76,6 @@ class DummyConnectivityService:
             status=status,
             error=None if self.success else "No working ports found",
             elapsed_sec=1.0,
-            verified_ports=list(range(20000, 20000 + self.verified_port_count)),
         )
 
 
