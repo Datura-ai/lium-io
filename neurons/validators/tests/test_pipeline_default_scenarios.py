@@ -245,17 +245,30 @@ class ConnectivityResult:
     """Result from port connectivity check (serializable)."""
 
     def __init__(self, sysbox_runtime: bool = True):
-        self.success = True
-        self.sysbox_runtime = sysbox_runtime
-        self.log_text = "Port connectivity verified"
-        self.verified_port_count = 10
+        from neurons.validators.src.services.executor_connectivity.models import (
+            PortPair,
+            PortVerificationResult,
+        )
+
+        ports = (PortPair(8000, 8000),)
+        self.result = PortVerificationResult(
+            selected_ports=ports,
+            successful_ports=ports,
+            failed_ports=tuple(),
+            dind_port=ports[0],
+            dind_ok=True,
+            sysbox_runtime=sysbox_runtime,
+            status="ok",
+            error=None,
+            elapsed_sec=1.0,
+        )
 
 
 class DummyConnectivityService:
     """Mock executor connectivity service."""
 
     async def verify_ports(self, *args, **kwargs):
-        return ConnectivityResult(kwargs.get("sysbox_runtime", True))
+        return ConnectivityResult(kwargs.get("sysbox_runtime", True)).result
 
 
 class DummyPortMappingService:
