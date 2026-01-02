@@ -55,6 +55,30 @@ def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
         root_dir="/root/app",
     )
 
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
+
+class DummyKeypair:
+    """Keypair that can be serialized (unlike Mock)."""
+
+    def __init__(self):
+        self.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+    def sign(self, data: bytes) -> bytes:
+        return b"\x00" * 64
+
+
+def make_executor(uuid: str = "executor-123") -> ExecutorSSHInfo:
+    """Create a real ExecutorSSHInfo for tests."""
+    return ExecutorSSHInfo(
+        uuid=uuid,
+        address="192.168.1.100",
+        port=8080,
+        ssh_username="root",
+        ssh_port=22,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+
 
 class DummyKeypair:
     """Keypair that can be serialized (unlike Mock)."""

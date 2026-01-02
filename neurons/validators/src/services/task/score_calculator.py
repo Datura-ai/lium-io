@@ -1,13 +1,13 @@
 """Score calculation logic for executor validation.
 
 This module contains the business logic for calculating actual and job scores
-based on collateral status, port availability, rental state, and contract versions.
+based on collateral status, rental state, and contract versions.
 """
 
 from typing import Tuple
 
 from core.config import settings
-from services.const import MIN_PORT_COUNT, MACHINE_PRICES
+from services.const import MACHINE_PRICES
 from services.task.pipeline import Context
 
 
@@ -23,7 +23,6 @@ def calculate_scores(
     Args:
         ctx: pipeline context
         rented: Whether the executor is currently rented
-        port_count: Number of available ports
 
     Returns:
         Tuple of (actual_score, job_score, warning_message)
@@ -36,7 +35,6 @@ def calculate_scores(
     is_rental_succeed = ctx.is_rental_succeed
     contract_version = ctx.contract_version or ""
     price_per_gpu = ctx.executor.price_per_gpu
-    port_count = ctx.port_count or 0
 
     warning_messages = []
     job_score = 1.0
@@ -45,13 +43,6 @@ def calculate_scores(
     if not is_rental_succeed and not settings.SKIP_RENTAL_VERIFICATION:
         actual_score = 0.0
         warning_messages.append("Score set to 0 pending rental verification")
-
-    if port_count < MIN_PORT_COUNT and not rented:
-        actual_score = 0.0
-        job_score = 0.0
-        warning_messages.append(
-            f"Insufficient ports: {port_count} available, {MIN_PORT_COUNT} required"
-        )
 
     # Machine price check
     base_price = MACHINE_PRICES.get(gpu_model, 0)
