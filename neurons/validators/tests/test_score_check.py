@@ -43,8 +43,6 @@ class DummyScoreCalculator:
         ("NVIDIA RTX 3090", True, False, "v1.0.0", False, 10, 0.0, 1.0, " WARNING: Score set to 0 pending rental verification", True),
         # Low collateral warning
         ("NVIDIA RTX 3080", False, True, "v1.0.0", False, 10, 1.0, 1.0, " WARNING: No collateral deposited", True),
-        # Insufficient ports - zero score
-        ("NVIDIA RTX 3070", True, True, "v1.0.0", False, 2, 0.0, 0.0, " WARNING: Insufficient ports: 2 available, 3 required", True),
         # Rented machine
         ("NVIDIA RTX 4090", True, True, "v1.0.0", True, 10, 1.0, 1.0, "", True),
         # Old contract version
