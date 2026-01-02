@@ -8,27 +8,27 @@ from ..pipeline import CheckResult, Context
 class PortCountCheck:
     """Record available ports so scoring can penalise poorly configured hosts.
 
-    The legacy task surfaced the DB/Redis-derived count in its final message and used it
-    for scoring. Keeping it as a check keeps that behaviour observable and testable.
+    Reads the verified port count from ctx.state (set by PortConnectivityCheck)
+    instead of querying the database.
     """
 
     check_id = "executor.validate.port_count"
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
-        port_mapping = ctx.services.port_mapping
-        executor_uuid = ctx.executor.uuid
-
-        port_count = await port_mapping.get_successful_ports_count(executor_uuid)
+        # Read verified_port_count from ctx.state (set by PortConnectivityCheck)
+        port_count = ctx.state.verified_port_count
 
         updated_state = replace(
             ctx.state,
             specs={
                 **ctx.state.specs,
                 "available_port_count": port_count,
+                "port_range": ctx.executor.port_range,
+                "port_mappings": ctx.executor.port_mappings,
             },
         )
-        
+
         event = render_message(
             Msg.PORT_COUNT_RECORDED,
             ctx=ctx,

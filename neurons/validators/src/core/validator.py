@@ -4,11 +4,21 @@ import os
 
 from daos.port_mapping_dao import PortMappingDao
 from payload_models.payloads import MinerJobRequestPayload
+from clients.backend_client import BackendClient
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
+from services.executor_connectivity import ContainerCleanupService
+from services.executor_connectivity.container_runner import ContainerRunner
+from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
+from services.executor_connectivity.port_probe import PortProbe
+from services.executor_connectivity.port_selector import PortSelector
+from services.executor_connectivity.port_tester import PortTester
+from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
+from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
+from services.executor_connectivity.persister import PortResultPersister
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
@@ -48,9 +58,27 @@ class Validator:
         self.verifyx_validation_service = VerifyXValidationService()
         self.collateral_contract_service = CollateralContractService()
         self.port_mapping_dao = PortMappingDao()
+
+        # Backend client for API requests
+        keypair = settings.get_bittensor_wallet().get_hotkey()
+        self.backend_client = BackendClient(
+            base_url=settings.COMPUTE_REST_API_URL or "",
+            keypair=keypair,
+        )
+
+        port_tester = PortTester()
+        runner = ContainerRunner()
         self.executor_connectivity_service = ExecutorConnectivityService(
-            redis_service=self.redis_service,
-            port_mapping_dao=self.port_mapping_dao,
+            orchestrator=ConnectivityOrchestrator(
+                PortSelector(),
+                PortProbe(
+                    BatchVerifier(port_tester, runner),
+                    FallbackVerifier(port_tester, runner),
+                ),
+                DindProbe(DindVerifier(ssh_service)),
+            ),
+            persister=PortResultPersister(self.port_mapping_dao),
+            cleanup_service=ContainerCleanupService(),
         )
 
         task_service = TaskService(
@@ -223,6 +251,17 @@ class Validator:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
 
+                # Fetch all rented executors from backend API
+                rented_executors = await self.backend_client.get_all_rented_executors()
+                if rented_executors is None:
+                    logger.error(
+                        _m(
+                            "[sync] Failed to fetch rented executors, skipping this iteration",
+                            extra=get_extra_info(self.default_extra),
+                        ),
+                    )
+                    return
+
                 logger.info(
                     _m(
                         "[sync] Send jobs to miners",
@@ -255,6 +294,7 @@ class Validator:
                                 miner_port=miner.axon_info.port,
                             ),
                             encrypted_files=encrypted_files,
+                            rented_data=rented_executors,
                         )
                     )
                     for miner in miners

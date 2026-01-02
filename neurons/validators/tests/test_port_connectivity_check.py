@@ -1,6 +1,7 @@
 import pytest
 from dataclasses import dataclass
 
+from neurons.validators.src.services.executor_connectivity.models import PortPair, PortVerificationResult
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
 
@@ -8,13 +9,6 @@ from tests.helpers import build_context_config, build_services, build_state
 
 
 # Mock result class matching DockerConnectionCheckResult
-@dataclass
-class MockConnectivityResult:
-    success: bool
-    log_text: str | None = None
-    sysbox_runtime: bool = False
-
-
 # Mock Redis service
 class DummyRedis:
     def __init__(self, *, renting_in_progress: bool = False):
@@ -26,43 +20,62 @@ class DummyRedis:
 
 # Mock connectivity service
 class DummyConnectivityService:
-    def __init__(self, *, success: bool, log_text: str = "", sysbox_runtime: bool = False):
+    def __init__(
+        self,
+        *,
+        success: bool,
+        log_text: str = "",
+        sysbox_runtime: bool = False,
+        verified_port_count: int = 0,
+    ):
         """
         Args:
             success: Whether verify_ports returns success
             log_text: The log message from verification
             sysbox_runtime: The sysbox runtime state to return
+            verified_port_count: Number of verified working ports
         """
         self.success = success
         self.log_text = log_text
         self.sysbox_runtime = sysbox_runtime
+        self.verified_port_count = verified_port_count
         self.called_with: dict | None = None
 
     async def verify_ports(
         self,
         ssh_client,
-        job_batch_id: str,
         miner_hotkey: str,
         executor_info,
-        private_key: str,
-        public_key: str,
         sysbox_runtime: bool,
-    ) -> MockConnectivityResult:
+        rented_ports: list[int] | None = None,
+        rented_pod_names: list[str] | None = None,
+    ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
         # Track what parameters we were called with
         self.called_with = {
-            "job_batch_id": job_batch_id,
             "miner_hotkey": miner_hotkey,
             "executor_uuid": executor_info.uuid,
-            "private_key": private_key,
-            "public_key": public_key,
             "sysbox_runtime": sysbox_runtime,
         }
 
-        return MockConnectivityResult(
-            success=self.success,
-            log_text=self.log_text,
+        if self.verified_port_count:
+            successful_ports = tuple(
+                PortPair(8000 + i, 8000 + i) for i in range(self.verified_port_count)
+            )
+        else:
+            successful_ports = tuple()
+        failed_ports = tuple()
+        status = "ok" if self.success else "no_working_ports"
+        return PortVerificationResult(
+            selected_ports=successful_ports,
+            successful_ports=successful_ports,
+            failed_ports=failed_ports,
+            dind_port=successful_ports[0] if successful_ports else None,
+            dind_ok=self.success,
             sysbox_runtime=self.sysbox_runtime,
+            status=status,
+            error=None if self.success else "No working ports found",
+            elapsed_sec=1.0,
         )
 
 
@@ -98,6 +111,7 @@ async def test_port_connectivity_check(
         success=verify_success,
         log_text="Port verification completed" if verify_success else "Port verification failed",
         sysbox_runtime=sysbox_runtime,
+        verified_port_count=100 if verify_success else 0,
     )
 
     services = build_services(
@@ -109,14 +123,10 @@ async def test_port_connectivity_check(
     if has_config:
         config = build_context_config(
             job_batch_id="batch-123",
-            port_private_key="private-key-data",
-            port_public_key="public-key-data",
         )
     else:
         config = build_context_config(
             job_batch_id=None,
-            port_private_key=None,
-            port_public_key=None,
         )
 
     state = build_state(sysbox_runtime=False)
@@ -148,10 +158,10 @@ async def test_port_connectivity_check(
     else:
         # Should call connectivity service
         assert connectivity_service.called_with is not None
-        assert connectivity_service.called_with["job_batch_id"] == "batch-123"
-        assert connectivity_service.called_with["private_key"] == "private-key-data"
-        assert connectivity_service.called_with["public_key"] == "public-key-data"
-
-        # Verify state update with sysbox_runtime
+        # Verify state update with sysbox_runtime and verified_port_count
         if "state" in result.updates:
             assert result.updates["state"].sysbox_runtime == sysbox_runtime
+            if verify_success:
+                assert result.updates["state"].verified_port_count == 100
+            else:
+                assert result.updates["state"].verified_port_count == 0

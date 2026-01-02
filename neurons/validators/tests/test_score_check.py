@@ -3,7 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.score import ScoreCheck
 from neurons.validators.src.services.task.messages import ScoreMessages as Msg
 
-from tests.helpers import build_context_config, build_services, build_state
+from helpers import build_context_config, build_services, build_state
 
 
 class DummyScoreCalculator:
@@ -21,11 +21,8 @@ class DummyScoreCalculator:
         self.warning_message = warning_message
         self.called_with: dict | None = None
 
-    def __call__(self, ctx, rented: bool = False) -> tuple[float, float, str]:
-        """Mock score calculator that tracks calls and returns configured scores.
-
-        Signature matches the real calculate_scores(ctx, rented) function.
-        """
+    def __call__(self, ctx, rented: bool) -> tuple[float, float, str]:
+        """Mock score calculator that tracks calls and returns configured scores."""
         self.called_with = {
             "gpu_model": ctx.state.gpu_model,
             "collateral_deposited": ctx.collateral_deposited,

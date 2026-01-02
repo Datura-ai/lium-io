@@ -628,5 +628,18 @@ sleep 60
             except Exception:
                 pass
 
-            failure_msg = f"dind: check failed port={internal_port}"
-            return DockerConnectionCheckResult(success=False, log_text=failure_msg, sysbox_runtime=sysbox_runtime,)
+__all__ = [
+    "ContainerRunner",
+    "BatchVerifier",
+    "DindVerifier",
+    "DockerCommand",
+    "DindProbeResult",
+    "ExecutorConnectivityService",
+    "FallbackVerifier",
+    "NetcatScript",
+    "PortPair",
+    "PortSelector",
+    "PortTester",
+]
+
+DockerConnectionCheckResult = DindProbeResult

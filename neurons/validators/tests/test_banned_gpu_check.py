@@ -2,16 +2,17 @@ import pytest
 
 from neurons.validators.src.services.task.checks.banned_gpu import BannedGpuCheck
 from neurons.validators.src.services.task.messages import BannedGpuMessages as Msg
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
 from tests.helpers import build_context_config, build_services, build_state
 
 
-class DummyRedis:
-    def __init__(self, banned: list[str]):
-        self._banned = banned
-
-    async def get_banned_guids(self) -> list[str]:
-        return self._banned
+def build_rented_data_with_banned_guids(banned_guids: list[str]) -> RentedExecutorsResponse:
+    """Create RentedExecutorsResponse with specified banned GUIDs."""
+    return RentedExecutorsResponse(
+        executors={},
+        banned_guids=banned_guids,
+    )
 
 
 @pytest.mark.parametrize(
@@ -31,9 +32,10 @@ async def test_banned_gpu_check(
     expect_clear,
     context_factory,
 ):
-    services = build_services(redis=DummyRedis(banned_list))
+    services = build_services()
     config = build_context_config()
-    state = build_state(specs={}, gpu_uuids=gpu_uuids)
+    rented_data = build_rented_data_with_banned_guids(banned_list)
+    state = build_state(specs={}, gpu_uuids=gpu_uuids, rented_data=rented_data)
 
     ctx = context_factory(services=services, config=config, state=state)
     result = await BannedGpuCheck().run(ctx)
