@@ -459,6 +459,14 @@ class PortCountMessages:
         category="runtime",
         impact="Proceed",
     )
+    INSUFFICIENT_PORTS = MessageTemplate(
+        event="Insufficient available ports",
+        reason="INSUFFICIENT_PORTS",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0",
+        remediation="Increase port range or check port mappings configuration.",
+    )
 
 
 class VerifyXMessages:
