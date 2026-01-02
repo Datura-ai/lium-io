@@ -71,6 +71,7 @@ class PortConnectivityCheck:
         msg = (
             f"verification complete total_time={elapsed:.2f}s {pct:.0f}% available, "
             f"dind={dind_status} batch={batch_status} ok={len(result.successful_ports)}{ok_sample}"
+            f" port_range={ctx.executor.port_range}, port_mappings={ctx.executor.port_mappings}"
         )
         if result.failed_ports:
             msg += f" fail={len(result.failed_ports)}{fail_sample}"
