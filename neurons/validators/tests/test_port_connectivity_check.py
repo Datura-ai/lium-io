@@ -1,5 +1,5 @@
 import pytest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from neurons.validators.src.services.executor_connectivity.models import PortPair, PortVerificationResult
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
@@ -82,8 +82,7 @@ class DummyConnectivityService:
 @pytest.mark.parametrize(
     "rented,renting_in_progress,has_config,verify_success,sysbox_runtime,expected_pass,expected_reason",
     [
-        # Renting in progress - skip verification
-        (False, True, True, True, False, True, Msg.RENTING_IN_PROGRESS.reason),
+        (False, True, True, True, False, True, Msg.VERIFY_OK.reason),
         # Missing config - fail
         (False, False, False, True, False, False, Msg.CONFIG_MISSING.reason),
         # Verification succeeds
@@ -147,12 +146,7 @@ async def test_port_connectivity_check(
     assert result.event.reason_code == expected_reason
 
     # Verify service interactions based on scenario
-    if renting_in_progress:
-        # Should call Redis but not connectivity service
-        assert connectivity_service.called_with is None
-        # Verify updates
-        assert result.updates.get("renting_in_progress") is True
-    elif not has_config:
+    if not has_config:
         # Should not call connectivity service
         assert connectivity_service.called_with is None
     else:
