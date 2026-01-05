@@ -54,8 +54,8 @@ class JSONFormatter(logging.Formatter):
             log_data["context"] = record.context
 
         # Extract extra data from _StructuredMessage if present
-        if hasattr(record, 'msg') and hasattr(record.msg, 'extra'):
-            log_data.update(record.msg.extra)
+        if hasattr(record, 'msg') and hasattr(record.msg, 'extra') and record.msg.extra:
+            log_data["extra"] = record.msg.extra
 
         # Add exception info if present
         if record.exc_info:
