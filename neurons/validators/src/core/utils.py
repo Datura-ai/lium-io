@@ -9,11 +9,67 @@ import asyncssh
 from core.config import settings
 from celium_collateral_contracts import CollateralContract
 
-logger = logging.getLogger(__name__)
-
 # Create a ContextVar to hold the context information
 context = contextvars.ContextVar("context", default="TaskService")
 context.set("TaskService")
+
+
+class JSONFormatter(logging.Formatter):
+    """Reusable JSON formatter for structured logging across all modules."""
+
+    def __init__(self, include_validator_hotkey=True):
+        super().__init__()
+        self.include_validator_hotkey = include_validator_hotkey
+        self._validator_hotkey = None
+
+    def _get_validator_hotkey(self):
+        """Lazy load validator hotkey to avoid initialization issues."""
+        if self._validator_hotkey is None and self.include_validator_hotkey:
+            try:
+                self._validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
+            except Exception:
+                self._validator_hotkey = "unknown"
+        return self._validator_hotkey
+
+    def format(self, record):
+        log_data = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "file": record.filename,
+            "function": record.funcName,
+            "line": record.lineno,
+            "process": record.process,
+        }
+
+        # Add validator hotkey if enabled
+        if self.include_validator_hotkey:
+            hotkey = self._get_validator_hotkey()
+            if hotkey:
+                log_data["validator"] = hotkey
+
+        # Add context if available
+        if hasattr(record, 'context'):
+            log_data["context"] = record.context
+
+        # Add asyncio task information if available
+        try:
+            task = asyncio.current_task()
+            if task:
+                log_data["coro_name"] = task.get_coro().__name__
+                log_data["task_id"] = id(task)
+        except Exception:
+            pass
+
+        # Add exception info if present
+        if record.exc_info:
+            log_data["exc_info"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_data, default=str)
+
+
+logger = logging.getLogger(__name__)
 
 
 def wait_for_services_sync(timeout=30):
@@ -78,12 +134,18 @@ def get_extra_info(extra: dict) -> dict:
 
 
 def configure_logs_of_other_modules():
-    validator_hotkey = settings.get_bittensor_wallet().get_hotkey().ss58_address
+    # Configure root logger with JSON formatter
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=f"Validator: {validator_hotkey} | Name: %(name)s | Time: %(asctime)s | Level: %(levelname)s | File: %(filename)s | Function: %(funcName)s | Line: %(lineno)s | Process: %(process)d | Message: %(message)s",
-    )
+    # Remove existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Add new handler with JSON formatter
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(JSONFormatter())
+    root_logger.addHandler(console_handler)
 
     sqlalchemy_logger = logging.getLogger("sqlalchemy")
     sqlalchemy_logger.setLevel(logging.WARNING)
@@ -97,34 +159,11 @@ def configure_logs_of_other_modules():
             record.context = context.get() or "Default"
             return True
 
-    # Create a custom formatter that adds the context to the log messages
-    class CustomFormatter(logging.Formatter):
-        def format(self, record):
-            try:
-                task = asyncio.current_task()
-                coro_name = task.get_coro().__name__ if task else "NoTask"
-                task_id = id(task) if task else "NoTaskID"
-                return f"{getattr(record, 'context', 'Default')} | {coro_name} | {task_id} | {super().format(record)}"
-            except Exception:
-                return ""
-
     asyncssh_logger = logging.getLogger("asyncssh")
     asyncssh_logger.setLevel(logging.WARNING)
 
     # Add the filter to the logger
     asyncssh_logger.addFilter(ContextFilter())
-
-    # Create a handler for the logger
-    handler = logging.StreamHandler()
-
-    # Add the handler to the logger
-    asyncssh_logger.handlers = []
-    asyncssh_logger.addHandler(handler)
-
-    # Set the formatter for the handler
-    handler.setFormatter(
-        CustomFormatter("%(name)s %(asctime)s %(levelname)s %(filename)s %(process)d %(message)s")
-    )
 
 
 def get_logger(name: str):
@@ -132,15 +171,14 @@ def get_logger(name: str):
         "version": 1,
         "disable_existing_loggers": False,
         "formatters": {
-            "verbose": {
-                "format": "%(levelname)-8s %(asctime)s --- "
-                "%(lineno)-8s [%(name)s] %(funcName)-24s : %(message)s",
+            "json": {
+                "()": JSONFormatter,
             }
         },
         "handlers": {
             "console": {
                 "class": "logging.StreamHandler",
-                "formatter": "verbose",
+                "formatter": "json",
             },
         },
         "root": {
