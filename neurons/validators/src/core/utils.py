@@ -53,14 +53,9 @@ class JSONFormatter(logging.Formatter):
         if hasattr(record, 'context'):
             log_data["context"] = record.context
 
-        # Add asyncio task information if available
-        try:
-            task = asyncio.current_task()
-            if task:
-                log_data["coro_name"] = task.get_coro().__name__
-                log_data["task_id"] = id(task)
-        except Exception:
-            pass
+        # Extract extra data from _StructuredMessage if present
+        if hasattr(record, 'msg') and hasattr(record.msg, 'extra'):
+            log_data.update(record.msg.extra)
 
         # Add exception info if present
         if record.exc_info:
@@ -203,16 +198,20 @@ def get_logger(name: str):
     return logger
 
 
-class StructuredMessage:
-    def __init__(self, message, extra: dict):
+class _StructuredMessage:
+    """Holds message and extra data for structured logging."""
+    def __init__(self, message: str, extra: dict = None):
         self.message = message
-        self.extra = extra
+        self.extra = extra or {}
 
     def __str__(self):
-        return "%s >>> %s" % (self.message, json.dumps(self.extra, default=str))  # noqa
+        # Just return the message, not the concatenated version
+        return self.message
 
 
-_m = StructuredMessage
+def _m(message: str, extra: dict = None):
+    """Helper to create structured log messages."""
+    return _StructuredMessage(message, extra)
 
 
 async def retry_ssh_command(
