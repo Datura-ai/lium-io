@@ -105,7 +105,7 @@ class TaskService:
                     miner_info=miner_info,
                     executor_info=executor_info,
                     verified_job_info=base_ctx.verified,  # From original context
-                    log_text=str(log_text),
+                    log_text=log_text.to_full_string(),
                     success=success,
                 )
 
@@ -132,7 +132,7 @@ class TaskService:
                 collateral_deposited=False,
                 job_batch_id=miner_info.job_batch_id,
                 log_status="error",
-                log_text=str(log_text),
+                log_text=log_text.to_full_string(),
                 gpu_model=None,
                 gpu_count=0,
                 sysbox_runtime=False,
