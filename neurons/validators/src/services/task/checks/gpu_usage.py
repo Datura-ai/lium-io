@@ -1,6 +1,6 @@
 from ..messages import GpuUsageMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from services.const import GPU_MEMORY_UTILIZATION_LIMIT, GPU_UTILIZATION_LIMIT
+from services.const import GPU_MEMORY_UTILIZATION_LIMIT, GPU_UTILIZATION_LIMIT, POD_CONTAINER_PREFIX
 
 
 class GpuUsageCheck:
@@ -27,7 +27,7 @@ class GpuUsageCheck:
         # Check for orphaned rental containers
         for process in gpu_processes:
             container_name = process.get("container_name")
-            if container_name and container_name.startswith("container_") and not ctx.rented:
+            if container_name and container_name.startswith(POD_CONTAINER_PREFIX) and not ctx.rented:
                 # Found orphaned rental container - rental ended but container still running
                 event = render_message(
                     Msg.ORPHANED_CONTAINER,

@@ -27,9 +27,9 @@ class ContainerCleanupService:
                 if n and n not in active_pod_names
             ]
             if names:
-                logger.info("cleanup: found %s containers", len(names))
+                logger.info(f"cleanup: found {len(names)} containers, {names=}", )
                 await ssh.run(f"/usr/bin/docker rm {' '.join(names)} -f")
                 await ssh.run(DockerCommand.volume_prune())
-                logger.info("cleanup: removed %s containers", len(names))
+                logger.info(f"cleanup: removed {len(names)} containers, {names=}")
         except Exception as e:
             logger.error("cleanup failed: %s", e, exc_info=True)
