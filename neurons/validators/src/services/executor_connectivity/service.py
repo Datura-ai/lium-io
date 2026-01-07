@@ -3,6 +3,7 @@ import time
 
 import asyncssh
 from datura.requests.miner_requests import ExecutorSSHInfo
+from services.const import POD_CONTAINER_PREFIX
 from services.executor_connectivity.cleanup_service import ContainerCleanupService
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.persister import PortResultPersister
@@ -43,7 +44,7 @@ class ExecutorConnectivityService:
             await self.cleanup_service.cleanup(
                 ssh_client,
                 rented_pod_names or [],
-                "container_",
+                POD_CONTAINER_PREFIX,
             )
 
             verification = await self.orchestrator.verify(

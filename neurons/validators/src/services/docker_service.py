@@ -40,7 +40,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
 from daos.port_mapping_dao import PortMappingDao
-from services.const import PREFERRED_POD_PORTS, MIN_PORT_COUNT
+from services.const import POD_CONTAINER_PREFIX, PREFERRED_POD_PORTS, MIN_PORT_COUNT
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
@@ -315,7 +315,7 @@ class DockerService:
             # wait until the docker connection check is finished.
             await asyncio.sleep(sleep)
 
-            container_names = " ".join([container for container in result.stdout.strip().split("\n") if pod_name == container or 'container_' in container])
+            container_names = " ".join([container for container in result.stdout.strip().split("\n") if pod_name == container or container.startswith(POD_CONTAINER_PREFIX)])
             if not container_names:
                 return
 
@@ -779,7 +779,7 @@ class DockerService:
                     else ""
                 )
 
-                container_name = f"pod_{payload.pod_id}"
+                container_name = f"{POD_CONTAINER_PREFIX}{payload.pod_id}"
 
                 await self.clean_existing_containers(
                     ssh_client=ssh_client,
