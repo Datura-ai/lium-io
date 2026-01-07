@@ -205,8 +205,12 @@ class _StructuredMessage:
         self.extra = extra or {}
 
     def __str__(self):
-        # Just return the message, not the concatenated version
+        # Just return the message for JSON formatter (extra is extracted separately)
         return self.message
+
+    def to_full_string(self) -> str:
+        """Return message with full JSON extra data for database storage."""
+        return "%s >>> %s" % (self.message, json.dumps(self.extra, default=str))
 
 
 def _m(message: str, extra: dict = None):
