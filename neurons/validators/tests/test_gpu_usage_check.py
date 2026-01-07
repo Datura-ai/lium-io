@@ -1,5 +1,6 @@
 import pytest
 
+from neurons.validators.src.services.const import POD_CONTAINER_PREFIX
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 
@@ -84,12 +85,14 @@ async def test_gpu_usage_orphaned_container(context_factory):
     config = build_context_config()
 
     # GPU usage exceeds limits with orphaned rental container
+    pod_id = "5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    container_name = f"{POD_CONTAINER_PREFIX}{pod_id}"
     gpu_details = [{"gpu_utilization": 100, "memory_utilization": 61}]
     gpu_processes = [
         {
             "pid": 3217038,
             "info": "0::/../df2b545dac1b4caa3642d0db98ca054a0d923a1d0a3e470b60852c5aac81301f/init.scope",
-            "container_name": "container_5703f4c9-c2f4-4fae-a652-3dee4753030a",
+            "container_name": container_name,
         }
     ]
 
@@ -100,7 +103,7 @@ async def test_gpu_usage_orphaned_container(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
-    assert result.event.what_we_saw.get("orphaned_container") == "container_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    assert result.event.what_we_saw.get("orphaned_container") == container_name
     assert result.event.what_we_saw.get("rental_status") == "ended"
     assert result.event.what_we_saw.get("container_status") == "still running"
-    assert "docker stop container_5703f4c9-c2f4-4fae-a652-3dee4753030a" in result.event.remediation
+    assert f"docker stop {container_name}" in result.event.remediation

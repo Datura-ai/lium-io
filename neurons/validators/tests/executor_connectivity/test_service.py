@@ -1,5 +1,6 @@
 import pytest
 
+from services.const import POD_CONTAINER_PREFIX
 from services.executor_connectivity_service import ExecutorConnectivityService, PortPair
 from services.executor_connectivity.models import PortVerificationResult
 
@@ -56,7 +57,7 @@ async def test_verify_ports_successful_flow(
     cleanup_service.cleanup.assert_called_once_with(
         mock_ssh_client,
         rented_pod_names,
-        "container_",
+        POD_CONTAINER_PREFIX,
     )
     orchestrator.verify.assert_called_once()
     persister.save.assert_called_once()
@@ -109,7 +110,7 @@ async def test_verify_ports_non_ok_status_skips_persist(
     cleanup_service.cleanup.assert_called_once_with(
         mock_ssh_client,
         [],
-        "container_",
+        POD_CONTAINER_PREFIX,
     )
     orchestrator.verify.assert_called_once()
     persister.save.assert_not_called()
