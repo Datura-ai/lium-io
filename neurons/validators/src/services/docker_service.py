@@ -35,6 +35,7 @@ from payload_models.payloads import (
     JupyterInstallationFailed,
     CustomOptions,
     ContainerWarningCode,
+    PayloadPortMapping,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -88,14 +89,22 @@ class DockerService:
         internal_ports: list[int] | None = None,
         initial_port_count: int | None = None,
         enable_jupyter: bool | None = False,
+        available_ports_raw: list[PayloadPortMapping] | None = None,
+        pod_mapping_raw: list[PayloadPortMapping] | None = None
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
         executor_uuid = UUID(executor_id)
 
         try:
             # Use distributed lock to prevent race conditions when allocating ports
             async with self.redis_service.acquire_executor_lock(executor_id):
-                available_ports = await self.port_mapping_dao.get_available_ports_excluding_rented(executor_uuid)
-                pod_mapping = await self.port_mapping_dao.get_ports_for_pod(pod_id)
+                # Use data from backend if provided, otherwise fallback to DB
+                if available_ports_raw is not None and pod_mapping_raw is not None:
+                    available_ports, pod_mapping = self._convert_payload_ports(available_ports_raw, pod_mapping_raw)
+                    logger.info(f"Using port data from backend: {len(available_ports)} available, {len(pod_mapping)} pod mappings")
+                else:
+                    available_ports = await self.port_mapping_dao.get_available_ports_excluding_rented(executor_uuid)
+                    pod_mapping = await self.port_mapping_dao.get_ports_for_pod(pod_id)
+                    logger.info(f"Using port data from DB (fallback): {len(available_ports)} available, {len(pod_mapping)} pod mappings")
 
                 if not pod_mapping and len(available_ports) < MIN_PORT_COUNT:
                     logger.warning(
@@ -170,6 +179,45 @@ class DockerService:
     def _find_mapping_by_docker_port(self, mappings: list[tuple[int, int, int]], docker_port: int) -> tuple[int, int, int] | None:
         """Find a port mapping by docker port number."""
         return next((m for m in mappings if m[0] == docker_port), None)
+
+    def _convert_payload_ports(
+        self,
+        available_ports_raw: list[PayloadPortMapping],
+        pod_mapping_raw: list[PayloadPortMapping],
+    ) -> tuple[dict[int, PortMapping], dict[int, PortMapping]]:
+        """
+        Convert payload port mappings to the format expected by generate_portMappings.
+
+        Returns:
+            - available_ports: dict[external_port, PortMapping]
+            - pod_mapping: dict[docker_port, PortMapping]
+        """
+        available_ports: dict[int, PortMapping] = {}
+        for p in available_ports_raw:
+            # Create a minimal PortMapping object with required fields
+            port_mapping = PortMapping(
+                internal_port=p.internal_port,
+                external_port=p.external_port,
+                docker_port=p.docker_port,
+                miner_hotkey="",  # Not used in port allocation logic
+                executor_id="00000000-0000-0000-0000-000000000000",  # Placeholder UUID
+            )
+            available_ports[p.external_port] = port_mapping
+
+        pod_mapping: dict[int, PortMapping] = {}
+        for p in pod_mapping_raw:
+            port_mapping = PortMapping(
+                internal_port=p.internal_port,
+                external_port=p.external_port,
+                docker_port=p.docker_port,
+                miner_hotkey="",
+                executor_id="00000000-0000-0000-0000-000000000000",
+            )
+            # Use docker_port as key if available, otherwise fallback to external_port
+            key = p.docker_port if p.docker_port is not None else p.external_port
+            pod_mapping[key] = port_mapping
+
+        return available_ports, pod_mapping
 
     async def execute_and_stream_logs(
         self,
@@ -611,7 +659,7 @@ class DockerService:
             custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
             port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, UUID(payload.pod_id), custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter
+                payload.miner_hotkey, payload.executor_id, UUID(payload.pod_id), custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter, payload.available_ports, payload.pod_mapping
             )
 
             # Add profiler for port mappings generation
