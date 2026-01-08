@@ -8,6 +8,7 @@ import pytest_asyncio
 from services.docker_service import DockerService
 from models.port_mapping import PortMapping
 from .factories import create_port_mapping, create_port_mappings_batch
+from payload_models.payloads import PayloadPortMapping
 
 
 def create_mock_port_dict(
@@ -553,3 +554,188 @@ async def test_pod_mapping_partial_reuse(docker_service, test_executor_id, test_
     # Ports 8080 and 8081 should be allocated from available
     assert (8080, 8080, 8080) in result
     assert (8081, 8081, 8081) in result
+
+
+# =============================================================================
+# Tests for _convert_payload_ports and backend data flow
+# =============================================================================
+
+def test_convert_payload_ports_available_ports(docker_service):
+    """Test _convert_payload_ports correctly converts available_ports list to dict."""
+    # Arrange
+    available_ports_raw = [
+        PayloadPortMapping(internal_port=20000, external_port=20000, docker_port=None),
+        PayloadPortMapping(internal_port=20001, external_port=20001, docker_port=None),
+        PayloadPortMapping(internal_port=20002, external_port=20002, docker_port=None),
+    ]
+    pod_mapping_raw: list[PayloadPortMapping] = []
+
+    # Act
+    available_ports, pod_mapping = docker_service._convert_payload_ports(
+        available_ports_raw, pod_mapping_raw
+    )
+
+    # Assert
+    assert len(available_ports) == 3
+    assert len(pod_mapping) == 0
+
+    # Check dict is keyed by external_port
+    assert 20000 in available_ports
+    assert 20001 in available_ports
+    assert 20002 in available_ports
+
+    # Check PortMapping fields
+    assert available_ports[20000].internal_port == 20000
+    assert available_ports[20000].external_port == 20000
+
+
+def test_convert_payload_ports_pod_mapping_with_docker_port(docker_service):
+    """Test _convert_payload_ports correctly converts pod_mapping with docker_port as key."""
+    # Arrange
+    available_ports_raw: list[PayloadPortMapping] = []
+    pod_mapping_raw = [
+        PayloadPortMapping(internal_port=20000, external_port=20000, docker_port=22),
+        PayloadPortMapping(internal_port=20001, external_port=20001, docker_port=8080),
+    ]
+
+    # Act
+    available_ports, pod_mapping = docker_service._convert_payload_ports(
+        available_ports_raw, pod_mapping_raw
+    )
+
+    # Assert
+    assert len(available_ports) == 0
+    assert len(pod_mapping) == 2
+
+    # Check dict is keyed by docker_port
+    assert 22 in pod_mapping
+    assert 8080 in pod_mapping
+
+    # Check PortMapping fields
+    assert pod_mapping[22].internal_port == 20000
+    assert pod_mapping[22].external_port == 20000
+    assert pod_mapping[22].docker_port == 22
+
+
+def test_convert_payload_ports_pod_mapping_fallback_to_external_port(docker_service):
+    """Test _convert_payload_ports uses external_port as key when docker_port is None."""
+    # Arrange
+    available_ports_raw: list[PayloadPortMapping] = []
+    pod_mapping_raw = [
+        PayloadPortMapping(internal_port=20000, external_port=20000, docker_port=None),
+    ]
+
+    # Act
+    available_ports, pod_mapping = docker_service._convert_payload_ports(
+        available_ports_raw, pod_mapping_raw
+    )
+
+    # Assert
+    assert len(pod_mapping) == 1
+    # Should use external_port as key when docker_port is None
+    assert 20000 in pod_mapping
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_uses_backend_data_when_provided(
+    docker_service, test_executor_id, test_miner_hotkey
+):
+    """Test that generate_portMappings uses backend data instead of DB when provided."""
+    # Arrange - backend data
+    available_ports_raw = [
+        PayloadPortMapping(internal_port=22, external_port=22, docker_port=None),
+        PayloadPortMapping(internal_port=8080, external_port=8080, docker_port=None),
+        PayloadPortMapping(internal_port=8081, external_port=8081, docker_port=None),
+    ]
+    pod_mapping_raw: list[PayloadPortMapping] = []
+
+    # Mock DAO - should NOT be called
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock()
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock()
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
+
+    # Act
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey,
+        test_executor_id,
+        uuid4(),
+        [22, 8080, 8081],
+        available_ports_raw=available_ports_raw,
+        pod_mapping_raw=pod_mapping_raw,
+    )
+
+    # Assert
+    assert len(result) == 3
+    assert (22, 22, 22) in result
+    assert (8080, 8080, 8080) in result
+    assert (8081, 8081, 8081) in result
+
+    # DAO methods for fetching ports should NOT be called
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented.assert_not_called()
+    docker_service.port_mapping_dao.get_ports_for_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_falls_back_to_db_when_no_backend_data(
+    docker_service, test_executor_id, test_miner_hotkey
+):
+    """Test that generate_portMappings falls back to DB when backend data is None."""
+    # Arrange - no backend data (None)
+    mock_ports = create_mock_port_dict([22, 8080, 8081], test_miner_hotkey, UUID(test_executor_id))
+
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented = AsyncMock(return_value=mock_ports)
+    docker_service.port_mapping_dao.get_ports_for_pod = AsyncMock(return_value={})
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
+
+    # Act - no available_ports_raw or pod_mapping_raw
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey,
+        test_executor_id,
+        uuid4(),
+        [22, 8080, 8081],
+        available_ports_raw=None,
+        pod_mapping_raw=None,
+    )
+
+    # Assert
+    assert len(result) == 3
+
+    # DAO methods should be called (fallback)
+    docker_service.port_mapping_dao.get_available_ports_excluding_rented.assert_called_once()
+    docker_service.port_mapping_dao.get_ports_for_pod.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_with_backend_pod_mapping_reuse(
+    docker_service, test_executor_id, test_miner_hotkey
+):
+    """Test that existing pod mappings from backend are reused correctly."""
+    # Arrange - backend provides both available ports and existing pod mapping
+    available_ports_raw = [
+        PayloadPortMapping(internal_port=9000, external_port=9000, docker_port=None),
+        PayloadPortMapping(internal_port=9001, external_port=9001, docker_port=None),
+    ]
+    # Pod already has port 22 mapped
+    pod_mapping_raw = [
+        PayloadPortMapping(internal_port=20000, external_port=20000, docker_port=22),
+    ]
+
+    docker_service.port_mapping_dao.reserve_ports_for_pod = AsyncMock()
+
+    # Act
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey,
+        test_executor_id,
+        uuid4(),
+        [22, 8080, 8081],
+        available_ports_raw=available_ports_raw,
+        pod_mapping_raw=pod_mapping_raw,
+    )
+
+    # Assert
+    assert len(result) == 3
+    # Port 22 should be reused from pod_mapping
+    assert (22, 20000, 20000) in result
+    # Other ports should come from available_ports
+    other_mappings = [m for m in result if m[0] != 22]
+    assert len(other_mappings) == 2
