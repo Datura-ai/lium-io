@@ -213,6 +213,12 @@ class ExternalVolumeInfo(BaseModel):
     iam_user_secret_key: str
 
 
+class PayloadPortMapping(BaseModel):
+    docker_port: int | None = None
+    internal_port: int
+    external_port: int
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
@@ -233,6 +239,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     backup_log_id: str | None = None
     restore_path: str | None = None
     enable_jupyter: bool | None = None
+    available_ports: list[PayloadPortMapping] | None = None
+    pod_mapping: list[PayloadPortMapping] | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
