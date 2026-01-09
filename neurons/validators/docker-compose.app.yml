@@ -36,7 +36,7 @@ services:
     expose:
       - ${INTERNAL_PORT}
     volumes:
-      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+      - ${BITTENSOR_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
       - db
       - redis
@@ -52,7 +52,7 @@ services:
       - REDIS_PORT=6379
       - DRY_RUN=true
     volumes:
-      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+      - ${BITTENSOR_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
       - db
       - redis
@@ -70,7 +70,7 @@ services:
       - COMPUTE_APP_URI=wss://lium.io
     command: pdm run src/connector.py
     volumes:
-      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+      - ${BITTENSOR_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
       - db
       - redis
