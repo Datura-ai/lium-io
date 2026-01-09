@@ -78,7 +78,7 @@ def wait_for_services_sync(timeout=30):
     from core.config import settings
 
     # Initialize Redis client
-    redis_client = Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT)
+    redis_client = Redis.from_url(settings.get_redis_connection_url())
 
     start_time = time.time()
 

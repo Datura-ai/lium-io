@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 class RedisService:
     def __init__(self):
-        self.redis = aioredis.from_url(f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}")
+        self.redis = aioredis.from_url(settings.get_redis_connection_url())
         self.lock = asyncio.Lock()
 
     @asynccontextmanager
