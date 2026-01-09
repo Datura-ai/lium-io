@@ -28,8 +28,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     PROJECT_NAME: str = "compute-subnet-miner"
 
-    BITTENSOR_WALLET_DIRECTORY: pathlib.Path = Field(
-        env="BITTENSOR_WALLET_DIRECTORY",
+    BITTENSOR_WALLET_DIR: pathlib.Path = Field(
+        env="BITTENSOR_WALLET_DIR",
         default=pathlib.Path("~").expanduser() / ".bittensor" / "wallets",
     )
     BITTENSOR_WALLET_NAME: str = Field(env="BITTENSOR_WALLET_NAME")
@@ -78,7 +78,7 @@ class Settings(BaseSettings):
         wallet = bittensor.wallet(
             name=self.BITTENSOR_WALLET_NAME,
             hotkey=self.BITTENSOR_WALLET_HOTKEY_NAME,
-            path=str(self.BITTENSOR_WALLET_DIRECTORY),
+            path=str(self.BITTENSOR_WALLET_DIR),
         )
         wallet.hotkey_file.get_keypair()  # this raises errors if the keys are inaccessible
         return wallet
