@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     PROJECT_NAME: str = "compute-subnet-validator"
 
-    BITTENSOR_WALLET_DIRECTORY: pathlib.Path = Field(
-        env="BITTENSOR_WALLET_DIRECTORY",
+    BITTENSOR_WALLET_DIR: pathlib.Path = Field(
+        env="BITTENSOR_WALLET_DIR",
         default=pathlib.Path("~").expanduser() / ".bittensor" / "wallets",
     )
     BITTENSOR_WALLET_NAME: str = Field(env="BITTENSOR_WALLET_NAME")
@@ -59,6 +59,8 @@ class Settings(BaseSettings):
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)
+    REDIS_USERNAME: str | None = Field(env="REDIS_USERNAME", default=None)
+    REDIS_PASSWORD: str | None = Field(env="REDIS_PASSWORD", default=None)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io")
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
@@ -121,10 +123,15 @@ class Settings(BaseSettings):
         wallet = bittensor.wallet(
             name=self.BITTENSOR_WALLET_NAME,
             hotkey=self.BITTENSOR_WALLET_HOTKEY_NAME,
-            path=str(self.BITTENSOR_WALLET_DIRECTORY),
+            path=str(self.BITTENSOR_WALLET_DIR),
         )
         wallet.hotkey_file.get_keypair()  # this raises errors if the keys are inaccessible
         return wallet
+
+    def get_redis_connection_url(self) -> str:
+        if settings.REDIS_USERNAME and settings.REDIS_PASSWORD:
+            return f"redis://{settings.REDIS_USERNAME}:{settings.REDIS_PASSWORD}@{settings.REDIS_HOST}:{int(settings.REDIS_PORT)}"
+        return f"redis://{settings.REDIS_HOST}:{int(settings.REDIS_PORT)}"
 
     def get_latest_contract_version(self) -> str:
         return max(self.CONTRACT_VERSIONS.keys())
