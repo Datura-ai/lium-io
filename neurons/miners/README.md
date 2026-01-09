@@ -65,7 +65,7 @@ Fill in your information for:
 
 `RENTAL_REQUEST_HOOK`: (Optional) The URL for the call hook. Miners will terminate chute programs within seconds using this hook.
 
-`HOST_WALLET_DIR`: The directory path of your wallet on the machine.
+`BITTENSOR_WALLET_DIR`: The directory path of your wallet on the machine.
 
 `INTERNAL_PORT` and `EXTERNAL_PORT`: Optionally customize these ports. Make sure the `EXTERNAL PORT` is open for external connections to connect to the validators.
 
