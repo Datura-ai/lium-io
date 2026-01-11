@@ -1,0 +1,23 @@
+name: Trigger Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deployment
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.DEPLOY_PAT }}
+          repository: Datura-ai/lium-io-deployment
+          event-type: ${{ github.ref_type == 'tag' && 'tag-release' || 'main-push' }}
+          client-payload: |
+            {
+              "sha": "${{ github.sha }}",
+              "ref": "${{ github.ref }}",
+              "ref_name": "${{ github.ref_name }}"
+            }
