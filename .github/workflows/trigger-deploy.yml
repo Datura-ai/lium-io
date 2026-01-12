@@ -2,7 +2,7 @@ name: Trigger Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, DAH-1723]
     tags: ["v*"]
 
 permissions: {}
