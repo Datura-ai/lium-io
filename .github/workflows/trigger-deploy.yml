@@ -15,7 +15,7 @@ jobs:
       - name: Trigger deployment
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.DEPLOY_PAT }}
+          token: ${{ secrets.LIUM_IO_DEPLOYMENT_PAT }}
           repository: Datura-ai/lium-io-deployment
           event-type: ${{ github.ref_type == 'tag' && 'tag-release' || 'main-push' }}
           client-payload: |
