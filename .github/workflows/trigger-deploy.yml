@@ -5,7 +5,8 @@ on:
     branches: [main, DAH-1723]
     tags: ["v*"]
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   notify:
