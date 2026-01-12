@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# Set mode (default: validator)
+MODE=${1:-validator}
+
 # Initialize Bittensor wallet from mnemonic
 if [ -n "$BITTENSOR_HOTKEY_MNEMONIC" ]; then
     # Validate required environment variables
@@ -17,7 +20,7 @@ if [ -n "$BITTENSOR_HOTKEY_MNEMONIC" ]; then
         --wallet.path $BITTENSOR_WALLET_DIR \
         --n-words 12 \
         --no-use-password \
-        --overwrite
+        --overwrite \
         --quiet
 
     pdm run btcli wallet regen_hotkey \
@@ -34,9 +37,12 @@ else
     echo "BITTENSOR_HOTKEY_MNEMONIC not set, skipping wallet initialization from seed phrase"
 fi
 
-
-# db migrate
-pdm run alembic upgrade head
-
-# run fastapi app
-pdm run src/validator.py
+if [ "$MODE" = "validator" ]; then
+    pdm run alembic upgrade head
+    pdm run src/validator.py
+elif [ "$MODE" = "connector" ]; then
+    pdm run src/connector.py
+else
+    echo "Error: Invalid mode '$MODE'. Use 'validator' or 'connector'."
+    exit 1
+fi
