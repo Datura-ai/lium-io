@@ -10,7 +10,7 @@ services:
     env_file: ./.env
     volumes:
       - db_data:/var/lib/postgresql/data
-
+  
   miner:
     image: daturaai/compute-subnet-miner:latest
     env_file: ./.env
@@ -21,7 +21,7 @@ services:
     expose:
       - ${INTERNAL_PORT}
     volumes:
-      - ${BITTENSOR_WALLET_DIR}:/root/.bittensor/wallets
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
       - db
 
@@ -32,7 +32,7 @@ services:
       - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     command: pdm run src/connector.py
     volumes:
-      - ${BITTENSOR_WALLET_DIR}:/root/.bittensor/wallets
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
       - db
 
