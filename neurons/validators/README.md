@@ -54,7 +54,7 @@ If did not correctly install, follow [this link](https://docs.docker.com/engine/
 cp neurons/validators/.env.template neurons/validators/.env
 ```
 
-Replace with your information for `BITTENSOR_WALLET_NAME`, `BITTENSOR_WALLET_HOTKEY_NAME`, `BITTENSOR_WALLET_DIR`.
+Replace with your information for `BITTENSOR_WALLET_NAME`, `BITTENSOR_WALLET_HOTKEY_NAME`, `HOST_WALLET_DIR`.
 If you want you can use different port for `INTERNAL_PORT`, `EXTERNAL_PORT`.
 
 #### Step 4: Docker Compose Up
