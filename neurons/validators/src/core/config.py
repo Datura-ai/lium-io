@@ -129,9 +129,9 @@ class Settings(BaseSettings):
         return wallet
 
     def get_redis_connection_url(self) -> str:
-        if settings.REDIS_USERNAME and settings.REDIS_PASSWORD:
-            return f"redis://{settings.REDIS_USERNAME}:{settings.REDIS_PASSWORD}@{settings.REDIS_HOST}:{int(settings.REDIS_PORT)}"
-        return f"redis://{settings.REDIS_HOST}:{int(settings.REDIS_PORT)}"
+        if self.REDIS_USERNAME and self.REDIS_PASSWORD:
+            return f"redis://{self.REDIS_USERNAME}:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{int(self.REDIS_PORT)}"
+        return f"redis://{self.REDIS_HOST}:{int(self.REDIS_PORT)}"
 
     def get_latest_contract_version(self) -> str:
         return max(self.CONTRACT_VERSIONS.keys())
