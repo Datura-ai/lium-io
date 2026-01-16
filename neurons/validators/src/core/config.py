@@ -111,6 +111,10 @@ class Settings(BaseSettings):
     
     # Use REST API instead of WebSocket for miner communication
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
+
+    # Enable Vulkan/DRI support by mounting /dev/dri in containers
+    # This allows GPU rendering capabilities (Vulkan, OpenGL) inside containers
+    ENABLE_VULKAN_SUPPORT: bool = Field(env="ENABLE_VULKAN_SUPPORT", default=True)
     
     # Machine Price Limit
     MACHINE_MAX_PRICE_RATE: float = Field(env="MACHINE_MAX_PRICE_RATE", default=2.0)
