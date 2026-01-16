@@ -39,6 +39,7 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
+from core.config import settings
 from core.utils import _m, get_extra_info, retry_ssh_command
 from daos.port_mapping_dao import PortMappingDao
 from services.const import POD_CONTAINER_PREFIX, PREFERRED_POD_PORTS, MIN_PORT_COUNT
@@ -875,11 +876,25 @@ class DockerService:
                         profilers.append({"name": "Docker volume creation step failed", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
 
+                # Check for /dev/dri availability (Vulkan/DRI support)
+                dri_flag = ""
+                if settings.ENABLE_VULKAN_SUPPORT:
+                    try:
+                        dri_check = await ssh_client.run("test -d /dev/dri && echo exists || echo missing")
+                        if dri_check.exit_status == 0 and dri_check.stdout and "exists" in dri_check.stdout:
+                            dri_flag = "--device /dev/dri "
+                            logger.info(_m("Vulkan/DRI support enabled: /dev/dri found on executor", extra=get_extra_info(default_extra)))
+                        else:
+                            logger.info(_m("Vulkan/DRI support disabled: /dev/dri not found on executor", extra=get_extra_info(default_extra)))
+                    except Exception as e:
+                        logger.warning(_m(f"Failed to check /dev/dri availability: {e}", extra=get_extra_info(default_extra)))
+
                 # Network permission flags (permission to create a network interface inside the container)
                 net_perm_flags = (
                     "--cap-add=NET_ADMIN "
                     "--sysctl net.ipv4.conf.all.src_valid_mark=1 "
                     "--device /dev/net/tun "
+                    f"{dri_flag}"
                 )
 
                 # GPU restriction flags
