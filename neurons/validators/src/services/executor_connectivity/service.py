@@ -6,7 +6,6 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from services.const import POD_CONTAINER_PREFIX
 from services.executor_connectivity.cleanup_service import ContainerCleanupService
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
-from services.executor_connectivity.persister import PortResultPersister
 from services.executor_connectivity.models import PortVerificationResult
 
 logger = logging.getLogger(__name__)
@@ -22,11 +21,9 @@ class ExecutorConnectivityService:
     def __init__(
         self,
         orchestrator: ConnectivityOrchestrator,
-        persister: PortResultPersister,
         cleanup_service: ContainerCleanupService,
     ):
         self.orchestrator = orchestrator
-        self.persister = persister
         self.cleanup_service = cleanup_service
 
     async def verify_ports(
@@ -66,8 +63,6 @@ class ExecutorConnectivityService:
                 elapsed_sec=time.monotonic() - t1,
             )
 
-            if result.status == "ok":
-                await self.persister.save(result, executor_info.uuid, miner_hotkey)
             return result
         except Exception as e:
             logger.error(

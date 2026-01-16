@@ -1,17 +1,4 @@
 services:
-  db:
-    image: postgres:14.0-alpine
-    healthcheck:
-      test: pg_isready -U postgres || exit 1
-    environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    restart: unless-stopped
-    env_file: ./.env
-    volumes:
-      - db_data:/var/lib/postgresql/data
-
   redis:
     image: daturaai/redis:7.4.2
     healthcheck:
@@ -27,8 +14,6 @@ services:
     image: daturaai/compute-subnet-validator:dev
     env_file: ./.env
     environment:
-      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
     ports:
@@ -38,15 +23,12 @@ services:
     volumes:
       - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
-      - db
       - redis
 
   connector:
     image: daturaai/compute-subnet-validator:dev
     env_file: ./.env
     environment:
-      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - COMPUTE_APP_URI=wss://dev.lium.io
@@ -54,9 +36,7 @@ services:
     volumes:
       - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
     depends_on:
-      - db
       - redis
 
 volumes:
-  db_data:
   redis_data:
