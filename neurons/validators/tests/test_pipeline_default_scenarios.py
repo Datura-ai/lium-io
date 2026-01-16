@@ -295,13 +295,6 @@ class DummyConnectivityService:
         return ConnectivityResult(kwargs.get("sysbox_runtime", True)).result
 
 
-class DummyPortMappingService:
-    """Mock port mapping service."""
-
-    async def get_successful_ports_count(self, executor_uuid: str) -> int:
-        return 10  # Sufficient ports
-
-
 class DummyKeypair:
     """Mock keypair that is JSON serializable."""
 
@@ -348,7 +341,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     validation_service = DummyValidationService()
     verifyx_service = DummyVerifyXService()
     connectivity_service = DummyConnectivityService()
-    port_mapping_service = DummyPortMappingService()
 
     # Setup services
     services = build_services(
@@ -358,7 +350,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         validation=validation_service,
         verifyx=verifyx_service,
         connectivity=connectivity_service,
-        port_mapping=port_mapping_service,
         score_calculator=dummy_score_calculator,
     )
 
@@ -539,14 +530,12 @@ async def test_successful_rented_pipeline_flow(context_factory):
     runner = DummySSHCommandRunner()
     redis_service = DummyRedisService()
     collateral_service = DummyCollateralService()
-    port_mapping_service = DummyPortMappingService()
 
     # Setup services
     services = build_services(
         ssh=ssh_service,
         redis=redis_service,
         collateral=collateral_service,
-        port_mapping=port_mapping_service,
         score_calculator=dummy_score_calculator,
     )
 

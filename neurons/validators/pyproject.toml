@@ -6,14 +6,12 @@ authors = [
     {name = "waris", email = "waris0609@outlook.com"},
 ]
 dependencies = [
-    "alembic>=1.16.5",
     "asyncssh>=2.21.0",
     "asgiref>=3.9.1",
     "bittensor==9.10.1",
     "bittensor-cli==9.11.0",
     "bittensor-commit-reveal==0.4.0",
     "celium-collateral==1.1.6",
-    "databases>=0.9.0",
     "datura @ file:///${PROJECT_ROOT}/../../datura",
     "fastapi>=0.110.3",
     "pydantic>=2.11.7",
@@ -22,19 +20,14 @@ dependencies = [
     "Nuitka==2.7.14",
     "pexpect>=4.9.0",
     "psutil>=7.0.0",
-    "psycopg2-binary>=2.9.10",
     "pyarmor==9.1.9",
     "pyinstaller==6.15.0",
     "redis>=6.4.0",
-    "SQLAlchemy>=2.0.43",
-    "sqlmodel>=0.0.24",
     "tenacity>=9.1.2",
     "uvicorn>=0.35.0",
     "pytest>=8.4.2",
     "pytest-asyncio>=0.25.0",
     "pytest-mock>=3.15.0",
-    "aiosqlite>=0.21.0",
-    "asyncpg>=0.30.0",
 ]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"

@@ -8,7 +8,6 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from daos.port_mapping_dao import PortMappingDao
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -33,7 +32,6 @@ class TaskService:
         verifyx_validation_service: Annotated[VerifyXValidationService, Depends(VerifyXValidationService)],
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
-        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -47,7 +45,6 @@ class TaskService:
             verifyx_validation_service=verifyx_validation_service,
             collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
-            port_mapping_dao=port_mapping_dao,
         )
 
     async def create_task(

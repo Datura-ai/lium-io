@@ -34,12 +34,8 @@ async def test_verify_ports_successful_flow(
         )
     )
 
-    persister = mocker.Mock()
-    persister.save = mocker.AsyncMock()
-
     executor_service = ExecutorConnectivityService(
         orchestrator=orchestrator,
-        persister=persister,
         cleanup_service=cleanup_service,
     )
 
@@ -60,11 +56,10 @@ async def test_verify_ports_successful_flow(
         POD_CONTAINER_PREFIX,
     )
     orchestrator.verify.assert_called_once()
-    persister.save.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_verify_ports_non_ok_status_skips_persist(
+async def test_verify_ports_non_ok_status(
     mock_ssh_client,
     sample_executor_info,
     mocker,
@@ -89,12 +84,8 @@ async def test_verify_ports_non_ok_status_skips_persist(
         )
     )
 
-    persister = mocker.Mock()
-    persister.save = mocker.AsyncMock()
-
     executor_service = ExecutorConnectivityService(
         orchestrator=orchestrator,
-        persister=persister,
         cleanup_service=cleanup_service,
     )
 
@@ -113,4 +104,3 @@ async def test_verify_ports_non_ok_status_skips_persist(
         POD_CONTAINER_PREFIX,
     )
     orchestrator.verify.assert_called_once()
-    persister.save.assert_not_called()
