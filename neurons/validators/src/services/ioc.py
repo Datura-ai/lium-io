@@ -2,7 +2,6 @@ import asyncio
 
 from clients.backend_client import BackendClient
 from core.config import settings
-from daos.port_mapping_dao import PortMappingDao
 from services.collateral_contract_service import CollateralContractService
 from services.docker_service import DockerService
 from services.executor_connectivity import ContainerCleanupService
@@ -13,7 +12,6 @@ from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
-from services.executor_connectivity.persister import PortResultPersister
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
@@ -27,8 +25,6 @@ ioc = {}
 
 
 async def initiate_services():
-    ioc["PortMappingDao"] = PortMappingDao()
-
     # Backend clients
     keypair = settings.get_bittensor_wallet().get_hotkey()
     ioc["BackendClient"] = BackendClient(
@@ -55,7 +51,6 @@ async def initiate_services():
             ),
             DindProbe(DindVerifier(ioc["SSHService"])),
         ),
-        persister=PortResultPersister(ioc["PortMappingDao"]),
         cleanup_service=ContainerCleanupService(),
     )
     ioc["TaskService"] = TaskService(
@@ -65,18 +60,15 @@ async def initiate_services():
         verifyx_validation_service=ioc["VerifyXValidationService"],
         collateral_contract_service=ioc["CollateralContractService"],
         executor_connectivity_service=ioc["ExecutorConnectivityService"],
-        port_mapping_dao=ioc["PortMappingDao"],
     )
     ioc["DockerService"] = DockerService(
         ssh_service=ioc["SSHService"],
         redis_service=ioc["RedisService"],
-        port_mapping_dao=ioc["PortMappingDao"],
     )
     ioc["MinerService"] = MinerService(
         ssh_service=ioc["SSHService"],
         task_service=ioc["TaskService"],
         redis_service=ioc["RedisService"],
-        port_mapping_dao=ioc["PortMappingDao"],
     )
 
 

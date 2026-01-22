@@ -13,7 +13,6 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
 from core.config import settings
-from daos.port_mapping_dao import PortMappingDao
 from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -73,7 +72,6 @@ class PipelineFactory:
         verifyx_validation_service: VerifyXValidationService,
         collateral_contract_service: CollateralContractService,
         executor_connectivity_service: ExecutorConnectivityService,
-        port_mapping_dao: PortMappingDao,
     ):
         """Initialize pipeline factory with required services.
 
@@ -84,7 +82,6 @@ class PipelineFactory:
             verifyx_validation_service: VerifyX validation service
             collateral_contract_service: Collateral contract service
             executor_connectivity_service: Executor connectivity service
-            port_mapping_dao: Port mapping DAO
         """
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -92,7 +89,6 @@ class PipelineFactory:
         self.verifyx_validation_service = verifyx_validation_service
         self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
-        self.port_mapping_dao = port_mapping_dao
 
     async def build_context(
         self,
@@ -161,7 +157,6 @@ class PipelineFactory:
                 verifyx=self.verifyx_validation_service,
                 connectivity=self.executor_connectivity_service,
                 shell=shell,
-                port_mapping=self.port_mapping_dao,
                 score_calculator=calculate_scores,
             ),
             config=ContextConfig(
