@@ -538,6 +538,39 @@ class ScoreMessages:
     )
 
 
+class RentalVerificationMessages:
+    SKIPPED = MessageTemplate(
+        event="Rental verification skipped",
+        reason="RENTAL_CHECK_DISABLED",
+        severity="info",
+        category="policy",
+        impact="Proceed without backend rental verification",
+    )
+    VERIFIED = MessageTemplate(
+        event="Rental verification successful",
+        reason="RENTAL_VERIFIED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    FAILED = MessageTemplate(
+        event="Rental verification failed",
+        reason="RENTAL_NOT_VERIFIED",
+        severity="error",
+        category="policy",
+        impact="Validation halted",
+        remediation="Check executor health with backend or review rental status",
+    )
+    API_ERROR = MessageTemplate(
+        event="Rental verification API error",
+        reason="RENTAL_CHECK_API_ERROR",
+        severity="warning",
+        category="policy",
+        impact="Proceed with existing rental status",
+        remediation="Check backend API connectivity and logs",
+    )
+
+
 class FinalizeMessages:
     COMPLETED = MessageTemplate(
         event="Validation task completed",

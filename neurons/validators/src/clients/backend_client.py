@@ -12,7 +12,7 @@ from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import ExecutorHealthCheckResponse, RentedExecutorsResponse
 
 logger = logging.getLogger(__name__)
 
@@ -201,4 +201,53 @@ class BackendClient:
             "/internal/executors/rented",
             RentedExecutorsResponse,
             timeout=30,
+        )
+
+    async def check_executor_health(
+        self,
+        miner_address: str,
+        miner_port: int,
+        miner_hotkey: str,
+        container_port: int,
+        executor_id: str | None = None,
+    ) -> ExecutorHealthCheckResponse | None:
+        """Check executor health via backend API.
+
+        Args:
+            miner_address: Miner IP address
+            miner_port: Miner SSH port
+            miner_hotkey: Miner hotkey (SS58 address)
+            container_port: Container port to check
+            executor_id: Executor ID (optional)
+
+        Returns:
+            ExecutorHealthCheckResponse if successful, None otherwise
+        """
+        validator_hotkey = self.keypair.ss58_address
+        path = f"/validator/{validator_hotkey}/executor-health-check"
+
+        # Use special signature header format for this endpoint
+        signature = f"0x{self.keypair.sign(validator_hotkey).hex()}"
+        extra_headers = {
+            "X-Validator-Signature": signature,
+            "Content-Type": "application/json"
+        }
+
+        json_data = {
+            "miner_address": miner_address,
+            "miner_port": miner_port,
+            "miner_hotkey": miner_hotkey,
+            "container_port": container_port,
+        }
+
+        if executor_id:
+            json_data["executor_id"] = executor_id
+
+        return await self.post(
+            path,
+            ExecutorHealthCheckResponse,
+            json_data=json_data,
+            add_signature=False,  # We're using custom signature header
+            timeout=300,  # 5 minutes - backend needs time to SSH and verify container
+            extra_headers=extra_headers,
         )

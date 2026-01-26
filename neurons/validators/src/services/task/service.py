@@ -6,6 +6,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
+from clients.backend_client import BackendClient
 from core.config import settings
 from core.utils import _m, get_extra_info
 from daos.port_mapping_dao import PortMappingDao
@@ -34,6 +35,7 @@ class TaskService:
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
+        backend_client: Annotated[BackendClient, Depends(BackendClient)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -48,6 +50,7 @@ class TaskService:
             collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
             port_mapping_dao=port_mapping_dao,
+            backend_client=backend_client,
         )
 
     async def create_task(
