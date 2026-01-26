@@ -66,3 +66,10 @@ class ExecutorUptimeResponse(BaseModel):
 
 class RevenuePerGpuTypeResponse(BaseModel):
     revenues: dict[str, float]
+
+
+class ExecutorHealthCheckResponse(BaseModel):
+    """Response from executor health check endpoint."""
+    success: bool
+    error: str | None = None
+    details: dict | None = None
