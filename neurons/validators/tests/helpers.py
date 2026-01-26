@@ -65,6 +65,7 @@ def build_services(**overrides) -> ContextServices:
         shell=None,
         port_mapping=DummyPortMapping(),
         score_calculator=DummyScoreCalc(),
+        backend=None,
     )
     base.update(overrides)
     return ContextServices(**base)
