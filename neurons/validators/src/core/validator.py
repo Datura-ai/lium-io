@@ -89,6 +89,7 @@ class Validator:
             collateral_contract_service=self.collateral_contract_service,
             executor_connectivity_service=self.executor_connectivity_service,
             port_mapping_dao=self.port_mapping_dao,
+            backend_client=self.backend_client,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
