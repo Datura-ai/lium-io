@@ -12,6 +12,7 @@ import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 
+from clients.backend_client import BackendClient
 from core.config import settings
 from daos.port_mapping_dao import PortMappingDao
 from services.collateral_contract_service import CollateralContractService
@@ -37,6 +38,7 @@ from .checks import (
     NvmlDigestCheck,
     PortConnectivityCheck,
     PortCountCheck,
+    RentalVerificationCheck,
     ScoreCheck,
     SpecChangeCheck,
     StartGPUMonitorCheck,
@@ -74,6 +76,7 @@ class PipelineFactory:
         collateral_contract_service: CollateralContractService,
         executor_connectivity_service: ExecutorConnectivityService,
         port_mapping_dao: PortMappingDao,
+        backend_client: BackendClient,
     ):
         """Initialize pipeline factory with required services.
 
@@ -85,6 +88,7 @@ class PipelineFactory:
             collateral_contract_service: Collateral contract service
             executor_connectivity_service: Executor connectivity service
             port_mapping_dao: Port mapping DAO
+            backend_client: Backend API client
         """
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -93,6 +97,7 @@ class PipelineFactory:
         self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
         self.port_mapping_dao = port_mapping_dao
+        self.backend_client = backend_client
 
     async def build_context(
         self,
@@ -163,6 +168,7 @@ class PipelineFactory:
                 shell=shell,
                 port_mapping=self.port_mapping_dao,
                 score_calculator=calculate_scores,
+                backend=self.backend_client,
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,
@@ -215,6 +221,7 @@ class PipelineFactory:
                 GpuUsageCheck(),
                 VerifyXCheck(),
                 CapabilityCheck(),
+                RentalVerificationCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -253,6 +260,7 @@ class PipelineFactory:
                 GpuUsageCheck(),
                 # VerifyXCheck(),
                 CapabilityCheck(),
+                RentalVerificationCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],

@@ -66,6 +66,7 @@ async def initiate_services():
         collateral_contract_service=ioc["CollateralContractService"],
         executor_connectivity_service=ioc["ExecutorConnectivityService"],
         port_mapping_dao=ioc["PortMappingDao"],
+        backend_client=ioc["BackendClient"],
     )
     ioc["DockerService"] = DockerService(
         ssh_service=ioc["SSHService"],
