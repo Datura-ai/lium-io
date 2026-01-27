@@ -46,6 +46,7 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
+from services.attestation_service import AttestationService, AttestationError
 from services.ssh_service import SSHService
 from models.port_mapping import PortMapping
 
@@ -71,15 +72,41 @@ class DockerService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
-        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)]
+        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
+        attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.port_mapping_dao = port_mapping_dao
+        self.attestation_service = attestation_service
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
         self.is_realtime_logging = False
+
+    async def _prepare_known_hosts_policy(
+        self,
+        executor: ExecutorSSHInfo,
+        miner_hotkey: str | None,
+        log_context: dict,
+    ) -> asyncssh.SSHKnownHosts | None:
+        try:
+            from core.db import AsyncSessionMaker
+            async with AsyncSessionMaker() as db:
+                known_hosts, _, _ = await self.attestation_service.prepare_host_policy(
+                    executor, miner_hotkey, db=db
+                )
+            return known_hosts
+        except AttestationError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Unable to prepare known_hosts policy",
+                    extra=get_extra_info({**log_context, "error": str(exc)}),
+                )
+            )
+            return None
 
     async def generate_portMappings(
         self,
@@ -743,12 +770,34 @@ class DockerService:
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
 
+            known_hosts_policy: asyncssh.SSHKnownHosts | None = None
+            try:
+                known_hosts_policy = await self._prepare_known_hosts_policy(
+                    executor_info,
+                    payload.miner_hotkey,
+                    default_extra,
+                )
+            except AttestationError as exc:
+                log_text = _m(
+                    "Attestation failed",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                )
+                logger.error(log_text)
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    msg=str(log_text),
+                    error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                    error_code=FailedContainerErrorCodes.UnknownError,
+                )
+
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
-                known_hosts=None,
+                known_hosts=known_hosts_policy,
             ) as ssh_client:
                 # Add profiler for ssh connection
                 profilers.append({"name": "SSH connection established", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -1098,12 +1147,34 @@ class DockerService:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
+        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(
+                executor_info,
+                payload.miner_hotkey,
+                default_extra,
+            )
+        except AttestationError as exc:
+            log_text = _m(
+                "Attestation failed",
+                extra=get_extra_info({**default_extra, "error": str(exc)}),
+            )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerStopFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
         async with asyncssh.connect(
             host=executor_info.address,
             port=executor_info.ssh_port,
             username=executor_info.ssh_username,
             client_keys=[pkey],
-            known_hosts=None,
+            known_hosts=known_hosts_policy,
         ) as ssh_client:
             await ssh_client.run(f"/usr/bin/docker stop {payload.container_name}")
 
@@ -1142,12 +1213,34 @@ class DockerService:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
+        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(
+                executor_info,
+                payload.miner_hotkey,
+                default_extra,
+            )
+        except AttestationError as exc:
+            log_text = _m(
+                "Attestation failed",
+                extra=get_extra_info({**default_extra, "error": str(exc)}),
+            )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerStartFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
         async with asyncssh.connect(
             host=executor_info.address,
             port=executor_info.ssh_port,
             username=executor_info.ssh_username,
             client_keys=[pkey],
-            known_hosts=None,
+            known_hosts=known_hosts_policy,
         ) as ssh_client:
             await ssh_client.run(f"/usr/bin/docker start {payload.container_name}")
             logger.info(
@@ -1186,13 +1279,35 @@ class DockerService:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
+        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(
+                executor_info,
+                payload.miner_hotkey,
+                default_extra,
+            )
+        except AttestationError as exc:
+            log_text = _m(
+                "Attestation failed",
+                extra=get_extra_info({**default_extra, "error": str(exc)}),
+            )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
         try:
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
-                known_hosts=None,
+                known_hosts=known_hosts_policy,
             ) as ssh_client:
                 # await ssh_client.run(f"docker stop {payload.container_name}")
                 command = f"/usr/bin/docker rm {payload.container_name} -f"
@@ -1284,13 +1399,35 @@ class DockerService:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
+        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(
+                executor_info,
+                payload.miner_hotkey,
+                default_extra,
+            )
+        except AttestationError as exc:
+            log_text = _m(
+                "Attestation failed",
+                extra=get_extra_info({**default_extra, "error": str(exc)}),
+            )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
         try:
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
-                known_hosts=None,
+                known_hosts=known_hosts_policy,
             ) as ssh_client:
                 jupyter_token = secrets.token_hex(16)
                 jupyter_port = payload.jupyter_port_map[0]
@@ -1366,13 +1503,35 @@ class DockerService:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
+        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(
+                executor_info,
+                payload.miner_hotkey,
+                default_extra,
+            )
+        except AttestationError as exc:
+            log_text = _m(
+                "Attestation failed",
+                extra=get_extra_info({**default_extra, "error": str(exc)}),
+            )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
         try:
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
-                known_hosts=None,
+                known_hosts=known_hosts_policy,
             ) as ssh_client:
                 if not payload.user_public_keys:
                     log_text = _m(
@@ -1471,13 +1630,35 @@ class DockerService:
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
+        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(
+                executor_info,
+                payload.miner_hotkey,
+                default_extra,
+            )
+        except AttestationError as exc:
+            log_text = _m(
+                "Attestation failed",
+                extra=get_extra_info({**default_extra, "error": str(exc)}),
+            )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
         try:
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
-                known_hosts=None,
+                known_hosts=known_hosts_policy,
             ) as ssh_client:
                 if not payload.user_public_keys:
                     log_text = _m(
