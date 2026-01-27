@@ -29,6 +29,7 @@ from services.task_service import TaskService, JobResult
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.collateral_contract_service import CollateralContractService
+from services.attestation_service import AttestationService
 from services.const import IS_NOT_DEPOSITED_SCORE_MULTIPLIER
 
 
@@ -61,6 +62,7 @@ class Validator:
         self.validation_service = ValidationService()
         self.verifyx_validation_service = VerifyXValidationService()
         self.collateral_contract_service = CollateralContractService()
+        self.attestation_service = AttestationService()
         self.port_mapping_dao = PortMappingDao()
 
         # Backend client for API requests
@@ -94,17 +96,20 @@ class Validator:
             executor_connectivity_service=self.executor_connectivity_service,
             port_mapping_dao=self.port_mapping_dao,
             backend_client=self.backend_client,
+            attestation_service=self.attestation_service,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             port_mapping_dao=self.port_mapping_dao,
+            attestation_service=self.attestation_service,
         )
         self.miner_service = MinerService(
             ssh_service=ssh_service,
             task_service=task_service,
             redis_service=self.redis_service,
             port_mapping_dao=self.port_mapping_dao,
+            attestation_service=self.attestation_service,
         )
 
         # init miner_scores

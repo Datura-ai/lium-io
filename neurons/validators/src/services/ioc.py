@@ -22,6 +22,7 @@ from services.redis_service import RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService
 from services.verifyx_validation_service import VerifyXValidationService
+from services.attestation_service import AttestationService
 
 ioc = {}
 
@@ -44,6 +45,7 @@ async def initiate_services():
     ioc["ValidationService"] = ValidationService()
     ioc["VerifyXValidationService"] = VerifyXValidationService()
     ioc["CollateralContractService"] = CollateralContractService()
+    ioc["AttestationService"] = AttestationService()
     port_tester = PortTester()
     runner = ContainerRunner()
     ioc["ExecutorConnectivityService"] = ExecutorConnectivityService(
@@ -67,17 +69,20 @@ async def initiate_services():
         executor_connectivity_service=ioc["ExecutorConnectivityService"],
         port_mapping_dao=ioc["PortMappingDao"],
         backend_client=ioc["BackendClient"],
+        attestation_service=ioc["AttestationService"],
     )
     ioc["DockerService"] = DockerService(
         ssh_service=ioc["SSHService"],
         redis_service=ioc["RedisService"],
         port_mapping_dao=ioc["PortMappingDao"],
+        attestation_service=ioc["AttestationService"],
     )
     ioc["MinerService"] = MinerService(
         ssh_service=ioc["SSHService"],
         task_service=ioc["TaskService"],
         redis_service=ioc["RedisService"],
         port_mapping_dao=ioc["PortMappingDao"],
+        attestation_service=ioc["AttestationService"],
     )
 
 
