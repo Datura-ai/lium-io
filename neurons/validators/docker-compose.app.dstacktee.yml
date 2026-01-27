@@ -1,0 +1,69 @@
+services:
+  db:
+    image: postgres:14.0-alpine
+    healthcheck:
+      test: pg_isready -U postgres || exit 1
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    env_file: ./.env
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  redis:
+    image: daturaai/redis:7.4.2
+    healthcheck:
+      test: redis-cli ping
+    environment:
+      - REDIS_MODE=master
+      - REDIS_REPLICATION_MODE=master
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  dstack-verifier:
+    image: dstacktee/dstack-verifier@sha256:3f36162ca8dd2d4207601a6302881de6b497e610eb44050bb0874776fc8ded07
+    restart: unless-stopped
+
+  validator:
+    image: daturaai/compute-subnet-validator:latest
+    env_file: ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - TDX_VERIFIER_URL=http://dstack-verifier:8080/verify
+      - ENABLE_ATTESTATION_WHITELIST=true
+    ports:
+      - ${EXTERNAL_PORT}:${INTERNAL_PORT}
+    expose:
+      - ${INTERNAL_PORT}
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    depends_on:
+      - db
+      - redis
+      - dstack-verifier
+
+  connector:
+    image: daturaai/compute-subnet-validator:latest
+    env_file: ./.env
+    environment:
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - COMPUTE_APP_URI=wss://lium.io
+    command: pdm run src/connector.py
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    depends_on:
+      - db
+      - redis
+
+volumes:
+  db_data:
+  redis_data:

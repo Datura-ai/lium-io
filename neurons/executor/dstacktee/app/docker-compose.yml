@@ -1,0 +1,16 @@
+services:
+  executor-runner:
+    image: daturaai/compute-subnet-executor-runner@sha256:da99500701b6f288a4012134cd47a570a87e2d5a1f0f9f56929fc2426ff8a845
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .env:/root/executor/.env
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1@sha256:6dd50763bbd632a83cb154d5451700530d1e44200b268a4e9488fefdfcf2b038
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 60 --cleanup --label-enable
