@@ -152,6 +152,8 @@ class PipelineFactory:
             pipeline_id=pipeline_id,
             executor=executor_info,
             miner_hotkey=miner_info.miner_hotkey,
+            miner_address=miner_info.miner_address,
+            miner_port=miner_info.miner_port,
             ssh=shell.ssh_client,
             runner=runner,
             verified=verified_job_info,
