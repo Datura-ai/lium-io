@@ -8,6 +8,7 @@ from fastapi import Depends
 
 from core.config import settings
 from services.ssh_service import SSHService
+from services.tdx_service import TDXQuoteService
 
 from payloads.miner import UploadSShKeyPayload
 
@@ -18,13 +19,18 @@ class MinerService:
     def __init__(
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
+        tdx_service: Annotated[TDXQuoteService, Depends(TDXQuoteService)],
     ):
         self.ssh_service = ssh_service
+        self.tdx_service = tdx_service
 
     async def upload_ssh_key(self, paylod: UploadSShKeyPayload):
         self.ssh_service.add_pubkey_to_host(paylod.public_key)
 
-        return {
+        host_key = self.ssh_service.get_host_public_key()
+        tdx_quote = await self.tdx_service.get_quote(host_key)
+
+        response = {
             "ssh_username": self.ssh_service.get_current_os_user(),
             "ssh_port": settings.SSH_PUBLIC_PORT or settings.SSH_PORT,
             "python_path": sys.executable,
@@ -32,6 +38,11 @@ class MinerService:
             "port_range": settings.RENTING_PORT_RANGE,
             "port_mappings": settings.RENTING_PORT_MAPPINGS,
         }
+        if host_key:
+            response["ssh_host_key"] = host_key
+        if tdx_quote:
+            response["tdx_quote"] = tdx_quote
+        return response
 
     async def remove_ssh_key(self, paylod: UploadSShKeyPayload):
         return self.ssh_service.remove_pubkey_from_host(paylod.public_key)

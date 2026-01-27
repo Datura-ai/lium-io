@@ -22,6 +22,10 @@ class ExecutorDao(BaseDao):
                 existing_executor.executor_ip_address = executor.executor_ip_address
                 existing_executor.executor_ssh_username = executor.executor_ssh_username
                 existing_executor.executor_ssh_port = executor.executor_ssh_port
+                existing_executor.attestation_digest = executor.attestation_digest
+                existing_executor.tee_type = executor.tee_type
+                existing_executor.attestation_verified = executor.attestation_verified
+                existing_executor.attestation_verified_at = executor.attestation_verified_at
 
                 await self.session.commit()
                 await self.session.refresh(existing_executor)

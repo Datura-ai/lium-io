@@ -157,6 +157,11 @@ class Settings(BaseSettings):
         "NVIDIA B200"
     ]
     
+    # TDX Attestation settings
+    ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
+    TDX_VERIFIER_URL: str | None = Field(env="TDX_VERIFIER_URL", default=None)
+    ENABLE_ATTESTATION_WHITELIST: bool = Field(env="ENABLE_ATTESTATION_WHITELIST", default=False)
+
     # Use REST API instead of WebSocket for miner communication
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
     

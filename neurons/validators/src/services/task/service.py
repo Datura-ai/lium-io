@@ -11,6 +11,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from daos.port_mapping_dao import PortMappingDao
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from services.attestation_service import AttestationService, AttestationError
 from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
@@ -36,9 +37,11 @@ class TaskService:
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
         backend_client: Annotated[BackendClient, Depends(BackendClient)],
+        attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
+        self.attestation_service = attestation_service
         self.wallet = settings.get_bittensor_wallet()
 
         # Initialize pipeline factory with all required services
@@ -64,15 +67,41 @@ class TaskService:
         rented_data: RentedExecutorsResponse,
     ):
         """New pipeline-based validation task implementation."""
+        attestation_digest = None
+        tee_type = None
+
         try:
             # Decrypt private key
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+
+            # Prepare attestation host policy before SSH connection
+            try:
+                from core.db import AsyncSessionMaker
+                async with AsyncSessionMaker() as db:
+                    known_hosts_policy, attestation_digest, tee_type = await self.attestation_service.prepare_host_policy(
+                        executor_info,
+                        miner_info.miner_hotkey,
+                        db=db,
+                    )
+            except AttestationError as exc:
+                log_text = _m(
+                    "Attestation failed",
+                    extra=get_extra_info({
+                        "job_batch_id": miner_info.job_batch_id,
+                        "miner_hotkey": miner_info.miner_hotkey,
+                        "executor_uuid": executor_info.uuid,
+                        "error": str(exc),
+                    }),
+                )
+                logger.error(log_text)
+                raise
 
             async with InteractiveShellService(
                 host=executor_info.address,
                 username=executor_info.ssh_username,
                 private_key=private_key,
                 port=executor_info.ssh_port,
+                known_hosts=known_hosts_policy,
             ) as shell:
                 # Build validation context
                 base_ctx = await self.pipeline_factory.build_context(
@@ -103,7 +132,7 @@ class TaskService:
 
                 # Handle result using ResultHandler
                 result_handler = ResultHandler(self.redis_service, dry_run=settings.DRY_RUN)
-                return await result_handler.handle_result(
+                result = await result_handler.handle_result(
                     context=last_context,
                     miner_info=miner_info,
                     executor_info=executor_info,
@@ -111,6 +140,9 @@ class TaskService:
                     log_text=log_text.to_full_string(),
                     success=success,
                 )
+                result.attestation_digest = attestation_digest
+                result.tee_type = tee_type
+                return result
 
         except Exception as e:
             log_text = _m(
@@ -139,6 +171,8 @@ class TaskService:
                 gpu_model=None,
                 gpu_count=0,
                 sysbox_runtime=False,
+                attestation_digest=attestation_digest,
+                tee_type=tee_type,
             )
 
 

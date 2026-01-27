@@ -21,6 +21,8 @@ class JobResult(BaseModel):
     sysbox_runtime: bool = False
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
+    attestation_digest: str | None = None
+    tee_type: str | None = None
 
     # Incentive relevant fields 
     mining_score: float | None = None                   # Score for mining pool for scoring logic
