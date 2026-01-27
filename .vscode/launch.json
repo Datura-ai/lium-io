@@ -49,7 +49,7 @@
                 "SQLALCHEMY_DATABASE_URI": "sqlite:///test.db",
                 "ASYNC_SQLALCHEMY_DATABASE_URI": "sqlite+aiosqlite:///test.db",
                 "ENABLE_TDX_ATTESTATION": "True",
-                "TDX_VERIFIER_URL": "https://712eab2f507b963e11144ae67218177e93ac2a24-8080.tdxlab.dstack.org:12004/verify"
+                "TDX_VERIFIER_URL": "http://localhost:8000/verify"
             }
         }
     ]

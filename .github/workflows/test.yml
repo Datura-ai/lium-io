@@ -50,4 +50,6 @@ jobs:
           BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
           SQLALCHEMY_DATABASE_URI: sqlite:///test.db
           ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
+          ENABLE_TDX_ATTESTATION: True
+          TDX_VERIFIER_URL: http://localhost:8000/verify
         run: pdm run pytest tests/ -v --tb=short --strict-markers
