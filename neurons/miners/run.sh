@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/sh -e
 
 # Initialize Bittensor wallet from mnemonic
 if [ -n "$BITTENSOR_HOTKEY_MNEMONIC" ]; then
@@ -12,9 +12,9 @@ if [ -n "$BITTENSOR_HOTKEY_MNEMONIC" ]; then
     echo "Initializing Bittensor wallet..."
 
     pdm run btcli wallet create \
-        --wallet.name $BITTENSOR_WALLET_NAME \
-        --wallet.hotkey $BITTENSOR_WALLET_HOTKEY_NAME \
-        --wallet.path $BITTENSOR_WALLET_DIRECTORY \
+        --wallet.name "$BITTENSOR_WALLET_NAME" \
+        --wallet.hotkey "$BITTENSOR_WALLET_HOTKEY_NAME" \
+        --wallet.path "$BITTENSOR_WALLET_DIRECTORY" \
         --n-words 12 \
         --no-use-password \
         --overwrite \
