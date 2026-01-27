@@ -120,7 +120,7 @@ async def test_rental_verification_success():
     # Verify API was called with correct params
     assert backend_client.called_with == {
         "miner_address": "127.0.0.1",
-        "miner_port": 22,
+        "miner_port": 8000,
         "miner_hotkey": "miner-hotkey",
         "container_port": 8080,  # First verified port
         "executor_id": "executor-123",

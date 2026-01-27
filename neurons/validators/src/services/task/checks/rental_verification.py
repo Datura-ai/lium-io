@@ -72,8 +72,8 @@ class RentalVerificationCheck:
         try:
             # Call backend API to verify executor health
             response = await backend_client.check_executor_health(
-                miner_address=executor.address,
-                miner_port=executor.port,
+                miner_address=ctx.miner_address,
+                miner_port=ctx.miner_port,
                 miner_hotkey=miner_hotkey,
                 container_port=container_port,
                 executor_id=executor.uuid,
