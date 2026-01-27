@@ -84,6 +84,8 @@ def make_context(
     config: ContextConfig | None = None,
     state: ContextState | None = None,
     miner_hotkey: str = "miner-hotkey",
+    miner_address: str = "127.0.0.1",
+    miner_port: int = 8000,
     pipeline_id: str = "test-pipeline-id",
     **extra,
 ) -> Context:
@@ -96,6 +98,8 @@ def make_context(
         pipeline_id=pipeline_id,
         executor=executor_obj,
         miner_hotkey=miner_hotkey,
+        miner_address=miner_address,
+        miner_port=miner_port,
         ssh=None,
         runner=None,
         verified={},

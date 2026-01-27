@@ -84,6 +84,8 @@ class Context(BaseModel):
     pipeline_id: str
     executor: ExecutorSSHInfo
     miner_hotkey: str
+    miner_address: str
+    miner_port: int
     ssh: asyncssh.SSHClientConnection
     runner: SSHCommandRunner
     verified: dict = {}
