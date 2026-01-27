@@ -35,6 +35,7 @@ def mock_dependencies():
     ssh_service = Mock()
     redis_service = Mock()
     port_mapping_dao = Mock()
+    attestation_service = Mock()
 
     # Mock the async context manager for Redis lock
     lock_mock = AsyncMock()
@@ -42,17 +43,18 @@ def mock_dependencies():
     lock_mock.__aexit__ = AsyncMock(return_value=None)
     redis_service.acquire_executor_lock = Mock(return_value=lock_mock)
 
-    return ssh_service, redis_service, port_mapping_dao
+    return ssh_service, redis_service, port_mapping_dao, attestation_service
 
 
 @pytest_asyncio.fixture
 async def docker_service(mock_dependencies):
     """Create DockerService instance with mocked dependencies."""
-    ssh_service, redis_service, port_mapping_dao = mock_dependencies
+    ssh_service, redis_service, port_mapping_dao, attestation_service = mock_dependencies
     service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
-        port_mapping_dao=port_mapping_dao
+        port_mapping_dao=port_mapping_dao,
+        attestation_service=attestation_service
     )
     return service
 
