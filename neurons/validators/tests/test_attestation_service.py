@@ -1,10 +1,14 @@
 import json
 import os
 import sys
+import types
 from pathlib import Path
 from typing import Any
-
+import asyncssh  # noqa: E402
 import pytest
+from datura.requests.miner_requests import ExecutorSSHInfo  # noqa: E402
+from neurons.validators.src.services.attestation_service import AttestationService  # noqa: E402
+
 
 THIS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = THIS_DIR / ".." / ".." / ".."
@@ -14,15 +18,6 @@ if str(VALIDATOR_SRC) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-os.environ.setdefault("BITTENSOR_WALLET_NAME", "test-wallet")
-os.environ.setdefault("BITTENSOR_WALLET_HOTKEY_NAME", "test-hotkey")
-os.environ.setdefault("SQLALCHEMY_DATABASE_URI", "sqlite:///tmp/validator.db")
-os.environ.setdefault("ASYNC_SQLALCHEMY_DATABASE_URI", "sqlite+aiosqlite:///tmp/validator.db")
-os.environ.setdefault("ENABLE_TDX_ATTESTATION", "true")
-os.environ.setdefault("TDX_VERIFIER_URL", "https://712eab2f507b963e11144ae67218177e93ac2a24-8080.tdxlab.dstack.org:12004/verify")
-
-import types
-
 if "celium_collateral_contracts" not in sys.modules:
     module = types.ModuleType("celium_collateral_contracts")
 
@@ -31,11 +26,6 @@ if "celium_collateral_contracts" not in sys.modules:
 
     module.CollateralContract = CollateralContract
     sys.modules["celium_collateral_contracts"] = module
-
-import asyncssh  # noqa: E402
-
-from datura.requests.miner_requests import ExecutorSSHInfo  # noqa: E402
-from neurons.validators.src.services.attestation_service import AttestationService  # noqa: E402
 
 FIXTURE_PATH = THIS_DIR / "fixtures" / "tdx_quote.json"
 VERIFIER_RESPONSE_PATH = THIS_DIR / "fixtures" / "verifier_response.json"
