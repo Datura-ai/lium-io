@@ -22,8 +22,12 @@ class Settings(BaseSettings):
     RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
 
     ENV: str = Field(env="ENV", default="dev")
-    
+
     DB_URI: str = Field(env="DB_URI")
+
+    ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
+    TDX_QUOTE_TIMEOUT: int = Field(env="TDX_QUOTE_TIMEOUT", default=60)
+    SSH_HOST_KEY_PATH: str = Field(env="SSH_HOST_KEY_PATH", default="/etc/ssh/ssh_host_ed25519_key.pub")
 
 
 settings = Settings()

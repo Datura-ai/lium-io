@@ -407,6 +407,7 @@ class FailedContainerErrorCodes(enum.Enum):
     FailedMsgFromMiner = "FailedMsgFromMiner"
     RentingInProgress = "RentingInProgress"
     NoJupyterPortMapping = "NoJupyterPortMapping"
+    AttestationError = "AttestationError"
 
 
 class FailedContainerErrorTypes(enum.Enum):
