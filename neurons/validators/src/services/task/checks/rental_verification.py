@@ -14,7 +14,7 @@ class RentalVerificationCheck:
     """
 
     check_id = "executor.validate.rental_verification"
-    fatal = True
+    fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
         """Run rental verification check via backend API.
