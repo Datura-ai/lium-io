@@ -28,7 +28,11 @@ from services.task_service import TaskService, JobResult
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.collateral_contract_service import CollateralContractService
-from services.const import IS_NOT_DEPOSITED_SCORE_MULTIPLIER
+from services.const import (
+    IS_NOT_DEPOSITED_SCORE_MULTIPLIER,
+    AVAILABILITY_BONUS_MULTIPLIER,
+    AVAILABILITY_BONUS_GPU_TYPES,
+)
 
 
 logger = get_logger(__name__)
@@ -89,6 +93,7 @@ class Validator:
             collateral_contract_service=self.collateral_contract_service,
             executor_connectivity_service=self.executor_connectivity_service,
             port_mapping_dao=self.port_mapping_dao,
+            backend_client=self.backend_client,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
@@ -151,6 +156,7 @@ class Validator:
             "score": job_result.score,
             "collateral_deposited": job_result.collateral_deposited,
             "sysbox_runtime": job_result.sysbox_runtime,
+            "rented": job_result.rented,
         }
         if job_result.score == 0:
             logger.info(
@@ -183,6 +189,12 @@ class Validator:
 
         score = score * multiplier
 
+        # Apply availability bonus for unrented target GPU types
+        availability_bonus_applied = False
+        if not job_result.rented and job_result.gpu_model in AVAILABILITY_BONUS_GPU_TYPES:
+            score = score * (1 + AVAILABILITY_BONUS_MULTIPLIER)
+            availability_bonus_applied = True
+
         logger.info(
             _m(
                 "Debug: calculating score",
@@ -190,6 +202,7 @@ class Validator:
                     **default_extra,
                     "score_portion": score_portion,
                     "multiplier": multiplier,
+                    "availability_bonus_applied": availability_bonus_applied,
                     "score": score,
                 })
             )
