@@ -16,7 +16,7 @@ class PortCountCheck:
     """
 
     check_id = "executor.validate.port_count"
-    fatal = False
+    fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
         port_count = ctx.state.verified_port_count
