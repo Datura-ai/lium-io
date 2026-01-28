@@ -274,7 +274,8 @@ class ConnectivityResult:
             PortVerificationResult,
         )
 
-        ports = (PortPair(8000, 8000),)
+        # MIN_PORT_COUNT = 3, so we need at least 3 successful ports
+        ports = (PortPair(8000, 8000), PortPair(8001, 8001), PortPair(8002, 8002))
         self.result = PortVerificationResult(
             selected_ports=ports,
             successful_ports=ports,
