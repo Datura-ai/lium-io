@@ -111,6 +111,15 @@ MAX_GPU_COUNT = 14
 
 UNRENTED_MULTIPLIER = 1
 
+# Availability bonus for target GPU types when unrented
+AVAILABILITY_BONUS_MULTIPLIER = 0.2  # 20% bonus for unrented target GPUs
+AVAILABILITY_BONUS_GPU_TYPES = frozenset({
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H200",
+    "NVIDIA H200 NVL",
+    "NVIDIA B200",
+})
+
 GPU_UTILIZATION_LIMIT = 5  # percent
 GPU_MEMORY_UTILIZATION_LIMIT = 5  # percent
 
