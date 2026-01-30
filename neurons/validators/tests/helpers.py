@@ -29,6 +29,7 @@ def default_executor() -> ExecutorSSHInfo:
         ssh_port=22,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        price_per_gpu=0.5,
     )
 
 
