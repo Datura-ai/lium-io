@@ -64,6 +64,7 @@ class CollateralCheck:
             event=event,
             updates={
                 "collateral_deposited": collateral_deposited,
+                "collateral_error_message": error_message,
                 "contract_version": contract_version,
             },
         )
