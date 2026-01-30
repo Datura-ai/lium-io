@@ -98,6 +98,7 @@ class Context(BaseModel):
     clear_verified_job_info: bool = False
     clear_verified_job_reason: str | None = None
     collateral_deposited: bool = False
+    collateral_error_message: str | None = None
     contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False

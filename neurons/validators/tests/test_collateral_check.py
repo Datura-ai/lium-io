@@ -65,6 +65,7 @@ async def test_collateral_check(
     assert result.passed is expected_pass
     assert result.event.reason_code == expected_reason
     assert result.updates["collateral_deposited"] is deposited
+    assert result.updates["collateral_error_message"] == error
     assert result.updates["contract_version"] == "1.0.2"
 
     assert service.called_with == {

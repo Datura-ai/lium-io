@@ -58,12 +58,13 @@ def calculate_scores(
 
     # Collateral checks
     if not collateral_deposited:
+        collateral_error = ctx.collateral_error_message
         if settings.ENABLE_NO_COLLATERAL:
-            warning_messages.append("No collateral deposited")
+            warning_messages.append(collateral_error or "No collateral deposited")
         else:
             actual_score = 0.0
             job_score = 0.0
-            warning_messages.append("Collateral required but not deposited")
+            warning_messages.append(collateral_error or "Collateral required but not deposited")
     elif (
         contract_version
         and contract_version != settings.get_latest_contract_version()
