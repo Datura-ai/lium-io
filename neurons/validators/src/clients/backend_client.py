@@ -226,13 +226,6 @@ class BackendClient:
         validator_hotkey = self.keypair.ss58_address
         path = f"/validator/{validator_hotkey}/executor-health-check"
 
-        # Use special signature header format for this endpoint
-        signature = f"0x{self.keypair.sign(validator_hotkey).hex()}"
-        extra_headers = {
-            "X-Validator-Signature": signature,
-            "Content-Type": "application/json"
-        }
-
         json_data = {
             "miner_address": miner_address,
             "miner_port": miner_port,
@@ -247,7 +240,6 @@ class BackendClient:
             path,
             ExecutorHealthCheckResponse,
             json_data=json_data,
-            add_signature=False,  # We're using custom signature header
+            add_signature=True,  # Use standard signature headers
             timeout=300,  # 5 minutes - backend needs time to SSH and verify container
-            extra_headers=extra_headers,
         )
