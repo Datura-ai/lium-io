@@ -397,6 +397,20 @@ class Validator:
                                 ),
                             )
                             task.cancel()
+                        
+                        # Wait for all cancelled tasks to complete with timeout to prevent resource leaks
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*pending, return_exceptions=True),
+                                timeout=5.0
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                _m(
+                                    "[sync] Some cancelled tasks did not complete within timeout",
+                                    extra=get_extra_info({**self.default_extra, "pending_count": len(pending)}),
+                                ),
+                            )
 
                     open_fd_count = len(os.listdir(f'/proc/self/fd'))
 
