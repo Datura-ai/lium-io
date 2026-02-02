@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
     )
+    COMPUTE_REST_API_URL_EXTERNAL: str | None = Field(
+        env="COMPUTE_REST_API_URL_EXTERNAL", default="https://lium.io/api"
+    )
     MINER_PORTAL_REST_API_URL: str = Field(
         env="MINER_PORTAL_REST_API_URL", default="https://provider-api.lium.io/"
     )
