@@ -7,7 +7,6 @@ logic to maintain backward compatibility with the existing system.
 import random
 
 import bittensor
-import numpy as np
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
@@ -114,76 +113,73 @@ class DefaultIncentive(BaseIncentive):
         self,
         miner_scores: dict[str, float],
         miners: list[bittensor.NeuronInfo],
-        last_mechanism_step_block: int,
+        last_mechanism_step_block: int | None,
         all_job_results: dict[str, list[JobResult]],
         rented_data: RentedExecutorsResponse,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Calculate final UIDs and weights for blockchain submission.
+    ) -> dict[str, float]:
+        """Calculate scores with burning logic for this cycle.
 
-        This method implements the burning logic from subtensor_client.py lines 336-347,
-        including burner selection and weight distribution based on miner scores.
+        This method applies burning logic and returns scores to be accumulated.
+        It does NOT return final weights for blockchain - those are calculated
+        later in set_weights by normalizing accumulated scores.
 
         Args:
-            miner_scores: Mapping of miner hotkeys to scores
+            miner_scores: Mining scores from this cycle only (not accumulated)
             miners: List of miner neuron information
             last_mechanism_step_block: Last mechanism step block number
             all_job_results: Mapping of miner hotkeys to their job results (unused in default)
             rented_data: Response containing all rented executors (unused in default)
 
         Returns:
-            Tuple of (uids, weights) as numpy arrays
+            dict[str, float]: Scores with burning applied for each miner
         """
-        # Initialize arrays
-        uids = np.zeros(len(miners), dtype=np.int64)
-        weights = np.zeros(len(miners), dtype=np.float32)
+        cycle_scores = {}
+        total_mining_score = sum(miner_scores.values())
 
-        # Burner selection
-        main_burner = random.Random(last_mechanism_step_block).choice(settings.BURNERS)
-        other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
+        if settings.ENABLE_NEW_BURN_LOGIC:
+            # New burn logic
+            burners = settings.NEW_BURNERS
+            burn_score_per_burner = TOTAL_BURN_EMISSION / len(burners)
 
-        # Weight distribution
-        total_score = sum(miner_scores.values())
-
-        for ind, miner in enumerate(miners):
-            uids[ind] = miner.uid
-
-            if settings.ENABLE_NEW_BURN_LOGIC:
-                # New burn logic
-                if miner.uid in settings.NEW_BURNERS:
-                    weights[ind] = TOTAL_BURN_EMISSION / len(settings.NEW_BURNERS)
+            for miner in miners:
+                if miner.uid in burners:
+                    # Burners get burn emission share
+                    cycle_scores[miner.hotkey] = burn_score_per_burner
                 else:
-                    weights[ind] = (
-                        0
-                        if total_score <= 0
-                        else (1 - TOTAL_BURN_EMISSION)
-                        * miner_scores.get(miner.hotkey, 0.0)
-                        / total_score
-                    )
-            else:
-                # Old burn logic
+                    # Regular miners share mining emission proportionally
+                    if total_mining_score > 0:
+                        mining_share = (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_mining_score
+                    else:
+                        mining_share = 0.0
+                    cycle_scores[miner.hotkey] = mining_share
+        else:
+            # Old burn logic with main burner
+            main_burner = random.Random(last_mechanism_step_block or 0).choice(settings.BURNERS)
+            other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
+
+            main_burner_score = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+
+            for miner in miners:
                 if miner.uid == main_burner:
-                    weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
+                    cycle_scores[miner.hotkey] = main_burner_score
                 elif miner.uid in other_burners:
-                    weights[ind] = BURNER_EMISSION
+                    cycle_scores[miner.hotkey] = BURNER_EMISSION
                 else:
-                    weights[ind] = (
-                        0
-                        if total_score <= 0
-                        else (1 - TOTAL_BURN_EMISSION)
-                        * miner_scores.get(miner.hotkey, 0.0)
-                        / total_score
-                    )
+                    if total_mining_score > 0:
+                        mining_share = (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_mining_score
+                    else:
+                        mining_share = 0.0
+                    cycle_scores[miner.hotkey] = mining_share
 
         logger.debug(
             _m(
-                "Calculated final weights",
+                "Calculated cycle scores with burning",
                 extra={
-                    "total_score": total_score,
+                    "total_mining_score": total_mining_score,
                     "num_miners": len(miners),
-                    "main_burner": main_burner,
                     "enable_new_burn_logic": settings.ENABLE_NEW_BURN_LOGIC,
                 },
             )
         )
 
-        return uids, weights
+        return cycle_scores
