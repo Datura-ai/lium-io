@@ -112,6 +112,7 @@ class ResultHandler:
             gpu_count=gpu_count,
             sysbox_runtime=context.state.sysbox_runtime,
             ssh_pub_keys=context.ssh_pub_keys,
+            is_rented=context.rented,
         )
 
     async def _persist_verification_data(

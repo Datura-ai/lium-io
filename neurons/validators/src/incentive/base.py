@@ -6,6 +6,7 @@ import bittensor
 import numpy as np
 
 from incentive.config import IncentiveConfig
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.redis_service import RedisService
 from services.task_service import JobResult
 
@@ -45,11 +46,13 @@ class BaseIncentive(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def calculate_final_weights(
+    async def calculate_final_weights(
         self,
         miner_scores: dict[str, float],
         miners: list[bittensor.NeuronInfo],
         last_mechanism_step_block: int,
+        all_job_results: dict[str, list[JobResult]],
+        rented_data: RentedExecutorsResponse,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Calculate final UIDs and weights for blockchain submission.
 
@@ -57,6 +60,8 @@ class BaseIncentive(ABC):
             miner_scores: Mapping of miner hotkeys to scores
             miners: List of miner neuron information
             last_mechanism_step_block: Last mechanism step block number
+            all_job_results: Mapping of miner hotkeys to their job results (needed for rental calculations)
+            rented_data: Response containing all rented executors from backend API
 
         Returns:
             Tuple of (uids, weights) as numpy arrays
