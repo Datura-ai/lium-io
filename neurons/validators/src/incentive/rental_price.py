@@ -4,7 +4,6 @@ This module implements the three-phase rental price incentive algorithm that
 rewards unrented high-end GPUs based on their rental market value.
 """
 
-import numpy as np
 import bittensor
 
 from core.config import settings
@@ -133,28 +132,31 @@ class RentalPriceIncentive(BaseIncentive):
         last_mechanism_step_block: int,
         all_job_results: dict[str, list[JobResult]],
         rented_data: RentedExecutorsResponse,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Calculate final UIDs and weights with rental price incentive.
+    ) -> dict[str, float]:
+        """Calculate scores with rental price incentive for this cycle.
+
+        This method applies rental price incentive and burning logic, returning
+        scores to be accumulated. It does NOT return final weights for blockchain.
 
         Phase 2: Calculate dynamic emission splits
         - Count unrented GPUs by type
         - Apply cap dilution if needed
         - Calculate rental_share (X) using rental costs and TAO price
 
-        Phase 3: Distribute weights across pools
+        Phase 3: Distribute scores across pools
         - Burn pool: 0.91 - X
         - Mining pool: 0.09 (fixed)
         - Rental pool: X
 
         Args:
-            miner_scores: Mapping of miner hotkeys to mining scores
+            miner_scores: Mining scores from this cycle only (not accumulated)
             miners: List of miner neuron information
             last_mechanism_step_block: Last mechanism step block number
             all_job_results: All job results by miner hotkey
             rented_data: Rented executors data from backend
 
         Returns:
-            Tuple of (uids, weights) as numpy arrays
+            dict[str, float]: Scores with burning and rental incentive applied
         """
         # Phase 2: Count unrented GPUs and calculate rental costs
         unrented_count_by_type = self._count_unrented_gpus(all_job_results, rented_data)
@@ -188,8 +190,8 @@ class RentalPriceIncentive(BaseIncentive):
             all_job_results, rented_data, unrented_count_by_type
         )
 
-        # Distribute weights across pools
-        return self._distribute_weights(
+        # Distribute scores across pools
+        return self._distribute_scores(
             miners=miners,
             miner_scores=miner_scores,
             miner_rental_values=miner_rental_values,
@@ -394,7 +396,7 @@ class RentalPriceIncentive(BaseIncentive):
 
         return miner_rental_values
 
-    def _distribute_weights(
+    def _distribute_scores(
         self,
         miners: list[bittensor.NeuronInfo],
         miner_scores: dict[str, float],
@@ -403,8 +405,8 @@ class RentalPriceIncentive(BaseIncentive):
         mining_share: float,
         rental_share: float,
         last_mechanism_step_block: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Distribute weights across burn, mining, and rental pools.
+    ) -> dict[str, float]:
+        """Distribute scores across burn, mining, and rental pools.
 
         Args:
             miners: List of miner neuron information
@@ -416,22 +418,19 @@ class RentalPriceIncentive(BaseIncentive):
             last_mechanism_step_block: Last mechanism step block number
 
         Returns:
-            Tuple of (uids, weights) as numpy arrays
+            dict[str, float]: Scores with burning and rental incentive applied
         """
-        uids = np.zeros(len(miners), dtype=np.int64)
-        weights = np.zeros(len(miners), dtype=np.float32)
-
+        cycle_scores = {}
         total_mining_score = sum(miner_scores.values())
         total_rental_value = sum(miner_rental_values.values())
 
-        for ind, miner in enumerate(miners):
-            uids[ind] = miner.uid
+        for miner in miners:
             hotkey = miner.hotkey
 
             # Burners get burn_share
             if settings.ENABLE_NEW_BURN_LOGIC:
                 if miner.uid in settings.NEW_BURNERS:
-                    weights[ind] = burn_share / len(settings.NEW_BURNERS)
+                    cycle_scores[hotkey] = burn_share / len(settings.NEW_BURNERS)
                     continue
             else:
                 # Old burn logic
@@ -440,28 +439,28 @@ class RentalPriceIncentive(BaseIncentive):
                 other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
 
                 if miner.uid == main_burner:
-                    weights[ind] = burn_share - (len(settings.BURNERS) - 1) * (burn_share / len(settings.BURNERS))
+                    cycle_scores[hotkey] = burn_share - (len(settings.BURNERS) - 1) * (burn_share / len(settings.BURNERS))
                     continue
                 elif miner.uid in other_burners:
-                    weights[ind] = burn_share / len(settings.BURNERS)
+                    cycle_scores[hotkey] = burn_share / len(settings.BURNERS)
                     continue
 
-            # Regular miners get mining + rental weights
-            weight = 0.0
+            # Regular miners get mining + rental scores
+            score = 0.0
 
             # Mining emission (for rented/non-eligible GPUs)
             if hotkey in miner_scores and total_mining_score > 0:
-                weight += mining_share * miner_scores[hotkey] / total_mining_score
+                score += mining_share * miner_scores[hotkey] / total_mining_score
 
             # Rental emission (for unrented eligible GPUs)
             if hotkey in miner_rental_values and total_rental_value > 0:
-                weight += rental_share * miner_rental_values[hotkey] / total_rental_value
+                score += rental_share * miner_rental_values[hotkey] / total_rental_value
 
-            weights[ind] = weight
+            cycle_scores[hotkey] = score
 
         logger.debug(
             _m(
-                "Distributed weights across pools",
+                "Distributed scores across pools",
                 extra={
                     "total_mining_score": total_mining_score,
                     "total_rental_value": total_rental_value,
@@ -470,4 +469,4 @@ class RentalPriceIncentive(BaseIncentive):
             )
         )
 
-        return uids, weights
+        return cycle_scores

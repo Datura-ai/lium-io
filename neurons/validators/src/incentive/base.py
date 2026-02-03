@@ -3,7 +3,6 @@
 from abc import ABC, abstractmethod
 
 import bittensor
-import numpy as np
 
 from incentive.config import IncentiveConfig
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -50,20 +49,27 @@ class BaseIncentive(ABC):
         self,
         miner_scores: dict[str, float],
         miners: list[bittensor.NeuronInfo],
-        last_mechanism_step_block: int,
+        last_mechanism_step_block: int | None,
         all_job_results: dict[str, list[JobResult]],
         rented_data: RentedExecutorsResponse,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Calculate final UIDs and weights for blockchain submission.
+    ) -> dict[str, float]:
+        """Calculate final scores with burning logic applied for this cycle.
+
+        This method receives mining scores from Phase 1 (calculate_executor_score)
+        for the current cycle only. It applies burning logic and returns scores
+        that will be accumulated across cycles.
 
         Args:
-            miner_scores: Mapping of miner hotkeys to scores
-            miners: List of miner neuron information
-            last_mechanism_step_block: Last mechanism step block number
-            all_job_results: Mapping of miner hotkeys to their job results (needed for rental calculations)
+            miner_scores: Mining scores from this cycle only (not accumulated)
+            miners: List of all miners (needed to identify burners by UID)
+            last_mechanism_step_block: For burner selection randomization
+            all_job_results: Job results from this cycle (for rental calculations)
             rented_data: Response containing all rented executors from backend API
 
         Returns:
-            Tuple of (uids, weights) as numpy arrays
+            dict[str, float]: Scores with burning applied for each miner.
+                - Burners receive high scores (proportional to TOTAL_BURN_EMISSION)
+                - Regular miners receive low scores (proportional to 1 - TOTAL_BURN_EMISSION)
+                These scores are accumulated across cycles in validator.miner_scores
         """
         pass
