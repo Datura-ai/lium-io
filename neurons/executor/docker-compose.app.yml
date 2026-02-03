@@ -28,6 +28,7 @@ services:
     pid: host
     environment:
       - DB_URI=postgresql://postgres:password@db:5432/compute-subnet-db
+      - NVIDIA_DRIVER_CAPABILITIES=all
     depends_on:
       - db
     labels:
