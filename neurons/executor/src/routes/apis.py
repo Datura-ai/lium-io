@@ -1,5 +1,7 @@
 import logging
 from typing import Annotated, Optional
+import tomllib
+from pathlib import Path
 
 import docker
 from fastapi import APIRouter, Depends, Query, Header, HTTPException
@@ -15,6 +17,18 @@ from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signa
 logger = logging.getLogger(__name__)
 
 apis_router = APIRouter()
+
+
+def _get_version() -> str:
+    """Read version from pyproject.toml."""
+    try:
+        pyproject_path = Path(__file__).parent.parent.parent / "pyproject.toml"
+        with open(pyproject_path, "rb") as f:
+            pyproject_data = tomllib.load(f)
+            return pyproject_data.get("project", {}).get("version", "unknown")
+    except Exception as e:
+        logger.error(f"Failed to read version from pyproject.toml: {e}")
+        return "unknown"
 
 
 def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
@@ -105,6 +119,17 @@ async def ping(_: None = Depends(verify_ping_signature)):
         dict: {"status": "pong"}
     """
     return {"status": "pong"}
+
+
+@apis_router.get("/version")
+async def get_version():
+    """
+    Get the executor version information.
+
+    Returns:
+        dict: {"version": "x.y.z"}
+    """
+    return {"version": _get_version()}
 
 
 @apis_router.get("/containers/{container_name}/logs")
