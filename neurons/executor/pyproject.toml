@@ -1,6 +1,6 @@
 [project]
 name = "executor"
-version = "3.0.0"
+version = "3.1.0"
 description = "Compute subnet executor"
 authors = [
     {name = "waris", email = "waris0609@outlook.com"},
