@@ -129,7 +129,7 @@ class RentalPriceIncentive(BaseIncentive):
         self,
         miner_scores: dict[str, float],
         miners: list[bittensor.NeuronInfo],
-        last_mechanism_step_block: int,
+        last_mechanism_step_block: int | None,
         all_job_results: dict[str, list[JobResult]],
         rented_data: RentedExecutorsResponse,
     ) -> dict[str, float]:
