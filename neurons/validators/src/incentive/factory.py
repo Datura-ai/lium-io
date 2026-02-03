@@ -3,6 +3,8 @@
 from core.utils import get_logger, _m
 from incentive.base import BaseIncentive
 from incentive.config import IncentiveConfig
+from incentive.default import DefaultIncentive
+from incentive.rental_price import RentalPriceIncentive
 from services.redis_service import RedisService
 
 logger = get_logger(__name__)
@@ -76,3 +78,8 @@ class IncentiveFactory:
             )
         )
         return incentive_class(config, redis_service)
+
+
+# Register algorithms
+IncentiveFactory.register("default", DefaultIncentive)
+IncentiveFactory.register("rental_price", RentalPriceIncentive)

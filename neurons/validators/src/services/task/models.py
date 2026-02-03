@@ -20,6 +20,7 @@ class JobResult(BaseModel):
     gpu_count: int = 0
     sysbox_runtime: bool = False
     ssh_pub_keys: list[str] | None = None
+    is_rented: bool = False
 
 
 class ValidationEvent(BaseModel):

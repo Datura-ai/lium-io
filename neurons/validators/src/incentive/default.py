@@ -13,6 +13,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from incentive.base import BaseIncentive
 from incentive.config import IncentiveConfig
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.const import BURNER_EMISSION, TOTAL_BURN_EMISSION
 from services.redis_service import RedisService
 from services.task_service import JobResult
@@ -109,11 +110,13 @@ class DefaultIncentive(BaseIncentive):
 
         return score
 
-    def calculate_final_weights(
+    async def calculate_final_weights(
         self,
         miner_scores: dict[str, float],
         miners: list[bittensor.NeuronInfo],
         last_mechanism_step_block: int,
+        all_job_results: dict[str, list[JobResult]],
+        rented_data: RentedExecutorsResponse,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Calculate final UIDs and weights for blockchain submission.
 
@@ -124,6 +127,8 @@ class DefaultIncentive(BaseIncentive):
             miner_scores: Mapping of miner hotkeys to scores
             miners: List of miner neuron information
             last_mechanism_step_block: Last mechanism step block number
+            all_job_results: Mapping of miner hotkeys to their job results (unused in default)
+            rented_data: Response containing all rented executors (unused in default)
 
         Returns:
             Tuple of (uids, weights) as numpy arrays

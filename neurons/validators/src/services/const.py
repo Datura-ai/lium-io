@@ -124,6 +124,11 @@ VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 TOTAL_BURN_EMISSION = 0.91
 BURNER_EMISSION = 0.01
 
+# Rental Price Incentive Constants
+TEMPO = 360  # blocks per epoch (from subtensor)
+SECONDS_PER_BLOCK = 12  # seconds per block
+FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
+
 IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
 DOCKER_DIND_IMAGE = "daturaai/dind:0.0.0"
 
