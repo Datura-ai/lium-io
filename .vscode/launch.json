@@ -29,6 +29,26 @@
             "program": "src/connector.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/neurons/validators"
+        },
+        {
+            "name": "Debug Test: Validators",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "console": "integratedTerminal",
+            "args": [
+                ".",
+                "-v",
+                "-s"
+            ],
+            "cwd": "${workspaceFolder}/neurons/validators/tests",
+            "python": "${workspaceFolder}/neurons/validators/.venv/bin/python3",
+            "env": {
+                "BITTENSOR_WALLET_NAME": "test_wallet",
+                "BITTENSOR_WALLET_HOTKEY_NAME": "test_hotkey",
+                "SQLALCHEMY_DATABASE_URI": "sqlite:///test.db",
+                "ASYNC_SQLALCHEMY_DATABASE_URI": "sqlite+aiosqlite:///test.db",
+            }
         }
     ]
 }
