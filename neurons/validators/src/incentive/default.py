@@ -4,17 +4,12 @@ This implementation extracts the original score calculation and weight distribut
 logic to maintain backward compatibility with the existing system.
 """
 
-import random
-
 import bittensor
 
 from core.config import settings
-from core.utils import _m, get_extra_info, get_logger
+from core.utils import _m, get_logger
 from incentive.base import BaseIncentive
-from incentive.config import IncentiveConfig
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.const import BURNER_EMISSION, TOTAL_BURN_EMISSION
-from services.redis_service import RedisService
+from services.const import TOTAL_BURN_EMISSION
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
@@ -27,87 +22,100 @@ class DefaultIncentive(BaseIncentive):
     This maintains backward compatibility with the existing incentive system.
     """
 
-    def __init__(self, config: IncentiveConfig, redis_service: RedisService):
-        """Initialize the default incentive algorithm.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.burn_share = TOTAL_BURN_EMISSION
+
+        # Metrics
+        self.total_executors = 0
+        self.successful_executors = 0
+        self.failed_executors = 0
+        
+        # Incentive states
+        self.total_mining_score = 0
+        self.miner_incentives = {}
+        self.mining_share = 1 - TOTAL_BURN_EMISSION
+
+    async def _pre_process_job_result(self, hotkey: str, result: JobResult):
+        """Process a job result.
 
         Args:
-            config: Incentive configuration
-            redis_service: Redis service for accessing shared state
+            result: Job execution result to process
         """
-        super().__init__(config, redis_service)
+        self.total_executors += 1
+        result = await self.calculate_executor_score(result)
+        self.total_mining_score += result.mining_score
+        if result.job_score == 1.0:
+            self.successful_executors += 1
+        else:
+            self.failed_executors += 1
+        return result
+
+    async def _post_process_job_result(self, hotkey: str, result: JobResult):
+        """Process a job result.
+
+        Args:
+            result: Job execution result to process
+        """
+        result.incentive = (self.mining_share * result.mining_score / self.total_mining_score) if self.total_mining_score > 0 else 0.0
+        self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
+        return result
 
     async def calculate_executor_score(
         self,
-        total_gpu_model_count_map: dict,
         job_result: JobResult,
-    ) -> float:
-        """Calculate score for a single executor/job result.
+    ) -> JobResult:
+        """Calculate mining score for a single executor/job result.
 
         This method implements the original calc_job_score() logic from validator.py
         lines 146-199, including GPU count calculation, base scoring, and multipliers
         for sysbox runtime and uptime.
 
         Args:
-            total_gpu_model_count_map: Mapping of GPU models to total counts
             job_result: Job execution result to score
 
         Returns:
-            Calculated score for the executor
+            JobResult with calculated mining score
         """
         # Early exit check - if job score is 0, return immediately
         if job_result.score == 0:
-            return 0
+            job_result.mining_score = 0
+            return job_result
 
         # GPU count calculation
-        total_gpu_count = total_gpu_model_count_map.get(job_result.gpu_model, 0)
-        if total_gpu_count == 0:
-            return 0
+        job_result.total_gpu_count = self.total_gpu_model_count_map.get(job_result.gpu_model, 0)
+        if job_result.total_gpu_count == 0:
+            job_result.mining_score = 0
+            return job_result
 
         # Base score calculation
-        score_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
-        score = job_result.score * score_portion * job_result.gpu_count / total_gpu_count
-
-        # Multiplier calculation
-        multiplier = 1
+        job_result.gpu_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
+        job_result.mining_score = job_result.score * job_result.gpu_portion * job_result.gpu_count / job_result.total_gpu_count
 
         # Sysbox runtime multiplier
-        if not job_result.sysbox_runtime:
-            multiplier *= 1 - settings.PORTION_FOR_SYSBOX
+        job_result.sysbox_multiplier = 1 if job_result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX
 
         # Uptime multiplier
         if not job_result.collateral_deposited:
             uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
-            multiplier *= (
+            job_result.uptime_multiplier = (
                 1
                 - settings.PORTION_FOR_UPTIME
                 + settings.PORTION_FOR_UPTIME
                 * min(1, uptime_in_minutes / settings.UPTIME_REQUIRED_MINUTES)
             )
+        else:
+            job_result.uptime_multiplier = 1
 
         # Apply multiplier
-        score *= multiplier
-
-        # Logging
-        logger.debug(
-            _m(
-                "Calculated executor score",
-                extra={
-                    "total_gpu_count": total_gpu_count,
-                    "score_portion": score_portion,
-                    "multiplier": multiplier,
-                    "final_score": score,
-                },
-            )
-        )
-
-        return score
+        job_result.mining_score *= job_result.sysbox_multiplier * job_result.uptime_multiplier
+        return job_result
 
     async def calculate_final_weights(
         self,
         miners: list[bittensor.NeuronInfo],
         last_mechanism_step_block: int | None,
-        all_job_results: dict[str, list[JobResult]],
-        rented_data: RentedExecutorsResponse,
     ) -> dict[str, float]:
         """Calculate scores with burning logic for this cycle.
 
@@ -116,63 +124,22 @@ class DefaultIncentive(BaseIncentive):
         later in set_weights by normalizing accumulated scores.
 
         Args:
-            miner_scores: Mining scores from this cycle only (not accumulated)
             miners: List of miner neuron information
             last_mechanism_step_block: Last mechanism step block number
-            all_job_results: Mapping of miner hotkeys to their job results (unused in default)
-            rented_data: Response containing all rented executors (unused in default)
 
         Returns:
             dict[str, float]: Scores with burning applied for each miner
         """
-        miner_scores = self.temp_miner_scores
-        cycle_scores = {}
-        total_mining_score = sum(miner_scores.values())
-
-        if settings.ENABLE_NEW_BURN_LOGIC:
-            # New burn logic
-            burners = settings.NEW_BURNERS
-            burn_score_per_burner = TOTAL_BURN_EMISSION / len(burners)
-
-            for miner in miners:
-                if miner.uid in burners:
-                    # Burners get burn emission share
-                    cycle_scores[miner.hotkey] = burn_score_per_burner
-                else:
-                    # Regular miners share mining emission proportionally
-                    if total_mining_score > 0:
-                        mining_share = (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_mining_score
-                    else:
-                        mining_share = 0.0
-                    cycle_scores[miner.hotkey] = mining_share
-        else:
-            # Old burn logic with main burner
-            main_burner = random.Random(last_mechanism_step_block or 0).choice(settings.BURNERS)
-            other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
-
-            main_burner_score = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
-
-            for miner in miners:
-                if miner.uid == main_burner:
-                    cycle_scores[miner.hotkey] = main_burner_score
-                elif miner.uid in other_burners:
-                    cycle_scores[miner.hotkey] = BURNER_EMISSION
-                else:
-                    if total_mining_score > 0:
-                        mining_share = (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_mining_score
-                    else:
-                        mining_share = 0.0
-                    cycle_scores[miner.hotkey] = mining_share
-
-        logger.debug(
-            _m(
-                "Calculated cycle scores with burning",
-                extra={
-                    "total_mining_score": total_mining_score,
-                    "num_miners": len(miners),
-                    "enable_new_burn_logic": settings.ENABLE_NEW_BURN_LOGIC,
-                },
-            )
+        # Calculate burn scores using BurnService
+        cycle_scores = self.burn_service.calculate_burn_scores(
+            miners=miners,
+            burn_share=self.burn_share,  # Fixed at 0.91 for default incentive
+            last_mechanism_step_block=last_mechanism_step_block,
         )
+        for miner in miners:
+            # Check if miner is a burner
+            if miner.hotkey in cycle_scores:
+                continue
+            cycle_scores[miner.hotkey] = self.miner_incentives.get(miner.hotkey, 0.0)
 
         return cycle_scores

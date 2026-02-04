@@ -79,8 +79,8 @@ def validator_with_rental_price(
 ):
     original_create = IncentiveFactory.create
 
-    def create_with_price_provider(config, redis_service):
-        incentive = original_create(config, redis_service)
+    def create_with_price_provider(*args, **kwargs):
+        incentive = original_create(*args, **kwargs)
         if hasattr(incentive, "price_provider"):
             incentive.price_provider = price_provider_holder["provider"]
         return incentive
@@ -993,7 +993,7 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
     )
 
     assert splits["rental_share"] == 0.0
-    assert validator.miner_scores["miner_a"] == 0.0
+    assert validator.miner_scores.get("miner_a", 0) == 0.0
     assert validator.miner_scores["miner_b"] > 0
 
 
