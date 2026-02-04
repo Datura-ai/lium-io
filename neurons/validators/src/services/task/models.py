@@ -12,7 +12,6 @@ class JobResult(BaseModel):
     executor_info: ExecutorSSHInfo
     score: float
     job_score: float
-    mining_score: float | None = None       # Score for mining pool
     collateral_deposited: bool = False
     job_batch_id: str
     log_status: str
@@ -22,6 +21,28 @@ class JobResult(BaseModel):
     sysbox_runtime: bool = False
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
+
+    # Incentive relevant fields 
+    mining_score: float | None = None                   # Score for mining pool for scoring logic
+    sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
+    uptime_multiplier: float | None = None              # Multiplier for uptime
+    gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
+    total_gpu_count: int | None = None                  # Total number of GPUs of the same model
+    incentive: float | None = None                      # Incentive score for the executor in this cycle
+
+    # V2 incentive relevant fields 
+    effective_rate: float | None = None              # Effective rate for the executor in this cycle for scoring logic
+    hourly_rate: float | None = None                  # Hourly rate for the executor in this cycle for scoring logic
+    max_cap: int | None = None                        # Max cap for GPU counts in this cycle for scoring logic
+    total_unrented_by_gpu_type: int | None = None           # GPU count for the executor in this cycle for scoring logic
+    cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
+    rental_value: float | None = None                  # Rental value for the executor in this cycle for scoring logic
+    eligible_for_rental_share: bool = False
+    rental_share: float | None = None                  # Rental share for the executor in this cycle for scoring logic
+    burn_share: float | None = None                    # Burn share for the executor in this cycle for scoring logic
+    total_rental_cost: float | None = None              # Total rental cost for the executor in this cycle for scoring logic
+    
+    incentive_logs: list[str] = []
 
 
 class ValidationEvent(BaseModel):

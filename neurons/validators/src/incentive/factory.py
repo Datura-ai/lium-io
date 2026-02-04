@@ -2,10 +2,13 @@
 
 from core.utils import get_logger, _m
 from incentive.base import BaseIncentive
+from incentive.burn_service import BurnService
 from incentive.config import IncentiveConfig
 from incentive.default import DefaultIncentive
 from incentive.rental_price import RentalPriceIncentive
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.redis_service import RedisService
+from services.task.models import JobResult
 
 logger = get_logger(__name__)
 
@@ -49,6 +52,8 @@ class IncentiveFactory:
         cls,
         config: IncentiveConfig,
         redis_service: RedisService,
+        jobs_results: dict[str, list[JobResult]],
+        total_gpu_model_count_map: dict,
     ) -> BaseIncentive:
         """Create an incentive algorithm instance based on configuration.
 
@@ -71,13 +76,19 @@ class IncentiveFactory:
             )
 
         incentive_class = cls._registry[algorithm]
+
+        # Create shared BurnService instance
+        burn_service = BurnService()
+
         logger.info(
             _m(
                 "Creating incentive algorithm",
                 extra={"algorithm_name": algorithm},
             )
         )
-        return incentive_class(config, redis_service)
+        return incentive_class(
+            config, redis_service, burn_service, jobs_results, total_gpu_model_count_map
+        )
 
 
 # Register algorithms

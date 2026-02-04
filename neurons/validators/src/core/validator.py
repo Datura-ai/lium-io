@@ -417,14 +417,17 @@ class Validator:
                         ),
                     )
 
-                    incentive = IncentiveFactory.create(self.incentive, self.redis_service)
-                    await incentive.normalize_job_result_score(
-                        all_job_results=all_job_results,
+                    incentive = IncentiveFactory.create(
+                        config=self.incentive,
+                        redis_service=self.redis_service,
+                        # pass results from synthetic job
+                        jobs_results=all_job_results,
                         total_gpu_model_count_map=total_gpu_model_count_map,
                     )
+                    await incentive.caluclate_mining_scores()
 
                     # Publish machine specs
-                    for miner_hotkey, results in all_job_results.items():
+                    for miner_hotkey, results in incentive.job_results.items():
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
                             await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
@@ -436,8 +439,6 @@ class Validator:
                     cycle_scores = await incentive.calculate_final_weights(
                         miners=miners,
                         last_mechanism_step_block=last_mechanism_step_block,
-                        all_job_results=all_job_results,
-                        rented_data=rented_executors,
                     )
 
                     # PHASE 3: Accumulate scores with burning applied
