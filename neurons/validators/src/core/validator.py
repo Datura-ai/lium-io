@@ -489,6 +489,7 @@ class Validator:
                                 }
                             ),
                         ),
+                        exc_info=True,
                     )
             else:
                 remaining_blocks = (

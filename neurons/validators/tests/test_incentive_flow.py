@@ -138,19 +138,25 @@ async def test_scenario_dominant_miner_premium_gpus(
         total_gpu_count=2,
     )
     total_score = dominant_score + small_a100_score + small_4090_score
+    mining_allocation = 1 - TOTAL_BURN_EMISSION
+    burn_share_per_burner = TOTAL_BURN_EMISSION / BURNER_COUNT
 
-    assert validator.miner_scores["dominant_miner"] == pytest.approx(dominant_score)
-    assert validator.miner_scores["small_miner_1"] == pytest.approx(small_a100_score)
-    assert validator.miner_scores["small_miner_2"] == pytest.approx(small_4090_score)
+    expected_dominant_cycle = mining_allocation * dominant_score / total_score
+    expected_small_a100_cycle = mining_allocation * small_a100_score / total_score
+    expected_small_4090_cycle = mining_allocation * small_4090_score / total_score
+
+    assert validator.miner_scores["dominant_miner"] == pytest.approx(expected_dominant_cycle)
+    assert validator.miner_scores["small_miner_1"] == pytest.approx(expected_small_a100_cycle)
+    assert validator.miner_scores["small_miner_2"] == pytest.approx(expected_small_4090_cycle)
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[100] == pytest.approx(TOTAL_BURN_EMISSION / BURNER_COUNT)
-    assert weights_by_uid[101] == pytest.approx(TOTAL_BURN_EMISSION / BURNER_COUNT)
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * dominant_score / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * small_a100_score / total_score)
-    assert weights_by_uid[4] == pytest.approx(MINING_ALLOCATION * small_4090_score / total_score)
+    assert weights_by_uid[100] == pytest.approx(burn_share_per_burner)
+    assert weights_by_uid[101] == pytest.approx(burn_share_per_burner)
+    assert weights_by_uid[2] == pytest.approx(expected_dominant_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_small_a100_cycle)
+    assert weights_by_uid[4] == pytest.approx(expected_small_4090_cycle)
 
 
 @pytest.mark.asyncio
@@ -226,18 +232,21 @@ async def test_scenario_mixed_collateral_strategies(
         uptime_minutes=60,
     )
     total_score = base_score + high_uptime_score + low_uptime_score
+    expected_base_cycle = MINING_ALLOCATION * base_score / total_score
+    expected_high_cycle = MINING_ALLOCATION * high_uptime_score / total_score
+    expected_low_cycle = MINING_ALLOCATION * low_uptime_score / total_score
 
-    assert validator.miner_scores["collateral_miner"] == pytest.approx(base_score)
-    assert validator.miner_scores["uptime_miner_high"] == pytest.approx(high_uptime_score)
-    assert validator.miner_scores["uptime_miner_low"] == pytest.approx(low_uptime_score)
+    assert validator.miner_scores["collateral_miner"] == pytest.approx(expected_base_cycle)
+    assert validator.miner_scores["uptime_miner_high"] == pytest.approx(expected_high_cycle)
+    assert validator.miner_scores["uptime_miner_low"] == pytest.approx(expected_low_cycle)
     assert validator.miner_scores["uptime_miner_low"] < validator.miner_scores["collateral_miner"]
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * base_score / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * high_uptime_score / total_score)
-    assert weights_by_uid[4] == pytest.approx(MINING_ALLOCATION * low_uptime_score / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_base_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_high_cycle)
+    assert weights_by_uid[4] == pytest.approx(expected_low_cycle)
 
 
 @pytest.mark.asyncio
@@ -295,16 +304,18 @@ async def test_scenario_new_vs_established_miner(
         uptime_minutes=10,
     )
     total_score = established_score + new_miner_score
+    expected_established_cycle = MINING_ALLOCATION * established_score / total_score
+    expected_new_cycle = MINING_ALLOCATION * new_miner_score / total_score
 
-    assert validator.miner_scores["established_miner"] == pytest.approx(established_score)
-    assert validator.miner_scores["new_miner"] == pytest.approx(new_miner_score)
+    assert validator.miner_scores["established_miner"] == pytest.approx(expected_established_cycle)
+    assert validator.miner_scores["new_miner"] == pytest.approx(expected_new_cycle)
     assert validator.miner_scores["new_miner"] < validator.miner_scores["established_miner"]
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * established_score / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * new_miner_score / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_established_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_new_cycle)
 
 
 @pytest.mark.asyncio
@@ -349,16 +360,18 @@ async def test_scenario_mixed_sysbox_usage(
         sysbox_runtime=False,
     )
     total_score = sysbox_score + no_sysbox_score
+    expected_sysbox_cycle = MINING_ALLOCATION * sysbox_score / total_score
+    expected_no_sysbox_cycle = MINING_ALLOCATION * no_sysbox_score / total_score
 
-    assert validator.miner_scores["sysbox_miner"] == pytest.approx(sysbox_score)
-    assert validator.miner_scores["no_sysbox_miner"] == pytest.approx(no_sysbox_score)
+    assert validator.miner_scores["sysbox_miner"] == pytest.approx(expected_sysbox_cycle)
+    assert validator.miner_scores["no_sysbox_miner"] == pytest.approx(expected_no_sysbox_cycle)
     assert validator.miner_scores["no_sysbox_miner"] < validator.miner_scores["sysbox_miner"]
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * sysbox_score / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * no_sysbox_score / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_sysbox_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_no_sysbox_cycle)
 
 
 @pytest.mark.asyncio
@@ -448,16 +461,18 @@ async def test_scenario_multiple_executors_per_miner(
         total_gpu_count=4,
     )
     total_score = multi_executor_score + single_executor_score
+    expected_multi_cycle = MINING_ALLOCATION * multi_executor_score / total_score
+    expected_single_cycle = MINING_ALLOCATION * single_executor_score / total_score
 
-    assert validator.miner_scores["multi_executor_miner"] == pytest.approx(multi_executor_score)
-    assert validator.miner_scores["single_executor_miner"] == pytest.approx(single_executor_score)
+    assert validator.miner_scores["multi_executor_miner"] == pytest.approx(expected_multi_cycle)
+    assert validator.miner_scores["single_executor_miner"] == pytest.approx(expected_single_cycle)
     assert validator.miner_scores["multi_executor_miner"] > validator.miner_scores["single_executor_miner"]
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * multi_executor_score / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * single_executor_score / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_multi_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_single_cycle)
 
 
 @pytest.mark.asyncio
@@ -493,13 +508,14 @@ async def test_scenario_all_jobs_failed(
     assert validator.miner_scores.get("miner1", 0) == 0
     assert validator.miner_scores.get("miner2", 0) == 0
 
-    captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
-    weights_by_uid = _weights_by_uid(captured)
+    if validator.miner_scores:
+        captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
+        weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[100] == pytest.approx(TOTAL_BURN_EMISSION / BURNER_COUNT)
-    assert weights_by_uid[101] == pytest.approx(TOTAL_BURN_EMISSION / BURNER_COUNT)
-    assert weights_by_uid[2] == 0
-    assert weights_by_uid[3] == 0
+        assert weights_by_uid[100] == pytest.approx(TOTAL_BURN_EMISSION / BURNER_COUNT)
+        assert weights_by_uid[101] == pytest.approx(TOTAL_BURN_EMISSION / BURNER_COUNT)
+        assert weights_by_uid[2] == 0
+        assert weights_by_uid[3] == 0
 
 
 @pytest.mark.asyncio
@@ -539,7 +555,7 @@ async def test_scenario_single_miner_monopoly(
     )
     failed_score = 0.0
 
-    assert validator.miner_scores["monopoly_miner"] == pytest.approx(monopoly_score)
+    assert validator.miner_scores["monopoly_miner"] == pytest.approx(MINING_ALLOCATION)
     assert validator.miner_scores.get("failed_miner", 0) == failed_score
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
@@ -592,16 +608,18 @@ async def test_scenario_gpu_type_scarcity(
         total_gpu_count=1,
     )
     total_score = scarce_score + abundant_score
+    expected_scarce_cycle = MINING_ALLOCATION * scarce_score / total_score
+    expected_abundant_cycle = MINING_ALLOCATION * abundant_score / total_score
 
-    assert validator.miner_scores["scarce_gpu_miner"] == pytest.approx(scarce_score)
-    assert validator.miner_scores["abundant_gpu_miner"] == pytest.approx(abundant_score)
+    assert validator.miner_scores["scarce_gpu_miner"] == pytest.approx(expected_scarce_cycle)
+    assert validator.miner_scores["abundant_gpu_miner"] == pytest.approx(expected_abundant_cycle)
     assert validator.miner_scores["scarce_gpu_miner"] > validator.miner_scores["abundant_gpu_miner"]
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * scarce_score / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * abundant_score / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_scarce_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_abundant_cycle)
 
 
 @pytest.mark.asyncio
@@ -643,10 +661,12 @@ async def test_scenario_equal_competition(
         gpu_count=2,
         total_gpu_count=6,
     )
+    total_score = equal_score * 3
+    expected_equal_cycle = MINING_ALLOCATION * equal_score / total_score
 
-    assert validator.miner_scores["equal_miner_1"] == pytest.approx(equal_score, rel=1e-3)
-    assert validator.miner_scores["equal_miner_2"] == pytest.approx(equal_score, rel=1e-3)
-    assert validator.miner_scores["equal_miner_3"] == pytest.approx(equal_score, rel=1e-3)
+    assert validator.miner_scores["equal_miner_1"] == pytest.approx(expected_equal_cycle, rel=1e-3)
+    assert validator.miner_scores["equal_miner_2"] == pytest.approx(expected_equal_cycle, rel=1e-3)
+    assert validator.miner_scores["equal_miner_3"] == pytest.approx(expected_equal_cycle, rel=1e-3)
 
     assert validator.miner_scores["equal_miner_1"] == pytest.approx(validator.miner_scores["equal_miner_2"])
     assert validator.miner_scores["equal_miner_2"] == pytest.approx(validator.miner_scores["equal_miner_3"])
@@ -654,10 +674,9 @@ async def test_scenario_equal_competition(
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    total_score = sum(validator.miner_scores.values())
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * validator.miner_scores["equal_miner_1"] / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * validator.miner_scores["equal_miner_2"] / total_score)
-    assert weights_by_uid[4] == pytest.approx(MINING_ALLOCATION * validator.miner_scores["equal_miner_3"] / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_equal_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_equal_cycle)
+    assert weights_by_uid[4] == pytest.approx(expected_equal_cycle)
 
 
 @pytest.mark.asyncio
@@ -749,22 +768,24 @@ async def test_scenario_mixed_fleet_diversity(
         gpu_count=16,
         total_gpu_count=18,
     )
+    total_score = enterprise_score + hobbyist_score + startup_score + datacenter_score
+    expected_enterprise_cycle = MINING_ALLOCATION * enterprise_score / total_score
+    expected_hobbyist_cycle = MINING_ALLOCATION * hobbyist_score / total_score
+    expected_startup_cycle = MINING_ALLOCATION * startup_score / total_score
+    expected_datacenter_cycle = MINING_ALLOCATION * datacenter_score / total_score
 
-    assert validator.miner_scores["enterprise_miner"] == pytest.approx(enterprise_score)
-    assert validator.miner_scores["hobbyist_miner"] == pytest.approx(hobbyist_score)
-    assert validator.miner_scores["startup_miner"] == pytest.approx(startup_score, rel=1e-3)
-    assert validator.miner_scores["datacenter_miner"] == pytest.approx(datacenter_score, rel=1e-3)
-
-    assert validator.miner_scores["enterprise_miner"] == max(validator.miner_scores.values())
+    assert validator.miner_scores["enterprise_miner"] == pytest.approx(expected_enterprise_cycle)
+    assert validator.miner_scores["hobbyist_miner"] == pytest.approx(expected_hobbyist_cycle)
+    assert validator.miner_scores["startup_miner"] == pytest.approx(expected_startup_cycle, rel=1e-3)
+    assert validator.miner_scores["datacenter_miner"] == pytest.approx(expected_datacenter_cycle, rel=1e-3)
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    total_score = sum(validator.miner_scores.values())
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * validator.miner_scores["enterprise_miner"] / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * validator.miner_scores["hobbyist_miner"] / total_score)
-    assert weights_by_uid[4] == pytest.approx(MINING_ALLOCATION * validator.miner_scores["startup_miner"] / total_score)
-    assert weights_by_uid[5] == pytest.approx(MINING_ALLOCATION * validator.miner_scores["datacenter_miner"] / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_enterprise_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_hobbyist_cycle)
+    assert weights_by_uid[4] == pytest.approx(expected_startup_cycle)
+    assert weights_by_uid[5] == pytest.approx(expected_datacenter_cycle)
 
 
 @pytest.mark.asyncio
@@ -797,8 +818,8 @@ async def test_scenario_burners_only_no_miner_scores(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    assert validator.miner_scores["miner1"] == 0
-    assert validator.miner_scores["miner2"] == 0
+    assert validator.miner_scores.get("miner1") == 0
+    assert validator.miner_scores.get("miner2") == 0
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
@@ -913,16 +934,18 @@ async def test_scenario_extreme_uptime_penalty(
         total_gpu_count=4,
     )
     total_score = zero_uptime_score + normal_score
+    expected_zero_cycle = MINING_ALLOCATION * zero_uptime_score / total_score
+    expected_normal_cycle = MINING_ALLOCATION * normal_score / total_score
 
-    assert validator.miner_scores["zero_uptime_miner"] == pytest.approx(zero_uptime_score)
-    assert validator.miner_scores["normal_miner"] == pytest.approx(normal_score)
+    assert validator.miner_scores["zero_uptime_miner"] == pytest.approx(expected_zero_cycle)
+    assert validator.miner_scores["normal_miner"] == pytest.approx(expected_normal_cycle)
     assert validator.miner_scores["zero_uptime_miner"] < validator.miner_scores["normal_miner"]
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * zero_uptime_score / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * normal_score / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_zero_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_normal_cycle)
 
 
 @pytest.mark.asyncio
@@ -967,16 +990,18 @@ async def test_scenario_weight_distribution_fairness(
     )
     total_score = high_score + low_score
     ratio = high_score / low_score
+    expected_high_cycle = MINING_ALLOCATION * high_score / total_score
+    expected_low_cycle = MINING_ALLOCATION * low_score / total_score
 
-    assert validator.miner_scores["miner_high"] == pytest.approx(high_score)
-    assert validator.miner_scores["miner_low"] == pytest.approx(low_score)
+    assert validator.miner_scores["miner_high"] == pytest.approx(expected_high_cycle)
+    assert validator.miner_scores["miner_low"] == pytest.approx(expected_low_cycle)
     assert validator.miner_scores["miner_high"] / validator.miner_scores["miner_low"] == pytest.approx(ratio)
 
     captured = await _run_set_weights_and_capture(mock_subtensor_client, miners, validator.miner_scores)
     weights_by_uid = _weights_by_uid(captured)
 
-    assert weights_by_uid[2] == pytest.approx(MINING_ALLOCATION * high_score / total_score)
-    assert weights_by_uid[3] == pytest.approx(MINING_ALLOCATION * low_score / total_score)
+    assert weights_by_uid[2] == pytest.approx(expected_high_cycle)
+    assert weights_by_uid[3] == pytest.approx(expected_low_cycle)
     assert weights_by_uid[2] / weights_by_uid[3] == pytest.approx(ratio)
 
 
