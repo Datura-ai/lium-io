@@ -140,7 +140,7 @@ def mock_subtensor_client(mock_settings):
 @pytest.fixture
 def validator_with_mocks(incentive_redis_service, mock_subtensor_client, mock_settings):
     validator = Validator()
-    validator.incentive = IncentiveFactory.create(settings.incentive, incentive_redis_service)
+    validator.incentive = settings.incentive
     validator.redis_service = incentive_redis_service
     validator.subtensor_client = mock_subtensor_client
     validator.file_encrypt_service = MagicMock()

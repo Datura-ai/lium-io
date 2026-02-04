@@ -12,6 +12,7 @@ class JobResult(BaseModel):
     executor_info: ExecutorSSHInfo
     score: float
     job_score: float
+    mining_score: float | None = None       # Score for mining pool
     collateral_deposited: bool = False
     job_batch_id: str
     log_status: str

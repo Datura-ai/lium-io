@@ -27,6 +27,37 @@ class BaseIncentive(ABC):
         self.config = config
         self.redis_service = redis_service
 
+        self.total_executors = 0
+        self.successful_executors = 0
+        self.failed_executors = 0
+
+        self.temp_miner_scores = {}
+
+    async def normalize_job_result_score(
+        self, all_job_results: dict[str, list[JobResult]], total_gpu_model_count_map: dict,
+    ):
+        """Normalize the score of a job result.
+
+        Args:
+            all_job_results: All job results
+
+        Returns:
+            None
+        """
+        for miner_hotkey, results in all_job_results.items():
+            for result in results:
+                self.total_executors += 1
+                # Replace calc_job_score with incentive.calculate_executor_score
+                result.mining_score = await self.calculate_executor_score(
+                    total_gpu_model_count_map=total_gpu_model_count_map,
+                    job_result=result,
+                )
+                self.temp_miner_scores[miner_hotkey] = self.temp_miner_scores.get(miner_hotkey, 0) + result.mining_score
+                if result.job_score == 1.0:
+                    self.successful_executors += 1
+                else:
+                    self.failed_executors += 1
+
     @abstractmethod
     async def calculate_executor_score(
         self,
@@ -47,7 +78,6 @@ class BaseIncentive(ABC):
     @abstractmethod
     async def calculate_final_weights(
         self,
-        miner_scores: dict[str, float],
         miners: list[bittensor.NeuronInfo],
         last_mechanism_step_block: int | None,
         all_job_results: dict[str, list[JobResult]],
