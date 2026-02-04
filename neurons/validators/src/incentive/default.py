@@ -56,12 +56,6 @@ class DefaultIncentive(BaseIncentive):
         """
         # Early exit check - if job score is 0, return immediately
         if job_result.score == 0:
-            logger.debug(
-                _m(
-                    "Job score is 0, returning 0",
-                    extra=get_extra_info(job_result),
-                )
-            )
             return 0
 
         # GPU count calculation
@@ -98,7 +92,6 @@ class DefaultIncentive(BaseIncentive):
             _m(
                 "Calculated executor score",
                 extra={
-                    **get_extra_info(job_result),
                     "total_gpu_count": total_gpu_count,
                     "score_portion": score_portion,
                     "multiplier": multiplier,

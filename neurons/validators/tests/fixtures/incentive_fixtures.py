@@ -6,6 +6,8 @@ import bittensor
 
 from core.config import settings
 from core.validator import Validator
+from incentive.config import IncentiveConfig
+from incentive.factory import IncentiveFactory
 from services.task_service import JobResult
 
 
@@ -39,6 +41,7 @@ def mock_settings(monkeypatch):
     monkeypatch.setattr(settings, "NEW_BURNERS", [100, 101])
     monkeypatch.setattr(settings, "ENABLE_NEW_BURN_LOGIC", True)
     monkeypatch.setattr(settings, "DRY_RUN", False)
+    monkeypatch.setattr(settings, "incentive", IncentiveConfig(algorithm="default"))
     return settings
 
 
@@ -135,8 +138,9 @@ def mock_subtensor_client(mock_settings):
 
 
 @pytest.fixture
-def validator_with_mocks(incentive_redis_service, mock_subtensor_client):
+def validator_with_mocks(incentive_redis_service, mock_subtensor_client, mock_settings):
     validator = Validator()
+    validator.incentive = IncentiveFactory.create(settings.incentive, incentive_redis_service)
     validator.redis_service = incentive_redis_service
     validator.subtensor_client = mock_subtensor_client
     validator.file_encrypt_service = MagicMock()
