@@ -48,6 +48,9 @@ class Validator:
 
         self.miner_scores = {}
 
+        # set incentive algorithm from setting
+        self.incentive = settings.incentive
+
     async def initiate_services(self):
         # initiate subtensor client
         self.subtensor_client = await SubtensorClient.initialize()
@@ -103,9 +106,6 @@ class Validator:
             redis_service=self.redis_service,
             port_mapping_dao=self.port_mapping_dao,
         )
-
-        # Initialize incentive module
-        self.incentive = IncentiveFactory.create(settings.incentive, self.redis_service)
 
         # init miner_scores
         try:
@@ -417,28 +417,14 @@ class Validator:
                         ),
                     )
 
-                    total_executors = 0
-                    successful_executors = 0
-                    failed_executors = 0
+                    incentive = IncentiveFactory.create(self.incentive, self.redis_service)
+                    await incentive.normalize_job_result_score(
+                        all_job_results=all_job_results,
+                        total_gpu_model_count_map=total_gpu_model_count_map,
+                    )
 
-                    # PHASE 1: Calculate executor scores per job result
-                    temp_miner_scores = {}
+                    # Publish machine specs
                     for miner_hotkey, results in all_job_results.items():
-                        for result in results:
-                            total_executors += 1
-                            # Replace calc_job_score with incentive.calculate_executor_score
-                            score = await self.incentive.calculate_executor_score(
-                                total_gpu_model_count_map=total_gpu_model_count_map,
-                                job_result=result,
-                            )
-                            result.score = score
-                            temp_miner_scores[miner_hotkey] = temp_miner_scores.get(miner_hotkey, 0) + score
-
-                            if result.job_score == 1.0:
-                                successful_executors += 1
-                            else:
-                                failed_executors += 1
-
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
                             await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
@@ -447,8 +433,7 @@ class Validator:
                     miners = await self.subtensor_client.get_miners()
                     last_mechanism_step_block = self.subtensor_client.get_last_mechansim_step_block()
 
-                    cycle_scores = await self.incentive.calculate_final_weights(
-                        miner_scores=temp_miner_scores,
+                    cycle_scores = await incentive.calculate_final_weights(
                         miners=miners,
                         last_mechanism_step_block=last_mechanism_step_block,
                         all_job_results=all_job_results,
@@ -469,9 +454,9 @@ class Validator:
                                     "cycle_scores": cycle_scores,
                                     "accumulated_miner_scores": self.miner_scores,
                                     "open_fd_count": open_fd_count,
-                                    "total_executors": total_executors,
-                                    "successful_executors": successful_executors,
-                                    "failed_executors": failed_executors,
+                                    "total_executors": incentive.total_executors,
+                                    "successful_executors": incentive.successful_executors,
+                                    "failed_executors": incentive.failed_executors,
                                 }
                             ),
                         ),

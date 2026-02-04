@@ -104,7 +104,6 @@ class DefaultIncentive(BaseIncentive):
 
     async def calculate_final_weights(
         self,
-        miner_scores: dict[str, float],
         miners: list[bittensor.NeuronInfo],
         last_mechanism_step_block: int | None,
         all_job_results: dict[str, list[JobResult]],
@@ -126,6 +125,7 @@ class DefaultIncentive(BaseIncentive):
         Returns:
             dict[str, float]: Scores with burning applied for each miner
         """
+        miner_scores = self.temp_miner_scores
         cycle_scores = {}
         total_mining_score = sum(miner_scores.values())
 
