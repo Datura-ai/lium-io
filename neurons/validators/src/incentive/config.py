@@ -3,6 +3,21 @@
 from pydantic import BaseModel, Field, field_validator
 
 
+# Rental prices by GPU type for rental-cost pool eligible GPU types 
+RENTAL_PRICES_BY_GPU_TYPE = {
+    "NVIDIA B200": 2.99,
+    "NVIDIA H200": 1.90,
+    "NVIDIA H200 NVL": 1.67, # same rate as "NVIDIA H100 NVL" / "NVIDIA H100 80GB HBM3"
+    "NVIDIA H100 80GB HBM3": 1.26,
+    "NVIDIA H100 NVL": 1.11,
+    "NVIDIA H100 PCIe": 1.11,
+    "NVIDIA A100 80GB PCIe": 0.36,
+    "NVIDIA A100-SXM4-80GB": 0.43,
+}
+
+MAX_UNRENTED_GPUS = 24
+
+
 class IncentiveConfig(BaseModel):
     """Configuration for incentive algorithm selection and parameters.
 
@@ -19,17 +34,17 @@ class IncentiveConfig(BaseModel):
     )
 
     eligible_gpu_types: list[str] = Field(
-        default_factory=list,
+        default=list(RENTAL_PRICES_BY_GPU_TYPE.keys()),
         description="GPU types eligible for rental incentives"
     )
 
     max_unrented_gpus: int = Field(
-        default=1000,
+        default=MAX_UNRENTED_GPUS,
         description="Maximum unrented GPUs before cap dilution"
     )
 
     rental_prices_per_hour: dict[str, float] = Field(
-        default_factory=dict,
+        default=RENTAL_PRICES_BY_GPU_TYPE,
         description="Rental prices per GPU type in USD/hour"
     )
 
