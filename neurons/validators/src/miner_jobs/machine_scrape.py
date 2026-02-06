@@ -750,8 +750,12 @@ def get_sha256_checksum_from_file_content(file_content: bytes):
 def get_libnvidia_ml_path():
     try:
         original_path = run_cmd("find /usr -name 'libnvidia-ml.so.1'").strip()
-        return original_path.split('\n')[-1]
-    except:
+        paths = [p for p in original_path.split('\n') if p]
+        for p in paths:
+            if 'x86_64' in p or 'lib64' in p:
+                return p
+        return paths[0] if paths else ''
+    except Exception:
         return ''
 
 
@@ -1035,6 +1039,10 @@ def _encrypt(key: str, payload: str) -> str:
 
 
 machine_specs = get_machine_specs()
-encryption_key = "".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
+gpu_details = machine_specs.get("data_gpu", {}).get("gpu_details", [])
+if not gpu_details:
+    print(json.dumps({"error": "no_gpu_details", "data": machine_specs}))
+    sys.exit(1)
+encryption_key = "".join(gpu_details[0].keys())
 encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
 print(encoded_str)
