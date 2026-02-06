@@ -398,6 +398,9 @@ class Validator:
                             )
                             task.cancel()
 
+                        # Await cancelled tasks to ensure resources are released
+                        await asyncio.gather(*pending, return_exceptions=True)
+
                     open_fd_count = len(os.listdir(f'/proc/self/fd'))
 
                     logger.info(

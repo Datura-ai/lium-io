@@ -245,6 +245,9 @@ async def _debug_validator(count: int):
 
                     pendings.append({"miner_hotkey": miner_hotkey})
 
+                # Await cancelled tasks to ensure resources are released
+                await asyncio.gather(*pending, return_exceptions=True)
+
             logger.info(_m("[sync] All Jobs finished", extra={
                 "success": success,
                 "errors": errors,
