@@ -1030,6 +1030,10 @@ def get_machine_specs():
         "md5_checksums_docker": f"{get_md5_checksum_from_file_content(docker_content)}:{get_sha256_checksum_from_file_content(docker_content)}",
     }
 
+    if not data.get("data_gpu", {}).get("gpu_details", []):
+        print(json.dumps({"error": "no_gpu_details", "data": data}))
+        sys.exit(1)
+
     return data
 
 
@@ -1039,10 +1043,6 @@ def _encrypt(key: str, payload: str) -> str:
 
 
 machine_specs = get_machine_specs()
-gpu_details = machine_specs.get("data_gpu", {}).get("gpu_details", [])
-if not gpu_details:
-    print(json.dumps({"error": "no_gpu_details", "data": machine_specs}))
-    sys.exit(1)
-encryption_key = "".join(gpu_details[0].keys())
+encryption_key = "".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
 encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
 print(encoded_str)
