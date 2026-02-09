@@ -17,7 +17,7 @@ def expected_executor_score(
     collateral_deposited: bool,
     uptime_minutes: float,
 ) -> float:
-    if not is_rented and gpu_model in rental_incentive_gpu_types:
+    if not is_rented:
         return 0.0
 
     if total_gpu_count == 0:
