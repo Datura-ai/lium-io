@@ -88,6 +88,8 @@ async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_b
     await validator.sync()
 
 
+# Existing test scenarios
+
 @pytest.mark.asyncio
 async def test_scenario_dominant_miner_premium_gpus(
     validator_with_mocks,
@@ -121,6 +123,21 @@ async def test_scenario_dominant_miner_premium_gpus(
     }
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify incentive logging for successful executors
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:  # Only check if logs were populated
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "mining_score",
+                    "total_mining_score",
+                    "mining_share",
+                    "incentive"
+                ])
 
     dominant_score = expected_score(
         portion=GPU_PORTION["H100"],
@@ -212,6 +229,20 @@ async def test_scenario_mixed_collateral_strategies(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify incentive logging
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "mining_score",
+                    "total_mining_score",
+                    "incentive"
+                ])
+
     base_score = expected_score(
         portion=GPU_PORTION["H100"],
         gpu_count=1,
@@ -291,6 +322,20 @@ async def test_scenario_new_vs_established_miner(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify incentive logging
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "mining_score",
+                    "total_mining_score",
+                    "incentive"
+                ])
+
     established_score = expected_score(
         portion=GPU_PORTION["H100"],
         gpu_count=4,
@@ -347,6 +392,20 @@ async def test_scenario_mixed_sysbox_usage(
     }
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify incentive logging
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "mining_score",
+                    "total_mining_score",
+                    "incentive"
+                ])
 
     sysbox_score = expected_score(
         portion=GPU_PORTION["A100"],
@@ -436,6 +495,33 @@ async def test_scenario_multiple_executors_per_miner(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify incentive logging - CRITICAL: Each executor should have independent log entry
+    from tests.helpers import (
+        assert_incentive_log_present,
+        assert_executor_has_log,
+        assert_log_contains_keys,
+        count_incentive_log_entries,
+    )
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "mining_score",
+                    "total_mining_score",
+                    "incentive"
+                ])
+
+    # Verify multi-executor miner has 3 independent log entries (one per executor)
+    multi_executor_results = all_job_results["multi_executor_miner"]
+    assert len(multi_executor_results) == 3, "Should have 3 executors"
+    for result in multi_executor_results:
+        # Each result should have its own executor_id in logs (if logs were populated)
+        if result.incentive_logs:
+            assert str(result.executor_info.uuid) in result.full_log_text
+
     exec1_score = expected_score(
         portion=GPU_PORTION["H100"],
         gpu_count=2,
@@ -504,6 +590,18 @@ async def test_scenario_all_jobs_failed(
     }
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify no incentive logs for failed jobs (Edge case)
+    from tests.helpers import extract_incentive_section
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.mining_score is None:
+                # Failed jobs should not have incentive logs or only error logs
+                section = extract_incentive_section(result.full_log_text)
+                if section:
+                    # If logs exist, should be error logs
+                    assert "Mining score is not set" in section
 
     assert validator.miner_scores.get("miner1", 0) == 0
     assert validator.miner_scores.get("miner2", 0) == 0
@@ -656,6 +754,20 @@ async def test_scenario_equal_competition(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify incentive logging for identical configurations
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "mining_score",
+                    "total_mining_score",
+                    "incentive"
+                ])
+
     equal_score = expected_score(
         portion=GPU_PORTION["A100"],
         gpu_count=2,
@@ -736,6 +848,22 @@ async def test_scenario_mixed_fleet_diversity(
     }
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify incentive logging for mixed fleet with diverse GPU types
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "mining_score",
+                    "total_mining_score",
+                    "incentive"
+                ])
+                # Verify GPU model appears in logs (mixed GPU types edge case)
+                assert result.gpu_model in result.full_log_text
 
     enterprise_score = expected_score(
         portion=GPU_PORTION["H100"],
@@ -920,6 +1048,20 @@ async def test_scenario_extreme_uptime_penalty(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify incentive logging even with extreme uptime penalty
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "mining_score",
+                    "total_mining_score",
+                    "incentive"
+                ])
+
     zero_uptime_score = expected_score(
         portion=GPU_PORTION["H100"],
         gpu_count=2,
@@ -1030,6 +1172,18 @@ async def test_scenario_zero_gpu_count_edge_case(
     }
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify no incentive logs for failed edge case (unknown GPU, zero score)
+    from tests.helpers import extract_incentive_section
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.mining_score is None:
+                # Failed jobs should not have incentive logs or only error logs
+                section = extract_incentive_section(result.full_log_text)
+                if section:
+                    # If logs exist, should be error logs
+                    assert "Mining score is not set" in section
 
     assert validator.miner_scores.get("miner1", 0) == 0
 

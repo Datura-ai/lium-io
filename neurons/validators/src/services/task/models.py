@@ -43,6 +43,13 @@ class JobResult(BaseModel):
     
     incentive_logs: list[str] = []
 
+    @property
+    def full_log_text(self):
+        """Return the full log text including the incentive logs."""
+        if not self.log_text or not self.incentive_logs:
+            return self.log_text
+        return self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
+
 
 class ValidationEvent(BaseModel):
     event: str

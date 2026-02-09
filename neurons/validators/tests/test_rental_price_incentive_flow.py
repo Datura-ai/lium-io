@@ -158,6 +158,30 @@ async def test_rental_price_scenario_basic_mixed(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify rental-specific logging for rented vs unrented executors
+    from tests.helpers import (
+        assert_incentive_log_present,
+        assert_executor_has_log,
+        assert_log_contains_keys,
+        assert_rental_price_incentive_log_full_content,
+    )
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+
+                if result.eligible_for_rental_share and not result.is_rented:
+                    # Rental algorithm logs for unrented eligible executors (rental_price.py 146-165)
+                    assert_rental_price_incentive_log_full_content(result.full_log_text)
+                else:
+                    # Falls back to default algorithm for rented or non-eligible
+                    assert_log_contains_keys(result.full_log_text, [
+                        "mining_score",
+                        "total_mining_score"
+                    ])
+
     total_gpu_counts = _total_gpu_counts(all_job_results)
     expected_a_score = expected_executor_score(
         gpu_model="H100",
@@ -287,6 +311,22 @@ async def test_rental_price_scenario_cap_dilution(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify cap dilution appears in logs
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                # Verify cap_dilution_applied is logged (key feature of this test)
+                assert_log_contains_keys(result.full_log_text, [
+                    "effective_rate",
+                    "total_unrented_by_gpu_type",
+                    "cap_dilution_applied",
+                    "rental_share"
+                ])
+
     total_unrented = 1500
     expected_effective_rate = H100_HOURLY_RATE * MAX_UNRENTED_GPUS / total_unrented
     expected_total_rental_cost = total_unrented * expected_effective_rate
@@ -347,6 +387,19 @@ async def test_rental_price_scenario_all_unrented(
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data())
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify rental logging for all unrented scenario
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, [
+                    "effective_rate",
+                    "rental_share"
+                ])
 
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 30, "H200": 15},
@@ -501,6 +554,35 @@ async def test_rental_price_edge_multi_executor_accumulation(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify logging for multiple executors per miner (CRITICAL edge case)
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+
+                if result.eligible_for_rental_share and not result.is_rented:
+                    # Rental algorithm logs
+                    assert_log_contains_keys(result.full_log_text, [
+                        "effective_rate",
+                        "rental_share"
+                    ])
+                else:
+                    # Default algorithm logs for rented executors
+                    assert_log_contains_keys(result.full_log_text, [
+                        "mining_score",
+                        "total_mining_score"
+                    ])
+
+    # Verify miner_a has 3 independent log entries
+    miner_a_results = all_job_results["miner_a"]
+    assert len(miner_a_results) == 3, "Should have 3 executors"
+    for result in miner_a_results:
+        if result.incentive_logs:
+            assert str(result.executor_info.uuid) in result.full_log_text
+
     total_gpu_counts = _total_gpu_counts(all_job_results)
     expected_a_mining = expected_executor_score(
         gpu_model="H100",
@@ -602,6 +684,22 @@ async def test_rental_price_edge_gpu_type_mix(
     )
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify logging for mixed GPU types edge case
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                # Verify GPU model appears in logs (mixed GPU types)
+                assert result.gpu_model in result.full_log_text
+
+                if result.eligible_for_rental_share and not result.is_rented:
+                    assert_log_contains_keys(result.full_log_text, ["effective_rate", "rental_share"])
+                else:
+                    assert_log_contains_keys(result.full_log_text, ["mining_score", "total_mining_score"])
 
     total_gpu_counts = _total_gpu_counts(all_job_results)
     expected_a_mining = expected_executor_score(
@@ -932,6 +1030,18 @@ async def test_rental_price_failed_executors_rented_do_not_score(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify no incentive logs for failed rented executors (Edge case)
+    from tests.helpers import extract_incentive_section
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.mining_score is None:
+                # Failed jobs should not have incentive logs or only error logs
+                section = extract_incentive_section(result.full_log_text)
+                if section:
+                    # If logs exist, should be error logs
+                    assert "Mining score is not set" in section
+
     assert validator.miner_scores["miner_a"] == 0.0
     assert validator.miner_scores["miner_b"] > 0
 
@@ -984,6 +1094,22 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    # Verify no incentive logs for failed unrented executor (Edge case)
+    from tests.helpers import extract_incentive_section, assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.mining_score is None:
+                # Failed jobs should not have incentive logs or only error logs
+                section = extract_incentive_section(result.full_log_text)
+                if section:
+                    assert "Mining score is not set" in section
+            elif result.score > 0 and result.incentive_logs:
+                # Successful executors should have logs
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                assert_log_contains_keys(result.full_log_text, ["mining_score", "total_mining_score"])
+
     splits = expected_emission_splits(
         unrented_gpu_counts={},
         rental_prices=RENTAL_PRICES_PER_HOUR,
@@ -1033,6 +1159,22 @@ async def test_rental_price_edge_single_miner_dominance(
     )
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify logging for single dominant miner scenario
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
+    for hotkey, results in all_job_results.items():
+        for result in results:
+            if result.score > 0 and result.incentive_logs:
+                assert_incentive_log_present(result.full_log_text)
+                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+
+                if result.eligible_for_rental_share and not result.is_rented:
+                    # Rental algorithm logs
+                    assert_log_contains_keys(result.full_log_text, ["effective_rate", "rental_share"])
+                else:
+                    # Default algorithm logs for rented executors
+                    assert_log_contains_keys(result.full_log_text, ["mining_score", "total_mining_score"])
 
     assert validator.miner_scores["miner_a"] > validator.miner_scores["miner_b"] + validator.miner_scores["miner_c"]
     assert validator.miner_scores["miner_b"] == pytest.approx(

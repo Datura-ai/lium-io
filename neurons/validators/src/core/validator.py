@@ -371,12 +371,6 @@ class Validator:
                     )
                     await incentive.caluclate_mining_scores()
 
-                    # Publish machine specs
-                    for miner_hotkey, results in incentive.job_results.items():
-                        miner_coldkey = miner_coldkeys.get(miner_hotkey)
-                        if miner_coldkey:
-                            await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
-
                     # PHASE 2: Calculate final weights with burning logic per cycle
                     miners = await self.subtensor_client.get_miners()
                     last_mechanism_step_block = self.subtensor_client.get_last_mechansim_step_block()
@@ -389,6 +383,12 @@ class Validator:
                     # PHASE 3: Accumulate scores with burning applied
                     for miner_hotkey, score in cycle_scores.items():
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+
+                    # Publish machine specs
+                    for miner_hotkey, results in incentive.job_results.items():
+                        miner_coldkey = miner_coldkeys.get(miner_hotkey)
+                        if miner_coldkey:
+                            await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
 
                     logger.info(
                         _m(

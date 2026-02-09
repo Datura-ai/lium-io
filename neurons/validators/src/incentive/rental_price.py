@@ -139,13 +139,13 @@ class RentalPriceIncentive(DefaultIncentive):
 
         # calculate incentive score
         result.incentive = (
-            result.rental_share * result.gpu_count * result.effective_rate / self.total_rental_cost 
+            result.rental_share * result.gpu_count * result.effective_rate / result.total_rental_cost 
             if result.total_rental_cost > 0 else 0.0
         )
 
         # update incentive logs
         result.incentive_logs.append(
-            str(_m(
+            _m(
                 "Rental price incentive for executor is calculated successfully. Formula: rental_share * gpu_count / total_unrented_count",
                 extra=get_extra_info({
                     "hotkey": hotkey,
@@ -159,8 +159,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     "rental_share": result.rental_share,
                     "burn_share": result.burn_share,
                     "incentive": result.incentive,
+                    "total_rental_cost": result.total_rental_cost,
                 }),
-            ))
+            ).to_full_string()
         )
 
         # aggregate miner incentives
