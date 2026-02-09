@@ -339,13 +339,20 @@ class RedisService:
         await self.hset(PORTION_PER_GPU_TYPE_SET, gpu_type, str(portion))
 
     async def get_portion_per_gpu_type(self, gpu_type: str):
-        portion = await self.hget(PORTION_PER_GPU_TYPE_SET, gpu_type)
-        portion = float(portion) if portion else 0
-        if not portion:
-            gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
-            return gpu_model_rate
+        try:
+            if gpu_type is None or not isinstance(gpu_type, str):
+                return 0
+            
+            portion = await self.hget(PORTION_PER_GPU_TYPE_SET, gpu_type)
+            portion = float(portion) if portion else 0
+            if not portion:
+                gpu_model_rate = GPU_MODEL_RATES.get(gpu_type, 0)
+                return gpu_model_rate
 
-        return portion
+            return portion
+        except Exception as e:
+            logger.error(_m("Error getting portion per gpu type.", extra={"error": str(e), "gpu_type": gpu_type}), exc_info=True)
+            return 0
 
     async def set_banned_guids(self, guids: list[str]):
         await self.redis.set(BANNED_GUIDS, json.dumps(guids))

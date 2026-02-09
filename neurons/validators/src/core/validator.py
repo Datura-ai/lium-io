@@ -147,61 +147,6 @@ class Validator:
             ),
         )
 
-    async def calc_job_score(self, total_gpu_model_count_map: dict, job_result: JobResult):
-        default_extra = {
-            "executor_id": str(job_result.executor_info.uuid),
-            "job_batch_id": job_result.job_batch_id,
-            "gpu_model": job_result.gpu_model,
-            "gpu_count": job_result.gpu_count,
-            "score": job_result.score,
-            "collateral_deposited": job_result.collateral_deposited,
-            "sysbox_runtime": job_result.sysbox_runtime,
-        }
-        if job_result.score == 0:
-            logger.info(
-                _m(
-                    "Debug: No need to calc score, score is 0",
-                    extra=get_extra_info(default_extra)
-                )
-            )
-            return 0
-
-        total_gpu_count = total_gpu_model_count_map.get(job_result.gpu_model, 0)
-
-        if total_gpu_count == 0:
-            return 0
-
-        score_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
-        score = job_result.score * score_portion * job_result.gpu_count / total_gpu_count
-        
-        # calc multiplier
-        multiplier = 1
-
-        # calc multiplier for sysbox_runtime
-        if not job_result.sysbox_runtime:
-            multiplier = multiplier * (1  - settings.PORTION_FOR_SYSBOX)
-
-        # calc multiplier for uptime
-        if not job_result.collateral_deposited:
-            uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
-            multiplier = multiplier * (1 - settings.PORTION_FOR_UPTIME + settings.PORTION_FOR_UPTIME * min(1, uptime_in_minutes / settings.UPTIME_REQUIRED_MINUTES))
-
-        score = score * multiplier
-
-        logger.info(
-            _m(
-                "Debug: calculating score",
-                extra=get_extra_info({
-                    **default_extra,
-                    "score_portion": score_portion,
-                    "multiplier": multiplier,
-                    "score": score,
-                })
-            )
-        )
-
-        return score
-
     async def sync(self):
         try:
             logger.info(

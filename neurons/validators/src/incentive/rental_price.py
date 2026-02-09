@@ -6,7 +6,7 @@ rewards unrented high-end GPUs based on their rental market value.
 
 import bittensor
 
-from core.utils import _m, get_logger
+from core.utils import _m, get_extra_info, get_logger
 from incentive.burn_service import BurnService
 from incentive.config import IncentiveConfig
 from incentive.default import DefaultIncentive
@@ -140,14 +140,14 @@ class RentalPriceIncentive(DefaultIncentive):
         # calculate incentive score
         result.incentive = (
             result.rental_share * result.gpu_count * result.effective_rate / self.total_rental_cost 
-            if result.total_unrented_by_gpu_type > 0 else 0.0
+            if result.total_rental_cost > 0 else 0.0
         )
 
         # update incentive logs
         result.incentive_logs.append(
             str(_m(
                 "Rental price incentive for executor is calculated successfully. Formula: rental_share * gpu_count / total_unrented_count",
-                extra={
+                extra=get_extra_info({
                     "hotkey": hotkey,
                     "executor_id": str(result.executor_info.uuid),
                     "gpu_model": result.gpu_model,
@@ -159,7 +159,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     "rental_share": result.rental_share,
                     "burn_share": result.burn_share,
                     "incentive": result.incentive,
-                },
+                }),
             ))
         )
 
@@ -260,7 +260,7 @@ class RentalPriceIncentive(DefaultIncentive):
         rental_cost_per_epoch = total_rental_cost * (TEMPO * SECONDS_PER_BLOCK) / 3600
 
         # Calculate rental share (before capping)
-        rental_share_raw = rental_cost_per_epoch / FIXED_RATIO / epoch_subnet_emission
+        rental_share_raw = rental_cost_per_epoch / FIXED_RATIO / epoch_subnet_emission if epoch_subnet_emission > 0 else 0.0
 
         logger.info(
             _m(
