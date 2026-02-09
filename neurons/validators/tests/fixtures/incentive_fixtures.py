@@ -56,6 +56,7 @@ def create_job_result():
         collateral_deposited: bool = True,
         executor_id: str | None = None,
         job_batch_id: str = "2024-01-01 00:00:00",
+        log_text: str = "Test job completed",
     ) -> JobResult:
         from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -84,7 +85,7 @@ def create_job_result():
             collateral_deposited=collateral_deposited,
             job_batch_id=job_batch_id,
             log_status="success",
-            log_text="Test job completed",
+            log_text=log_text,
         )
 
     return _factory
