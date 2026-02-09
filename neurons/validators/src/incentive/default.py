@@ -79,13 +79,13 @@ class DefaultIncentive(BaseIncentive):
             JobResult with calculated mining score
         """
         # Early exit check - if job score is 0, return immediately
-        if job_result.score == 0:
+        if not job_result.score:
             job_result.mining_score = 0
             return job_result
 
         # GPU count calculation
         job_result.total_gpu_count = self.total_gpu_model_count_map.get(job_result.gpu_model, 0)
-        if job_result.total_gpu_count == 0:
+        if not job_result.total_gpu_count:
             job_result.mining_score = 0
             return job_result
 
