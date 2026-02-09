@@ -2,6 +2,10 @@
 
 This module implements the three-phase rental price incentive algorithm that
 rewards unrented high-end GPUs based on their rental market value.
+
+The system uses per-GPU-type caps to dilute incentives when supply exceeds
+demand for specific GPU models. Each GPU type has an independent cap value
+configured in MAX_UNRENTED_GPUS_BY_TYPE.
 """
 
 import bittensor
@@ -26,14 +30,17 @@ class RentalPriceIncentive(DefaultIncentive):
     - Phase 1: Exclude unrented eligible GPUs from mining scores
     - Phase 2: Calculate dynamic emission splits based on rental costs
     - Phase 3: Distribute weights across burn/mining/rental pools
+
+    Cap dilution is applied per GPU type based on max_unrented_gpus dictionary.
+    Each GPU type has an independent cap, allowing different supply/demand dynamics.
     """
 
     def __init__(self, *args, **kwargs):
         """Initialize rental price incentive algorithm.
 
         Args:
-            config: Incentive configuration with eligible_gpu_types,
-                   max_unrented_gpus, and rental_prices_per_hour
+            config: Incentive configuration with rental_incentive_gpu_types,
+                   max_unrented_gpus (dict per GPU type), and rental_prices_per_hour
             redis_service: Redis service for accessing shared state
             burn_service: Burn emission distribution service
         """
@@ -49,26 +56,26 @@ class RentalPriceIncentive(DefaultIncentive):
         """Process a job result.
         Aggregate metrics from job result.
 
-        """       
+        Note: max_unrented_gpus is now a dictionary per GPU type.
+        """
         await super()._pre_process_job_result(hotkey, result)
 
         if result.score == 0 and result.job_score == 0:
-            return           
+            return
 
         # Check if GPU is eligible
-        if result.gpu_model not in self.config.eligible_gpu_types:
+        if result.gpu_model not in self.config.rental_incentive_gpu_types:
             return
 
         #  calculate unrented gpu count that's eligible for rental price incentive
         if result.eligible_for_rental_share:
-            # update reuslt state
+            # update result state
             result.hourly_rate = self.config.rental_prices_per_hour.get(result.gpu_model, 0)
-            result.max_cap = self.config.max_unrented_gpus
+            result.max_cap = self.config.max_unrented_gpus.get(result.gpu_model, 0)
 
             gpu_type = result.gpu_model
-            max_cap = self.config.max_unrented_gpus
             gpu_count_for_rental_share = min(
-                max_cap - min(self.unrented_count_by_type.get(gpu_type, 0), max_cap),
+                result.max_cap - min(self.unrented_count_by_type.get(gpu_type, 0), result.max_cap),
                 result.gpu_count
             )
 
@@ -176,6 +183,9 @@ class RentalPriceIncentive(DefaultIncentive):
         Phase 1: Unrented eligible GPUs are excluded from mining emission
         by returning score = 0. All other GPUs use normal scoring logic.
 
+        Eligibility is determined by whether the GPU type has a defined cap
+        in max_unrented_gpus (per-GPU-type caps).
+
         Args:
             total_gpu_model_count_map: Mapping of GPU models to total counts
             job_result: Job execution result to score
@@ -183,9 +193,11 @@ class RentalPriceIncentive(DefaultIncentive):
         Returns:
             Calculated score (0 for unrented eligible GPUs, normal score otherwise)
         """
-        # Check if GPU is unrented and eligible
+        # Check if GPU is unrented and eligible (has defined cap in max_unrented_gpus)
         job_result.eligible_for_rental_share = (
-            not job_result.is_rented and (job_result.gpu_model in self.config.eligible_gpu_types) and (job_result.score > 0 or job_result.job_score > 0)
+            not job_result.is_rented
+            and (job_result.gpu_model in self.config.max_unrented_gpus)
+            and (job_result.score > 0 or job_result.job_score > 0)
         )
         if job_result.eligible_for_rental_share:
             logger.info(

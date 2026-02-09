@@ -12,12 +12,12 @@ def expected_executor_score(
     total_gpu_count: int,
     portion: float,
     is_rented: bool,
-    eligible_gpu_types: list[str],
+    rental_incentive_gpu_types: list[str],
     sysbox_runtime: bool,
     collateral_deposited: bool,
     uptime_minutes: float,
 ) -> float:
-    if not is_rented and gpu_model in eligible_gpu_types:
+    if not is_rented and gpu_model in rental_incentive_gpu_types:
         return 0.0
 
     if total_gpu_count == 0:
@@ -40,15 +40,21 @@ def expected_emission_splits(
     *,
     unrented_gpu_counts: dict[str, int],
     rental_prices: dict[str, float],
-    max_unrented_gpus: int,
+    max_unrented_gpus: dict[str, int],
     tao_price: float,
     alpha_rate: float,
 ) -> dict[str, float]:
     total_rental_cost = 0.0
     for gpu_type, count in unrented_gpu_counts.items():
         hourly_rate = rental_prices.get(gpu_type, 0.0)
-        if count > max_unrented_gpus and count > 0:
-            effective_rate = hourly_rate * max_unrented_gpus / count
+        max_cap = max_unrented_gpus.get(gpu_type, 0)
+
+        # Handle case where GPU type has no defined cap
+        if max_cap == 0:
+            continue
+
+        if count > max_cap and count > 0:
+            effective_rate = hourly_rate * max_cap / count
         else:
             effective_rate = hourly_rate
         total_rental_cost += count * effective_rate
@@ -74,22 +80,28 @@ def expected_emission_splits(
 def expected_miner_rental_value(
     *,
     miner_results: list,
-    eligible_gpu_types: list[str],
+    rental_incentive_gpu_types: list[str],
     rental_prices: dict[str, float],
-    max_unrented_gpus: int,
+    max_unrented_gpus: dict[str, int],
     total_unrented_counts: dict[str, int],
 ) -> float:
     rental_value = 0.0
 
     for result in miner_results:
         gpu_model = result.gpu_model
-        if result.is_rented or gpu_model not in eligible_gpu_types:
+        if result.is_rented or gpu_model not in rental_incentive_gpu_types:
             continue
 
         hourly_rate = rental_prices.get(gpu_model, 0.0)
         total_count = total_unrented_counts.get(gpu_model, 0)
-        if total_count > max_unrented_gpus and total_count > 0:
-            effective_rate = hourly_rate * max_unrented_gpus / total_count
+        max_cap = max_unrented_gpus.get(gpu_model, 0)
+
+        # Handle case where GPU type has no defined cap
+        if max_cap == 0:
+            continue
+
+        if total_count > max_cap and total_count > 0:
+            effective_rate = hourly_rate * max_cap / total_count
         else:
             effective_rate = hourly_rate
 
