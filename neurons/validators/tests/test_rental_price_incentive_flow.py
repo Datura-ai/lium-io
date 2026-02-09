@@ -18,8 +18,16 @@ from tests.test_rental_price_helpers import (
 pytest_plugins = ["fixtures.incentive_fixtures"]
 
 ALGORITHM = "rental_price"
-ELIGIBLE_GPU_TYPES = ["H100", "H200"]
-MAX_UNRENTED_GPUS = 1000
+
+# Per-GPU-type caps for testing
+MAX_UNRENTED_GPUS_BY_TYPE = {
+    "H100": 1000,
+    "H200": 1000,
+}
+
+RENTAL_INCENTIVE_GPU_TYPES = [
+    gpu_type for gpu_type, cap in MAX_UNRENTED_GPUS_BY_TYPE.items() if cap > 0
+]
 
 H100_HOURLY_RATE = 3.50
 H200_HOURLY_RATE = 4.00
@@ -50,8 +58,10 @@ def _expected_rental_share(total_rental_cost: float, tao_price: float, alpha_rat
 def rental_price_config():
     return IncentiveConfig(
         algorithm=ALGORITHM,
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        rental_incentive_gpu_types=[
+            gpu_type for gpu_type, cap in MAX_UNRENTED_GPUS_BY_TYPE.items() if cap > 0
+        ],
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
     )
 
@@ -189,7 +199,7 @@ async def test_rental_price_scenario_basic_mixed(
         total_gpu_count=total_gpu_counts["H100"],
         portion=GPU_PORTION["H100"],
         is_rented=True,
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         sysbox_runtime=True,
         collateral_deposited=True,
         uptime_minutes=120,
@@ -199,7 +209,7 @@ async def test_rental_price_scenario_basic_mixed(
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -328,13 +338,13 @@ async def test_rental_price_scenario_cap_dilution(
                 ])
 
     total_unrented = 1500
-    expected_effective_rate = H100_HOURLY_RATE * MAX_UNRENTED_GPUS / total_unrented
+    expected_effective_rate = H100_HOURLY_RATE * MAX_UNRENTED_GPUS_BY_TYPE["H100"] / total_unrented
     expected_total_rental_cost = total_unrented * expected_effective_rate
 
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": total_unrented},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -350,6 +360,105 @@ async def test_rental_price_scenario_cap_dilution(
     }
     assert weights["miner_a"] / weights["miner_b"] == pytest.approx(600 / 500, abs=0.01)
     assert weights["miner_b"] / weights["miner_c"] == pytest.approx(500 / 400, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_different_caps_per_gpu_type(
+    validator_with_mocks,
+    incentive_redis_service,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    price_provider_holder,
+    monkeypatch,
+):
+    """Test that different GPU types have independent caps applied correctly."""
+    # Create custom config with different caps for H100 and H200
+    different_caps = {
+        "H100": 5,
+        "H200": 3,
+    }
+    custom_config = IncentiveConfig(
+        algorithm=ALGORITHM,
+        rental_incentive_gpu_types=list(different_caps.keys()),
+        max_unrented_gpus=different_caps,
+        rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
+    )
+
+    # Set up validator with custom config
+    original_create = IncentiveFactory.create
+
+    def create_with_price_provider(*args, **kwargs):
+        incentive = original_create(*args, **kwargs)
+        if hasattr(incentive, "price_provider"):
+            incentive.price_provider = price_provider_holder["provider"]
+        return incentive
+
+    monkeypatch.setattr(IncentiveFactory, "create", create_with_price_provider)
+    monkeypatch.setattr(settings, "incentive", custom_config)
+
+    validator = validator_with_mocks
+    validator.incentive = custom_config
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_a"),
+        create_neuron_info(uid=3, hotkey="miner_b"),
+    ]
+
+    # Mock price provider
+    mock_price_provider = AsyncMock()
+    mock_price_provider.get_tao_price.return_value = TAO_PRICE
+    mock_price_provider.get_alpha_rate.return_value = ALPHA_RATE
+    price_provider_holder["provider"] = mock_price_provider
+
+    # Both GPU types exceed their respective caps
+    all_job_results = {
+        "miner_a": [
+            _job(create_job_result, executor_id="exec-a", gpu_model="H100", gpu_count=8, is_rented=False),
+            _job(create_job_result, executor_id="exec-a", gpu_model="H100", gpu_count=8, is_rented=True),
+        ],
+        "miner_b": [
+            _job(create_job_result, executor_id="exec-b", gpu_model="H200", gpu_count=6, is_rented=False),
+        ],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data())
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Verify cap dilution for each GPU type independently
+    h100_effective_rate = H100_HOURLY_RATE * different_caps["H100"] / 8
+    h200_effective_rate = H200_HOURLY_RATE * different_caps["H200"] / 6
+    expected_total_rental_cost = 8 * h100_effective_rate + 6 * h200_effective_rate
+
+    splits = expected_emission_splits(
+        unrented_gpu_counts={"H100": 8, "H200": 6},
+        rental_prices=RENTAL_PRICES_PER_HOUR,
+        max_unrented_gpus=different_caps,
+        tao_price=TAO_PRICE,
+        alpha_rate=ALPHA_RATE,
+    )
+
+    # Verify effective rates are calculated per GPU type
+    assert h100_effective_rate == pytest.approx(H100_HOURLY_RATE * 5 / 8, abs=0.001)
+    assert h200_effective_rate == pytest.approx(H200_HOURLY_RATE * 3 / 6, abs=0.001)
+
+    # Verify total rental cost aggregates correctly
+    assert expected_total_rental_cost == pytest.approx(
+        8 * h100_effective_rate + 6 * h200_effective_rate, abs=1
+    )
+
+    # Verify rental share calculation
+    assert splits["rental_share"] > 0
+
+    # Verify each miner gets appropriate weight based on their GPU type's cap
+    assert validator.miner_scores["miner_a"] > 0
+    assert validator.miner_scores["miner_b"] > 0
+    assert sum(validator.miner_scores.values()) == pytest.approx(1.0, abs=0.0001)
 
 
 @pytest.mark.asyncio
@@ -404,7 +513,7 @@ async def test_rental_price_scenario_all_unrented(
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 30, "H200": 15},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -455,7 +564,7 @@ async def test_rental_price_scenario_zero_unrented(
     splits = expected_emission_splits(
         unrented_gpu_counts={},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -507,7 +616,7 @@ async def test_rental_price_scenario_rental_share_cap(
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 1000},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         tao_price=0.01,
         alpha_rate=0.01,
     )
@@ -590,7 +699,7 @@ async def test_rental_price_edge_multi_executor_accumulation(
         total_gpu_count=total_gpu_counts["H100"],
         portion=GPU_PORTION["H100"],
         is_rented=True,
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         sysbox_runtime=True,
         collateral_deposited=True,
         uptime_minutes=120,
@@ -601,7 +710,7 @@ async def test_rental_price_edge_multi_executor_accumulation(
         total_gpu_count=total_gpu_counts["H100"],
         portion=GPU_PORTION["H100"],
         is_rented=True,
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         sysbox_runtime=True,
         collateral_deposited=True,
         uptime_minutes=120,
@@ -610,9 +719,9 @@ async def test_rental_price_edge_multi_executor_accumulation(
     total_unrented_counts = {"H100": 3, "H200": 4}
     expected_a_rental = expected_miner_rental_value(
         miner_results=all_job_results["miner_a"],
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         total_unrented_counts=total_unrented_counts,
     )
     assert expected_a_rental == pytest.approx(3 * H100_HOURLY_RATE + 4 * H200_HOURLY_RATE)
@@ -620,7 +729,7 @@ async def test_rental_price_edge_multi_executor_accumulation(
     splits = expected_emission_splits(
         unrented_gpu_counts=total_unrented_counts,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -708,7 +817,7 @@ async def test_rental_price_edge_gpu_type_mix(
         total_gpu_count=total_gpu_counts["H100"],
         portion=GPU_PORTION["H100"],
         is_rented=True,
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         sysbox_runtime=True,
         collateral_deposited=True,
         uptime_minutes=120,
@@ -719,7 +828,7 @@ async def test_rental_price_edge_gpu_type_mix(
         total_gpu_count=total_gpu_counts["A100"],
         portion=GPU_PORTION["A100"],
         is_rented=False,
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         sysbox_runtime=True,
         collateral_deposited=True,
         uptime_minutes=120,
@@ -804,7 +913,7 @@ async def test_rental_price_edge_uptime_penalties(
         total_gpu_count=total_gpu_counts["H100"],
         portion=GPU_PORTION["H100"],
         is_rented=True,
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         sysbox_runtime=True,
         collateral_deposited=True,
         uptime_minutes=120,
@@ -815,7 +924,7 @@ async def test_rental_price_edge_uptime_penalties(
         total_gpu_count=total_gpu_counts["H100"],
         portion=GPU_PORTION["H100"],
         is_rented=True,
-        eligible_gpu_types=ELIGIBLE_GPU_TYPES,
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         sysbox_runtime=True,
         collateral_deposited=False,
         uptime_minutes=60,
@@ -901,7 +1010,7 @@ def test_expected_emission_splits_zero_unrented():
     splits = expected_emission_splits(
         unrented_gpu_counts={},
         rental_prices={"H100": 3.5},
-        max_unrented_gpus=1000,
+        max_unrented_gpus={"H100": 1000},
         tao_price=500.0,
         alpha_rate=0.5,
     )
@@ -918,7 +1027,7 @@ def test_expected_emission_splits_basic_calculation():
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=rental_prices,
-        max_unrented_gpus=1000,
+        max_unrented_gpus={"H100": 1000, "H200": 1000},
         tao_price=500.0,
         alpha_rate=0.5,
     )
@@ -938,7 +1047,7 @@ def test_expected_emission_splits_cap_dilution():
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=rental_prices,
-        max_unrented_gpus=1000,
+        max_unrented_gpus={"H100": 1000},
         tao_price=500.0,
         alpha_rate=0.5,
     )
@@ -958,7 +1067,7 @@ def test_expected_emission_splits_cap_at_burn_emission():
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=rental_prices,
-        max_unrented_gpus=1000,
+        max_unrented_gpus={"H100": 1000},
         tao_price=0.01,
         alpha_rate=0.01,
     )
@@ -972,7 +1081,7 @@ def test_expected_emission_splits_zero_epoch_emission():
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 10},
         rental_prices={"H100": 3.5},
-        max_unrented_gpus=1000,
+        max_unrented_gpus={"H100": 1000},
         tao_price=0.0,
         alpha_rate=0.5,
     )
@@ -1113,7 +1222,7 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
     splits = expected_emission_splits(
         unrented_gpu_counts={},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )

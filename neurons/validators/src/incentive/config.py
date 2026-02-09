@@ -1,21 +1,52 @@
-"""Configuration models for incentive algorithms."""
+"""Configuration models for incentive algorithms.
+
+This module defines per-GPU-type caps for the rental price incentive system.
+Different GPU types have different cap values based on expected supply/demand dynamics.
+High-end GPUs (B300, B200, H200) have lower caps due to scarcity, while mid-range
+GPUs have higher caps to accommodate larger deployments.
+"""
 
 from pydantic import BaseModel, Field, field_validator
 
+from services.const import MACHINE_PRICES
 
-# Rental prices by GPU type for rental-cost pool eligible GPU types 
-RENTAL_PRICES_BY_GPU_TYPE = {
-    "NVIDIA B200": 2.99,
-    "NVIDIA H200": 1.90,
-    "NVIDIA H200 NVL": 1.67, # same rate as "NVIDIA H100 NVL" / "NVIDIA H100 80GB HBM3"
-    "NVIDIA H100 80GB HBM3": 1.26,
-    "NVIDIA H100 NVL": 1.11,
-    "NVIDIA H100 PCIe": 1.11,
-    "NVIDIA A100 80GB PCIe": 0.36,
-    "NVIDIA A100-SXM4-80GB": 0.43,
+
+# Maximum unrented GPUs per GPU type before cap dilution is applied
+# High-end GPUs have lower caps (12-24) due to scarcity and high value
+# Mid-tier GPUs have moderate caps (24-48) for balanced incentives
+# Lower-tier GPUs have higher caps (48-96) to accommodate larger deployments
+MAX_UNRENTED_GPUS_BY_TYPE = {
+    "NVIDIA B300 SXM6 AC": 8,
+    "NVIDIA B200": 8,
+    "NVIDIA H200": 8,
+    "NVIDIA H200 NVL": 8,
+    "NVIDIA H100 80GB HBM3": 8,
+    "NVIDIA H100 NVL": 8,
+    "NVIDIA H100 PCIe": 8,
+    "NVIDIA H800 80GB HBM3": 0,
+    "NVIDIA H800 NVL": 0,
+    "NVIDIA H800 PCIe": 0,
+    "NVIDIA GeForce RTX 5090": 0,
+    "NVIDIA GeForce RTX 4090": 8,
+    "NVIDIA GeForce RTX 4090 D": 8,
+    "NVIDIA RTX 4000 Ada Generation": 0,
+    "NVIDIA RTX 6000 Ada Generation": 0,
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0,
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0,
+    "NVIDIA L4": 0,
+    "NVIDIA L40S": 0,
+    "NVIDIA L40": 0,
+    "NVIDIA RTX 2000 Ada Generation": 0,
+    "NVIDIA A100 80GB PCIe": 8,
+    "NVIDIA A100-SXM4-80GB": 8,
+    "NVIDIA RTX A6000": 8,
+    "NVIDIA RTX A5000": 0,
+    "NVIDIA RTX A4500": 0,
+    "NVIDIA RTX A4000": 0,
+    "NVIDIA A40": 0,
+    "NVIDIA A30": 0,
+    "NVIDIA GeForce RTX 3090": 0,
 }
-
-MAX_UNRENTED_GPUS = 24
 
 
 class IncentiveConfig(BaseModel):
@@ -23,8 +54,8 @@ class IncentiveConfig(BaseModel):
 
     Attributes:
         algorithm: Algorithm name (default: "default", options: "default", "rental_price")
-        eligible_gpu_types: GPU types eligible for rental incentives
-        max_unrented_gpus: Maximum unrented GPUs before cap dilution
+        rental_incentive_gpu_types: GPU types eligible for rental incentives
+        max_unrented_gpus: Maximum unrented GPUs per GPU type before cap dilution
         rental_prices_per_hour: Rental prices per GPU type in USD/hour
     """
 
@@ -33,18 +64,20 @@ class IncentiveConfig(BaseModel):
         description="Incentive algorithm to use"
     )
 
-    eligible_gpu_types: list[str] = Field(
-        default=list(RENTAL_PRICES_BY_GPU_TYPE.keys()),
-        description="GPU types eligible for rental incentives"
+    rental_incentive_gpu_types: list[str] = Field(
+        default=[
+            gpu_type for gpu_type, cap in MAX_UNRENTED_GPUS_BY_TYPE.items() if cap > 0
+        ],
+        description="GPU types eligible for rental price incentives (excludes types with 0 cap)"
     )
 
-    max_unrented_gpus: int = Field(
-        default=MAX_UNRENTED_GPUS,
-        description="Maximum unrented GPUs before cap dilution"
+    max_unrented_gpus: dict[str, int] = Field(
+        default=MAX_UNRENTED_GPUS_BY_TYPE,
+        description="Maximum unrented GPUs per GPU type before cap dilution"
     )
 
     rental_prices_per_hour: dict[str, float] = Field(
-        default=RENTAL_PRICES_BY_GPU_TYPE,
+        default=MACHINE_PRICES,
         description="Rental prices per GPU type in USD/hour"
     )
 
@@ -61,12 +94,15 @@ class IncentiveConfig(BaseModel):
 
     @field_validator("max_unrented_gpus")
     @classmethod
-    def validate_max_unrented_gpus(cls, v: int) -> int:
-        """Validate that max_unrented_gpus is positive."""
-        if v <= 0:
-            raise ValueError(
-                f"max_unrented_gpus must be positive, got: {v}"
-            )
+    def validate_max_unrented_gpus(cls, v: dict[str, int]) -> dict[str, int]:
+        """Validate that max_unrented_gpus values are non-negative."""
+        # Validate all values are non-negative integers
+        for gpu_type, cap in v.items():
+            if cap < 0:
+                raise ValueError(
+                    f"max_unrented_gpus for {gpu_type} must be non-negative, got: {cap}"
+                )
+
         return v
 
     @field_validator("rental_prices_per_hour")
