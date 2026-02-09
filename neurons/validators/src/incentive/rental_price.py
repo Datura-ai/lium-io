@@ -196,7 +196,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # Check if GPU is unrented and eligible (has defined cap in max_unrented_gpus)
         job_result.eligible_for_rental_share = (
             not job_result.is_rented
-            and (job_result.gpu_model in self.config.max_unrented_gpus)
+            and (job_result.gpu_model in self.config.rental_incentive_gpu_types)
             and (job_result.score > 0 or job_result.job_score > 0)
         )
         if job_result.eligible_for_rental_share:
@@ -215,6 +215,10 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.mining_score = 0
             return job_result # Exclude from mining pool
+
+        if not job_result.is_rented:
+            job_result.mining_score = 0
+            return job_result
 
         # For rented or non-eligible GPUs, use parent's default scoring logic
         return await super().calculate_executor_score(job_result)
