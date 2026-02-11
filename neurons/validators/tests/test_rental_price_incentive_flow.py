@@ -1114,6 +1114,7 @@ async def test_rental_price_failed_executors_rented_do_not_score(
         create_neuron_info(uid=101, hotkey="burner2"),
         create_neuron_info(uid=2, hotkey="miner_a"),
         create_neuron_info(uid=3, hotkey="miner_b"),
+        create_neuron_info(uid=4, hotkey="miner_c"),
     ]
 
     all_job_results = {
@@ -1137,6 +1138,15 @@ async def test_rental_price_failed_executors_rented_do_not_score(
                 is_rented=True,
             ),
         ],
+        "miner_c": [
+            _job(
+                create_job_result,
+                executor_id="exec-c",
+                gpu_model=None,
+                gpu_count=0,
+                is_rented=False,
+            ),
+        ]
     }
 
     validator.backend_client.get_all_rented_executors = AsyncMock(
@@ -1158,6 +1168,7 @@ async def test_rental_price_failed_executors_rented_do_not_score(
 
     assert validator.miner_scores["miner_a"] == 0.0
     assert validator.miner_scores["miner_b"] > 0
+    assert validator.miner_scores["miner_c"] == 0.0
 
 
 @pytest.mark.asyncio

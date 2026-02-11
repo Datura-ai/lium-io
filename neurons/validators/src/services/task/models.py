@@ -50,6 +50,10 @@ class JobResult(BaseModel):
             return self.log_text
         return self.log_text + "\n\n Incentive Scores Calculation Logs: " + "\n\n".join(self.incentive_logs)
 
+    @property
+    def is_successful(self):
+        return (self.score > 0 or self.job_score > 0) and self.gpu_model and self.gpu_count > 0
+
 
 class ValidationEvent(BaseModel):
     event: str
