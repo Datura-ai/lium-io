@@ -53,6 +53,13 @@ class RentalPriceIncentive(DefaultIncentive):
         self.rental_share = 0.0
         self.burn_share = 0.0
 
+        # validate configs
+        for base_model in self.config.rental_incentive_gpu_types:
+            assert base_model in BASE_GPU_MAP.values(), f"Base model {base_model} not found in BASE_GPU_MAP"
+        
+        for gpu_type in self.config.rental_prices_per_hour.keys():
+            assert gpu_type in BASE_GPU_MAP.keys(), f"GPU type {gpu_type} not found in BASE_GPU_MAP"
+
     def get_base_model_for_gpu(self, gpu_model: str) -> str:
         base_model = BASE_GPU_MAP[gpu_model]
         return base_model
@@ -63,10 +70,10 @@ class RentalPriceIncentive(DefaultIncentive):
 
         Note: max_unrented_gpus is now a dictionary per GPU type.
         """
-        await super()._pre_process_job_result(hotkey, result)
-
-        if result.score == 0 and result.job_score == 0:
+        if not result.is_successful:
             return
+
+        await super()._pre_process_job_result(hotkey, result)
 
         # Check if GPU is eligible
         base_model = self.get_base_model_for_gpu(result.gpu_model)
