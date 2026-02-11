@@ -12,7 +12,7 @@ import bittensor
 
 from core.utils import _m, get_extra_info, get_logger
 from incentive.burn_service import BurnService
-from incentive.config import IncentiveConfig
+from incentive.config import BASE_GPU_MAP, IncentiveConfig
 from incentive.default import DefaultIncentive
 from incentive.price_provider import PriceProvider
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -48,9 +48,14 @@ class RentalPriceIncentive(DefaultIncentive):
         self.price_provider = PriceProvider()
 
         self.unrented_count_by_type = {}
+        self.effective_rate_by_type = {} # effective hourly rate in case it's diluted by cap
         self.total_rental_cost = 0.0
         self.rental_share = 0.0
         self.burn_share = 0.0
+
+    def get_base_model_for_gpu(self, gpu_model: str) -> str:
+        base_model = BASE_GPU_MAP[gpu_model]
+        return base_model
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult):
         """Process a job result.
@@ -64,32 +69,47 @@ class RentalPriceIncentive(DefaultIncentive):
             return
 
         # Check if GPU is eligible
-        if result.gpu_model not in self.config.rental_incentive_gpu_types:
+        base_model = self.get_base_model_for_gpu(result.gpu_model)
+        if base_model not in self.config.rental_incentive_gpu_types:
             return
 
         #  calculate unrented gpu count that's eligible for rental price incentive
         if result.eligible_for_rental_share:
             # update result state
             result.hourly_rate = self.config.rental_prices_per_hour.get(result.gpu_model, 0)
-            result.max_cap = self.config.max_unrented_gpus.get(result.gpu_model, 0)
+            # result.max_cap = self.config.max_unrented_gpus.get(result.gpu_model, 0)
+            # result.max_cap = self.get_max_cap_for_unrented_gpu(result.gpu_model)
 
             gpu_type = result.gpu_model
-            gpu_count_for_rental_share = min(
-                result.max_cap - min(self.unrented_count_by_type.get(gpu_type, 0), result.max_cap),
-                result.gpu_count
-            )
+            base_model = self.get_base_model_for_gpu(result.gpu_model)
+
+            result.max_cap = self.config.max_unrented_gpus.get(base_model, 0)
 
             # aggregated unrented count by type
-            self.unrented_count_by_type[gpu_type] = self.unrented_count_by_type.get(gpu_type, 0) + result.gpu_count
-
-            # aggregate for total rental cost
-            self.total_rental_cost += gpu_count_for_rental_share * result.hourly_rate
+            if base_model not in self.unrented_count_by_type:
+                self.unrented_count_by_type[base_model] = {}
+            if gpu_type not in self.unrented_count_by_type[base_model]:
+                self.unrented_count_by_type[base_model][gpu_type] = 0
+            self.unrented_count_by_type[base_model][gpu_type] += result.gpu_count
 
     async def _on_finish_pre_process(self) -> None:
         """Callback after pre-processing all job results.
 
         - Calculate rental share 
         """
+        # calculate self.total_rental_cost 
+        for base_model, gpu_types in self.unrented_count_by_type.items():
+            unrented_count = sum(gpu_types.values())
+            max_cap = self.config.max_unrented_gpus.get(base_model, 0)
+
+            if not unrented_count:
+                continue
+
+            for gpu_type, count in gpu_types.items():
+                hourly_rate = self.config.rental_prices_per_hour.get(gpu_type, 0)
+                self.effective_rate_by_type[gpu_type] = hourly_rate * min(unrented_count, max_cap) / unrented_count
+                self.total_rental_cost += count * self.effective_rate_by_type[gpu_type]
+
         rental_share_raw = await self._calculate_rental_share(self.total_rental_cost)
 
         # Ensure rental_share doesn't exceed 0.91 (cap at burn emission)
@@ -134,15 +154,13 @@ class RentalPriceIncentive(DefaultIncentive):
             return await super()._post_process_job_result(hotkey, result) # use default incentive logic.
 
         # state updates
-        result.total_unrented_by_gpu_type = self.unrented_count_by_type.get(result.gpu_model, 0)
-        # formula - executor's reward will be diluted by the total unrented count for the gpu type
-        result.effective_rate = (
-            result.hourly_rate * min(result.max_cap, result.total_unrented_by_gpu_type) / result.total_unrented_by_gpu_type
-        ) if result.total_unrented_by_gpu_type > 0 else 0
+        base_model = self.get_base_model_for_gpu(result.gpu_model)
+        result.total_unrented_by_gpu_type = sum(self.unrented_count_by_type.get(base_model, {}).values())
         result.cap_dilution_applied = result.total_unrented_by_gpu_type > result.max_cap
         result.rental_share = self.rental_share # calculated in _on_finish_pre_process
         result.burn_share = self.burn_share # calculated in _on_finish_pre_process
         result.total_rental_cost = self.total_rental_cost # calculated in _on_finish_pre_process
+        result.effective_rate = self.effective_rate_by_type.get(result.gpu_model, 0) # calculated in _on_finish_pre_process
 
         # calculate incentive score
         result.incentive = (
@@ -194,9 +212,10 @@ class RentalPriceIncentive(DefaultIncentive):
             Calculated score (0 for unrented eligible GPUs, normal score otherwise)
         """
         # Check if GPU is unrented and eligible (has defined cap in max_unrented_gpus)
+        base_model = self.get_base_model_for_gpu(job_result.gpu_model)
         job_result.eligible_for_rental_share = (
             not job_result.is_rented
-            and (job_result.gpu_model in self.config.rental_incentive_gpu_types)
+            and (base_model in self.config.rental_incentive_gpu_types)
             and (job_result.score > 0 or job_result.job_score > 0)
         )
         if job_result.eligible_for_rental_share:
