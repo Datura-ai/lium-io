@@ -464,6 +464,33 @@ run_cvm() {
     fi
 }
 
+# Stop command - gracefully shut down a running CVM
+stop_cvm() {
+    local cvm_name="$1"
+
+    if [ -z "$cvm_name" ]; then
+        echo "Usage: $0 stop <cvm_name> [--timeout N] [--force]"
+        return 1
+    fi
+
+    log_info "Stopping CVM: $cvm_name"
+
+    if [ ! -d "$VMS_DIR/$cvm_name" ]; then
+        log_error "CVM '$cvm_name' not found at $VMS_DIR/$cvm_name"
+        return 1
+    fi
+
+    shift
+    python3 "$SCRIPTS_DIR/dstack.py" stop "$VMS_DIR/$cvm_name" "$@"
+
+    if [ $? -eq 0 ]; then
+        log_success "CVM '$cvm_name' stopped"
+    else
+        log_error "Failed to stop CVM '$cvm_name'"
+        return 1
+    fi
+}
+
 # List available GPUs
 list_gpus() {
     log_info "Available GPUs:"
@@ -500,6 +527,8 @@ show_help() {
     echo "  download                  Download and extract the OS image"
     echo "  new <name>                Create a new CVM using .env configuration"
     echo "  run <name> [--dry-run]    Run the specified CVM"
+    echo "  stop <name> [--timeout N] [--force]"
+    echo "                            Gracefully stop a running CVM"
     echo "  list                      List available CVMs"
     echo "  lsgpu                     List available GPUs"
     echo "  help                      Show this help message"
@@ -516,6 +545,8 @@ show_help() {
     echo "  $0 new web-cvm"
     echo "  $0 run my-cvm"
     echo "  $0 run my-cvm --dry-run"
+    echo "  $0 stop my-cvm"
+    echo "  $0 stop my-cvm --force --timeout 60"
     echo "  $0 list"
     echo "  $0 lsgpu"
 }
@@ -540,6 +571,10 @@ case "$1" in
     ;;
 "run")
     run_cvm "$2" "$3"
+    ;;
+"stop")
+    shift
+    stop_cvm "$@"
     ;;
 "list")
     list_cvms
