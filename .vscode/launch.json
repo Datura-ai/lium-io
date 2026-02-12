@@ -23,12 +23,30 @@
             "cwd": "${workspaceFolder}/neurons/validators"
         },
         {
+            "name": "Validator: Debug Run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/validator.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/neurons/validators",
+            "python": "${workspaceFolder}/neurons/validators/.venv/bin/python3",
+        },
+        {
             "name": "Validator: Connector",
             "type": "debugpy",
             "request": "launch",
             "program": "src/connector.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}/neurons/validators"
+        },
+        {
+            "name": "Miner: Debug Run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/miner.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/neurons/miners",
+            "python": "${workspaceFolder}/neurons/miners/.venv/bin/python3",
         },
         {
             "name": "Debug Test: Validators",
