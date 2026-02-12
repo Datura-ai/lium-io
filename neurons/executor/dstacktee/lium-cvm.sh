@@ -226,18 +226,45 @@ new_cvm() {
     local cvm_name="$1"
 
     if [ -z "$cvm_name" ]; then
-        echo "Usage: $0 new <cvm_name>"
+        echo "Usage: $0 new <cvm_name> [--enable-logs] [--enable-sysinfo]"
         echo
         echo "Configuration is read from .env file. Copy .env.example to .env and edit as needed."
+        echo
+        echo "Options:"
+        echo "  --enable-logs            Enable public container logs"
+        echo "  --enable-sysinfo         Enable public system and TCB info"
         echo
         echo "Examples:"
         echo "  $0 new my-cvm"
         echo "  $0 new gpu-cvm"
         echo "  $0 new web-cvm"
+        echo "  $0 new web-cvm --enable-logs --enable-sysinfo"
         echo
         echo "Note: OS image will be automatically downloaded to $IMAGE_DIR if not present"
         return 1
     fi
+    shift
+
+    local logs_arg=""
+    local sysinfo_arg=""
+
+    # Parse optional new command flags
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --enable-logs)
+            logs_arg="--enable-logs"
+            ;;
+        --enable-sysinfo)
+            sysinfo_arg="--enable-sysinfo"
+            ;;
+        *)
+            log_error "Unknown option for new command: $1"
+            echo "Usage: $0 new <cvm_name> [--enable-logs] [--enable-sysinfo]"
+            return 1
+            ;;
+        esac
+        shift
+    done
 
     # Configuration from .env file
     local env_file=".env"
@@ -363,6 +390,12 @@ new_cvm() {
     if [ -n "$port_args" ]; then
         echo "  Port args: $port_args"
     fi
+    if [ -n "$logs_arg" ]; then
+        echo "  Public logs: enabled"
+    fi
+    if [ -n "$sysinfo_arg" ]; then
+        echo "  Public sysinfo/tcbinfo: enabled"
+    fi
     echo
 
     # Ensure VMs directory exists
@@ -380,7 +413,9 @@ new_cvm() {
         --env-file "$env_file" \
         $gpu_args \
         $port_args \
-        $lkp_args
+        $lkp_args \
+        $logs_arg \
+        $sysinfo_arg
 
     if [ $? -eq 0 ]; then
         log_success "CVM '$cvm_name' created successfully at $VMS_DIR/$cvm_name"
@@ -525,7 +560,7 @@ show_help() {
     echo "Commands:"
     echo "  check                     Check if required software is installed"
     echo "  download                  Download and extract the OS image"
-    echo "  new <name>                Create a new CVM using .env configuration"
+    echo "  new <name> [options]      Create a new CVM using .env configuration"
     echo "  run <name> [--dry-run]    Run the specified CVM"
     echo "  stop <name> [--timeout N] [--force]"
     echo "                            Gracefully stop a running CVM"
@@ -537,10 +572,15 @@ show_help() {
     echo "  All CVM settings are configured via .env file"
     echo "  Copy .env.example to .env and edit the CVM_* variables"
     echo
+    echo "New command options:"
+    echo "  --enable-logs             Enable public container logs"
+    echo "  --enable-sysinfo          Enable public system and TCB info"
+    echo
     echo "Examples:"
     echo "  $0 check"
     echo "  $0 download"
     echo "  $0 new my-cvm"
+    echo "  $0 new my-cvm --enable-logs --enable-sysinfo"
     echo "  $0 new gpu-cvm"
     echo "  $0 new web-cvm"
     echo "  $0 run my-cvm"
