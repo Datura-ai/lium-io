@@ -293,8 +293,12 @@ class DStackManager:
                 "runner": "docker-compose",
                 "docker_compose_file": compose_content,
                 "local_key_provider_enabled": args.local_key_provider,
+                "public_logs": args.enable_logs,
                 "secure_time": False,
             }
+            if args.enable_sysinfo:
+                app_compose["public_sysinfo"] = True
+                app_compose["public_tcbinfo"] = True
             if args.init_script:
                 app_compose["init_script"] = open(args.init_script, "r").read()
             if args.pre_launch_script:
@@ -1251,6 +1255,16 @@ def main():
         "--lkp",
         action="store_true",
         help="Enable local key provider",
+    )
+    setup_parser.add_argument(
+        "--enable-logs",
+        action="store_true",
+        help="Enable public container logs",
+    )
+    setup_parser.add_argument(
+        "--enable-sysinfo",
+        action="store_true",
+        help="Enable public system and TCB info",
     )
     setup_parser.add_argument("--init-script", type=str, help="Init script path")
     setup_parser.add_argument(
