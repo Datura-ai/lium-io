@@ -6,7 +6,10 @@ import logging
 import os
 import random
 import re
+import signal
+import socket
 import subprocess
+import time
 import uuid
 import configparser
 import host_api
@@ -533,10 +536,15 @@ class DStackManager:
 
         cid = random.randint(1, 10000) + 3
 
+        # Save runtime state for graceful shutdown support
+        runtime_path = os.path.join(vm_dir, "runtime.json")
+        with open(runtime_path, "w") as f:
+            json.dump({"cid": cid, "pid": os.getpid()}, f)
+
         # Prepare QEMU command
         cmd_args = []
         rootfs_image = os.path.join(image_path, img_metadata["rootfs"])
-        if rootfs_image.endswith(".img.verity"):
+        if rootfs_image.endswith(".verity"):
             cmd_args.extend(
                 [
                     "-drive",
@@ -720,6 +728,108 @@ class DStackManager:
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to start VM: {e}")
+        finally:
+            runtime_path = os.path.join(vm_dir, "runtime.json")
+            if os.path.exists(runtime_path):
+                os.remove(runtime_path)
+
+
+def shutdown_instance(vm_dir: str, timeout: int = 30, force: bool = False) -> None:
+    """Gracefully shut down a running VM instance via vsock.
+
+    Connects to the guest-agent's GuestApi.Shutdown RPC over vsock,
+    which triggers `systemctl poweroff` inside the guest.
+
+    Args:
+        vm_dir: Directory containing the VM runtime state
+        timeout: Seconds to wait for the VM process to exit
+        force: If True, kill the QEMU process when graceful shutdown times out
+    """
+    runtime_path = os.path.join(vm_dir, "runtime.json")
+    if not os.path.exists(runtime_path):
+        logger.error("VM is not running (no runtime.json found in %s)", vm_dir)
+        return
+
+    with open(runtime_path, "r") as f:
+        runtime = json.load(f)
+
+    cid = runtime["cid"]
+    pid = runtime.get("pid")
+
+    # Send shutdown RPC via vsock
+    logger.info("sending shutdown request to guest (cid=%d) ...", cid)
+    try:
+        sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect((cid, 8000))
+        request = (
+            "GET /api/Shutdown HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        sock.sendall(request.encode())
+        response = sock.recv(4096)
+        sock.close()
+        logger.info("shutdown request sent successfully")
+    except Exception as e:
+        logger.error("failed to send shutdown request: %s", e)
+        if not force:
+            return
+        logger.info("--force specified, will kill the process directly")
+        if pid:
+            _kill_process(pid)
+        _cleanup_runtime(runtime_path)
+        return
+
+    # Wait for the QEMU process to exit
+    if pid:
+        logger.info("waiting up to %ds for VM process (pid=%d) to exit ...", timeout, pid)
+        for _ in range(timeout):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                logger.info("VM process exited")
+                _cleanup_runtime(runtime_path)
+                return
+            time.sleep(1)
+
+        logger.warning("VM process did not exit within %ds", timeout)
+        if force:
+            _kill_process(pid)
+            _cleanup_runtime(runtime_path)
+        else:
+            logger.info("use --force to kill the process")
+
+
+def _cleanup_runtime(runtime_path: str) -> None:
+    """Remove the runtime.json file if it exists."""
+    try:
+        if os.path.exists(runtime_path):
+            os.remove(runtime_path)
+            logger.info("cleaned up %s", runtime_path)
+    except OSError as e:
+        logger.warning("failed to clean up %s: %s", runtime_path, e)
+
+
+def _kill_process(pid: int) -> None:
+    """Send SIGTERM then SIGKILL to a process."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+        logger.info("sent SIGTERM to pid %d", pid)
+        for _ in range(5):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                logger.info("process exited after SIGTERM")
+                return
+            time.sleep(1)
+        os.kill(pid, signal.SIGKILL)
+        logger.info("sent SIGKILL to pid %d", pid)
+    except ProcessLookupError:
+        logger.info("process already exited")
+    except PermissionError:
+        logger.error("no permission to kill pid %d", pid)
 
 
 def numa_node_of_device(pci_slot):
@@ -1169,6 +1279,16 @@ def main():
         "--dry-run", action="store_true", help="Run in dry run mode"
     )
 
+    # Stop command
+    stop_parser = subparsers.add_parser("stop", help="Gracefully stop a running instance")
+    stop_parser.add_argument("dir", type=str, help="Work directory")
+    stop_parser.add_argument(
+        "--timeout", type=int, default=30, help="Seconds to wait before giving up"
+    )
+    stop_parser.add_argument(
+        "--force", action="store_true", help="Force kill if graceful shutdown fails"
+    )
+
     # List Gpus command
     subparsers.add_parser("lsgpu", help="List available GPUs")
 
@@ -1195,6 +1315,8 @@ def main():
         manager.run_instance(
             args.dir, thread.host_port, imgdir=args.imgdir, dry_run=args.dry_run
         )
+    elif args.command == "stop":
+        shutdown_instance(args.dir, timeout=args.timeout, force=args.force)
     elif args.command == "lsgpu":
         list_available_gpus()
     elif args.command == "tag-vfio":
