@@ -22,21 +22,21 @@ miner_hotkey,executor_id,gpu_model,gpu_count,score,job_score,collateral_deposite
 5G1YLwQurC794BqNVCyf6V2kULLvSN5UvambjFB5Hkn8Z5Yo,81d5cf2b-2f2d-476d-bbc4-1ad472ae3d13,NVIDIA GeForce RTX 3090,7,1.0,1.0,True,True,True,0.0008890688285941216,1,1,0.0055884326368773355,44,False,,,,,,,,,0.00011054345881954451,0.09447292160783323
 5G1YLwQurC794BqNVCyf6V2kULLvSN5UvambjFB5Hkn8Z5Yo,15e6ba88-9606-4207-b582-871ec3578844,NVIDIA RTX A6000,5,1.0,1.0,False,False,True,0.0010026321191682662,0.8,0.3861607142857143,0.013631160371582442,21,False,,,,,,,,,0.00012466348927303141,0.10654021662806683
 5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,a221d7ff-5947-45de-8f0a-437e4ec13e01,NVIDIA A100-SXM4-80GB,8,1.0,1.0,False,False,True,0.0066011386676215825,0.8,0.5669642857142857,0.24923196780508258,137,False,,,,,,,,,0.0008207606396686059,0.701440468737151
-5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,c17a86f1-b4e0-45a2-ac3c-f73dfc27b983,NVIDIA A100-SXM4-80GB,8,1.0,1.0,False,False,False,0,,,,,True,0.43,8,8,False,0.43,0.03201413676881528,0.8779858632311848,27.360000000000003,0.00402516924286274,3.4399999999999995
+5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,c17a86f1-b4e0-45a2-ac3c-f73dfc27b983,NVIDIA A100-SXM4-80GB,8,1.0,1.0,False,False,False,0,,,,,True,0.43,8,8,False,0.43,0.020734302030095277,0.8892656979699047,17.72,0.00402516924286274,3.4399999999999995
 5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,ce7c6667-bcd9-46c3-87b0-71de628edbd0,NVIDIA A100-SXM4-80GB,8,1.0,1.0,False,False,True,0.006731082342181062,0.8,0.578125,0.24923196780508258,137,False,,,,,,,,,0.0008369173451738932,0.7152483519800082
 5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,ee6c6bad-7bfb-40e9-8730-882c36c99d06,NVIDIA A100-SXM4-80GB,8,1.0,1.0,True,False,True,0.011642953240529406,0.8,1,0.24923196780508258,137,False,,,,,,,,,0.0014476408132737613,1.2371863385600144
 5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,d77a3a7c-0ee5-467f-acdb-9c141b3da5d5,NVIDIA A100-SXM4-80GB,8,1.0,1.0,True,False,True,0.011642953240529406,0.8,1,0.24923196780508258,137,False,,,,,,,,,0.0014476408132737613,1.2371863385600144
 5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,156a2ad6-eec9-44e0-86b8-b4494e832ceb,NVIDIA RTX A6000,8,1.0,1.0,False,False,True,0.004154258398958458,0.8,1.0,0.013631160371582442,21,False,,,,,,,,,0.0005165247925486065,0.4414336836936318
 5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,67107e5d-48f4-492c-9a62-eb4fd25c111d,NVIDIA RTX 6000 Ada Generation,8,1.0,1.0,False,False,True,0.005883646743944137,0.8,1.0,0.023902314897273055,26,False,,,,,,,,,0.0007315504049066784,0.6251993993398375
 5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,e3a470b9-654c-4397-8025-5be23b5edb00,NVIDIA RTX A6000,8,1.0,1.0,False,False,True,0.004154258398958458,0.8,1.0,0.013631160371582442,21,False,,,,,,,,,0.0005165247925486065,0.4414336836936318
-5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,71a354ab-9a32-4290-8586-fdc9c8c0020f,NVIDIA A100-SXM4-80GB,8,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
+5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj,71a354ab-9a32-4290-8586-fdc9c8c0020f,NVIDIA A100-SXM4-80GB,8,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
 5ExwvZeo3XRKN1XU3hAc1G2s11g6BCG4BC7y9cga9z2T6ock,67c578df-aede-47c7-8c10-e4e26fa1551e,NVIDIA RTX 6000 Ada Generation,2,1.0,1.0,False,True,True,0.0018386396074825428,1,1.0,0.023902314897273055,26,False,,,,,,,,,0.00022860950153333695,0.19537481229369916
 5Gs1FrdGmGko4REHe24HGJJwDR2iogAGimvWgWsxNVT2e21j,1752006d-741f-4f42-8aad-474df17020b9,NVIDIA GeForce RTX 4090,4,1.0,1.0,True,False,True,0.0016343240185868622,0.8,1,0.006128715069700733,12,False,,,,,,,,,0.00020320567321219864,0.17366413029450856
 5FZ32Hs29mNJ94cAU1J6kRaU7dij3ACqQ6ZqqZ1Hi7Qi6tAX,fa0e0f18-d72b-4cdf-88d3-dadb5c69f52b,NVIDIA GeForce RTX 3090,2,1.0,1.0,False,True,True,0.00025401966531260614,1,1.0,0.0055884326368773355,44,False,,,,,,,,,3.158384537701271e-05,0.026992263316523775
 5FZ32Hs29mNJ94cAU1J6kRaU7dij3ACqQ6ZqqZ1Hi7Qi6tAX,907af9bf-9aa0-4767-8393-1de9f1d176f2,NVIDIA GeForce RTX 3090,2,1.0,1.0,False,True,False,0,,,,,False,,,,,,,,,0.0,0.0
 5FZ32Hs29mNJ94cAU1J6kRaU7dij3ACqQ6ZqqZ1Hi7Qi6tAX,d5de2dcd-c051-483c-9ec7-1073ef3fa7b7,NVIDIA GeForce RTX 3090,2,1.0,1.0,False,True,False,0,,,,,False,,,,,,,,,0.0,0.0
-5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS,8e83da12-6201-470b-a09b-89d5f0e62e91,NVIDIA B200,8,1.0,1.0,False,False,False,0,,,,,True,2.99,8,16,True,1.495,0.03201413676881528,0.8779858632311848,27.360000000000003,0.01399448376297627,11.959999999999997
-5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS,8e83da12-6201-470b-a09b-89d5f0e62e92,NVIDIA B200,8,1.0,1.0,False,False,False,0,,,,,True,2.99,8,16,True,1.495,0.03201413676881528,0.8779858632311848,27.360000000000003,0.01399448376297627,11.959999999999997
+5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS,8e83da12-6201-470b-a09b-89d5f0e62e91,NVIDIA H200,8,1.0,1.0,False,False,False,0,,,,,True,1.9,8,16,True,0.95,0.020734302030095277,0.8892656979699047,17.72,0.008892815769115357,7.6
+5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS,8e83da12-6201-470b-a09b-89d5f0e62e92,NVIDIA H200 NVL,8,1.0,1.0,False,False,False,0,,,,,True,1.67,8,16,True,0.835,0.020734302030095277,0.8892656979699047,17.72,0.007816317018117181,6.68
 5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS,8e83da12-6201-470b-a09b-89d5f0e62e9b,NVIDIA B200,8,1.0,1.0,False,False,True,0.07374120860013418,0.8,1.0,0.645235575251174,56,False,,,,,,,,,0.009168703247736686,7.835779632903683
 5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS,cde3343f-34e9-4f31-b06d-f2020040fb23,NVIDIA B200,8,1.0,1.0,False,False,True,0.07374120860013418,0.8,1.0,0.645235575251174,56,False,,,,,,,,,0.009168703247736686,7.835779632903683
 5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS,0dd610d4-6bd9-4cbf-b4dc-ce6caa869d45,NVIDIA B200,8,1.0,1.0,False,False,True,0.07374120860013418,0.8,1.0,0.645235575251174,56,False,,,,,,,,,0.009168703247736686,7.835779632903683
@@ -62,143 +62,143 @@ miner_hotkey,executor_id,gpu_model,gpu_count,score,job_score,collateral_deposite
 5CCwGES74ZGuyNey5mdLMZYCvGpMPi8Haz8744EyonfNWgZp,ad0ec01a-221d-415c-8abe-d576dbb9c169,NVIDIA A100-SXM4-80GB,8,1.0,1.0,False,False,True,0.011642953240529406,0.8,1.0,0.24923196780508258,137,False,,,,,,,,,0.0014476408132737613,1.2371863385600144
 5CCwGES74ZGuyNey5mdLMZYCvGpMPi8Haz8744EyonfNWgZp,b2e5bf62-1f25-4673-8247-5c04294aa2ba,NVIDIA RTX 6000 Ada Generation,8,1.0,1.0,False,False,True,0.005883646743944137,0.8,1.0,0.023902314897273055,26,False,,,,,,,,,0.0007315504049066784,0.6251993993398375
 5CCwGES74ZGuyNey5mdLMZYCvGpMPi8Haz8744EyonfNWgZp,db8ee411-ade5-447b-b635-02029902feb8,NVIDIA RTX 6000 Ada Generation,8,1.0,1.0,False,False,True,0.005883646743944137,0.8,1.0,0.023902314897273055,26,False,,,,,,,,,0.0007315504049066784,0.6251993993398375
-unknown,7937a0a6-4e53-427b-82dc-7047dbbad044,NVIDIA GeForce RTX 4090,5,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,b01150c1-285b-414d-babe-50c3ab8a5521,NVIDIA GeForce RTX 4090,2,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,ca8aeb09-f2e8-452c-8ce9-ebb80dd78425,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,f411c030-eb3e-4e11-bc82-eb2c1b228374,NVIDIA A100-SXM4-80GB,8,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,723fe85d-689c-4bd3-ae50-e7db4236649f,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,c9e35920-ae32-4f9e-a1ec-5a634e8bb815,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,97438c95-a705-4a19-977f-ae0e5db8892b,NVIDIA RTX A6000,1,0.0,0.0,False,True,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,9f08ac43-41c4-439f-8f1b-659b86d4057f,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,2a5f1b29-ddb6-4c32-8700-b076f9c8e6a1,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,d02e06a1-0f03-4e86-8303-d7e96afb144e,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,a7522a6c-ae45-4c5f-89a1-132774ddd0a0,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,86a118e3-495e-4dae-a660-b9b218586ddb,NVIDIA A100-SXM4-80GB,8,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
-unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,0,,,,,False,,,,,,,,,0.0,0.0
+unknown,7937a0a6-4e53-427b-82dc-7047dbbad044,NVIDIA GeForce RTX 4090,5,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,b01150c1-285b-414d-babe-50c3ab8a5521,NVIDIA GeForce RTX 4090,2,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,ca8aeb09-f2e8-452c-8ce9-ebb80dd78425,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,f411c030-eb3e-4e11-bc82-eb2c1b228374,NVIDIA A100-SXM4-80GB,8,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,723fe85d-689c-4bd3-ae50-e7db4236649f,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,c9e35920-ae32-4f9e-a1ec-5a634e8bb815,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,97438c95-a705-4a19-977f-ae0e5db8892b,NVIDIA RTX A6000,1,0.0,0.0,False,True,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,9f08ac43-41c4-439f-8f1b-659b86d4057f,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,2a5f1b29-ddb6-4c32-8700-b076f9c8e6a1,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,d02e06a1-0f03-4e86-8303-d7e96afb144e,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,a7522a6c-ae45-4c5f-89a1-132774ddd0a0,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,86a118e3-495e-4dae-a660-b9b218586ddb,NVIDIA A100-SXM4-80GB,8,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,
+unknown,11111111-1111-1111-1111-111111111111,,0,0.0,0.0,False,False,False,,,,,,False,,,,,,,,,,

@@ -3585,20 +3585,20 @@
       "148126ba-45bd-4ee9-81b6-bab055a7fdaa": 0.06710892937185176,
       "6bf0f442-6102-4d62-9484-de9590e48939": 0.06710892937185176,
       "6eb92e45-a676-4a53-a3f5-b4f148004932": 0.0006288678834353908,
-      "11111111-1111-1111-1111-111111111111": 0,
-      "4c8bdf1a-c5c9-4a11-9b58-d6bff24ba11b": 0,
-      "a7522a6c-ae45-4c5f-89a1-132774ddd0a0": 0,
-      "61280236-2d09-41f7-bef2-0e8653804c3f": 0,
-      "97438c95-a705-4a19-977f-ae0e5db8892b": 0,
-      "45b29655-94fc-49ed-b818-e292f6c2c816": 0,
-      "c668a317-4245-4c5e-94f1-d41f5756f899": 0
+      "11111111-1111-1111-1111-111111111111": null,
+      "4c8bdf1a-c5c9-4a11-9b58-d6bff24ba11b": null,
+      "a7522a6c-ae45-4c5f-89a1-132774ddd0a0": null,
+      "61280236-2d09-41f7-bef2-0e8653804c3f": null,
+      "97438c95-a705-4a19-977f-ae0e5db8892b": null,
+      "45b29655-94fc-49ed-b818-e292f6c2c816": null,
+      "c668a317-4245-4c5e-94f1-d41f5756f899": null
     },
     "total_mining_score": 0.7637358880389585,
     "miner_incentives": {
       "5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS": 0.02372470799679861,
       "5HGyf9J3u5iByuRYwNLTjrkwSqrLVEeixhFMZUavVuzihUyj": 0.008258239874646186,
       "5CUQK1orC4gBwCwV36AtSvHX4ZDJzqF2ibeWmw69usiG277u": 0.007655727079286448,
-      "5G1YLwQurC794BqNVCyf6V2kULLvSN5UvambjFB5Hkn8Z5Yo": 0.001499625978377379,
+      "5G1YLwQurC794BqNVCyf6V2kULLvSN5UvambjFB5Hkn8Z5Yo": 9.549717272758579e-05,
       "5DhzqmmkD99d8MFbEEFgtQYSUWyYHRLNJKpVjYQFn5d6hJsv": 0.007888629473258852,
       "5DWu2VKAMd8TbNGFFjtgDxr8zd8SKZAJbaQuZhWSJtvJ5xh3": 0.005305886383273372,
       "5G4MNptjsxfj8XGpgCZ8Jt6yBhzbo8qmNdUCWFQ6zUVf25zJ": 0.0003705345682688283,
@@ -3615,14 +3615,12 @@
       "5E9dhZ8zGkaQcTg4R3k2yE9XmccUpmGbWAseV7epKVwoYmvP": 6.548377558463025e-05,
       "5Hiwc4kPcBvkmbkEtAKK8EgevWMGU8VVT73EG2KsvGVSNW4g": 0.00790823599893287,
       "5CkM4uub6wkipume69CtY38K3YxpygoTRDektH8xUHa6Yxfz": 0.02372470799679861,
-      "5GEt8xmrb4ubrsD3PizXK7aUv9XDvFZgpPLuwC85i1JXj3A8": 7.410691365376568e-05,
-      "unknown": 0.0,
-      "5HYKyVUb6dprbN7NzfhgXRpB9Wgm7Vc7GZhQTYoVivVhVCKD": 0.0
+      "5GEt8xmrb4ubrsD3PizXK7aUv9XDvFZgpPLuwC85i1JXj3A8": 7.410691365376568e-05
     },
     "metrics": {
-      "total_executors": 207,
+      "total_executors": 70,
       "successful_executors": 70,
-      "failed_executors": 137
+      "failed_executors": 0
     }
   }
 }

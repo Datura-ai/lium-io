@@ -3433,7 +3433,7 @@
       "156a2ad6-eec9-44e0-86b8-b4494e832ceb": 0.004154258398958458,
       "67107e5d-48f4-492c-9a62-eb4fd25c111d": 0.005883646743944137,
       "e3a470b9-654c-4397-8025-5be23b5edb00": 0.004154258398958458,
-      "71a354ab-9a32-4290-8586-fdc9c8c0020f": 0,
+      "71a354ab-9a32-4290-8586-fdc9c8c0020f": null,
       "67c578df-aede-47c7-8c10-e4e26fa1551e": 0.0018386396074825428,
       "1752006d-741f-4f42-8aad-474df17020b9": 0.0016343240185868622,
       "fa0e0f18-d72b-4cdf-88d3-dadb5c69f52b": 0.00025401966531260614,
@@ -3464,19 +3464,19 @@
       "ad0ec01a-221d-415c-8abe-d576dbb9c169": 0.011642953240529406,
       "b2e5bf62-1f25-4673-8247-5c04294aa2ba": 0.005883646743944137,
       "db8ee411-ade5-447b-b635-02029902feb8": 0.005883646743944137,
-      "7937a0a6-4e53-427b-82dc-7047dbbad044": 0,
-      "11111111-1111-1111-1111-111111111111": 0,
-      "b01150c1-285b-414d-babe-50c3ab8a5521": 0,
-      "ca8aeb09-f2e8-452c-8ce9-ebb80dd78425": 0,
-      "f411c030-eb3e-4e11-bc82-eb2c1b228374": 0,
-      "723fe85d-689c-4bd3-ae50-e7db4236649f": 0,
-      "c9e35920-ae32-4f9e-a1ec-5a634e8bb815": 0,
-      "97438c95-a705-4a19-977f-ae0e5db8892b": 0,
-      "9f08ac43-41c4-439f-8f1b-659b86d4057f": 0,
-      "2a5f1b29-ddb6-4c32-8700-b076f9c8e6a1": 0,
-      "d02e06a1-0f03-4e86-8303-d7e96afb144e": 0,
-      "a7522a6c-ae45-4c5f-89a1-132774ddd0a0": 0,
-      "86a118e3-495e-4dae-a660-b9b218586ddb": 0
+      "7937a0a6-4e53-427b-82dc-7047dbbad044": null,
+      "11111111-1111-1111-1111-111111111111": null,
+      "b01150c1-285b-414d-babe-50c3ab8a5521": null,
+      "ca8aeb09-f2e8-452c-8ce9-ebb80dd78425": null,
+      "f411c030-eb3e-4e11-bc82-eb2c1b228374": null,
+      "723fe85d-689c-4bd3-ae50-e7db4236649f": null,
+      "c9e35920-ae32-4f9e-a1ec-5a634e8bb815": null,
+      "97438c95-a705-4a19-977f-ae0e5db8892b": null,
+      "9f08ac43-41c4-439f-8f1b-659b86d4057f": null,
+      "2a5f1b29-ddb6-4c32-8700-b076f9c8e6a1": null,
+      "d02e06a1-0f03-4e86-8303-d7e96afb144e": null,
+      "a7522a6c-ae45-4c5f-89a1-132774ddd0a0": null,
+      "86a118e3-495e-4dae-a660-b9b218586ddb": null
     },
     "total_mining_score": 0.7192697580171268,
     "miner_incentives": {
@@ -3500,13 +3500,12 @@
       "5DhzqmmkD99d8MFbEEFgtQYSUWyYHRLNJKpVjYQFn5d6hJsv": 0.001821058406751989,
       "5Hiwc4kPcBvkmbkEtAKK8EgevWMGU8VVT73EG2KsvGVSNW4g": 0.009227009338343466,
       "5CkM4uub6wkipume69CtY38K3YxpygoTRDektH8xUHa6Yxfz": 0.027681028015030397,
-      "5CCwGES74ZGuyNey5mdLMZYCvGpMPi8Haz8744EyonfNWgZp": 0.005177632282810918,
-      "unknown": 0.0
+      "5CCwGES74ZGuyNey5mdLMZYCvGpMPi8Haz8744EyonfNWgZp": 0.005177632282810918
     },
     "metrics": {
-      "total_executors": 201,
+      "total_executors": 60,
       "successful_executors": 60,
-      "failed_executors": 141
+      "failed_executors": 0
     }
   }
 }
