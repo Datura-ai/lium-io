@@ -10,6 +10,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 if TYPE_CHECKING:
     from bittensor import Wallet
 
+from incentive.config import IncentiveConfig
+
 
 class FeatureFlag(str, Enum):
     """Feature flag names for type-safe access."""
@@ -116,9 +118,10 @@ class Settings(BaseSettings):
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
     
     # Machine Price Limit
-    MACHINE_MAX_PRICE_RATE: float = Field(env="MACHINE_MAX_PRICE_RATE", default=3.0)
+    MACHINE_MAX_PRICE_RATE: float = Field(env="MACHINE_MAX_PRICE_RATE", default=2.0)
 
     debug: DebugSettings = Field(default_factory=DebugSettings)
+    incentive: IncentiveConfig = Field(default_factory=IncentiveConfig)
 
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

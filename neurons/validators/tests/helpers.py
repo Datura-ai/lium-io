@@ -114,3 +114,69 @@ def make_context(
     base_kwargs.update(extra)
 
     return Context.model_construct(**base_kwargs)
+
+
+# Incentive logging assertion helpers
+
+def assert_incentive_log_present(log_text: str) -> None:
+    """Verify 'Incentive Scores Calculation Logs:' header is present."""
+    assert "Incentive Scores Calculation Logs:" in log_text
+
+
+def assert_executor_has_log(log_text: str, executor_id: str) -> None:
+    """Verify executor_id appears in the logs."""
+    assert executor_id in log_text
+
+
+def assert_log_contains_keys(log_text: str, expected_keys: list[str]) -> None:
+    """Verify log_text contains all expected key strings."""
+    for key in expected_keys:
+        assert key in log_text, f"Expected key '{key}' not found in log_text"
+
+
+def extract_incentive_section(log_text: str) -> str:
+    """Extract the incentive logs section from log_text."""
+    if "Incentive Scores Calculation Logs:" not in log_text:
+        return ""
+    return log_text.split("Incentive Scores Calculation Logs:")[1]
+
+
+def count_incentive_log_entries(log_text: str) -> int:
+    """Count incentive log entries by counting 'executor_id:' occurrences."""
+    section = extract_incentive_section(log_text)
+    return section.count("executor_id:")
+
+
+# Rental price incentive log (rental_price.py lines 146-165): message + extra keys
+RENTAL_PRICE_INCENTIVE_LOG_MESSAGE = (
+    "Rental price incentive for executor is calculated successfully. "
+    "Formula: rental_share * gpu_count / total_unrented_count"
+)
+RENTAL_PRICE_INCENTIVE_EXTRA_KEYS = [
+    "hotkey",
+    "executor_id",
+    "gpu_model",
+    "gpu_count",
+    "effective_rate",
+    "total_unrented_by_gpu_type",
+    "max_cap",
+    "cap_dilution_applied",
+    "rental_share",
+    "burn_share",
+    "incentive",
+    "total_rental_cost",
+]
+
+
+def assert_rental_price_incentive_log_full_content(full_log_text: str) -> None:
+    """Assert full_log_text contains the rental price incentive log message and all extra keys.
+
+    Covers the logic in incentive/rental_price.py that appends the rental price
+    incentive log (message + get_extra_info(...)). Verifies the message and
+    every extra field is present in the log.
+    """
+    assert_incentive_log_present(full_log_text)
+    assert (
+        RENTAL_PRICE_INCENTIVE_LOG_MESSAGE in full_log_text
+    ), f"Expected rental price incentive message not found in full_log_text"
+    assert_log_contains_keys(full_log_text, RENTAL_PRICE_INCENTIVE_EXTRA_KEYS)
