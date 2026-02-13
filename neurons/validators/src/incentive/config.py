@@ -84,7 +84,7 @@ class IncentiveConfig(BaseModel):
     """
 
     algorithm: str = Field(
-        default="default",
+        default="rental_price",
         description="Incentive algorithm to use"
     )
 
