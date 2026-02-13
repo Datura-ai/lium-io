@@ -355,7 +355,8 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         sleep: int = 0,
-        clear_volume: bool = True
+        clear_volume: bool = True,
+        active_container_names: list[str] | None = None,
     ):
         command = f'/usr/bin/docker ps -a --format "{{{{.Names}}}}"'
         result = await ssh_client.run(command)
@@ -363,7 +364,19 @@ class DockerService:
             # wait until the docker connection check is finished.
             await asyncio.sleep(sleep)
 
-            container_names = " ".join([container for container in result.stdout.strip().split("\n") if pod_name == container or container.startswith(POD_CONTAINER_PREFIX)])
+            active_set = set(active_container_names) if active_container_names else set()
+            containers_to_remove = []
+            for container in result.stdout.strip().split("\n"):
+                container = container.strip()
+                if not container:
+                    continue
+                if container == pod_name:
+                    containers_to_remove.append(container)
+                elif active_container_names is not None and container.startswith(POD_CONTAINER_PREFIX) and container not in active_set:
+                    containers_to_remove.append(container)
+                # if active_container_names is None — only exact match (safe fallback)
+
+            container_names = " ".join(containers_to_remove)
             if not container_names:
                 return
 
@@ -373,6 +386,7 @@ class DockerService:
                     extra=get_extra_info({
                         **default_extra,
                         "container_names": container_names,
+                        "active_containers": list(active_set),
                     }),
                 ),
             )
@@ -381,7 +395,8 @@ class DockerService:
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
-                command = f'/usr/bin/docker volume prune -af'
+                target_volume = f"volume_{pod_name.removeprefix(POD_CONTAINER_PREFIX)}"
+                command = f'/usr/bin/docker volume rm {target_volume} 2>/dev/null || true'
                 await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
     async def install_open_ssh_server_and_start_ssh_service(
@@ -835,6 +850,7 @@ class DockerService:
                     pod_name=container_name,
                     sleep=10,
                     clear_volume=False if local_volume else True,
+                    active_container_names=payload.active_container_names,
                 )
 
                 # Add profiler for docker volume creation
@@ -930,7 +946,7 @@ class DockerService:
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
-                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra, pod_name=container_name)
+                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra, pod_name=container_name, active_container_names=payload.active_container_names)
                     raise Exception("Run docker run command but container is not running")
 
                 # Add profiler for docker container creation
