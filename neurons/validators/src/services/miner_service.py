@@ -464,7 +464,7 @@ class MinerService:
                         "synthetic_job_score": result.job_score,
                         "job_batch_id": result.job_batch_id,
                         "log_status": result.log_status,
-                        "log_text": result.log_text,
+                        "log_text": result.full_log_text,
                         "collateral_deposited": result.collateral_deposited,
                         "ssh_pub_keys": result.ssh_pub_keys,
                     },

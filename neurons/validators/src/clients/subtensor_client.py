@@ -7,7 +7,6 @@ from bittensor.utils.weight_utils import (
     process_weights_for_netuid,
 )
 from websockets.protocol import State as WebSocketClientState
-import random
 from datetime import datetime
 import json
 import aiohttp
@@ -15,7 +14,6 @@ import aiohttp
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 
-from services.const import TOTAL_BURN_EMISSION, BURNER_EMISSION
 from services.redis_service import NORMALIZED_SCORE_CHANNEL, RedisService
 from clients.validator_portal_api import ValidatorPortalAPI
 
@@ -289,10 +287,15 @@ class SubtensorClient:
             logger.error(_m("[send_weights_to_lium] Failed to post latest-set-weights", extra=get_extra_info({"error": str(e)})))
 
     async def set_weights(self, miner_scores: dict[str, float]):
+        """Set weights using accumulated scores with burning already applied.
+
+        The miner_scores dict already includes burning logic from calculate_final_weights
+        called per cycle. This method just normalizes and sends to chain.
+        """
         miners = await self.get_miners()
         logger.info(
             _m(
-                "[set_weights] scores",
+                "[set_weights] accumulated scores",
                 extra=get_extra_info(
                     {
                         **self.default_extra,
@@ -311,43 +314,15 @@ class SubtensorClient:
             )
             return
 
+        # Build uids and weights arrays
         uids = np.zeros(len(miners), dtype=np.int64)
         weights = np.zeros(len(miners), dtype=np.float32)
-
-        last_mechansim_step_block = self.get_last_mechansim_step_block()
-        main_burner = random.Random(last_mechansim_step_block).choice(settings.BURNERS)
-        logger.info(
-            _m(
-                "[set_weights] main burner",
-                extra=get_extra_info({
-                    "last_mechansim_step_block": last_mechansim_step_block,
-                    "main_burner": main_burner,
-                }),
-            ),
-        )
-        other_burners = [uid for uid in settings.BURNERS if uid != main_burner]
-
-        metagraph = self.get_metagraph()
         miner_hotkeys = []
-        total_score = sum(miner_scores.values())
+
         for ind, miner in enumerate(miners):
             uids[ind] = miner.uid
+            weights[ind] = miner_scores.get(miner.hotkey, 0.0)
             miner_hotkeys.append(miner.hotkey)
-            if settings.ENABLE_NEW_BURN_LOGIC:
-                if miner.uid in settings.NEW_BURNERS:
-                    weights[ind] = TOTAL_BURN_EMISSION / len(settings.NEW_BURNERS)
-                else:
-                    weights[ind] = 0 if total_score <= 0 else (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_score
-            else:
-                if miner.uid == main_burner:
-                    weights[ind] = TOTAL_BURN_EMISSION - (len(settings.BURNERS) - 1) * BURNER_EMISSION
-                elif miner.uid in other_burners:
-                    weights[ind] = BURNER_EMISSION
-                else:
-                    weights[ind] = 0 if total_score <= 0 else (1 - TOTAL_BURN_EMISSION) * miner_scores.get(miner.hotkey, 0.0) / total_score
-
-            # uids[ind] = miner.uid
-            # weights[ind] = self.miner_scores.get(miner.hotkey, 0.0)
 
         logger.debug(
             _m(
@@ -355,15 +330,17 @@ class SubtensorClient:
                 extra=get_extra_info(self.default_extra),
             ),
         )
+
+        # Publish normalized scores
         normalized_scores = [
             {"uid": int(uid), "weight": float(weight), "miner_hotkey": miner_hotkey}
             for uid, weight, miner_hotkey in zip(uids, weights, miner_hotkeys)
         ]
-        message = {
-            "normalized_scores": normalized_scores,
-        }
+        message = {"normalized_scores": normalized_scores}
         await self.redis_service.publish(NORMALIZED_SCORE_CHANNEL, message)
 
+        # Process weights for blockchain
+        metagraph = self.get_metagraph()
         processed_uids, processed_weights = process_weights_for_netuid(
             uids=uids,
             weights=weights,
