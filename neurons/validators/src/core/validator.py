@@ -7,6 +7,7 @@ from payload_models.payloads import MinerJobRequestPayload
 from clients.backend_client import BackendClient
 
 from core.config import settings
+from incentive.factory import IncentiveFactory
 from core.utils import _m, get_extra_info, get_logger
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
@@ -46,6 +47,9 @@ class Validator:
         self.default_extra = {}
 
         self.miner_scores = {}
+
+        # set incentive algorithm from setting
+        self.incentive = settings.incentive
 
     async def initiate_services(self):
         # initiate subtensor client
@@ -142,61 +146,6 @@ class Validator:
                 ),
             ),
         )
-
-    async def calc_job_score(self, total_gpu_model_count_map: dict, job_result: JobResult):
-        default_extra = {
-            "executor_id": str(job_result.executor_info.uuid),
-            "job_batch_id": job_result.job_batch_id,
-            "gpu_model": job_result.gpu_model,
-            "gpu_count": job_result.gpu_count,
-            "score": job_result.score,
-            "collateral_deposited": job_result.collateral_deposited,
-            "sysbox_runtime": job_result.sysbox_runtime,
-        }
-        if job_result.score == 0:
-            logger.info(
-                _m(
-                    "Debug: No need to calc score, score is 0",
-                    extra=get_extra_info(default_extra)
-                )
-            )
-            return 0
-
-        total_gpu_count = total_gpu_model_count_map.get(job_result.gpu_model, 0)
-
-        if total_gpu_count == 0:
-            return 0
-
-        score_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
-        score = job_result.score * score_portion * job_result.gpu_count / total_gpu_count
-        
-        # calc multiplier
-        multiplier = 1
-
-        # calc multiplier for sysbox_runtime
-        if not job_result.sysbox_runtime:
-            multiplier = multiplier * (1  - settings.PORTION_FOR_SYSBOX)
-
-        # calc multiplier for uptime
-        if not job_result.collateral_deposited:
-            uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
-            multiplier = multiplier * (1 - settings.PORTION_FOR_UPTIME + settings.PORTION_FOR_UPTIME * min(1, uptime_in_minutes / settings.UPTIME_REQUIRED_MINUTES))
-
-        score = score * multiplier
-
-        logger.info(
-            _m(
-                "Debug: calculating score",
-                extra=get_extra_info({
-                    **default_extra,
-                    "score_portion": score_portion,
-                    "multiplier": multiplier,
-                    "score": score,
-                })
-            )
-        )
-
-        return score
 
     async def sync(self):
         try:
@@ -413,22 +362,30 @@ class Validator:
                         ),
                     )
 
-                    total_executors = 0
-                    successful_executors = 0
-                    failed_executors = 0
+                    incentive = IncentiveFactory.create(
+                        config=self.incentive,
+                        redis_service=self.redis_service,
+                        # pass results from synthetic job
+                        jobs_results=all_job_results,
+                        total_gpu_model_count_map=total_gpu_model_count_map,
+                    )
+                    await incentive.calculate_mining_scores()
 
-                    for miner_hotkey, results in all_job_results.items():
-                        for result in results:
-                            total_executors += 1
-                            score = await self.calc_job_score(total_gpu_model_count_map, result)
-                            result.score = score
-                            self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+                    # PHASE 2: Calculate final weights with burning logic per cycle
+                    miners = await self.subtensor_client.get_miners()
+                    last_mechanism_step_block = self.subtensor_client.get_last_mechansim_step_block()
 
-                            if result.job_score == 1.0:
-                                successful_executors += 1
-                            else:
-                                failed_executors += 1
+                    cycle_scores = await incentive.calculate_final_weights(
+                        miners=miners,
+                        last_mechanism_step_block=last_mechanism_step_block,
+                    )
 
+                    # PHASE 3: Accumulate scores with burning applied
+                    for miner_hotkey, score in cycle_scores.items():
+                        self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+
+                    # Publish machine specs
+                    for miner_hotkey, results in incentive.job_results.items():
                         miner_coldkey = miner_coldkeys.get(miner_hotkey)
                         if miner_coldkey:
                             await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
@@ -440,11 +397,12 @@ class Validator:
                                 {
                                     **self.default_extra,
                                     "job_batch_id": job_batch_id,
-                                    "miner_scores": self.miner_scores,
+                                    "cycle_scores": cycle_scores,
+                                    "accumulated_miner_scores": self.miner_scores,
                                     "open_fd_count": open_fd_count,
-                                    "total_executors": total_executors,
-                                    "successful_executors": successful_executors,
-                                    "failed_executors": failed_executors,
+                                    "total_executors": incentive.total_executors,
+                                    "successful_executors": incentive.successful_executors,
+                                    "failed_executors": incentive.failed_executors,
                                 }
                             ),
                         ),
@@ -462,6 +420,7 @@ class Validator:
                                 }
                             ),
                         ),
+                        exc_info=True,
                     )
             else:
                 remaining_blocks = (
