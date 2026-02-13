@@ -23,7 +23,7 @@
             "cwd": "${workspaceFolder}/neurons/validators"
         },
         {
-            "name": "Validator: Debug Run",
+            "name": "Validator: App",
             "type": "debugpy",
             "request": "launch",
             "program": "src/validator.py",
@@ -37,10 +37,11 @@
             "request": "launch",
             "program": "src/connector.py",
             "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}/neurons/validators"
+            "cwd": "${workspaceFolder}/neurons/validators",
+            "python": "${workspaceFolder}/neurons/validators/.venv/bin/python3",
         },
         {
-            "name": "Miner: Debug Run",
+            "name": "Miner: App",
             "type": "debugpy",
             "request": "launch",
             "program": "src/miner.py",
