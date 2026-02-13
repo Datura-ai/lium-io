@@ -640,3 +640,142 @@ async def test_generate_portMappings_with_backend_pod_mapping(docker_service, te
 
     assert len(result) == 3
     assert (22, 20000, 20000) in result  # from backend pod_mapping
+
+
+# =============================================================================
+# Tests for clean_existing_containers
+# =============================================================================
+
+
+def _make_ssh_run_result(stdout: str):
+    """Helper to create a mock SSH run result."""
+    mock_result = Mock()
+    mock_result.stdout = stdout
+    return mock_result
+
+
+@pytest.fixture
+def retry_ssh_mock(monkeypatch):
+    """Mock retry_ssh_command to capture SSH commands without executing."""
+    import services.docker_service as ds_module
+    mock = AsyncMock()
+    monkeypatch.setattr(ds_module, "retry_ssh_command", mock)
+    return mock
+
+
+@pytest.mark.asyncio
+async def test_clean_containers_active_siblings_not_removed(docker_service, retry_ssh_mock):
+    """Active sibling containers listed in active_container_names must be preserved."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
+        "pod_abc123\npod_sibling1\npod_sibling2\n"
+    ))
+
+    # Act
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={},
+        pod_name="pod_abc123",
+        active_container_names=["pod_sibling1", "pod_sibling2"],
+    )
+
+    # Assert — only target pod removed, active siblings preserved
+    rm_command = retry_ssh_mock.call_args_list[0][0][1]
+    assert "pod_abc123" in rm_command
+    assert "pod_sibling1" not in rm_command
+    assert "pod_sibling2" not in rm_command
+
+
+@pytest.mark.asyncio
+async def test_clean_containers_stale_pods_removed(docker_service, retry_ssh_mock):
+    """Stale pod_ containers not in active list should be cleaned up."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
+        "pod_target\npod_stale_orphan\npod_active_sibling\nsome_other_container\n"
+    ))
+
+    # Act
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={},
+        pod_name="pod_target",
+        active_container_names=["pod_active_sibling"],
+    )
+
+    # Assert — target + stale orphan removed; active sibling and non-pod container kept
+    rm_command = retry_ssh_mock.call_args_list[0][0][1]
+    assert "pod_target" in rm_command
+    assert "pod_stale_orphan" in rm_command
+    assert "pod_active_sibling" not in rm_command
+    # non-pod containers are never touched
+    assert "some_other_container" not in rm_command
+
+
+@pytest.mark.asyncio
+async def test_clean_containers_none_fallback_exact_match_only(docker_service, retry_ssh_mock):
+    """When active_container_names is None (old backend), only exact-match pod is removed."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
+        "pod_target\npod_other_pod\nsome_container\n"
+    ))
+
+    # Act
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={},
+        pod_name="pod_target",
+        active_container_names=None,
+    )
+
+    # Assert — safe fallback: only the exact target removed
+    rm_command = retry_ssh_mock.call_args_list[0][0][1]
+    assert "pod_target" in rm_command
+    assert "pod_other_pod" not in rm_command
+    assert "some_container" not in rm_command
+
+
+@pytest.mark.asyncio
+async def test_clean_containers_targeted_volume_rm(docker_service, retry_ssh_mock):
+    """Volume cleanup removes only the target pod's volume, not prune -af."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result("pod_abc123\n"))
+
+    # Act
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={},
+        pod_name="pod_abc123",
+        clear_volume=True,
+        active_container_names=[],
+    )
+
+    # Assert — two calls: container rm + targeted volume rm (not prune)
+    assert retry_ssh_mock.call_count == 2
+    volume_command = retry_ssh_mock.call_args_list[1][0][1]
+    assert "volume rm volume_abc123" in volume_command
+    assert "volume prune" not in volume_command
+
+
+@pytest.mark.asyncio
+async def test_clean_containers_no_volume_cleanup_when_disabled(docker_service, retry_ssh_mock):
+    """No volume cleanup when clear_volume=False (e.g. local volume reuse)."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result("pod_abc123\n"))
+
+    # Act
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={},
+        pod_name="pod_abc123",
+        clear_volume=False,
+        active_container_names=[],
+    )
+
+    # Assert — only one call for container rm, no volume command
+    assert retry_ssh_mock.call_count == 1
+    assert "docker rm" in retry_ssh_mock.call_args_list[0][0][1]

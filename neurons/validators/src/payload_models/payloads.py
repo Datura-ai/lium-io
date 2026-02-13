@@ -241,6 +241,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     enable_jupyter: bool | None = None
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
+    active_container_names: list[str] | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
