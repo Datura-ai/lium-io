@@ -12,6 +12,20 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from helpers import make_context
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--update-snapshot",
+        action="store_true",
+        default=False,
+        help="Update expected_output in snapshot JSON instead of asserting",
+    )
+
+
+@pytest.fixture
+def update_snapshot(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--update-snapshot")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def setup_sql_logging():
     """Enable SQL query logging for all tests."""
