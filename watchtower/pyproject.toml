@@ -1,0 +1,32 @@
+[project]
+name = "watchtower"
+version = "1.0.0"
+description = "Automated Docker image update service with cryptographic verification"
+authors = [
+    {name = "Lium Team"},
+]
+dependencies = [
+    "docker>=7.1.0",
+    "requests>=2.32.0",
+    "bittensor==9.10.1",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-dotenv>=1.0.0",
+    "pytest>=8.3.0",
+]
+requires-python = "<3.13,>=3.11"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.pdm]
+distribution = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
