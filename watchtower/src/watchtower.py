@@ -1,8 +1,9 @@
 import docker
+import os
 import requests
 import bittensor
 import time
-import json
+from datetime import datetime
 from typing import Optional
 from docker.models.containers import Container
 
@@ -48,18 +49,16 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
     """
     try:
         keypair = bittensor.Keypair(ss58_address=settings.WATCHTOWER_VALIDATOR_HOTKEY)
+        signing_data = f"{payload.digest}:{payload.timestamp}"
+        is_valid = keypair.verify(signing_data, payload.signature)
 
-        signing_data = {
-            "digest": payload.digest,
-            "timestamp": payload.timestamp,
-        }
-        message = json.dumps(signing_data, sort_keys=True)
-
-        signature = payload.signature
-        if not signature.startswith('0x'):
-            signature = '0x' + signature
-
-        is_valid = keypair.verify(message, signature)
+        # Verify that the timestamp is not too far in the future or past (e.g., within 5 minutes)
+        now = int(datetime.utcnow().timestamp())
+        max_skew = 10 * 60  # 10 minutes
+        if abs(payload.timestamp - now) > max_skew:
+            raise Exception(
+                f"Digest response timestamp out of allowed range (now={now}, ts={payload.timestamp})"
+            )
 
         if not is_valid:
             raise Exception(
@@ -109,68 +108,109 @@ def fetch_verified_digest() -> Optional[str]:
         return None
 
 
-def find_containers_by_image(client: docker.DockerClient, image_name: str) -> list[Container]:
+def find_container_by_name(client: docker.DockerClient, container_name: str) -> Optional[Container]:
     """
-    Find all running containers using the specified image.
+    Find a container by its name.
 
     Args:
         client: Docker client instance
-        image_name: Image name to match
+        container_name: Name of the container to find
 
     Returns:
-        List of Container objects
+        Container object or None if not found
     """
     try:
-        containers = client.containers.list(filters={"ancestor": image_name})
-        logger.info(_m("Found containers using image", {
-            "image": image_name,
-            "count": len(containers),
-            "containers": [c.name for c in containers]
+        container = client.containers.get(container_name)
+        logger.info(_m("Found container", {
+            "name": container_name,
+            "id": container.short_id,
+            "status": container.status
         }))
-        return containers
+        return container
+    except docker.errors.NotFound:
+        logger.info(_m("Container not found", {"name": container_name}))
+        return None
     except Exception as e:
-        logger.error(_m("Error finding containers", {"error": str(e)}))
-        return []
+        logger.error(_m("Error finding container", {"name": container_name, "error": str(e)}))
+        return None
 
 
-def pull_and_restart_containers(client: docker.DockerClient, image_name: str) -> bool:
+def pull_and_restart_containers(client: docker.DockerClient, image_name: str, remote_digest: str) -> bool:
     """
-    Pull the latest image and restart all containers using it.
+    Pull the latest image and restart the executor-runner container.
+    Stops and removes the old container, then creates a new one with proper configuration.
 
     Args:
         client: Docker client instance
         image_name: Image to pull
+        remote_digest: The digest of the remote image
 
     Returns:
         True if successful, False otherwise
     """
+    container_name = "executor-runner"
+
     try:
-        containers = find_containers_by_image(client, image_name)
-        if not containers:
-            logger.warning(_m("No containers found to restart", {"image": image_name}))
-            return False
+        # Pull the new image
+        logger.info(_m("Pulling new image", {"image": f"{image_name}@{remote_digest}"}))
+        client.images.pull(f"{image_name}@{remote_digest}")
+        logger.info(_m("Successfully pulled new image", {"image": f"{image_name}@{remote_digest}"}))
 
-        logger.info(_m("Pulling new image", {"image": image_name}))
-        client.images.pull(image_name)
-        logger.info(_m("Successfully pulled new image", {"image": image_name}))
+        # Find the existing container
+        container = find_container_by_name(client, container_name)
 
-        for container in containers:
+        if container:
+            # Stop and remove the old container
             try:
-                logger.info(_m("Restarting container", {
-                    "name": container.name,
+                logger.info(_m("Stopping existing container", {
+                    "name": container_name,
                     "id": container.short_id
                 }))
-                container.restart(timeout=10)
-                logger.info(_m("Successfully restarted container", {
-                    "name": container.name
-                }))
+                container.stop(timeout=10)
+                logger.info(_m("Removing old container", {"name": container_name}))
+                container.remove()
+                logger.info(_m("Successfully removed old container", {"name": container_name}))
             except Exception as e:
-                logger.error(_m("Failed to restart container", {
-                    "name": container.name,
+                logger.error(_m("Failed to stop/remove old container", {
+                    "name": container_name,
                     "error": str(e)
                 }))
+                return False
 
-        return True
+        # Create new container with proper configuration from docker-compose.yml
+        home_dir = os.path.expanduser("~")
+
+        try:
+            logger.info(_m("Creating new container with updated image", {
+                "name": container_name,
+                "image": f"{image_name}@{remote_digest}"
+            }))
+
+            new_container = client.containers.run(
+                f"{image_name}@{remote_digest}",
+                name=container_name,
+                detach=True,
+                restart_policy={"Name": "unless-stopped"},
+                volumes={
+                    "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
+                    f"{home_dir}/.bittensor/wallets": {"bind": "/root/.bittensor/wallets", "mode": "rw"},
+                    "/app/.env": {"bind": "/root/executor/.env", "mode": "rw"}
+                },
+            )
+
+            logger.info(_m("Successfully created new container", {
+                "name": container_name,
+                "id": new_container.short_id
+            }))
+            return True
+
+        except Exception as e:
+            logger.error(_m("Failed to create new container", {
+                "name": container_name,
+                "image": f"{image_name}@{remote_digest}",
+                "error": str(e)
+            }))
+            return False
 
     except docker.errors.APIError as e:
         logger.error(_m("Docker API error during pull/restart", {"error": str(e)}))
@@ -189,10 +229,6 @@ def check_and_update() -> None:
         image_name = settings.WATCHTOWER_IMAGE
 
         current_digest = get_current_image_digest(client, image_name)
-        if not current_digest:
-            logger.warning(_m("Could not retrieve current image digest", {"image": image_name}))
-            return
-
         logger.info(_m("Current image digest", {"digest": current_digest}))
 
         remote_digest = fetch_verified_digest()
@@ -203,7 +239,7 @@ def check_and_update() -> None:
         logger.info(_m("Remote verified digest", {"digest": remote_digest}))
 
         if current_digest == remote_digest:
-            logger.info(_m("Image is up to date"))
+            logger.info(_m("Image is up to date", extra={"image": image_name}))
             return
 
         logger.info(_m("Image update detected", {
@@ -211,11 +247,11 @@ def check_and_update() -> None:
             "remote": remote_digest
         }))
 
-        success = pull_and_restart_containers(client, image_name)
+        success = pull_and_restart_containers(client, image_name, remote_digest)
         if success:
-            logger.info(_m("Successfully updated to new image"))
+            logger.info(_m("Successfully updated to new image", extra={"image": image_name}))
         else:
-            logger.error(_m("Failed to update image"))
+            logger.error(_m("Failed to update image", extra={"image": image_name}))
 
     except Exception as e:
         logger.error(_m("Error in check_and_update", {"error": str(e)}), exc_info=True)
