@@ -1,12 +1,11 @@
 version: '3.7'
 
 services:
-  executor-runner:
+  lium-watchtower:
     image: daturaai/lium-watchtower@sha256:374681f6de94dab595b559a3ac0782caed0f1c5cb4df75b3e1994ed8814c4776
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
       - ./.env:/app/.env
     environment:
       - WATCHTOWER_ENABLED=true
