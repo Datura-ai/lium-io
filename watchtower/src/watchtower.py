@@ -193,7 +193,7 @@ def pull_and_restart_containers(client: docker.DockerClient, image_name: str, re
                 restart_policy={"Name": "unless-stopped"},
                 volumes={
                     "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
-                    "/app/.env": {"bind": "/root/executor/.env", "mode": "rw"}
+                    settings.WATCHTOWER_ENV_FILE_PATH: {"bind": "/root/executor/.env", "mode": "rw"}
                 },
             )
 
