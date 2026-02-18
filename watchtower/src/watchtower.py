@@ -53,7 +53,7 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
         is_valid = keypair.verify(signing_data, payload.signature)
 
         # Verify that the timestamp is not too far in the future or past (e.g., within 5 minutes)
-        now = int(datetime.utcnow().timestamp())
+        now = int(datetime.now(datetime.UTC).timestamp())
         max_skew = 10 * 60  # 10 minutes
         if abs(payload.timestamp - now) > max_skew:
             raise Exception(
