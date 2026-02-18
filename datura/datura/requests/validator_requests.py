@@ -58,6 +58,7 @@ class AuthenticateRequest(BaseValidatorRequest):
 class SSHPubKeySubmitRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeySubmitRequest
     public_key: bytes
+    validator_signature: str
     executor_id: Optional[str] = None
     is_rental_request: bool = False
     miner_hotkey: str
@@ -66,6 +67,7 @@ class SSHPubKeySubmitRequest(BaseValidatorRequest):
 class SSHPubKeyRemoveRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeyRemoveRequest
     public_key: bytes
+    validator_signature: str
     executor_id: Optional[str] = None
     miner_hotkey: str
 
