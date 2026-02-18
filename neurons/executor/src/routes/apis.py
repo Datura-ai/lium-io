@@ -4,11 +4,13 @@ import tomllib
 from pathlib import Path
 
 import docker
+import bittensor
 from fastapi import APIRouter, Depends, Query, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics, get_container_metrics
+from core.config import VALIDATOR_HOTKEY_SS58
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
@@ -52,11 +54,25 @@ def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
         raise HTTPException(status_code=400, detail="Public key mismatch")
 
 
+def _validate_validator_signature(payload: UploadSShKeyPayload) -> None:
+    """Require a valid validator signature over the SSH public key."""
+    try:
+        keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
+        if not keypair.verify(payload.public_key, payload.validator_signature):
+            raise HTTPException(status_code=401, detail="Invalid validator signature")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Validator signature verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid validator signature")
+
+
 @apis_router.post("/upload_ssh_key")
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
     _validate_ssh_key_consistency(payload)
+    _validate_validator_signature(payload)
     return await miner_service.upload_ssh_key(payload)
 
 
@@ -65,6 +81,7 @@ async def remove_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
     _validate_ssh_key_consistency(payload)
+    _validate_validator_signature(payload)
     return await miner_service.remove_ssh_key(payload)
 
 

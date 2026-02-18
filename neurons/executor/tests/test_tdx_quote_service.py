@@ -19,7 +19,7 @@ from neurons.executor.src.services.tdx_service import TDXQuoteService  # noqa: E
 
 
 async def _run_quote_flow(monkeypatch):
-    quote_payload = {"quote": "00", "event_log": "[]"}
+    quote_payload = {"quote": "00", "event_log": "[]", "report_data": "", "vm_config": ""}
     captured: dict[str, object] = {"count": 0}
 
     async def handle_get_quote(request: web.Request):
