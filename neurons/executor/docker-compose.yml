@@ -2,18 +2,17 @@ version: '3.7'
 
 services:
   executor-runner:
-    image: daturaai/compute-subnet-executor-runner:latest
+    image: daturaai/lium-watchtower@sha256:374681f6de94dab595b559a3ac0782caed0f1c5cb4df75b3e1994ed8814c4776
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - "$HOME/.bittensor/wallets:/root/.bittensor/wallets"
-      - ./.env:/root/executor/.env
+      - ./.env:/app/.env
+    environment:
+      - WATCHTOWER_ENABLED=true
+      - WATCHTOWER_IMAGE=daturaai/compute-subnet-executor-runner
+      - WATCHTOWER_INTERVAL=300
+      - WATCHTOWER_ENDPOINT_URL=https://validator.lium.io/api/digest
+      - WATCHTOWER_VALIDATOR_HOTKEY=5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
-
-  watchtower:
-    image: nickfedor/watchtower
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 60 --cleanup --label-enable
