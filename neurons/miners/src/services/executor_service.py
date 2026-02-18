@@ -1,12 +1,10 @@
 import asyncio
 import json
 import logging
-import uuid
 from typing import Annotated, Optional, Union
 from uuid import UUID
 
 import aiohttp
-import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo, PodLog
 from fastapi import Depends
@@ -43,61 +41,18 @@ class ExecutorService:
 
     async def test_executor_connectivity(self, executor: Executor) -> tuple[bool, str]:
         """
-        Test executor connectivity by adding a test SSH key, connecting to it, and then removing the key.
+        Test executor connectivity by checking the executor HTTP API health.
 
         :param executor: Executor to test
         :return: True if connectivity test passed, False otherwise
         """
-        keypair = settings.get_bittensor_wallet().get_hotkey()
-        hotkey = keypair.ss58_address
-
-        # Generate a temporary SSH key pair for testing
-        encrypted_private_key, public_key = self.ssh_service.generate_ssh_key(hotkey)
-
         try:
-            # Step 1: Send the test public key to executor
-            executor_ssh_info = await self.send_pubkey_to_executor(
-                executor,
-                public_key.decode('utf-8')
-            )
-
-            if not executor_ssh_info:
-                log_text = "Failed to send SSH key - Please check if executor ip address and port are correct"
-                
-                logger.error(log_text)
-                return False, str(log_text)
-
-            # Step 2: Try to connect via SSH
-            decrypted_private_key_str = self.ssh_service.decrypt_payload(
-                hotkey,
-                encrypted_private_key.decode('utf-8')
-            )
-
-            try:
-                # Import the decrypted private key for asyncssh
-                private_key_obj = asyncssh.import_private_key(decrypted_private_key_str)
-
-                async with asyncssh.connect(
-                    host=executor_ssh_info.address,
-                    port=executor_ssh_info.ssh_port,
-                    username=executor_ssh_info.ssh_username,
-                    client_keys=[private_key_obj],
-                    known_hosts=None,
-                    connect_timeout=10,
-                ) as ssh_conn:
-                    pass
-            except asyncssh.Error as e:
-                # Still try to clean up the key
-                await self.remove_pubkey_from_executor(executor, public_key.decode('utf-8'))
-                return False, "Failed to connect to executor via SSH"
-            except Exception as e:
-                # Still try to clean up the key
-                await self.remove_pubkey_from_executor(executor, public_key.decode('utf-8'))
-                return False, "Failed to connect to executor via SSH"
-
-            # Step 3: Clean up - remove the test SSH key
-            await self.remove_pubkey_from_executor(executor, public_key.decode('utf-8'))
-
+            timeout = aiohttp.ClientTimeout(total=10)
+            url = f"http://{executor.address}:{executor.port}/version"
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return False, f"Executor health check failed with status {response.status}"
             return True, "Connectivity test passed - proceeding to save executor"
 
         except Exception as e:
@@ -284,7 +239,7 @@ class ExecutorService:
         return result
 
     async def send_pubkey_to_executor(
-        self, executor: Executor, pubkey: str
+        self, executor: Executor, pubkey: str, validator_signature: str
     ) -> ExecutorSSHInfo | None:
         """TODO: Send API request to executor with pubkey
 
@@ -300,6 +255,7 @@ class ExecutorService:
         keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         payload = {
             "public_key": pubkey,
+            "validator_signature": validator_signature,
             "data_to_sign": pubkey,
             "signature": f"0x{keypair.sign(pubkey).hex()}"
         }
@@ -355,7 +311,7 @@ class ExecutorService:
                 )
                 return None
 
-    async def remove_pubkey_from_executor(self, executor: Executor, pubkey: str):
+    async def remove_pubkey_from_executor(self, executor: Executor, pubkey: str, validator_signature: str):
         """TODO: Send API request to executor to cleanup pubkey
 
         Args:
@@ -366,6 +322,7 @@ class ExecutorService:
         keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
         payload = {
             "public_key": pubkey,
+            "validator_signature": validator_signature,
             "data_to_sign": pubkey,
             "signature": f"0x{keypair.sign(pubkey).hex()}"
         }
@@ -401,7 +358,14 @@ class ExecutorService:
                     ),
                 )
 
-    async def register_pubkey(self, validator_hotkey: str, miner_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
+    async def register_pubkey(
+        self,
+        validator_hotkey: str,
+        miner_hotkey: str,
+        pubkey: bytes,
+        validator_signature: str,
+        executor_id: Optional[str] = None,
+    ):
         """Register pubkeys to executors for given validator.
 
         Args:
@@ -414,7 +378,7 @@ class ExecutorService:
         executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
             asyncio.create_task(
-                self.send_pubkey_to_executor(executor, pubkey.decode("utf-8")),
+                self.send_pubkey_to_executor(executor, pubkey.decode("utf-8"), validator_signature),
                 name=f"{executor}.send_pubkey_to_executor",
             )
             for executor in executors
@@ -437,7 +401,14 @@ class ExecutorService:
         )
         return results
 
-    async def deregister_pubkey(self, validator_hotkey: str, miner_hotkey: str, pubkey: bytes, executor_id: Optional[str] = None):
+    async def deregister_pubkey(
+        self,
+        validator_hotkey: str,
+        miner_hotkey: str,
+        pubkey: bytes,
+        validator_signature: str,
+        executor_id: Optional[str] = None,
+    ):
         """Deregister pubkey from executors.
 
         Args:
@@ -447,7 +418,7 @@ class ExecutorService:
         executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
             asyncio.create_task(
-                self.remove_pubkey_from_executor(executor, pubkey.decode("utf-8")),
+                self.remove_pubkey_from_executor(executor, pubkey.decode("utf-8"), validator_signature),
                 name=f"{executor}.remove_pubkey_from_executor",
             )
             for executor in executors
