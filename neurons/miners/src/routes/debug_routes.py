@@ -24,7 +24,12 @@ async def register_pubkey(
     if not settings.debug.ENABLED:
         return None
     pub_key = "Test Pubkey"
-    return await executor_service.register_pubkey(validator_hotkey, pub_key.encode("utf-8"))
+    return await executor_service.register_pubkey(
+        validator_hotkey,
+        settings.get_bittensor_wallet().get_hotkey().ss58_address,
+        pub_key.encode("utf-8"),
+        "0xdebug",
+    )
 
 
 @debug_apis_router.post("/debug/remove_pubkey/{validator_hotkey}")
@@ -34,4 +39,9 @@ async def remove_pubkey_from_executor(
     if not settings.debug.ENABLED:
         return None
     pub_key = "Test Pubkey"
-    await executor_service.deregister_pubkey(validator_hotkey, pub_key.encode("utf-8"))
+    await executor_service.deregister_pubkey(
+        validator_hotkey,
+        settings.get_bittensor_wallet().get_hotkey().ss58_address,
+        pub_key.encode("utf-8"),
+        "0xdebug",
+    )

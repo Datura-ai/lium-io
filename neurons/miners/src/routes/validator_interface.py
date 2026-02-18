@@ -108,7 +108,11 @@ async def submit_ssh_pubkey(
         logger.info("Validator %s sent SSH Pubkey via REST API.", authenticated_validator)
         
         executors = await executor_service.register_pubkey(
-            authenticated_validator, request.miner_hotkey, request.public_key, request.executor_id
+            authenticated_validator,
+            request.miner_hotkey,
+            request.public_key,
+            request.validator_signature,
+            request.executor_id,
         )
         
         if request.is_rental_request and len(executors) == 1:
@@ -165,7 +169,11 @@ async def remove_ssh_pubkey(
         logger.info("Validator %s sent remove SSH Pubkey via REST API.", authenticated_validator)
         
         await executor_service.deregister_pubkey(
-            authenticated_validator, request.miner_hotkey, request.public_key, request.executor_id
+            authenticated_validator,
+            request.miner_hotkey,
+            request.public_key,
+            request.validator_signature,
+            request.executor_id,
         )
         logger.info("Sent SSHKeyRemoved to validator %s via REST API", authenticated_validator)
         return SSHKeyRemoved()
