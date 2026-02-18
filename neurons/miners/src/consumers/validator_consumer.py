@@ -153,7 +153,11 @@ class ValidatorConsumer(BaseConsumer):
             try:
                 msg: SSHPubKeySubmitRequest
                 executors: list[ExecutorSSHInfo] = await self.executor_service.register_pubkey(
-                    self.validator_key, msg.miner_hotkey, msg.public_key, msg.executor_id
+                    self.validator_key,
+                    msg.miner_hotkey,
+                    msg.public_key,
+                    msg.validator_signature,
+                    msg.executor_id,
                 )
                 if msg.is_rental_request and len(executors) == 1:
                     await self.invoke_rental_request_hook(
@@ -175,7 +179,13 @@ class ValidatorConsumer(BaseConsumer):
         if isinstance(msg, SSHPubKeyRemoveRequest):
             logger.info("Validator %s sent remove SSH Pubkey.", self.validator_key)
             try:
-                await self.executor_service.deregister_pubkey(self.validator_key, msg.miner_hotkey, msg.public_key, msg.executor_id)
+                await self.executor_service.deregister_pubkey(
+                    self.validator_key,
+                    msg.miner_hotkey,
+                    msg.public_key,
+                    msg.validator_signature,
+                    msg.executor_id,
+                )
                 logger.info("Sent SSHKeyRemoved to validator %s", self.validator_key)
             except Exception as e:
                 logger.error("Failed SSHKeyRemoved request: %s", str(e))

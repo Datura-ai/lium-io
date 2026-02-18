@@ -52,18 +52,22 @@ class MinerMiddleware(BaseHTTPMiddleware):
             verified = False
             for hotkey in hotkeys_to_verify:
                 keypair = bittensor.Keypair(ss58_address=hotkey)
-                if keypair.verify(payload.data_to_sign, payload.signature):
-                    verified = True
-                    logger.info(
-                        _m(
-                            "Auth successful",
-                            extra={
-                                **default_extra,
-                                "verified_with_hotkey": hotkey,
-                            },
+                try:
+                    if keypair.verify(payload.data_to_sign, payload.signature):
+                        verified = True
+                        logger.info(
+                            _m(
+                                "Auth successful",
+                                extra={
+                                    **default_extra,
+                                    "verified_with_hotkey": hotkey,
+                                },
+                            )
                         )
-                    )
-                    break
+                        break
+                except ValueError as e:
+                    logger.error(f"Error verifying signature: {e}")
+                    verified = False
 
             if not verified:
                 logger.error(
