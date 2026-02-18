@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     WATCHTOWER_INTERVAL: int = Field(env="WATCHTOWER_INTERVAL", default=300)
     WATCHTOWER_ENDPOINT_URL: str = Field(env="WATCHTOWER_ENDPOINT_URL")
     WATCHTOWER_VALIDATOR_HOTKEY: str = Field(env="WATCHTOWER_VALIDATOR_HOTKEY")
+    WATCHTOWER_ENV_FILE_PATH: str = Field(env="WATCHTOWER_ENV_FILE_PATH", default="~/.env")
 
 
 settings = Settings()
