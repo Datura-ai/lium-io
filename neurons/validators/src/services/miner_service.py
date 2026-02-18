@@ -155,6 +155,14 @@ class MinerService:
         self.port_mapping_dao = port_mapping_dao
         self.attestation_service = attestation_service
 
+    @staticmethod
+    def _normalize_public_key(public_key: bytes | str) -> str:
+        return public_key.decode("utf-8") if isinstance(public_key, bytes) else public_key
+
+    def _sign_validator_pubkey(self, keypair: bittensor.Keypair, public_key: bytes | str) -> str:
+        pubkey = self._normalize_public_key(public_key)
+        return f"0x{keypair.sign(pubkey).hex()}"
+
     async def request_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
@@ -213,6 +221,7 @@ class MinerService:
                 await miner_client.send_model(
                     SSHPubKeySubmitRequest(
                         public_key=public_key,
+                        validator_signature=self._sign_validator_pubkey(my_key, public_key),
                         miner_hotkey=payload.miner_hotkey, # include miner's hotkey in the request
                     )
                 )
@@ -293,6 +302,7 @@ class MinerService:
                     try:
                         await miner_client.send_model(SSHPubKeyRemoveRequest(
                             public_key=public_key,
+                            validator_signature=self._sign_validator_pubkey(my_key, public_key),
                             miner_hotkey=payload.miner_hotkey
                         ))
                     except Exception as e:
@@ -595,6 +605,7 @@ class MinerService:
                 await miner_client.send_model(
                     SSHPubKeySubmitRequest(
                         public_key=public_key,
+                        validator_signature=self._sign_validator_pubkey(my_key, public_key),
                         executor_id=payload.executor_id,
                         is_rental_request=isinstance(payload, ContainerCreateRequest),
                         miner_hotkey=payload.miner_hotkey
@@ -629,6 +640,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key, 
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id, 
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -659,6 +671,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key, 
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id, 
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -697,6 +710,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -731,6 +745,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -765,6 +780,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -777,6 +793,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -789,6 +806,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -810,6 +828,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=public_key,
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -1032,6 +1051,7 @@ class MinerService:
                 await miner_client.send_model(
                     SSHPubKeySubmitRequest(
                         public_key=payload.public_key,
+                        validator_signature=self._sign_validator_pubkey(my_key, payload.public_key),
                         executor_id=payload.executor_id,
                         is_rental_request=False,
                         miner_hotkey=payload.miner_hotkey,
@@ -1067,6 +1087,7 @@ class MinerService:
                         await miner_client.send_model(
                             SSHPubKeyRemoveRequest(
                                 public_key=payload.public_key, 
+                                validator_signature=self._sign_validator_pubkey(my_key, payload.public_key),
                                 executor_id=payload.executor_id,
                                 miner_hotkey=payload.miner_hotkey
                             )
@@ -1341,6 +1362,7 @@ class MinerService:
         try:
             remove_request = SSHPubKeyRemoveRequest(
                 public_key=public_key,
+                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                 executor_id=executor_id,
                 miner_hotkey=miner_hotkey,
             )
@@ -1418,6 +1440,7 @@ class MinerService:
             # Prepare request
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
+                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                 miner_hotkey=payload.miner_hotkey,
             )
             
@@ -1592,6 +1615,7 @@ class MinerService:
 
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
+                validator_signature=self._sign_validator_pubkey(my_key, public_key),
                 executor_id=payload.executor_id,
                 is_rental_request=isinstance(payload, ContainerCreateRequest),
                 miner_hotkey=payload.miner_hotkey
@@ -1947,6 +1971,7 @@ class MinerService:
             
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=payload.public_key,
+                validator_signature=self._sign_validator_pubkey(my_key, payload.public_key),
                 executor_id=payload.executor_id,
                 is_rental_request=False,
                 miner_hotkey=payload.miner_hotkey,
