@@ -24,4 +24,4 @@ ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
 # Run watchtower
-CMD ["pdm", "run", "python", "-m", "src.watchtower"]
+CMD ["pdm", "run", "src/watchtower.py"]
