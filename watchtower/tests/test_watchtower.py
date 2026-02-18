@@ -76,7 +76,7 @@ class TestVerifyWatchtowerSignature:
     @patch('watchtower.settings')
     def test_valid_signature(self, mock_settings, mock_keypair_class):
         """Should verify valid signature without raising exception"""
-        mock_settings.WATCHTOWER_VALIDATOR_HOTKEY = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
+        mock_settings.WATCHTOWER_VALIDATOR_HOTKEY = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
         mock_keypair = Mock()
         mock_keypair.verify.return_value = True
         mock_keypair_class.return_value = mock_keypair
@@ -94,7 +94,7 @@ class TestVerifyWatchtowerSignature:
     @patch('watchtower.settings')
     def test_invalid_signature(self, mock_settings, mock_keypair_class):
         """Should raise exception for invalid signature"""
-        mock_settings.WATCHTOWER_VALIDATOR_HOTKEY = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
+        mock_settings.WATCHTOWER_VALIDATOR_HOTKEY = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
         mock_keypair = Mock()
         mock_keypair.verify.return_value = False
         mock_keypair_class.return_value = mock_keypair
@@ -112,7 +112,7 @@ class TestVerifyWatchtowerSignature:
     @patch('watchtower.settings')
     def test_signature_without_0x_prefix(self, mock_settings, mock_keypair_class):
         """Should add 0x prefix to signature if missing"""
-        mock_settings.WATCHTOWER_VALIDATOR_HOTKEY = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
+        mock_settings.WATCHTOWER_VALIDATOR_HOTKEY = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
         mock_keypair = Mock()
         mock_keypair.verify.return_value = True
         mock_keypair_class.return_value = mock_keypair
@@ -132,7 +132,7 @@ class TestVerifyWatchtowerSignature:
     @patch('watchtower.settings')
     def test_message_format_with_sorted_keys(self, mock_settings, mock_keypair_class):
         """Should create message with sorted JSON keys"""
-        mock_settings.WATCHTOWER_VALIDATOR_HOTKEY = "5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1"
+        mock_settings.WATCHTOWER_VALIDATOR_HOTKEY = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
         mock_keypair = Mock()
         mock_keypair.verify.return_value = True
         mock_keypair_class.return_value = mock_keypair
