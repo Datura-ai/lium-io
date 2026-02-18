@@ -3,7 +3,7 @@ import os
 import requests
 import bittensor
 import time
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional
 from docker.models.containers import Container
 
@@ -53,7 +53,7 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
         is_valid = keypair.verify(signing_data, payload.signature)
 
         # Verify that the timestamp is not too far in the future or past (e.g., within 5 minutes)
-        now = int(datetime.now(datetime.UTC).timestamp())
+        now = int(datetime.now(UTC).timestamp())
         max_skew = 10 * 60  # 10 minutes
         if abs(payload.timestamp - now) > max_skew:
             raise Exception(
