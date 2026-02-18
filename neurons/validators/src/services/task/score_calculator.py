@@ -6,8 +6,7 @@ based on collateral status, rental state, and contract versions.
 
 from typing import Tuple
 
-from core.config import settings
-from services.const import MACHINE_PRICES
+from core.config import settings, shared_config
 from services.task.pipeline import Context
 
 
@@ -45,7 +44,7 @@ def calculate_scores(
         warning_messages.append("Score set to 0 pending rental verification")
 
     # Machine price check
-    base_price = MACHINE_PRICES.get(gpu_model, 0)
+    base_price = shared_config.machine_prices.get(gpu_model, 0)
     if price_per_gpu and price_per_gpu > base_price * settings.MACHINE_MAX_PRICE_RATE:
         actual_score = 0.0
         warning_messages.append(

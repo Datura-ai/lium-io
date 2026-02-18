@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 if TYPE_CHECKING:
     from bittensor import Wallet
 
+from lium_core.shared_config import SharedConfigClient
 from incentive.config import IncentiveConfig
 
 
@@ -250,3 +251,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+shared_config = SharedConfigClient(
+    api_url=f"{settings.COMPUTE_REST_API_URL}/v1/shared-config"
+)

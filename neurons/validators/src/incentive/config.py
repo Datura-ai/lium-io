@@ -8,7 +8,7 @@ GPUs have higher caps to accommodate larger deployments.
 
 from pydantic import BaseModel, Field, field_validator
 
-from services.const import MACHINE_PRICES
+from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 
 # Sentinel value: use default price from MACHINE_PRICES
 DEFAULT_PRICE = "default"
@@ -113,8 +113,8 @@ class IncentiveConfig(BaseModel):
     )
 
     rental_prices_per_hour: dict[str, float] = Field(
-        default=MACHINE_PRICES,
-        description="Default rental prices per GPU type in USD/hour"
+        default=DEFAULT_SHARED_CONFIG.machine_prices,
+        description="Rental prices per GPU type in USD/hour"
     )
 
     gpu_count_custom_prices: dict[str, dict[str, float | str]] = Field(

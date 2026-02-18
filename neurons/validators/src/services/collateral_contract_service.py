@@ -2,8 +2,7 @@ import logging
 
 from typing import Optional, Dict, Any
 from core.utils import _m, get_extra_info, get_collateral_contract
-from core.config import settings
-from services.const import REQUIRED_DEPOSIT_AMOUNT
+from core.config import settings, shared_config
 from clients.subtensor_client import SubtensorClient
 from celium_collateral_contracts import CollateralContract
 
@@ -136,7 +135,7 @@ class CollateralContractService:
 
     async def _get_gpu_required_deposit(self, gpu_model: str, gpu_count: int) -> Optional[float]:
         # Handle missing GPU model gracefully
-        unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT.get(gpu_model)
+        unit_tao_amount = shared_config.required_deposit_amount.get(gpu_model)
         if unit_tao_amount is None:
             return None
         required_deposit_amount = unit_tao_amount * gpu_count * settings.COLLATERAL_DAYS

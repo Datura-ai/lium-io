@@ -5,7 +5,11 @@ description = "Compute subnet shared library"
 authors = [
     {name = "waris", email = "waris0609@outlook.com"},
 ]
-dependencies = []
+dependencies = [
+    "requests>=2.31.0",
+    "pydantic>=2.0.0",
+    "lium-core @ git+ssh://git@github.com/Datura-ai/lium-core.git@v0.1.0",
+]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
 license = {text = "MIT"}
@@ -14,6 +18,9 @@ license = {text = "MIT"}
 requires = ["pdm-backend"]
 build-backend = "pdm.backend"
 
+
+[dependency-groups]
+dev = ["pytest>=8.4.2", "pytest-mock>=3.15.0"]
 
 [tool.pdm]
 distribution = true
