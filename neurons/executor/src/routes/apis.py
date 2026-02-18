@@ -60,6 +60,7 @@ def _validate_validator_signature(payload: UploadSShKeyPayload) -> None:
         keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
         if not keypair.verify(payload.public_key, payload.validator_signature):
             raise HTTPException(status_code=401, detail="Invalid validator signature")
+        logger.info("Validator signature verification successful")
     except HTTPException:
         raise
     except Exception as exc:
