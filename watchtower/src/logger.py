@@ -20,7 +20,7 @@ def get_logger(name: str):
 
 
 class StructuredMessage:
-    def __init__(self, message, extra: dict):
+    def __init__(self, message, extra: dict={}):
         self.message = message
         self.extra = extra
 

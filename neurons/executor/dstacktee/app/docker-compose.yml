@@ -2,7 +2,7 @@ version: '3.7'
 
 services:
   lium-watchtower:
-    image: daturaai/lium-watchtower@sha256:374681f6de94dab595b559a3ac0782caed0f1c5cb4df75b3e1994ed8814c4776
+    image: daturaai/lium-watchtower@sha256:78892862ff1fe8ec43adcc906feffce89dc7358c8966448c929d1fafbb85bfd9
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
