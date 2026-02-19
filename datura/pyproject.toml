@@ -15,8 +15,5 @@ requires = ["pdm-backend"]
 build-backend = "pdm.backend"
 
 
-[dependency-groups]
-dev = ["pytest>=8.4.2", "pytest-mock>=3.15.0"]
-
 [tool.pdm]
 distribution = true
