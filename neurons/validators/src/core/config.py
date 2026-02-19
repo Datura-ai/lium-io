@@ -251,6 +251,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-shared_config = SharedConfigClient(
+shared_client = SharedConfigClient(
     api_url=f"{settings.COMPUTE_REST_API_URL}/v1/shared-config"
 )
