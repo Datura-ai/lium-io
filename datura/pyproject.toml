@@ -5,11 +5,7 @@ description = "Compute subnet shared library"
 authors = [
     {name = "waris", email = "waris0609@outlook.com"},
 ]
-dependencies = [
-    "requests>=2.31.0",
-    "pydantic>=2.0.0",
-    "lium-core>=0.1.0",
-]
+dependencies = []
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
 license = {text = "MIT"}
