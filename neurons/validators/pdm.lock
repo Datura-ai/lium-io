@@ -5,7 +5,7 @@
 groups = ["default", "dev"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:9dd714b140e5f15dc62c75a859ab42e928c1ccfda42830928e579011428e9d9d"
+content_hash = "sha256:29054c01c904d5da85b549b9741d7886b4048f1b62a9e81bf1444f2a07ef16b8"
 
 [[metadata.targets]]
 requires_python = ">=3.11,<3.13"
@@ -169,6 +169,17 @@ dependencies = [
 files = [
     {file = "asgiref-3.9.1-py3-none-any.whl", hash = "sha256:f3bba7092a48005b5f5bacd747d36ee4a5a61f4a269a6df590b43144355ebd2c"},
     {file = "asgiref-3.9.1.tar.gz", hash = "sha256:a5ab6582236218e5ef1648f242fd9f10626cfd4de8dc377db215d5d5098e3142"},
+]
+
+[[package]]
+name = "async-cache"
+version = "1.2.1"
+requires_python = ">=3.3"
+summary = "an asyncio cache"
+groups = ["default"]
+files = [
+    {file = "async_cache-1.2.1-py3-none-any.whl", hash = "sha256:e8418c71112e11b5785c5ed99bbae10262b74b3138c39ab18e952a8932557d78"},
+    {file = "async_cache-1.2.1.tar.gz", hash = "sha256:985f29dfa0ce66d9b8bf2071fd9e207a19047b1ce5a980c8c27cdf6d166588d5"},
 ]
 
 [[package]]
