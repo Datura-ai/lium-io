@@ -133,22 +133,22 @@ def test_fetch_success() -> None:
     with patch("lium_core.shared_config.client.requests.get", return_value=_make_response(SAMPLE_CONFIG_DATA)):
         client = _build_client(MagicMock())
 
-    assert isinstance(client._config, SharedConfig)
-    assert client._config == DEFAULT_SHARED_CONFIG
+    assert isinstance(client.config, SharedConfig)
+    assert client.config == DEFAULT_SHARED_CONFIG
 
 
 def test_fetch_http_error() -> None:
     with patch("lium_core.shared_config.client.requests.get", return_value=_make_response({}, status_code=500)):
         client = _build_client(MagicMock())
 
-    assert client._config == DEFAULT_SHARED_CONFIG
+    assert client.config == DEFAULT_SHARED_CONFIG
 
 
 def test_fetch_network_error() -> None:
     with patch("lium_core.shared_config.client.requests.get", side_effect=requests.ConnectionError("no network")):
         client = _build_client(MagicMock())
 
-    assert client._config == DEFAULT_SHARED_CONFIG
+    assert client.config == DEFAULT_SHARED_CONFIG
 
 
 # ==================== Client tests: __init__ ====================
@@ -158,15 +158,15 @@ def test_init_with_successful_fetch() -> None:
     with patch("lium_core.shared_config.client.requests.get", return_value=_make_response(ALTERED_CONFIG_DATA)):
         client = _build_client(MagicMock())
 
-    assert client._config.rental_fees_rate == 0.75
-    assert client._config.collateral_days == 14
+    assert client.config.rental_fees_rate == 0.75
+    assert client.config.collateral_days == 14
 
 
 def test_init_fallback_to_default() -> None:
     with patch("lium_core.shared_config.client.requests.get", side_effect=Exception("boom")):
         client = _build_client(MagicMock())
 
-    assert client._config is DEFAULT_SHARED_CONFIG
+    assert client.config is DEFAULT_SHARED_CONFIG
 
 
 # ==================== Client tests: _refresh_loop ====================
@@ -177,7 +177,7 @@ def test_refresh_updates_config_on_change() -> None:
     with patch("lium_core.shared_config.client.requests.get", mock_get):
         client = _build_client(mock_get)
 
-    assert client._config == DEFAULT_SHARED_CONFIG
+    assert client.config == DEFAULT_SHARED_CONFIG
 
     mock_get.return_value = _make_response(ALTERED_CONFIG_DATA)
 
@@ -191,8 +191,8 @@ def test_refresh_updates_config_on_change() -> None:
         client._running = True
         client._refresh_loop()
 
-    assert client._config.rental_fees_rate == 0.75
-    assert client._config.collateral_days == 14
+    assert client.config.rental_fees_rate == 0.75
+    assert client.config.collateral_days == 14
 
 
 def test_refresh_skips_on_same_config(caplog: pytest.LogCaptureFixture) -> None:
@@ -219,7 +219,7 @@ def test_refresh_skips_on_fetch_failure() -> None:
     with patch("lium_core.shared_config.client.requests.get", mock_get):
         client = _build_client(mock_get)
 
-    original_config = client._config
+    original_config = client.config
     mock_get.side_effect = requests.ConnectionError("down")
 
     def _stop_after_one_iteration(_interval: int) -> None:
@@ -232,17 +232,17 @@ def test_refresh_skips_on_fetch_failure() -> None:
         client._running = True
         client._refresh_loop()
 
-    assert client._config is original_config
+    assert client.config is original_config
 
 
-# ==================== Client tests: __getattr__ ====================
+# ==================== Client tests: .config property ====================
 
 
-def test_getattr_delegates_to_config() -> None:
+def test_config_property_returns_shared_config() -> None:
     mock_get = MagicMock(return_value=_make_response(SAMPLE_CONFIG_DATA))
     with patch("lium_core.shared_config.client.requests.get", mock_get):
         client = _build_client(mock_get)
 
-    assert client.bittensor_netuid == DEFAULT_SHARED_CONFIG.bittensor_netuid
-    assert client.rental_fees_rate == DEFAULT_SHARED_CONFIG.rental_fees_rate
-    assert client.machine_prices == DEFAULT_SHARED_CONFIG.machine_prices
+    assert client.config.bittensor_netuid == DEFAULT_SHARED_CONFIG.bittensor_netuid
+    assert client.config.rental_fees_rate == DEFAULT_SHARED_CONFIG.rental_fees_rate
+    assert client.config.machine_prices == DEFAULT_SHARED_CONFIG.machine_prices

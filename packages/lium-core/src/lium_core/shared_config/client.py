@@ -16,14 +16,23 @@ class SharedConfigClient:
         self._api_url = api_url
         self._refresh_interval = refresh_interval
         self._lock = threading.Lock()
-        self._config: SharedConfig = self._fetch() or DEFAULT_SHARED_CONFIG
         self._running = True
+
+        fetched = self._fetch()
+        if fetched:
+            logger.info("Shared config fetched from API: %s", self._api_url)
+            self._config = fetched
+        else:
+            logger.warning("Using default shared config (API unavailable: %s)", self._api_url)
+            self._config = DEFAULT_SHARED_CONFIG
+
         self._thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self._thread.start()
 
-    def __getattr__(self, name: str):
-        """Delegate attribute access to the underlying frozen SharedConfig."""
-        return getattr(self._config, name)
+    @property
+    def config(self) -> SharedConfig:
+        with self._lock:
+            return self._config
 
     def _fetch(self) -> SharedConfig | None:
         """Fetch config from API, return None on failure."""
@@ -40,14 +49,17 @@ class SharedConfigClient:
         logger.info("Started shared config refresh loop")
         while self._running:
             time.sleep(self._refresh_interval)
-            new_config = self._fetch()
-            with self._lock:
-                if new_config and self._config != new_config:
-                    for change in dict_diff(self._config.model_dump(), new_config.model_dump()):
-                        logger.info("Config changed %s", change)
-                    self._config = new_config
-                else:
-                    logger.debug("Shared config unchanged")
+            try:
+                new_config = self._fetch()
+                with self._lock:
+                    if new_config and self._config != new_config:
+                        for change in dict_diff(self._config.model_dump(), new_config.model_dump()):
+                            logger.info("Config changed %s", change)
+                        self._config = new_config
+                    else:
+                        logger.debug("Shared config unchanged")
+            except Exception:
+                logger.exception("Unexpected error in shared config refresh loop")
 
     def stop(self) -> None:
         """Stop background refresh."""

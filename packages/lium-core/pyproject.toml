@@ -1,6 +1,6 @@
 [project]
 name = "lium-core"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared core library for Lium platform"
 requires-python = ">=3.11"
 dependencies = [
