@@ -164,3 +164,5 @@ cython_debug/
 
 temp/
 test.db
+
+config_override.py

@@ -13,7 +13,7 @@ services:
       - db_data:/var/lib/postgresql/data
 
   executor:
-    image: daturaai/compute-subnet-executor:latest
+    image: daturaai/compute-subnet-executor@sha256:8c39222e648c6c340bfc0e3692a61b5d7c9a3f5b41443c9cfb6cdbb13f1bff4d
     env_file: ./.env
     restart: always
     ports:
@@ -24,6 +24,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/docker/daemon.json:/etc/docker/daemon.json
+      - /var/run/dstack.sock:/var/run/dstack.sock
       - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
     pid: host
     environment:
@@ -47,7 +48,7 @@ services:
               capabilities: [ gpu ]
 
   monitor:
-    image: daturaai/compute-subnet-executor:latest
+    image: daturaai/compute-subnet-executor@sha256:8c39222e648c6c340bfc0e3692a61b5d7c9a3f5b41443c9cfb6cdbb13f1bff4d
     env_file: ./.env
     restart: always
     volumes:
