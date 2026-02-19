@@ -13,30 +13,37 @@ from models import WatchtowerDigestResponse
 
 logger = get_logger(__name__)
 
+EXECUTOR_RUNNER_CONTAINER_NAME = "executor-runner"
 
-def get_current_image_digest(client: docker.DockerClient, image_name: str) -> Optional[str]:
+
+def get_current_image_digest(client: docker.DockerClient, container_name: str) -> Optional[str]:
     """
-    Get the current digest of the monitored Docker image.
+    Get the current digest of the image running inside the given container.
 
     Args:
         client: Docker client instance
-        image_name: Full image name (e.g., "daturaai/compute-subnet-executor-runner")
+        container_name: Name of the running container (e.g., "executor-runner")
 
     Returns:
         Image digest (e.g., "sha256:abc123...") or None if not found
     """
     try:
-        image = client.images.get(image_name)
-        repo_digests = image.attrs.get('RepoDigests', [])
+        container = client.containers.get(container_name)
+        image_id = container.attrs.get("Image")
+        if not image_id:
+            logger.warning(_m("Container has no image ID", {"container": container_name}))
+            return None
+        image = client.images.get(image_id)
+        repo_digests = image.attrs.get("RepoDigests", [])
         if repo_digests:
-            digest = repo_digests[0].split('@')[1]
+            digest = repo_digests[0].split("@")[1]
             return digest
         return None
-    except docker.errors.ImageNotFound:
-        logger.warning(_m("Image not found locally", {"image": image_name}))
+    except docker.errors.NotFound:
+        logger.warning(_m("Container not found", {"container": container_name}))
         return None
     except Exception as e:
-        logger.error(_m("Error getting image digest", {"image": image_name, "error": str(e)}))
+        logger.error(_m("Error getting image digest from container", {"container": container_name, "error": str(e)}))
         return None
 
 
@@ -148,7 +155,7 @@ def pull_and_restart_containers(client: docker.DockerClient, image_name: str, re
     Returns:
         True if successful, False otherwise
     """
-    container_name = "executor-runner"
+    container_name = EXECUTOR_RUNNER_CONTAINER_NAME
 
     try:
         # Pull the new image
@@ -226,9 +233,10 @@ def check_and_update() -> None:
     try:
         client = docker.from_env()
         image_name = settings.WATCHTOWER_IMAGE
+        container_name = EXECUTOR_RUNNER_CONTAINER_NAME
 
-        current_digest = get_current_image_digest(client, image_name)
-        logger.info(_m("Current image digest", {"digest": current_digest}))
+        current_digest = get_current_image_digest(client, container_name)
+        logger.info(_m("Current image digest", {"digest": current_digest, "container": container_name}))
 
         remote_digest = fetch_verified_digest()
         if not remote_digest:
