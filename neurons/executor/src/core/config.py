@@ -6,6 +6,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # This hotkey is used to verify the validator signature. 
 # This shouldn't be overridden by the environment variable. 
 VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
+try:
+    from core.config_override import _VALIDATOR_HOTKEY_SS58 
+    VALIDATOR_HOTKEY_SS58 = _VALIDATOR_HOTKEY_SS58
+except Exception as e:
+    pass
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

@@ -2,7 +2,7 @@ version: '3.7'
 
 services:
   lium-watchtower:
-    image: daturaai/lium-watchtower@sha256:06f6a369aca55a41afc2a6c37f962d3766496635b5b0924f51685e0af9829e16
+    image: daturaai/lium-watchtower@sha256:c6f378988de5e1bcad0c69c37ffbed6a621193e8e76d3f356e309b7c83fc06c5
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -13,5 +13,6 @@ services:
       - WATCHTOWER_INTERVAL=300
       - WATCHTOWER_ENDPOINT_URL=https://validator.lium.io/api/digest
       - WATCHTOWER_VALIDATOR_HOTKEY=5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p
+      - WATCHTOWER_ENV_FILE_PATH=${PWD}/.env
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
