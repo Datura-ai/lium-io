@@ -13,7 +13,7 @@ services:
       - db_data:/var/lib/postgresql/data
 
   executor:
-    image: daturaai/compute-subnet-executor@${EXECUTOR_IMAGE_SHA256}
+    image: daturaai/compute-subnet-executor@sha256:3eb8e183c11d489b82b79788e97bc491fe1ef87709b88f3bc09612e6c3431862
     env_file: ./.env
     restart: always
     ports:
@@ -48,7 +48,7 @@ services:
               capabilities: [ gpu ]
 
   monitor:
-    image: daturaai/compute-subnet-executor@${EXECUTOR_IMAGE_SHA256}
+    image: daturaai/compute-subnet-executor@sha256:3eb8e183c11d489b82b79788e97bc491fe1ef87709b88f3bc09612e6c3431862
     env_file: ./.env
     restart: always
     volumes:
