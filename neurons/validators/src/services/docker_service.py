@@ -389,8 +389,11 @@ class DockerService:
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
-                volumes = " ".join(f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}" for name in stale_containers)
-                command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
+                if active_container_names is not None:
+                    volumes = " ".join(f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}" for name in stale_containers)
+                    command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
+                else:
+                    command = '/usr/bin/docker volume prune -af'
                 await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
     async def install_open_ssh_server_and_start_ssh_service(
