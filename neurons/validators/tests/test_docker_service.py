@@ -739,24 +739,28 @@ async def test_clean_containers_none_fallback_removes_all_pods(docker_service, r
 
 @pytest.mark.asyncio
 async def test_clean_containers_targeted_volume_rm(docker_service, retry_ssh_mock):
-    """Volume cleanup removes only the target pod's volume, not prune -af."""
+    """Volume cleanup removes volumes for all removed containers, not prune -af."""
     # Arrange
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result("pod_abc123\n"))
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
+        "pod_target\npod_stale\npod_active_sibling\n"
+    ))
 
     # Act
     await docker_service.clean_existing_containers(
         ssh_client=ssh_client,
         default_extra={},
-        pod_name="pod_abc123",
+        pod_name="pod_target",
         clear_volume=True,
-        active_container_names=[],
+        active_container_names=["pod_active_sibling"],
     )
 
-    # Assert — two calls: container rm + targeted volume rm (not prune)
+    # Assert — two calls: container rm + volume rm for all removed containers
     assert retry_ssh_mock.call_count == 2
     volume_command = retry_ssh_mock.call_args_list[1][0][1]
-    assert "volume rm volume_abc123" in volume_command
+    assert "volume_target" in volume_command
+    assert "volume_stale" in volume_command
+    assert "volume_active_sibling" not in volume_command
     assert "volume prune" not in volume_command
 
 
