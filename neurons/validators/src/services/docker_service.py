@@ -365,18 +365,12 @@ class DockerService:
             await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
-            containers_to_remove = []
-            for container in result.stdout.strip().split("\n"):
-                container = container.strip()
-                if not container:
-                    continue
-                if container == pod_name:
-                    containers_to_remove.append(container)
-                elif active_container_names is not None and container.startswith(POD_CONTAINER_PREFIX) and container not in active_set:
-                    containers_to_remove.append(container)
-                # if active_container_names is None — only exact match (safe fallback)
-
-            container_names = " ".join(containers_to_remove)
+            found = [
+                c for c in result.stdout.strip().split("\n")
+                if c == pod_name or c.startswith(POD_CONTAINER_PREFIX)
+            ]
+            to_remove = [c for c in found if c not in active_set]
+            container_names = " ".join(to_remove)
             if not container_names:
                 return
 
