@@ -175,3 +175,6 @@ testing/
 notebooks/
 
 .vscode/*
+
+
+config_override.py
