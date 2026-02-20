@@ -212,3 +212,29 @@ NETWORK_MIN_DOWNLOAD_SPEED_MBPS = 50.0
 PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 20008, 20009]
 
 POD_CONTAINER_PREFIX = "pod_"
+
+# For simplicity, store whitelist in code. Can be updated to use DB if needed. 
+TDX_WHITELIST = {
+    "OS_IMAGE_HASH": set(
+        [
+            "9b69bb1698bacbb6985409a2c272bcb892e09cdcea63d5399c6768b67d3ff677",
+        ]
+    ),
+    "COMPOSE_HASH": { # compose file hash will be vary depending on the environment (depends on lium-watchtower)
+        "PROD": set(
+            [
+                "dc7bc77158834b823c48450670efd66442e01b4aa5c6285f08406c40bde3b513",
+            ]
+        ),
+        "STAGE": set(
+            [
+                "2005cfb41b453122175b509741bb750d791bedfbb15c5e0dae31750b3dc39d5e",
+            ]
+        ),
+        "LOCAL": set( 
+            [
+                "dc0994f6fc33707085d0cbbf8138df69af92e66c2014b73243a001822886abde",
+            ]
+        ),
+    }
+}
