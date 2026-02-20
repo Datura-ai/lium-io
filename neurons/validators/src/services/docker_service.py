@@ -365,12 +365,12 @@ class DockerService:
             await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
-            found = [
-                c for c in result.stdout.strip().split("\n")
-                if c == pod_name or c.startswith(POD_CONTAINER_PREFIX)
+            pod_containers = [
+                name for name in result.stdout.strip().split("\n")
+                if name == pod_name or name.startswith(POD_CONTAINER_PREFIX)
             ]
-            to_remove = [c for c in found if c not in active_set]
-            container_names = " ".join(to_remove)
+            stale_containers = [name for name in pod_containers if name not in active_set]
+            container_names = " ".join(stale_containers)
             if not container_names:
                 return
 
@@ -389,8 +389,8 @@ class DockerService:
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
-                target_volume = f"volume_{pod_name.removeprefix(POD_CONTAINER_PREFIX)}"
-                command = f'/usr/bin/docker volume rm {target_volume} 2>/dev/null || true'
+                volumes = " ".join(f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}" for name in stale_containers)
+                command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
                 await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
     async def install_open_ssh_server_and_start_ssh_service(
