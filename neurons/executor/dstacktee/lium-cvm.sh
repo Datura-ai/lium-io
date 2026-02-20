@@ -226,19 +226,24 @@ new_cvm() {
     local cvm_name="$1"
 
     if [ -z "$cvm_name" ]; then
-        echo "Usage: $0 new <cvm_name> [--enable-logs] [--enable-sysinfo]"
+        echo "Usage: $0 new <cvm_name> [--env <environment>] [--enable-logs] [--enable-sysinfo]"
         echo
         echo "Configuration is read from .env file. Copy .env.example to .env and edit as needed."
         echo
         echo "Options:"
+        echo "  --env <environment>      Target environment: local, staging, prod (default: prod)"
+        echo "                             local   -> app/docker-compose.local.yml"
+        echo "                             staging -> app/docker-compose.staging.yml"
+        echo "                             prod    -> app/docker-compose.yml"
         echo "  --enable-logs            Enable public container logs"
         echo "  --enable-sysinfo         Enable public system and TCB info"
         echo
         echo "Examples:"
         echo "  $0 new my-cvm"
-        echo "  $0 new gpu-cvm"
-        echo "  $0 new web-cvm"
-        echo "  $0 new web-cvm --enable-logs --enable-sysinfo"
+        echo "  $0 new my-cvm --env local"
+        echo "  $0 new my-cvm --env staging"
+        echo "  $0 new my-cvm --env prod --enable-logs --enable-sysinfo"
+        echo "  $0 new gpu-cvm --env local"
         echo
         echo "Note: OS image will be automatically downloaded to $IMAGE_DIR if not present"
         return 1
@@ -247,10 +252,19 @@ new_cvm() {
 
     local logs_arg=""
     local sysinfo_arg=""
+    local env_name="prod"
 
     # Parse optional new command flags
     while [ $# -gt 0 ]; do
         case "$1" in
+        --env)
+            if [ -z "$2" ]; then
+                log_error "--env requires a value: local, staging, or prod"
+                return 1
+            fi
+            env_name="$2"
+            shift
+            ;;
         --enable-logs)
             logs_arg="--enable-logs"
             ;;
@@ -259,7 +273,7 @@ new_cvm() {
             ;;
         *)
             log_error "Unknown option for new command: $1"
-            echo "Usage: $0 new <cvm_name> [--enable-logs] [--enable-sysinfo]"
+            echo "Usage: $0 new <cvm_name> [--env <environment>] [--enable-logs] [--enable-sysinfo]"
             return 1
             ;;
         esac
@@ -284,8 +298,22 @@ new_cvm() {
         return 1
     fi
 
-    # Hardcoded values
-    local compose_file="$THIS_DIR/app/docker-compose.yml"
+    # Resolve compose file based on environment
+    case "$env_name" in
+    local)
+        local compose_file="$THIS_DIR/app/docker-compose.local.yml"
+        ;;
+    staging)
+        local compose_file="$THIS_DIR/app/docker-compose.staging.yml"
+        ;;
+    prod)
+        local compose_file="$THIS_DIR/app/docker-compose.yml"
+        ;;
+    *)
+        log_error "Unknown environment: '$env_name'. Valid values are: local, staging, prod"
+        return 1
+        ;;
+    esac
     local lkp_args="--local-key-provider"
 
     # Validate required files/directories
@@ -573,6 +601,7 @@ show_help() {
     echo "  Copy .env.example to .env and edit the CVM_* variables"
     echo
     echo "New command options:"
+    echo "  --env <environment>       Target environment: local, staging, prod (default: prod)"
     echo "  --enable-logs             Enable public container logs"
     echo "  --enable-sysinfo          Enable public system and TCB info"
     echo
@@ -580,9 +609,10 @@ show_help() {
     echo "  $0 check"
     echo "  $0 download"
     echo "  $0 new my-cvm"
-    echo "  $0 new my-cvm --enable-logs --enable-sysinfo"
-    echo "  $0 new gpu-cvm"
-    echo "  $0 new web-cvm"
+    echo "  $0 new my-cvm --env local"
+    echo "  $0 new my-cvm --env staging"
+    echo "  $0 new my-cvm --env prod --enable-logs --enable-sysinfo"
+    echo "  $0 new gpu-cvm --env local"
     echo "  $0 run my-cvm"
     echo "  $0 run my-cvm --dry-run"
     echo "  $0 stop my-cvm"
