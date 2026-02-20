@@ -714,8 +714,8 @@ async def test_clean_containers_stale_pods_removed(docker_service, retry_ssh_moc
 
 
 @pytest.mark.asyncio
-async def test_clean_containers_none_fallback_exact_match_only(docker_service, retry_ssh_mock):
-    """When active_container_names is None (old backend), only exact-match pod is removed."""
+async def test_clean_containers_none_fallback_removes_all_pods(docker_service, retry_ssh_mock):
+    """When active_container_names is None (old backend), all pod_ containers are removed."""
     # Arrange
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
@@ -730,10 +730,10 @@ async def test_clean_containers_none_fallback_exact_match_only(docker_service, r
         active_container_names=None,
     )
 
-    # Assert — safe fallback: only the exact target removed
+    # Assert — old behavior: all pod_ containers removed, non-pod containers untouched
     rm_command = retry_ssh_mock.call_args_list[0][0][1]
     assert "pod_target" in rm_command
-    assert "pod_other_pod" not in rm_command
+    assert "pod_other_pod" in rm_command
     assert "some_container" not in rm_command
 
 
