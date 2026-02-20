@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import aiohttp
 import asyncssh
+from services.const import TDX_WHITELIST
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -87,18 +88,11 @@ class AttestationService:
         except ValueError:
             return None
 
-    async def _check_whitelist(self, db: AsyncSession, tee_type: str, attestation_digest: str) -> bool:
+    async def _check_whitelist(self, compose_hash: str, os_image_hash: str) -> bool:
         """Check if an attestation digest is in the whitelist for the given TEE type."""
-        if not attestation_digest:
-            return False
-
-        statement = select(AttestationWhitelist).where(
-            AttestationWhitelist.tee_type == tee_type,
-            AttestationWhitelist.attestation_digest == attestation_digest,
-            AttestationWhitelist.is_active == True
-        )
-        result = await db.exec(statement)
-        return result.first() is not None
+        if compose_hash in TDX_WHITELIST["COMPOSE_HASH"][settings.DEPLOY_ENV] and os_image_hash in TDX_WHITELIST["OS_IMAGE_HASH"]:
+            return True
+        return False
 
     def _validate_verifier_response(self, verifier_payload: dict, expected_report_hex: str, executor: ExecutorSSHInfo) -> None:
         details = verifier_payload.get("details")
@@ -189,7 +183,7 @@ class AttestationService:
                         f"Missing attestation digest for executor {executor.address}:{executor.port}"
                     )
 
-                is_whitelisted = await self._check_whitelist(db, tee_type, attestation_digest)
+                is_whitelisted = await self._check_whitelist(compose_hash=compose_hash, os_image_hash=os_image_hash)
                 if not is_whitelisted:
                     raise AttestationError(
                         f"Attestation digest {attestation_digest} with TEE type {tee_type} not in whitelist for executor {executor.address}:{executor.port}"

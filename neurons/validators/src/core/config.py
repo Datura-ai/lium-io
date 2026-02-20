@@ -1,7 +1,7 @@
 import argparse
 import pathlib
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import bittensor
 from pydantic import Field
@@ -128,6 +128,8 @@ class Settings(BaseSettings):
     # Default docker image & tag for digest endpoint 
     DEFAULT_DOCKER_IMAGE: str = Field(env="DEFAULT_DOCKER_IMAGE", default="compute-subnet-executor-runner")
     DEFAULT_DOCKER_TAG: str = Field(env="DEFAULT_DOCKER_TAG", default="latest")
+
+    DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 
     debug: DebugSettings = Field(default_factory=DebugSettings)
     incentive: IncentiveConfig = Field(default_factory=IncentiveConfig)
