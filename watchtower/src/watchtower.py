@@ -7,7 +7,7 @@ from datetime import datetime, UTC
 from typing import Optional
 from docker.models.containers import Container
 
-from config import settings
+from config import settings, WATCHTOWER_ENDPOINT_URL, WATCHTOWER_VALIDATOR_HOTKEY
 from logger import get_logger, _m
 from models import WatchtowerDigestResponse
 
@@ -55,7 +55,7 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
         Exception: If signature verification fails
     """
     try:
-        keypair = bittensor.Keypair(ss58_address=settings.WATCHTOWER_VALIDATOR_HOTKEY)
+        keypair = bittensor.Keypair(ss58_address=WATCHTOWER_VALIDATOR_HOTKEY)
         signing_data = f"{payload.digest}:{payload.timestamp}"
         is_valid = keypair.verify(signing_data, payload.signature)
 
@@ -69,7 +69,7 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
 
         if not is_valid:
             raise Exception(
-                f"Invalid signature from validator {settings.WATCHTOWER_VALIDATOR_HOTKEY}"
+                f"Invalid signature from validator {WATCHTOWER_VALIDATOR_HOTKEY}"
             )
 
     except Exception as e:
@@ -87,7 +87,7 @@ def fetch_verified_digest() -> Optional[str]:
     """
     try:
         response = requests.get(
-            settings.WATCHTOWER_ENDPOINT_URL,
+            WATCHTOWER_ENDPOINT_URL,
             timeout=30
         )
         response.raise_for_status()
@@ -106,7 +106,7 @@ def fetch_verified_digest() -> Optional[str]:
 
     except requests.RequestException as e:
         logger.error(_m("Failed to fetch digest from endpoint", {
-            "url": settings.WATCHTOWER_ENDPOINT_URL,
+            "url": WATCHTOWER_ENDPOINT_URL,
             "error": str(e)
         }))
         return None
@@ -275,8 +275,8 @@ def main():
     logger.info(_m("Starting watchtower", {
         "image": settings.WATCHTOWER_IMAGE,
         "interval": settings.WATCHTOWER_INTERVAL,
-        "endpoint": settings.WATCHTOWER_ENDPOINT_URL,
-        "validator_hotkey": settings.WATCHTOWER_VALIDATOR_HOTKEY
+        "endpoint": WATCHTOWER_ENDPOINT_URL,
+        "validator_hotkey": WATCHTOWER_VALIDATOR_HOTKEY
     }))
 
     while True:
