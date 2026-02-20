@@ -122,6 +122,20 @@
             "env": {
                 "DB_SQLALCHEMY_DATABASE_URIURI": "sqlite:///test.db",
             }
+        },
+        {
+            "name": "Debug Test: Watchtower",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "console": "integratedTerminal",
+            "args": [
+                ".",
+                "-v",
+                "-s"
+            ],
+            "cwd": "${workspaceFolder}/watchtower/tests",
+            "python": "${workspaceFolder}/watchtower/.venv/bin/python3",
         }
     ]
 }
