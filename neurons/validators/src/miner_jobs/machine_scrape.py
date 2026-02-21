@@ -671,11 +671,54 @@ def benchmark_network_speed():
     
     return {"upload_speed": None, "download_speed": None}
 
+def extract_storage_limit_eligible_status(docker_path: str) -> dict:
+    """
+    Run `docker info` and check whether the host is eligible for storage limits.
+
+    Eligibility requires all three conditions:
+      - Storage Driver: overlay2
+      - Backing Filesystem: xfs
+      - Supports d_type: true
+
+    Returns:
+        {
+            "storage_limit_eligible": bool,
+            "docker_info_output": str   # raw stdout+stderr, empty string on exec failure
+        }
+    """
+    docker_info_output = ""
+    error = ""
+    try:
+        proc = subprocess.run(
+            [docker_path, "info"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        docker_info_output = (proc.stdout or "") + (proc.stderr or "")
+        output = proc.stdout or ""
+
+        storage_driver_ok = bool(re.search(r"Storage Driver:\s*overlay2", output))
+        backing_fs_ok = bool(re.search(r"Backing Filesystem:\s*xfs", output))
+        d_type_ok = bool(re.search(r"Supports d_type:\s*true", output))
+
+        eligible = storage_driver_ok and backing_fs_ok and d_type_ok
+    except Exception as e:
+        eligible = False
+        error = repr(e)
+
+    return {
+        "storage_limit_eligible": eligible,
+        "docker_info_output": docker_info_output,
+        "storage_limit_scrape_error": error,
+    }
+
 def get_docker_info(content: bytes):
     data = {
         "docker_version": "",
         "docker_container_id": "",
-        "docker_containers": []
+        "docker_containers": [],
+        "storage_limit": {}
     }
 
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -718,6 +761,8 @@ def get_docker_info(content: bytes):
                 containers.append({'each_container_id': container_id, 'each_digest': '', "each_name": container_name})
 
         data["docker_containers"] = containers
+
+        data["storage_limit"] = extract_storage_limit_eligible_status(docker_path)
 
     finally:
         os.remove(docker_path)
@@ -1042,7 +1087,9 @@ def _encrypt(key: str, payload: str) -> str:
     return Fernet(key_bytes).encrypt(payload.encode("utf-8")).decode("utf-8")
 
 
-machine_specs = get_machine_specs()
-encryption_key = "".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
-encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
-print(encoded_str)
+if __name__ == "__main__":
+    machine_specs = get_machine_specs()
+    encryption_key = "".join(machine_specs["data_gpu"]["gpu_details"][0].keys())
+    encoded_str = _encrypt(encryption_key, json.dumps(machine_specs))
+    # print(encoded_str)
+    print(json.dumps(machine_specs))
