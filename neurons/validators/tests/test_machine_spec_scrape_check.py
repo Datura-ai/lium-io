@@ -1,10 +1,13 @@
 import json
 from datetime import datetime, UTC
+from unittest.mock import patch, MagicMock
+import subprocess
 import pytest
 
 from neurons.validators.src.services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
+from neurons.validators.src.miner_jobs.machine_scrape import extract_storage_limit_eligible_status
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -184,3 +187,162 @@ async def test_machine_spec_scrape_check(
         assert ssh_service.decrypt_called_with is not None
         assert ssh_service.decrypt_called_with["encrypt_key"] == "test-encrypt-key"
         assert ssh_service.decrypt_called_with["payload"] == "encrypted_payload_here"
+
+
+# ---------------------------------------------------------------------------
+# extract_storage_limit_eligible_status unit tests
+# ---------------------------------------------------------------------------
+
+DOCKER_INFO_ELIGIBLE = """\
+Client: Docker Engine - Community
+ Version:    29.1.4
+ Context:    default
+ Debug Mode: false
+
+Server:
+ Containers: 6
+  Running: 6
+  Paused: 0
+  Stopped: 0
+ Images: 10
+ Server Version: 29.1.4
+ Storage Driver: overlay2
+  Backing Filesystem: xfs
+  Supports d_type: true
+  Using metacopy: false
+  Native Overlay Diff: true
+  userxattr: false
+ Logging Driver: json-file
+ Cgroup Driver: cgroupfs
+ Cgroup Version: 2
+ Kernel Version: 6.8.0-90-generic
+ Operating System: Ubuntu 22.04.5 LTS
+ OSType: linux
+ Architecture: x86_64
+ CPUs: 8
+ Total Memory: 42.13GiB
+"""
+
+DOCKER_INFO_WRONG_DRIVER = """\
+Server:
+ Storage Driver: overlayfs
+  driver-type: io.containerd.snapshotter.v1
+ Logging Driver: json-file
+ Cgroup Driver: systemd
+ Cgroup Version: 2
+ Kernel Version: 5.15.0-170-generic
+"""
+
+DOCKER_INFO_WRONG_FS = """\
+Server:
+ Storage Driver: overlay2
+  Backing Filesystem: extfs
+  Supports d_type: true
+ Logging Driver: json-file
+"""
+
+DOCKER_INFO_DTYPE_FALSE = """\
+Server:
+ Storage Driver: overlay2
+  Backing Filesystem: xfs
+  Supports d_type: false
+ Logging Driver: json-file
+"""
+
+DOCKER_INFO_MISSING_BACKING_FS = """\
+Server:
+ Storage Driver: overlay2
+  Supports d_type: true
+ Logging Driver: json-file
+"""
+
+DOCKER_INFO_EMPTY = ""
+
+
+@pytest.mark.parametrize(
+    "docker_stdout,docker_returncode,subprocess_raises,expected_eligible,description",
+    [
+        (
+            DOCKER_INFO_ELIGIBLE,
+            0,
+            False,
+            True,
+            "all three conditions met → eligible",
+        ),
+        (
+            DOCKER_INFO_WRONG_DRIVER,
+            0,
+            False,
+            False,
+            "storage driver is overlayfs, not overlay2 → ineligible",
+        ),
+        (
+            DOCKER_INFO_WRONG_FS,
+            0,
+            False,
+            False,
+            "backing filesystem is extfs, not xfs → ineligible",
+        ),
+        (
+            DOCKER_INFO_DTYPE_FALSE,
+            0,
+            False,
+            False,
+            "supports d_type is false → ineligible",
+        ),
+        (
+            DOCKER_INFO_MISSING_BACKING_FS,
+            0,
+            False,
+            False,
+            "backing filesystem line absent → ineligible",
+        ),
+        (
+            DOCKER_INFO_EMPTY,
+            0,
+            False,
+            False,
+            "empty docker info output → ineligible",
+        ),
+        (
+            "",
+            1,
+            False,
+            False,
+            "docker info exits with non-zero code → ineligible",
+        ),
+        (
+            "",
+            0,
+            True,
+            False,
+            "subprocess raises an exception → ineligible, no crash",
+        ),
+    ],
+)
+def test_extract_storage_limit_eligible_status(
+    docker_stdout,
+    docker_returncode,
+    subprocess_raises,
+    expected_eligible,
+    description,
+):
+    def fake_run(args, **kwargs):
+        if subprocess_raises:
+            raise OSError("docker not found")
+        mock = MagicMock()
+        mock.stdout = docker_stdout
+        mock.stderr = ""
+        mock.returncode = docker_returncode
+        return mock
+
+    with patch("neurons.validators.src.miner_jobs.machine_scrape.subprocess.run", side_effect=fake_run):
+        result = extract_storage_limit_eligible_status("/usr/bin/docker")
+
+    assert isinstance(result, dict), "result must be a dict"
+    assert "storage_limit_eligible" in result, "key 'storage_limit_eligible' must be present"
+    assert "docker_info_output" in result, "key 'docker_info_output' must be present"
+    assert result["storage_limit_eligible"] is expected_eligible, (
+        f"[{description}] expected eligible={expected_eligible}, got {result['storage_limit_eligible']}"
+    )
+    assert isinstance(result["docker_info_output"], str), "docker_info_output must be a string"
