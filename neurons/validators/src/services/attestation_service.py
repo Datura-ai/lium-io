@@ -120,8 +120,6 @@ class AttestationService:
     async def prepare_host_policy(
         self,
         executor: ExecutorSSHInfo,
-        miner_hotkey: Optional[str],
-        db: Optional[AsyncSession] = None,
     ) -> Tuple[Optional[asyncssh.SSHKnownHosts], Optional[str], Optional[str]]:
         should_verify = self._should_verify(executor)
         attestation_digest = None
@@ -177,7 +175,7 @@ class AttestationService:
             ))
 
             # Validate with whitelist if database session is provided
-            if db and settings.ENABLE_ATTESTATION_WHITELIST:
+            if settings.ENABLE_ATTESTATION_WHITELIST:
                 if not attestation_digest:
                     raise AttestationError(
                         f"Missing attestation digest for executor {executor.address}:{executor.port}"
