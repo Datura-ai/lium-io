@@ -95,7 +95,7 @@ class SubtensorClient:
             subtensor = bittensor.subtensor(config=self.config)
 
             # check registered
-            # self.check_registered(subtensor)
+            self.check_registered(subtensor)
 
             SubtensorClient._subtensor = subtensor
         except Exception as e:
