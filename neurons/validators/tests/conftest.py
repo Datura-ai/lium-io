@@ -11,6 +11,16 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from helpers import make_context
 
+# Prevent wallet KeyFileError during module-level PriceProvider() instantiation in rental_price.py.
+# rental_price.py creates PriceProvider() as a class variable at import time; after the
+# price_provider.py update, PriceProvider.__init__ calls SubtensorClient.get_instance() which
+# reads the wallet keypair file. This patch must run before test collection.
+_subtensor_patcher = patch(
+    "clients.subtensor_client.SubtensorClient.get_instance",
+    return_value=MagicMock(),
+)
+_subtensor_patcher.start()
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
