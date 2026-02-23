@@ -76,13 +76,9 @@ class TaskService:
 
             # Prepare attestation host policy before SSH connection
             try:
-                from core.db import AsyncSessionMaker
-                async with AsyncSessionMaker() as db:
-                    known_hosts_policy, attestation_digest, tee_type = await self.attestation_service.prepare_host_policy(
-                        executor_info,
-                        miner_info.miner_hotkey,
-                        db=db,
-                    )
+                known_hosts_policy, attestation_digest, tee_type = await self.attestation_service.prepare_host_policy(
+                    executor_info,
+                )
             except AttestationError as exc:
                 log_text = _m(
                     "Attestation failed",

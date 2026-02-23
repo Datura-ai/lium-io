@@ -125,10 +125,6 @@ class Settings(BaseSettings):
     # Machine Price Limit
     MACHINE_MAX_PRICE_RATE: float = Field(env="MACHINE_MAX_PRICE_RATE", default=2.0)
 
-    # Default docker image & tag for digest endpoint 
-    DEFAULT_DOCKER_IMAGE: str = Field(env="DEFAULT_DOCKER_IMAGE", default="compute-subnet-executor-runner")
-    DEFAULT_DOCKER_TAG: str = Field(env="DEFAULT_DOCKER_TAG", default="latest")
-
     DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 
     debug: DebugSettings = Field(default_factory=DebugSettings)
