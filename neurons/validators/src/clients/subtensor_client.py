@@ -50,7 +50,7 @@ class SubtensorClient:
             return
 
         # Instance variables (belong to this specific instance)
-        # self.wallet = settings.get_bittensor_wallet()
+        self.wallet = settings.get_bittensor_wallet()
         self.netuid = settings.BITTENSOR_NETUID
         self.config = settings.get_bittensor_config()
         self.redis_service = RedisService()
