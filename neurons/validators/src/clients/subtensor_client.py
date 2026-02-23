@@ -50,7 +50,7 @@ class SubtensorClient:
             return
 
         # Instance variables (belong to this specific instance)
-        self.wallet = settings.get_bittensor_wallet()
+        # self.wallet = settings.get_bittensor_wallet()
         self.netuid = settings.BITTENSOR_NETUID
         self.config = settings.get_bittensor_config()
         self.redis_service = RedisService()
@@ -95,7 +95,7 @@ class SubtensorClient:
             subtensor = bittensor.subtensor(config=self.config)
 
             # check registered
-            self.check_registered(subtensor)
+            # self.check_registered(subtensor)
 
             SubtensorClient._subtensor = subtensor
         except Exception as e:
@@ -578,3 +578,7 @@ class SubtensorClient:
             instance = cls.get_instance()
             instance.set_subtensor()
         return cls._subtensor
+
+    def get_alpha_rate(self) -> float:
+        price = self.subtensor.get_subnet_price(netuid=self.netuid)
+        return price.tao

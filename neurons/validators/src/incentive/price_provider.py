@@ -10,7 +10,7 @@ external services.
 import time
 import logging
 from typing import Optional
-
+import asyncio
 import aiohttp
 
 from bittensor import AsyncSubtensor
@@ -96,6 +96,8 @@ class PriceProvider:
         # Cache TTL: 15 minutes in seconds
         self._cache_ttl: int = 900
 
+        self.subtensor_client = SubtensorClient.get_instance()
+
     def _is_cache_valid(self, timestamp: Optional[float]) -> bool:
         """
         Check if a cached value is still valid based on its timestamp.
@@ -142,9 +144,13 @@ class PriceProvider:
         reraise=True,
     )
     async def _get_alpha_rate(self) -> float:
-        subtensor = AsyncSubtensor(config=settings.get_bittensor_config())
-        price = await subtensor.get_subnet_price(netuid=settings.BITTENSOR_NETUID)
-        return price.tao
+        return await asyncio.to_thread(self.subtensor_client.get_alpha_rate)
+
+        # subtensor = AsyncSubtensor(config=settings.get_bittensor_config())
+        # await subtensor.initialize()
+        # price = await subtensor.get_subnet_price(netuid=settings.BITTENSOR_NETUID)
+        # await subtensor.close()
+        # return price.tao
 
     async def get_tao_price(self) -> Optional[float]:
         """
