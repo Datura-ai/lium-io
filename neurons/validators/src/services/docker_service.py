@@ -91,11 +91,9 @@ class DockerService:
         log_context: dict,
     ) -> asyncssh.SSHKnownHosts | None:
         try:
-            from core.db import AsyncSessionMaker
-            async with AsyncSessionMaker() as db:
-                known_hosts, _, _ = await self.attestation_service.prepare_host_policy(
-                    executor, miner_hotkey, db=db
-                )
+            known_hosts, _, _ = await self.attestation_service.prepare_host_policy(
+                executor, 
+            )
             return known_hosts
         except AttestationError:
             raise
