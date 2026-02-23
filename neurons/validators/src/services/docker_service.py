@@ -389,7 +389,7 @@ class DockerService:
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
-                if active_container_names is not None:
+                if active_set:
                     volumes = " ".join(f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}" for name in stale_containers)
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
                 else:
