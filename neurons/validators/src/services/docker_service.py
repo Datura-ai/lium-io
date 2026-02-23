@@ -952,7 +952,12 @@ class DockerService:
                     gpu_flags = "--gpus all "
 
                 # CPU and memory restriction flags
-                cpu_flag = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
+                # --cpus flag isn't working inside cvm. skip to use it when tdx_quote is present
+                # TODO: remove this when cvm is fixed
+                if executor_info.tdx_quote: 
+                    cpu_flag = ""
+                else:
+                    cpu_flag = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
                 memory_flag = f"--memory {payload.memory_gb}g " if payload.memory_gb else ""
                 
                 storage_flag = f"--storage-opt size={payload.storage_limit_gb}g " if payload.storage_limit_gb else ""
