@@ -35,7 +35,10 @@ from incentive.price_provider import (
 @pytest.fixture
 def price_provider():
     """Fresh PriceProvider instance for each test."""
-    return PriceProvider()
+    with patch("incentive.price_provider.SubtensorClient") as mock_sc_cls:
+        mock_client = MagicMock()
+        mock_sc_cls.get_instance.return_value = mock_client
+        yield PriceProvider()
 
 
 @pytest.fixture
