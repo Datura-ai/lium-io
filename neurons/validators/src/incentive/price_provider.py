@@ -146,12 +146,6 @@ class PriceProvider:
     async def _get_alpha_rate(self) -> float:
         return await asyncio.to_thread(self.subtensor_client.get_alpha_rate)
 
-        # subtensor = AsyncSubtensor(config=settings.get_bittensor_config())
-        # await subtensor.initialize()
-        # price = await subtensor.get_subnet_price(netuid=settings.BITTENSOR_NETUID)
-        # await subtensor.close()
-        # return price.tao
-
     async def get_tao_price(self) -> Optional[float]:
         """
         Get the current TAO price in USD.
