@@ -25,7 +25,7 @@ class Settings(BaseSettings):
         env="DEFAULT_MINER_HOTKEY",
         default="5D4jX4TqUkZwNwKAjjYrbk2FHFNN2U1TgFF6ZMuNPnjnKJVU"
     )
-    ALLOWED_HOTKEY_SS58_ADDRESS: str = Field(env="ALLOWED_HOTKEY_SS58_ADDRESS", default="5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p")
+    ALLOWED_HOTKEY_SS58_ADDRESS: str = Field(env="ALLOWED_HOTKEY_SS58_ADDRESS", default="5E1nK3myeWNWrmffVaH76f2mCFCbe9VcHGwgkfdcD7k3E8D1")
 
     RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
     RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
