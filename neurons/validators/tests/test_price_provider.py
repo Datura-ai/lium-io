@@ -93,7 +93,12 @@ def mock_subtensor():
         price_obj.tao = 0.001
         subtensor.get_subnet_price = AsyncMock(return_value=price_obj)
 
-        yield subtensor
+        async def shim_to_thread(func, *args, **kwargs):
+            price = await subtensor.get_subnet_price(netuid=settings.BITTENSOR_NETUID)
+            return price.tao
+
+        with patch("asyncio.to_thread", side_effect=shim_to_thread):
+            yield subtensor
 
 
 @pytest.fixture

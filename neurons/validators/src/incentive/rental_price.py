@@ -35,6 +35,8 @@ class RentalPriceIncentive(DefaultIncentive):
     Each GPU type has an independent cap, allowing different supply/demand dynamics.
     """
 
+    price_provider: PriceProvider = PriceProvider()
+
     def __init__(self, *args, **kwargs):
         """Initialize rental price incentive algorithm.
 
@@ -45,7 +47,6 @@ class RentalPriceIncentive(DefaultIncentive):
             burn_service: Burn emission distribution service
         """
         super().__init__(*args, **kwargs)
-        self.price_provider = PriceProvider()
 
         self.unrented_count_by_type = {}
         self.effective_rate_by_type = {} # effective hourly rate in case it's diluted by cap
