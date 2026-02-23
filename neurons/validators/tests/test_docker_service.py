@@ -765,6 +765,30 @@ async def test_clean_containers_targeted_volume_rm(docker_service, retry_ssh_moc
 
 
 @pytest.mark.asyncio
+async def test_clean_containers_empty_active_list_falls_back_to_prune(docker_service, retry_ssh_mock):
+    """When active_container_names is empty list, volume prune -af is used (old behavior)."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
+        "pod_target\npod_stale\n"
+    ))
+
+    # Act
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={},
+        pod_name="pod_target",
+        clear_volume=True,
+        active_container_names=[],
+    )
+
+    # Assert — falls back to prune, not targeted volume rm
+    assert retry_ssh_mock.call_count == 2
+    volume_command = retry_ssh_mock.call_args_list[1][0][1]
+    assert "volume prune -af" in volume_command
+
+
+@pytest.mark.asyncio
 async def test_clean_containers_no_volume_cleanup_when_disabled(docker_service, retry_ssh_mock):
     """No volume cleanup when clear_volume=False (e.g. local volume reuse)."""
     # Arrange
