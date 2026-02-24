@@ -223,17 +223,17 @@ TDX_WHITELIST = {
     "COMPOSE_HASH": { # compose file hash will be vary depending on the environment (depends on lium-watchtower)
         "PROD": set(
             [
-                "dc7bc77158834b823c48450670efd66442e01b4aa5c6285f08406c40bde3b513",
+                "a77f05d55bdb6c8fe86f2cd76271192a0b95617f198da4700d92c20d8798d4ee",
             ]
         ),
         "STAGE": set(
             [
-                "2005cfb41b453122175b509741bb750d791bedfbb15c5e0dae31750b3dc39d5e",
+                "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11",
             ]
         ),
         "LOCAL": set( 
             [
-                "dc0994f6fc33707085d0cbbf8138df69af92e66c2014b73243a001822886abde",
+                "2d655bf8eca15eaec6cc5800acae99eaeb21fc3dafcfcf594139c827596a7828",
             ]
         ),
     }
