@@ -91,10 +91,11 @@ class RentalPriceIncentive(DefaultIncentive):
                 base_model, result.gpu_count, self.config.gpu_count_multipliers
             )
 
-            # accumulate raw unrented GPU count per base model
-            self.unrented_count_by_type[base_model] = (
-                self.unrented_count_by_type.get(base_model, 0) + result.gpu_count
-            )
+            # accumulate raw unrented GPU count per base model (only if multiplier > 0)
+            if result.gpu_count_multiplier > 0:
+                self.unrented_count_by_type[base_model] = (
+                    self.unrented_count_by_type.get(base_model, 0) + result.gpu_count
+                )
 
     async def _on_finish_pre_process(self) -> None:
         """Callback after pre-processing all job results.
