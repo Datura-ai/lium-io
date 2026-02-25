@@ -111,6 +111,7 @@ class Context(BaseModel):
     log_status: str = "info"
     log_text: str | None = None
     success: bool = False
+    tdx_attestation_passed: bool = False
 
 
 class Check(Protocol):

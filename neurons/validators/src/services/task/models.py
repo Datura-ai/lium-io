@@ -21,8 +21,11 @@ class JobResult(BaseModel):
     sysbox_runtime: bool = False
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
+
+    # tdx attestation relevant fields
     attestation_digest: str | None = None
     tee_type: str | None = None
+    tdx_attestation_passed: bool = False
 
     # Incentive relevant fields 
     mining_score: float | None = None                   # Score for mining pool for scoring logic
@@ -42,6 +45,7 @@ class JobResult(BaseModel):
     rental_share: float | None = None                  # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                    # Burn share for the executor in this cycle for scoring logic
     total_rental_cost: float | None = None              # Total rental cost for the executor in this cycle for scoring logic
+
     
     incentive_logs: list[str] = []
 

@@ -109,6 +109,7 @@ class PipelineFactory:
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
+        tdx_attestation_passed: bool = False,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -120,6 +121,7 @@ class PipelineFactory:
             private_key: Decrypted private key for SSH
             public_key: Public key for SSH
             encrypted_files: Encrypted validation files
+            tdx_attestation_passed: Whether TDX attestation passed
 
         Returns:
             Configured Context ready for pipeline execution
@@ -194,6 +196,7 @@ class PipelineFactory:
                 rented_data=rented_data,
             ),
             is_rental_succeed=is_rental_succeed,
+            tdx_attestation_passed=tdx_attestation_passed,
         )
 
     @staticmethod
