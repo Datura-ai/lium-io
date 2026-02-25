@@ -55,10 +55,7 @@ def log_for_monitoring(
         burn_share = first_with_rental.burn_share if first_with_rental else float(TOTAL_BURN_EMISSION)
         total_rental_cost = first_with_rental.total_rental_cost if first_with_rental else 0
 
-        unrented_count_by_group = {
-            base_model: sum(gpu_types.values())
-            for base_model, gpu_types in unrented_count_by_type.items()
-        } if unrented_count_by_type else {}
+        unrented_count_by_group = unrented_count_by_type or {}
 
         logger.info(_m("Incentive_results", extra={
             "duration": f"{time() - started_at:.2f}s",
