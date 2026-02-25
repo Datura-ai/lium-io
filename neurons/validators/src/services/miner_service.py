@@ -482,6 +482,7 @@ class MinerService:
                         "ssh_pub_keys": result.ssh_pub_keys,
                         "attestation_digest": result.attestation_digest,
                         "tee_type": result.tee_type,
+                        "tdx_attestation_passed": result.tdx_attestation_passed,
                     },
                 )
             except Exception as e:
