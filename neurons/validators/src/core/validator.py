@@ -352,7 +352,11 @@ class Validator:
                             )
                             task.cancel()
 
-                    open_fd_count = len(os.listdir(f'/proc/self/fd'))
+                    try:
+                        open_fd_count = len(os.listdir('/proc/self/fd'))
+                    except FileNotFoundError:
+                        open_fd_count = -1
+                        logger.error("Failed to get open file descriptor count. Defaulting to -1.")
 
                     logger.info(
                         _m(

@@ -39,6 +39,14 @@ MAX_UNRENTED_GPUS_BY_TYPE = {
     "RTX 3090": 8,
 }
 
+# Multiplier by (base_gpu_model, gpu_count) for rental incentive.
+# Resolution order: specific GPU name > "*"; specific count > "*"
+# Example: {"B200": {"8": 1, "*": 0}, "*": {"1": 1, "8": 1, "*": 0}}
+GPU_COUNT_MULTIPLIERS: dict[str, dict[str, float]] = {
+    "*": {"*": 0, "1": 1, "8": 1}
+}
+
+
 BASE_GPU_MAP = {
     "NVIDIA B300 SXM6 AC": "B300",
     "NVIDIA B200": "B200",
@@ -103,6 +111,11 @@ class IncentiveConfig(BaseModel):
     rental_prices_per_hour: dict[str, float] = Field(
         default=MACHINE_PRICES,
         description="Rental prices per GPU type in USD/hour"
+    )
+
+    gpu_count_multipliers: dict[str, dict[str, float]] = Field(
+        default=GPU_COUNT_MULTIPLIERS,
+        description="Rental incentive multiplier by (base_gpu_model, gpu_count)"
     )
 
     @field_validator("algorithm")
