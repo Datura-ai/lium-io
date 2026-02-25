@@ -21,7 +21,7 @@ if [ -n "$BITTENSOR_HOTKEY_MNEMONIC" ]; then
         --n-words 12 \
         --no-use-password \
         --overwrite \
-        --quiet
+        --quiet > /dev/null
 
     pdm run btcli wallet regen_hotkey \
         --wallet-name "$BITTENSOR_WALLET_NAME" \
@@ -30,7 +30,7 @@ if [ -n "$BITTENSOR_HOTKEY_MNEMONIC" ]; then
         --mnemonic "$BITTENSOR_HOTKEY_MNEMONIC" \
         --no-use-password \
         --overwrite \
-        --quiet
+        --quiet > /dev/null
 
     echo "Bittensor wallet initialized successfully"
 else
