@@ -104,7 +104,7 @@ async def verify_validator_auth_from_headers(
             detail=f"X-Timestamp must be a Unix timestamp in seconds. Received invalid value: {x_timestamp}"
         )
     
-    now = time.time()
+    now = int(time.time())
     
     # Check timestamp is within allowed symmetric window
     # Allow timestamps within AUTH_MESSAGE_MAX_AGE seconds in either direction
