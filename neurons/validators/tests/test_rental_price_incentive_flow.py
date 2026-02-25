@@ -76,6 +76,7 @@ def rental_price_config():
         ],
         max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
+        gpu_count_multipliers={"*": {"*": 1}},
     )
 
 
@@ -398,6 +399,7 @@ async def test_different_caps_per_gpu_type(
         rental_incentive_gpu_types=list(different_caps.keys()),
         max_unrented_gpus=different_caps,
         rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
+        gpu_count_multipliers={"*": {"*": 1}},
     )
 
     # Set up validator with custom config
