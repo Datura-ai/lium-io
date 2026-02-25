@@ -151,13 +151,16 @@ def count_incentive_log_entries(log_text: str) -> int:
 # Rental price incentive log (rental_price.py lines 146-165): message + extra keys
 RENTAL_PRICE_INCENTIVE_LOG_MESSAGE = (
     "Rental price incentive for executor is calculated successfully. "
-    "Formula: rental_share * gpu_count / total_unrented_count"
+    "Formula: rental_share * gpu_count * effective_rate / total_rental_cost"
 )
 RENTAL_PRICE_INCENTIVE_EXTRA_KEYS = [
     "hotkey",
     "executor_id",
     "gpu_model",
     "gpu_count",
+    "gpu_count_multiplier",
+    "hourly_rate",
+    "unrented_cap_multiplier",
     "effective_rate",
     "total_unrented_by_gpu_type",
     "max_cap",
