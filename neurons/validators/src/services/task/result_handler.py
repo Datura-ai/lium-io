@@ -98,9 +98,12 @@ class ResultHandler:
             gpu_model = parts[0]
             gpu_count = int(parts[1])
 
+        # add TDX attestation passed to specs
+        specs = {**(context.state.specs or {}), "tdx_attestation_passed": context.tdx_attestation_passed}
+
         # Build and return JobResult
         return JobResult(
-            spec=context.state.specs,
+            spec=specs,
             executor_info=executor_info,
             score=context.score,
             job_score=context.job_score,
@@ -113,6 +116,7 @@ class ResultHandler:
             sysbox_runtime=context.state.sysbox_runtime,
             ssh_pub_keys=context.ssh_pub_keys,
             is_rented=context.rented,
+            tdx_attestation_passed=context.tdx_attestation_passed,
         )
 
     async def _persist_verification_data(

@@ -69,6 +69,7 @@ class TaskService:
         """New pipeline-based validation task implementation."""
         attestation_digest = None
         tee_type = None
+        attestation_passed = False
 
         try:
             # Decrypt private key
@@ -79,6 +80,7 @@ class TaskService:
                 known_hosts_policy, attestation_digest, tee_type = await self.attestation_service.prepare_host_policy(
                     executor_info,
                 )
+                attestation_passed = attestation_digest is not None
             except AttestationError as exc:
                 log_text = _m(
                     "Attestation failed",
@@ -109,6 +111,7 @@ class TaskService:
                     public_key=public_key,
                     encrypted_files=encrypted_files,
                     rented_data=rented_data,
+                    tdx_attestation_passed=attestation_passed,
                 )
 
                 # Build and run validation pipeline
