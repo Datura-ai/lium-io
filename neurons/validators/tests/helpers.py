@@ -158,7 +158,6 @@ RENTAL_PRICE_INCENTIVE_EXTRA_KEYS = [
     "executor_id",
     "gpu_model",
     "gpu_count",
-    "gpu_count_multiplier",
     "hourly_rate",
     "unrented_cap_multiplier",
     "effective_rate",
