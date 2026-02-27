@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from services.const import MACHINE_PRICES
 
+# Sentinel value: use default price from MACHINE_PRICES
+DEFAULT_PRICE = "default"
 
 # Maximum unrented GPUs per GPU type before cap dilution is applied
 # High-end GPUs have lower caps (12-24) due to scarcity and high value
@@ -38,12 +40,14 @@ MAX_UNRENTED_GPUS_BY_TYPE = {
     "A30": 0,
     "RTX 3090": 8,
 }
-
-# Multiplier by (base_gpu_model, gpu_count) for rental incentive.
-# Resolution order: specific GPU name > "*"; specific count > "*"
-# Example: {"B200": {"8": 1, "*": 0}, "*": {"1": 1, "8": 1, "*": 0}}
-GPU_COUNT_MULTIPLIERS: dict[str, dict[str, float]] = {
-    "*": {"*": 0, "1": 1, "8": 1}
+# Per-(gpu_model, gpu_count) hourly prices in USD.
+# Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
+# Use DEFAULT_PRICE sentinel to fall back to MACHINE_PRICES.
+# Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
+# Resolution order: specific GPU name > "*"; specific count > "*".
+D = DEFAULT_PRICE
+GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | str]] = {
+    "*": {"*": 0, "1": D, "8": D},
 }
 
 
@@ -110,12 +114,12 @@ class IncentiveConfig(BaseModel):
 
     rental_prices_per_hour: dict[str, float] = Field(
         default=MACHINE_PRICES,
-        description="Rental prices per GPU type in USD/hour"
+        description="Default rental prices per GPU type in USD/hour"
     )
 
-    gpu_count_multipliers: dict[str, dict[str, float]] = Field(
-        default=GPU_COUNT_MULTIPLIERS,
-        description="Rental incentive multiplier by (base_gpu_model, gpu_count)"
+    gpu_count_custom_prices: dict[str, dict[str, float | str]] = Field(
+        default=GPU_COUNT_CUSTOM_PRICES,
+        description="Per-(gpu_model, gpu_count) hourly prices. Use DEFAULT_PRICE for MACHINE_PRICES fallback."
     )
 
     @field_validator("algorithm")

@@ -4,7 +4,7 @@ import pytest
 
 from core.config import settings
 from incentive import rental_price as rental_price_module
-from incentive.config import IncentiveConfig
+from incentive.config import DEFAULT_PRICE, IncentiveConfig
 from incentive.factory import IncentiveFactory
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
@@ -76,7 +76,7 @@ def rental_price_config():
         ],
         max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
-        gpu_count_multipliers={"*": {"*": 1}},
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
     )
 
 
@@ -399,7 +399,7 @@ async def test_different_caps_per_gpu_type(
         rental_incentive_gpu_types=list(different_caps.keys()),
         max_unrented_gpus=different_caps,
         rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
-        gpu_count_multipliers={"*": {"*": 1}},
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
     )
 
     # Set up validator with custom config
