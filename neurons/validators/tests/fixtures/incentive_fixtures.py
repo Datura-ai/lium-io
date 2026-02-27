@@ -43,7 +43,6 @@ def mock_settings(monkeypatch):
     monkeypatch.setattr(settings, "DRY_RUN", False)
     monkeypatch.setattr(settings, "incentive", IncentiveConfig(
         algorithm="default",
-        gpu_count_multipliers={"*": {"*": 1}},
     ))
     return settings
 
