@@ -150,10 +150,10 @@ def get_balance_of_eth_address(private_key: str):
     "--validator", required=False, help="Validator hotkey that executor opens to."
 )
 @click.option(
-    "--gpu-type", help="Type of GPU", required=False
+    "--gpu-type", help="Type of GPU", required=True
 )
 @click.option(
-    "--gpu-count", type=int, help="Number of GPUs", required=False
+    "--gpu-count", type=int, help="Number of GPUs", required=True
 )
 @click.option(
     "--deposit-amount", type=float, required=False, help="Amount of TAO to deposit as collateral (optional)"

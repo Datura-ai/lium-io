@@ -190,6 +190,8 @@ class MinerPortalClient:
                     port=request.payload.port,
                     validator=request.validator_hotkey,
                     price_per_gpu=request.payload.price_per_gpu,
+                    gpu_type=request.payload.gpu_type,
+                    gpu_count=request.payload.gpu_count,
                 )
             )
             self.message_queue.append(result)
