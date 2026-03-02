@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG: "dev" 
-      TARGET_FILE: "docker-compose.app.dev.yml"
+      TARGET_FILE: "docker-compose.app.dstacktee.dev.yml"
       DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
 
