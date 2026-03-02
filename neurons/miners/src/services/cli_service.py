@@ -285,7 +285,9 @@ class CliService:
                 address=address,
                 port=port,
                 validator=validator,
-                price_per_gpu=price_per_gpu
+                price_per_gpu=price_per_gpu,
+                gpu_type=gpu_type,
+                gpu_count=gpu_count
             )
         )
         if isinstance(result, AddExecutorFailed):
@@ -536,12 +538,14 @@ class CliService:
                     "address": executor.address,
                     "port": executor.port,
                     "validator": executor.validator,
-                    "price_per_gpu": executor.price_per_gpu
+                    "price_per_gpu": executor.price_per_gpu,
+                    "gpu_type": executor.gpu_type,
+                    "gpu_count": executor.gpu_count,
                 }
                 for executor in executors
             ]
             for ex in result:
-                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> validator: {ex['validator']}, price_per_gpu (USD/gpu/h): {ex['price_per_gpu']}")
+                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> validator: {ex['validator']}, price_per_gpu (USD/gpu/h): {ex['price_per_gpu']}, gpu_type: {ex['gpu_type']}, gpu_count: {ex['gpu_count']}")
             return True
         except Exception as e:
             self.logger.error("Failed in showing an executor: %s", str(e))

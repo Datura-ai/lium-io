@@ -118,6 +118,8 @@ class ExecutorService:
                 address=payload.executor.address,
                 port=payload.executor.port,
                 price_per_gpu=payload.executor.price_per_gpu,
+                gpu_type=payload.executor.gpu_type,
+                gpu_count=payload.executor.gpu_count,
             )
             self.executor_dao.update_by_uuid(executor.uuid, executor)
 
@@ -155,6 +157,8 @@ class ExecutorService:
                     executor.address = executor_payload.address
                     executor.port = executor_payload.port
                     executor.price_per_gpu = executor_payload.price_per_gpu or executor.price_per_gpu
+                    executor.gpu_type = executor_payload.gpu_type or executor.gpu_type
+                    executor.gpu_count = executor_payload.gpu_count or executor.gpu_count
                     self.executor_dao.update_by_uuid(executor.uuid, executor)
                     logger.info("Updated executor (id=%s)", str(executor.uuid))
                 else:
@@ -166,6 +170,8 @@ class ExecutorService:
                             address=executor_payload.address,
                             port=executor_payload.port,
                             price_per_gpu=executor_payload.price_per_gpu,
+                            gpu_type=executor_payload.gpu_type,
+                            gpu_count=executor_payload.gpu_count,
                         )
                     )
 
@@ -226,6 +232,8 @@ class ExecutorService:
                         address=item.get("executor_ip_address"),
                         port=int(item.get("executor_ip_port")),
                         price_per_gpu=item.get("price_per_gpu"),
+                        gpu_type=item.get("gpu_type"),
+                        gpu_count=item.get("gpu_count"),
                     )
                 )
             except Exception as e:

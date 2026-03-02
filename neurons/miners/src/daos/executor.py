@@ -69,6 +69,8 @@ class ExecutorDao(BaseDao):
         existing_executor.address = executor.address
         existing_executor.port = executor.port
         existing_executor.price_per_gpu = executor.price_per_gpu
+        existing_executor.gpu_type = executor.gpu_type
+        existing_executor.gpu_count = executor.gpu_count
         self.session.commit()
         self.session.refresh(existing_executor)
         return existing_executor
