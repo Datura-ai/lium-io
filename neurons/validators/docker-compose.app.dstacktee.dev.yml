@@ -3,11 +3,11 @@ services:
     image: postgres:14.0-alpine
     healthcheck:
       test: pg_isready -U postgres || exit 1
-    restart: unless-stopped
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    restart: unless-stopped
     env_file: ./.env
     volumes:
       - db_data:/var/lib/postgresql/data
@@ -28,7 +28,7 @@ services:
     restart: unless-stopped
 
   validator:
-    image: daturaai/compute-subnet-validator:latest
+    image: daturaai/compute-subnet-validator:dev
     env_file: ./.env
     environment:
       - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -38,7 +38,7 @@ services:
       - ENABLE_TDX_ATTESTATION=true
       - TDX_VERIFIER_URL=http://dstack-verifier:8080/verify
       - ENABLE_ATTESTATION_WHITELIST=true
-      - DEPLOY_ENV=PROD
+      - DEPLOY_ENV=LOCAL
     ports:
       - ${EXTERNAL_PORT}:${INTERNAL_PORT}
     expose:
@@ -51,14 +51,14 @@ services:
       - dstack-verifier
 
   connector:
-    image: daturaai/compute-subnet-validator:latest
+    image: daturaai/compute-subnet-validator:dev
     env_file: ./.env
     environment:
       - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - ASYNC_SQLALCHEMY_DATABASE_URI=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - COMPUTE_APP_URI=wss://lium.io
+      - COMPUTE_APP_URI=wss://dev.lium.io
     command: pdm run src/connector.py
     volumes:
       - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
