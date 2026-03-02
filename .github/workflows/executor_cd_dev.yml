@@ -21,15 +21,20 @@ jobs:
 
       - name: Make scripts executable
         run: |
+          chmod +x neurons/executor/docker_build.sh
           chmod +x neurons/executor/docker_publish.sh
+          chmod +x neurons/executor/docker_runner_build.sh
           chmod +x neurons/executor/docker_runner_publish.sh
-          
-      - name: Run docker_publish.sh
+
+      - name: Build and publish executor image
         run: |
           cd neurons/executor
-          ./docker_publish.sh
-          
-      - name: Run docker_runner_publish.sh
+          source ./docker_build.sh
+          source ./docker_publish.sh
+          echo "EXECUTOR_IMAGE_SHA256=${EXECUTOR_IMAGE_SHA256}" >> $GITHUB_ENV
+
+      - name: Build and publish runner image
         run: |
           cd neurons/executor
-          ./docker_runner_publish.sh
+          source ./docker_runner_build.sh
+          source ./docker_runner_publish.sh
