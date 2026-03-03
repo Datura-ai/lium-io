@@ -9,16 +9,6 @@ from typing import Dict, Any, Optional, Tuple, List
 from core.config import settings, FeatureFlag
 from core.utils import _m, get_extra_info
 
-from services.const import (
-    MEMORY_ALLOCATION_PERCENTAGE,
-    MEMORY_MIN_TEST_GB,
-    MEMORY_MAX_TEST_GB,
-    STORAGE_MIN_AVAILABLE_GB,
-    STORAGE_THROUGHPUT_TEST_GB,
-    NETWORK_TIMEOUT_SECONDS,
-    NETWORK_MIN_DOWNLOAD_SPEED_MBPS,
-)
-
 
 logger = logging.getLogger(__name__)
 
@@ -134,12 +124,12 @@ class VerifyXValidationService:
                 "seed": seed,
                 "machine_info": gpu_info,
                 "config": {
-                    "memory_allocation_percentage": MEMORY_ALLOCATION_PERCENTAGE,
-                    "memory_min_test_gb": MEMORY_MIN_TEST_GB,
-                    "memory_max_test_gb": MEMORY_MAX_TEST_GB,
-                    "storage_min_available_gb": STORAGE_MIN_AVAILABLE_GB,
-                    "storage_throughput_test_gb": STORAGE_THROUGHPUT_TEST_GB,
-                    "network_timeout_seconds": NETWORK_TIMEOUT_SECONDS,
+                    "memory_allocation_percentage": settings.verifyx.MEMORY_ALLOCATION_PERCENTAGE,
+                    "memory_min_test_gb": settings.verifyx.MEMORY_MIN_TEST_GB,
+                    "memory_max_test_gb": settings.verifyx.MEMORY_MAX_TEST_GB,
+                    "storage_min_available_gb": settings.verifyx.STORAGE_MIN_AVAILABLE_GB,
+                    "storage_throughput_test_gb": settings.verifyx.STORAGE_THROUGHPUT_TEST_GB,
+                    "network_timeout_seconds": settings.verifyx.NETWORK_TIMEOUT_SECONDS,
                 },
             }
 
@@ -257,9 +247,9 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
 
     download_speed = network_execution["download"]["speed_mbps"]
 
-    if download_speed < NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
+    if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
         errors.append(
-            f"Network download speed inadequate: {download_speed:.2f} Mbps achieved, {NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+            f"Network download speed inadequate: {download_speed:.2f} Mbps achieved, {settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
         )
         success = False
 
