@@ -34,9 +34,12 @@ class PreflightCheck(ABC):
         pass
 
     @abstractmethod
-    async def run(self) -> CheckResult:
+    async def run(self, context: dict) -> CheckResult:
         """
         Run the validation check.
+
+        Args:
+            context: Configuration context containing settings for the check
 
         Returns:
             CheckResult with status, message, and optional details
