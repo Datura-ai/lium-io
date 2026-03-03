@@ -10,14 +10,6 @@ from typing import Optional
 
 from preflight.base import PreflightCheck, CheckResult, CheckStatus
 from preflight.utils import suppress_library_output, get_gpu_info
-from preflight.constants import (
-    MEMORY_ALLOCATION_PERCENTAGE,
-    MEMORY_MIN_TEST_GB,
-    MEMORY_MAX_TEST_GB,
-    STORAGE_MIN_AVAILABLE_GB,
-    STORAGE_THROUGHPUT_TEST_GB,
-    NETWORK_TIMEOUT_SECONDS,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -155,50 +147,31 @@ class VerifyXCheck(PreflightCheck):
     3. Tests network download speed and integrity
     """
 
-    def __init__(
-        self,
-        lib_path: str = "/usr/lib/libverifyx.so",
-        memory_allocation_percentage: int = MEMORY_ALLOCATION_PERCENTAGE,
-        memory_min_test_gb: int = MEMORY_MIN_TEST_GB,
-        memory_max_test_gb: int = MEMORY_MAX_TEST_GB,
-        storage_min_available_gb: int = STORAGE_MIN_AVAILABLE_GB,
-        storage_throughput_test_gb: int = STORAGE_THROUGHPUT_TEST_GB,
-        network_timeout_seconds: int = NETWORK_TIMEOUT_SECONDS,
-    ):
-        """
-        Initialize the VerifyX check.
-
-        Args:
-            lib_path: Path to libverifyx.so
-            memory_allocation_percentage: Percentage of RAM to allocate for testing
-            memory_min_test_gb: Minimum RAM required (GB)
-            memory_max_test_gb: Maximum RAM to test (GB)
-            storage_min_available_gb: Minimum storage space required (GB)
-            storage_throughput_test_gb: Size of data to test storage throughput (GB)
-            network_timeout_seconds: Timeout for network tests
-        """
-        self.lib_path = lib_path
-        self.memory_allocation_percentage = memory_allocation_percentage
-        self.memory_min_test_gb = memory_min_test_gb
-        self.memory_max_test_gb = memory_max_test_gb
-        self.storage_min_available_gb = storage_min_available_gb
-        self.storage_throughput_test_gb = storage_throughput_test_gb
-        self.network_timeout_seconds = network_timeout_seconds
-
     @property
     def name(self) -> str:
         return "VerifyX (RAM/Storage/Network)"
 
-    async def run(self) -> CheckResult:
+    async def run(self, context: dict) -> CheckResult:
         """Run VerifyX validation in one clear, linear flow."""
         try:
+            # Extract verifyx config from context
+            verifyx_config = context.get('verifyx', {})
+
+            lib_path = verifyx_config.get('lib_path', '/usr/lib/libverifyx.so')
+            memory_allocation_percentage = verifyx_config.get('memory_allocation_percentage')
+            memory_min_test_gb = verifyx_config.get('memory_min_test_gb')
+            memory_max_test_gb = verifyx_config.get('memory_max_test_gb')
+            storage_min_available_gb = verifyx_config.get('storage_min_available_gb')
+            storage_throughput_test_gb = verifyx_config.get('storage_throughput_test_gb')
+            network_timeout_seconds = verifyx_config.get('network_timeout_seconds')
+
             # 1) Detect GPU
             gpu_info = get_gpu_info(include_memory=True)
             if not gpu_info:
                 raise NoGpuError("No GPUs detected for verifyx test")
 
             # 2) Load VerifyX wrapper
-            wrapper = self._load_wrapper(self.lib_path)
+            wrapper = self._load_wrapper(lib_path)
 
             # 3) Build challenge input
             seed = random.getrandbits(64)
@@ -207,12 +180,12 @@ class VerifyXCheck(PreflightCheck):
                 "seed": seed,
                 "machine_info": gpu_info,
                 "config": {
-                    "memory_allocation_percentage": self.memory_allocation_percentage,
-                    "memory_min_test_gb": self.memory_min_test_gb,
-                    "memory_max_test_gb": self.memory_max_test_gb,
-                    "storage_min_available_gb": self.storage_min_available_gb,
-                    "storage_throughput_test_gb": self.storage_throughput_test_gb,
-                    "network_timeout_seconds": self.network_timeout_seconds,
+                    "memory_allocation_percentage": memory_allocation_percentage,
+                    "memory_min_test_gb": memory_min_test_gb,
+                    "memory_max_test_gb": memory_max_test_gb,
+                    "storage_min_available_gb": storage_min_available_gb,
+                    "storage_throughput_test_gb": storage_throughput_test_gb,
+                    "network_timeout_seconds": network_timeout_seconds,
                 },
             }
 

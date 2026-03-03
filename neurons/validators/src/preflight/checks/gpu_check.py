@@ -4,12 +4,7 @@ import logging
 
 from preflight.base import PreflightCheck, CheckResult, CheckStatus
 from preflight.utils import get_gpu_info
-from preflight.constants import (
-    GPU_MODEL_RATES,
-    MAX_GPU_COUNT,
-    GPU_UTILIZATION_LIMIT,
-    GPU_MEMORY_UTILIZATION_LIMIT,
-)
+from preflight.constants import GPU_MODEL_RATES
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +24,15 @@ class GPUCheck(PreflightCheck):
     def name(self) -> str:
         return "GPU Configuration"
 
-    async def run(self) -> CheckResult:
+    async def run(self, context: dict) -> CheckResult:
         """Run the GPU validation checks."""
         try:
+            # Extract gpu config from context
+            gpu_config = context.get('gpu', {})
+            max_gpu_count = gpu_config.get('max_gpu_count')
+            gpu_utilization_limit = gpu_config.get('gpu_utilization_limit')
+            gpu_memory_utilization_limit = gpu_config.get('gpu_memory_utilization_limit')
+
             # Get GPU information
             logger.debug("Getting GPU information...")
             gpu_info = get_gpu_info(include_utilization=True)
@@ -59,11 +60,11 @@ class GPUCheck(PreflightCheck):
                 )
 
             # Check 2: GPU count
-            if gpu_count > MAX_GPU_COUNT:
+            if gpu_count > max_gpu_count:
                 return CheckResult(
                     name=self.name,
                     status=CheckStatus.FAILED,
-                    message=f"GPU count ({gpu_count}) exceeds maximum allowed ({MAX_GPU_COUNT})"
+                    message=f"GPU count ({gpu_count}) exceeds maximum allowed ({max_gpu_count})"
                 )
 
             if len(gpu_details) != gpu_count:
@@ -79,7 +80,7 @@ class GPUCheck(PreflightCheck):
                 gpu_util = detail.get("utilization", 0)
                 mem_util = detail.get("memory_utilization", 0)
 
-                if gpu_util >= GPU_UTILIZATION_LIMIT or mem_util > GPU_MEMORY_UTILIZATION_LIMIT:
+                if gpu_util >= gpu_utilization_limit or mem_util > gpu_memory_utilization_limit:
                     high_util_gpus.append({
                         "gpu_index": idx,
                         "gpu_utilization": gpu_util,
@@ -90,7 +91,7 @@ class GPUCheck(PreflightCheck):
                 return CheckResult(
                     name=self.name,
                     status=CheckStatus.FAILED,
-                    message=f"GPUs must be idle. {len(high_util_gpus)} GPU(s) have high utilization (>={GPU_UTILIZATION_LIMIT}%). Stop running processes"
+                    message=f"GPUs must be idle. {len(high_util_gpus)} GPU(s) have high utilization (>={gpu_utilization_limit}%). Stop running processes"
                 )
 
             # Check 4: GPU UUIDs (uniqueness)
