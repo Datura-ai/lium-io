@@ -81,6 +81,23 @@ class PortConnectivityCheck:
                 details = "No port available for docker container"
             elif result.status == "no_working_ports":
                 details = "No working ports found"
+            elif result.status == "skipped_rental_active":
+                # Rental is active, skip port check but don't fail
+                event = render_message(
+                    Msg.VERIFY_OK,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"message": "Port check skipped - rental container active"},
+                    extra=extra_info,
+                )
+                return CheckResult(
+                    passed=True,
+                    event=event,
+                    updates={
+                        "default_extra": {**extra, **extra_info},
+                        "state": updated_state,
+                    },
+                )
             elif result.status == "error":
                 details = f"Verification failed: {result.error}" if result.error else "Verification failed"
             else:

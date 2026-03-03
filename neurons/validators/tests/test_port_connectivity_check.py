@@ -27,6 +27,7 @@ class DummyConnectivityService:
         log_text: str = "",
         sysbox_runtime: bool = False,
         verified_port_count: int = 0,
+        status: str | None = None,
     ):
         """
         Args:
@@ -34,11 +35,13 @@ class DummyConnectivityService:
             log_text: The log message from verification
             sysbox_runtime: The sysbox runtime state to return
             verified_port_count: Number of verified working ports
+            status: Override the status field (e.g., "skipped_rental_active")
         """
         self.success = success
         self.log_text = log_text
         self.sysbox_runtime = sysbox_runtime
         self.verified_port_count = verified_port_count
+        self.status = status
         self.called_with: dict | None = None
 
     async def verify_ports(
@@ -65,7 +68,15 @@ class DummyConnectivityService:
         else:
             successful_ports = tuple()
         failed_ports = tuple()
-        status = "ok" if self.success else "no_working_ports"
+
+        # Use custom status if provided, otherwise default logic
+        if self.status:
+            status = self.status
+            error = "Rental container active, skipping port check" if status == "skipped_rental_active" else None
+        else:
+            status = "ok" if self.success else "no_working_ports"
+            error = None if self.success else "No working ports found"
+
         return PortVerificationResult(
             selected_ports=successful_ports,
             successful_ports=successful_ports,
@@ -74,23 +85,25 @@ class DummyConnectivityService:
             dind_ok=self.success,
             sysbox_runtime=self.sysbox_runtime,
             status=status,
-            error=None if self.success else "No working ports found",
+            error=error,
             elapsed_sec=1.0,
         )
 
 
 @pytest.mark.parametrize(
-    "rented,renting_in_progress,has_config,verify_success,sysbox_runtime,expected_pass,expected_reason",
+    "rented,renting_in_progress,has_config,verify_success,sysbox_runtime,status_override,expected_pass,expected_reason",
     [
-        (False, True, True, True, False, True, Msg.VERIFY_OK.reason),
+        (False, True, True, True, False, None, True, Msg.VERIFY_OK.reason),
         # Missing config - fail
-        (False, False, False, True, False, False, Msg.CONFIG_MISSING.reason),
+        (False, False, False, True, False, None, False, Msg.CONFIG_MISSING.reason),
         # Verification succeeds
-        (False, False, True, True, False, True, Msg.VERIFY_OK.reason),
+        (False, False, True, True, False, None, True, Msg.VERIFY_OK.reason),
         # Verification succeeds with sysbox runtime
-        (False, False, True, True, True, True, Msg.VERIFY_OK.reason),
+        (False, False, True, True, True, None, True, Msg.VERIFY_OK.reason),
         # Verification fails
-        (False, False, True, False, False, False, Msg.VERIFY_FAILED.reason),
+        (False, False, True, False, False, None, False, Msg.VERIFY_FAILED.reason),
+        # Rental container active - skip port check but pass
+        (False, False, True, False, False, "skipped_rental_active", True, Msg.VERIFY_OK.reason),
     ],
 )
 @pytest.mark.asyncio
@@ -100,6 +113,7 @@ async def test_port_connectivity_check(
     has_config,
     verify_success,
     sysbox_runtime,
+    status_override,
     expected_pass,
     expected_reason,
     context_factory,
@@ -111,6 +125,7 @@ async def test_port_connectivity_check(
         log_text="Port verification completed" if verify_success else "Port verification failed",
         sysbox_runtime=sysbox_runtime,
         verified_port_count=100 if verify_success else 0,
+        status=status_override,
     )
 
     services = build_services(

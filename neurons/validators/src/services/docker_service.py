@@ -374,6 +374,78 @@ class DockerService:
             await asyncio.sleep(1)
         return False
 
+    async def wait_for_port_check_containers(
+        self,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        keypair: bittensor.Keypair,
+        private_key: str,
+        max_retries: int = 2,
+        retry_delay: int = 60
+    ) -> tuple[bool, str]:
+        """Wait for port check containers to finish before creating rental containers.
+
+        Port check containers have the prefix 'container_{miner_hotkey}_'
+
+        Args:
+            executor_info: Executor SSH connection info
+            miner_hotkey: The miner's hotkey to check containers for
+            keypair: Bittensor keypair for decrypting private key
+            private_key: Encrypted SSH private key
+            max_retries: Maximum number of times to check (default 2)
+            retry_delay: Seconds to wait between checks (default 60)
+
+        Returns:
+            Tuple of (success: bool, message: str)
+            - (True, "No port check containers found") - Can proceed immediately
+            - (True, "Port check containers cleared after X attempts") - Waited and cleared
+            - (False, "Port check containers still exist after max retries") - Failed to clear
+        """
+        container_prefix = f"container_{miner_hotkey}_"
+
+        # Decrypt private key and establish SSH connection
+        decrypted_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(decrypted_key)
+
+        try:
+            async with asyncssh.connect(
+                host=executor_info.address,
+                port=executor_info.ssh_port,
+                username=executor_info.ssh_username,
+                client_keys=[pkey],
+                known_hosts=None,
+            ) as ssh_client:
+                for attempt in range(max_retries + 1):
+                    # Check if port check containers exist
+                    command = f'/usr/bin/docker ps --format "{{{{.Names}}}}" --filter "name=^{container_prefix}"'
+                    result = await ssh_client.run(command)
+
+                    if not result.stdout or not result.stdout.strip():
+                        if attempt == 0:
+                            return True, "No port check containers found"
+                        else:
+                            return True, f"Port check containers cleared after {attempt} attempt(s)"
+
+                    # Found port check containers
+                    container_names = result.stdout.strip()
+
+                    if attempt < max_retries:
+                        logger.info(
+                            f"Port check containers exist ({container_names}), "
+                            f"waiting {retry_delay}s (attempt {attempt + 1}/{max_retries + 1})"
+                        )
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        # Max retries reached, containers still exist
+                        return False, f"Port check containers still exist after {max_retries} retries: {container_names}"
+
+                # Should never reach here, but just in case
+                return False, "Unexpected error in wait_for_port_check_containers"
+        except Exception as e:
+            logger.error(f"Error connecting to check for port check containers: {e}")
+            # If we can't connect, assume it's safe to proceed
+            return True, "Unable to check for port check containers, proceeding"
+
     async def clean_existing_containers(
         self,
         ssh_client: asyncssh.SSHClientConnection,
