@@ -132,7 +132,7 @@ class MatrixValidationCheck(PreflightCheck):
     def name(self) -> str:
         return "GPU Matrix Multiplication"
 
-    async def run(self) -> CheckResult:
+    async def run(self, context: dict) -> CheckResult:
         """Run the matrix multiplication validation in one clear, linear flow."""
         try:
             # 1) Detect GPU
