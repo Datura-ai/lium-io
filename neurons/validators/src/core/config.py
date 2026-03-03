@@ -18,9 +18,52 @@ class FeatureFlag(str, Enum):
     VERIFYX_NETWORK_VALIDATION = "verifyx_network_validation"
 
 
+class VerifyXSettings(BaseSettings):
+    """VerifyX configuration - configurable thresholds for validation.
+
+    Set via environment variables prefixed with VERIFYX_ (e.g., VERIFYX_MEMORY_MIN_TEST_GB=16).
+    Use .env for local development (git-ignored).
+    """
+    model_config = SettingsConfigDict(env_prefix="VERIFYX_", env_file=".env", extra="ignore")
+
+    # Memory configuration
+    MEMORY_ALLOCATION_PERCENTAGE: int = Field(
+        default=75,
+        description="Percentage of RAM to allocate for testing"
+    )
+    MEMORY_MIN_TEST_GB: int = Field(
+        default=8,
+        description="Minimum RAM required in GB"
+    )
+    MEMORY_MAX_TEST_GB: int = Field(
+        default=128,
+        description="Maximum RAM to test in GB"
+    )
+
+    # Storage configuration
+    STORAGE_MIN_AVAILABLE_GB: int = Field(
+        default=100,
+        description="Minimum storage space required in GB"
+    )
+    STORAGE_THROUGHPUT_TEST_GB: int = Field(
+        default=5,
+        description="Size of data to test storage throughput in GB"
+    )
+
+    # Network configuration
+    NETWORK_TIMEOUT_SECONDS: int = Field(
+        default=120,
+        description="Timeout for network tests in seconds"
+    )
+    NETWORK_MIN_DOWNLOAD_SPEED_MBPS: float = Field(
+        default=50.0,
+        description="Minimum required network download speed in Mbps"
+    )
+
+
 class DebugSettings(BaseSettings):
     """Debug configuration - all flags default to False/None.
-    
+
     Set via environment variables prefixed with DEBUG_ (e.g., DEBUG_SKIP_STAKE_CHECKS=true).
     Use .env for local development (git-ignored).
     """
@@ -121,6 +164,7 @@ class Settings(BaseSettings):
     MACHINE_MAX_PRICE_RATE: float = Field(env="MACHINE_MAX_PRICE_RATE", default=2.0)
 
     debug: DebugSettings = Field(default_factory=DebugSettings)
+    verifyx: VerifyXSettings = Field(default_factory=VerifyXSettings)
     incentive: IncentiveConfig = Field(default_factory=IncentiveConfig)
 
     def get_bittensor_wallet(self) -> "Wallet":
