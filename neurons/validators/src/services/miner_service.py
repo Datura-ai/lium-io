@@ -1728,6 +1728,48 @@ class MinerService:
                 # Handle different container request types
                 result = None
                 if isinstance(payload, ContainerCreateRequest):
+                    # Check for port check containers and wait if found
+                    success, message = await docker_service.wait_for_port_check_containers(
+                        executor,
+                        payload.miner_hotkey,
+                        my_key,
+                        private_key.decode("utf-8"),
+                        max_retries=2,
+                        retry_delay=60
+                    )
+
+                    if not success:
+                        logger.warning(
+                            _m(
+                                message,
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
+
+                        # Remove SSH key only if it was accepted
+                        if ssh_key_accepted:
+                            await self._remove_ssh_key_via_rest(
+                                base_url=base_url,
+                                my_key=my_key,
+                                public_key=public_key,
+                                miner_hotkey=payload.miner_hotkey,
+                                executor_id=payload.executor_id,
+                                log_extra=default_extra,
+                            )
+
+                        return self._handle_container_error(
+                            payload=payload,
+                            msg=message,
+                            error_code=FailedContainerErrorCodes.RentingInProgress,
+                        )
+                    else:
+                        logger.info(
+                            _m(
+                                f"Port check container wait result: {message}",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
+
                     logger.info(
                         _m(
                             "Creating container",
