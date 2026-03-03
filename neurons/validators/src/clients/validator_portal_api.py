@@ -62,6 +62,7 @@ class ValidatorPortalAPI:
                                         "status": resp.status,
                                         "body": text,
                                         "url": url,
+                                        "api_base": api_base
                                     }),
                                 )
                             )
