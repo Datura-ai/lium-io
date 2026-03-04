@@ -150,15 +150,20 @@ def get_balance_of_eth_address(private_key: str):
     "--validator", required=False, help="Validator hotkey that executor opens to."
 )
 @click.option(
-    "--gpu-type", help="Type of GPU", required=True
+    "--gpu-type", required=True, help="Type of GPU"
 )
 @click.option(
-    "--gpu-count", type=int, help="Number of GPUs", required=True
+    "--gpu-count", type=int, required=True, help="Number of GPUs"
 )
 @click.option(
     "--deposit-amount", type=float, required=False, help="Amount of TAO to deposit as collateral (optional)"
 )
 @click.option("--private-key", required=False, hide_input=True, help="Ethereum private key")
+@click.option(
+    "--skip-deposit/--no-skip-deposit",
+    default=True,
+    help="Skip collateral deposit when adding an executor.",
+)
 def add_executor(
     address: str,
     port: int,
@@ -168,21 +173,40 @@ def add_executor(
     gpu_count: int | None = None,
     private_key: str | None = None,
     deposit_amount: float | None = None,
+    skip_deposit: bool = True,
 ):
     """Add executor machine to the database"""
-    if gpu_type is not None or gpu_count is not None or deposit_amount is not None:
-        if not private_key:
-            logger.error("Private key is required to deposit collateral.")
-            return
+    if skip_deposit and deposit_amount is not None:
+        logger.error("`--deposit-amount` requires `--no-skip-deposit`.")
+        return
+
+    if not skip_deposit and not private_key:
+        logger.error("Private key is required to deposit collateral.")
+        return
 
     cli_service = CliService(private_key=private_key, with_executor_db=True)
     success = asyncio.run(
-        cli_service.add_executor(address, port, price, validator, deposit_amount, gpu_type, gpu_count)
+        cli_service.add_executor(
+            address,
+            port,
+            price,
+            validator,
+            deposit_amount,
+            gpu_type,
+            gpu_count,
+            skip_deposit=skip_deposit,
+        )
     )
     if success:
-        logger.info("✅ Added executor and deposited collateral successfully.")
+        if skip_deposit:
+            logger.info("✅ Added executor successfully. Collateral deposit skipped.")
+        else:
+            logger.info("✅ Added executor and deposited collateral successfully.")
     else:
-        logger.error("❌ Failed to add executor or deposit collateral.")
+        if skip_deposit:
+            logger.error("❌ Failed to add executor.")
+        else:
+            logger.error("❌ Failed to add executor or deposit collateral.")
 
 
 @cli.command()
