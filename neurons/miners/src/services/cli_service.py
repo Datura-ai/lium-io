@@ -262,7 +262,8 @@ class CliService:
         validator: str | None = None,
         deposit_amount: float | None = None,
         gpu_type: str | None = None,
-        gpu_count: int | None = None
+        gpu_count: int | None = None,
+        skip_deposit: bool = True,
     ) -> bool:
         """
         Add an executor to the database and deposit collateral.
@@ -273,8 +274,13 @@ class CliService:
         :param deposit_amount: Amount of TAO to deposit (optional)
         :param gpu_type: Type of GPU (optional)
         :param gpu_count: Number of GPUs (optional)
+        :param skip_deposit: Skip collateral deposit and only save the executor
         :return: True if successful, False otherwise
         """
+        if gpu_type is None or gpu_count is None:
+            self.logger.error("gpu_type and gpu_count must be specified when adding an executor.")
+            return False
+
         if validator is None:
             validator = settings.DEFAULT_VALIDATOR_HOTKEY
 
@@ -293,14 +299,11 @@ class CliService:
         if isinstance(result, AddExecutorFailed):
             return False
 
-        if deposit_amount is None and gpu_type is None and gpu_count is None:
-            self.logger.info("No deposit amount provided, skipping deposit.")
+        if skip_deposit:
+            self.logger.info("Skipping collateral deposit for executor %s by explicit CLI option.", executor_uuid)
             return True
 
         if deposit_amount is None:
-            if gpu_type is None or gpu_count is None:
-                self.logger.error("gpu_type and gpu_count must be specified if deposit_amount is not provided.")
-                return False
             if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
                 self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
                 return False

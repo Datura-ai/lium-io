@@ -173,10 +173,11 @@ testing/
 
 **/.python-version
 notebooks/
-
-.vscode/*
-
+.notebooks/
+AGENTS.md
+.cursor/
+.codex/
+.claude/
 
 config_override.py
-.cursor
-.claude
+.vscode/*
