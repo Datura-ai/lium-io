@@ -11,7 +11,6 @@ from incentive.factory import IncentiveFactory
 from core.utils import _m, get_extra_info, get_logger
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
-from services.executor_connectivity import ContainerCleanupService
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.port_probe import PortProbe
@@ -84,7 +83,6 @@ class Validator:
                 DindProbe(DindVerifier(ssh_service)),
             ),
             persister=PortResultPersister(self.port_mapping_dao),
-            cleanup_service=ContainerCleanupService(),
         )
 
         task_service = TaskService(
