@@ -82,12 +82,23 @@ class PortConnectivityCheck:
             elif result.status == "no_working_ports":
                 details = "No working ports found"
             elif result.status == "skipped_rental_active":
+                # Rental container detected - fetch fresh rental data from backend
+                backend_client = ctx.services.backend_client
+                fresh_rented_data = await backend_client.get_all_rented_executors()
+
+                if fresh_rented_data:
+                    # Update the state with fresh rental data
+                    updated_state = replace(
+                        updated_state,
+                        rented_data=fresh_rented_data,
+                    )
+
                 # Rental is active, skip port check but don't fail
                 event = render_message(
                     Msg.VERIFY_OK,
                     ctx=ctx,
                     check_id=self.check_id,
-                    what={"message": "Port check skipped - rental container active"},
+                    what={"message": "Port check skipped - rental container active, updated context with fresh rental data"},
                     extra=extra_info,
                 )
                 return CheckResult(
