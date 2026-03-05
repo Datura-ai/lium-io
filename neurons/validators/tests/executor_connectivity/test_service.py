@@ -1,6 +1,5 @@
 import pytest
 
-from services.const import POD_CONTAINER_PREFIX
 from services.executor_connectivity_service import ExecutorConnectivityService, PortPair
 from services.executor_connectivity.models import PortVerificationResult
 
@@ -17,9 +16,6 @@ async def test_verify_ports_successful_flow(
 
     selected = (PortPair(9000, 9000), PortPair(9001, 9001), PortPair(9002, 9002))
     successful = (PortPair(9001, 9001), PortPair(9002, 9002))
-
-    cleanup_service = mocker.Mock()
-    cleanup_service.cleanup = mocker.AsyncMock()
 
     orchestrator = mocker.Mock()
     orchestrator.verify = mocker.AsyncMock(
@@ -40,7 +36,6 @@ async def test_verify_ports_successful_flow(
     executor_service = ExecutorConnectivityService(
         orchestrator=orchestrator,
         persister=persister,
-        cleanup_service=cleanup_service,
     )
 
     result = await executor_service.verify_ports(
@@ -54,11 +49,6 @@ async def test_verify_ports_successful_flow(
     assert result.status == "ok"
     assert result.elapsed_sec is not None
 
-    cleanup_service.cleanup.assert_called_once_with(
-        mock_ssh_client,
-        rented_pod_names,
-        POD_CONTAINER_PREFIX,
-    )
     orchestrator.verify.assert_called_once()
     persister.save.assert_called_once()
 
@@ -72,9 +62,6 @@ async def test_verify_ports_non_ok_status_skips_persist(
     miner_hotkey = "test_miner"
 
     selected = (PortPair(9000, 9000),)
-
-    cleanup_service = mocker.Mock()
-    cleanup_service.cleanup = mocker.AsyncMock()
 
     orchestrator = mocker.Mock()
     orchestrator.verify = mocker.AsyncMock(
@@ -95,7 +82,6 @@ async def test_verify_ports_non_ok_status_skips_persist(
     executor_service = ExecutorConnectivityService(
         orchestrator=orchestrator,
         persister=persister,
-        cleanup_service=cleanup_service,
     )
 
     result = await executor_service.verify_ports(
@@ -107,10 +93,5 @@ async def test_verify_ports_non_ok_status_skips_persist(
     assert result.status == "no_working_ports"
     assert result.elapsed_sec is not None
 
-    cleanup_service.cleanup.assert_called_once_with(
-        mock_ssh_client,
-        [],
-        POD_CONTAINER_PREFIX,
-    )
     orchestrator.verify.assert_called_once()
     persister.save.assert_not_called()
