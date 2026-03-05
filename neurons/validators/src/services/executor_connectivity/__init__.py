@@ -1,4 +1,3 @@
-from services.executor_connectivity.cleanup_service import ContainerCleanupService
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.docker_command import DockerCommand
@@ -21,7 +20,6 @@ from services.executor_connectivity.service import ExecutorConnectivityService
 __all__ = [
     "ContainerRunner",
     "BatchVerifier",
-    "ContainerCleanupService",
     "ContainerStartResult",
     "ConnectivityOrchestrator",
     "DindProbe",

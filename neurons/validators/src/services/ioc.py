@@ -5,7 +5,6 @@ from core.config import settings
 from daos.port_mapping_dao import PortMappingDao
 from services.collateral_contract_service import CollateralContractService
 from services.docker_service import DockerService
-from services.executor_connectivity import ContainerCleanupService
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
 from services.executor_connectivity.port_probe import PortProbe
@@ -58,7 +57,6 @@ async def initiate_services():
             DindProbe(DindVerifier(ioc["SSHService"])),
         ),
         persister=PortResultPersister(ioc["PortMappingDao"]),
-        cleanup_service=ContainerCleanupService(),
     )
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
