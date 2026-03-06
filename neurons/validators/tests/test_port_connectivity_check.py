@@ -18,6 +18,14 @@ class DummyRedis:
         return self.renting_in_progress_value
 
 
+# Mock backend service
+class DummyBackendService:
+    async def get_all_rented_executors(self):
+        """Mock method that returns rented executors data."""
+        # Return None or empty rented data structure as needed
+        return None
+
+
 # Mock connectivity service
 class DummyConnectivityService:
     def __init__(
@@ -120,6 +128,7 @@ async def test_port_connectivity_check(
 ):
     # Setup mocks
     redis_service = DummyRedis(renting_in_progress=renting_in_progress)
+    backend_service = DummyBackendService()
     connectivity_service = DummyConnectivityService(
         success=verify_success,
         log_text="Port verification completed" if verify_success else "Port verification failed",
@@ -130,6 +139,7 @@ async def test_port_connectivity_check(
 
     services = build_services(
         redis=redis_service,
+        backend=backend_service,
         connectivity=connectivity_service,
     )
 
