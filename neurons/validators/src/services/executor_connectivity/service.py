@@ -3,8 +3,6 @@ import time
 
 import asyncssh
 from datura.requests.miner_requests import ExecutorSSHInfo
-from services.const import POD_CONTAINER_PREFIX
-from services.executor_connectivity.cleanup_service import ContainerCleanupService
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.models import PortVerificationResult
 
@@ -21,10 +19,8 @@ class ExecutorConnectivityService:
     def __init__(
         self,
         orchestrator: ConnectivityOrchestrator,
-        cleanup_service: ContainerCleanupService,
     ):
         self.orchestrator = orchestrator
-        self.cleanup_service = cleanup_service
 
     async def verify_ports(
         self,
@@ -38,12 +34,7 @@ class ExecutorConnectivityService:
         """Verify executor port connectivity and DinD capability."""
         t1 = time.monotonic()
         try:
-            await self.cleanup_service.cleanup(
-                ssh_client,
-                rented_pod_names or [],
-                POD_CONTAINER_PREFIX,
-            )
-
+            # Cleanup removed - test containers are ephemeral and short-lived anyway
             verification = await self.orchestrator.verify(
                 ssh_client=ssh_client,
                 executor_info=executor_info,

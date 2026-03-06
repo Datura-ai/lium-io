@@ -11,7 +11,6 @@ from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
-from services.executor_connectivity import ContainerCleanupService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.matrix_validation_service import ValidationService
@@ -53,7 +52,6 @@ async def initiate_services():
             ),
             DindProbe(DindVerifier(ioc["SSHService"])),
         ),
-        cleanup_service=ContainerCleanupService(),
     )
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
