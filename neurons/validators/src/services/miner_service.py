@@ -10,7 +10,6 @@ from asyncssh import SSHKey
 import asyncssh
 import bittensor
 from clients.miner_client import MinerClient
-from daos.port_mapping_dao import PortMappingDao
 from datura.requests.miner_requests import (
     AcceptJobRequest,
     AcceptSSHKeyRequest,
@@ -146,13 +145,11 @@ class MinerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         task_service: Annotated[TaskService, Depends(TaskService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
-        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
         self.ssh_service = ssh_service
         self.task_service = task_service
         self.redis_service = redis_service
-        self.port_mapping_dao = port_mapping_dao
         self.attestation_service = attestation_service
 
     @staticmethod
@@ -584,7 +581,6 @@ class MinerService:
         docker_service = DockerService(
             ssh_service=self.ssh_service,
             redis_service=self.redis_service,
-            port_mapping_dao=self.port_mapping_dao,
             attestation_service=self.attestation_service,
         )
 
@@ -1602,7 +1598,6 @@ class MinerService:
         docker_service = DockerService(
             ssh_service=self.ssh_service,
             redis_service=self.redis_service,
-            port_mapping_dao=self.port_mapping_dao,
             attestation_service=self.attestation_service,
         )
 
