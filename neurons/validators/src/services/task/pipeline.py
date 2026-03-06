@@ -60,7 +60,7 @@ class ContextState:
     upload_local_dir: Optional[str] = None
     upload_remote_dir: Optional[str] = None
     remote_dir: Optional[str] = None
-    specs: Optional[dict[str, Any]] = None
+    specs: dict[str, Any] = field(default_factory=dict)
     gpu_model: Optional[str] = None
     gpu_count: Optional[int] = None
     gpu_details: list[dict] = field(default_factory=list)

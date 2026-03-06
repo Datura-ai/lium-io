@@ -83,7 +83,7 @@ class PortConnectivityCheck:
                 details = "No working ports found"
             elif result.status == "skipped_rental_active":
                 # Rental container detected - fetch fresh rental data from backend
-                backend_client = ctx.services.backend_client
+                backend_client = ctx.services.backend
                 fresh_rented_data = await backend_client.get_all_rented_executors()
 
                 if fresh_rented_data:
