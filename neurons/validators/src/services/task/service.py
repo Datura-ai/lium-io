@@ -9,7 +9,6 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from clients.backend_client import BackendClient
 from core.config import settings
 from core.utils import _m, get_extra_info
-from daos.port_mapping_dao import PortMappingDao
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService, AttestationError
 from services.collateral_contract_service import CollateralContractService
@@ -35,7 +34,6 @@ class TaskService:
         verifyx_validation_service: Annotated[VerifyXValidationService, Depends(VerifyXValidationService)],
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
-        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
         backend_client: Annotated[BackendClient, Depends(BackendClient)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
@@ -52,7 +50,6 @@ class TaskService:
             verifyx_validation_service=verifyx_validation_service,
             collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
-            port_mapping_dao=port_mapping_dao,
             backend_client=backend_client,
         )
 

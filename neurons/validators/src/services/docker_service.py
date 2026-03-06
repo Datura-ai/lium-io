@@ -40,7 +40,6 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
-from daos.port_mapping_dao import PortMappingDao
 from services.const import POD_CONTAINER_PREFIX, PREFERRED_POD_PORTS, MIN_PORT_COUNT
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
@@ -48,7 +47,6 @@ from services.redis_service import (
 )
 from services.attestation_service import AttestationService, AttestationError
 from services.ssh_service import SSHService
-from models.port_mapping import PortMapping
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +70,10 @@ class DockerService:
         self,
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
-        port_mapping_dao: Annotated[PortMappingDao, Depends(PortMappingDao)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
-        self.port_mapping_dao = port_mapping_dao
         self.attestation_service = attestation_service
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
@@ -122,19 +118,20 @@ class DockerService:
         try:
             # Use distributed lock to prevent race conditions when allocating ports
             async with self.redis_service.acquire_executor_lock(executor_id):
-                # Use data from backend if provided, otherwise fallback to DB
+                # Use port data from backend
                 if available_ports_raw is not None and pod_mapping_raw is not None:
                     available_ports, pod_mapping = self._convert_payload_ports(available_ports_raw, pod_mapping_raw)
                     logger.info(f"Using port data from backend: {len(available_ports)} available, {len(pod_mapping)} pod mappings")
                 else:
-                    available_ports = await self.port_mapping_dao.get_available_ports_excluding_rented(executor_uuid)
-                    pod_mapping = await self.port_mapping_dao.get_ports_for_pod(pod_id)
-                    logger.info(f"Using port data from DB (fallback): {len(available_ports)} available, {len(pod_mapping)} pod mappings")
+                    # No backend data provided - cannot proceed without port information
+                    logger.error(f"No port data provided from backend for executor {executor_id}")
+                    available_ports = {}
+                    pod_mapping = {}
 
                 if not pod_mapping and len(available_ports) < MIN_PORT_COUNT:
                     logger.warning(
-                        f"Insufficient ports in database ({len(available_ports)}/{MIN_PORT_COUNT}), "
-                        f"falling back to Redis for executor {executor_id}"
+                        f"Insufficient ports available ({len(available_ports)}/{MIN_PORT_COUNT}) "
+                        f"for executor {executor_id}"
                     )
                     return [], None
 
@@ -158,7 +155,7 @@ class DockerService:
                 for port in docker_internal_ports:
                     if port in pod_mapping:
                         port_mapping = pod_mapping[port]
-                        mappings.append((port, port_mapping.internal_port, port_mapping.external_port))
+                        mappings.append((port, port_mapping["internal_port"], port_mapping["external_port"]))
                         reused_count += 1
                         continue
 
@@ -176,7 +173,7 @@ class DockerService:
                         docker_port = port if user_defined else external_port
 
                     port_mapping = available_ports.pop(external_port)
-                    mappings.append((docker_port, port_mapping.internal_port, external_port))
+                    mappings.append((docker_port, port_mapping["internal_port"], external_port))
 
                 allocated_count = len(mappings) - reused_count
                 logger.info(
@@ -189,7 +186,7 @@ class DockerService:
                     if mapping:
                         jupyter_port_map = (mapping[0], mapping[2])
 
-                await self.port_mapping_dao.reserve_ports_for_pod(executor_uuid, mappings, pod_id)
+                # Port reservation now handled by backend
 
                 return mappings, jupyter_port_map
 
@@ -209,38 +206,34 @@ class DockerService:
         self,
         available_ports_raw: list[PayloadPortMapping],
         pod_mapping_raw: list[PayloadPortMapping],
-    ) -> tuple[dict[int, PortMapping], dict[int, PortMapping]]:
+    ) -> tuple[dict[int, dict], dict[int, dict]]:
         """
         Convert payload port mappings to the format expected by generate_portMappings.
 
         Returns:
-            - available_ports: dict[external_port, PortMapping]
-            - pod_mapping: dict[docker_port, PortMapping]
+            - available_ports: dict[external_port, port_info_dict]
+            - pod_mapping: dict[docker_port, port_info_dict]
         """
-        available_ports: dict[int, PortMapping] = {}
+        available_ports: dict[int, dict] = {}
         for p in available_ports_raw:
-            # Create a minimal PortMapping object with required fields
-            port_mapping = PortMapping(
-                internal_port=p.internal_port,
-                external_port=p.external_port,
-                docker_port=p.docker_port,
-                miner_hotkey="",  # Not used in port allocation logic
-                executor_id="00000000-0000-0000-0000-000000000000",  # Placeholder UUID
-            )
-            available_ports[p.external_port] = port_mapping
+            # Create a minimal port info dict with required fields
+            port_info = {
+                "internal_port": p.internal_port,
+                "external_port": p.external_port,
+                "docker_port": p.docker_port,
+            }
+            available_ports[p.external_port] = port_info
 
-        pod_mapping: dict[int, PortMapping] = {}
+        pod_mapping: dict[int, dict] = {}
         for p in pod_mapping_raw:
-            port_mapping = PortMapping(
-                internal_port=p.internal_port,
-                external_port=p.external_port,
-                docker_port=p.docker_port,
-                miner_hotkey="",
-                executor_id="00000000-0000-0000-0000-000000000000",
-            )
+            port_info = {
+                "internal_port": p.internal_port,
+                "external_port": p.external_port,
+                "docker_port": p.docker_port,
+            }
             # Use docker_port as key if available, otherwise fallback to external_port
             key = p.docker_port if p.docker_port is not None else p.external_port
-            pod_mapping[key] = port_mapping
+            pod_mapping[key] = port_info
 
         return available_ports, pod_mapping
 
@@ -802,9 +795,8 @@ class DockerService:
                     extra=get_extra_info(default_extra),
                 )
                 logger.error(log_text)
-                
-                # Release ports reserved for this pod
-                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
+
+                # Port release now handled by backend
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -821,9 +813,8 @@ class DockerService:
                     extra=get_extra_info(default_extra),
                 )
                 logger.error(log_text)
-                
-                # Release ports reserved for this pod
-                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
+
+                # Port release now handled by backend
 
                 return FailedContainerRequest(
                     miner_hotkey=payload.miner_hotkey,
@@ -1174,9 +1165,8 @@ class DockerService:
 
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            
-            # Release ports reserved for this pod
-            await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
+
+            # Port release now handled by backend
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -1416,8 +1406,7 @@ class DockerService:
 
                 await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
 
-                # Release ports reserved for this pod
-                await self.port_mapping_dao.release_ports_for_pod(payload.pod_id)
+                # Port release now handled by backend
 
                 logger.info(
                     _m(

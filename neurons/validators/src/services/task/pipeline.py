@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import _m
-from daos.port_mapping_dao import PortMappingDao
 from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
 from services.redis_service import RedisService
@@ -31,7 +30,6 @@ class ContextServices:
     verifyx: VerifyXValidationService
     connectivity: ExecutorConnectivityService
     shell: InteractiveShellService
-    port_mapping: PortMappingDao
     score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
     backend: BackendClient
 
