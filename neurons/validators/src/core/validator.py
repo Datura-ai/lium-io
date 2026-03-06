@@ -17,7 +17,6 @@ from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
-from services.executor_connectivity import ContainerCleanupService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
@@ -80,7 +79,6 @@ class Validator:
                 ),
                 DindProbe(DindVerifier(ssh_service)),
             ),
-            cleanup_service=ContainerCleanupService(),
         )
 
         task_service = TaskService(
