@@ -10,9 +10,6 @@ from neurons.validators.src.services.task.pipeline import (
 )
 
 
-class DummyPortMapping:
-    async def get_successful_ports_count(self, executor_uuid: str) -> int:  # pragma: no cover
-        return 0
 
 
 class DummyScoreCalc:
@@ -64,7 +61,6 @@ def build_services(**overrides) -> ContextServices:
         verifyx=None,
         connectivity=None,
         shell=None,
-        port_mapping=DummyPortMapping(),
         score_calculator=DummyScoreCalc(),
         backend=None,
     )
