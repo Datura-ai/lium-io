@@ -77,42 +77,39 @@ class PortConnectivityCheck:
             msg += f" fail={len(result.failed_ports)}{fail_sample}"
 
         if result.status != "ok":
+            # Fetch fresh rental data from backend to ensure we have latest state
+            backend_client = ctx.services.backend
+            fresh_rented_data = await backend_client.get_all_rented_executors()
+
+            rental_info = {}
+            if fresh_rented_data:
+                # Update the state with fresh rental data
+                updated_state = replace(
+                    updated_state,
+                    rented_data=fresh_rented_data,
+                )
+                # Add rental context to help debug
+                rented_executor = fresh_rented_data.executors.get(ctx.executor.uuid) if fresh_rented_data else None
+                if rented_executor:
+                    rental_info = {
+                        "has_rental": True,
+                        "rental_pod_count": len(rented_executor.pods),
+                        "rental_port_count": len(rented_executor.rented_ports),
+                        "rental_pods": [p.container_name for p in rented_executor.pods],
+                    }
+
+            # Provide detailed error messages based on status
             if result.status == "no_ports":
-                details = "No port available for docker container"
+                details = "No ports available for docker container - all ports may be in use or misconfigured"
             elif result.status == "no_working_ports":
-                details = "No working ports found"
+                details = f"No working ports found - verified {len(result.failed_ports)} ports, all failed connectivity test"
             elif result.status == "skipped_rental_active":
-                # Rental container detected - fetch fresh rental data from backend
-                backend_client = ctx.services.backend
-                fresh_rented_data = await backend_client.get_all_rented_executors()
-
-                if fresh_rented_data:
-                    # Update the state with fresh rental data
-                    updated_state = replace(
-                        updated_state,
-                        rented_data=fresh_rented_data,
-                    )
-
-                # Rental is active, skip port check but don't fail
-                event = render_message(
-                    Msg.VERIFY_OK,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={"message": "Port check skipped - rental container active, updated context with fresh rental data"},
-                    extra=extra_info,
-                )
-                return CheckResult(
-                    passed=True,
-                    event=event,
-                    updates={
-                        "default_extra": {**extra, **extra_info},
-                        "state": updated_state,
-                    },
-                )
+                # This shouldn't happen anymore but provide clear message if it does
+                details = "Port verification was incorrectly skipped due to rental detection - this is a bug"
             elif result.status == "error":
-                details = f"Verification failed: {result.error}" if result.error else "Verification failed"
+                details = f"Port verification error: {result.error}" if result.error else "Port verification encountered an unexpected error"
             else:
-                details = "Verification failed"
+                details = f"Port verification failed with status: {result.status}"
 
             event = render_message(
                 Msg.VERIFY_FAILED,
@@ -123,13 +120,18 @@ class PortConnectivityCheck:
                     "message": msg,
                     "port_range": ctx.executor.port_range,
                     "port_mappings": ctx.executor.port_mappings,
+                    "verification_status": result.status,
+                    "total_ports_tested": len(result.successful_ports) + len(result.failed_ports),
+                    "successful_ports": len(result.successful_ports),
+                    "failed_ports": len(result.failed_ports),
+                    **rental_info,
                 },
                 extra=extra_info,
             )
             return CheckResult(
                 passed=False,
                 event=event,
-                updates={"default_extra": extra, "state": updated_state},
+                updates={"default_extra": {**extra, **extra_info}, "state": updated_state},
             )
 
         event = render_message(
