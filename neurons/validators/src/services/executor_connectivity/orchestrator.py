@@ -35,26 +35,6 @@ class ConnectivityOrchestrator:
         rented_ports: list[int] | None,
         ssh_client,
     ) -> PortVerificationResult:
-        # Check if any rental containers (pod_*) are running
-        try:
-            cmd = DockerCommand.ps_filter(f"^{POD_CONTAINER_PREFIX}")
-            result = await ssh_client.run(cmd)
-            if result.stdout and result.stdout.strip():
-                logger.info(f"Skipping port check - rental container exists: {result.stdout.strip()}")
-                return PortVerificationResult(
-                    selected_ports=tuple(),
-                    successful_ports=tuple(),
-                    failed_ports=tuple(),
-                    dind_port=None,
-                    dind_ok=False,
-                    sysbox_runtime=sysbox_runtime,
-                    status="skipped_rental_active",
-                    error="Rental container active, skipping port check"
-                )
-        except Exception as e:
-            logger.debug(f"Error checking for rental containers: {e}")
-            # Continue with port check if we can't determine container status
-
         rented = set(rented_ports) if rented_ports else set()
         ports = self.port_selector.select(executor_info, BATCH_PORT_VERIFICATION_SIZE, rented)
 
