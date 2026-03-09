@@ -30,6 +30,27 @@ class Settings(BaseSettings):
     RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
     RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
 
+    CHUTES_BRIDGE_ENABLED: bool = Field(env="CHUTES_BRIDGE_ENABLED", default=False)
+    CHUTES_BRIDGE_SSH_HOST: Optional[str] = Field(env="CHUTES_BRIDGE_SSH_HOST", default=None)
+    CHUTES_BRIDGE_SSH_PORT: int = Field(env="CHUTES_BRIDGE_SSH_PORT", default=22)
+    CHUTES_BRIDGE_SSH_USER: str = Field(env="CHUTES_BRIDGE_SSH_USER", default="lium-bridge")
+    CHUTES_BRIDGE_SSH_KEY_PATH: str = Field(
+        env="CHUTES_BRIDGE_SSH_KEY_PATH",
+        default="/run/secrets/chutes_bridge_key",
+    )
+    CHUTES_BRIDGE_CONNECT_TIMEOUT_SEC: int = Field(
+        env="CHUTES_BRIDGE_CONNECT_TIMEOUT_SEC",
+        default=10,
+    )
+    CHUTES_BRIDGE_COMMAND_TIMEOUT_SEC: int = Field(
+        env="CHUTES_BRIDGE_COMMAND_TIMEOUT_SEC",
+        default=300,
+    )
+    CHUTES_STAGING_AUTH_BYPASS: bool = Field(
+        env="CHUTES_STAGING_AUTH_BYPASS",
+        default=False,
+    )
+
     ENV: str = Field(env="ENV", default="dev")
 
     DB_URI: str = Field(env="DB_URI")

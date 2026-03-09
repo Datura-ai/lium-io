@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# bridgectl stop — stop K3s + Chutes
+set -euo pipefail
+
+# --- Constants ---
+
+BRIDGE_DIR="/opt/lium-bridge"
+STATE_FILE="${BRIDGE_DIR}/state.json"
+LOG_FILE="/var/log/lium-bridge.log"
+
+# --- Logging ---
+
+log() {
+    local level="$1"; shift
+    local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [${level}] $*"
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+    echo "${msg}" >&2
+}
+
+fail() {
+    local msg="$1"
+    log "FATAL" "${msg}"
+    python3 -c "
+import json, sys
+state = 'error'
+try:
+    state = json.load(open('${STATE_FILE}'))['state']
+except: pass
+json.dump({'ok': False, 'state': state, 'error': sys.argv[1]}, sys.stdout)
+" "${msg}"
+    echo ""
+    exit 1
+}
+
+read_state() {
+    python3 -c "import json; print(json.load(open('${STATE_FILE}'))['state'])" 2>/dev/null || echo "unknown"
+}
+
+save_state() {
+    local state="$1"
+    python3 -c "
+import json, sys
+s = {'state': sys.argv[1], 'gpu_verified': False, 'node_name': None, 'last_error': None}
+try:
+    old = json.load(open('${STATE_FILE}'))
+    for k in ('gpu_verified', 'node_name'):
+        if k in old: s[k] = old[k]
+except: pass
+json.dump(s, open('${STATE_FILE}', 'w'))
+" "${state}"
+}
+
+# =============================================================================
+# STEP 1: VALIDATE STATE
+# =============================================================================
+log "INFO" "Step 1: Validating state..."
+
+[[ -f "${STATE_FILE}" ]] || fail "State file not found — run setup-chutes first"
+
+CURRENT_STATE=$(read_state)
+
+# Idempotency: if already stopped, verify and return success
+if [[ "${CURRENT_STATE}" == "stopped" ]]; then
+    log "INFO" "Already in 'stopped' state, verifying..."
+    if ! systemctl is-active k3s >/dev/null 2>&1; then
+        log "INFO" "Already stopped, K3s inactive"
+        cat <<EOF
+{
+  "ok": true,
+  "state": "stopped",
+  "chutes": { "k3s_active": false, "agent_healthy": false }
+}
+EOF
+        exit 0
+    fi
+    log "WARN" "State says stopped but K3s still active, proceeding with stop"
+fi
+
+if [[ "${CURRENT_STATE}" != "running" && "${CURRENT_STATE}" != "stopped" && "${CURRENT_STATE}" != "installed_stopped" ]]; then
+    fail "Cannot stop: state is '${CURRENT_STATE}', expected 'running' or 'installed_stopped'"
+fi
+
+# =============================================================================
+# STEP 2: DELETE CHUTE DEPLOYMENTS
+# =============================================================================
+log "INFO" "Step 2: Deleting chute workload pods..."
+
+FORCED_PREEMPTION="false"
+
+if systemctl is-active k3s >/dev/null 2>&1; then
+    if k3s kubectl get pods -n chutes -l app.kubernetes.io/managed-by=gepetto --no-headers 2>/dev/null | grep -q .; then
+        log "INFO" "Terminating chute workload pods (60s grace period)..."
+        if ! k3s kubectl delete pods -n chutes -l app.kubernetes.io/managed-by=gepetto \
+            --grace-period=60 --timeout=90s >> "${LOG_FILE}" 2>&1; then
+            FORCED_PREEMPTION="true"
+            log "WARN" "Grace period exceeded, pods force-killed (forced_preemption=true)"
+        fi
+    else
+        log "INFO" "No chute workload pods found, skipping"
+    fi
+else
+    log "INFO" "K3s not active, skipping pod deletion"
+fi
+
+# =============================================================================
+# STEP 3: STOP K3S
+# =============================================================================
+log "INFO" "Step 3: Stopping K3s..."
+
+if systemctl is-active k3s >/dev/null 2>&1; then
+    systemctl stop k3s
+
+    for i in $(seq 1 12); do
+        if ! systemctl is-active k3s >/dev/null 2>&1; then
+            break
+        fi
+        sleep 5
+    done
+
+    if systemctl is-active k3s >/dev/null 2>&1; then
+        fail "K3s did not stop within 1 min"
+    fi
+
+    log "INFO" "K3s stopped"
+else
+    log "INFO" "K3s already stopped, skipping"
+fi
+
+# =============================================================================
+# STEP 4: SAVE STATE + OUTPUT
+# =============================================================================
+log "INFO" "Step 4: Saving state..."
+
+save_state "stopped"
+
+log "INFO" "Stop complete — Chutes stopped (forced_preemption=${FORCED_PREEMPTION})"
+
+cat <<EOF
+{
+  "ok": true,
+  "state": "stopped",
+  "chutes": { "k3s_active": false, "agent_healthy": false },
+  "forced_preemption": ${FORCED_PREEMPTION}
+}
+EOF

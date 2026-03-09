@@ -24,6 +24,14 @@ class MinerMiddleware(BaseHTTPMiddleware):
         # Skip middleware for endpoints with their own signature verification
         if request.url.path in ["/hardware_utilization", "/ping"]:
             return await call_next(request)
+
+        # Staging-only bypass for Chutes relay endpoints.
+        if settings.CHUTES_STAGING_AUTH_BYPASS and request.url.path in [
+            "/chutes/install",
+            "/chutes/start",
+            "/chutes/stop",
+        ]:
+            return await call_next(request)
         
         # Skip for specific container hardware utilization endpoint
         # Pattern: /containers/{container_name}

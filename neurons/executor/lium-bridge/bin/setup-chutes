@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# bridgectl setup — install K3s + Chutes stack on a GPU machine
+# Expects: NVIDIA drivers + Docker already installed (from Lium executor)
+# Usage: setup-chutes --validator-hotkey <ss58> --hotkey-ss58 <ss58> --hotkey-seed <hex>
+set -euo pipefail
+
+# --- Constants ---
+
+BRIDGE_DIR="/opt/lium-bridge"
+STATE_FILE="${BRIDGE_DIR}/state.json"
+LOG_FILE="/var/log/lium-bridge.log"
+KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+
+K3S_VERSION="v1.33.1+k3s1"
+HELM_VERSION="v3.17.3"
+REGISTRY_PORT="30500"
+AGENT_PORT="32000"
+
+# --- Logging ---
+
+log() {
+    local level="$1"; shift
+    local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [${level}] $*"
+    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+    echo "${msg}" >&2
+}
+
+fail() {
+    local msg="$1"
+    log "FATAL" "${msg}"
+    python3 -c "
+import json, sys
+state = 'error'
+try:
+    state = json.load(open('${STATE_FILE}'))['state']
+except: pass
+json.dump({'ok': False, 'state': state, 'error': sys.argv[1]}, sys.stdout)
+" "${msg}"
+    echo ""
+    exit 1
+}
+
+save_state() {
+    local state="$1"
+    python3 -c "
+import json, sys
+s = {'state': sys.argv[1], 'gpu_verified': False, 'node_name': None, 'last_error': None}
+try:
+    old = json.load(open('${STATE_FILE}'))
+    for k in ('gpu_verified', 'node_name'):
+        if k in old: s[k] = old[k]
+except: pass
+json.dump(s, open('${STATE_FILE}', 'w'))
+" "${state}"
+}
+
+# --- Parse args ---
+
+VALIDATOR_HOTKEY=""
+HOTKEY_SS58=""
+HOTKEY_SEED=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --validator-hotkey) VALIDATOR_HOTKEY="$2"; shift 2 ;;
+        --hotkey-ss58)      HOTKEY_SS58="$2"; shift 2 ;;
+        --hotkey-seed)      HOTKEY_SEED="$2"; shift 2 ;;
+        *) fail "Unknown argument: $1" ;;
+    esac
+done
+
+[[ -z "${VALIDATOR_HOTKEY}" ]] && fail "Missing --validator-hotkey"
+[[ -z "${HOTKEY_SS58}" ]]      && fail "Missing --hotkey-ss58"
+[[ -z "${HOTKEY_SEED}" ]]      && fail "Missing --hotkey-seed"
+
+# Strip 0x prefix from seed if present
+HOTKEY_SEED="${HOTKEY_SEED#0x}"
+
+save_state "installing"
+
+# =============================================================================
+# STEP 1: PREREQUISITES CHECK
+# =============================================================================
+log "INFO" "Step 1: Checking prerequisites..."
+
+command -v nvidia-smi &>/dev/null || fail "nvidia-smi not found"
+nvidia-smi &>/dev/null           || fail "nvidia-smi failed — GPU driver not working"
+
+systemctl is-active docker &>/dev/null || fail "Docker is not running"
+
+DISK_FREE=$(df -BG / | tail -1 | awk '{print $4}' | tr -d 'G')
+[[ "${DISK_FREE}" -lt 100 ]] && log "WARN" "Only ${DISK_FREE}GB free (recommended: 200GB+)"
+
+# Check ports not already in use (skip if K3s is already installed — idempotent re-run)
+if ! command -v k3s &>/dev/null; then
+    for port in 6443 ${AGENT_PORT}; do
+        if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+            fail "Port ${port} is already in use"
+        fi
+    done
+fi
+
+# Install missing packages
+log "INFO" "Installing required packages..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq jq curl socat conntrack openssl &>/dev/null
+
+# Install nvidia-container-toolkit if missing
+if ! command -v nvidia-ctk &>/dev/null; then
+    log "INFO" "Installing nvidia-container-toolkit..."
+    apt-get install -y -qq nvidia-container-toolkit &>/dev/null \
+        || fail "Failed to install nvidia-container-toolkit"
+fi
+
+log "INFO" "Prerequisites OK"
+
+# =============================================================================
+# STEP 2: INSTALL HELM
+# =============================================================================
+if ! command -v helm &>/dev/null; then
+    log "INFO" "Step 2: Installing Helm ${HELM_VERSION}..."
+    ARCH=$(uname -m)
+    HELM_ARCH="amd64"
+    [[ "${ARCH}" == "aarch64" || "${ARCH}" == "arm64" ]] && HELM_ARCH="arm64"
+
+    curl -sfL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz" -o /tmp/helm.tar.gz
+    tar -xzf /tmp/helm.tar.gz -C /tmp
+    mv /tmp/linux-${HELM_ARCH}/helm /usr/local/bin/helm
+    chmod 755 /usr/local/bin/helm
+    rm -rf /tmp/helm.tar.gz /tmp/linux-${HELM_ARCH}
+
+    helm version --short >> "${LOG_FILE}" 2>&1 || fail "Helm install failed"
+    log "INFO" "Helm installed"
+else
+    log "INFO" "Step 2: Helm already installed, skipping"
+fi
+
+# =============================================================================
+# STEP 3: INSTALL K3S (without starting)
+# =============================================================================
+log "INFO" "Step 3: Installing K3s ${K3S_VERSION}..."
+
+# Detect the local node IP (for K3s binding)
+NODE_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1)
+[[ -z "${NODE_IP}" ]] && NODE_IP=$(hostname -I | awk '{print $1}')
+[[ -z "${NODE_IP}" ]] && fail "Could not detect node IP"
+log "INFO" "Detected local node IP: ${NODE_IP}"
+
+# Detect the public IP (for external access: kubeconfig, TLS SAN, node label)
+PUBLIC_IP=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || true)
+if [[ -z "${PUBLIC_IP}" ]]; then
+    PUBLIC_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || true)
+fi
+if [[ -n "${PUBLIC_IP}" && "${PUBLIC_IP}" != "${NODE_IP}" ]]; then
+    log "INFO" "Detected public IP: ${PUBLIC_IP}"
+    EXTERNAL_IP="${PUBLIC_IP}"
+    TLS_SAN_EXTRA=("--tls-san" "${PUBLIC_IP}")
+else
+    log "WARN" "Could not detect public IP or same as local, using local IP for external access"
+    EXTERNAL_IP="${NODE_IP}"
+    TLS_SAN_EXTRA=()
+fi
+
+curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_SKIP_START=true \
+    INSTALL_K3S_VERSION="${K3S_VERSION}" \
+    sh -s - \
+        --write-kubeconfig-mode 644 \
+        --disable servicelb \
+        --disable traefik \
+        --node-ip "${NODE_IP}" \
+        --advertise-address "${NODE_IP}" \
+        --tls-san "${NODE_IP}" \
+        "${TLS_SAN_EXTRA[@]}" \
+    || fail "K3s install failed"
+
+log "INFO" "K3s binary installed"
+
+# =============================================================================
+# STEP 4: CONFIGURE K3S (registries, sysctl, kernel modules)
+# =============================================================================
+log "INFO" "Step 4: Configuring K3s..."
+
+REGISTRY_HOSTNAME="$(echo "${VALIDATOR_HOTKEY}" | tr '[:upper:]' '[:lower:]').localregistry.chutes.ai"
+
+mkdir -p /etc/rancher/k3s
+cat > /etc/rancher/k3s/registries.yaml <<REGISTRIES
+mirrors:
+  "${REGISTRY_HOSTNAME}:${REGISTRY_PORT}":
+    endpoint:
+      - "http://${REGISTRY_HOSTNAME}:${REGISTRY_PORT}"
+
+configs:
+  "${REGISTRY_HOSTNAME}:${REGISTRY_PORT}":
+    tls:
+      insecure_skip_verify: true
+REGISTRIES
+
+# Load kernel modules
+modprobe br_netfilter  2>/dev/null || true
+modprobe overlay       2>/dev/null || true
+
+cat > /etc/modules-load.d/kubernetes.conf <<'EOF'
+br_netfilter
+overlay
+EOF
+
+# Sysctl
+sysctl -w net.bridge.bridge-nf-call-iptables=1  2>/dev/null || true
+sysctl -w net.bridge.bridge-nf-call-ip6tables=1 2>/dev/null || true
+sysctl -w net.ipv4.ip_forward=1                 2>/dev/null || true
+
+cat > /etc/sysctl.d/99-kubernetes.conf <<'EOF'
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOF
+
+# Disable swap (K3s requirement)
+swapoff -a 2>/dev/null || true
+sed -i '/\sswap\s/s/^/#/' /etc/fstab 2>/dev/null || true
+
+log "INFO" "K3s configured"
+
+# =============================================================================
+# STEP 5: START K3S
+# =============================================================================
+log "INFO" "Step 5: Starting K3s..."
+
+systemctl daemon-reload
+systemctl start k3s
+systemctl enable k3s
+
+# Wait for kubeconfig
+log "INFO" "Waiting for kubeconfig..."
+for i in $(seq 1 60); do
+    [[ -f "${KUBECONFIG}" ]] && break
+    sleep 2
+done
+[[ -f "${KUBECONFIG}" ]] || fail "Timeout waiting for ${KUBECONFIG}"
+
+# Wait for node Ready
+log "INFO" "Waiting for node Ready..."
+for i in $(seq 1 60); do
+    if k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; then
+        break
+    fi
+    sleep 5
+done
+k3s kubectl get nodes 2>/dev/null | grep -q " Ready" || fail "Node did not become Ready"
+
+# Label node with external IP (required for GraVal verification and control node access)
+NODE_NAME=$(k3s kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+k3s kubectl label nodes "${NODE_NAME}" "chutes/external-ip=${EXTERNAL_IP}" --overwrite
+log "INFO" "K3s node is Ready (labeled with external-ip=${NODE_IP})"
+
+# =============================================================================
+# STEP 6: CONFIGURE NVIDIA RUNTIME FOR K3S CONTAINERD
+# =============================================================================
+log "INFO" "Step 6: Configuring NVIDIA runtime for K3s containerd..."
+
+CONTAINERD_CONFIG="/var/lib/rancher/k3s/agent/etc/containerd/config.toml"
+CONTAINERD_TMPL="${CONTAINERD_CONFIG}.tmpl"
+
+# Wait for containerd config to appear
+for i in $(seq 1 30); do
+    [[ -f "${CONTAINERD_CONFIG}" ]] && break
+    sleep 2
+done
+[[ -f "${CONTAINERD_CONFIG}" ]] || fail "K3s containerd config not found"
+
+# Create template from config if not exists
+if [[ ! -f "${CONTAINERD_TMPL}" ]]; then
+    cp "${CONTAINERD_CONFIG}" "${CONTAINERD_TMPL}"
+fi
+
+# Configure both docker and k3s containerd
+nvidia-ctk runtime configure --runtime=docker --set-as-default 2>/dev/null || true
+nvidia-ctk runtime configure --runtime=containerd \
+    --config="${CONTAINERD_TMPL}" \
+    || fail "nvidia-ctk containerd configure failed"
+
+# Restart K3s to pick up NVIDIA runtime
+log "INFO" "Restarting K3s with NVIDIA runtime..."
+systemctl restart k3s
+
+# Wait for node Ready again
+for i in $(seq 1 60); do
+    if k3s kubectl get nodes 2>/dev/null | grep -q " Ready"; then
+        break
+    fi
+    sleep 5
+done
+k3s kubectl get nodes 2>/dev/null | grep -q " Ready" || fail "Node not Ready after NVIDIA runtime config"
+log "INFO" "NVIDIA runtime configured"
+
+# =============================================================================
+# STEP 7: CREATE NAMESPACES + HOST MOUNTS + DEVICE PERMISSIONS
+# =============================================================================
+log "INFO" "Step 7: Creating namespaces and host mounts..."
+
+k3s kubectl create namespace chutes      2>/dev/null || true
+k3s kubectl create namespace monitoring  2>/dev/null || true
+k3s kubectl create namespace gpu-operator 2>/dev/null || true
+
+# Host mount directories (pods run as UID 1000)
+mkdir -p /var/snap/cache
+chown 1000:1000 /var/snap/cache
+chmod 0755 /var/snap/cache
+
+mkdir -p /var/lib/chutes/agent
+chown -R 1000:1000 /var/lib/chutes
+chmod -R 0755 /var/lib/chutes
+
+# NVIDIA device permissions
+chmod 0666 /dev/nvidia* 2>/dev/null || true
+chmod 0666 /dev/nvidiactl 2>/dev/null || true
+chmod 0666 /dev/nvidia-uvm 2>/dev/null || true
+chmod 0666 /dev/nvidia-uvm-tools 2>/dev/null || true
+
+# Create /dev/char symlinks for nvidia devices
+ls /dev/nvidia? 2>/dev/null | grep -E 'nvidia[0-9]' | while read -r dev; do
+    MAJ=$(stat -c '%t' "${dev}" 2>/dev/null | xargs printf '%d' 2>/dev/null) || continue
+    MIN=$(stat -c '%T' "${dev}" 2>/dev/null | xargs printf '%d' 2>/dev/null) || continue
+    ln -sf "${dev}" "/dev/char/${MAJ}:${MIN}" 2>/dev/null || true
+done
+
+log "INFO" "Namespaces and host mounts created"
+
+# =============================================================================
+# STEP 8: GPU OPERATOR (Helm)
+# =============================================================================
+log "INFO" "Step 8: Installing GPU Operator..."
+
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia 2>/dev/null || true
+helm repo update
+
+helm upgrade --install gpu-operator nvidia/gpu-operator \
+    --namespace gpu-operator \
+    --kubeconfig "${KUBECONFIG}" \
+    --create-namespace \
+    --set driver.enabled=false \
+    --set toolkit.enabled=false \
+    --set operator.upgradeCRD=false \
+    --wait --timeout 5m \
+    || fail "GPU Operator helm install failed"
+
+log "INFO" "GPU Operator installed"
+
+# =============================================================================
+# STEP 9: DEPLOY CHUTES GPU CHARTS (Helm)
+# =============================================================================
+# NOTE: RBAC (miner ClusterRole/RoleBinding) is included in the chutes-miner-gpu chart,
+# so we do NOT apply miner-rbac.yml separately — it would conflict with Helm ownership.
+log "INFO" "Step 9: Deploying Chutes GPU charts..."
+
+helm repo add chutes https://chutesai.github.io/chutes-miner 2>/dev/null || true
+helm repo update
+
+helm upgrade --install chutes chutes/chutes-miner-gpu \
+    --namespace chutes \
+    --kubeconfig "${KUBECONFIG}" \
+    --create-namespace \
+    --set multiCluster=true \
+    --set-string minerCredentials.ss58Address="${HOTKEY_SS58}" \
+    --set-string minerCredentials.secretSeed="${HOTKEY_SEED}" \
+    --wait --timeout 10m \
+    || fail "Chutes GPU charts helm install failed"
+
+# Wait for agent pod to be running
+log "INFO" "Waiting for chutes-agent pod..."
+for i in $(seq 1 60); do
+    if k3s kubectl get pods -n chutes 2>/dev/null | grep -E "agent.*Running"; then
+        break
+    fi
+    sleep 5
+done
+
+# Check agent API is responding
+for i in $(seq 1 30); do
+    if curl -sf "http://localhost:${AGENT_PORT}" &>/dev/null || \
+       curl -sf "http://localhost:${AGENT_PORT}/health" &>/dev/null; then
+        break
+    fi
+    sleep 2
+done
+
+log "INFO" "Chutes GPU charts deployed"
+
+# =============================================================================
+# STEP 10: SETUP MINER KUBECONFIG (for control node access via add-node)
+# =============================================================================
+log "INFO" "Step 10: Generating miner kubeconfig..."
+
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "${TEMP_DIR}"' EXIT
+
+CERT_NAME="miner"
+CERT_ORG="chutes"
+NAMESPACE="default"
+
+# Check if kubeconfig secret already exists
+if k3s kubectl get secret "${CERT_NAME}-kubeconfig" -n "${NAMESPACE}" &>/dev/null; then
+    log "INFO" "Miner kubeconfig secret already exists, skipping"
+else
+    # Generate RSA key
+    openssl genrsa -out "${TEMP_DIR}/${CERT_NAME}.key" 2048 2>/dev/null
+
+    # Generate CSR
+    openssl req -new \
+        -key "${TEMP_DIR}/${CERT_NAME}.key" \
+        -out "${TEMP_DIR}/${CERT_NAME}.csr" \
+        -subj "/CN=${CERT_NAME}/O=${CERT_ORG}" \
+        2>/dev/null
+
+    CSR_B64=$(base64 -w 0 < "${TEMP_DIR}/${CERT_NAME}.csr")
+
+    # Delete old CSR if exists
+    k3s kubectl delete csr "${CERT_NAME}-csr" 2>/dev/null || true
+
+    # Submit CSR to K8s
+    k3s kubectl apply -f - <<CSRYAML
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: ${CERT_NAME}-csr
+spec:
+  request: ${CSR_B64}
+  signerName: kubernetes.io/kube-apiserver-client
+  usages:
+    - client auth
+CSRYAML
+
+    # Approve CSR
+    k3s kubectl certificate approve "${CERT_NAME}-csr"
+
+    # Wait for certificate to be issued
+    for i in $(seq 1 30); do
+        CERT_DATA=$(k3s kubectl get csr "${CERT_NAME}-csr" -o jsonpath='{.status.certificate}' 2>/dev/null)
+        [[ -n "${CERT_DATA}" ]] && break
+        sleep 2
+    done
+    [[ -z "${CERT_DATA}" ]] && fail "Timeout waiting for certificate to be issued"
+
+    # Save cert
+    echo "${CERT_DATA}" | base64 -d > "${TEMP_DIR}/${CERT_NAME}.crt"
+
+    # Get cluster CA and API server from admin kubeconfig
+    CLUSTER_CA=$(k3s kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+    API_PORT=$(k3s kubectl config view --raw -o jsonpath='{.clusters[0].cluster.server}' | grep -oP ':\K[0-9]+$')
+
+    CERT_B64=$(base64 -w 0 < "${TEMP_DIR}/${CERT_NAME}.crt")
+    KEY_B64=$(base64 -w 0 < "${TEMP_DIR}/${CERT_NAME}.key")
+    HOSTNAME=$(hostname)
+
+    # Build kubeconfig
+    MINER_KUBECONFIG=$(cat <<KUBECFG
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: ${CLUSTER_CA}
+    server: https://${EXTERNAL_IP}:${API_PORT}
+  name: ${HOSTNAME}
+contexts:
+- context:
+    cluster: ${HOSTNAME}
+    user: ${HOSTNAME}
+    namespace: ${NAMESPACE}
+  name: ${HOSTNAME}
+current-context: ${CERT_NAME}
+users:
+- name: ${HOSTNAME}
+  user:
+    client-certificate-data: ${CERT_B64}
+    client-key-data: ${KEY_B64}
+KUBECFG
+)
+
+    KC_B64=$(echo "${MINER_KUBECONFIG}" | base64 -w 0)
+
+    # Store as secret
+    k3s kubectl apply -f - <<SECRETYAML
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${CERT_NAME}-kubeconfig
+  namespace: ${NAMESPACE}
+type: Opaque
+data:
+  kubeconfig: ${KC_B64}
+SECRETYAML
+
+    # Cleanup CSR from cluster
+    k3s kubectl delete csr "${CERT_NAME}-csr" 2>/dev/null || true
+
+    log "INFO" "Miner kubeconfig stored as secret '${CERT_NAME}-kubeconfig' in namespace '${NAMESPACE}'"
+fi
+
+# =============================================================================
+# STEP 11: SAVE STATE + SUCCESS
+# =============================================================================
+log "INFO" "Step 11: Saving state..."
+
+save_state "installed_stopped"
+
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr -d '[:space:]' || echo "unknown")
+GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
+
+log "INFO" "Setup complete!"
+
+cat <<RESULT
+{
+  "ok": true,
+  "state": "installed_stopped",
+  "node_ip": "${NODE_IP}",
+  "external_ip": "${EXTERNAL_IP}",
+  "agent_port": ${AGENT_PORT},
+  "gpu": "${GPU_NAME}",
+  "gpu_count": ${GPU_COUNT},
+  "message": "K3s + Chutes stack installed. Run 'chutes-miner add-node' from control node while K3s is up."
+}
+RESULT

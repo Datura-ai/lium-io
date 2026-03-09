@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# bridgectl — dispatcher for lium-bridge commands
+# All commands return JSON. No arbitrary shell access.
+
+set -euo pipefail
+
+BRIDGE_DIR="/opt/lium-bridge"
+BIN_DIR="${BRIDGE_DIR}/bin"
+STATE_FILE="${BRIDGE_DIR}/state.json"
+LOG_FILE="/var/log/lium-bridge.log"
+
+# --- Helpers ---
+
+log() {
+    local level="$1"; shift
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [${level}] $*" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+json_output() {
+    # Usage: json_output '{"ok": true, ...}'
+    echo "$1"
+}
+
+fail_json() {
+    local msg="$1"
+    local state
+    state=$(read_state)
+    log "ERROR" "${msg}"
+    python3 -c "import json,sys; json.dump({'ok':False,'state':sys.argv[1],'error':sys.argv[2]}, sys.stdout)" "${state}" "${msg}"
+    echo ""
+    exit 1
+}
+
+read_state() {
+    if [[ -f "${STATE_FILE}" ]]; then
+        python3 -c "import json; print(json.load(open('${STATE_FILE}'))['state'])" 2>/dev/null || echo "unknown"
+    else
+        echo "not_installed"
+    fi
+}
+
+# --- SSH ForceCommand support ---
+# When called via SSH ForceCommand, the original command is in SSH_ORIGINAL_COMMAND
+if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+    # Parse safely: read -ra prevents glob expansion and honours quoting
+    read -ra _args <<< "${SSH_ORIGINAL_COMMAND}"
+    set -- "${_args[@]}"
+    # Strip "bridgectl" prefix if present
+    if [[ "${1:-}" == "bridgectl" ]]; then
+        shift
+    fi
+fi
+
+# --- Dispatch ---
+
+VERB="${1:-}"
+
+case "${VERB}" in
+    setup|start|stop|status|uninstall)
+        SCRIPT="${BIN_DIR}/${VERB}-chutes"
+        if [[ "${VERB}" == "status" ]]; then
+            SCRIPT="${BIN_DIR}/status"
+        fi
+        if [[ ! -x "${SCRIPT}" ]]; then
+            fail_json "Script not found: ${SCRIPT}"
+        fi
+        shift
+        log "INFO" "Running: ${VERB} $*"
+        exec sudo "${SCRIPT}" "$@"
+        ;;
+    "")
+        fail_json "No command specified. Usage: bridgectl {setup|start|stop|status|uninstall}"
+        ;;
+    *)
+        fail_json "Unknown command: ${VERB}. Usage: bridgectl {setup|start|stop|status|uninstall}"
+        ;;
+esac
