@@ -135,7 +135,7 @@ cmd_enable() {
     # --- Step 6: Update .env ---
     step "6/6  Update .env"
 
-    bash "${EXECUTOR_DIR}/chutes-install.sh" \
+    bash "${SCRIPT_DIR}/chutes-install.sh" \
         --env-file "${ENV_FILE}" \
         --stage-secrets-dir "${STAGE_SECRETS}" \
         --bridge-host "host.docker.internal" \
