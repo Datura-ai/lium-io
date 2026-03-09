@@ -110,8 +110,8 @@ class DummyConnectivityService:
         (False, False, True, True, True, None, True, Msg.VERIFY_OK.reason),
         # Verification fails
         (False, False, True, False, False, None, False, Msg.VERIFY_FAILED.reason),
-        # Rental container active - skip port check but pass
-        (False, False, True, False, False, "skipped_rental_active", True, Msg.VERIFY_OK.reason),
+        # Rental container active - should now fail with proper error message
+        (False, False, True, False, False, "skipped_rental_active", False, Msg.VERIFY_FAILED.reason),
     ],
 )
 @pytest.mark.asyncio
