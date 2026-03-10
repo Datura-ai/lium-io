@@ -3,6 +3,7 @@ import random
 from datetime import datetime
 import logging
 import time
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4, UUID
 import shlex
@@ -61,6 +62,7 @@ REPOSITORIES = [
 ]
 
 LOG_STREAM_INTERVAL = 5  # 5 seconds
+IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 
 DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
@@ -83,6 +85,9 @@ class DockerService:
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
         self.is_realtime_logging = False
+
+    def _ssh_bootstrap_script_path(self) -> Path:
+        return Path(__file__).resolve().parent / "assets" / "sshd_bootstrap.sh"
 
     async def _prepare_known_hosts_policy(
         self,
@@ -499,29 +504,107 @@ class DockerService:
         container_name: str,
         log_tag: str,
         log_extra: dict,
-    ) -> None:
-        # Always install openssh-server (idempotent - apt will skip if already installed)
-        command = f"/usr/bin/docker exec {container_name} sh -c 'apt-get update && apt-get install -y openssh-server'"
-        await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text="Installing openssh-server",
-            log_extra=log_extra,
-            raise_exception=False
-        )
+    ) -> bool:
+        local_script_path = self._ssh_bootstrap_script_path()
+        remote_script_path = f"/tmp/{container_name}-sshd-bootstrap-{uuid4().hex}.sh"
+        container_path = IN_CONTAINER_SSH_BOOTSTRAP_PATH
+        success = True
 
-        # Start SSH service
-        # logger.info(_m("Starting SSH service", extra={**log_extra, "container_name": container_name}))
-        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A && mkdir -p /run/sshd && mkdir -p /root/.ssh && chmod 700 /root/.ssh && /usr/sbin/sshd'"
-        await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text="Starting SSH daemon",
-            log_extra=log_extra,
-            raise_exception=False
-        )
+        try:
+            logger.info(
+                _m(
+                    "Uploading SSH bootstrap script to executor host",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "local_script_path": str(local_script_path),
+                        "remote_script_path": remote_script_path,
+                    }),
+                ),
+            )
+            async with ssh_client.start_sftp_client() as sftp:
+                await sftp.put(str(local_script_path), remote_script_path)
+        except Exception as exc:
+            await self.stream_log("Failed to upload SSH bootstrap script", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to upload SSH bootstrap script",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "remote_script_path": remote_script_path,
+                        "error": str(exc),
+                    }),
+                ),
+                exc_info=True,
+            )
+            return False
+
+        try:
+            container_target = shlex.quote(f"{container_name}:{container_path}")
+            remote_script_quoted = shlex.quote(remote_script_path)
+            container_path_quoted = shlex.quote(container_path)
+            container_name_quoted = shlex.quote(container_name)
+
+            command = f"/usr/bin/docker cp {remote_script_quoted} {container_target}"
+            status, _ = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Copying SSH bootstrap script to container",
+                log_extra=log_extra,
+                raise_exception=False,
+            )
+            success = success and status
+
+            command = f"/usr/bin/docker exec {container_name_quoted} sh -c 'chmod +x {container_path_quoted}'"
+            status, _ = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Making SSH bootstrap script executable",
+                log_extra=log_extra,
+                raise_exception=False,
+            )
+            success = success and status
+
+            command = f"/usr/bin/docker exec {container_name_quoted} sh {container_path_quoted}"
+            status, _ = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Bootstrapping SSH daemon and watchdog",
+                log_extra=log_extra,
+                raise_exception=False,
+            )
+            success = success and status
+
+            if not success:
+                logger.warning(
+                    _m(
+                        "SSH bootstrap script finished with errors",
+                        extra=get_extra_info({**log_extra, "container_name": container_name}),
+                    )
+                )
+
+            return success
+        finally:
+            cleanup_command = f"rm -f {shlex.quote(remote_script_path)}"
+            try:
+                await ssh_client.run(cleanup_command)
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Failed to remove staged SSH bootstrap script from executor host",
+                        extra=get_extra_info({
+                            **log_extra,
+                            "container_name": container_name,
+                            "remote_script_path": remote_script_path,
+                            "error": str(exc),
+                        }),
+                    ),
+                    exc_info=True,
+                )
 
     async def create_s3fs_volume(
         self,
@@ -1318,6 +1401,21 @@ class DockerService:
             known_hosts=known_hosts_policy,
         ) as ssh_client:
             await ssh_client.run(f"/usr/bin/docker start {payload.container_name}")
+            ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service(
+                ssh_client=ssh_client,
+                container_name=payload.container_name,
+                log_tag=f"start_container_{payload.pod_id}",
+                log_extra=default_extra,
+            )
+            if not ssh_bootstrap_ok:
+                logger.warning(
+                    _m(
+                        "Docker container started but SSH bootstrap did not complete cleanly",
+                        extra=get_extra_info(
+                            {**default_extra, "container_name": payload.container_name}
+                        ),
+                    )
+                )
             logger.info(
                 _m(
                     "Started Docker Container",
@@ -1939,5 +2037,4 @@ class DockerService:
         extra_ports = [max_port + i for i in range(extra_count)]
 
         return list(PREFERRED_POD_PORTS) + extra_ports
-
 
