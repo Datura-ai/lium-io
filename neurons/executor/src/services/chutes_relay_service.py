@@ -207,18 +207,33 @@ class ChutesRelayService:
                 f"Chutes bridge command '{verb}' failed: {self._summarize_stderr(stderr)}"
             )
 
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError as exc:
+        payload = self._extract_json(stdout)
+        if payload is None:
             raise ChutesMalformedResponseError(
                 f"Chutes bridge command '{verb}' returned malformed JSON"
-            ) from exc
+            )
 
         if not isinstance(payload, dict):
             raise ChutesMalformedResponseError(
                 f"Chutes bridge command '{verb}' returned non-object JSON"
             )
         return payload
+
+    @staticmethod
+    def _extract_json(stdout: str) -> dict[str, Any] | None:
+        """Extract JSON object from stdout that may contain non-JSON prefix (helm, k3s, etc.)."""
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError:
+            pass
+        # Find the last '{' that starts a line — bridge scripts output JSON at the end
+        for i in range(len(stdout) - 1, -1, -1):
+            if stdout[i] == "{" and (i == 0 or stdout[i - 1] == "\n"):
+                try:
+                    return json.loads(stdout[i:])
+                except json.JSONDecodeError:
+                    continue
+        return None
 
     def _is_transport_error(self, returncode: int, stderr: str) -> bool:
         if returncode == 255:
