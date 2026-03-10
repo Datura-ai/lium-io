@@ -62,7 +62,7 @@ cmd_enable() {
         info "lium-bridge already installed, skipping"
     else
         local installer="${SCRIPT_DIR}/install_chutes_bridge.sh"
-        if [[ ! -x "${installer}" ]]; then
+        if [[ ! -f "${installer}" ]]; then
             err "Installer not found: ${installer}"
         fi
         info "Running install_chutes_bridge.sh ..."
