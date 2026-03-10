@@ -169,6 +169,7 @@ def chutes_install(
             validator_hotkey=payload.validator_hotkey,
             hotkey_ss58=payload.hotkey_ss58,
             hotkey_seed=payload.hotkey_seed,
+            node_name=payload.node_name,
         )
     except Exception as exc:
         logger.error(_m("Chutes install failed", extra={"error": str(exc)}))

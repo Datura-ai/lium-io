@@ -72,7 +72,13 @@ class ChutesRelayService:
             command.extend(args)
         return command
 
-    def install(self, validator_hotkey: str, hotkey_ss58: str, hotkey_seed: str) -> dict[str, Any]:
+    def install(
+        self,
+        validator_hotkey: str,
+        hotkey_ss58: str,
+        hotkey_seed: str,
+        node_name: str,
+    ) -> dict[str, Any]:
         return self._run_bridge_command(
             "setup",
             [
@@ -82,6 +88,8 @@ class ChutesRelayService:
                 hotkey_ss58,
                 "--hotkey-seed",
                 hotkey_seed,
+                "--node-name",
+                node_name,
             ],
             timeout=self.INSTALL_TIMEOUT_SEC,
         )
