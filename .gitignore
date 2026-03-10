@@ -180,3 +180,5 @@ notebooks/
 config_override.py
 .cursor
 .claude
+
+CLAUDE.md
