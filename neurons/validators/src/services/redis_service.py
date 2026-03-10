@@ -381,16 +381,16 @@ class RedisService:
         entry = json.dumps(
             {"upload": upload_speed, "download": download_speed, "ts": int(time.time())}
         )
-        async with self.acquire_executor_lock(executor_id):
-            await self.redis.lpush(key, entry)
-            await self.redis.ltrim(key, 0, BANDWIDTH_HISTORY_MAX_ENTRIES - 1)
-            await self.redis.expire(key, BANDWIDTH_HISTORY_TTL)
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.lpush(key, entry)
+            pipe.ltrim(key, 0, BANDWIDTH_HISTORY_MAX_ENTRIES - 1)
+            pipe.expire(key, BANDWIDTH_HISTORY_TTL)
+            await pipe.execute()
 
     async def get_bandwidth_history(self, executor_id: str) -> list[BandwidthEntry]:
         """Retrieve bandwidth history for an executor."""
         key = f"{BANDWIDTH_HISTORY_PREFIX}:{executor_id}"
-        async with self.lock:
-            raw_entries = await self.redis.lrange(key, 0, -1)
+        raw_entries = await self.redis.lrange(key, 0, -1)
         return [json.loads(entry) for entry in raw_entries]
 
     async def get_averaged_bandwidth(self, executor_id: str) -> BandwidthAverage:

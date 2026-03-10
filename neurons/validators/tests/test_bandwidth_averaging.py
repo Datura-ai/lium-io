@@ -1,35 +1,21 @@
 import asyncio
-import json
-from contextlib import asynccontextmanager
 
 import fakeredis
 import pytest
 import pytest_asyncio
 
-from neurons.validators.src.services.redis_service import (
+from services.redis_service import (
     BANDWIDTH_HISTORY_MAX_ENTRIES,
-    BANDWIDTH_HISTORY_PREFIX,
     RedisService,
 )
 
 
 @pytest_asyncio.fixture
-async def redis_service(monkeypatch):
-    """RedisService backed by an in-process async fakeredis instance.
-
-    acquire_executor_lock is stubbed to a no-op because fakeredis does not
-    support the Lua-based EVALSHA commands used by the distributed Redis lock.
-    Locking correctness is out of scope for these unit tests.
-    """
+async def redis_service():
+    """RedisService backed by an in-process async fakeredis instance."""
     svc = RedisService.__new__(RedisService)
     svc.lock = asyncio.Lock()
     svc.redis = fakeredis.FakeAsyncRedis()
-
-    @asynccontextmanager
-    async def _noop_lock(executor_id: str, **kwargs):
-        yield None
-
-    monkeypatch.setattr(svc, "acquire_executor_lock", _noop_lock)
     return svc
 
 
