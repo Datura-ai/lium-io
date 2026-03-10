@@ -44,10 +44,10 @@ save_state() {
     local state="$1"
     python3 -c "
 import json, sys
-s = {'state': sys.argv[1], 'gpu_verified': False, 'node_name': None, 'last_error': None, 'gpu_name': None}
+s = {'state': sys.argv[1], 'gpu_verified': False, 'node_name': None, 'last_error': None}
 try:
     old = json.load(open('${STATE_FILE}'))
-    for k in ('gpu_verified', 'node_name', 'gpu_name'):
+    for k in ('gpu_verified', 'node_name'):
         if k in old: s[k] = old[k]
 except: pass
 json.dump(s, open('${STATE_FILE}', 'w'))
@@ -77,18 +77,6 @@ done
 HOTKEY_SEED="${HOTKEY_SEED#0x}"
 
 save_state "installing"
-
-# Detect GPU name early (before K3s takes over GPUs) and persist to state.json
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs) || GPU_NAME=""
-if [[ -n "${GPU_NAME}" ]]; then
-    log "INFO" "Detected GPU: ${GPU_NAME}"
-    python3 -c "
-import json, sys
-s = json.load(open(sys.argv[1]))
-s['gpu_name'] = sys.argv[2]
-json.dump(s, open(sys.argv[1], 'w'))
-" "${STATE_FILE}" "${GPU_NAME}" 2>/dev/null || log "WARN" "Failed to save gpu_name to state"
-fi
 
 # =============================================================================
 # STEP 1: PREREQUISITES CHECK
