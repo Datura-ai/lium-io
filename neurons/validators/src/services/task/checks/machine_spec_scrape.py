@@ -4,6 +4,8 @@ import json
 from dataclasses import replace
 from typing import Any
 
+import redis.exceptions
+
 from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
@@ -97,7 +99,7 @@ class MachineSpecScrapeCheck:
 
             # Bandwidth averaging: store current measurement and resolve smoothed values
             network = specs.get("network", {}) or {}
-            executor_id = str(ctx.executor.executor_id)
+            executor_id = str(ctx.executor.uuid)
             current_upload = network.get("upload_speed")
             current_download = network.get("download_speed")
 
@@ -112,7 +114,7 @@ class MachineSpecScrapeCheck:
                     "upload_speed": averaged["upload_speed"],
                     "download_speed": averaged["download_speed"],
                 }
-            except Exception:
+            except (redis.exceptions.RedisError, json.JSONDecodeError):
                 specs["network"] = {
                     **network,
                     "upload_speed": current_upload,

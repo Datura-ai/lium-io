@@ -224,6 +224,12 @@ class DummyRedisService:
     async def renting_in_progress(self, miner_hotkey: str, executor_uuid: str):
         return False  # Not renting in progress
 
+    async def store_bandwidth_measurement(self, executor_id: str, upload_speed, download_speed):
+        pass
+
+    async def get_averaged_bandwidth(self, executor_id: str):
+        return {"upload_speed": None, "download_speed": None}
+
 
 class DummyCollateralService:
     """Mock collateral contract service."""
