@@ -95,6 +95,30 @@ class MachineSpecScrapeCheck:
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)
 
+            # Bandwidth averaging: store current measurement and resolve smoothed values
+            network = specs.get("network", {}) or {}
+            executor_id = str(ctx.executor.executor_id)
+            current_upload = network.get("upload_speed")
+            current_download = network.get("download_speed")
+
+            try:
+                if current_upload is not None or current_download is not None:
+                    await ctx.services.redis.store_bandwidth_measurement(
+                        executor_id, current_upload, current_download
+                    )
+                averaged = await ctx.services.redis.get_averaged_bandwidth(executor_id)
+                specs["network"] = {
+                    **network,
+                    "upload_speed": averaged["upload_speed"],
+                    "download_speed": averaged["download_speed"],
+                }
+            except Exception:
+                specs["network"] = {
+                    **network,
+                    "upload_speed": current_upload,
+                    "download_speed": current_download,
+                }
+
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
             gpu_details = gpu_info.get("details", []) or []
