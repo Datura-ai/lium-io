@@ -2,6 +2,14 @@ services:
   executor:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8001/version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        reservations: {}
     volumes:
       - ./src/core/config.py:/root/app/src/core/config.py:ro
       - ./src/middlewares/miner.py:/root/app/src/middlewares/miner.py:ro

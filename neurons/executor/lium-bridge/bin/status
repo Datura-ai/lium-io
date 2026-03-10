@@ -12,11 +12,13 @@ if [[ -f "${STATE_FILE}" ]]; then
     LAST_ERROR=$(python3 -c "import json; v=json.load(open('${STATE_FILE}')).get('last_error'); print(v if v else '')" 2>/dev/null || echo "")
     NODE_NAME=$(python3 -c "import json; v=json.load(open('${STATE_FILE}')).get('node_name'); print(v if v else '')" 2>/dev/null || echo "")
     GPU_VERIFIED=$(python3 -c "import json; print(str(json.load(open('${STATE_FILE}')).get('gpu_verified',False)).lower())" 2>/dev/null || echo "false")
+    GPU_NAME=$(python3 -c "import json; v=json.load(open('${STATE_FILE}')).get('gpu_name'); print(v if v else '')" 2>/dev/null || echo "")
 else
     PERSISTED_STATE="not_installed"
     LAST_ERROR=""
     NODE_NAME=""
     GPU_VERIFIED="false"
+    GPU_NAME=""
 fi
 
 # --- Check Lium executor ---
@@ -81,6 +83,11 @@ if [[ -n "${NODE_NAME}" ]]; then
     NODE_NAME_JSON="\"${NODE_NAME}\""
 fi
 
+GPU_NAME_JSON="null"
+if [[ -n "${GPU_NAME}" ]]; then
+    GPU_NAME_JSON="\"${GPU_NAME}\""
+fi
+
 cat <<EOF
 {
   "ok": true,
@@ -95,7 +102,8 @@ cat <<EOF
     "server_locked": ${SERVER_LOCKED},
     "gpu_verified": ${GPU_VERIFIED},
     "pods_running": ${PODS_RUNNING},
-    "node_name": ${NODE_NAME_JSON}
+    "node_name": ${NODE_NAME_JSON},
+    "gpu_name": ${GPU_NAME_JSON}
   },
   "disk_free_gb": ${DISK_FREE_GB},
   "last_error": ${LAST_ERROR_JSON}
