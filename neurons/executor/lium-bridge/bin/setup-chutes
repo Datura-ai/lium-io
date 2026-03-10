@@ -28,13 +28,11 @@ log() {
 fail() {
     local msg="$1"
     log "FATAL" "${msg}"
+    # Reset state to not_installed so retries are possible
+    save_state "not_installed"
     python3 -c "
 import json, sys
-state = 'error'
-try:
-    state = json.load(open('${STATE_FILE}'))['state']
-except: pass
-json.dump({'ok': False, 'state': state, 'error': sys.argv[1]}, sys.stdout)
+json.dump({'ok': False, 'state': 'not_installed', 'error': sys.argv[1]}, sys.stdout)
 " "${msg}"
     echo ""
     exit 1
@@ -106,9 +104,19 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq jq curl socat conntrack openssl &>/dev/null
 
-# Install nvidia-container-toolkit if missing
+# Install or upgrade nvidia-container-toolkit (>=1.17 required for containerd config v3)
+_nctk_need_install=false
 if ! command -v nvidia-ctk &>/dev/null; then
-    log "INFO" "Installing nvidia-container-toolkit..."
+    _nctk_need_install=true
+else
+    _nctk_major=$(nvidia-ctk --version 2>/dev/null | grep -oP 'version \K[0-9]+' || echo "0")
+    _nctk_minor=$(nvidia-ctk --version 2>/dev/null | grep -oP 'version [0-9]+\.\K[0-9]+' || echo "0")
+    if [[ "${_nctk_major}" -lt 1 ]] || [[ "${_nctk_major}" -eq 1 && "${_nctk_minor}" -lt 17 ]]; then
+        _nctk_need_install=true
+    fi
+fi
+if [[ "${_nctk_need_install}" == "true" ]]; then
+    log "INFO" "Installing/upgrading nvidia-container-toolkit..."
     apt-get install -y -qq nvidia-container-toolkit &>/dev/null \
         || fail "Failed to install nvidia-container-toolkit"
 fi
