@@ -1,6 +1,7 @@
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4, UUID
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -9,6 +10,8 @@ from services.docker_service import DockerService
 from models.port_mapping import PortMapping
 from .factories import create_port_mapping, create_port_mappings_batch
 from payload_models.payloads import PayloadPortMapping
+from datura.requests.miner_requests import ExecutorSSHInfo
+from payload_models.payloads import ContainerStartRequest
 
 
 def create_mock_port_dict(
@@ -656,6 +659,44 @@ def _make_ssh_run_result(stdout: str):
     return mock_result
 
 
+class DummySFTPClient:
+    def __init__(self):
+        self.put_called_with: dict | None = None
+
+    async def put(self, local_path: str, remote_path: str, recurse: bool = False):
+        self.put_called_with = {
+            "local_path": local_path,
+            "remote_path": remote_path,
+            "recurse": recurse,
+        }
+
+
+class DummySSHClientWithSFTP:
+    def __init__(self):
+        self.sftp_client = DummySFTPClient()
+        self.run = AsyncMock()
+
+    def start_sftp_client(self):
+        return self
+
+    async def __aenter__(self):
+        return self.sftp_client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return None
+
+
+class DummySSHConnectionManager:
+    def __init__(self, ssh_client):
+        self.ssh_client = ssh_client
+
+    async def __aenter__(self):
+        return self.ssh_client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return None
+
+
 @pytest.fixture
 def retry_ssh_mock(monkeypatch):
     """Mock retry_ssh_command to capture SSH commands without executing."""
@@ -663,6 +704,154 @@ def retry_ssh_mock(monkeypatch):
     mock = AsyncMock()
     monkeypatch.setattr(ds_module, "retry_ssh_command", mock)
     return mock
+
+
+@pytest.mark.asyncio
+async def test_install_ssh_service_uses_uploaded_bootstrap_script(docker_service):
+    """SSH bootstrap is staged on the executor host, copied into the container, then executed."""
+    ssh_client = DummySSHClientWithSFTP()
+    docker_service.execute_and_stream_logs = AsyncMock(return_value=(True, ""))
+
+    result = await docker_service.install_open_ssh_server_and_start_ssh_service(
+        ssh_client=ssh_client,
+        container_name="pod_test",
+        log_tag="test_log",
+        log_extra={"pod_id": "pod-id"},
+    )
+
+    assert result is True
+    assert ssh_client.sftp_client.put_called_with is not None
+    local_path = Path(ssh_client.sftp_client.put_called_with["local_path"])
+    assert local_path.name == "sshd_bootstrap.sh"
+    assert ssh_client.sftp_client.put_called_with["remote_path"].startswith("/tmp/pod_test-sshd-bootstrap-")
+
+    assert docker_service.execute_and_stream_logs.await_count == 3
+    commands = [call.kwargs["command"] for call in docker_service.execute_and_stream_logs.await_args_list]
+    assert commands[0].startswith("/usr/bin/docker cp ")
+    assert "pod_test:/tmp/lium-ssh-bootstrap.sh" in commands[0]
+    assert "chmod +x /tmp/lium-ssh-bootstrap.sh" in commands[1]
+    assert commands[2].endswith(" sh /tmp/lium-ssh-bootstrap.sh")
+
+    cleanup_command = ssh_client.run.await_args_list[0].args[0]
+    assert cleanup_command.startswith("rm -f /tmp/pod_test-sshd-bootstrap-")
+
+
+def test_ssh_bootstrap_script_supports_multi_distro_install(docker_service):
+    """The injected SSH bootstrap script supports the expected package managers."""
+    script = docker_service._ssh_bootstrap_script_path().read_text()
+
+    assert "apt-get update" in script
+    assert "apt-get install -y openssh-server" in script
+    assert "apk add --no-cache openssh" in script
+    assert "dnf install -y openssh-server" in script
+    assert "yum install -y openssh-server" in script
+
+
+def test_ssh_bootstrap_script_uses_single_watchdog_with_30_second_sleep(docker_service):
+    """The watchdog loop is single-instance and checks sshd every 30 seconds."""
+    script = docker_service._ssh_bootstrap_script_path().read_text()
+
+    assert 'WATCHDOG_PIDFILE="/run/sshd-watchdog.pid"' in script
+    assert 'WATCHDOG_LOG="/tmp/sshd-watchdog.log"' in script
+    assert 'SLEEP_SECONDS=30' in script
+    assert 'kill -0 "$watchdog_pid"' in script
+    assert 'nohup sh "$SCRIPT_PATH" --watchdog-loop' in script
+    assert 'sleep "$SLEEP_SECONDS"' in script
+
+
+@pytest.mark.asyncio
+async def test_start_container_restarts_ssh_after_docker_start(docker_service, monkeypatch):
+    """start_container reruns the SSH bootstrap helper after docker start."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock()
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.install_open_ssh_server_and_start_ssh_service = AsyncMock(return_value=True)
+
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    await docker_service.start_container(payload, executor_info, keypair, "encrypted-private-key")
+
+    ssh_client.run.assert_awaited_once_with("/usr/bin/docker start pod_test")
+    docker_service.install_open_ssh_server_and_start_ssh_service.assert_awaited_once_with(
+        ssh_client=ssh_client,
+        container_name="pod_test",
+        log_tag="start_container_pod-id",
+        log_extra={
+            "miner_hotkey": "miner-hotkey",
+            "executor_uuid": payload.executor_id,
+            "executor_ip_address": "127.0.0.1",
+            "executor_port": 8001,
+            "executor_ssh_username": "root",
+            "executor_ssh_port": 2200,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_container_logs_ssh_bootstrap_failure_and_keeps_starting(docker_service, monkeypatch):
+    """A failed SSH bootstrap does not interrupt docker start."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock()
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.install_open_ssh_server_and_start_ssh_service = AsyncMock(return_value=False)
+
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+    keypair = Mock(ss58_address="validator-hotkey")
+    logger_mock = Mock()
+    monkeypatch.setattr("services.docker_service.logger.warning", logger_mock)
+
+    await docker_service.start_container(payload, executor_info, keypair, "encrypted-private-key")
+
+    ssh_client.run.assert_awaited_once_with("/usr/bin/docker start pod_test")
+    docker_service.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+    assert logger_mock.called
 
 
 @pytest.mark.asyncio
