@@ -28,11 +28,13 @@ log() {
 fail() {
     local msg="$1"
     log "FATAL" "${msg}"
-    # Reset state to not_installed so retries are possible
-    save_state "not_installed"
     python3 -c "
 import json, sys
-json.dump({'ok': False, 'state': 'not_installed', 'error': sys.argv[1]}, sys.stdout)
+state = 'error'
+try:
+    state = json.load(open('${STATE_FILE}'))['state']
+except: pass
+json.dump({'ok': False, 'state': state, 'error': sys.argv[1]}, sys.stdout)
 " "${msg}"
     echo ""
     exit 1
@@ -57,12 +59,14 @@ json.dump(s, open('${STATE_FILE}', 'w'))
 VALIDATOR_HOTKEY=""
 HOTKEY_SS58=""
 HOTKEY_SEED=""
+NODE_NAME=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --validator-hotkey) VALIDATOR_HOTKEY="$2"; shift 2 ;;
         --hotkey-ss58)      HOTKEY_SS58="$2"; shift 2 ;;
         --hotkey-seed)      HOTKEY_SEED="$2"; shift 2 ;;
+        --node-name)        NODE_NAME="$2"; shift 2 ;;
         *) fail "Unknown argument: $1" ;;
     esac
 done
@@ -70,11 +74,20 @@ done
 [[ -z "${VALIDATOR_HOTKEY}" ]] && fail "Missing --validator-hotkey"
 [[ -z "${HOTKEY_SS58}" ]]      && fail "Missing --hotkey-ss58"
 [[ -z "${HOTKEY_SEED}" ]]      && fail "Missing --hotkey-seed"
+[[ -z "${NODE_NAME}" ]]        && fail "Missing --node-name"
 
 # Strip 0x prefix from seed if present
 HOTKEY_SEED="${HOTKEY_SEED#0x}"
 
 save_state "installing"
+
+# =============================================================================
+# STEP 0: SET HOSTNAME
+# =============================================================================
+log "INFO" "Step 0: Setting hostname to '${NODE_NAME}'..."
+hostnamectl set-hostname "${NODE_NAME}" 2>/dev/null || true
+echo "${NODE_NAME}" > /etc/hostname
+log "INFO" "Hostname set to '${NODE_NAME}'"
 
 # =============================================================================
 # STEP 1: PREREQUISITES CHECK
@@ -104,21 +117,20 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq jq curl socat conntrack openssl &>/dev/null
 
-# Install or upgrade nvidia-container-toolkit (>=1.17 required for containerd config v3)
-_nctk_need_install=false
-if ! command -v nvidia-ctk &>/dev/null; then
-    _nctk_need_install=true
-else
-    _nctk_major=$(nvidia-ctk --version 2>/dev/null | grep -oP 'version \K[0-9]+' || echo "0")
-    _nctk_minor=$(nvidia-ctk --version 2>/dev/null | grep -oP 'version [0-9]+\.\K[0-9]+' || echo "0")
-    if [[ "${_nctk_major}" -lt 1 ]] || [[ "${_nctk_major}" -eq 1 && "${_nctk_minor}" -lt 17 ]]; then
-        _nctk_need_install=true
-    fi
+# Install/upgrade nvidia-container-toolkit (>= 1.18 required for GPU Operator CDI support)
+NCTK_MIN="1.18.0"
+NCTK_CUR="0.0.0"
+if command -v nvidia-ctk &>/dev/null; then
+    NCTK_CUR=$(nvidia-container-cli --version 2>/dev/null | awk '/^cli-version:/{print $2}' || echo "0.0.0")
 fi
-if [[ "${_nctk_need_install}" == "true" ]]; then
-    log "INFO" "Installing/upgrading nvidia-container-toolkit..."
+if printf '%s\n' "${NCTK_MIN}" "${NCTK_CUR}" | sort -V | head -1 | grep -qx "${NCTK_MIN}"; then
+    log "INFO" "nvidia-container-toolkit ${NCTK_CUR} >= ${NCTK_MIN}, OK"
+else
+    log "INFO" "Installing/upgrading nvidia-container-toolkit (current: ${NCTK_CUR}, need >= ${NCTK_MIN})..."
     apt-get install -y -qq nvidia-container-toolkit &>/dev/null \
         || fail "Failed to install nvidia-container-toolkit"
+    NCTK_CUR=$(nvidia-container-cli --version 2>/dev/null | awk '/^cli-version:/{print $2}' || echo "unknown")
+    log "INFO" "nvidia-container-toolkit upgraded to ${NCTK_CUR}"
 fi
 
 log "INFO" "Prerequisites OK"
@@ -460,7 +472,7 @@ CSRYAML
 
     CERT_B64=$(base64 -w 0 < "${TEMP_DIR}/${CERT_NAME}.crt")
     KEY_B64=$(base64 -w 0 < "${TEMP_DIR}/${CERT_NAME}.key")
-    HOSTNAME=$(hostname)
+    HOSTNAME="${NODE_NAME}"
 
     # Build kubeconfig
     MINER_KUBECONFIG=$(cat <<KUBECFG
