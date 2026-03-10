@@ -79,15 +79,15 @@ HOTKEY_SEED="${HOTKEY_SEED#0x}"
 save_state "installing"
 
 # Detect GPU name early (before K3s takes over GPUs) and persist to state.json
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs || echo "")
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | xargs) || GPU_NAME=""
 if [[ -n "${GPU_NAME}" ]]; then
     log "INFO" "Detected GPU: ${GPU_NAME}"
     python3 -c "
-import json
-s = json.load(open('${STATE_FILE}'))
-s['gpu_name'] = '${GPU_NAME}'
-json.dump(s, open('${STATE_FILE}', 'w'))
-"
+import json, sys
+s = json.load(open(sys.argv[1]))
+s['gpu_name'] = sys.argv[2]
+json.dump(s, open(sys.argv[1], 'w'))
+" "${STATE_FILE}" "${GPU_NAME}" 2>/dev/null || log "WARN" "Failed to save gpu_name to state"
 fi
 
 # =============================================================================
