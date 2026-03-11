@@ -517,33 +517,20 @@ class DockerService:
         log_extra: dict,
     ) -> bool:
         local_script_path = self._ssh_bootstrap_script_path()
-        remote_script_path = f"/tmp/{container_name}-sshd-bootstrap-{uuid4().hex}.sh"
         container_path = IN_CONTAINER_SSH_BOOTSTRAP_PATH
         success = True
 
         try:
-            logger.info(
+            script_content = local_script_path.read_text()
+        except Exception as exc:
+            await self.stream_log("Failed to read SSH bootstrap script", "error", log_tag)
+            logger.warning(
                 _m(
-                    "Uploading SSH bootstrap script to executor host",
+                    "Failed to read SSH bootstrap script",
                     extra=get_extra_info({
                         **log_extra,
                         "container_name": container_name,
                         "local_script_path": str(local_script_path),
-                        "remote_script_path": remote_script_path,
-                    }),
-                ),
-            )
-            async with ssh_client.start_sftp_client() as sftp:
-                await sftp.put(str(local_script_path), remote_script_path)
-        except Exception as exc:
-            await self.stream_log("Failed to upload SSH bootstrap script", "error", log_tag)
-            logger.warning(
-                _m(
-                    "Failed to upload SSH bootstrap script",
-                    extra=get_extra_info({
-                        **log_extra,
-                        "container_name": container_name,
-                        "remote_script_path": remote_script_path,
                         "error": str(exc),
                     }),
                 ),
@@ -552,70 +539,80 @@ class DockerService:
             return False
 
         try:
-            container_target = shlex.quote(f"{container_name}:{container_path}")
-            remote_script_quoted = shlex.quote(remote_script_path)
-            container_path_quoted = shlex.quote(container_path)
             container_name_quoted = shlex.quote(container_name)
-
-            command = f"/usr/bin/docker cp {remote_script_quoted} {container_target}"
-            status, _ = await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Copying SSH bootstrap script to container",
-                log_extra=log_extra,
-                raise_exception=False,
+            container_path_quoted = shlex.quote(container_path)
+            heredoc = f"__LIUM_SSHD_BOOTSTRAP_{uuid4().hex}__"
+            create_script_command = (
+                f"/usr/bin/docker exec -i {container_name_quoted} sh -c "
+                f"\"cat > {container_path_quoted} && chmod +x {container_path_quoted}\" "
+                f"<< '{heredoc}'\n"
+                f"{script_content}\n"
+                f"{heredoc}"
             )
-            success = success and status
-
-            command = f"/usr/bin/docker exec {container_name_quoted} sh -c 'chmod +x {container_path_quoted}'"
-            status, _ = await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Making SSH bootstrap script executable",
-                log_extra=log_extra,
-                raise_exception=False,
+            logger.info(
+                _m(
+                    "Creating SSH bootstrap script inside container",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "local_script_path": str(local_script_path),
+                        "container_path": container_path,
+                    }),
+                ),
             )
-            success = success and status
-
-            command = f"/usr/bin/docker exec {container_name_quoted} sh {container_path_quoted}"
-            status, _ = await self.execute_and_stream_logs(
-                ssh_client=ssh_client,
-                command=command,
-                log_tag=log_tag,
-                log_text="Bootstrapping SSH daemon and watchdog",
-                log_extra=log_extra,
-                raise_exception=False,
-            )
-            success = success and status
-
-            if not success:
+            create_result = await ssh_client.run(create_script_command)
+            if create_result.exit_status != 0:
+                await self.stream_log("Failed to create SSH bootstrap script in container", "error", log_tag)
                 logger.warning(
                     _m(
-                        "SSH bootstrap script finished with errors",
-                        extra=get_extra_info({**log_extra, "container_name": container_name}),
-                    )
-                )
-
-            return success
-        finally:
-            cleanup_command = f"rm -f {shlex.quote(remote_script_path)}"
-            try:
-                await ssh_client.run(cleanup_command)
-            except Exception as exc:
-                logger.warning(
-                    _m(
-                        "Failed to remove staged SSH bootstrap script from executor host",
+                        "Failed to create SSH bootstrap script in container",
                         extra=get_extra_info({
                             **log_extra,
                             "container_name": container_name,
-                            "remote_script_path": remote_script_path,
-                            "error": str(exc),
+                            "container_path": container_path,
+                            "exit_status": create_result.exit_status,
+                            "stdout": create_result.stdout,
+                            "stderr": create_result.stderr,
                         }),
-                    ),
-                    exc_info=True,
+                    )
                 )
+                return False
+        except Exception as exc:
+            await self.stream_log("Failed to create SSH bootstrap script in container", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to create SSH bootstrap script in container",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "container_path": container_path,
+                        "error": str(exc),
+                    }),
+                ),
+                exc_info=True,
+            )
+            return False
+
+        command = f"/usr/bin/docker exec {container_name_quoted} sh {container_path_quoted}"
+        status, _ = await self.execute_and_stream_logs(
+            ssh_client=ssh_client,
+            command=command,
+            log_tag=log_tag,
+            log_text="Bootstrapping SSH daemon and watchdog",
+            log_extra=log_extra,
+            raise_exception=False,
+        )
+        success = success and status
+
+        if not success:
+            logger.warning(
+                _m(
+                    "SSH bootstrap script finished with errors",
+                    extra=get_extra_info({**log_extra, "container_name": container_name}),
+                )
+            )
+
+        return success
 
     async def create_s3fs_volume(
         self,
@@ -2048,4 +2045,3 @@ class DockerService:
         extra_ports = [max_port + i for i in range(extra_count)]
 
         return list(PREFERRED_POD_PORTS) + extra_ports
-
