@@ -1,7 +1,6 @@
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4, UUID
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -659,33 +658,6 @@ def _make_ssh_run_result(stdout: str):
     return mock_result
 
 
-class DummySFTPClient:
-    def __init__(self):
-        self.put_called_with: dict | None = None
-
-    async def put(self, local_path: str, remote_path: str, recurse: bool = False):
-        self.put_called_with = {
-            "local_path": local_path,
-            "remote_path": remote_path,
-            "recurse": recurse,
-        }
-
-
-class DummySSHClientWithSFTP:
-    def __init__(self):
-        self.sftp_client = DummySFTPClient()
-        self.run = AsyncMock()
-
-    def start_sftp_client(self):
-        return self
-
-    async def __aenter__(self):
-        return self.sftp_client
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return None
-
-
 class DummySSHConnectionManager:
     def __init__(self, ssh_client):
         self.ssh_client = ssh_client
@@ -706,10 +678,19 @@ def retry_ssh_mock(monkeypatch):
     return mock
 
 
+def _make_ssh_command_result(exit_status: int = 0, stdout: str = "", stderr: str = ""):
+    result = Mock()
+    result.exit_status = exit_status
+    result.stdout = stdout
+    result.stderr = stderr
+    return result
+
+
 @pytest.mark.asyncio
-async def test_install_ssh_service_uses_uploaded_bootstrap_script(docker_service):
-    """SSH bootstrap is staged on the executor host, copied into the container, then executed."""
-    ssh_client = DummySSHClientWithSFTP()
+async def test_install_ssh_service_creates_bootstrap_script_inside_container(docker_service):
+    """SSH bootstrap script is written directly in-container before execution."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(exit_status=0))
     docker_service.execute_and_stream_logs = AsyncMock(return_value=(True, ""))
 
     result = await docker_service.install_open_ssh_server_and_start_ssh_service(
@@ -720,20 +701,38 @@ async def test_install_ssh_service_uses_uploaded_bootstrap_script(docker_service
     )
 
     assert result is True
-    assert ssh_client.sftp_client.put_called_with is not None
-    local_path = Path(ssh_client.sftp_client.put_called_with["local_path"])
-    assert local_path.name == "sshd_bootstrap.sh"
-    assert ssh_client.sftp_client.put_called_with["remote_path"].startswith("/tmp/pod_test-sshd-bootstrap-")
+    ssh_client.run.assert_awaited_once()
+    create_command = ssh_client.run.await_args_list[0].args[0]
+    assert create_command.startswith('/usr/bin/docker exec -i pod_test sh -c ')
+    assert "cat > /tmp/lium-ssh-bootstrap.sh" in create_command
+    assert "chmod +x /tmp/lium-ssh-bootstrap.sh" in create_command
+    assert "<< '__LIUM_SSHD_BOOTSTRAP_" in create_command
+    assert "/usr/bin/docker cp" not in create_command
 
-    assert docker_service.execute_and_stream_logs.await_count == 3
+    assert docker_service.execute_and_stream_logs.await_count == 1
     commands = [call.kwargs["command"] for call in docker_service.execute_and_stream_logs.await_args_list]
-    assert commands[0].startswith("/usr/bin/docker cp ")
-    assert "pod_test:/tmp/lium-ssh-bootstrap.sh" in commands[0]
-    assert "chmod +x /tmp/lium-ssh-bootstrap.sh" in commands[1]
-    assert commands[2].endswith(" sh /tmp/lium-ssh-bootstrap.sh")
+    assert commands[0].endswith(" sh /tmp/lium-ssh-bootstrap.sh")
+    assert all("/usr/bin/docker cp" not in command for command in commands)
 
-    cleanup_command = ssh_client.run.await_args_list[0].args[0]
-    assert cleanup_command.startswith("rm -f /tmp/pod_test-sshd-bootstrap-")
+
+@pytest.mark.asyncio
+async def test_install_ssh_service_returns_false_when_in_container_script_creation_fails(docker_service):
+    """Script creation failure returns False and skips bootstrap execution."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(exit_status=1, stderr="permission denied"))
+    docker_service.execute_and_stream_logs = AsyncMock(return_value=(True, ""))
+    docker_service.stream_log = AsyncMock()
+
+    result = await docker_service.install_open_ssh_server_and_start_ssh_service(
+        ssh_client=ssh_client,
+        container_name="pod_test",
+        log_tag="test_log",
+        log_extra={"pod_id": "pod-id"},
+    )
+
+    assert result is False
+    ssh_client.run.assert_awaited_once()
+    docker_service.execute_and_stream_logs.assert_not_awaited()
 
 
 def test_ssh_bootstrap_script_supports_multi_distro_install(docker_service):
