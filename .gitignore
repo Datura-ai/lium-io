@@ -180,5 +180,6 @@ notebooks/
 config_override.py
 .cursor
 .claude
+.codex
 .notebooks
 AGENTS.md
