@@ -136,19 +136,6 @@
             ],
             "cwd": "${workspaceFolder}/watchtower/tests",
             "python": "${workspaceFolder}/watchtower/.venv/bin/python3",
-        },
-        {
-            "name": "Debug Script: Smoke Test",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/neurons/validators/tests/smoke_install_ssh_service.py",
-            "console": "integratedTerminal",
-            "args": [
-                "--ssh-private-key",
-                "/home/pyon/.ssh/id_ed25519"
-            ],
-            "cwd": "${workspaceFolder}/neurons/validators",
-            "python": "${workspaceFolder}/neurons/validators/.venv/bin/python3",
         }
     ]
 }
