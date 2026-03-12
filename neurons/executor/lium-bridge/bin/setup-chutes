@@ -525,6 +525,24 @@ log "INFO" "Step 11: Saving state..."
 
 save_state "installed_stopped"
 
+# Stop K3s so GPU devices return to the host (executor container needs NVML access).
+# K3s will be started again by `bridgectl start`.
+log "INFO" "Stopping K3s to release GPU back to host..."
+systemctl stop k3s
+
+for i in $(seq 1 12); do
+    if ! systemctl is-active k3s >/dev/null 2>&1; then
+        break
+    fi
+    sleep 5
+done
+
+if systemctl is-active k3s >/dev/null 2>&1; then
+    log "WARN" "K3s did not stop within 1 min after setup, GPU may remain unavailable to host"
+else
+    log "INFO" "K3s stopped — GPU returned to host"
+fi
+
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr -d '[:space:]' || echo "unknown")
 GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
 
