@@ -133,6 +133,15 @@ log "INFO" "Step 4: Saving state..."
 
 save_state "stopped"
 
+# Collect GPU container IDs before output (so the list is ready for background restart)
+GPU_CONTAINER_IDS=""
+for cid in $(docker ps -q 2>/dev/null); do
+    devreq=$(docker inspect "${cid}" --format '{{.HostConfig.DeviceRequests}}' 2>/dev/null || true)
+    if [[ "${devreq}" == *"nvidia"* ]]; then
+        GPU_CONTAINER_IDS="${GPU_CONTAINER_IDS} ${cid}"
+    fi
+done
+
 log "INFO" "Stop complete — Chutes stopped (forced_preemption=${FORCED_PREEMPTION})"
 
 cat <<EOF
@@ -143,3 +152,21 @@ cat <<EOF
   "forced_preemption": ${FORCED_PREEMPTION}
 }
 EOF
+
+# =============================================================================
+# STEP 5: RESTART GPU CONTAINERS IN BACKGROUND
+# After K3s releases GPUs, Docker containers need restart to re-initialize NVML.
+# Run in background with delay so the SSH session and HTTP response complete first.
+# =============================================================================
+if [[ -n "${GPU_CONTAINER_IDS}" ]]; then
+    (
+        sleep 5
+        for cid in ${GPU_CONTAINER_IDS}; do
+            cname=$(docker inspect "${cid}" --format '{{.Name}}' 2>/dev/null | sed 's|^/||')
+            log "INFO" "Restarting GPU container: ${cname}"
+            docker restart "${cid}" >> "${LOG_FILE}" 2>&1 || log "WARN" "Failed to restart ${cname}"
+        done
+        log "INFO" "GPU container restart complete"
+    ) </dev/null >/dev/null 2>&1 &
+    disown
+fi
