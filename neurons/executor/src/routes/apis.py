@@ -116,7 +116,8 @@ def _log_chutes_error(verb: str, exc: Exception) -> None:
 def _validate_chutes_signature(message: str, signature: str) -> None:
     try:
         keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
-        if not keypair.verify(message, signature):
+        normalized = signature if signature.startswith("0x") else f"0x{signature}"
+        if not keypair.verify(message, normalized):
             raise HTTPException(status_code=401, detail="Invalid validator signature")
     except HTTPException:
         raise
