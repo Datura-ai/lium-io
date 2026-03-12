@@ -1,7 +1,7 @@
 import re
 
-from pydantic import BaseModel, field_validator
 from bittensor.utils import is_valid_ss58_address
+from pydantic import BaseModel, field_validator
 
 
 _SEED_PATTERN = re.compile(r"^(?:0x)?([0-9a-fA-F]{64})$")
