@@ -13,6 +13,7 @@ class ChutesInstallPayload(BaseModel):
     hotkey_ss58: str
     hotkey_seed: str
     node_name: str
+    validator_signature: str
 
     @field_validator("validator_hotkey", "hotkey_ss58")
     @classmethod
@@ -43,4 +44,4 @@ class ChutesInstallPayload(BaseModel):
 
 
 class ChutesCommandPayload(BaseModel):
-    pass
+    validator_signature: str

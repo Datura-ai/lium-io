@@ -25,9 +25,7 @@ from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
 from payloads.chutes import ChutesCommandPayload, ChutesInstallPayload
 from dependencies.auth import (
-    ChutesMutationAuth,
     verify_allowed_hotkey_signature,
-    verify_chutes_mutation_auth_from_headers,
     verify_ping_signature,
     verify_container_signature,
     verify_container_logs_signature,
@@ -115,19 +113,16 @@ def _log_chutes_error(verb: str, exc: Exception) -> None:
     )
 
 
-def _validate_chutes_install_request(
-    payload: ChutesInstallPayload, auth: ChutesMutationAuth
-) -> None:
-    if payload.validator_hotkey != auth.validator_hotkey:
-        raise HTTPException(
-            status_code=400,
-            detail="validator_hotkey in request body must match X-Validator-Hotkey",
-        )
-    if payload.hotkey_ss58 != auth.miner_hotkey:
-        raise HTTPException(
-            status_code=400,
-            detail="hotkey_ss58 in request body must match X-Miner-Hotkey",
-        )
+def _validate_chutes_signature(message: str, signature: str) -> None:
+    try:
+        keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
+        if not keypair.verify(message, signature):
+            raise HTTPException(status_code=401, detail="Invalid validator signature")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("Chutes signature verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid validator signature")
 
 
 @apis_router.post("/upload_ssh_key")
@@ -205,9 +200,8 @@ async def ping(_: None = Depends(verify_ping_signature)):
 def chutes_install(
     payload: ChutesInstallPayload,
     relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
-    auth: Annotated[ChutesMutationAuth, Depends(verify_chutes_mutation_auth_from_headers)],
 ):
-    _validate_chutes_install_request(payload, auth)
+    _validate_chutes_signature(payload.node_name, payload.validator_signature)
     try:
         return relay_service.install(
             validator_hotkey=payload.validator_hotkey,
@@ -222,10 +216,10 @@ def chutes_install(
 
 @apis_router.post("/chutes/start")
 def chutes_start(
-    _: ChutesCommandPayload,
+    payload: ChutesCommandPayload,
     relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
-    __: Annotated[ChutesMutationAuth, Depends(verify_chutes_mutation_auth_from_headers)],
 ):
+    _validate_chutes_signature("chutes_start", payload.validator_signature)
     try:
         return relay_service.start()
     except _KNOWN_CHUTES_ERRORS as exc:
@@ -235,10 +229,10 @@ def chutes_start(
 
 @apis_router.post("/chutes/stop")
 def chutes_stop(
-    _: ChutesCommandPayload,
+    payload: ChutesCommandPayload,
     relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
-    __: Annotated[ChutesMutationAuth, Depends(verify_chutes_mutation_auth_from_headers)],
 ):
+    _validate_chutes_signature("chutes_stop", payload.validator_signature)
     try:
         return relay_service.stop()
     except _KNOWN_CHUTES_ERRORS as exc:
