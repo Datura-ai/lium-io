@@ -46,10 +46,6 @@ class Settings(BaseSettings):
         env="CHUTES_BRIDGE_COMMAND_TIMEOUT_SEC",
         default=300,
     )
-    CHUTES_STAGING_AUTH_BYPASS: bool = Field(
-        env="CHUTES_STAGING_AUTH_BYPASS",
-        default=False,
-    )
 
     ENV: str = Field(env="ENV", default="dev")
 

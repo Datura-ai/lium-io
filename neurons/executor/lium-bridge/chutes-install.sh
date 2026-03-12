@@ -16,7 +16,6 @@ Options:
   --bridge-user USER           Bridge SSH user. Default: lium-bridge
   --connect-timeout SEC        SSH connect timeout. Default: 10
   --command-timeout SEC        Bridge command timeout. Default: 300
-  --auth-bypass true|false     Set CHUTES_STAGING_AUTH_BYPASS. Default: false
   --help, -h                   Show this help message
 
 This script does not:
@@ -38,7 +37,6 @@ BRIDGE_PORT="22"
 BRIDGE_USER="lium-bridge"
 CONNECT_TIMEOUT="10"
 COMMAND_TIMEOUT="300"
-AUTH_BYPASS="false"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -70,10 +68,6 @@ while [[ $# -gt 0 ]]; do
             COMMAND_TIMEOUT="$2"
             shift 2
             ;;
-        --auth-bypass)
-            AUTH_BYPASS="$2"
-            shift 2
-            ;;
         --help|-h)
             usage
             exit 0
@@ -85,11 +79,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-if [[ "${AUTH_BYPASS}" != "true" && "${AUTH_BYPASS}" != "false" ]]; then
-    echo "--auth-bypass must be true or false" >&2
-    exit 1
-fi
 
 if [[ -z "${BRIDGE_HOST}" ]]; then
     echo "--bridge-host must not be empty" >&2
@@ -128,7 +117,6 @@ upsert_env "CHUTES_BRIDGE_SSH_USER" "${BRIDGE_USER}"
 upsert_env "CHUTES_BRIDGE_SSH_KEY_PATH" "/run/secrets/chutes_bridge_key"
 upsert_env "CHUTES_BRIDGE_CONNECT_TIMEOUT_SEC" "${CONNECT_TIMEOUT}"
 upsert_env "CHUTES_BRIDGE_COMMAND_TIMEOUT_SEC" "${COMMAND_TIMEOUT}"
-upsert_env "CHUTES_STAGING_AUTH_BYPASS" "${AUTH_BYPASS}"
 upsert_env "CHUTES_BRIDGE_SSH_KEY_HOST_PATH" "${STAGE_SECRETS_DIR}/chutes_bridge_key"
 upsert_env "CHUTES_BRIDGE_SSH_KNOWN_HOSTS_HOST_PATH" "${STAGE_SECRETS_DIR}/chutes_bridge_known_hosts"
 
@@ -148,7 +136,6 @@ Configured values:
   CHUTES_BRIDGE_SSH_KEY_PATH=/run/secrets/chutes_bridge_key
   CHUTES_BRIDGE_CONNECT_TIMEOUT_SEC=${CONNECT_TIMEOUT}
   CHUTES_BRIDGE_COMMAND_TIMEOUT_SEC=${COMMAND_TIMEOUT}
-  CHUTES_STAGING_AUTH_BYPASS=${AUTH_BYPASS}
 
 Next steps:
   1. On the GPU host, run sudo ./install_chutes_bridge.sh if lium-bridge is not installed yet.
@@ -157,5 +144,5 @@ Next steps:
   4. Put the host fingerprint at ${STAGE_SECRETS_DIR}/chutes_bridge_known_hosts.
   5. Restart executor:
        docker compose -f docker-compose.app.yml -f docker-compose.chutes-stage.override.yml up -d --force-recreate executor
-  6. Smoke-test GET /chutes/status, then POST /chutes/install.
+  6. Smoke-test GET /chutes/status, then run a signed POST /chutes/install via the Phase 1 scripts.
 EOF

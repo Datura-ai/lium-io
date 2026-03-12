@@ -71,15 +71,12 @@ fi
 
 # --- Output JSON ---
 
-LAST_ERROR_JSON="null"
-if [[ -n "${LAST_ERROR}" ]]; then
-    LAST_ERROR_JSON="\"${LAST_ERROR}\""
-fi
+json_or_null() {
+    python3 -c "import json, sys; print(json.dumps(sys.argv[1] if sys.argv[1] else None))" "$1"
+}
 
-NODE_NAME_JSON="null"
-if [[ -n "${NODE_NAME}" ]]; then
-    NODE_NAME_JSON="\"${NODE_NAME}\""
-fi
+LAST_ERROR_JSON=$(json_or_null "${LAST_ERROR}")
+NODE_NAME_JSON=$(json_or_null "${NODE_NAME}")
 
 cat <<EOF
 {

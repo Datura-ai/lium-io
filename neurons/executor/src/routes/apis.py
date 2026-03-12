@@ -24,9 +24,23 @@ from core.config import VALIDATOR_HOTKEY_SS58
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
 from payloads.chutes import ChutesCommandPayload, ChutesInstallPayload
-from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signature, verify_container_signature, verify_container_logs_signature
+from dependencies.auth import (
+    ChutesMutationAuth,
+    verify_allowed_hotkey_signature,
+    verify_chutes_mutation_auth_from_headers,
+    verify_ping_signature,
+    verify_container_signature,
+    verify_container_logs_signature,
+)
 
 logger = logging.getLogger(__name__)
+_KNOWN_CHUTES_ERRORS = (
+    ChutesRelayDisabledError,
+    ChutesBridgeConfigError,
+    ChutesTransportError,
+    ChutesMalformedResponseError,
+    ChutesExecutorError,
+)
 
 apis_router = APIRouter()
 
@@ -86,6 +100,34 @@ def _translate_chutes_error(exc: Exception) -> HTTPException:
     if isinstance(exc, (ChutesExecutorError, ChutesBridgeConfigError)):
         return HTTPException(status_code=500, detail=str(exc))
     return HTTPException(status_code=500, detail="Unexpected Chutes relay error")
+
+
+def _log_chutes_error(verb: str, exc: Exception) -> None:
+    logger.error(
+        _m(
+            "Chutes relay request failed",
+            extra={
+                "verb": verb,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        ),
+    )
+
+
+def _validate_chutes_install_request(
+    payload: ChutesInstallPayload, auth: ChutesMutationAuth
+) -> None:
+    if payload.validator_hotkey != auth.validator_hotkey:
+        raise HTTPException(
+            status_code=400,
+            detail="validator_hotkey in request body must match X-Validator-Hotkey",
+        )
+    if payload.hotkey_ss58 != auth.miner_hotkey:
+        raise HTTPException(
+            status_code=400,
+            detail="hotkey_ss58 in request body must match X-Miner-Hotkey",
+        )
 
 
 @apis_router.post("/upload_ssh_key")
@@ -163,7 +205,9 @@ async def ping(_: None = Depends(verify_ping_signature)):
 def chutes_install(
     payload: ChutesInstallPayload,
     relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
+    auth: Annotated[ChutesMutationAuth, Depends(verify_chutes_mutation_auth_from_headers)],
 ):
+    _validate_chutes_install_request(payload, auth)
     try:
         return relay_service.install(
             validator_hotkey=payload.validator_hotkey,
@@ -171,8 +215,8 @@ def chutes_install(
             hotkey_seed=payload.hotkey_seed,
             node_name=payload.node_name,
         )
-    except Exception as exc:
-        logger.error(_m("Chutes install failed", extra={"error": str(exc)}))
+    except _KNOWN_CHUTES_ERRORS as exc:
+        _log_chutes_error("install", exc)
         raise _translate_chutes_error(exc)
 
 
@@ -180,11 +224,12 @@ def chutes_install(
 def chutes_start(
     _: ChutesCommandPayload,
     relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
+    __: Annotated[ChutesMutationAuth, Depends(verify_chutes_mutation_auth_from_headers)],
 ):
     try:
         return relay_service.start()
-    except Exception as exc:
-        logger.error(_m("Chutes start failed", extra={"error": str(exc)}))
+    except _KNOWN_CHUTES_ERRORS as exc:
+        _log_chutes_error("start", exc)
         raise _translate_chutes_error(exc)
 
 
@@ -192,11 +237,12 @@ def chutes_start(
 def chutes_stop(
     _: ChutesCommandPayload,
     relay_service: Annotated[ChutesRelayService, Depends(ChutesRelayService)],
+    __: Annotated[ChutesMutationAuth, Depends(verify_chutes_mutation_auth_from_headers)],
 ):
     try:
         return relay_service.stop()
-    except Exception as exc:
-        logger.error(_m("Chutes stop failed", extra={"error": str(exc)}))
+    except _KNOWN_CHUTES_ERRORS as exc:
+        _log_chutes_error("stop", exc)
         raise _translate_chutes_error(exc)
 
 

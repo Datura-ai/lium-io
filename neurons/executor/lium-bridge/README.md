@@ -25,9 +25,9 @@ bridgectl uninstall  # Tear down K3s + Chutes, restore host to not_installed
 ## Current behavior
 
 - `setup` installs K3s, GPU Operator, Chutes GPU charts, and leaves the host in `installed_stopped`
-- `start` starts K3s, waits for node Ready (up to 2 min) and agent pod healthy (up to 3 min), then saves `state=running`
+- `start` starts K3s, waits for node Ready (up to 2 min) and agent pod healthy (up to 3 min); if the agent pod never becomes healthy it returns `ok=false`, saves `state=error`, and records `last_error`
 - `stop` deletes Chutes-managed workload pods with 60s grace, stops K3s, then saves `state=stopped`
-- `status` is read-only and no longer treats `stopped` without a running executor as an error
+- `status` is read-only and surfaces persisted `state=error` and `last_error` from the previous bridge action
 - `uninstall` removes Helm releases when possible, runs `k3s-uninstall.sh`, cleans K3s paths, restarts Docker, and saves `state=not_installed`
 
 Validated on H100 host `64.34.82.167`: repeated `start -> stop` cycles, plus idempotent `start` and `stop`.
@@ -38,6 +38,8 @@ Validated on H100 host `64.34.82.167`: repeated `start -> stop` cycles, plus ide
 not_installed → [setup] → installed_stopped → [start] → running
                                   ↑              ↑          |
                                   |              +--- [stop] -+
+                                  |                          |
+                                  +-- [start fails] → error -+
                                   |                          |
                                   +------ [stop] ------------+
                                           (state: stopped)
@@ -50,10 +52,10 @@ State is persisted in `/opt/lium-bridge/state.json`.
 | File | Description |
 |------|-------------|
 | `install_chutes_bridge.sh` | One-shot installer: creates dirs, users, SSH config, sudoers |
-| `bin/bridgectl` | Dispatcher — parses command verb, delegates to the right script. Supports SSH `ForceCommand` |
+| `bin/bridgectl` | Dispatcher — parses command verb, delegates to the right script, and logs only the verb to avoid leaking setup secrets |
 | `bin/setup-chutes` | Installs K3s, Helm, GPU Operator, Chutes Helm charts, generates miner kubeconfig |
-| `bin/start-chutes` | Starts K3s, waits for node Ready + agent pod healthy, saves state → `running` |
+| `bin/start-chutes` | Starts K3s, waits for node Ready + agent pod healthy, and fails closed into `state=error` if the agent never becomes healthy |
 | `bin/stop-chutes` | Deletes chute workload pods (grace period 60s), stops K3s, saves state → `stopped` |
-| `bin/status` | Read-only health check: K3s active, agent healthy, pod count, disk free; `stopped` without executor is valid |
+| `bin/status` | Read-only health check: K3s active, agent healthy, pod count, disk free, and persisted `last_error` |
 | `bin/uninstall-chutes` | Removes Helm releases, uninstalls K3s, restarts Docker, saves state → `not_installed` |
 | `bin/miner-rbac.yml` | K8s RBAC manifest for miner service account (used by Helm chart, not applied directly) |

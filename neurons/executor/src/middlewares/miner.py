@@ -9,6 +9,11 @@ from core.config import settings
 from core.logger import _m, get_logger
 
 logger = get_logger(__name__)
+_ROUTE_LOCAL_AUTH_PATHS = {
+    "/chutes/install",
+    "/chutes/start",
+    "/chutes/stop",
+}
 
 
 class MinerMiddleware(BaseHTTPMiddleware):
@@ -25,19 +30,15 @@ class MinerMiddleware(BaseHTTPMiddleware):
         if request.url.path in ["/hardware_utilization", "/ping"]:
             return await call_next(request)
 
-        # Staging-only bypass for Chutes relay endpoints.
-        if settings.CHUTES_STAGING_AUTH_BYPASS and request.url.path in [
-            "/chutes/install",
-            "/chutes/start",
-            "/chutes/stop",
-        ]:
+        # Chutes relay mutation routes own their validator auth contract.
+        if request.url.path in _ROUTE_LOCAL_AUTH_PATHS:
             return await call_next(request)
-        
+
         # Skip for specific container hardware utilization endpoint
         # Pattern: /containers/{container_name}
         if re.match(r'^/containers(/[^/]+)?/?$', request.url.path):
             return await call_next(request)
-            
+
         default_extra = {
             'url': request.url.path,
             'client_host': request.client.host,

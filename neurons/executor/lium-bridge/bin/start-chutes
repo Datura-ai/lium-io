@@ -38,16 +38,22 @@ read_state() {
 
 save_state() {
     local state="$1"
+    local last_error="${2:-}"
     python3 -c "
 import json, sys
-s = {'state': sys.argv[1], 'gpu_verified': False, 'node_name': None, 'last_error': None}
+s = {
+    'state': sys.argv[1],
+    'gpu_verified': False,
+    'node_name': None,
+    'last_error': sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None,
+}
 try:
     old = json.load(open('${STATE_FILE}'))
     for k in ('gpu_verified', 'node_name'):
         if k in old: s[k] = old[k]
 except: pass
 json.dump(s, open('${STATE_FILE}', 'w'))
-" "${state}"
+" "${state}" "${last_error}"
 }
 
 # =============================================================================
@@ -117,7 +123,18 @@ for i in $(seq 1 36); do
 done
 
 if [[ "${AGENT_HEALTHY}" == "false" ]]; then
-    log "WARN" "Agent pod not running after 3 min — continuing but flagging"
+    ERROR_MSG="Agent pod did not become healthy within 3 min"
+    log "FATAL" "${ERROR_MSG}"
+    save_state "error" "${ERROR_MSG}"
+    cat <<EOF
+{
+  "ok": false,
+  "state": "error",
+  "error": "${ERROR_MSG}",
+  "chutes": { "k3s_active": true, "agent_healthy": false }
+}
+EOF
+    exit 1
 fi
 
 log "INFO" "Pods status: agent=${AGENT_HEALTHY}"

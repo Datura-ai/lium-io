@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 
 from core.config import settings
 from services.chutes_relay_service import (
+    ChutesExecutorError,
     ChutesMalformedResponseError,
     ChutesRelayService,
     ChutesTransportError,
@@ -73,6 +74,27 @@ class TestChutesRelayService(unittest.TestCase):
             payload = self.service.status()
         self.assertEqual(payload["state"], "not_installed")
 
+    def test_status_preserves_escaped_last_error(self):
+        completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "state": "error",
+                    "last_error": 'bad "quote" and slash \\\\ content',
+                }
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(settings, "CHUTES_BRIDGE_ENABLED", True),
+            patch.object(settings, "CHUTES_BRIDGE_SSH_HOST", "127.0.0.1"),
+            patch("services.chutes_relay_service.subprocess.run", return_value=completed),
+        ):
+            payload = self.service.status()
+        self.assertEqual(payload["last_error"], 'bad "quote" and slash \\\\ content')
+
     def test_transport_failure_is_raised(self):
         completed = subprocess.CompletedProcess(
             args=["ssh"],
@@ -102,6 +124,46 @@ class TestChutesRelayService(unittest.TestCase):
         ):
             with self.assertRaises(ChutesMalformedResponseError):
                 self.service.status()
+
+    def test_ok_false_payload_is_raised_as_executor_error(self):
+        completed = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=0,
+            stdout=json.dumps({"ok": False, "state": "error", "error": "agent unhealthy"}),
+            stderr="",
+        )
+        with (
+            patch.object(settings, "CHUTES_BRIDGE_ENABLED", True),
+            patch.object(settings, "CHUTES_BRIDGE_SSH_HOST", "127.0.0.1"),
+            patch("services.chutes_relay_service.subprocess.run", return_value=completed),
+        ):
+            with self.assertRaisesRegex(ChutesExecutorError, "agent unhealthy"):
+                self.service.status()
+
+    def test_install_timeout_is_sanitized_and_has_no_cause(self):
+        timeout_error = subprocess.TimeoutExpired(
+            cmd=["ssh", "bridgectl", "setup", "--hotkey-seed", "super-secret-seed"],
+            timeout=self.service.INSTALL_TIMEOUT_SEC,
+        )
+        with (
+            patch.object(settings, "CHUTES_BRIDGE_ENABLED", True),
+            patch.object(settings, "CHUTES_BRIDGE_SSH_HOST", "127.0.0.1"),
+            patch("services.chutes_relay_service.subprocess.run", side_effect=timeout_error),
+        ):
+            with self.assertRaises(ChutesExecutorError) as exc_info:
+                self.service.install(
+                    validator_hotkey="validator",
+                    hotkey_ss58="miner",
+                    hotkey_seed="super-secret-seed",
+                    node_name="gpu-node-01",
+                )
+
+        self.assertEqual(
+            str(exc_info.exception),
+            "Chutes bridge command 'setup' timed out after 3600s",
+        )
+        self.assertIsNone(exc_info.exception.__cause__)
+        self.assertNotIn("super-secret-seed", str(exc_info.exception))
 
 
 if __name__ == "__main__":

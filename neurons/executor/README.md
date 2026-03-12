@@ -173,7 +173,6 @@ cd neurons/executor
 - `CHUTES_BRIDGE_SSH_KEY_PATH=/run/secrets/chutes_bridge_key`
 - `CHUTES_BRIDGE_CONNECT_TIMEOUT_SEC`
 - `CHUTES_BRIDGE_COMMAND_TIMEOUT_SEC`
-- `CHUTES_STAGING_AUTH_BYPASS`
 - `CHUTES_BRIDGE_SSH_KEY_HOST_PATH`
 - `CHUTES_BRIDGE_SSH_KNOWN_HOSTS_HOST_PATH`
 
@@ -192,3 +191,11 @@ After that, the staging-only Chutes relay endpoints can call the host bridge:
 - `POST /chutes/start` -> `bridgectl start`
 - `POST /chutes/stop` -> `bridgectl stop`
 - `GET /chutes/status` -> `bridgectl status`
+
+Relay contract:
+- `POST /chutes/install`, `POST /chutes/start`, and `POST /chutes/stop` require validator-signed headers: `X-Validator-Hotkey`, `X-Miner-Hotkey`, `X-Timestamp`, and `X-Signature`
+- The signed blob must match the canonical validator/miner REST auth payload (`validator_hotkey`, `miner_hotkey`, `timestamp` with sorted JSON keys)
+- The executor only trusts the configured validator hotkey and requires `X-Miner-Hotkey` to match the executor miner hotkey
+- `POST /chutes/install` validates `validator_hotkey` and `hotkey_ss58` as SS58, `hotkey_seed` as 64 hex chars with optional `0x`, and `node_name` against the bridge hostname pattern
+- `POST /chutes/start` is fail-closed: if the agent pod does not become healthy within the bridge timeout window, the API returns `500` instead of a degraded `200`
+- `GET /chutes/status` can report `bridge.state=error` together with `last_error` after a failed `start`

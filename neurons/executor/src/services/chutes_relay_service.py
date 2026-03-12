@@ -176,9 +176,9 @@ class ChutesRelayService:
         except subprocess.TimeoutExpired as exc:
             raise ChutesExecutorError(
                 f"Chutes bridge command '{verb}' timed out after {timeout}s"
-            ) from exc
+            ) from None
         except OSError as exc:
-            raise ChutesExecutorError(f"Failed to execute ssh for '{verb}': {exc}") from exc
+            raise ChutesExecutorError(f"Failed to execute ssh for '{verb}': {exc}") from None
 
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         stderr = (completed.stderr or "").strip()
@@ -217,6 +217,12 @@ class ChutesRelayService:
             raise ChutesMalformedResponseError(
                 f"Chutes bridge command '{verb}' returned non-object JSON"
             )
+
+        if payload.get("ok") is False:
+            raise ChutesExecutorError(
+                f"Chutes bridge command '{verb}' failed: {self._summarize_bridge_error(payload, stderr)}"
+            )
+
         return payload
 
     @staticmethod
@@ -244,3 +250,11 @@ class ChutesRelayService:
         if stderr:
             return stderr.splitlines()[-1]
         return "Unknown SSH transport error"
+
+    def _summarize_bridge_error(self, payload: dict[str, Any], stderr: str) -> str:
+        error = payload.get("error")
+        if isinstance(error, str) and error.strip():
+            return error.strip()
+        if stderr:
+            return self._summarize_stderr(stderr)
+        return "Bridge command returned ok=false"

@@ -65,7 +65,7 @@ case "${VERB}" in
             fail_json "Script not found: ${SCRIPT}"
         fi
         shift
-        log "INFO" "Running: ${VERB} $*"
+        log "INFO" "Running verb=${VERB}"
         exec sudo "${SCRIPT}" "$@"
         ;;
     "")
