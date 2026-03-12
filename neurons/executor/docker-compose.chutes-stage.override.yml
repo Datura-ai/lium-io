@@ -14,6 +14,7 @@ services:
       - ./src/core/config.py:/root/app/src/core/config.py:ro
       - ./src/middlewares/miner.py:/root/app/src/middlewares/miner.py:ro
       - ./src/routes/apis.py:/root/app/src/routes/apis.py:ro
+      - ./src/dependencies/auth.py:/root/app/src/dependencies/auth.py:ro
       - ./src/payloads/chutes.py:/root/app/src/payloads/chutes.py:ro
       - ./src/services/chutes_relay_service.py:/root/app/src/services/chutes_relay_service.py:ro
       - ${CHUTES_BRIDGE_SSH_KEY_HOST_PATH:-./stage-secrets/chutes_bridge_key}:/run/secrets/chutes_bridge_key:ro
