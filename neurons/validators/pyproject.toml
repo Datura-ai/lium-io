@@ -30,12 +30,7 @@ dependencies = [
     "sqlmodel>=0.0.24",
     "tenacity>=9.1.2",
     "uvicorn>=0.35.0",
-    "pytest>=8.4.2",
-    "pytest-asyncio>=0.25.0",
-    "pytest-mock>=3.15.0",
-    "aiosqlite>=0.21.0",
     "asyncpg>=0.30.0",
-    "fakeredis>=2.34.1",
 ]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
@@ -55,5 +50,9 @@ testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
-    "pytest-asyncio>=1.2.0",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=0.25.0",
+    "pytest-mock>=3.15.0",
+    "aiosqlite>=0.21.0",
+    "fakeredis>=2.34.1",
 ]
