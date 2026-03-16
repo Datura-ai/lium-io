@@ -1,5 +1,6 @@
 from typing import Iterable
 from dataclasses import replace
+import shlex
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ..messages import TenantEnforcementMessages as Msg, render_message
@@ -208,15 +209,17 @@ class TenantEnforcementCheck:
 
 
 async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str]]:
+    # Use shlex.quote to safely escape container_name to prevent command injection
+    container_name_quoted = shlex.quote(container_name)
     try:
-        ps_result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name}")
+        ps_result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name_quoted}")
         pod_running = bool(ps_result.stdout.strip())
     except Exception:
         pod_running = False
 
     try:
         keys_result = await ssh_client.run(
-            f"/usr/bin/docker exec -i {container_name} sh -c 'cat ~/.ssh/authorized_keys'"
+            f"/usr/bin/docker exec -i {container_name_quoted} sh -c 'cat ~/.ssh/authorized_keys'"
         )
         ssh_keys = keys_result.stdout.strip().split("\n") if keys_result.stdout else []
     except Exception:

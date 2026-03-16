@@ -32,13 +32,16 @@ class CustomOptions(BaseModel):
         # Sanitize environment variables
         environment = cls._sanitize_environment(custom_options.environment or {})
         
+        # Sanitize startup_commands to prevent command injection
+        startup_commands = cls._sanitize_startup_commands(custom_options.startup_commands)
+        
         return cls(
             volumes=volumes if volumes else None,
             environment=environment if environment else None,
             entrypoint=entrypoint,
             internal_ports=custom_options.internal_ports,
             initial_port_count=custom_options.initial_port_count,
-            startup_commands=custom_options.startup_commands,
+            startup_commands=startup_commands,
             shm_size=shm_size,
         )
 
@@ -141,6 +144,35 @@ class CustomOptions(BaseModel):
         ]
         
         return key.upper() in dangerous_keys
+
+    @staticmethod
+    def _sanitize_startup_commands(startup_commands: str | None) -> str | None:
+        """Sanitize startup_commands to prevent command injection."""
+        import re
+        if not startup_commands or not startup_commands.strip():
+            return None
+        
+        # Remove dangerous shell metacharacters that could be used for command injection
+        # Allow only alphanumeric, spaces, and safe characters for shell commands
+        clean_commands = startup_commands.strip()
+        
+        # Reject commands containing dangerous patterns
+        dangerous_patterns = [
+            r'[;&|`$(){}]',  # Command separators and shell expansions
+            r'<|>',  # Redirections
+            r'\$\{',  # Variable expansion
+            r'`',  # Command substitution
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, clean_commands):
+                return None
+        
+        # Limit length to prevent DoS
+        if len(clean_commands) > 1000:
+            return None
+        
+        return clean_commands
 
 
 class MinerJobRequestPayload(BaseModel):

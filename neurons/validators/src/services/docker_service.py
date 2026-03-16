@@ -512,7 +512,9 @@ class DockerService:
         log_extra: dict,
     ) -> None:
         # Always install openssh-server (idempotent - apt will skip if already installed)
-        command = f"/usr/bin/docker exec {container_name} sh -c 'apt-get update && apt-get install -y openssh-server'"
+        # Use shlex.quote to safely escape container_name to prevent command injection
+        container_name_quoted = shlex.quote(container_name)
+        command = f"/usr/bin/docker exec {container_name_quoted} sh -c 'apt-get update && apt-get install -y openssh-server'"
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
@@ -524,7 +526,9 @@ class DockerService:
 
         # Start SSH service
         # logger.info(_m("Starting SSH service", extra={**log_extra, "container_name": container_name}))
-        command = f"/usr/bin/docker exec {container_name} sh -c 'ssh-keygen -A && mkdir -p /run/sshd && mkdir -p /root/.ssh && chmod 700 /root/.ssh && /usr/sbin/sshd'"
+        # Use shlex.quote to safely escape container_name to prevent command injection
+        container_name_quoted = shlex.quote(container_name)
+        command = f"/usr/bin/docker exec {container_name_quoted} sh -c 'ssh-keygen -A && mkdir -p /run/sshd && mkdir -p /root/.ssh && chmod 700 /root/.ssh && /usr/sbin/sshd'"
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
@@ -629,9 +633,12 @@ class DockerService:
                     raise_exception=False,
                 )
 
+            # Use shlex.quote to safely escape container_name and local_volume_path to prevent command injection
+            container_name_quoted = shlex.quote(container_name)
+            local_volume_path_quoted = shlex.quote(local_volume_path)
             command = (
-                f"/usr/bin/docker exec {container_name} "
-                f"sh -c 'chmod +x {local_volume_path}/run_jupyter.sh'"
+                f"/usr/bin/docker exec {container_name_quoted} "
+                f"sh -c 'chmod +x {local_volume_path_quoted}/run_jupyter.sh'"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -642,10 +649,11 @@ class DockerService:
                 raise_exception=True,
             )
 
-            command = (
-                f"/usr/bin/docker exec {container_name} sh -c "
-                f"'{local_volume_path}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
-            )
+            # Use shlex.quote to safely escape all user inputs to prevent command injection
+            container_name_quoted = shlex.quote(container_name)
+            # Build shell command with proper escaping (no double-quoting)
+            shell_cmd = f"{shlex.quote(local_volume_path)}/run_jupyter.sh --password={shlex.quote(jupyter_token)} --port={shlex.quote(str(jupyter_port))}"
+            command = f"/usr/bin/docker exec {container_name_quoted} sh -c {shlex.quote(shell_cmd)}"
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
@@ -655,7 +663,9 @@ class DockerService:
                 raise_exception=False,
             )
         else:
-            command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/root/run_jupyter.sh"
+            # Use shlex.quote to safely escape container_name to prevent command injection
+            container_name_quoted = shlex.quote(container_name)
+            command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name_quoted}:/root/run_jupyter.sh"
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
@@ -664,7 +674,9 @@ class DockerService:
                 log_extra=log_extra,
                 raise_exception=True
             )
-            command = f"/usr/bin/docker exec {container_name} sh -c 'chmod +x /root/run_jupyter.sh'"
+            # Use shlex.quote to safely escape container_name to prevent command injection
+            container_name_quoted = shlex.quote(container_name)
+            command = f"/usr/bin/docker exec {container_name_quoted} sh -c 'chmod +x /root/run_jupyter.sh'"
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
@@ -673,7 +685,11 @@ class DockerService:
                 log_extra=log_extra,
                 raise_exception=True
             )
-            command = f"/usr/bin/docker exec {container_name} sh -c '/root/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+            # Use shlex.quote to safely escape all user inputs to prevent command injection
+            container_name_quoted = shlex.quote(container_name)
+            # Build shell command with proper escaping (no double-quoting)
+            shell_cmd = f"/root/run_jupyter.sh --password={shlex.quote(jupyter_token)} --port={shlex.quote(str(jupyter_port))}"
+            command = f"/usr/bin/docker exec {container_name_quoted} sh -c {shlex.quote(shell_cmd)}"
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
@@ -961,8 +977,10 @@ class DockerService:
                     if custom_options and custom_options.environment
                     else "-e NVIDIA_DRIVER_CAPABILITIES=all"
                 )
+                # startup_commands should already be sanitized by CustomOptions.sanitize()
+                # Use shlex.quote to safely escape it when inserting into command
                 startup_commands = (
-                    f"{custom_options.startup_commands}"
+                    shlex.quote(custom_options.startup_commands)
                     if custom_options
                     and custom_options.startup_commands
                     and custom_options.startup_commands.strip()
@@ -1131,7 +1149,10 @@ class DockerService:
 
                 # add rest of public keys
                 for public_key in payload.user_public_keys:
-                    command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
+                    # Use shlex.quote to safely escape public_key and container_name to prevent command injection
+                    container_name_quoted = shlex.quote(container_name)
+                    public_key_quoted = shlex.quote(public_key)
+                    command = f"/usr/bin/docker exec {container_name_quoted} sh -c 'echo {public_key_quoted} >> ~/.ssh/authorized_keys'"
                     await ssh_client.run(command)
 
                 # add environment variables
@@ -1140,8 +1161,10 @@ class DockerService:
                         if k and v and k.strip() and str(v).strip():
                             env_line = f"{k}={v}"
                             # Execute each variable addition separately for better error handling
+                            # Use shlex.quote to safely escape container_name to prevent command injection
+                            container_name_quoted = shlex.quote(container_name)
                             script = f'printf "%s\\n" {shlex.quote(env_line)} >> /etc/environment'
-                            command = f"/usr/bin/docker exec {container_name} sh -c {shlex.quote(script)}"
+                            command = f"/usr/bin/docker exec {container_name_quoted} sh -c {shlex.quote(script)}"
                             try:
                                 await ssh_client.run(command)
                             except Exception as e:
@@ -1644,8 +1667,6 @@ class DockerService:
                     # Remove the public key from authorized_keys
                     # Properly escape slashes and pluses in pubkey for sed
                     # Use Python's shlex.quote to safely quote the pubkey for shell usage
-                    import shlex
-
                     # Remove the public key from authorized_keys by matching the exact line
                     # This approach is safer and more reliable than trying to escape characters for sed
                     quoted_pubkey = shlex.quote(pubkey)
@@ -1767,7 +1788,10 @@ class DockerService:
                     )
 
                 for public_key in payload.user_public_keys:
-                    command = f"/usr/bin/docker exec -i {payload.container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
+                    # Use shlex.quote to safely escape public_key and container_name to prevent command injection
+                    container_name_quoted = shlex.quote(payload.container_name)
+                    public_key_quoted = shlex.quote(public_key)
+                    command = f"/usr/bin/docker exec -i {container_name_quoted} sh -c 'echo {public_key_quoted} >> ~/.ssh/authorized_keys'"
                     await retry_ssh_command(ssh_client, command, "add_ssh_key", 3, 5)
 
                 logger.info(
@@ -1879,7 +1903,10 @@ class DockerService:
 
         await asyncio.sleep(5)
 
-        command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
+        # Use shlex.quote to safely escape public_key and container_name to prevent command injection
+        container_name_quoted = shlex.quote(container_name)
+        public_key_quoted = shlex.quote(public_key)
+        command = f"/usr/bin/docker exec {container_name_quoted} sh -c 'echo {public_key_quoted} >> /root/.ssh/authorized_keys'"
 
         result = await ssh_client.run(command)
         if result.exit_status != 0:

@@ -3,6 +3,7 @@ import pexpect
 import tempfile
 import os
 import re
+import shlex
 import asyncssh
 import asyncio
 import logging
@@ -48,21 +49,19 @@ class InteractiveShellService:
             ))
 
     def _spawn_interactive_shell(self):
-        # Build the SSH command
-        ssh_command = f"ssh -p {self.port}"
-
+        # Build the SSH command safely using shlex.quote to prevent command injection
         with tempfile.NamedTemporaryFile(delete=False) as temp:
             temp.write(self.private_key.encode())
             temp_key_path = temp.name
             self.priv_key_path = temp_key_path
 
-        ssh_command += f" -i {temp_key_path}"
-
-        # Add options to match typical human behavior
-        ssh_command += " -o BatchMode=no -o StrictHostKeyChecking=no"
-
-        # Add the destination
-        ssh_command += f" {self.username}@{self.host}"
+        # Use shlex.quote to safely escape all user inputs
+        port_quoted = shlex.quote(str(self.port))
+        key_path_quoted = shlex.quote(temp_key_path)
+        username_quoted = shlex.quote(self.username)
+        host_quoted = shlex.quote(self.host)
+        
+        ssh_command = f"ssh -p {port_quoted} -i {key_path_quoted} -o BatchMode=no -o StrictHostKeyChecking=no {username_quoted}@{host_quoted}"
 
         try:
             i_shell = pexpect.spawn(ssh_command, timeout=10)
@@ -148,7 +147,9 @@ class InteractiveShellService:
 
         await self.clear_remote_directory()
 
-        await self.ssh_client.run(f"mkdir -p {remote_dir}")
+        # Use shlex.quote to safely escape remote_dir to prevent command injection
+        remote_dir_quoted = shlex.quote(remote_dir)
+        await self.ssh_client.run(f"mkdir -p {remote_dir_quoted}")
 
         """Uploads a directory recursively to a remote server using AsyncSSH."""
         async with self.ssh_client.start_sftp_client() as sftp_client:
@@ -156,8 +157,9 @@ class InteractiveShellService:
                 relative_dir = os.path.relpath(root, local_dir)
                 remote_path = os.path.join(self.remote_dir, relative_dir)
 
-                # Create remote directory if it doesn't exist
-                result = await self.ssh_client.run(f"mkdir -p {remote_path}")
+                # Use shlex.quote to safely escape remote_path to prevent command injection
+                remote_path_quoted = shlex.quote(remote_path)
+                result = await self.ssh_client.run(f"mkdir -p {remote_path_quoted}")
                 if result.exit_status != 0:
                     raise Exception(f"Failed to create directory {remote_path}: {result.stderr}")
 
@@ -176,7 +178,9 @@ class InteractiveShellService:
             return
 
         try:
-            await self.ssh_client.run(f"rm -rf {self.remote_dir}", timeout=10)
+            # Use shlex.quote to safely escape remote_dir to prevent command injection
+            remote_dir_quoted = shlex.quote(self.remote_dir)
+            await self.ssh_client.run(f"rm -rf {remote_dir_quoted}", timeout=10)
             # await self.exec_shell_command(f"rm -rf {self.remote_dir}")
         except Exception as e:
             pass

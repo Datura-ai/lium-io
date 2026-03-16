@@ -3,6 +3,7 @@ import hashlib
 import json
 import random
 import os
+import shlex
 import logging
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -135,7 +136,12 @@ class VerifyXValidationService:
 
             cipher_text = verifyx_validator.generate_challenge(challenge_input)
 
-            command = f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py --seed {seed} --cipher_text {cipher_text}"
+            # Use shlex.quote to safely escape all user inputs to prevent command injection
+            python_path_quoted = shlex.quote(executor_info.python_path)
+            root_dir_quoted = shlex.quote(executor_info.root_dir)
+            seed_quoted = shlex.quote(str(seed))
+            cipher_text_quoted = shlex.quote(cipher_text)
+            command = f"{python_path_quoted} {root_dir_quoted}/src/verifyx_executor.py --seed {seed_quoted} --cipher_text {cipher_text_quoted}"
 
             log_extra = {
                 **default_extra,

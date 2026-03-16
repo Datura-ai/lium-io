@@ -1,6 +1,7 @@
 import os
 import subprocess
 import logging
+import shlex
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -10,7 +11,12 @@ plugin_name = "s3fs-backup"
 
 
 def run_command(command):
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    # Use shlex.split to safely parse command string and prevent command injection
+    if isinstance(command, str):
+        cmd_list = shlex.split(command)
+    else:
+        cmd_list = command
+    result = subprocess.run(cmd_list, shell=False, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"Command failed: {command}")
         logger.error(f"stdout: {result.stdout}")
@@ -116,18 +122,24 @@ def aws_cp(args):
     backup_path_parent = os.path.dirname(backup_path)
     backup_path_current = os.path.basename(backup_path)
 
-    command = (
-        "docker run --rm "
-        f"-v {args.source_volume}:{args.source_volume_path} "
-        f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
-        f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
-        f"-e AWS_DEFAULT_REGION=us-east-1 "
-        "--entrypoint sh "
-        "daturaai/aws-cli  -lc "
-        f'"tar --xattrs --acls -C {backup_path_parent} -czf - {backup_path_current} '
-        f"| aws s3 cp - s3://{args.backup_volume_name}/{args.backup_target_path} "
-        f'  --sse AES256 --expected-size $(tar -C {backup_path_parent} -cf - {backup_path_current} | wc -c)" '
+    # Build command as a list - no need for shlex.quote() as list form is already safe
+    # Only the shell command string needs escaping
+    shell_cmd = (
+        f"tar --xattrs --acls -C {shlex.quote(backup_path_parent)} -czf - "
+        f"{shlex.quote(backup_path_current)} | aws s3 cp - "
+        f"s3://{shlex.quote(args.backup_volume_name)}/{shlex.quote(args.backup_target_path)} --sse AES256"
     )
+    
+    command = [
+        "docker", "run", "--rm",
+        "-v", f"{args.source_volume}:{args.source_volume_path}",
+        "-e", f"AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key}",
+        "-e", f"AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key}",
+        "-e", "AWS_DEFAULT_REGION=us-east-1",
+        "--entrypoint", "sh",
+        "daturaai/aws-cli", "-lc",
+        shell_cmd
+    ]
     run_command(command)
 
 

@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import shlex
 import threading
 import psutil
 from functools import wraps
@@ -604,7 +605,13 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
 
 
 def run_cmd(cmd):
-    proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True)
+    # Use shlex.split to safely parse command string and prevent command injection
+    # This prevents shell injection attacks by properly escaping arguments
+    if isinstance(cmd, str):
+        cmd_list = shlex.split(cmd)
+    else:
+        cmd_list = cmd
+    proc = subprocess.run(cmd_list, shell=False, capture_output=True, check=False, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
             f"run_cmd error {cmd=!r} {proc.returncode=} {proc.stdout=!r} {proc.stderr=!r}"
