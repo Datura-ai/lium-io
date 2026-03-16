@@ -436,8 +436,19 @@ class DockerService:
                         )
                         await asyncio.sleep(retry_delay)
                     else:
-                        # Max retries reached, containers still exist
-                        return False, f"Port check containers still exist after {max_retries} retries: {container_names}"
+                        # Max retries reached, containers still exist - force cleanup
+                        logger.warning(
+                            f"Port check containers still running after {max_retries} retries, "
+                            f"forcing cleanup: {container_names}"
+                        )
+
+                        # Force remove all containers with the prefix in one command
+                        # docker rm -f will stop and remove the containers
+                        remove_cmd = f"docker ps -q --filter 'name=^{container_prefix}' | xargs -r docker rm -f"
+                        result = await ssh_client.run(remove_cmd)
+
+                        logger.info(f"Forced removal of stale port check containers completed")
+                        return True, f"Port check containers forcefully removed after {max_retries} retries"
 
                 # Should never reach here, but just in case
                 return False, "Unexpected error in wait_for_port_check_containers"
