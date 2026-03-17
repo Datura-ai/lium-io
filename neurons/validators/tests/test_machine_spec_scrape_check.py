@@ -54,11 +54,7 @@ class DummySSHCommandRunner:
 
 
 class DummyRedisService:
-    async def store_bandwidth_measurement(self, executor_id: str, upload_speed, download_speed):
-        pass
-
-    async def get_averaged_bandwidth(self, executor_id: str):
-        return {"upload_speed": None, "download_speed": None}
+    pass
 
 
 # Mock SSHService for decryption
@@ -178,10 +174,7 @@ async def test_machine_spec_scrape_check(
     if expected_pass:
         assert "state" in result.updates
         updated_state = result.updates["state"]
-        # Check that specs were parsed and stored correctly.
-        # Bandwidth averaging injects a "network" key with averaged values (None when no history).
-        expected_specs = {**mock_specs, "network": {"upload_speed": None, "download_speed": None}}
-        assert updated_state.specs == expected_specs
+        assert updated_state.specs == mock_specs
         assert updated_state.gpu_count == 2
         assert updated_state.gpu_model == "NVIDIA RTX 3090"
         assert updated_state.gpu_model_count == "NVIDIA RTX 3090:2"
