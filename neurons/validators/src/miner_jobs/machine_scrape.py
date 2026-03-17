@@ -1,5 +1,4 @@
 from ctypes import *
-import logging
 import sys
 import os
 import json
@@ -13,8 +12,6 @@ import hashlib
 from base64 import b64encode
 from cryptography.fernet import Fernet
 import tempfile
-
-logger = logging.getLogger("machine_scrape")
 
 
 nvmlLib = None
@@ -624,7 +621,6 @@ def get_network_speed():
         data["upload_speed"] = speedtest_data["upload"] / 1_000_000  # Convert to Mbps
         data["download_speed"] = speedtest_data["download"] / 1_000_000  # Convert to Mbps
     except Exception as exc:
-        logger.warning("get_network_speed failed: %s", exc)
         data["network_speed_error"] = repr(exc)
     return data
 
@@ -638,7 +634,6 @@ def speedcheck_output():
         data["download_speed"] = float(speedtest_data["Download Speed"].split()[0]) #extract the number
         data["upload_speed"] = float(speedtest_data["Upload Speed"].split()[0]) #extract the number
     except Exception as exc:
-        logger.warning("speedcheck_output failed: %s", exc)
         data["network_speed_error"] = repr(exc)
     return data
 
@@ -657,7 +652,6 @@ def netmeasure_output():
             data["download_speed"] = download_speed / 1_000_000 # Convert to Mbps 
             data["upload_speed"] = upload_speed / 1_000_000 # Convert to Mbps
     except Exception as exc:
-        logger.warning("netmeasure_output failed: %s", exc)
         data["network_speed_error"] = repr(exc)
     return data
 

@@ -53,10 +53,6 @@ class DummySSHCommandRunner:
         return self.result
 
 
-class DummyRedisService:
-    pass
-
-
 # Mock SSHService for decryption
 class DummySSHService:
     def __init__(self, *, decrypted_data: dict):
@@ -133,7 +129,7 @@ async def test_machine_spec_scrape_check(
     ssh_service = DummySSHService(decrypted_data=mock_specs)
 
     # Setup services
-    services = build_services(ssh=ssh_service, redis=DummyRedisService())
+    services = build_services(ssh=ssh_service)
 
     # Setup config
     config = build_context_config(
@@ -174,6 +170,7 @@ async def test_machine_spec_scrape_check(
     if expected_pass:
         assert "state" in result.updates
         updated_state = result.updates["state"]
+        # Check that specs were parsed and stored correctly
         assert updated_state.specs == mock_specs
         assert updated_state.gpu_count == 2
         assert updated_state.gpu_model == "NVIDIA RTX 3090"
