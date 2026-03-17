@@ -1,7 +1,7 @@
 from fastapi import HTTPException
 import bittensor
 import json
-from core.config import VALIDATOR_HOTKEY_SS58
+from core.config import settings
 from core.logger import get_logger
 from payloads.backend import SignaturePayload, HardwareUtilizationPayload, PingPayload, ContainerUtilizationPayload
 
@@ -24,7 +24,7 @@ async def verify_signature(payload: SignaturePayload, message: str) -> None:
     """
     try:
         # Create keypair from the allowed hotkey SS58 address
-        keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
+        keypair = bittensor.Keypair(ss58_address=settings.ALLOWED_HOTKEY_SS58_ADDRESS)
 
         # Normalize signature format - Bittensor expects 0x prefix
         signature = payload.signature
@@ -37,7 +37,7 @@ async def verify_signature(payload: SignaturePayload, message: str) -> None:
         if not is_valid:
             raise HTTPException(
                 status_code=401,
-                detail=f"Invalid signature from allowed hotkey {VALIDATOR_HOTKEY_SS58}"
+                detail=f"Invalid signature from allowed hotkey {settings.ALLOWED_HOTKEY_SS58_ADDRESS}"
             )
 
     except HTTPException:
