@@ -10,8 +10,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      TAG: "dev" 
-      VALIDATOR_HOTKEY_SS58: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
+      TAG: "dev"
       TARGET_FILE: "docker-compose.app.dev.yml"
       DOCKERHUB_PAT: ${{ secrets.DOCKERHUB_PAT }} 
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
