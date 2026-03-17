@@ -12,6 +12,7 @@ async def verify_signature(payload: SignaturePayload, message: str) -> None:
     """
     Universal signature verification function for any message.
 
+
     Args:
         payload: SignaturePayload containing the signature
         message: The fixed string that was signed by the client
