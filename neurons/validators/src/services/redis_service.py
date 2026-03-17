@@ -3,7 +3,6 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import TypedDict
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
@@ -18,9 +17,6 @@ STREAMING_LOG_CHANNEL = "STREAMING_LOG_CHANNEL"
 RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 
-BANDWIDTH_HISTORY_PREFIX = "bandwidth_history"
-BANDWIDTH_HISTORY_MAX_ENTRIES = 10
-BANDWIDTH_HISTORY_TTL = 86400 * 7  # 7 days
 PENDING_PODS_PREFIX = "pending_pods_prefix"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
@@ -37,17 +33,6 @@ EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
 EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (seconds)
 
 logger = logging.getLogger(__name__)
-
-
-class BandwidthEntry(TypedDict):
-    upload: float | None
-    download: float | None
-    ts: int
-
-
-class BandwidthAverage(TypedDict):
-    upload_speed: float | None
-    download_speed: float | None
 
 
 class RedisService:
@@ -369,43 +354,6 @@ class RedisService:
         except Exception as e:
             logger.error(_m("Error getting portion per gpu type.", extra={"error": str(e), "gpu_type": gpu_type}), exc_info=True)
             return 0
-
-    async def store_bandwidth_measurement(
-        self,
-        executor_id: str,
-        upload_speed: float | None,
-        download_speed: float | None,
-    ) -> None:
-        """Store a bandwidth measurement in executor's history list."""
-        key = f"{BANDWIDTH_HISTORY_PREFIX}:{executor_id}"
-        entry = json.dumps(
-            {"upload": upload_speed, "download": download_speed, "ts": int(time.time())}
-        )
-        async with self.redis.pipeline(transaction=True) as pipe:
-            pipe.lpush(key, entry)
-            pipe.ltrim(key, 0, BANDWIDTH_HISTORY_MAX_ENTRIES - 1)
-            pipe.expire(key, BANDWIDTH_HISTORY_TTL)
-            await pipe.execute()
-
-    async def get_bandwidth_history(self, executor_id: str) -> list[BandwidthEntry]:
-        """Retrieve bandwidth history for an executor."""
-        key = f"{BANDWIDTH_HISTORY_PREFIX}:{executor_id}"
-        raw_entries = await self.redis.lrange(key, 0, -1)
-        return [json.loads(entry) for entry in raw_entries]
-
-    async def get_averaged_bandwidth(self, executor_id: str) -> BandwidthAverage:
-        """Compute averaged upload/download from history, filtering None values."""
-        history = await self.get_bandwidth_history(executor_id)
-        if not history:
-            return {"upload_speed": None, "download_speed": None}
-
-        uploads = [e["upload"] for e in history if e.get("upload") is not None]
-        downloads = [e["download"] for e in history if e.get("download") is not None]
-
-        return {
-            "upload_speed": sum(uploads) / len(uploads) if uploads else None,
-            "download_speed": sum(downloads) / len(downloads) if downloads else None,
-        }
 
     async def set_banned_guids(self, guids: list[str]):
         await self.redis.set(BANNED_GUIDS, json.dumps(guids))
