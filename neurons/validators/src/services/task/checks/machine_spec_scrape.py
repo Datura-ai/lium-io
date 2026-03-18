@@ -105,8 +105,10 @@ class MachineSpecScrapeCheck:
             gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
             gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
             sysbox_runtime = specs.get("sysbox_runtime", False)
+            supports_gpu_splitting = specs.get("gpu_splitting", False)
             extra_info = {
                 "sysbox_runtime": sysbox_runtime,
+                "supports_gpu_splitting": supports_gpu_splitting,
             }
 
             event = render_message(
@@ -128,6 +130,7 @@ class MachineSpecScrapeCheck:
                 gpu_details=gpu_details,
                 gpu_processes=specs.get("gpu_processes", []) or [],
                 sysbox_runtime=sysbox_runtime,
+                supports_gpu_splitting=supports_gpu_splitting,
                 gpu_model_count=gpu_model_count,
                 gpu_uuids=gpu_uuids,
             )
