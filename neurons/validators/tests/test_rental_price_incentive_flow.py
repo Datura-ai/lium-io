@@ -163,7 +163,6 @@ async def test_rental_price_scenario_basic_mixed(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -189,11 +188,16 @@ async def test_rental_price_scenario_basic_mixed(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data(["exec-a"]))
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # Rented executors use the default mining algorithm; unrented eligible executors use rental_price logs
+    # Verify rental-specific logging for rented vs unrented executors
+    from tests.helpers import (
+        assert_incentive_log_present,
+        assert_executor_has_log,
+        assert_log_contains_keys,
+        assert_rental_price_incentive_log_full_content,
+    )
+
     for hotkey, results in all_job_results.items():
         for result in results:
             if result.score > 0 and result.incentive_logs:
@@ -297,7 +301,6 @@ async def test_rental_price_scenario_basic_mixed(
         ),
     }
 
-    # Each miner's final weight is the sum of their mining and rental portions; weights must sum to 1.0
     for hotkey, expected in expected_scores.items():
         assert validator.miner_scores[hotkey] == pytest.approx(expected, abs=0.0001)
 
@@ -313,7 +316,6 @@ async def test_rental_price_scenario_cap_dilution(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -339,16 +341,17 @@ async def test_rental_price_scenario_cap_dilution(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data())
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # cap_dilution_applied must appear in logs when total unrented exceeds the per-type cap
+    # Verify cap dilution appears in logs
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
     for hotkey, results in all_job_results.items():
         for result in results:
             if result.score > 0 and result.incentive_logs:
                 assert_incentive_log_present(result.full_log_text)
                 assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
+                # Verify cap_dilution_applied is logged (key feature of this test)
                 assert_log_contains_keys(result.full_log_text, [
                     "effective_rate",
                     "total_unrented_by_gpu_type",
@@ -357,7 +360,6 @@ async def test_rental_price_scenario_cap_dilution(
                 ])
 
     total_unrented = 1500
-    # Total H100 (1500) exceeds cap (1000), so effective_rate = hourly_rate * cap / total
     expected_effective_rate = H100_HOURLY_RATE * MAX_UNRENTED_GPUS_BY_TYPE["H100"] / total_unrented
     expected_total_rental_cost = total_unrented * expected_effective_rate
 
@@ -369,11 +371,8 @@ async def test_rental_price_scenario_cap_dilution(
         alpha_rate=ALPHA_RATE,
     )
 
-    # Effective rate is diluted by factor 1000/1500 ≈ 0.667 → $3.50 * 0.667 ≈ $2.333
     assert expected_effective_rate == pytest.approx(2.333, abs=0.001)
-    # Total rental cost is capped by the cap: 1000 * $3.50 = $3500 (even though 1500 GPUs exist)
     assert expected_total_rental_cost == pytest.approx(3500, abs=1)
-    # Rental share derived from capped rental cost
     assert splits["rental_share"] == pytest.approx(0.1146, abs=0.001)
 
     weights = {
@@ -381,7 +380,6 @@ async def test_rental_price_scenario_cap_dilution(
         "miner_b": validator.miner_scores["miner_b"],
         "miner_c": validator.miner_scores["miner_c"],
     }
-    # All miners share the same effective_rate, so weights are proportional to GPU counts alone
     assert weights["miner_a"] / weights["miner_b"] == pytest.approx(600 / 500, abs=0.01)
     assert weights["miner_b"] / weights["miner_c"] == pytest.approx(500 / 400, abs=0.01)
 
@@ -398,7 +396,6 @@ async def test_different_caps_per_gpu_type(
     monkeypatch,
 ):
     """Test that different GPU types have independent caps applied correctly."""
-    # Arrange
     # Create custom config with different caps for H100 and H200
     different_caps = {
         "H100": 5,
@@ -412,6 +409,7 @@ async def test_different_caps_per_gpu_type(
         gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
     )
 
+    # Set up validator with custom config
     original_create = IncentiveFactory.create
 
     def create_with_price_provider(*args, **kwargs):
@@ -435,6 +433,7 @@ async def test_different_caps_per_gpu_type(
         create_neuron_info(uid=3, hotkey="miner_b"),
     ]
 
+    # Mock price provider
     mock_price_provider = AsyncMock()
     mock_price_provider.get_tao_price.return_value = TAO_PRICE
     mock_price_provider.get_alpha_rate.return_value = ALPHA_RATE
@@ -453,11 +452,9 @@ async def test_different_caps_per_gpu_type(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data())
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # Each GPU type's cap is applied independently: H100 cap=5/8 of actual, H200 cap=3/6 of actual
+    # Verify cap dilution for each GPU type independently
     h100_effective_rate = H100_HOURLY_RATE * different_caps["H100"] / 8
     h200_effective_rate = H200_HOURLY_RATE * different_caps["H200"] / 6
     expected_total_rental_cost = 8 * h100_effective_rate + 6 * h200_effective_rate
@@ -470,19 +467,19 @@ async def test_different_caps_per_gpu_type(
         alpha_rate=ALPHA_RATE,
     )
 
-    # Verify effective rates are calculated per GPU type independently
+    # Verify effective rates are calculated per GPU type
     assert h100_effective_rate == pytest.approx(H100_HOURLY_RATE * 5 / 8, abs=0.001)
     assert h200_effective_rate == pytest.approx(H200_HOURLY_RATE * 3 / 6, abs=0.001)
 
-    # Verify total rental cost aggregates both GPU types correctly
+    # Verify total rental cost aggregates correctly
     assert expected_total_rental_cost == pytest.approx(
         8 * h100_effective_rate + 6 * h200_effective_rate, abs=1
     )
 
-    # Rental share is positive because there are unrented eligible GPUs
+    # Verify rental share calculation
     assert splits["rental_share"] > 0
 
-    # Both miners get positive weight; weights sum to 1.0
+    # Verify each miner gets appropriate weight based on their GPU type's cap
     assert validator.miner_scores["miner_a"] > 0
     assert validator.miner_scores["miner_b"] > 0
     assert sum(validator.miner_scores.values()) == pytest.approx(1.0, abs=0.0001)
@@ -497,7 +494,6 @@ async def test_rental_price_scenario_all_unrented(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -523,11 +519,11 @@ async def test_rental_price_scenario_all_unrented(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data())
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # All executors are unrented and eligible, so each should produce rental_price algorithm logs
+    # Verify rental logging for all unrented scenario
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
     for hotkey, results in all_job_results.items():
         for result in results:
             if result.score > 0 and result.incentive_logs:
@@ -546,12 +542,9 @@ async def test_rental_price_scenario_all_unrented(
         alpha_rate=ALPHA_RATE,
     )
 
-    # Mining share is always 9% of total emission regardless of rental activity
     assert splits["mining_share"] == pytest.approx(0.09)
-    # When there are no rented executors, no mining score exists, so all non-burn emission flows to rental
     assert sum(validator.miner_scores.values()) == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
 
-    # Every miner with eligible unrented GPUs receives a positive rental weight
     for hotkey in ["miner_a", "miner_b", "miner_c"]:
         assert validator.miner_scores[hotkey] > 0
 
@@ -565,7 +558,6 @@ async def test_rental_price_scenario_zero_unrented(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -591,10 +583,8 @@ async def test_rental_price_scenario_zero_unrented(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data(["exec-a"]))
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
     splits = expected_emission_splits(
         unrented_gpu_counts={},
         rental_prices=RENTAL_PRICES_PER_HOUR,
@@ -603,12 +593,9 @@ async def test_rental_price_scenario_zero_unrented(
         alpha_rate=ALPHA_RATE,
     )
 
-    # No eligible unrented GPUs (A100 cap=0, RTX4090 not in rental list) → rental_share must be 0
     assert splits["rental_share"] == 0.0
-    # When rental_share is 0, full burn emission goes to burners
     assert splits["burn_share"] == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
     assert splits["mining_share"] == pytest.approx(0.09, abs=0.0001)
-    # Price provider should not be called when there are no eligible unrented executors
     mock_price_provider.get_tao_price.assert_not_called()
     mock_price_provider.get_alpha_rate.assert_not_called()
 
@@ -622,12 +609,9 @@ async def test_rental_price_scenario_rental_share_cap(
     create_neuron_info,
     price_provider_holder,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
-    # Very low tao_price and alpha_rate makes rental cost extremely large relative to epoch emission,
-    # driving rental_share above TOTAL_BURN_EMISSION, which should be clamped at the cap
     price_provider = AsyncMock()
     price_provider.get_tao_price.return_value = 0.01
     price_provider.get_alpha_rate.return_value = 0.01
@@ -651,10 +635,8 @@ async def test_rental_price_scenario_rental_share_cap(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data(["exec-b"]))
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 1000},
         rental_prices=RENTAL_PRICES_PER_HOUR,
@@ -663,10 +645,7 @@ async def test_rental_price_scenario_rental_share_cap(
         alpha_rate=0.01,
     )
 
-    # rental_share is capped at TOTAL_BURN_EMISSION; very high rental cost with tiny epoch emission
-    # drives the uncapped value far above TOTAL_BURN_EMISSION, so it gets clamped
     assert splits["rental_share"] == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
-    # When rental_share consumes all of burn emission, burn_share falls to 0 (no residual for burners)
     assert splits["burn_share"] == pytest.approx(0.0, abs=0.0001)
     assert validator.miner_scores["burner1"] == pytest.approx(0.0, abs=0.0001)
     assert validator.miner_scores["burner2"] == pytest.approx(0.0, abs=0.0001)
@@ -681,7 +660,6 @@ async def test_rental_price_edge_multi_executor_accumulation(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -707,11 +685,11 @@ async def test_rental_price_edge_multi_executor_accumulation(
         return_value=_make_rented_data(["exec-a1", "exec-b1"])
     )
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # Each executor produces an independent log entry with its own UUID
+    # Verify logging for multiple executors per miner (CRITICAL edge case)
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
     for hotkey, results in all_job_results.items():
         for result in results:
             if result.score > 0 and result.incentive_logs:
@@ -731,7 +709,7 @@ async def test_rental_price_edge_multi_executor_accumulation(
                         "total_mining_score"
                     ])
 
-    # miner_a has 3 independent executors, each must have its own log entry
+    # Verify miner_a has 3 independent log entries
     miner_a_results = all_job_results["miner_a"]
     assert len(miner_a_results) == 3, "Should have 3 executors"
     for result in miner_a_results:
@@ -770,7 +748,6 @@ async def test_rental_price_edge_multi_executor_accumulation(
         max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         total_unrented_counts=total_unrented_counts,
     )
-    # miner_a accumulates rental value from both its unrented H100 and unrented H200 executors
     assert expected_a_rental == pytest.approx(3 * H100_HOURLY_RATE + 4 * H200_HOURLY_RATE)
 
     splits = expected_emission_splits(
@@ -796,7 +773,6 @@ async def test_rental_price_edge_multi_executor_accumulation(
         num_burners=2,
     )
 
-    # miner_a gets both its mining portion (rented H100) and rental portion (unrented H100 + H200)
     assert validator.miner_scores["miner_a"] == pytest.approx(expected_a_weight, abs=0.0001)
 
 
@@ -809,7 +785,6 @@ async def test_rental_price_edge_gpu_type_mix(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -841,17 +816,17 @@ async def test_rental_price_edge_gpu_type_mix(
         return_value=_make_rented_data(["exec-a", "exec-d"])
     )
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # Each executor's GPU model should appear in its own log entry to confirm type routing
+    # Verify logging for mixed GPU types edge case
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
     for hotkey, results in all_job_results.items():
         for result in results:
             if result.score > 0 and result.incentive_logs:
                 assert_incentive_log_present(result.full_log_text)
                 assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
-                # GPU model must be present in logs to confirm correct GPU-type routing
+                # Verify GPU model appears in logs (mixed GPU types)
                 assert result.gpu_model in result.full_log_text
 
                 if result.eligible_for_rental_share and not result.is_rented:
@@ -871,12 +846,10 @@ async def test_rental_price_edge_gpu_type_mix(
         collateral_deposited=True,
         uptime_minutes=120,
     )
-    # A100 is excluded from the rental incentive (max_cap=0), so its score is 0
     assert expected_c_mining == 0
 
-    # miner_c gets 0 because A100 is excluded from both mining and rental in this incentive config
+    # miner_c has no rental incentive for A100, so it gets 0 score
     assert validator.miner_scores.get("miner_c", 0) == 0
-    # H200 unrented → rental share; H100 and H200 rented → mining share
     assert validator.miner_scores["miner_b"] > 0
     assert validator.miner_scores["miner_a"] > 0
     assert validator.miner_scores["miner_d"] > 0
@@ -891,7 +864,6 @@ async def test_rental_price_edge_uptime_penalties(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -946,10 +918,8 @@ async def test_rental_price_edge_uptime_penalties(
         return_value=_make_rented_data(["exec-a", "exec-b"])
     )
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
     total_gpu_counts = _total_gpu_counts(all_job_results)
     expected_a = expected_executor_score(
         gpu_model="H100",
@@ -974,9 +944,7 @@ async def test_rental_price_edge_uptime_penalties(
         uptime_minutes=60,
     )
 
-    # miner_b has lower uptime (60 min) and no collateral → lower expected score than miner_a
     assert expected_b < expected_a
-    # Validator scores must reflect the same ordering
     assert validator.miner_scores["miner_b"] < validator.miner_scores["miner_a"]
 
 
@@ -989,7 +957,6 @@ async def test_rental_price_burner_distribution(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -1007,12 +974,9 @@ async def test_rental_price_burner_distribution(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data(["exec-a"]))
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
     burn_share = TOTAL_BURN_EMISSION
-    # With no unrented eligible GPUs, burn_share = TOTAL_BURN_EMISSION, split equally among 2 burners
     assert validator.miner_scores["burner1"] == pytest.approx(burn_share / 2, abs=0.0001)
     assert validator.miner_scores["burner2"] == pytest.approx(burn_share / 2, abs=0.0001)
 
@@ -1026,7 +990,6 @@ async def test_rental_price_weight_normalization(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -1048,24 +1011,16 @@ async def test_rental_price_weight_normalization(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data(["exec-a"]))
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
     captured = await _run_set_weights_and_capture(
         mock_subtensor_client, miners, validator.miner_scores, normalize=True
     )
     processed = captured["processed_weights"]
-    # After on-chain normalization, processed weights must sum to exactly 1.0
     assert processed.sum() == pytest.approx(1.0, abs=0.0001)
 
 
-@pytest.mark.asyncio
-async def test_expected_emission_splits_zero_unrented():
-    # Arrange
-    # No unrented GPUs → rental cost is 0 → rental_share must be 0
-
-    # Act
+def test_expected_emission_splits_zero_unrented():
     splits = expected_emission_splits(
         unrented_gpu_counts={},
         rental_prices={"H100": 3.5},
@@ -1074,21 +1029,15 @@ async def test_expected_emission_splits_zero_unrented():
         alpha_rate=0.5,
     )
 
-    # Assert
-    # With zero rental cost, rental_share is 0 and all of TOTAL_BURN_EMISSION goes to burners
     assert splits["rental_share"] == 0.0
     assert splits["burn_share"] == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
-    # Mining share is always fixed at 1 - TOTAL_BURN_EMISSION regardless of rental activity
     assert splits["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION, abs=0.0001)
 
 
-@pytest.mark.asyncio
-async def test_expected_emission_splits_basic_calculation():
-    # Arrange
+def test_expected_emission_splits_basic_calculation():
     unrented_counts = {"H100": 8, "H200": 5}
     rental_prices = {"H100": 3.5, "H200": 4.0}
 
-    # Act
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=rental_prices,
@@ -1097,25 +1046,18 @@ async def test_expected_emission_splits_basic_calculation():
         alpha_rate=0.5,
     )
 
-    # Assert
     total_rental_cost = 8 * 3.5 + 5 * 4.0
     expected_rental = _expected_rental_share(total_rental_cost, 500.0, 0.5)
 
-    # rental_share is proportional to total rental cost divided by epoch emission
     assert splits["rental_share"] == pytest.approx(expected_rental, abs=0.0001)
-    # burn_share is the remainder of TOTAL_BURN_EMISSION after rental_share is subtracted
     assert splits["burn_share"] == pytest.approx(TOTAL_BURN_EMISSION - expected_rental, abs=0.0001)
-    # mining_share is always fixed regardless of rental_share
     assert splits["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION, abs=0.0001)
 
 
-@pytest.mark.asyncio
-async def test_expected_emission_splits_cap_dilution():
-    # Arrange
+def test_expected_emission_splits_cap_dilution():
     unrented_counts = {"H100": 1500}
     rental_prices = {"H100": 3.5}
 
-    # Act
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=rental_prices,
@@ -1124,24 +1066,18 @@ async def test_expected_emission_splits_cap_dilution():
         alpha_rate=0.5,
     )
 
-    # Assert
-    # Total (1500) exceeds cap (1000), so effective_rate = 3.5 * 1000/1500 ≈ 2.333
     effective_rate = 3.5 * 1000 / 1500
     total_rental_cost = 1500 * effective_rate
     expected_rental = _expected_rental_share(total_rental_cost, 500.0, 0.5)
 
     assert effective_rate == pytest.approx(2.333, abs=0.001)
-    # rental_share is calculated from the cap-diluted total rental cost, not the raw cost
     assert splits["rental_share"] == pytest.approx(expected_rental, abs=0.0001)
 
 
-@pytest.mark.asyncio
-async def test_expected_emission_splits_cap_at_burn_emission():
-    # Arrange
+def test_expected_emission_splits_cap_at_burn_emission():
     unrented_counts = {"H100": 1000}
     rental_prices = {"H100": 3.5}
 
-    # Act
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=rental_prices,
@@ -1150,20 +1086,12 @@ async def test_expected_emission_splits_cap_at_burn_emission():
         alpha_rate=0.01,
     )
 
-    # Assert
-    # Very low tao_price and alpha_rate → tiny epoch_emission → uncapped rental_share >> TOTAL_BURN_EMISSION
-    # The rental_share is clamped to TOTAL_BURN_EMISSION, leaving burn_share = 0
     assert splits["rental_share"] == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
     assert splits["burn_share"] == pytest.approx(0.0, abs=0.0001)
     assert splits["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION, abs=0.0001)
 
 
-@pytest.mark.asyncio
-async def test_expected_emission_splits_zero_epoch_emission():
-    # Arrange
-    # tao_price=0.0 → epoch_emission = TEMPO * 0.0 * alpha_rate = 0 → rental_share is undefined → 0
-
-    # Act
+def test_expected_emission_splits_zero_epoch_emission():
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 10},
         rental_prices={"H100": 3.5},
@@ -1172,8 +1100,6 @@ async def test_expected_emission_splits_zero_epoch_emission():
         alpha_rate=0.5,
     )
 
-    # Assert
-    # When epoch emission is zero the formula is undefined; the implementation returns 0 for safety
     assert splits["rental_share"] == 0.0
     assert splits["burn_share"] == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
     assert splits["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION, abs=0.0001)
@@ -1188,7 +1114,7 @@ async def test_rental_price_failed_executors_rented_do_not_score(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
+    # --- Arrange ---
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -1236,11 +1162,12 @@ async def test_rental_price_failed_executors_rented_do_not_score(
         return_value=_make_rented_data(["exec-a", "exec-b"])
     )
 
-    # Act
+    # --- Act ---
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # Executors with missing mining_score log "Mining score is not set" in the incentive section
+    # --- Assert ---
+    from tests.helpers import extract_incentive_section
+
     for hotkey, results in all_job_results.items():
         for result in results:
             if result.mining_score is None:
@@ -1248,11 +1175,8 @@ async def test_rental_price_failed_executors_rented_do_not_score(
                 if section:
                     assert "Mining score is not set" in section
 
-    # miner_a's executor returned score=0 / job_score=0, so the miner gets 0 final weight
     assert validator.miner_scores["miner_a"] == 0.0
-    # miner_b's executor returned a valid score, so the miner gets a positive final weight
     assert validator.miner_scores["miner_b"] > 0
-    # miner_c has gpu_count=0 → not eligible for rental share and produces no mining score
     assert validator.miner_scores["miner_c"] == 0.0
 
 
@@ -1265,7 +1189,7 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
+    # --- Arrange ---
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -1303,10 +1227,17 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
         return_value=_make_rented_data(["exec-b"])
     )
 
-    # Act
+    # --- Act ---
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
+    # --- Assert ---
+    from tests.helpers import (
+        assert_executor_has_log,
+        assert_incentive_log_present,
+        assert_log_contains_keys,
+        extract_incentive_section,
+    )
+
     for hotkey, results in all_job_results.items():
         for result in results:
             if result.mining_score is None:
@@ -1325,10 +1256,8 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
-    # miner_a's unrented executor has score=0 → it does not contribute to rental calculations
     assert splits["rental_share"] == 0.0
     assert validator.miner_scores.get("miner_a", 0) == 0.0
-    # miner_b's rented executor has a valid score → it gets the mining portion
     assert validator.miner_scores["miner_b"] > 0
 
 
@@ -1341,7 +1270,7 @@ async def test_rental_price_gpu_type_max_cap_zero_miner_gets_zero_score(
     create_neuron_info,
     mock_price_provider,
 ):
-    # Arrange
+    # --- Arrange ---
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -1379,18 +1308,16 @@ async def test_rental_price_gpu_type_max_cap_zero_miner_gets_zero_score(
         return_value=_make_rented_data([])
     )
 
-    # Act
+    # --- Act ---
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # The job itself produced a non-zero score, confirming the executor passed validation
+    # --- Assert ---
+    # Job for miner_a has score/job_score > 0 (default from create_job_result), but miner gets 0 (max_cap=0 GPU)
     miner_a_results = all_job_results["miner_a"]
     assert len(miner_a_results) == 1
     assert miner_a_results[0].score > 0 or miner_a_results[0].job_score > 0
 
-    # Despite having a valid job score, miner_a gets 0 final weight because A100 has max_cap=0
     assert validator.miner_scores.get("miner_a", 0) == pytest.approx(0.0, abs=0.0001)
-    # miner_b's H100 is eligible (max_cap=1000) → gets a positive rental share weight
     assert validator.miner_scores["miner_b"] > 0
 
 
@@ -1402,7 +1329,6 @@ async def test_rental_price_edge_single_miner_dominance(
     create_job_result,
     create_neuron_info,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -1430,11 +1356,11 @@ async def test_rental_price_edge_single_miner_dominance(
         return_value=_make_rented_data(["exec-b", "exec-c"])
     )
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # Verify logs for each executor type
+    # Verify logging for single dominant miner scenario
+    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
+
     for hotkey, results in all_job_results.items():
         for result in results:
             if result.score > 0 and result.incentive_logs:
@@ -1448,9 +1374,7 @@ async def test_rental_price_edge_single_miner_dominance(
                     # Default algorithm logs for rented executors
                     assert_log_contains_keys(result.full_log_text, ["mining_score", "total_mining_score"])
 
-    # miner_a dominates the rental pool (1000 GPUs) while miner_b/c split mining equally (5 GPUs each)
     assert validator.miner_scores["miner_a"] > validator.miner_scores["miner_b"] + validator.miner_scores["miner_c"]
-    # miner_b and miner_c have identical GPU counts and scores, so they get equal weights
     assert validator.miner_scores["miner_b"] == pytest.approx(
         validator.miner_scores["miner_c"], abs=0.0001
     )
@@ -1465,11 +1389,9 @@ async def test_rental_price_price_provider_fallback(
     create_neuron_info,
     price_provider_holder,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
-    # Simulate price provider returning None (e.g. API outage)
     price_provider = AsyncMock()
     price_provider.get_tao_price.return_value = None
     price_provider.get_alpha_rate.return_value = None
@@ -1489,16 +1411,11 @@ async def test_rental_price_price_provider_fallback(
 
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data())
 
-    # Act
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
-    # Assert
-    # When price provider returns None, epoch_emission = 0, so rental_share = 0 → miner_a gets nothing
     assert validator.miner_scores["miner_a"] == 0.0
-    # With rental_share = 0, full burn emission flows to burners split evenly
     assert validator.miner_scores["burner1"] == pytest.approx(TOTAL_BURN_EMISSION / 2, abs=0.0001)
     assert validator.miner_scores["burner2"] == pytest.approx(TOTAL_BURN_EMISSION / 2, abs=0.0001)
-    # Price provider must have been called (the failure happened at the provider level, not skipped)
     assert price_provider.get_tao_price.called
     assert price_provider.get_alpha_rate.called
 
@@ -1511,7 +1428,6 @@ async def test_rental_price_integration_chain_submission(
     create_job_result,
     create_neuron_info,
 ):
-    # Arrange
     validator = validator_with_rental_price
     validator.miner_scores = {}
 
@@ -1537,7 +1453,6 @@ async def test_rental_price_integration_chain_submission(
 
     mock_subtensor_client.get_miners = AsyncMock(return_value=miners)
 
-    # Act
     with patch("clients.subtensor_client.process_weights_for_netuid") as process_mock, patch(
         "clients.subtensor_client.convert_weights_and_uids_for_emit"
     ) as convert_mock:
@@ -1549,14 +1464,11 @@ async def test_rental_price_integration_chain_submission(
 
         await mock_subtensor_client.set_weights(miner_scores=validator.miner_scores)
 
-    # Assert
-    # The full on-chain submission path must be invoked with the correct payload shape
     assert mock_subtensor_client.send_weights_to_lium.called
     call_payload = mock_subtensor_client.send_weights_to_lium.call_args.args[0]
     assert "netuid" in call_payload
     assert "uids" in call_payload
     assert "weights" in call_payload
-
 
 @pytest.mark.asyncio
 async def test_rental_price_gpu_variants_under_cap(
