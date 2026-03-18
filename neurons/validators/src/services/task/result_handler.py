@@ -114,6 +114,7 @@ class ResultHandler:
             gpu_model=gpu_model,
             gpu_count=gpu_count,
             sysbox_runtime=context.state.sysbox_runtime,
+            supports_gpu_splitting=context.state.supports_gpu_splitting,
             ssh_pub_keys=context.ssh_pub_keys,
             is_rented=context.rented,
             tdx_attestation_passed=context.tdx_attestation_passed,

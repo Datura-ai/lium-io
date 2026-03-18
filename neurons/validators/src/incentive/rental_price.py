@@ -89,6 +89,13 @@ class RentalPriceIncentive(DefaultIncentive):
                 result.gpu_model, result.gpu_count,
                 self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
             )
+            # GPU splitting: always pick the best of the bundle rate vs per-GPU rate
+            if result.supports_gpu_splitting:
+                rate_for_one = get_hourly_rate(
+                    result.gpu_model, 1,
+                    self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
+                )
+                result.hourly_rate = max(result.hourly_rate, rate_for_one)
             result.max_cap = self.config.max_unrented_gpus.get(base_model, 0)
 
             # accumulate raw unrented GPU count per base model (only if rate > 0)
