@@ -4,7 +4,7 @@ import logging
 import asyncssh
 from asyncssh import SSHClientConnection
 
-from services.executor_connectivity.docker_command import DockerCommand
+from core.docker_utils import DockerCommand
 from services.executor_connectivity.models import DindProbeResult, PortPair
 from services.ssh_service import SSHService
 
