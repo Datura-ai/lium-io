@@ -59,3 +59,27 @@ class DockerCommand:
     def volume_prune() -> str:
         """Build docker volume prune command."""
         return "/usr/bin/docker volume prune -af"
+
+    @staticmethod
+    def volume_remove(volume_name: str) -> str:
+        """Build docker volume rm command."""
+        return f"/usr/bin/docker volume rm {volume_name} 2>/dev/null || true"
+
+    @staticmethod
+    def inspect_created_timestamp(container_id: str) -> str:
+        """Build docker inspect command to get creation timestamp in seconds."""
+        return (
+            f"/usr/bin/docker inspect {container_id} "
+            "--format '{{json .Created}}' | "
+            "xargs -I {} date -d {} +%s"
+        )
+
+    @staticmethod
+    def ps_running(container_name: str) -> str:
+        """Build docker ps command to check if container is running."""
+        return f"/usr/bin/docker ps -q -f name={container_name}"
+
+    @staticmethod
+    def exec_command(container_name: str, command: str) -> str:
+        """Build docker exec command."""
+        return f"/usr/bin/docker exec -i {container_name} sh -c '{command}'"
