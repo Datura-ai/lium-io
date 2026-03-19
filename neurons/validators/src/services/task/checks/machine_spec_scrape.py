@@ -105,7 +105,7 @@ class MachineSpecScrapeCheck:
             gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
             gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
             sysbox_runtime = specs.get("sysbox_runtime", False)
-            supports_gpu_splitting = specs.get("gpu_splitting", False)
+            supports_gpu_splitting = specs.get("storage_limit_supported", False)
             extra_info = {
                 "sysbox_runtime": sysbox_runtime,
                 "supports_gpu_splitting": supports_gpu_splitting,
