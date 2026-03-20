@@ -1,8 +1,6 @@
 from typing import Iterable
 from dataclasses import replace
-import logging
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
 from core.docker_utils import DockerCommand
 from ..messages import TenantEnforcementMessages as Msg, render_message
@@ -11,10 +9,7 @@ from ...const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     MIN_PORT_COUNT,
-    POD_CONTAINER_PREFIX,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
@@ -94,11 +89,10 @@ class TenantEnforcementCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         # Clean up stale containers
-        await cleanup_stale_containers(
+        await ctx.services.container_cleanup.cleanup(
             ssh_client=ctx.ssh,
             rented_data=ctx.state.rented_data,
             executor_uuid=ctx.executor.uuid,
-            stale_threshold_minutes=15,
         )
 
         # Get rented executor from context instead of Redis
@@ -238,68 +232,3 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
 
     return pod_running, ssh_keys
 
-
-async def cleanup_stale_containers(
-    ssh_client,
-    rented_data: RentedExecutorsResponse | None,
-    executor_uuid: str,
-    stale_threshold_minutes: int = 15,
-) -> tuple[int, list[str]]:
-    """Remove containers that are not in rented data and are older than threshold.
-
-    Returns:
-        Tuple of (number_removed, list_of_removed_container_names)
-    """
-    removed_names = []
-
-    try:
-        # Get all containers with the rental prefix
-        result = await ssh_client.run(DockerCommand.ps_filter(f"{POD_CONTAINER_PREFIX}*"))
-        if not result.stdout or not result.stdout.strip():
-            return 0, []
-
-        all_pod_containers = result.stdout.strip().split('\n')
-
-        # Get currently rented containers for this executor
-        rented_containers = set()
-        if rented_data and executor_uuid in rented_data.executors:
-            executor = rented_data.executors[executor_uuid]
-            rented_containers = {pod.container_name for pod in executor.pods}
-
-        # Check each container
-        for container_name in all_pod_containers:
-            if container_name in rented_containers:
-                continue
-
-            # Get container creation time and calculate age on the machine
-            try:
-                created_result = await ssh_client.run(DockerCommand.inspect_created_timestamp(container_name))
-                if created_result.exit_status != 0:
-                    continue
-                created_timestamp = int(created_result.stdout.strip())
-
-                # Get current time on the machine
-                current_result = await ssh_client.run("date +%s")
-                if current_result.exit_status != 0:
-                    continue
-                current_timestamp = int(current_result.stdout.strip())
-
-                # Check if stale
-                age_minutes = (current_timestamp - created_timestamp) / 60
-                if age_minutes > stale_threshold_minutes:
-                    # Remove container
-                    remove_result = await ssh_client.run(DockerCommand.remove(container_name))
-                    if remove_result.exit_status == 0:
-                        removed_names.append(container_name)
-
-                        # Remove associated volume
-                        pod_id = container_name.removeprefix(POD_CONTAINER_PREFIX)
-                        await ssh_client.run(DockerCommand.volume_remove(f"volume_{pod_id}"))
-
-            except Exception:
-                continue
-
-    except Exception:
-        pass
-
-    return len(removed_names), removed_names
