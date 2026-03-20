@@ -17,6 +17,7 @@ from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
+from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
@@ -32,6 +33,7 @@ class ContextServices:
     shell: InteractiveShellService
     score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
     backend: BackendClient
+    container_cleanup: ContainerCleanup
 
 
 @dataclass(frozen=True)
