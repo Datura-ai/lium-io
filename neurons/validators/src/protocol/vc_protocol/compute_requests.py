@@ -55,6 +55,7 @@ class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
     banned_guids: list[str] = []
+    gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
 
 
 class ExecutorUptimeResponse(BaseModel):

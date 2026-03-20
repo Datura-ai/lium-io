@@ -89,13 +89,13 @@ class RentalPriceIncentive(DefaultIncentive):
                 result.gpu_model, result.gpu_count,
                 self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
             )
-            # GPU splitting: always pick the best of the bundle rate vs per-GPU rate
-            if result.supports_gpu_splitting:
-                rate_for_one = get_hourly_rate(
-                    result.gpu_model, 1,
+            # GPU splitting: always pick the best of the bundle rate vs min-count rate
+            if result.supports_gpu_splitting and result.gpu_splitting_min_count:
+                rate_for_min = get_hourly_rate(
+                    result.gpu_model, result.gpu_splitting_min_count,
                     self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
                 )
-                result.hourly_rate = max(result.hourly_rate, rate_for_one)
+                result.hourly_rate = max(result.hourly_rate, rate_for_min)
             result.max_cap = self.config.max_unrented_gpus.get(base_model, 0)
 
             # accumulate raw unrented GPU count per base model (only if rate > 0)
@@ -221,7 +221,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
         Eligibility is determined by whether the GPU type has a defined cap
         in max_unrented_gpus (per-GPU-type caps).
-
+ _g
         Args:
             total_gpu_model_count_map: Mapping of GPU models to total counts
             job_result: Job execution result to score
