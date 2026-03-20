@@ -36,6 +36,12 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, Rente
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from helpers import build_context_config, build_services, build_state
+
+
+class MockContainerCleanup:
+    """Mock container cleanup service for tests."""
+    async def cleanup(self, ssh_client, rented_data, executor_uuid):
+        return 0, []
 from protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
@@ -354,6 +360,7 @@ async def test_successful_unrented_pipeline_flow(context_factory):
         verifyx=verifyx_service,
         connectivity=connectivity_service,
         score_calculator=dummy_score_calculator,
+        container_cleanup=MockContainerCleanup(),
     )
 
     # Setup config with all required fields
@@ -540,6 +547,7 @@ async def test_successful_rented_pipeline_flow(context_factory):
         redis=redis_service,
         collateral=collateral_service,
         score_calculator=dummy_score_calculator,
+        container_cleanup=MockContainerCleanup(),
     )
 
     # Setup config
