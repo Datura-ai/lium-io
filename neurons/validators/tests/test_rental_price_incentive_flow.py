@@ -123,7 +123,10 @@ def validator_with_rental_price(
     return validator_with_mocks
 
 
-def _make_rented_data(rented_executor_ids: list[str] | None = None) -> RentedExecutorsResponse:
+def _make_rented_data(
+    rented_executor_ids: list[str] | None = None,
+    gpu_splitting_config: dict[str, int] | None = None,
+) -> RentedExecutorsResponse:
     executors = {}
     for executor_id in rented_executor_ids or []:
         executors[executor_id] = RentedExecutor(
@@ -132,7 +135,11 @@ def _make_rented_data(rented_executor_ids: list[str] | None = None) -> RentedExe
             executor_ip_port="8000",
             pods=[RentedPod(pod_id="pod-1", container_name="ctr")],
         )
-    return RentedExecutorsResponse(executors=executors, banned_guids=[])
+    return RentedExecutorsResponse(
+        executors=executors,
+        banned_guids=[],
+        gpu_splitting_config=gpu_splitting_config or {},
+    )
 
 
 def _job(create_job_result, *, executor_id: str, gpu_model: str, gpu_count: int, is_rented: bool, **kwargs):
@@ -2120,3 +2127,127 @@ async def test_rental_price_variant_eligibility_check(
 
     # Rental share is positive because eligible H200 variants contribute to rental cost
     assert splits["rental_share"] > 0
+
+
+# ---------------------------------------------------------------------------
+# GPU splitting tests (DAH-1871)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gpu_splitting_hardware_and_backend_enabled(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """When hardware supports GPU splitting AND backend opts in, the min-count rate is used."""
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_a"),
+    ]
+
+    job_a = _job(create_job_result, executor_id="exec-a", gpu_model="H100", gpu_count=8, is_rented=False)
+    job_a.supports_gpu_splitting = True
+    job_a.gpu_splitting_min_count = 1
+
+    all_job_results = {"miner_a": [job_a]}
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(gpu_splitting_config={"exec-a": 1})
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Executor is eligible and unrented → positive rental score
+    assert validator.miner_scores.get("miner_a", 0) > 0
+
+    # hourly_rate should be max(bundle_rate, min_count_rate)
+    bundle_rate = H100_HOURLY_RATE  # rate for 8 GPUs
+    single_rate = H100_HOURLY_RATE  # rate for 1 GPU (same table entry)
+    assert job_a.hourly_rate == pytest.approx(max(bundle_rate, single_rate), rel=1e-6)
+
+    # incentive log should contain gpu_splitting_min_count
+    assert_incentive_log_present(job_a.full_log_text)
+    assert_rental_price_incentive_log_full_content(job_a.full_log_text)
+
+
+@pytest.mark.asyncio
+async def test_gpu_splitting_hardware_supports_but_backend_not_enabled(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """When hardware supports GPU splitting but the backend does NOT opt in, standard bundle rate is used."""
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_a"),
+    ]
+
+    job_a = _job(create_job_result, executor_id="exec-a", gpu_model="H100", gpu_count=8, is_rented=False)
+    # hardware claims support but backend has no entry → combined flag must be False
+    job_a.supports_gpu_splitting = False
+    job_a.gpu_splitting_min_count = None
+
+    all_job_results = {"miner_a": [job_a]}
+
+    # No gpu_splitting_config provided → backend has not opted in
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data()
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    assert validator.miner_scores.get("miner_a", 0) > 0
+    # hourly_rate is only the bundle rate, no splitting uplift
+    assert job_a.hourly_rate == pytest.approx(H100_HOURLY_RATE, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_gpu_splitting_backend_enabled_but_hardware_does_not_support(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """When backend opts in but hardware does NOT support GPU splitting, standard rate is used."""
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_a"),
+    ]
+
+    job_a = _job(create_job_result, executor_id="exec-a", gpu_model="H100", gpu_count=8, is_rented=False)
+    # hardware does NOT support splitting → combined flag must be False even though backend opted in
+    job_a.supports_gpu_splitting = False
+    job_a.gpu_splitting_min_count = None
+
+    all_job_results = {"miner_a": [job_a]}
+
+    # Backend says min_count=1 for exec-a, but hardware flag prevents it
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(gpu_splitting_config={"exec-a": 1})
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    assert validator.miner_scores.get("miner_a", 0) > 0
+    assert job_a.hourly_rate == pytest.approx(H100_HOURLY_RATE, rel=1e-6)
