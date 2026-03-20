@@ -20,6 +20,7 @@ class JobResult(BaseModel):
     gpu_count: int = 0
     sysbox_runtime: bool = False
     supports_gpu_splitting: bool = False
+    gpu_splitting_min_count: int | None = None
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
 

@@ -105,10 +105,14 @@ class MachineSpecScrapeCheck:
             gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
             gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
             sysbox_runtime = specs.get("sysbox_runtime", False)
-            supports_gpu_splitting = specs.get("storage_limit_supported", False)
+            hardware_supports = specs.get("storage_limit_supported", False)
+            gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
+            gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
+            supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
             extra_info = {
                 "sysbox_runtime": sysbox_runtime,
                 "supports_gpu_splitting": supports_gpu_splitting,
+                "gpu_splitting_min_count": gpu_splitting_min_count,
             }
 
             event = render_message(
@@ -131,6 +135,7 @@ class MachineSpecScrapeCheck:
                 gpu_processes=specs.get("gpu_processes", []) or [],
                 sysbox_runtime=sysbox_runtime,
                 supports_gpu_splitting=supports_gpu_splitting,
+                gpu_splitting_min_count=gpu_splitting_min_count,
                 gpu_model_count=gpu_model_count,
                 gpu_uuids=gpu_uuids,
             )

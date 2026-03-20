@@ -65,6 +65,7 @@ class ContextState:
     gpu_processes: list[dict] = field(default_factory=list)
     sysbox_runtime: bool = False
     supports_gpu_splitting: bool = False
+    gpu_splitting_min_count: int | None = None
     gpu_model_count: Optional[str] = None
     gpu_uuids: Optional[str] = None
     verified_port_count: int = 0
