@@ -17,6 +17,7 @@ from core.config import settings
 from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
 from services.executor_connectivity_service import ExecutorConnectivityService
+from services.container_cleanup import ContainerCleanup
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.redis_service import RENTAL_SUCCEED_MACHINE_SET, RedisService
@@ -168,6 +169,7 @@ class PipelineFactory:
                 shell=shell,
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
+                container_cleanup=ContainerCleanup(),
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,
