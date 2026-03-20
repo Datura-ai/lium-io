@@ -65,11 +65,10 @@ class VerifyXCheck:
             )
 
             # Store verifyx network measurements under their own keys (additive — does not overwrite speedtest values)
-            if verifyx_network.get("download_speed") is not None or verifyx_network.get("upload_speed") is not None:
+            if verifyx_network.get("download_speed") is not None:
                 if "network" not in updated_specs:
                     updated_specs["network"] = {}
                 updated_specs["network"]["verifyx_download_speed"] = verifyx_network.get("download_speed")
-                updated_specs["network"]["verifyx_upload_speed"] = verifyx_network.get("upload_speed")
 
             # Update storage specs if storage is present
             if "hard_disk" in sanitized:
@@ -83,12 +82,7 @@ class VerifyXCheck:
                 check_id=self.check_id,
                 what={
                     "verifyx_success": True,
-                    "verifyx_download_speed": verifyx_network.get("download_speed"),
-                    "verifyx_upload_speed": verifyx_network.get("upload_speed"),
-                    "verifyx_execution_time_ms": verifyx_network.get("execution_time_ms"),
                     "verifyx_network_success": verifyx_network.get("success"),
-                    "speedtest_upload": speedtest_network.get("upload_speed"),
-                    "speedtest_download": speedtest_network.get("download_speed"),
                     "network": speedtest_network,
                 },
             )
