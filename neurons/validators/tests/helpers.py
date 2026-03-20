@@ -63,6 +63,7 @@ def build_services(**overrides) -> ContextServices:
         shell=None,
         score_calculator=DummyScoreCalc(),
         backend=None,
+        container_cleanup=None,
     )
     base.update(overrides)
     return ContextServices(**base)
