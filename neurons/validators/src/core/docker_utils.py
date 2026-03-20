@@ -36,9 +36,10 @@ class DockerCommand:
         return f"/usr/bin/docker rm -f {name} 2>/dev/null || true"
 
     @staticmethod
-    def ps_filter(name_pattern: str) -> str:
-        """Build docker ps command with filter."""
-        return f'/usr/bin/docker ps -a --filter "name={name_pattern}" --format "{{{{.Names}}}}"'
+    def ps_filter(*name_patterns: str) -> str:
+        """Build docker ps command with one or more filters."""
+        filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
+        return f'/usr/bin/docker ps -a {filters} --format "{{{{.Names}}}}"'
 
     @staticmethod
     def inspect_status(container_id: str) -> str:

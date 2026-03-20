@@ -88,25 +88,24 @@ class ContainerCleanup:
 
     async def _get_all_rental_containers(self, ssh_client) -> list[str]:
         """Get all containers with rental-related prefixes."""
-        containers = []
-
-        # Get pod_ prefixed containers
         try:
-            result = await ssh_client.run(DockerCommand.ps_filter(f"{POD_CONTAINER_PREFIX}*"))
+            # Get both pod_ and container_ prefixed containers in one command
+            result = await ssh_client.run(
+                DockerCommand.ps_filter(f"{POD_CONTAINER_PREFIX}*", "container_*")
+            )
             if result.stdout and result.stdout.strip():
-                containers.extend(result.stdout.strip().split('\n'))
+                return result.stdout.strip().split('\n')
         except Exception as e:
-            logger.debug(f"Error getting pod containers: {e}")
+            logger.warning(
+                _m(
+                    f"Error getting rental containers",
+                    extra={
+                        "error": str(e)
+                    }
+                )
+            )
 
-        # Get container_ prefixed containers
-        try:
-            result = await ssh_client.run(DockerCommand.ps_filter("container_*"))
-            if result.stdout and result.stdout.strip():
-                containers.extend(result.stdout.strip().split('\n'))
-        except Exception as e:
-            logger.debug(f"Error getting container_ containers: {e}")
-
-        return containers
+        return []
 
     def _get_rented_containers(
         self,
@@ -142,7 +141,12 @@ class ContainerCleanup:
             return age_minutes
 
         except Exception as e:
-            logger.debug(f"Error checking container age for {container_name}: {e}")
+            logger.warning(
+                _m(
+                    f"Error checking container age for {container_name}",
+                    extra={"container_name": container_name, "error": str(e)}
+                )
+            )
             return None
 
     async def _remove_container(self, ssh_client, container_name: str) -> bool:
