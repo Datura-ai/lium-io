@@ -9,6 +9,12 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, Rente
 from helpers import build_context_config, build_services, build_state
 
 
+class MockContainerCleanup:
+    """Mock container cleanup service for tests."""
+    async def cleanup(self, ssh_client, rented_data, executor_uuid):
+        return 0, []
+
+
 def convert_rented_machine_to_rented_data(
     rented_machine: dict | None,
     executor_uuid: str = "executor-123",
@@ -266,6 +272,7 @@ async def test_tenant_enforcement_check(
     # Setup services
     services = build_services(
         score_calculator=score_calculator,
+        container_cleanup=MockContainerCleanup(),
     )
 
     # Setup config
