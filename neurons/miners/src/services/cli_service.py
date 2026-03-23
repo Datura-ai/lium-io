@@ -6,14 +6,13 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 from eth_utils import to_hex, keccak
 from typing import Optional, Any
-from core.config import settings
+from core.config import settings, shared_client
 from core.db import get_db
 from daos.executor import ExecutorDao
 from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
 from models.executor import Executor
 from core.utils import get_collateral_contract, _m
-from core.const import REQUIRED_DEPOSIT_AMOUNT
 from celium_collateral_contracts.address_conversion import h160_to_ss58
 from bittensor.utils.balance import Balance
 from protocol.miner_portal_request import AddExecutorFailed
@@ -299,8 +298,12 @@ class CliService:
             if gpu_type is None or gpu_count is None:
                 self.logger.error("gpu_type and gpu_count must be specified if deposit_amount is not provided.")
                 return False
-            if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
-                self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
+            required_deposit_amounts = shared_client.config.required_deposit_amount
+            if gpu_type not in required_deposit_amounts:
+                self.logger.error(
+                    f"Unknown GPU type: {gpu_type}. "
+                    f"Please use one of: {list(required_deposit_amounts.keys())}"
+                )
                 return False
             deposit_amount = self._get_required_deposit_amount(gpu_type, gpu_count)
             if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
@@ -346,8 +349,12 @@ class CliService:
             if gpu_type is None or gpu_count is None:
                 self.logger.error("gpu_type and gpu_count must be specified if deposit_amount is not provided.")
                 return False
-            if gpu_type not in REQUIRED_DEPOSIT_AMOUNT:
-                self.logger.error(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
+            required_deposit_amounts = shared_client.config.required_deposit_amount
+            if gpu_type not in required_deposit_amounts:
+                self.logger.error(
+                    f"Unknown GPU type: {gpu_type}. "
+                    f"Please use one of: {list(required_deposit_amounts.keys())}"
+                )
                 return False
             deposit_amount = self._get_required_deposit_amount(gpu_type, gpu_count)
             if deposit_amount < settings.REQUIRED_TAO_COLLATERAL:
@@ -615,9 +622,12 @@ class CliService:
 
     def _get_required_deposit_amount(self, gpu_type: str, gpu_count: int) -> float:
         # Handle missing GPU model gracefully
-        unit_tao_amount = REQUIRED_DEPOSIT_AMOUNT.get(gpu_type)
+        required_deposit_amounts = shared_client.config.required_deposit_amount
+        unit_tao_amount = required_deposit_amounts.get(gpu_type)
         if unit_tao_amount is None:
-            raise ValueError(f"Unknown GPU type: {gpu_type}. Please use one of: {list(REQUIRED_DEPOSIT_AMOUNT.keys())}")
+            raise ValueError(
+                f"Unknown GPU type: {gpu_type}. Please use one of: {list(required_deposit_amounts.keys())}"
+            )
 
-        required_deposit_amount = unit_tao_amount * gpu_count * settings.COLLATERAL_DAYS
+        required_deposit_amount = unit_tao_amount * gpu_count * shared_client.config.collateral_days
         return round(required_deposit_amount, 6)

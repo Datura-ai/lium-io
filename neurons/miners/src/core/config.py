@@ -3,6 +3,7 @@ import argparse
 import pathlib
 
 import bittensor
+from lium_core.shared_config import SharedConfigClient
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -44,6 +45,9 @@ class Settings(BaseSettings):
     EXTERNAL_IP_ADDRESS: str = Field(env="EXTERNAL_IP_ADDRESS")
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     EXTERNAL_PORT: int = Field(env="EXTERNAL_PORT", default=8000)
+    COMPUTE_REST_API_URL: str | None = Field(
+        env="COMPUTE_REST_API_URL", default="https://lium.io/api"
+    )
     ENV: str = Field(env="ENV", default="dev")
 
     MIN_ALPHA_STAKE: int = Field(env="MIN_ALPHA_STAKE", default=10)
@@ -126,3 +130,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+shared_client = SharedConfigClient(
+    api_url=f"{settings.COMPUTE_REST_API_URL}/v1/shared-config"
+)
