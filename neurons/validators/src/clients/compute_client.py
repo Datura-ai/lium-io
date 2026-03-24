@@ -658,7 +658,6 @@ class ComputeClient:
             gpu_model=req.gpu_model,
             gpu_count=req.gpu_count,
             is_rented=req.is_rented,
-            hourly_price=req.hourly_price,
         )
         async with self.lock:
             self.message_queue.append(EstimateResponse(request_id=req.request_id, estimate=result.model_dump()))

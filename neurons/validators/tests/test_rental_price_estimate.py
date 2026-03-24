@@ -195,8 +195,6 @@ async def test_estimate_executor_unrented_h100_eligible(
     assert result.base_model == "H100"
     assert result.is_rented is False
     assert result.eligible_for_rental_incentive is True
-    # resolved_hourly_rate comes from config
-    assert result.resolved_hourly_rate == pytest.approx(RENTAL_PRICES_PER_HOUR["H100"])
     # With rental cost present, tao_per_epoch should be positive
     assert result.tao_per_epoch > 0
     assert result.rental_share is not None
@@ -228,36 +226,6 @@ async def test_estimate_executor_unrented_ineligible_gpu_returns_zero(
     # Assert — ineligible flag set, no reward
     assert result.eligible_for_rental_incentive is False
     assert result.tao_per_epoch == 0.0
-
-
-@pytest.mark.asyncio
-async def test_estimate_executor_unrented_user_supplied_price(
-    rental_config, mock_redis, mock_price_provider, monkeypatch
-):
-    """When hourly_price is supplied, it overrides the config price."""
-    # Arrange
-    job_results = {"miner_a": [_make_job("exec-a", "H100", 8, is_rented=False)]}
-    incentive = _make_incentive(rental_config, mock_redis, mock_price_provider, job_results, monkeypatch)
-    await incentive.calculate_mining_scores()
-    snapshot = incentive.get_snapshot()
-
-    # Act
-    custom_price = 5.00
-    estimator = RentalPriceIncentive(
-        rental_config,
-        mock_redis,
-        jobs_results={},
-        total_gpu_model_count_map={},
-        snapshot=snapshot,
-    )
-    result = await estimator.estimate_executor(
-        gpu_model="H100", gpu_count=8, is_rented=False, hourly_price=custom_price
-    )
-
-    # Assert — resolved_hourly_rate reflects the user-supplied price
-    assert result.resolved_hourly_rate == pytest.approx(custom_price)
-    assert result.tao_per_epoch > 0
-
 
 @pytest.mark.asyncio
 async def test_estimate_executor_unrented_gpu_splitting(
