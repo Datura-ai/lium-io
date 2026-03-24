@@ -464,4 +464,3 @@ class GetEstimateRequest(BaseModel):
     gpu_model: str
     gpu_count: int = 1
     is_rented: bool = False
-    hourly_price: float | None = None
