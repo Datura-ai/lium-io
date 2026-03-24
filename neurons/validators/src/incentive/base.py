@@ -2,18 +2,17 @@
 
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING  
 
 import bittensor
+from pydantic import BaseModel
 
+from incentive.burn_service import BurnService
 from incentive.config import IncentiveConfig
 from incentive.utils import log_for_monitoring
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.redis_service import RedisService
 from services.task_service import JobResult
 from services.const import TOTAL_BURN_EMISSION
-if TYPE_CHECKING:
-    from incentive.burn_service import BurnService
 
 
 class BaseIncentive(ABC):
@@ -24,10 +23,9 @@ class BaseIncentive(ABC):
     """
 
     def __init__(
-        self, 
-        config: IncentiveConfig, 
-        redis_service: RedisService, 
-        burn_service: "BurnService", 
+        self,
+        config: IncentiveConfig,
+        redis_service: RedisService,
         jobs_results: dict[str, list[JobResult]],
         total_gpu_model_count_map: dict,
     ):
@@ -36,11 +34,10 @@ class BaseIncentive(ABC):
         Args:
             config: Incentive configuration
             redis_service: Redis service for accessing shared state
-            burn_service: Burn emission distribution service
         """
         self.config = config
         self.redis_service = redis_service
-        self.burn_service = burn_service
+        self.burn_service = BurnService()
         self.job_results = jobs_results
         self.total_gpu_model_count_map = total_gpu_model_count_map
 
@@ -94,6 +91,13 @@ class BaseIncentive(ABC):
             None
         """
         pass
+
+    def get_snapshot(self) -> BaseModel | None:
+        """Return a serializable snapshot of the current epoch state.
+
+        Subclasses override this to expose their state for the /incentive-snapshot endpoint.
+        """
+        return None
 
     @abstractmethod
     async def calculate_executor_score(
