@@ -8,20 +8,74 @@ demand for specific GPU models. Each GPU type has an independent cap value
 configured in MAX_UNRENTED_GPUS_BY_TYPE.
 """
 
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+
 import bittensor
+from pydantic import BaseModel, Field
 
 from core.utils import _m, get_extra_info, get_logger
-from incentive.burn_service import BurnService
-from incentive.config import BASE_GPU_MAP, IncentiveConfig
+from incentive.config import BASE_GPU_MAP
+
+if TYPE_CHECKING:
+    from incentive.config import IncentiveConfig
+    from services.redis_service import RedisService
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive
 from incentive.price_provider import PriceProvider
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
-from services.redis_service import RedisService
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
+
+
+# ── Snapshot models ──────────────────────────────────────────────────────────
+
+class GpuTypeRentalState(BaseModel):
+    unrented_count: int
+    max_cap: int
+    cap_multiplier: float
+    weighted_rate_sum: float  # sum(gpu_count * hourly_rate) for this type, cap NOT applied
+
+
+class RentalMiningState(BaseModel):
+    total_gpu_count: int
+    total_mining_score: float
+    # Per full GPU model totals used by DefaultIncentive.calculate_executor_score.
+    # This must be per `JobResult.gpu_model` (not base model), so the default mining
+    # score formula can normalize consistently for both real and estimated jobs.
+    total_gpu_model_count_map: dict[str, int] = Field(default_factory=dict)
+
+
+class RentalShareState(BaseModel):
+    total_rental_cost: float
+    by_gpu_type: dict[str, GpuTypeRentalState]
+
+
+class RentalPriceSnapshot(BaseModel):
+    epoch_subnet_emission: float
+    rental_share: float
+    burn_share: float
+    mining: RentalMiningState
+    rental: RentalShareState
+
+
+# ── Estimate model ────────────────────────────────────────────────────────────
+
+class RentalPriceEstimate(BaseModel):
+    gpu_model: str
+    base_model: str
+    gpu_count: int
+    is_rented: bool
+    resolved_hourly_rate: float
+    tao_per_epoch: float
+    rental_share: float | None = None
+    effective_rate: float | None = None
+    cap_multiplier: float | None = None
+    eligible_for_rental_incentive: bool = True
+    mining_share: float | None = None
 
 
 class RentalPriceIncentive(DefaultIncentive):
@@ -38,7 +92,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
     price_provider: PriceProvider = PriceProvider()
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, snapshot: "RentalPriceSnapshot | None" = None, **kwargs):
         """Initialize rental price incentive algorithm.
 
         Args:
@@ -46,6 +100,7 @@ class RentalPriceIncentive(DefaultIncentive):
                    max_unrented_gpus (dict per GPU type), and rental_prices_per_hour
             redis_service: Redis service for accessing shared state
             burn_service: Burn emission distribution service
+            snapshot: Optional snapshot to seed accumulated state (for estimation)
         """
         super().__init__(*args, **kwargs)
 
@@ -54,13 +109,24 @@ class RentalPriceIncentive(DefaultIncentive):
         self.total_rental_cost = 0.0
         self.rental_share = 0.0
         self.burn_share = 0.0
+        self._weighted_rate_sum_by_type: dict[str, float] = {}  # {base_model: sum(gpu_count * rate)}
+        self.epoch_subnet_emission: float = 0.0
+        # Store the snapshot so estimation can derive per-model totals from it.
+        self._seed_snapshot = snapshot
 
         # validate configs
         for base_model in self.config.rental_incentive_gpu_types:
             assert base_model in BASE_GPU_MAP.values(), f"Base model {base_model} not found in BASE_GPU_MAP"
-        
+
         for gpu_type in self.config.rental_prices_per_hour.keys():
             assert gpu_type in BASE_GPU_MAP.keys(), f"GPU type {gpu_type} not found in BASE_GPU_MAP"
+
+        if snapshot:
+            for base_model, state in snapshot.rental.by_gpu_type.items():
+                self.unrented_count_by_type[base_model] = state.unrented_count
+                self._weighted_rate_sum_by_type[base_model] = state.weighted_rate_sum
+            self.total_mining_score = snapshot.mining.total_mining_score
+            self.epoch_subnet_emission = snapshot.epoch_subnet_emission
 
     def get_base_model_for_gpu(self, gpu_model: str) -> str:
         base_model = BASE_GPU_MAP[gpu_model]
@@ -98,16 +164,19 @@ class RentalPriceIncentive(DefaultIncentive):
                 result.hourly_rate = max(result.hourly_rate, rate_for_min)
             result.max_cap = self.config.max_unrented_gpus.get(base_model, 0)
 
-            # accumulate raw unrented GPU count per base model (only if rate > 0)
+            # accumulate raw unrented GPU count and weighted rate sum per base model (only if rate > 0)
             if result.hourly_rate > 0:
                 self.unrented_count_by_type[base_model] = (
                     self.unrented_count_by_type.get(base_model, 0) + result.gpu_count
+                )
+                self._weighted_rate_sum_by_type[base_model] = (
+                    self._weighted_rate_sum_by_type.get(base_model, 0) + result.gpu_count * result.hourly_rate
                 )
 
     async def _on_finish_pre_process(self) -> None:
         """Callback after pre-processing all job results.
 
-        - Calculate rental share 
+        - Calculate rental share
         """
         # Step 1: cap multiplier from raw counts
         for base_model, unrented_count in self.unrented_count_by_type.items():
@@ -115,15 +184,10 @@ class RentalPriceIncentive(DefaultIncentive):
             if unrented_count > 0:
                 self.cap_multiplier_by_base_model[base_model] = min(unrented_count, max_cap) / unrented_count
 
-        # Step 2: total_rental_cost per executor (explicit formula)
-        for hotkey, results in self.job_results.items():
-            for result in results:
-                if result.eligible_for_rental_share and result.hourly_rate > 0:
-                    base_model = self.get_base_model_for_gpu(result.gpu_model)
-                    cap_mult = self.cap_multiplier_by_base_model.get(base_model, 0)
-                    self.total_rental_cost += (
-                        result.gpu_count * cap_mult * result.hourly_rate
-                    )
+        # Step 2: total_rental_cost from accumulated weighted rate sums
+        for base_model, weighted_sum in self._weighted_rate_sum_by_type.items():
+            cap_mult = self.cap_multiplier_by_base_model.get(base_model, 0)
+            self.total_rental_cost += cap_mult * weighted_sum
 
         rental_share_raw = await self._calculate_rental_share(self.total_rental_cost)
 
@@ -260,6 +324,120 @@ class RentalPriceIncentive(DefaultIncentive):
         # For rented or non-eligible GPUs, use parent's default scoring logic
         return await super().calculate_executor_score(job_result)
 
+    async def estimate_executor(
+        self,
+        gpu_model: str,
+        gpu_count: int = 1,
+        is_rented: bool = False,
+        hourly_price: float | None = None,
+        gpu_splitting: bool = False,
+        gpu_splitting_min_count: int | None = None,
+    ) -> RentalPriceEstimate:
+        """Estimate TAO/epoch reward for a hypothetical executor from this instance's snapshot.
+
+        This uses the same internal 3-stage pipeline as real scoring:
+        `_pre_process_job_result` -> `_on_finish_pre_process` -> `_post_process_job_result`.
+        """
+        # Snapshot is required so we can:
+        # 1) seed rental-phase state (unrented counts, weighted rate sums, etc.)
+        # 2) get per-model GPU totals for DefaultIncentive's normalization.
+        if self._seed_snapshot is None:
+            raise ValueError("estimate_executor requires RentalPriceIncentive initialized with snapshot=")
+
+        from datura.requests.miner_requests import ExecutorSSHInfo
+
+        base_model = BASE_GPU_MAP.get(gpu_model)
+        if base_model is None:
+            return RentalPriceEstimate(
+                gpu_model=gpu_model,
+                base_model=gpu_model,
+                gpu_count=gpu_count,
+                is_rented=is_rented,
+                resolved_hourly_rate=hourly_price or 0.0,
+                tao_per_epoch=0.0,
+                eligible_for_rental_incentive=False,
+            )
+
+        if not is_rented:
+            # Unrented path: only eligible if this GPU type has a non-zero cap.
+            if self.config.max_unrented_gpus.get(base_model, 0) == 0:
+                return RentalPriceEstimate(
+                    gpu_model=gpu_model,
+                    base_model=base_model,
+                    gpu_count=gpu_count,
+                    is_rented=False,
+                    resolved_hourly_rate=hourly_price or 0.0,
+                    tao_per_epoch=0.0,
+                    eligible_for_rental_incentive=False,
+                )
+
+        # Build per-model totals including the hypothetical executor.
+        # DefaultIncentive.calculate_executor_score needs this per `JobResult.gpu_model`.
+        base_total_map = self._seed_snapshot.mining.total_gpu_model_count_map or {}
+        total_map_with_hypo = dict(base_total_map)
+        total_map_with_hypo[gpu_model] = total_map_with_hypo.get(gpu_model, 0) + gpu_count
+        self.total_gpu_model_count_map = total_map_with_hypo
+
+        fake_result = JobResult(
+            executor_info=ExecutorSSHInfo(
+                uuid="estimate",
+                address="0.0.0.0",
+                port=0,
+                ssh_username="",
+                ssh_port=0,
+                python_path="",
+                root_dir="",
+            ),
+            score=1.0,
+            job_score=1.0,
+            job_batch_id="estimate",
+            log_status="",
+            log_text="",
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+            is_rented=is_rented,
+            # Prevent uptime redis lookups for the fake executor. Pipeline still
+            # needs get_portion_per_gpu_type() for mining_score normalization.
+            collateral_deposited=True,
+            hourly_rate=hourly_price,
+        )
+
+        await self._pre_process_job_result("estimate", fake_result)
+        await self._on_finish_pre_process()
+        await self._post_process_job_result("estimate", fake_result)
+
+        tao = fake_result.incentive * self.epoch_subnet_emission if fake_result.incentive else 0.0
+
+        if not is_rented:
+            return RentalPriceEstimate(
+                gpu_model=gpu_model,
+                base_model=base_model,
+                gpu_count=gpu_count,
+                is_rented=False,
+                resolved_hourly_rate=fake_result.hourly_rate or 0.0,
+                tao_per_epoch=tao,
+                rental_share=fake_result.rental_share,
+                effective_rate=fake_result.effective_rate,
+                cap_multiplier=fake_result.unrented_cap_multiplier,
+                eligible_for_rental_incentive=bool(fake_result.eligible_for_rental_share),
+            )
+
+        resolved_rate = hourly_price or get_hourly_rate(
+            gpu_model,
+            gpu_count,
+            self.config.gpu_count_custom_prices,
+            self.config.rental_prices_per_hour,
+        )
+        return RentalPriceEstimate(
+            gpu_model=gpu_model,
+            base_model=base_model,
+            gpu_count=gpu_count,
+            is_rented=True,
+            resolved_hourly_rate=resolved_rate,
+            tao_per_epoch=tao,
+            mining_share=self.mining_share,
+        )
+
     async def _calculate_rental_share(self, total_rental_cost: float) -> float:
         """Calculate rental emission share (X).
 
@@ -287,28 +465,32 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             return 0.0
 
-        # Fetch TAO price and alpha rate
-        tao_price = await self.price_provider.get_tao_price()
-        alpha_rate = await self.price_provider.get_alpha_rate()
+        # If seeded from a snapshot, epoch_subnet_emission is already correct — skip price fetch.
+        if self._seed_snapshot is not None:
+            epoch_subnet_emission = self.epoch_subnet_emission
+        else:
+            tao_price = await self.price_provider.get_tao_price()
+            alpha_rate = await self.price_provider.get_alpha_rate()
 
-        if tao_price is None or alpha_rate is None:
-            logger.warning(
-                _m(
-                    "Failed to fetch TAO price or alpha rate - falling back to 0 rental share",
-                    extra={
-                        "tao_price": tao_price,
-                        "alpha_rate": alpha_rate,
-                        "total_rental_cost": total_rental_cost,
-                        "rental_share": 0.0,
-                        "reason": "missing_price_data",
-                        "hint": "Check price provider connection",
-                    },
+            if tao_price is None or alpha_rate is None:
+                logger.warning(
+                    _m(
+                        "Failed to fetch TAO price or alpha rate - falling back to 0 rental share",
+                        extra={
+                            "tao_price": tao_price,
+                            "alpha_rate": alpha_rate,
+                            "total_rental_cost": total_rental_cost,
+                            "rental_share": 0.0,
+                            "reason": "missing_price_data",
+                            "hint": "Check price provider connection",
+                        },
+                    )
                 )
-            )
-            return 0.0
+                return 0.0
 
-        # Calculate epoch subnet emission
-        epoch_subnet_emission = TEMPO * tao_price * alpha_rate
+            # Calculate epoch subnet emission and store for estimation use
+            epoch_subnet_emission = TEMPO * tao_price * alpha_rate
+            self.epoch_subnet_emission = epoch_subnet_emission
 
         # Calculate rental cost per epoch
         rental_cost_per_epoch = total_rental_cost * (TEMPO * SECONDS_PER_BLOCK) / 3600
@@ -321,8 +503,6 @@ class RentalPriceIncentive(DefaultIncentive):
                 "Phase 2: Calculated rental share formula breakdown",
                 extra={
                     "total_rental_cost_per_hour": total_rental_cost,
-                    "tao_price": tao_price,
-                    "alpha_rate": alpha_rate,
                     "tempo": TEMPO,
                     "seconds_per_block": SECONDS_PER_BLOCK,
                     "fixed_ratio": FIXED_RATIO,
@@ -335,3 +515,99 @@ class RentalPriceIncentive(DefaultIncentive):
         )
 
         return rental_share_raw
+
+    def get_snapshot(self) -> RentalPriceSnapshot:
+        """Return a snapshot of the current epoch incentive state."""
+        total_gpu_model_count_map: dict[str, int] = {}
+        for results in self.job_results.values():
+            for result in results:
+                if not result.is_successful or not result.gpu_model:
+                    continue
+                total_gpu_model_count_map[result.gpu_model] = (
+                    total_gpu_model_count_map.get(result.gpu_model, 0) + result.gpu_count
+                )
+
+        total_gpu_count = sum(total_gpu_model_count_map.values())
+
+        by_gpu_type: dict[str, GpuTypeRentalState] = {}
+        for base_model, unrented_count in self.unrented_count_by_type.items():
+            max_cap = self.config.max_unrented_gpus.get(base_model, 0)
+            cap_multiplier = self.cap_multiplier_by_base_model.get(base_model, 0.0)
+            weighted_rate_sum = self._weighted_rate_sum_by_type.get(base_model, 0.0)
+            by_gpu_type[base_model] = GpuTypeRentalState(
+                unrented_count=unrented_count,
+                max_cap=max_cap,
+                cap_multiplier=cap_multiplier,
+                weighted_rate_sum=weighted_rate_sum,
+            )
+
+        return RentalPriceSnapshot(
+            epoch_subnet_emission=self.epoch_subnet_emission,
+            rental_share=self.rental_share,
+            burn_share=self.burn_share,
+            mining=RentalMiningState(
+                total_gpu_count=total_gpu_count,
+                total_mining_score=self.total_mining_score,
+                total_gpu_model_count_map=total_gpu_model_count_map,
+            ),
+            rental=RentalShareState(
+                total_rental_cost=self.total_rental_cost,
+                by_gpu_type=by_gpu_type,
+            ),
+        )
+
+
+# ── Module-level standalone estimation functions ──────────────────────────────
+
+async def estimate_executor(
+    config: IncentiveConfig,
+    redis_service: RedisService,
+    snapshot: RentalPriceSnapshot,
+    gpu_model: str,
+    gpu_count: int = 1,
+    is_rented: bool = False,
+    hourly_price: float | None = None,
+    gpu_splitting: bool = False,
+    gpu_splitting_min_count: int | None = None,
+) -> RentalPriceEstimate:
+    """Estimate TAO/epoch reward for a single hypothetical executor against a snapshot."""
+    estimator = RentalPriceIncentive(
+        config,
+        redis_service,
+        jobs_results={},
+        total_gpu_model_count_map=snapshot.mining.total_gpu_model_count_map or {},
+        snapshot=snapshot,
+    )
+    return await estimator.estimate_executor(
+        gpu_model=gpu_model,
+        gpu_count=gpu_count,
+        is_rented=is_rented,
+        hourly_price=hourly_price,
+        gpu_splitting=gpu_splitting,
+        gpu_splitting_min_count=gpu_splitting_min_count,
+    )
+
+
+async def precompute_all_estimates(
+    config: IncentiveConfig,
+    snapshot: RentalPriceSnapshot,
+    redis_service: RedisService,
+) -> dict[str, dict]:
+    """Precompute rented and unrented estimates for every GPU model in BASE_GPU_MAP.
+
+    Returns a dict keyed by full GPU model name with "rented" and "unrented" estimates.
+    """
+    gpu_models = list(BASE_GPU_MAP.keys())
+    coros = [
+        estimate_executor(config, redis_service, snapshot, gpu_model=m, gpu_count=1, is_rented=False)
+        for m in gpu_models
+    ] + [
+        estimate_executor(config, redis_service, snapshot, gpu_model=m, gpu_count=1, is_rented=True)
+        for m in gpu_models
+    ]
+    estimates = await asyncio.gather(*coros)
+    n = len(gpu_models)
+    return {
+        m: {"unrented": estimates[i], "rented": estimates[n + i]}
+        for i, m in enumerate(gpu_models)
+    }
