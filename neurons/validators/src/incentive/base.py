@@ -28,16 +28,18 @@ class BaseIncentive(ABC):
         redis_service: RedisService,
         jobs_results: dict[str, list[JobResult]],
         total_gpu_model_count_map: dict,
+        burn_service: BurnService | None = None,
     ):
         """Initialize the incentive algorithm.
 
         Args:
             config: Incentive configuration
             redis_service: Redis service for accessing shared state
+            burn_service: Optional injected burn service, primarily for tests
         """
         self.config = config
         self.redis_service = redis_service
-        self.burn_service = BurnService()
+        self.burn_service = burn_service or BurnService()
         self.job_results = jobs_results
         self.total_gpu_model_count_map = total_gpu_model_count_map
 

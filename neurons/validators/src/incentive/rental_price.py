@@ -69,7 +69,6 @@ class RentalPriceEstimate(BaseModel):
     base_model: str
     gpu_count: int
     is_rented: bool
-    resolved_hourly_rate: float
     tao_per_epoch: float
     rental_share: float | None = None
     effective_rate: float | None = None
@@ -329,7 +328,6 @@ class RentalPriceIncentive(DefaultIncentive):
         gpu_model: str,
         gpu_count: int = 1,
         is_rented: bool = False,
-        hourly_price: float | None = None,
         gpu_splitting: bool = False,
         gpu_splitting_min_count: int | None = None,
     ) -> RentalPriceEstimate:
@@ -347,29 +345,19 @@ class RentalPriceIncentive(DefaultIncentive):
         from datura.requests.miner_requests import ExecutorSSHInfo
 
         base_model = BASE_GPU_MAP.get(gpu_model)
-        if base_model is None:
+        eligible_for_unrented_estimate = (
+            base_model is not None
+            and self.config.max_unrented_gpus.get(base_model, 0) > 0
+        )
+        if base_model is None or (not is_rented and not eligible_for_unrented_estimate):
             return RentalPriceEstimate(
                 gpu_model=gpu_model,
-                base_model=gpu_model,
+                base_model=base_model or gpu_model,
                 gpu_count=gpu_count,
                 is_rented=is_rented,
-                resolved_hourly_rate=hourly_price or 0.0,
                 tao_per_epoch=0.0,
                 eligible_for_rental_incentive=False,
             )
-
-        if not is_rented:
-            # Unrented path: only eligible if this GPU type has a non-zero cap.
-            if self.config.max_unrented_gpus.get(base_model, 0) == 0:
-                return RentalPriceEstimate(
-                    gpu_model=gpu_model,
-                    base_model=base_model,
-                    gpu_count=gpu_count,
-                    is_rented=False,
-                    resolved_hourly_rate=hourly_price or 0.0,
-                    tao_per_epoch=0.0,
-                    eligible_for_rental_incentive=False,
-                )
 
         # Build per-model totals including the hypothetical executor.
         # DefaultIncentive.calculate_executor_score needs this per `JobResult.gpu_model`.
@@ -399,43 +387,25 @@ class RentalPriceIncentive(DefaultIncentive):
             # Prevent uptime redis lookups for the fake executor. Pipeline still
             # needs get_portion_per_gpu_type() for mining_score normalization.
             collateral_deposited=True,
-            hourly_rate=hourly_price,
         )
 
         await self._pre_process_job_result("estimate", fake_result)
         await self._on_finish_pre_process()
         await self._post_process_job_result("estimate", fake_result)
 
-        tao = fake_result.incentive * self.epoch_subnet_emission if fake_result.incentive else 0.0
-
-        if not is_rented:
-            return RentalPriceEstimate(
-                gpu_model=gpu_model,
-                base_model=base_model,
-                gpu_count=gpu_count,
-                is_rented=False,
-                resolved_hourly_rate=fake_result.hourly_rate or 0.0,
-                tao_per_epoch=tao,
-                rental_share=fake_result.rental_share,
-                effective_rate=fake_result.effective_rate,
-                cap_multiplier=fake_result.unrented_cap_multiplier,
-                eligible_for_rental_incentive=bool(fake_result.eligible_for_rental_share),
-            )
-
-        resolved_rate = hourly_price or get_hourly_rate(
-            gpu_model,
-            gpu_count,
-            self.config.gpu_count_custom_prices,
-            self.config.rental_prices_per_hour,
-        )
         return RentalPriceEstimate(
             gpu_model=gpu_model,
             base_model=base_model,
-            gpu_count=gpu_count,
-            is_rented=True,
-            resolved_hourly_rate=resolved_rate,
-            tao_per_epoch=tao,
-            mining_share=self.mining_share,
+            gpu_count=fake_result.gpu_count,
+            is_rented=fake_result.is_rented,
+            tao_per_epoch=(fake_result.incentive or 0.0) * self.epoch_subnet_emission,
+            rental_share=fake_result.rental_share if not is_rented else None,
+            effective_rate=fake_result.effective_rate if not is_rented else None,
+            cap_multiplier=fake_result.unrented_cap_multiplier if not is_rented else None,
+            eligible_for_rental_incentive=(
+                bool(fake_result.eligible_for_rental_share) if not is_rented else True
+            ),
+            mining_share=self.mining_share if is_rented else None,
         )
 
     async def _calculate_rental_share(self, total_rental_cost: float) -> float:
@@ -566,7 +536,6 @@ async def estimate_executor(
     gpu_model: str,
     gpu_count: int = 1,
     is_rented: bool = False,
-    hourly_price: float | None = None,
     gpu_splitting: bool = False,
     gpu_splitting_min_count: int | None = None,
 ) -> RentalPriceEstimate:
@@ -582,7 +551,6 @@ async def estimate_executor(
         gpu_model=gpu_model,
         gpu_count=gpu_count,
         is_rented=is_rented,
-        hourly_price=hourly_price,
         gpu_splitting=gpu_splitting,
         gpu_splitting_min_count=gpu_splitting_min_count,
     )
