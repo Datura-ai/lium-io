@@ -18,6 +18,8 @@ class RequestType(enum.Enum):
     NormalizedScoreRequest = "NormalizedScoreRequest"
     RevenuePerGpuTypeRequest = "RevenuePerGpuTypeRequest"
     ScorePortionPerGpuTypeRequest = "ScorePortionPerGpuTypeRequest"
+    GpuEstimatesRequest = "GpuEstimatesRequest"
+    EstimateResponse = "EstimateResponse"
 
 
 class BaseValidatorRequest(BaseRequest):
@@ -112,3 +114,14 @@ class RevenuePerGpuTypeRequest(BaseValidatorRequest):
 class ScorePortionPerGpuTypeRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ScorePortionPerGpuTypeRequest
     portions: dict[str, float]
+
+
+class GpuEstimatesRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.GpuEstimatesRequest
+    estimates: dict
+
+
+class EstimateResponse(BaseValidatorRequest):
+    message_type: RequestType = RequestType.EstimateResponse
+    request_id: str = ""
+    estimate: dict

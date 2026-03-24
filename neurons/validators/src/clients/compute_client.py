@@ -29,6 +29,7 @@ from payload_models.payloads import (
     DuplicateExecutorsResponse,
     FailedContainerRequest,
     ExecutorRentFinishedRequest,
+    GetEstimateRequest,
     GetPodLogsRequestFromServer,
     PodLogsResponseToServer,
     FailedGetPodLogs,
@@ -49,7 +50,9 @@ from protocol.vc_protocol.compute_requests import (
 from protocol.vc_protocol.validator_requests import (
     AuthenticateRequest,
     DuplicateExecutorsRequest,
+    EstimateResponse,
     ExecutorSpecRequest,
+    GpuEstimatesRequest,
     LogStreamRequest,
     RentedMachineRequest,
     ResetVerifiedJobRequest,
@@ -64,9 +67,11 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
 from services.miner_service import MinerService
+from incentive.rental_price import RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     EXECUTORS_UPTIME_PREFIX,
+    GPU_ESTIMATES_CHANNEL,
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
     RENTED_MACHINE_PREFIX,
@@ -261,6 +266,7 @@ class ComputeClient:
                     STREAMING_LOG_CHANNEL,
                     RESET_VERIFIED_JOB_CHANNEL,
                     NORMALIZED_SCORE_CHANNEL,
+                    GPU_ESTIMATES_CHANNEL,
                 )
                 async for message in pubsub.listen():
                     try:
@@ -342,6 +348,12 @@ class ComputeClient:
 
                         async with self.lock:
                             self.message_queue.append(normalized_score)
+                    elif channel == GPU_ESTIMATES_CHANNEL:
+                        redis_service = self.miner_service.redis_service
+                        estimates = await redis_service.get_gpu_estimates()
+                        if estimates:
+                            async with self.lock:
+                                self.message_queue.append(GpuEstimatesRequest(estimates=estimates))
 
             except Exception as exc:
                 logger.error(
@@ -595,6 +607,14 @@ class ComputeClient:
             return
 
         try:
+            req: GetEstimateRequest = pydantic.TypeAdapter(GetEstimateRequest).validate_json(raw_msg)
+        except pydantic.ValidationError:
+            pass
+        else:
+            await self._handle_get_estimate(req)
+            return
+
+        try:
             job_request = self.accepted_request_type().parse(raw_msg)
         except Exception as ex:
             error_msg = f"Invalid message received from backend: {str(ex)}"
@@ -609,6 +629,39 @@ class ComputeClient:
             task = asyncio.create_task(self.miner_driver(job_request))
             await self.miner_drivers.put(task)
             return
+
+    async def _handle_get_estimate(self, req: GetEstimateRequest):
+        redis_service = self.miner_service.redis_service
+        snapshot_data = await redis_service.get_incentive_snapshot()
+        if snapshot_data is None:
+            logger.warning(
+                _m(
+                    "No incentive snapshot available for estimate request",
+                    extra=get_extra_info({**self.logging_extra, "request_id": req.request_id}),
+                )
+            )
+            return
+        try:
+            snapshot = RentalPriceSnapshot.model_validate(snapshot_data)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "Failed to parse incentive snapshot for estimate request",
+                    extra=get_extra_info({**self.logging_extra, "error": str(exc)}),
+                )
+            )
+            return
+        result = await estimate_executor(
+            config=settings.incentive,
+            redis_service=redis_service,
+            snapshot=snapshot,
+            gpu_model=req.gpu_model,
+            gpu_count=req.gpu_count,
+            is_rented=req.is_rented,
+            hourly_price=req.hourly_price,
+        )
+        async with self.lock:
+            self.message_queue.append(EstimateResponse(request_id=req.request_id, estimate=result.model_dump()))
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)

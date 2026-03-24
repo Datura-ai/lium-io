@@ -26,6 +26,9 @@ NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
 REVENUE_PER_GPU_TYPE_SET = "revenue_per_gpu_type"
 BANNED_GUIDS = "banned_guids"
 PORTION_PER_GPU_TYPE_SET = "portion_per_gpu_type"
+GPU_ESTIMATES_CHANNEL = "gpu_estimates_channel"
+GPU_ESTIMATES_KEY = "gpu_estimates"
+INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -361,4 +364,29 @@ class RedisService:
         data = await self.redis.get(BANNED_GUIDS)
         if not data:
             return []
+        return json.loads(data)
+
+    async def set_gpu_estimates(self, estimates: dict) -> None:
+        """Serialize and store precomputed GPU estimates under GPU_ESTIMATES_KEY."""
+        serialized: dict[str, dict] = {}
+        for gpu_model, data in estimates.items():
+            serialized[gpu_model] = {k: v.model_dump() for k, v in data.items()}
+        await self.set(GPU_ESTIMATES_KEY, json.dumps(serialized))
+
+    async def get_gpu_estimates(self) -> dict | None:
+        """Read and deserialize precomputed GPU estimates from Redis."""
+        data = await self.get(GPU_ESTIMATES_KEY)
+        if not data:
+            return None
+        return json.loads(data)
+
+    async def set_incentive_snapshot(self, snapshot) -> None:
+        """Serialize and store the incentive snapshot under INCENTIVE_SNAPSHOT_KEY."""
+        await self.set(INCENTIVE_SNAPSHOT_KEY, snapshot.model_dump_json())
+
+    async def get_incentive_snapshot(self) -> dict | None:
+        """Read and deserialize the incentive snapshot from Redis."""
+        data = await self.get(INCENTIVE_SNAPSHOT_KEY)
+        if not data:
+            return None
         return json.loads(data)
