@@ -457,3 +457,11 @@ class JupyterServerInstalled(ContainerBaseResponse):
 class JupyterInstallationFailed(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.JupyterInstallationFailed
     msg: str
+
+
+class GetEstimateRequest(BaseModel):
+    request_id: str = ""
+    gpu_model: str
+    gpu_count: int = 1
+    is_rented: bool = False
+    hourly_price: float | None = None

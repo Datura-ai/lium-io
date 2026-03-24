@@ -7,6 +7,7 @@ from clients.backend_client import BackendClient
 
 from core.config import settings
 from incentive.factory import IncentiveFactory
+from incentive.rental_price import precompute_all_estimates
 from core.utils import _m, get_extra_info, get_logger
 from clients.subtensor_client import SubtensorClient
 from services.docker_service import DockerService
@@ -20,7 +21,7 @@ from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
-from services.redis_service import PENDING_PODS_PREFIX, RedisService
+from services.redis_service import GPU_ESTIMATES_CHANNEL, PENDING_PODS_PREFIX, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService, JobResult
 from services.matrix_validation_service import ValidationService
@@ -370,6 +371,26 @@ class Validator:
                         total_gpu_model_count_map=total_gpu_model_count_map,
                     )
                     await incentive.calculate_mining_scores()
+
+                    snapshot = incentive.get_snapshot()
+                    if snapshot is not None:
+                        try:
+                            await self.redis_service.set_incentive_snapshot(snapshot)
+                            estimates = await precompute_all_estimates(
+                                config=self.incentive,
+                                snapshot=snapshot,
+                                redis_service=self.redis_service,
+                            )
+                            await self.redis_service.set_gpu_estimates(estimates)
+                            await self.redis_service.publish(GPU_ESTIMATES_CHANNEL, {"updated": True})
+                        except Exception as e:
+                            logger.error(
+                                _m(
+                                    "[sync] Failed to precompute GPU estimates",
+                                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                                ),
+                                exc_info=True,
+                            )
 
                     # PHASE 2: Calculate final weights with burning logic per cycle
                     miners = await self.subtensor_client.get_miners()
