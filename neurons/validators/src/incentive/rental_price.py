@@ -69,7 +69,7 @@ class RentalPriceEstimate(BaseModel):
     base_model: str
     gpu_count: int
     is_rented: bool
-    tao_per_epoch: float
+    usd_per_epoch: float
     rental_share: float | None = None
     effective_rate: float | None = None
     cap_multiplier: float | None = None
@@ -331,7 +331,7 @@ class RentalPriceIncentive(DefaultIncentive):
         gpu_splitting: bool = False,
         gpu_splitting_min_count: int | None = None,
     ) -> RentalPriceEstimate:
-        """Estimate TAO/epoch reward for a hypothetical executor from this instance's snapshot.
+        """Estimate USD/epoch reward for a hypothetical executor from this instance's snapshot.
 
         This uses the same internal 3-stage pipeline as real scoring:
         `_pre_process_job_result` -> `_on_finish_pre_process` -> `_post_process_job_result`.
@@ -355,7 +355,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 base_model=base_model or gpu_model,
                 gpu_count=gpu_count,
                 is_rented=is_rented,
-                tao_per_epoch=0.0,
+                usd_per_epoch=0.0,
                 eligible_for_rental_incentive=False,
             )
 
@@ -398,7 +398,7 @@ class RentalPriceIncentive(DefaultIncentive):
             base_model=base_model,
             gpu_count=fake_result.gpu_count,
             is_rented=fake_result.is_rented,
-            tao_per_epoch=(fake_result.incentive or 0.0) * self.epoch_subnet_emission,
+            usd_per_epoch=(fake_result.incentive or 0.0) * self.epoch_subnet_emission * FIXED_RATIO,
             rental_share=fake_result.rental_share if not is_rented else None,
             effective_rate=fake_result.effective_rate if not is_rented else None,
             cap_multiplier=fake_result.unrented_cap_multiplier if not is_rented else None,
@@ -422,19 +422,6 @@ class RentalPriceIncentive(DefaultIncentive):
         Returns:
             Rental emission share (0 to 0.91)
         """
-        if total_rental_cost == 0:
-            logger.info(
-                _m(
-                    "Phase 2: No rental cost - rental share is 0",
-                    extra={
-                        "total_rental_cost": total_rental_cost,
-                        "rental_share": 0.0,
-                        "reason": "no_unrented_eligible_gpus",
-                    },
-                )
-            )
-            return 0.0
-
         # If seeded from a snapshot, epoch_subnet_emission is already correct — skip price fetch.
         if self._seed_snapshot is not None:
             epoch_subnet_emission = self.epoch_subnet_emission
@@ -539,7 +526,7 @@ async def estimate_executor(
     gpu_splitting: bool = False,
     gpu_splitting_min_count: int | None = None,
 ) -> RentalPriceEstimate:
-    """Estimate TAO/epoch reward for a single hypothetical executor against a snapshot."""
+    """Estimate USD/epoch reward for a single hypothetical executor against a snapshot."""
     estimator = RentalPriceIncentive(
         config,
         redis_service,
