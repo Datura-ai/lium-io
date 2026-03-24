@@ -169,7 +169,7 @@ async def test_get_snapshot_cap_multiplier_stored(
 async def test_estimate_executor_unrented_h100_eligible(
     rental_config, mock_redis, mock_price_provider, monkeypatch
 ):
-    """Eligible GPU (H100) unrented path returns positive tao_per_epoch."""
+    """Eligible GPU (H100) unrented path returns positive usd_per_epoch."""
     # Arrange — two existing unrented H100 executors already in epoch
     job_results = {
         "miner_a": [_make_job("exec-a", "H100", 8, is_rented=False)],
@@ -195,8 +195,8 @@ async def test_estimate_executor_unrented_h100_eligible(
     assert result.base_model == "H100"
     assert result.is_rented is False
     assert result.eligible_for_rental_incentive is True
-    # With rental cost present, tao_per_epoch should be positive
-    assert result.tao_per_epoch > 0
+    # With rental cost present, usd_per_epoch should be positive
+    assert result.usd_per_epoch > 0
     assert result.rental_share is not None
     assert result.effective_rate is not None
     assert result.cap_multiplier is not None
@@ -206,7 +206,7 @@ async def test_estimate_executor_unrented_h100_eligible(
 async def test_estimate_executor_unrented_ineligible_gpu_returns_zero(
     rental_config, mock_redis, mock_price_provider, monkeypatch
 ):
-    """GPU with cap=0 (e.g. A100, L4) is ineligible and returns tao_per_epoch=0."""
+    """GPU with cap=0 (e.g. A100, L4) is ineligible and returns usd_per_epoch=0."""
     # Arrange
     job_results = {"miner_a": [_make_job("exec-a", "H100", 8, is_rented=False)]}
     incentive = _make_incentive(rental_config, mock_redis, mock_price_provider, job_results, monkeypatch)
@@ -225,7 +225,7 @@ async def test_estimate_executor_unrented_ineligible_gpu_returns_zero(
 
     # Assert — ineligible flag set, no reward
     assert result.eligible_for_rental_incentive is False
-    assert result.tao_per_epoch == 0.0
+    assert result.usd_per_epoch == 0.0
 
 @pytest.mark.asyncio
 async def test_estimate_executor_unrented_gpu_splitting(
@@ -264,8 +264,8 @@ async def test_estimate_executor_unrented_gpu_splitting(
     result_no_split = await estimator_no_split.estimate_executor(gpu_model="H100", gpu_count=8, is_rented=False)
 
     # Assert — both are valid estimates; splitting takes best of bundle vs min-count rate
-    assert result_split.tao_per_epoch > 0
-    assert result_no_split.tao_per_epoch > 0
+    assert result_split.usd_per_epoch > 0
+    assert result_no_split.usd_per_epoch > 0
 
 
 # ── estimate_executor() — rented path ────────────────────────────────────────
@@ -274,7 +274,7 @@ async def test_estimate_executor_unrented_gpu_splitting(
 async def test_estimate_executor_rented_returns_tao(
     rental_config, mock_redis, mock_price_provider, monkeypatch
 ):
-    """Rented path returns tao_per_epoch based on mining share."""
+    """Rented path returns usd_per_epoch based on mining share."""
     # Arrange — some existing rented executors set mining_score baseline
     job_results = {
         "miner_a": [_make_job("exec-a", "H100", 8, is_rented=True)],
@@ -296,7 +296,7 @@ async def test_estimate_executor_rented_returns_tao(
     # Assert
     assert isinstance(result, RentalPriceEstimate)
     assert result.is_rented is True
-    assert result.tao_per_epoch >= 0
+    assert result.usd_per_epoch >= 0
     assert result.mining_share is not None
 
 
