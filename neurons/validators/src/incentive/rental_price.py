@@ -80,11 +80,24 @@ class RentalPriceEstimate(BaseModel):
     gpu_count: int
     is_rented: bool
     usd_per_epoch: float
-    rental_share: float | None = None
-    effective_rate: float | None = None
-    cap_multiplier: float | None = None
-    eligible_for_rental_incentive: bool = True
-    mining_share: float | None = None
+    mining_score: float | None = None                   # Score for mining pool for scoring logic
+    sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
+    uptime_multiplier: float | None = None              # Multiplier for uptime
+    gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
+    total_gpu_count: int | None = None                  # Total number of GPUs of the same model
+    incentive: float | None = None                      # Incentive score for the executor in this cycle
+
+    # V2 incentive relevant fields
+    effective_rate: float | None = None                 # Effective rate for the executor in this cycle for scoring logic
+    hourly_rate: float | None = None                    # Hourly rate for the executor in this cycle for scoring logic
+    max_cap: int | None = None                          # Max cap for GPU counts in this cycle for scoring logic
+    total_unrented_by_gpu_type: float | None = None     # Weighted GPU count for the executor in this cycle for scoring logic
+    cap_dilution_applied: bool | None = None            # Whether the cap dilution is applied for the executor in this cycle for scoring logic
+    eligible_for_rental_share: bool = False
+    unrented_cap_multiplier: float | None = None        # Cap dilution multiplier: min(count, cap) / count
+    rental_share: float | None = None                   # Rental share for the executor in this cycle for scoring logic
+    burn_share: float | None = None                     # Burn share for the executor in this cycle for scoring logic
+    total_rental_cost: float | None = None              # Total rental cost for the executor in this cycle for scoring logic
 
 
 class RentalPriceIncentive(DefaultIncentive):
@@ -408,13 +421,22 @@ class RentalPriceIncentive(DefaultIncentive):
             gpu_count=fake_result.gpu_count,
             is_rented=fake_result.is_rented,
             usd_per_epoch=(fake_result.incentive or 0.0) * self.epoch_subnet_emission * FIXED_RATIO,
-            rental_share=fake_result.rental_share if not is_rented else None,
-            effective_rate=fake_result.effective_rate if not is_rented else None,
-            cap_multiplier=fake_result.unrented_cap_multiplier if not is_rented else None,
-            eligible_for_rental_incentive=(
-                bool(fake_result.eligible_for_rental_share) if not is_rented else True
-            ),
-            mining_share=self.mining_share if is_rented else None,
+            mining_score=fake_result.mining_score,
+            sysbox_multiplier=fake_result.sysbox_multiplier,
+            uptime_multiplier=fake_result.uptime_multiplier,
+            gpu_portion=fake_result.gpu_portion,
+            total_gpu_count=fake_result.total_gpu_count,
+            incentive=fake_result.incentive,
+            effective_rate=fake_result.effective_rate,
+            hourly_rate=fake_result.hourly_rate,
+            max_cap=fake_result.max_cap,
+            total_unrented_by_gpu_type=fake_result.total_unrented_by_gpu_type,
+            cap_dilution_applied=fake_result.cap_dilution_applied,
+            eligible_for_rental_share=fake_result.eligible_for_rental_share or False,
+            unrented_cap_multiplier=fake_result.unrented_cap_multiplier,
+            rental_share=fake_result.rental_share,
+            burn_share=fake_result.burn_share,
+            total_rental_cost=fake_result.total_rental_cost,
         )
 
     async def _calculate_rental_share(self, total_rental_cost: float) -> float:
