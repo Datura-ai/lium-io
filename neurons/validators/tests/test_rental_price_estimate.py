@@ -7,6 +7,7 @@ import pytest
 from incentive import rental_price as rental_price_module
 from incentive.config import DEFAULT_PRICE, IncentiveConfig
 from incentive.rental_price import (
+    ExecutorEstimateParams,
     GpuTypeRentalState,
     RentalPriceEstimate,
     RentalPriceIncentive,
@@ -187,7 +188,7 @@ async def test_estimate_executor_unrented_h100_eligible(
         total_gpu_model_count_map={},
         snapshot=snapshot,
     )
-    result = await estimator.estimate_executor(gpu_model="H100", gpu_count=8, is_rented=False)
+    result = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model="H100", gpu_count=8, is_rented=False))
 
     # Assert
     assert isinstance(result, RentalPriceEstimate)
@@ -221,7 +222,7 @@ async def test_estimate_executor_unrented_ineligible_gpu_returns_zero(
         total_gpu_model_count_map={},
         snapshot=snapshot,
     )
-    result = await estimator.estimate_executor(gpu_model="A100", gpu_count=8, is_rented=False)
+    result = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model="A100", gpu_count=8, is_rented=False))
 
     # Assert — ineligible flag set, no reward
     assert result.eligible_for_rental_incentive is False
@@ -247,11 +248,7 @@ async def test_estimate_executor_unrented_gpu_splitting(
         snapshot=snapshot,
     )
     result_split = await estimator_split.estimate_executor(
-        gpu_model="H100",
-        gpu_count=8,
-        is_rented=False,
-        gpu_splitting=True,
-        gpu_splitting_min_count=1,
+        ExecutorEstimateParams(gpu_model="H100", gpu_count=8, is_rented=False, gpu_splitting=True, gpu_splitting_min_count=1)
     )
 
     estimator_no_split = RentalPriceIncentive(
@@ -261,7 +258,7 @@ async def test_estimate_executor_unrented_gpu_splitting(
         total_gpu_model_count_map={},
         snapshot=snapshot,
     )
-    result_no_split = await estimator_no_split.estimate_executor(gpu_model="H100", gpu_count=8, is_rented=False)
+    result_no_split = await estimator_no_split.estimate_executor(ExecutorEstimateParams(gpu_model="H100", gpu_count=8, is_rented=False))
 
     # Assert — both are valid estimates; splitting takes best of bundle vs min-count rate
     assert result_split.usd_per_epoch > 0
@@ -291,7 +288,7 @@ async def test_estimate_executor_rented_returns_tao(
         total_gpu_model_count_map={},
         snapshot=snapshot,
     )
-    result = await estimator.estimate_executor(gpu_model="H100", gpu_count=8, is_rented=True)
+    result = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model="H100", gpu_count=8, is_rented=True))
 
     # Assert
     assert isinstance(result, RentalPriceEstimate)
@@ -352,7 +349,7 @@ async def test_estimate_executor_does_not_fetch_prices_when_snapshot_provided(
         total_gpu_model_count_map={},
         snapshot=snapshot,
     )
-    await estimator.estimate_executor(gpu_model="H100", gpu_count=8, is_rented=False)
+    await estimator.estimate_executor(ExecutorEstimateParams(gpu_model="H100", gpu_count=8, is_rented=False))
 
     # Assert — price provider must not have been called during estimation
     mock_price_provider.get_tao_price.assert_not_called()
