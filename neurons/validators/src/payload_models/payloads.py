@@ -464,3 +464,5 @@ class GetEstimateRequest(BaseModel):
     gpu_model: str
     gpu_count: int = 1
     is_rented: bool = False
+    sysbox_runtime: bool = True
+    collateral_deposited: bool = True
