@@ -67,7 +67,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
 from services.miner_service import MinerService
-from incentive.rental_price import RentalPriceSnapshot, estimate_executor
+from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     EXECUTORS_UPTIME_PREFIX,
@@ -655,12 +655,22 @@ class ComputeClient:
             config=settings.incentive,
             redis_service=redis_service,
             snapshot=snapshot,
-            gpu_model=req.gpu_model,
-            gpu_count=req.gpu_count,
-            is_rented=req.is_rented,
+            params=ExecutorEstimateParams(
+                gpu_model=req.gpu_model,
+                gpu_count=req.gpu_count,
+                is_rented=req.is_rented,
+                sysbox_runtime=req.sysbox_runtime,
+                collateral_deposited=req.collateral_deposited,
+            ),
         )
         async with self.lock:
-            self.message_queue.append(EstimateResponse(request_id=req.request_id, estimate=result.model_dump()))
+            self.message_queue.append(
+                EstimateResponse(
+                    request_id=req.request_id,
+                    estimate=result.model_dump(),
+                    snapshot=snapshot_data,
+                )
+            )
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)

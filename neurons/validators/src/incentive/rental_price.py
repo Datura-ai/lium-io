@@ -62,6 +62,16 @@ class RentalPriceSnapshot(BaseModel):
     rental: RentalShareState
 
 
+class ExecutorEstimateParams(BaseModel):
+    gpu_model: str
+    gpu_count: int = 1
+    is_rented: bool = False
+    gpu_splitting: bool = False
+    gpu_splitting_min_count: int | None = None
+    sysbox_runtime: bool = True
+    collateral_deposited: bool = True
+
+
 # ── Estimate model ────────────────────────────────────────────────────────────
 
 class RentalPriceEstimate(BaseModel):
@@ -325,11 +335,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
     async def estimate_executor(
         self,
-        gpu_model: str,
-        gpu_count: int = 1,
-        is_rented: bool = False,
-        gpu_splitting: bool = False,
-        gpu_splitting_min_count: int | None = None,
+        params: ExecutorEstimateParams,
     ) -> RentalPriceEstimate:
         """Estimate USD/epoch reward for a hypothetical executor from this instance's snapshot.
 
@@ -343,6 +349,10 @@ class RentalPriceIncentive(DefaultIncentive):
             raise ValueError("estimate_executor requires RentalPriceIncentive initialized with snapshot=")
 
         from datura.requests.miner_requests import ExecutorSSHInfo
+
+        gpu_model = params.gpu_model
+        gpu_count = params.gpu_count
+        is_rented = params.is_rented
 
         base_model = BASE_GPU_MAP.get(gpu_model)
         eligible_for_unrented_estimate = (
@@ -384,9 +394,8 @@ class RentalPriceIncentive(DefaultIncentive):
             gpu_model=gpu_model,
             gpu_count=gpu_count,
             is_rented=is_rented,
-            # Prevent uptime redis lookups for the fake executor. Pipeline still
-            # needs get_portion_per_gpu_type() for mining_score normalization.
-            collateral_deposited=True,
+            collateral_deposited=params.collateral_deposited,
+            sysbox_runtime=params.sysbox_runtime,
         )
 
         await self._pre_process_job_result("estimate", fake_result)
@@ -520,11 +529,7 @@ async def estimate_executor(
     config: IncentiveConfig,
     redis_service: RedisService,
     snapshot: RentalPriceSnapshot,
-    gpu_model: str,
-    gpu_count: int = 1,
-    is_rented: bool = False,
-    gpu_splitting: bool = False,
-    gpu_splitting_min_count: int | None = None,
+    params: ExecutorEstimateParams,
 ) -> RentalPriceEstimate:
     """Estimate USD/epoch reward for a single hypothetical executor against a snapshot."""
     estimator = RentalPriceIncentive(
@@ -534,13 +539,7 @@ async def estimate_executor(
         total_gpu_model_count_map=snapshot.mining.total_gpu_model_count_map or {},
         snapshot=snapshot,
     )
-    return await estimator.estimate_executor(
-        gpu_model=gpu_model,
-        gpu_count=gpu_count,
-        is_rented=is_rented,
-        gpu_splitting=gpu_splitting,
-        gpu_splitting_min_count=gpu_splitting_min_count,
-    )
+    return await estimator.estimate_executor(params=params)
 
 
 async def precompute_all_estimates(
@@ -554,10 +553,10 @@ async def precompute_all_estimates(
     """
     gpu_models = list(BASE_GPU_MAP.keys())
     coros = [
-        estimate_executor(config, redis_service, snapshot, gpu_model=m, gpu_count=1, is_rented=False)
+        estimate_executor(config, redis_service, snapshot, ExecutorEstimateParams(gpu_model=m, is_rented=False))
         for m in gpu_models
     ] + [
-        estimate_executor(config, redis_service, snapshot, gpu_model=m, gpu_count=1, is_rented=True)
+        estimate_executor(config, redis_service, snapshot, ExecutorEstimateParams(gpu_model=m, is_rented=True))
         for m in gpu_models
     ]
     estimates = await asyncio.gather(*coros)
