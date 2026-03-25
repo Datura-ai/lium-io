@@ -195,12 +195,12 @@ async def test_estimate_executor_unrented_h100_eligible(
     assert result.gpu_model == "H100"
     assert result.base_model == "H100"
     assert result.is_rented is False
-    assert result.eligible_for_rental_incentive is True
+    assert result.eligible_for_rental_share is True
     # With rental cost present, usd_per_epoch should be positive
     assert result.usd_per_epoch > 0
     assert result.rental_share is not None
     assert result.effective_rate is not None
-    assert result.cap_multiplier is not None
+    assert result.unrented_cap_multiplier is not None
 
 
 @pytest.mark.asyncio
@@ -225,7 +225,7 @@ async def test_estimate_executor_unrented_ineligible_gpu_returns_zero(
     result = await estimator.estimate_executor(ExecutorEstimateParams(gpu_model="A100", gpu_count=8, is_rented=False))
 
     # Assert — ineligible flag set, no reward
-    assert result.eligible_for_rental_incentive is False
+    assert result.eligible_for_rental_share is False
     assert result.usd_per_epoch == 0.0
 
 @pytest.mark.asyncio
@@ -294,7 +294,7 @@ async def test_estimate_executor_rented_returns_tao(
     assert isinstance(result, RentalPriceEstimate)
     assert result.is_rented is True
     assert result.usd_per_epoch >= 0
-    assert result.mining_share is not None
+    assert result.mining_score is not None
 
 
 # ── snapshot seeding ──────────────────────────────────────────────────────────
