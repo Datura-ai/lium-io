@@ -631,7 +631,9 @@ class ComputeClient:
             return
 
     async def _handle_get_estimate(self, req: GetEstimateRequest):
+        started_at = time.perf_counter()
         redis_service = self.miner_service.redis_service
+        snapshot_started_at = time.perf_counter()
         snapshot_data = await redis_service.get_incentive_snapshot()
         if snapshot_data is None:
             logger.warning(
@@ -651,6 +653,7 @@ class ComputeClient:
                 )
             )
             return
+        snapshot_extraction_ms = round((time.perf_counter() - snapshot_started_at) * 1000, 2)
         result = await estimate_executor(
             config=settings.incentive,
             redis_service=redis_service,
@@ -668,9 +671,23 @@ class ComputeClient:
                 EstimateResponse(
                     request_id=req.request_id,
                     estimate=result.model_dump(),
-                    snapshot=snapshot_data,
                 )
             )
+        logger.info(
+            _m(
+                "Processed estimate request",
+                extra=get_extra_info(
+                    {
+                        **self.logging_extra,
+                        "request_id": req.request_id,
+                        "gpu_model": req.gpu_model,
+                        "snapshot_extraction_ms": snapshot_extraction_ms,
+                        "total_processing_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                        "is_rented": req.is_rented,
+                    }
+                ),
+            )
+        )
 
     async def get_miner_axon_info(self, hotkey: str) -> bittensor.AxonInfo:
         miner = await self.subtensor_client.get_miner(hotkey)

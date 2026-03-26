@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -2251,3 +2251,39 @@ async def test_gpu_splitting_backend_enabled_but_hardware_does_not_support(
 
     assert validator.miner_scores.get("miner_a", 0) > 0
     assert job_a.hourly_rate == pytest.approx(H100_HOURLY_RATE, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_sync_logs_successful_gpu_estimate_precompute(
+    validator_with_rental_price,
+    create_job_result,
+    create_neuron_info,
+    monkeypatch,
+):
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_a"),
+    ]
+    all_job_results = {
+        "miner_a": [_job(create_job_result, executor_id="exec-a", gpu_model="H100", gpu_count=8, is_rented=False)],
+    }
+    logger_info = MagicMock()
+
+    monkeypatch.setattr("core.validator.precompute_all_estimates", AsyncMock(return_value={"H100": {}}))
+    monkeypatch.setattr("core.validator.logger.info", logger_info)
+    monkeypatch.setattr("core.validator.time.perf_counter", MagicMock(side_effect=[10.0, 10.5]))
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    success_logs = [
+        call.args[0]
+        for call in logger_info.call_args_list
+        if str(call.args[0]) == "[sync] GPU estimates calculated successfully"
+    ]
+    assert len(success_logs) == 1
+    assert success_logs[0].extra["duration_ms"] == 500.0
+    assert success_logs[0].extra["gpu_models_count"] == 1
