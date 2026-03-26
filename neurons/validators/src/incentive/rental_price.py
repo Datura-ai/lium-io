@@ -10,7 +10,6 @@ configured in MAX_UNRENTED_GPUS_BY_TYPE.
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 import bittensor
@@ -574,16 +573,21 @@ async def precompute_all_estimates(
     Returns a dict keyed by full GPU model name with "rented" and "unrented" estimates.
     """
     gpu_models = list(BASE_GPU_MAP.keys())
-    coros = [
-        estimate_executor(config, redis_service, snapshot, ExecutorEstimateParams(gpu_model=m, is_rented=False))
-        for m in gpu_models
-    ] + [
-        estimate_executor(config, redis_service, snapshot, ExecutorEstimateParams(gpu_model=m, is_rented=True))
-        for m in gpu_models
-    ]
-    estimates = await asyncio.gather(*coros)
-    n = len(gpu_models)
-    return {
-        m: {"unrented": estimates[i], "rented": estimates[n + i]}
-        for i, m in enumerate(gpu_models)
-    }
+    estimates: dict[str, dict] = {}
+    for gpu_model in gpu_models:
+        estimates[gpu_model] = {
+            "unrented": await estimate_executor(
+                config,
+                redis_service,
+                snapshot,
+                ExecutorEstimateParams(gpu_model=gpu_model, is_rented=False),
+            ),
+            "rented": await estimate_executor(
+                config,
+                redis_service,
+                snapshot,
+                ExecutorEstimateParams(gpu_model=gpu_model, is_rented=True),
+            ),
+        }
+
+    return estimates
