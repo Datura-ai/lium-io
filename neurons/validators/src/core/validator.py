@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 
 from payload_models.payloads import MinerJobRequestPayload
 from clients.backend_client import BackendClient
@@ -374,6 +375,7 @@ class Validator:
 
                     snapshot = incentive.get_snapshot()
                     if snapshot is not None:
+                        estimates_started_at = time.perf_counter()
                         try:
                             await self.redis_service.set_incentive_snapshot(snapshot)
                             estimates = await precompute_all_estimates(
@@ -383,6 +385,20 @@ class Validator:
                             )
                             await self.redis_service.set_gpu_estimates(estimates)
                             await self.redis_service.publish(GPU_ESTIMATES_CHANNEL, {"updated": True})
+                            logger.info(
+                                _m(
+                                    "[sync] GPU estimates calculated successfully",
+                                    extra=get_extra_info(
+                                        {
+                                            **self.default_extra,
+                                            "duration_ms": round(
+                                                (time.perf_counter() - estimates_started_at) * 1000, 2
+                                            ),
+                                            "gpu_models_count": len(estimates),
+                                        }
+                                    ),
+                                )
+                            )
                         except Exception as e:
                             logger.error(
                                 _m(
