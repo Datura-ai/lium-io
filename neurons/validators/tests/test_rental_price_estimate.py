@@ -1,5 +1,6 @@
 """Tests for RentalPriceIncentive.get_snapshot() and standalone estimate_executor()."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,6 +13,7 @@ from incentive.rental_price import (
     RentalPriceEstimate,
     RentalPriceIncentive,
     RentalPriceSnapshot,
+    precompute_all_estimates,
 )
 from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
 from services.task_service import JobResult
@@ -354,3 +356,132 @@ async def test_estimate_executor_does_not_fetch_prices_when_snapshot_provided(
     # Assert — price provider must not have been called during estimation
     mock_price_provider.get_tao_price.assert_not_called()
     mock_price_provider.get_alpha_rate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_precompute_all_estimates_returns_both_rented_and_unrented_without_gather(
+    rental_config, mock_redis, monkeypatch
+):
+    """Precompute should fill both estimate slots sequentially without relying on asyncio.gather."""
+    snapshot = RentalPriceSnapshot(
+        epoch_subnet_emission=1.0,
+        rental_share=0.2,
+        burn_share=0.1,
+        mining={
+            "total_gpu_count": 1,
+            "total_mining_score": 1.0,
+            "total_gpu_model_count_map": {"H100": 1},
+        },
+        rental={
+            "total_rental_cost": 10.0,
+            "by_gpu_type": {
+                "H100": GpuTypeRentalState(
+                    unrented_count=1,
+                    max_cap=16,
+                    cap_multiplier=1.0,
+                    weighted_rate_sum=3.5,
+                )
+            },
+        },
+    )
+    estimates_by_key = {
+        ("H100", False): RentalPriceEstimate(
+            gpu_model="H100",
+            base_model="H100",
+            gpu_count=1,
+            is_rented=False,
+            usd_per_epoch=1.0,
+        ),
+        ("H100", True): RentalPriceEstimate(
+            gpu_model="H100",
+            base_model="H100",
+            gpu_count=1,
+            is_rented=True,
+            usd_per_epoch=2.0,
+        ),
+        ("H100 NVL", False): RentalPriceEstimate(
+            gpu_model="H100 NVL",
+            base_model="H100",
+            gpu_count=1,
+            is_rented=False,
+            usd_per_epoch=3.0,
+        ),
+        ("H100 NVL", True): RentalPriceEstimate(
+            gpu_model="H100 NVL",
+            base_model="H100",
+            gpu_count=1,
+            is_rented=True,
+            usd_per_epoch=4.0,
+        ),
+        ("H200", False): RentalPriceEstimate(
+            gpu_model="H200",
+            base_model="H200",
+            gpu_count=1,
+            is_rented=False,
+            usd_per_epoch=5.0,
+        ),
+        ("H200", True): RentalPriceEstimate(
+            gpu_model="H200",
+            base_model="H200",
+            gpu_count=1,
+            is_rented=True,
+            usd_per_epoch=6.0,
+        ),
+        ("A100", False): RentalPriceEstimate(
+            gpu_model="A100",
+            base_model="A100",
+            gpu_count=1,
+            is_rented=False,
+            usd_per_epoch=7.0,
+        ),
+        ("A100", True): RentalPriceEstimate(
+            gpu_model="A100",
+            base_model="A100",
+            gpu_count=1,
+            is_rented=True,
+            usd_per_epoch=8.0,
+        ),
+        ("L4", False): RentalPriceEstimate(
+            gpu_model="L4",
+            base_model="L4",
+            gpu_count=1,
+            is_rented=False,
+            usd_per_epoch=9.0,
+        ),
+        ("L4", True): RentalPriceEstimate(
+            gpu_model="L4",
+            base_model="L4",
+            gpu_count=1,
+            is_rented=True,
+            usd_per_epoch=10.0,
+        ),
+    }
+    estimate_executor_mock = AsyncMock(
+        side_effect=lambda _config, _redis, _snapshot, params: estimates_by_key[(params.gpu_model, params.is_rented)]
+    )
+
+    monkeypatch.setattr(rental_price_module, "BASE_GPU_MAP", BASE_GPU_MAP)
+    monkeypatch.setattr(
+        rental_price_module,
+        "asyncio",
+        SimpleNamespace(gather=AsyncMock(side_effect=AssertionError("asyncio.gather should not be used"))),
+        raising=False,
+    )
+    monkeypatch.setattr(rental_price_module, "estimate_executor", estimate_executor_mock)
+
+    estimates = await precompute_all_estimates(
+        config=rental_config,
+        snapshot=snapshot,
+        redis_service=mock_redis,
+    )
+
+    assert set(estimates) == set(BASE_GPU_MAP)
+    for gpu_model in BASE_GPU_MAP:
+        assert estimates[gpu_model]["unrented"] == estimates_by_key[(gpu_model, False)]
+        assert estimates[gpu_model]["rented"] == estimates_by_key[(gpu_model, True)]
+
+    assert estimate_executor_mock.await_count == len(BASE_GPU_MAP) * 2
+    assert estimate_executor_mock.await_args_list[0].args[3].gpu_model == "H100"
+    assert estimate_executor_mock.await_args_list[0].args[3].is_rented is False
+    assert estimate_executor_mock.await_args_list[1].args[3].gpu_model == "H100"
+    assert estimate_executor_mock.await_args_list[1].args[3].is_rented is True
