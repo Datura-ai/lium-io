@@ -3,7 +3,7 @@ name: "CD: executor (prod)"
 on:
   push:
     tags:
-      - 'executor-*'
+      - 'executor-v*'
 
 jobs:
   deploy:
