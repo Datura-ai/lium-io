@@ -234,14 +234,20 @@ async def test_estimate_executor_unrented_ineligible_gpu_returns_zero(
 async def test_estimate_executor_unrented_gpu_splitting(
     rental_config, mock_redis, mock_price_provider, monkeypatch
 ):
-    """gpu_splitting flag is accepted; both split and non-split estimates are positive."""
+    """gpu_splitting changes the fake JobResult path used by estimate_executor()."""
     # Arrange
+    rental_config.gpu_count_custom_prices = {
+        "H100": {
+            "8": 1.0,
+            "1": 3.5,
+        }
+    }
     job_results = {"miner_a": [_make_job("exec-a", "H100", 8, is_rented=False)]}
     incentive = _make_incentive(rental_config, mock_redis, mock_price_provider, job_results, monkeypatch)
     await incentive.calculate_mining_scores()
     snapshot = incentive.get_snapshot()
 
-    # Act — with gpu_splitting enabled; min-count rate resolved from config
+    # Act — gpu_splitting should cause estimate_executor() to use the higher min-count rate.
     estimator_split = RentalPriceIncentive(
         rental_config,
         mock_redis,
@@ -262,9 +268,15 @@ async def test_estimate_executor_unrented_gpu_splitting(
     )
     result_no_split = await estimator_no_split.estimate_executor(ExecutorEstimateParams(gpu_model="H100", gpu_count=8, is_rented=False))
 
-    # Assert — both are valid estimates; splitting takes best of bundle vs min-count rate
+    # Assert — splitting takes the better 1-GPU rate, proving the fake JobResult received the new fields.
+    assert result_no_split.hourly_rate == pytest.approx(1.0)
+    assert result_split.hourly_rate == pytest.approx(3.5)
+    assert result_split.effective_rate is not None
+    assert result_no_split.effective_rate is not None
+    assert result_split.effective_rate > result_no_split.effective_rate
     assert result_split.usd_per_epoch > 0
     assert result_no_split.usd_per_epoch > 0
+    assert result_split.usd_per_epoch > result_no_split.usd_per_epoch
 
 
 # ── estimate_executor() — rented path ────────────────────────────────────────
