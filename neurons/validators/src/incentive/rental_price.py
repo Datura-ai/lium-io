@@ -406,6 +406,8 @@ class RentalPriceIncentive(DefaultIncentive):
             gpu_model=gpu_model,
             gpu_count=gpu_count,
             is_rented=is_rented,
+            supports_gpu_splitting=params.gpu_splitting,
+            gpu_splitting_min_count=params.gpu_splitting_min_count,
             collateral_deposited=params.collateral_deposited,
             sysbox_runtime=params.sysbox_runtime,
         )

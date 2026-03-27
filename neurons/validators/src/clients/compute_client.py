@@ -662,6 +662,8 @@ class ComputeClient:
                 gpu_model=req.gpu_model,
                 gpu_count=req.gpu_count,
                 is_rented=req.is_rented,
+                gpu_splitting=req.gpu_splitting,
+                gpu_splitting_min_count=req.gpu_splitting_min_count,
                 sysbox_runtime=req.sysbox_runtime,
                 collateral_deposited=req.collateral_deposited,
             ),

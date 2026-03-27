@@ -42,8 +42,9 @@ async def test_handle_get_estimate_queues_protocol_safe_response_and_logs(monkey
     estimate_result = MagicMock()
     estimate_result.model_dump.return_value = {"gpu_model": "H100", "usd_per_epoch": 12.5}
     logger_info = MagicMock()
+    estimate_executor_mock = AsyncMock(return_value=estimate_result)
 
-    monkeypatch.setattr("clients.compute_client.estimate_executor", AsyncMock(return_value=estimate_result))
+    monkeypatch.setattr("clients.compute_client.estimate_executor", estimate_executor_mock)
     monkeypatch.setattr("clients.compute_client.logger.info", logger_info)
     monkeypatch.setattr("clients.compute_client.time.perf_counter", MagicMock(side_effect=[1.0, 1.05, 1.12, 1.25]))
 
@@ -53,6 +54,8 @@ async def test_handle_get_estimate_queues_protocol_safe_response_and_logs(monkey
             gpu_model="H100",
             gpu_count=2,
             is_rented=False,
+            gpu_splitting=True,
+            gpu_splitting_min_count=1,
             sysbox_runtime=True,
             collateral_deposited=True,
         )
@@ -72,3 +75,7 @@ async def test_handle_get_estimate_queues_protocol_safe_response_and_logs(monkey
     assert message.extra["request_id"] == "req-1"
     assert message.extra["snapshot_extraction_ms"] == 70.0
     assert message.extra["total_processing_ms"] == 250.0
+
+    params = estimate_executor_mock.await_args.kwargs["params"]
+    assert params.gpu_splitting is True
+    assert params.gpu_splitting_min_count == 1
