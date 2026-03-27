@@ -2,8 +2,8 @@ name: "CD: validator (prod)"
 
 on:
   push:
-    branches:
-      - 'prod_validator'
+    tags:
+      - 'validator-*'
 
 jobs:
   deploy:

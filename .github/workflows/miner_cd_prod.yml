@@ -2,8 +2,8 @@ name: "CD: miner (prod)"
 
 on:
   push:
-    branches:
-      - 'prod_miner'
+    tags:
+      - 'miner-*'
 
 jobs:
   deploy:

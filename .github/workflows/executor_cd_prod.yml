@@ -2,8 +2,8 @@ name: "CD: executor (prod)"
 
 on:
   push:
-    branches:
-      - 'prod_executor'
+    tags:
+      - 'executor-*'
 
 jobs:
   deploy:
