@@ -2,10 +2,6 @@ name: "CD: Validator (staging)"
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - staging
-      - feature/DAH-1676-prepare-staging-cd
 
 env:
   REGISTRY: ghcr.io
