@@ -3,7 +3,7 @@ name: "CD: miner (prod)"
 on:
   push:
     tags:
-      - 'miner-*'
+      - 'miner-v*'
 
 jobs:
   deploy:
