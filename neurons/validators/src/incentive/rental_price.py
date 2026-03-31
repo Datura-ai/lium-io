@@ -378,7 +378,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 gpu_count=gpu_count,
                 is_rented=is_rented,
                 usd_per_epoch=0.0,
-                eligible_for_rental_incentive=False,
+                eligible_for_rental_share=False,
             )
 
         # Build per-model totals including the hypothetical executor.
