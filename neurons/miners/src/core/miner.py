@@ -122,6 +122,15 @@ class Miner:
         await self.initialize_subtensor()
 
     async def check_registered(self):
+        if settings.CENTRAL_MODE:
+            logger.info(
+                _m(
+                    "[check_registered] Skipping registration check (CENTRAL_MODE)",
+                    extra=get_extra_info(self.default_extra),
+                ),
+            )
+            return
+
         try:
             logger.info(
                 _m(
