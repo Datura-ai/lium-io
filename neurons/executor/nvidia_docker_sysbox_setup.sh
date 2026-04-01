@@ -18,13 +18,17 @@ VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
 NC='\033[0m'
 
-info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1"; }
+info()  { echo -e "  ${GREEN}✓${NC} $1"; }
+warn()  { echo -e "  ${YELLOW}!${NC} $1"; }
+error() { echo -e "  ${RED}✗${NC} $1"; }
+step()  { echo -e "\n${BLUE}[$1/$2]${NC} $3"; }
 
 # ── 1. Pre-flight checks ──────────────────────────────────
+
+step 1 6 "Pre-flight checks"
 
 if [ "$(id -u)" -ne 0 ]; then
     error "This script must be run as root (use sudo)."
@@ -57,20 +61,33 @@ if ! ls /proc/driver/nvidia &>/dev/null; then
     exit 1
 fi
 
-info "Pre-flight checks passed."
+info "All checks passed."
 
-# ── 2. Already installed? ─────────────────────────────────
+echo ""
+echo "  This script will:"
+echo "    • Install sysbox runtime (for Docker-in-Docker support)"
+echo "    • Configure Docker daemon (daemon.json)"
+echo "    • Restart Docker"
+echo "    • Verify sysbox + GPU works"
+echo ""
+
+if [ -t 0 ]; then
+    read -rp "  Continue? [Y/n]: " confirm
+    if [ "$confirm" = "n" ] || [ "$confirm" = "N" ]; then
+        info "Aborted."
+        exit 0
+    fi
+fi
+
+# ── 2. Quick check: already working? ─────────────────────
 
 if command -v sysbox-runc &>/dev/null; then
-    installed_version=$(sysbox-runc --version 2>/dev/null | head -1 || echo "unknown")
-    info "Sysbox is already installed: $installed_version"
-
     if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
+        echo ""
         info "Sysbox is already working with GPU support. Nothing to do."
         exit 0
     fi
-
-    warn "Sysbox is installed but verification failed. Reconfiguring..."
+    warn "Sysbox is installed but not working. Reconfiguring..."
     SKIP_INSTALL=true
 else
     SKIP_INSTALL=false
@@ -78,11 +95,13 @@ fi
 
 # ── 3. Check running rented pods ──────────────────────────
 
+step 2 6 "Checking for active rentals"
+
 rented_pods=$(docker ps --filter "name=pod_" --format "{{.Names}}" 2>/dev/null || true)
 
 if [ -n "$rented_pods" ]; then
     warn "Found running rented pods:"
-    echo "$rented_pods" | sed 's/^/  - /'
+    echo "$rented_pods" | sed 's/^/    - /'
     echo ""
     warn "Docker restart is required and will STOP these pods."
     warn "Active tenants will be disconnected."
@@ -95,23 +114,27 @@ if [ -n "$rented_pods" ]; then
         exit 1
     fi
 
-    echo "Options:"
-    echo "  1) Abort — wait until pods finish, then run again"
-    echo "  2) Continue — install sysbox and restart Docker now"
+    echo "  Options:"
+    echo "    1) Abort — wait until pods finish, then run again"
+    echo "    2) Continue — install sysbox and restart Docker now"
     echo ""
-    read -rp "Choose [1/2]: " choice
+    read -rp "  Choose [1/2]: " choice
     if [ "$choice" != "2" ]; then
         info "Aborted. Run this script again when there are no active rentals."
         exit 0
     fi
     warn "Continuing with active pods. They will be stopped."
+else
+    info "No active rentals."
 fi
 
 # ── 4. Install packages ──────────────────────────────────
 
+step 3 6 "Installing packages"
+
 info "Installing nvidia-container-toolkit and jq..."
-apt-get update -qq
-apt-get install -y -qq nvidia-container-toolkit jq > /dev/null
+apt-get update -qq 2>/dev/null
+apt-get install -y -qq nvidia-container-toolkit jq > /dev/null 2>&1
 
 if [ "$SKIP_INSTALL" = false ]; then
     LOCAL_DEB="./sysbox-ce_${SYSBOX_VERSION}-0.linux_amd64.deb"
@@ -131,12 +154,15 @@ if [ "$SKIP_INSTALL" = false ]; then
         fi
         info "Checksum verified."
     fi
-    apt-get install -y -qq "$SYSBOX_DEB" > /dev/null
+    apt-get install -y -qq "$SYSBOX_DEB" > /dev/null 2>&1
+    info "Sysbox v${SYSBOX_VERSION} installed."
+else
+    info "Sysbox already installed, skipping."
 fi
 
-# ── 5. Configure Docker daemon ────────────────────────────
+# ── 5. Configure Docker ──────────────────────────────────
 
-info "Configuring Docker daemon..."
+step 4 6 "Configuring Docker"
 
 SYSBOX_CONFIG='{
     "runtimes": {
@@ -150,31 +176,30 @@ SYSBOX_CONFIG='{
 mkdir -p /etc/docker
 
 if [ -f "$DAEMON_JSON" ]; then
-    info "Merging sysbox config into existing $DAEMON_JSON..."
     jq --argjson patch "$SYSBOX_CONFIG" '. * $patch' "$DAEMON_JSON" > /tmp/daemon.json.tmp
     mv /tmp/daemon.json.tmp "$DAEMON_JSON"
+    info "Merged sysbox config into existing daemon.json."
 else
-    info "Creating $DAEMON_JSON..."
     echo "$SYSBOX_CONFIG" | jq '.' > "$DAEMON_JSON"
+    info "Created daemon.json."
 fi
 
-# ── 6. CDI cleanup (Docker >= 29.2.0 compatibility) ──────
-
+# CDI cleanup for Docker >= 29.2.0
 DOCKER_VERSION=$(docker --version | grep -oP '\d+\.\d+\.\d+' | head -1)
 DOCKER_MINOR=$(echo "$DOCKER_VERSION" | cut -d. -f2)
 
 if [ "$DOCKER_MINOR" -ge 2 ] 2>/dev/null; then
-    info "Docker $DOCKER_VERSION detected (>= 29.2.0). Cleaning up CDI specs..."
     rm -f /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml
     if systemctl list-units --all | grep -q nvidia-cdi-refresh; then
         systemctl disable --now nvidia-cdi-refresh.path nvidia-cdi-refresh.service 2>/dev/null || true
-        info "Disabled nvidia-cdi-refresh service."
     fi
+    info "Cleaned up CDI specs (Docker $DOCKER_VERSION)."
 fi
 
-# ── 7. Restart Docker ─────────────────────────────────────
+# ── 6. Restart Docker ─────────────────────────────────────
 
-info "Restarting Docker daemon..."
+step 5 6 "Restarting Docker"
+
 systemctl restart docker
 
 for i in $(seq 1 30); do
@@ -192,27 +217,27 @@ fi
 
 info "Docker is running."
 
-# ── 8. Verify ─────────────────────────────────────────────
+# ── 7. Verify ─────────────────────────────────────────────
 
-info "Verifying sysbox + GPU (this may pull the image on first run)..."
+step 6 6 "Verifying sysbox + GPU"
 
-if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi; then
+if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
     echo ""
-    info "============================================"
-    info " SUCCESS: Sysbox is working with GPU support"
-    info "============================================"
+    echo -e "  ${GREEN}╔══════════════════════════════════════════╗${NC}"
+    echo -e "  ${GREEN}║  SUCCESS: Sysbox is working with GPUs!   ║${NC}"
+    echo -e "  ${GREEN}╚══════════════════════════════════════════╝${NC}"
     echo ""
-    info "Your executor will receive full incentive score (no 20% sysbox penalty)."
+    info "Full incentive score — no 20% sysbox penalty."
 else
     echo ""
-    error "Sysbox verification FAILED. Diagnostics:"
+    error "Verification FAILED. Diagnostics:"
     echo ""
-    echo "  Docker version:     $(docker --version 2>/dev/null || echo 'unknown')"
-    echo "  nvidia-smi:         $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo 'FAILED')"
-    echo "  /proc/driver/nvidia: $(ls /proc/driver/nvidia &>/dev/null && echo 'exists' || echo 'MISSING')"
-    echo "  sysbox-runc:        $(sysbox-runc --version 2>/dev/null | head -1 || echo 'not found')"
-    echo "  CDI specs:          $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo 'none')"
-    echo "  daemon.json cdi:    $(jq -r '.features.cdi // "not set"' /etc/docker/daemon.json 2>/dev/null)"
+    echo "    Docker:             $(docker --version 2>/dev/null || echo 'unknown')"
+    echo "    NVIDIA driver:      $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo 'FAILED')"
+    echo "    /proc/driver/nvidia: $(ls /proc/driver/nvidia &>/dev/null && echo 'exists' || echo 'MISSING')"
+    echo "    sysbox-runc:        $(sysbox-runc --version 2>/dev/null | head -1 || echo 'not found')"
+    echo "    CDI specs:          $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo 'none')"
+    echo "    daemon.json cdi:    $(jq -r '.features.cdi // "not set"' /etc/docker/daemon.json 2>/dev/null)"
     echo ""
     error "Check logs:"
     error "  journalctl -u docker.service --no-pager -n 20"
