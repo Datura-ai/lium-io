@@ -126,7 +126,7 @@ class Settings(BaseSettings):
 
     PORTION_FOR_SYSBOX: float = 0.2
     PORTION_FOR_SYSBOX_UNRENTED: float = 0.5
-    PORTION_FOR_SYSBOX_RENTED: float = 0.5
+    PORTION_FOR_SYSBOX_RENTED: float = 0.2
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0, tzinfo=UTC)
 
     TIME_DELTA_FOR_EMISSION: float = 0.01
