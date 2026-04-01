@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import bittensor
 from pydantic import BaseModel, Field
 
+from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from incentive.config import BASE_GPU_MAP
 
@@ -183,6 +184,11 @@ class RentalPriceIncentive(DefaultIncentive):
                     self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
                 )
                 result.hourly_rate = max(result.hourly_rate, rate_for_min)
+
+            # Sysbox penalty: reduce hourly_rate for executors without sysbox runtime
+            result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
+            result.hourly_rate *= result.sysbox_multiplier
+
             result.max_cap = self.config.max_unrented_gpus.get(base_model, 0)
 
             # accumulate raw unrented GPU count and weighted rate sum per base model (only if rate > 0)
@@ -279,6 +285,8 @@ class RentalPriceIncentive(DefaultIncentive):
                     "gpu_model": result.gpu_model,
                     "gpu_count": result.gpu_count,
                     "hourly_rate": result.hourly_rate,
+                    "sysbox_runtime": result.sysbox_runtime,
+                    "sysbox_multiplier": result.sysbox_multiplier,
                     "unrented_cap_multiplier": result.unrented_cap_multiplier,
                     "effective_rate": result.effective_rate,
                     "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,

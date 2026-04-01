@@ -4,6 +4,8 @@ This implementation extracts the original score calculation and weight distribut
 logic to maintain backward compatibility with the existing system.
 """
 
+from datetime import UTC, datetime
+
 import bittensor
 
 from core.config import settings
@@ -125,7 +127,17 @@ class DefaultIncentive(BaseIncentive):
         job_result.mining_score = job_result.score * job_result.gpu_portion * job_result.gpu_count / job_result.total_gpu_count
 
         # Sysbox runtime multiplier
-        job_result.sysbox_multiplier = 1 if job_result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX
+        if job_result.sysbox_runtime:
+            job_result.sysbox_multiplier = 1
+        else:
+            sysbox_cutoff = datetime.fromisoformat(settings.SYSBOX_RENTED_CUTOFF).replace(tzinfo=UTC)
+            is_rented_after_cutoff = (
+                job_result.is_rented
+                and job_result.rental_created_at
+                and job_result.rental_created_at >= sysbox_cutoff
+            )
+            portion = settings.PORTION_FOR_SYSBOX_RENTED if is_rented_after_cutoff else settings.PORTION_FOR_SYSBOX
+            job_result.sysbox_multiplier = 1 - portion
 
         # Uptime multiplier
         if not job_result.collateral_deposited:
