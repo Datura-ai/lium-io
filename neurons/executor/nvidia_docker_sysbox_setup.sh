@@ -241,7 +241,7 @@ if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &
     echo -e "  ${GREEN}║  SUCCESS: Sysbox is working with GPUs!   ║${NC}"
     echo -e "  ${GREEN}╚══════════════════════════════════════════╝${NC}"
     echo ""
-    info "Full incentive score — no 20% sysbox penalty."
+    info "Your executor now supports Docker-in-Docker (no 20% sysbox penalty)."
 else
     echo ""
     error "Verification FAILED. Diagnostics:"
