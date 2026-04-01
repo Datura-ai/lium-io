@@ -30,7 +30,7 @@ docker_version_ge() {
 
 # ── 1. Pre-flight ────────────────────────────────────────
 
-step 1 6 "Pre-flight checks"
+step 1 7 "Pre-flight checks"
 
 [ "$(id -u)" -eq 0 ]                         || { fail "Run as root (use sudo)."; exit 1; }
 [ "$(uname -m)" = "x86_64" ]                 || { fail "Sysbox requires x86_64."; exit 1; }
@@ -58,25 +58,75 @@ fi
 SKIP_INSTALL=false
 command -v sysbox-runc &>/dev/null && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
 
-# ── 3. Active rentals ───────────────────────────────────
+# ── 3. Check running containers ─────────────────────────
 
-step 2 6 "Checking for active rentals"
+step 2 7 "Checking running containers"
 
-rented=$(docker ps --filter "name=pod_" --format "{{.Names}}" 2>/dev/null || true)
-if [ -n "$rented" ]; then
-    warn "Running pods found (Docker restart will stop them):"
-    echo "$rented" | sed 's/^/    - /'
-    if [ ! -t 0 ]; then
-        fail "Cannot proceed non-interactively with active pods."; exit 1
-    fi
-    read -rp "  Continue anyway? [y/N]: " c; [ "$c" = "y" ] || [ "$c" = "Y" ] || { ok "Aborted."; exit 0; }
-else
-    ok "No active rentals."
+EXECUTOR_COMPOSE_DIR=""
+all_containers=$(docker ps --format "{{.Names}}" 2>/dev/null || true)
+has_pods=false has_validator=false has_executor=false has_unknown=false
+unknown_list=""
+
+for name in $all_containers; do
+    case "$name" in
+        pod_*)       has_pods=true ;;
+        container_*) has_validator=true ;;
+        executor-*|executor_*)
+            has_executor=true
+            if [ -z "$EXECUTOR_COMPOSE_DIR" ]; then
+                EXECUTOR_COMPOSE_DIR=$(docker inspect "$name" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' 2>/dev/null || true)
+            fi
+            ;;
+        *)           has_unknown=true; unknown_list="$unknown_list\n    - $name" ;;
+    esac
+done
+
+if [ "$has_pods" = true ]; then
+    fail "Active rentals found (pod_* containers). Cannot proceed."
+    docker ps --filter "name=pod_" --format "    - {{.Names}}" 2>/dev/null
+    exit 1
 fi
+
+if [ "$has_validator" = true ]; then
+    fail "Validator check in progress (container_* containers). Wait ~30 seconds and retry."
+    exit 1
+fi
+
+if [ "$has_unknown" = true ]; then
+    fail "Unknown containers found — stop them manually before proceeding:"
+    echo -e "$unknown_list"
+    exit 1
+fi
+
+if [ "$has_executor" = true ]; then
+    if [ -z "$EXECUTOR_COMPOSE_DIR" ]; then
+        # Fallback: if running from repo, compose is in current dir
+        [ -f ./docker-compose.yml ] && EXECUTOR_COMPOSE_DIR="$(pwd)"
+    fi
+    if [ -z "$EXECUTOR_COMPOSE_DIR" ]; then
+        fail "Executor containers found but cannot determine compose directory."
+        fail "Stop them manually: docker compose down (from executor directory)"
+        exit 1
+    fi
+    warn "Executor containers will be stopped and restarted after setup."
+    docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" down 2>/dev/null \
+        || { fail "Failed to stop executor. Run 'docker compose down' manually from: $EXECUTOR_COMPOSE_DIR"; exit 1; }
+    ok "Executor stopped ($EXECUTOR_COMPOSE_DIR)."
+fi
+
+# Check for stopped containers (sysbox requires zero containers)
+stopped=$(docker ps -a -q 2>/dev/null || true)
+if [ -n "$stopped" ]; then
+    warn "Removing stopped containers (sysbox requires none)..."
+    docker rm -f $stopped > /dev/null 2>&1
+    ok "Stopped containers removed."
+fi
+
+ok "Docker is clear for sysbox installation."
 
 # ── 4. Install ──────────────────────────────────────────
 
-step 3 6 "Installing packages"
+step 3 7 "Installing packages"
 
 apt-get update -qq 2>/dev/null
 apt-get install -y -qq nvidia-container-toolkit jq > /dev/null 2>&1
@@ -102,7 +152,7 @@ fi
 
 # ── 5. Configure Docker ────────────────────────────────
 
-step 4 6 "Configuring Docker"
+step 4 7 "Configuring Docker"
 
 CONFIG='{"runtimes":{"sysbox-runc":{"path":"/usr/bin/sysbox-runc"},"nvidia":{"path":"nvidia-container-runtime","runtimeArgs":[]}},"features":{"cdi":false}}'
 
@@ -127,7 +177,7 @@ fi
 
 # ── 6. Restart Docker ──────────────────────────────────
 
-step 5 6 "Restarting Docker"
+step 5 7 "Restarting Docker"
 
 systemctl restart docker
 for _ in $(seq 1 30); do docker ps &>/dev/null && break; sleep 1; done
@@ -136,7 +186,7 @@ ok "Docker is running."
 
 # ── 7. Verify ──────────────────────────────────────────
 
-step 6 6 "Verifying sysbox + GPU"
+step 6 7 "Verifying sysbox + GPU"
 
 if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
     echo ""
@@ -145,6 +195,14 @@ if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &
     echo -e "  ${G}╚══════════════════════════════════════════╝${N}"
     echo ""
     ok "Your executor now supports Docker-in-Docker."
+
+    # ── 8. Restart executor ──────────────────────────────
+    if [ -n "$EXECUTOR_COMPOSE_DIR" ]; then
+        step 7 7 "Restarting executor"
+        docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" up -d 2>/dev/null \
+            && ok "Executor restarted ($EXECUTOR_COMPOSE_DIR)." \
+            || warn "Failed to restart executor. Run manually: cd $EXECUTOR_COMPOSE_DIR && docker compose up -d"
+    fi
 else
     echo ""
     fail "Verification FAILED. Diagnostics:"
