@@ -86,7 +86,7 @@ def _make_incentive(rental_config, mock_redis, mock_price_provider, job_results,
     return incentive
 
 
-def _make_job(executor_id: str, gpu_model: str, gpu_count: int, is_rented: bool) -> JobResult:
+def _make_job(executor_id: str, gpu_model: str, gpu_count: int, is_rented: bool, sysbox_runtime: bool = True) -> JobResult:
     from datura.requests.miner_requests import ExecutorSSHInfo
 
     return JobResult(
@@ -98,6 +98,7 @@ def _make_job(executor_id: str, gpu_model: str, gpu_count: int, is_rented: bool)
         log_status="success", log_text="ok",
         gpu_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented,
         collateral_deposited=True,
+        sysbox_runtime=sysbox_runtime,
     )
 
 

@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel
@@ -24,6 +25,7 @@ class RentedPod(BaseModel):
     pod_id: str
     container_name: str
     rented_ports: list[int] = []
+    created_at: datetime | None = None
 
 
 class RentedExecutor(BaseModel):
