@@ -103,15 +103,21 @@ if [ "$has_executor" = true ]; then
         # Fallback: if running from repo, compose is in current dir
         [ -f ./docker-compose.yml ] && EXECUTOR_COMPOSE_DIR="$(pwd)"
     fi
-    if [ -z "$EXECUTOR_COMPOSE_DIR" ]; then
-        fail "Executor containers found but cannot determine compose directory."
-        fail "Stop them manually: docker compose down (from executor directory)"
-        exit 1
-    fi
     warn "Executor containers will be stopped and restarted after setup."
-    docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" down 2>/dev/null \
-        || { fail "Failed to stop executor. Run 'docker compose down' manually from: $EXECUTOR_COMPOSE_DIR"; exit 1; }
-    ok "Executor stopped ($EXECUTOR_COMPOSE_DIR)."
+    if [ -n "$EXECUTOR_COMPOSE_DIR" ] && [ -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" ]; then
+        docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" down 2>/dev/null \
+            || { fail "Failed to stop executor. Run 'docker compose down' manually from: $EXECUTOR_COMPOSE_DIR"; exit 1; }
+        ok "Executor stopped via compose ($EXECUTOR_COMPOSE_DIR)."
+    else
+        # Compose file missing — stop and remove executor containers directly
+        executor_ids=$(docker ps --filter "name=executor" -q 2>/dev/null || true)
+        if [ -n "$executor_ids" ]; then
+            docker stop $executor_ids > /dev/null 2>&1
+            docker rm $executor_ids > /dev/null 2>&1
+        fi
+        ok "Executor containers stopped (compose file not found — restart manually after setup)."
+        EXECUTOR_COMPOSE_DIR=""  # Clear so we don't try to restart
+    fi
 fi
 
 # Check for stopped containers (sysbox requires zero containers)
