@@ -5,6 +5,7 @@ and converting the validation context into a JobResult for reporting.
 """
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from core.utils import _m
@@ -118,8 +119,20 @@ class ResultHandler:
             gpu_splitting_min_count=context.state.gpu_splitting_min_count,
             ssh_pub_keys=context.ssh_pub_keys,
             is_rented=context.rented,
+            rental_created_at=self._get_rental_created_at(context),
             tdx_attestation_passed=context.tdx_attestation_passed,
         )
+
+    @staticmethod
+    def _get_rental_created_at(context: Context) -> datetime | None:
+        rented_data = context.state.rented_data
+        if not rented_data or not context.rented:
+            return None
+        rented_executor = rented_data.executors.get(context.executor.uuid)
+        if not rented_executor or not rented_executor.pods:
+            return None
+        created_dates = [p.created_at for p in rented_executor.pods if p.created_at]
+        return max(created_dates) if created_dates else None
 
     async def _persist_verification_data(
         self,

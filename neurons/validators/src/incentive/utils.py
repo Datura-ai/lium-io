@@ -68,36 +68,30 @@ def log_for_monitoring(
             "total_rental_cost": total_rental_cost,
         }))
 
-        # Rental breakdown by (base_model, gpu_count)
-        rental_breakdown: dict[str, dict] = {}
+        # Rental breakdown: one line per executor, sorted by gpu name then gpu count
+        if any(r.eligible_for_rental_share for results in job_results.values() for r in results):
+            logger.info(_m("Rental_breakdown | format: rate * cap * sysbox = eff/gpu * gpus = cost"))
+        rental_executors: list[tuple[str, JobResult]] = []
         for results in job_results.values():
             for r in results:
                 if not r.eligible_for_rental_share:
                     continue
                 base = BASE_GPU_MAP.get(r.gpu_model, r.gpu_model)
-                key = f"{r.gpu_count}x{base}"
-                if key not in rental_breakdown:
-                    rental_breakdown[key] = {
-                        "unrented_cap_multiplier": r.unrented_cap_multiplier,
-                        "hourly_rate": r.hourly_rate,
-                        "effective_rate": r.effective_rate,
-                        "executor_count": 0,
-                        "total_gpus": 0,
-                        "total_cost": 0.0,
-                    }
-                rental_breakdown[key]["executor_count"] += 1
-                rental_breakdown[key]["total_gpus"] += r.gpu_count
-                rental_breakdown[key]["total_cost"] += r.gpu_count * (r.effective_rate or 0)
+                rental_executors.append((base, r))
 
-        for key, info in sorted(rental_breakdown.items(), key=lambda x: -x[1]["total_cost"]):
-            cap = info["unrented_cap_multiplier"]
-            rate = info["hourly_rate"]
-            eff = info["effective_rate"]
-            exs = info["executor_count"]
-            cost = info["total_cost"]
+        for base, r in sorted(rental_executors, key=lambda x: (x[0], x[1].gpu_count)):
+            key = f"{r.gpu_count}x{base}"
+            cap = r.unrented_cap_multiplier or 0
+            rate = r.hourly_rate or 0
+            eff = r.effective_rate or 0
+            sysbox = r.sysbox_multiplier or 0
+            ex_cost = r.gpu_count * eff
+            ex_id = r.executor_info.uuid[:8] if r.executor_info.uuid else "?"
             logger.info(_m(
-                f"Rental_breakdown | {key} - {exs}ex | ${rate:.2f} * {cap:.2f} = ${eff:.3f}/gpu | total=${cost:.2f}",
-                extra={"group": key, **info},
+                f"Rental_breakdown | {key} [{ex_id}] | ${rate:.2f} * {cap:.2f} * {sysbox:.2f} = ${eff:.3f}/gpu * {r.gpu_count}gpu = ${ex_cost:.2f}",
+                extra={"group": key, "executor_id": ex_id, "hourly_rate": rate,
+                        "unrented_cap_multiplier": cap, "sysbox_multiplier": sysbox,
+                        "effective_rate": eff, "gpu_count": r.gpu_count, "executor_cost": ex_cost},
             ))
 
         for job_list in job_results.values():
