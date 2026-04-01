@@ -8,6 +8,7 @@ from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
 from services.file_encrypt_service import ORIGINAL_KEYS
+from .network_ema import compute_ema
 
 
 def _update_keys(data: Any, key_mapping: dict[str, str]) -> Any:
@@ -109,6 +110,22 @@ class MachineSpecScrapeCheck:
             gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
             gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
             supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
+
+            prev_ema = (
+                ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
+                if ctx.state.rented_data else None
+            )
+            network = specs.get("network") or {}
+            network["ema_download_speed"] = compute_ema(
+                prev_ema.ema_download_speed if prev_ema else None,
+                network.get("download_speed"),
+            )
+            network["ema_upload_speed"] = compute_ema(
+                prev_ema.ema_upload_speed if prev_ema else None,
+                network.get("upload_speed"),
+            )
+            specs = {**specs, "network": network}
+
             extra_info = {
                 "sysbox_runtime": sysbox_runtime,
                 "supports_gpu_splitting": supports_gpu_splitting,

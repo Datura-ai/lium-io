@@ -51,11 +51,20 @@ class RentedMachineResponse(BaseModel):
     banned_guids: list[str] = []
 
 
+class NetworkEMA(BaseModel):
+    """EMA-smoothed network speed measurements for an executor."""
+
+    ema_download_speed: float | None = None
+    ema_upload_speed: float | None = None
+    ema_verifyx_download_speed: float | None = None
+
+
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
     banned_guids: list[str] = []
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
+    network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
 
 
 class ExecutorUptimeResponse(BaseModel):
