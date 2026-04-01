@@ -171,7 +171,13 @@ async def test_machine_spec_scrape_check(
         assert "state" in result.updates
         updated_state = result.updates["state"]
         # Check that specs were parsed and stored correctly
-        assert updated_state.specs == mock_specs
+        assert updated_state.specs.get("gpu") == mock_specs["gpu"]
+        assert updated_state.specs.get("cpu") == mock_specs["cpu"]
+        assert updated_state.specs.get("gpu_processes") == mock_specs["gpu_processes"]
+        assert updated_state.specs.get("sysbox_runtime") == mock_specs["sysbox_runtime"]
+        # EMA network fields are always added; both None since mock_specs has no network data
+        assert updated_state.specs.get("network", {}).get("ema_download_speed") is None
+        assert updated_state.specs.get("network", {}).get("ema_upload_speed") is None
         assert updated_state.gpu_count == 2
         assert updated_state.gpu_model == "NVIDIA RTX 3090"
         assert updated_state.gpu_model_count == "NVIDIA RTX 3090:2"
