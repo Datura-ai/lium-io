@@ -98,11 +98,25 @@ if [ "$has_unknown" = true ]; then
     exit 1
 fi
 
+find_executor_compose() {
+    # 1. Label from container
+    [ -n "$EXECUTOR_COMPOSE_DIR" ] && [ -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" ] && return 0
+    # 2. Current directory
+    [ -f ./docker-compose.yml ] && EXECUTOR_COMPOSE_DIR="$(pwd)" && return 0
+    # 3. Known paths
+    for d in \
+        "$HOME/compute-subnet/neurons/executor" \
+        /root/compute-subnet/neurons/executor \
+        /home/*/compute-subnet/neurons/executor \
+        "$HOME/executor" \
+        /root/executor; do
+        [ -f "$d/docker-compose.yml" ] && EXECUTOR_COMPOSE_DIR="$d" && return 0
+    done
+    return 1
+}
+
 if [ "$has_executor" = true ]; then
-    if [ -z "$EXECUTOR_COMPOSE_DIR" ]; then
-        # Fallback: if running from repo, compose is in current dir
-        [ -f ./docker-compose.yml ] && EXECUTOR_COMPOSE_DIR="$(pwd)"
-    fi
+    find_executor_compose || EXECUTOR_COMPOSE_DIR=""
     warn "Executor containers will be stopped and restarted after setup."
     if [ -n "$EXECUTOR_COMPOSE_DIR" ] && [ -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" ]; then
         docker compose -f "$EXECUTOR_COMPOSE_DIR/docker-compose.yml" down 2>/dev/null \
