@@ -124,6 +124,9 @@ class Settings(BaseSettings):
     UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
     PORTION_FOR_SYSBOX: float = 0.2
+    PORTION_FOR_SYSBOX_UNRENTED: float = 0.5
+    PORTION_FOR_SYSBOX_RENTED: float = 0.5
+    SYSBOX_RENTED_CUTOFF: str = "2026-04-03T12:00:00"
 
     TIME_DELTA_FOR_EMISSION: float = 0.01
 
