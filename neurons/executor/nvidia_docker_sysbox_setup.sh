@@ -64,7 +64,13 @@ info "Pre-flight checks passed."
 if command -v sysbox-runc &>/dev/null; then
     installed_version=$(sysbox-runc --version 2>/dev/null | head -1 || echo "unknown")
     info "Sysbox is already installed: $installed_version"
-    info "Skipping installation, jumping to configuration and verification..."
+
+    if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
+        info "Sysbox is already working with GPU support. Nothing to do."
+        exit 0
+    fi
+
+    warn "Sysbox is installed but verification failed. Reconfiguring..."
     SKIP_INSTALL=true
 else
     SKIP_INSTALL=false
