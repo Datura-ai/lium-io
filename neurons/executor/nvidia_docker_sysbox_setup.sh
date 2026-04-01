@@ -14,6 +14,7 @@ SYSBOX_DEB_URL="https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_V
 SYSBOX_DEB_SHA256="87cfa5cad97dc5dc1a243d6d88be1393be75b93a517dc1580ecd8a2801c2777a"
 DAEMON_JSON="/etc/docker/daemon.json"
 VERIFY_IMAGE="daturaai/compute-subnet-executor:latest"
+DOWNLOADED_DEB=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -25,6 +26,13 @@ info()  { echo -e "  ${GREEN}✓${NC} $1"; }
 warn()  { echo -e "  ${YELLOW}!${NC} $1"; }
 error() { echo -e "  ${RED}✗${NC} $1"; }
 step()  { echo -e "\n${BLUE}[$1/$2]${NC} $3"; }
+
+cleanup() {
+    if [ -n "$DOWNLOADED_DEB" ] && [ -f "$DOWNLOADED_DEB" ]; then
+        rm -f "$DOWNLOADED_DEB"
+    fi
+}
+trap cleanup EXIT
 
 # ── 1. Pre-flight checks ──────────────────────────────────
 
@@ -82,10 +90,15 @@ fi
 # ── 2. Quick check: already working? ─────────────────────
 
 if command -v sysbox-runc &>/dev/null; then
-    if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
-        echo ""
-        info "Sysbox is already working with GPU support. Nothing to do."
-        exit 0
+    # Only check if runtime is registered in Docker and image is cached
+    if docker info 2>/dev/null | grep -q sysbox-runc; then
+        if docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
+            if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
+                echo ""
+                info "Sysbox is already working with GPU support. Nothing to do."
+                exit 0
+            fi
+        fi
     fi
     warn "Sysbox is installed but not working. Reconfiguring..."
     SKIP_INSTALL=true
@@ -144,12 +157,12 @@ if [ "$SKIP_INSTALL" = false ]; then
     else
         info "Downloading sysbox v${SYSBOX_VERSION}..."
         SYSBOX_DEB=$(mktemp /tmp/sysbox-ce.XXXXXX.deb)
+        DOWNLOADED_DEB="$SYSBOX_DEB"
         wget -q -O "$SYSBOX_DEB" "$SYSBOX_DEB_URL"
         ACTUAL_SHA=$(sha256sum "$SYSBOX_DEB" | cut -d' ' -f1)
         if [ "$ACTUAL_SHA" != "$SYSBOX_DEB_SHA256" ]; then
             error "Checksum mismatch! Expected: $SYSBOX_DEB_SHA256"
             error "Got: $ACTUAL_SHA"
-            rm -f "$SYSBOX_DEB"
             exit 1
         fi
         info "Checksum verified."
@@ -169,16 +182,16 @@ SYSBOX_CONFIG='{
         "sysbox-runc": {"path": "/usr/bin/sysbox-runc"},
         "nvidia": {"path": "nvidia-container-runtime", "runtimeArgs": []}
     },
-    "exec-opts": ["native.cgroupdriver=cgroupfs"],
     "features": {"cdi": false}
 }'
 
 mkdir -p /etc/docker
 
 if [ -f "$DAEMON_JSON" ]; then
+    cp "$DAEMON_JSON" "${DAEMON_JSON}.bak"
     jq --argjson patch "$SYSBOX_CONFIG" '. * $patch' "$DAEMON_JSON" > /tmp/daemon.json.tmp
     mv /tmp/daemon.json.tmp "$DAEMON_JSON"
-    info "Merged sysbox config into existing daemon.json."
+    info "Merged sysbox config into existing daemon.json (backup: daemon.json.bak)."
 else
     echo "$SYSBOX_CONFIG" | jq '.' > "$DAEMON_JSON"
     info "Created daemon.json."
@@ -186,9 +199,10 @@ fi
 
 # CDI cleanup for Docker >= 29.2.0
 DOCKER_VERSION=$(docker --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+DOCKER_MAJOR=$(echo "$DOCKER_VERSION" | cut -d. -f1)
 DOCKER_MINOR=$(echo "$DOCKER_VERSION" | cut -d. -f2)
 
-if [ "$DOCKER_MINOR" -ge 2 ] 2>/dev/null; then
+if [ "$DOCKER_MAJOR" -ge 29 ] && [ "$DOCKER_MINOR" -ge 2 ] 2>/dev/null; then
     rm -f /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml
     if systemctl list-units --all | grep -q nvidia-cdi-refresh; then
         systemctl disable --now nvidia-cdi-refresh.path nvidia-cdi-refresh.service 2>/dev/null || true
