@@ -109,7 +109,9 @@ CONFIG='{"runtimes":{"sysbox-runc":{"path":"/usr/bin/sysbox-runc"},"nvidia":{"pa
 mkdir -p /etc/docker
 if [ -f /etc/docker/daemon.json ]; then
     cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
-    jq --argjson p "$CONFIG" '. * $p' /etc/docker/daemon.json > /tmp/daemon.json.tmp
+    jq --argjson p "$CONFIG" '. * $p' /etc/docker/daemon.json > /tmp/daemon.json.tmp \
+        || { fail "Failed to merge daemon.json (invalid JSON?). Backup: daemon.json.bak"; exit 1; }
+    [ -s /tmp/daemon.json.tmp ] || { fail "Merged daemon.json is empty. Backup: daemon.json.bak"; exit 1; }
     mv /tmp/daemon.json.tmp /etc/docker/daemon.json
     ok "Merged into daemon.json (backup: daemon.json.bak)."
 else
