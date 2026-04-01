@@ -6,6 +6,7 @@ from typing import Any
 
 from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .network_ema import compute_ema
 
 
 class VerifyXCheck:
@@ -69,6 +70,14 @@ class VerifyXCheck:
                 if "network" not in updated_specs:
                     updated_specs["network"] = {}
                 updated_specs["network"]["verifyx_download_speed"] = verifyx_network.get("download_speed")
+                prev_ema = (
+                    ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
+                    if ctx.state.rented_data else None
+                )
+                updated_specs["network"]["ema_verifyx_download_speed"] = compute_ema(
+                    prev_ema.ema_verifyx_download_speed if prev_ema else None,
+                    verifyx_network.get("download_speed"),
+                )
 
             # Update storage specs if storage is present
             if "hard_disk" in sanitized:
