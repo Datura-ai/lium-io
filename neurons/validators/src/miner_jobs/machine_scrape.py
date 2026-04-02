@@ -655,21 +655,54 @@ def netmeasure_output():
         data["network_speed_error"] = repr(exc)
     return data
 
+def cloudflare_speed():
+    """Measure network speed using Cloudflare's speed endpoint via curl."""
+    data = {"upload_speed": None, "download_speed": None}
+    try:
+        # Download: 50 MB
+        out = run_cmd(
+            "curl -o /dev/null -s -w '%{speed_download}' "
+            "--max-time 15 "
+            "'https://speed.cloudflare.com/__down?bytes=50000000'"
+        )
+        data["download_speed"] = round(float(out) * 8 / 1_000_000, 2)  # bytes/s → Mbps
+
+        # Upload: 25 MB via stdin pipe (no temp file)
+        out = run_cmd(
+            "dd if=/dev/zero bs=1M count=25 2>/dev/null | "
+            "curl -o /dev/null -s -w '%{speed_upload}' "
+            "--max-time 15 -X POST --data-binary @- "
+            "'https://speed.cloudflare.com/__up'"
+        )
+        data["upload_speed"] = round(float(out) * 8 / 1_000_000, 2)  # bytes/s → Mbps
+    except Exception as exc:
+        data["network_speed_error"] = repr(exc)
+    return data
+
+
 def benchmark_network_speed():
-    """Benchmark network speed using different methods"""
-    data = get_network_speed()
-    if data.get("download_speed") or data.get("upload_speed"):
-        return data
-    
-    data = speedcheck_output()
-    if data.get("download_speed") or data.get("upload_speed"):
-        return data
-    
-    data = netmeasure_output()
-    if data.get("download_speed") or data.get("upload_speed"):
-        return data
-    
-    return {"upload_speed": None, "download_speed": None}
+    """Run all network speed methods and return the best per-metric results.
+
+    Each method is run independently so a partial failure in one (e.g. only
+    download succeeded) does not prevent another method from filling the gap.
+    All per-method raw results are stored under 'measurements' for logging.
+    """
+    measurements = {
+        "speedtest_cli": get_network_speed(),
+        "speedcheck": speedcheck_output(),
+        "netmeasure": netmeasure_output(),
+        "cloudflare": cloudflare_speed(),
+    }
+
+    results = list(measurements.values())
+    download = next((r["download_speed"] for r in results if r.get("download_speed")), None)
+    upload = next((r["upload_speed"] for r in results if r.get("upload_speed")), None)
+
+    return {
+        "download_speed": download,
+        "upload_speed": upload,
+        "measurements": measurements,
+    }
 
 def get_docker_info(content: bytes):
     data = {
