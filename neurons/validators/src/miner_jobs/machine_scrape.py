@@ -685,26 +685,45 @@ def cloudflare_speed():
 
 
 def benchmark_network_speed():
-    """Run all network speed methods and return the best per-metric results.
+    """Run network speed methods in fallback order, stopping once both metrics are satisfied.
 
-    Each method is run independently so a partial failure in one (e.g. only
-    download succeeded) does not prevent another method from filling the gap.
-    All per-method raw results are stored under 'measurements' for logging.
+    Methods are tried in order: speedtest_cli → cloudflare → netmeasure → speedcheck.
+    Each method is only called if at least one metric (download or upload) is still missing.
+    All executed per-method raw results are stored under 'measurements' for logging.
     """
-    measurements = {
-        "speedtest_cli": get_network_speed(),
-        "speedcheck": speedcheck_output(),
-        "netmeasure": netmeasure_output(),
-        "cloudflare": cloudflare_speed(),
-    }
+    order = [
+        ("speedtest_cli", get_network_speed),
+        ("cloudflare", cloudflare_speed),
+        ("netmeasure", netmeasure_output),
+        ("speedcheck", speedcheck_output),
+    ]
 
-    results = list(measurements.values())
-    download = next((r["download_speed"] for r in results if r.get("download_speed")), None)
-    upload = next((r["upload_speed"] for r in results if r.get("upload_speed")), None)
+    measurements = {}
+    download: float | None = None
+    upload: float | None = None
+    download_source: str | None = None
+    upload_source: str | None = None
+
+    for name, method in order:
+        if download is not None and upload is not None:
+            break
+
+        result = method()
+        measurements[name] = result
+
+        if download is None and result.get("download_speed"):
+            download = result["download_speed"]
+            download_source = name
+
+        if upload is None and result.get("upload_speed"):
+            upload = result["upload_speed"]
+            upload_source = name
 
     return {
         "download_speed": download,
         "upload_speed": upload,
+        "download_source": download_source,
+        "upload_source": upload_source,
         "measurements": measurements,
     }
 
