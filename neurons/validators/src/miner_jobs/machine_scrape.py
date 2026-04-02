@@ -604,7 +604,11 @@ def nvmlDeviceGetComputeRunningProcesses_v2(handle):
 
 
 def run_cmd(cmd):
-    proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True)
+    # Strip LD_LIBRARY_PATH so PyInstaller's bundled libs don't leak into subprocesses
+    # and conflict with system-linked shared libs (e.g. libssl vs libcrypto version mismatch).
+    env = {**os.environ}
+    env.pop("LD_LIBRARY_PATH", None)
+    proc = subprocess.run(cmd, shell=True, capture_output=True, check=False, text=True, env=env)
     if proc.returncode != 0:
         raise RuntimeError(
             f"run_cmd error {cmd=!r} {proc.returncode=} {proc.stdout=!r} {proc.stderr=!r}"
