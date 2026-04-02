@@ -185,9 +185,8 @@ class RentalPriceIncentive(DefaultIncentive):
                 )
                 result.hourly_rate = max(result.hourly_rate, rate_for_min)
 
-            # Sysbox penalty: reduce hourly_rate for executors without sysbox runtime
+            # Sysbox penalty: applied later via effective_rate, not baked into hourly_rate
             result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
-            result.hourly_rate *= result.sysbox_multiplier
 
             result.max_cap = self.config.max_unrented_gpus.get(base_model, 0)
 
@@ -197,7 +196,8 @@ class RentalPriceIncentive(DefaultIncentive):
                     self.unrented_count_by_type.get(base_model, 0) + result.gpu_count
                 )
                 self._weighted_rate_sum_by_type[base_model] = (
-                    self._weighted_rate_sum_by_type.get(base_model, 0) + result.gpu_count * result.hourly_rate
+                    self._weighted_rate_sum_by_type.get(base_model, 0)
+                    + result.gpu_count * result.hourly_rate * result.sysbox_multiplier
                 )
 
     async def _on_finish_pre_process(self) -> None:
@@ -267,7 +267,7 @@ class RentalPriceIncentive(DefaultIncentive):
         result.burn_share = self.burn_share
         result.total_rental_cost = self.total_rental_cost
         result.unrented_cap_multiplier = self.cap_multiplier_by_base_model.get(base_model, 0)
-        result.effective_rate = result.hourly_rate * result.unrented_cap_multiplier
+        result.effective_rate = result.hourly_rate * result.unrented_cap_multiplier * result.sysbox_multiplier
 
         # calculate incentive score
         result.incentive = (
