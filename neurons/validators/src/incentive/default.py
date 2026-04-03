@@ -134,6 +134,7 @@ class DefaultIncentive(BaseIncentive):
             job_result.sysbox_multiplier = 1
         else:
             portion = settings.PORTION_FOR_SYSBOX_RENTED if is_rented_after_cutoff else settings.PORTION_FOR_SYSBOX
+
             job_result.sysbox_multiplier = 1 - portion
 
         # Uptime multiplier
@@ -150,10 +151,10 @@ class DefaultIncentive(BaseIncentive):
 
         # Apply multiplier
         job_result.mining_score *= job_result.sysbox_multiplier * job_result.uptime_multiplier
-        job_result.incentive_logs.append(
-            _m(
-                "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier",
-                extra=get_extra_info({
+        log = _m(
+            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier",
+            extra=get_extra_info(
+                {
                     "executor_id": str(job_result.executor_info.uuid),
                     "gpu_model": job_result.gpu_model,
                     "gpu_count": job_result.gpu_count,
@@ -164,9 +165,13 @@ class DefaultIncentive(BaseIncentive):
                     "total_gpu_count": job_result.total_gpu_count,
                     "rental_created": job_result.rental_created_at,
                     "is_rented_after_cutoff": is_rented_after_cutoff,
-                }),
-            ).to_full_string()
+                }
+            ),
         )
+        job_result.incentive_logs.append(
+            log.to_full_string()
+        )
+        logger.info(log)
         return job_result
 
     async def calculate_final_weights(
