@@ -128,11 +128,7 @@ class DefaultIncentive(BaseIncentive):
         if job_result.sysbox_runtime:
             job_result.sysbox_multiplier = 1
         else:
-            is_rented_after_cutoff = (
-                job_result.is_rented
-                and job_result.rental_created_at
-                and job_result.rental_created_at >= settings.SYSBOX_RENTED_CUTOFF
-            )
+            is_rented_after_cutoff = False
             portion = settings.PORTION_FOR_SYSBOX_RENTED if is_rented_after_cutoff else settings.PORTION_FOR_SYSBOX
             job_result.sysbox_multiplier = 1 - portion
 
