@@ -1,7 +1,7 @@
 from time import time
 
 from core.utils import get_logger, _m
-from incentive.config import BASE_GPU_MAP, DEFAULT_PRICE
+from incentive.config import BASE_GPU_MAP, DefaultPrice
 from services.const import TOTAL_BURN_EMISSION
 from services.task import JobResult
 
@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 def get_hourly_rate(
     gpu_model: str,
     gpu_count: int,
-    custom_prices: dict[str, dict[str, float | str]],
+    custom_prices: dict[str, dict[str, float | DefaultPrice]],
     default_prices: dict[str, float],
 ) -> float:
     """Resolve hourly rate in USD for a (gpu_model, gpu_count) pair.
@@ -38,8 +38,8 @@ def get_hourly_rate(
     else:
         return 0.0
 
-    if value == DEFAULT_PRICE:
-        return default_prices.get(gpu_model, 0.0)
+    if isinstance(value, DefaultPrice):
+        return default_prices.get(gpu_model, 0.0) * value.multiplier
 
     return float(value)
 

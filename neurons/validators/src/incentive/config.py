@@ -6,39 +6,48 @@ High-end GPUs (B300, B200, H200) have lower caps due to scarcity, while mid-rang
 GPUs have higher caps to accommodate larger deployments.
 """
 
+from dataclasses import dataclass
+
 from pydantic import BaseModel, Field, field_validator
 
 from services.const import MACHINE_PRICES
 
-# Sentinel value: use default price from MACHINE_PRICES
-DEFAULT_PRICE = "default"
+
+@dataclass(frozen=True)
+class DefaultPrice:
+    """Sentinel: resolve to MACHINE_PRICES[gpu_model] * multiplier."""
+    multiplier: float = 1.0
+
+
+DEFAULT_PRICE = DefaultPrice()
+
 
 # Maximum unrented GPUs per GPU type before cap dilution is applied
 # High-end GPUs have lower caps (12-24) due to scarcity and high value
 # Mid-tier GPUs have moderate caps (24-48) for balanced incentives
 # Lower-tier GPUs have higher caps (48-96) to accommodate larger deployments
 MAX_UNRENTED_GPUS_BY_TYPE = {
-    "B300": 8,
+    "B300": 0,
     "B200": 8,
     "H200": 8,
     "H100": 8,
+    "RTX 4090": 8,
+    "A100": 8,
+    "RTX A6000": 8,
+    "RTX 3090": 8,
     "H800": 0,
     "RTX 5090": 0,
-    "RTX 4090": 8,
     "RTX 4000 Ada Generation": 0,
     "RTX 6000 Ada Generation": 0,
     "RTX PRO 6000": 0,
     "L4": 0,
     "L40S": 0,
     "RTX 2000 Ada Generation": 0,
-    "A100": 8,
-    "RTX A6000": 8,
     "RTX A5000": 0,
     "RTX A4500": 0,
     "RTX A4000": 0,
     "A40": 0,
     "A30": 0,
-    "RTX 3090": 8,
 }
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
@@ -46,8 +55,20 @@ MAX_UNRENTED_GPUS_BY_TYPE = {
 # Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
 # Resolution order: specific GPU name > "*"; specific count > "*".
 D = DEFAULT_PRICE
-GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | str]] = {
+D12 = DefaultPrice(1.2)
+GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
     "*": {"*": 0, "1": D, "8": D},
+    # B200
+    "NVIDIA B200": {"*": 0, "1": D12, "8": D12},
+    # H100
+    "NVIDIA H100 80GB HBM3": {"*": 0, "1": D12, "8": D12},
+    "NVIDIA H100 NVL": {"*": 0, "1": D12, "8": D12},
+    "NVIDIA H100 PCIe": {"*": 0, "1": D12, "8": D12},
+    # A100
+    "NVIDIA A100 80GB PCIe": {"*": 0, "1": D12, "8": D12},
+    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": D12, "8": D12},
+    # RTX A6000
+    "NVIDIA RTX A6000": {"*": 0, "1": D12, "8": D12},
 }
 
 
@@ -117,7 +138,7 @@ class IncentiveConfig(BaseModel):
         description="Default rental prices per GPU type in USD/hour"
     )
 
-    gpu_count_custom_prices: dict[str, dict[str, float | str]] = Field(
+    gpu_count_custom_prices: dict[str, dict[str, float | DefaultPrice]] = Field(
         default=GPU_COUNT_CUSTOM_PRICES,
         description="Per-(gpu_model, gpu_count) hourly prices. Use DEFAULT_PRICE for MACHINE_PRICES fallback."
     )
