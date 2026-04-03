@@ -125,10 +125,14 @@ class DefaultIncentive(BaseIncentive):
         job_result.mining_score = job_result.score * job_result.gpu_portion * job_result.gpu_count / job_result.total_gpu_count
 
         # Sysbox runtime multiplier
+        is_rented_after_cutoff = (
+            job_result.is_rented
+            and job_result.rental_created_at
+            and job_result.rental_created_at >= settings.SYSBOX_RENTED_CUTOFF
+        )
         if job_result.sysbox_runtime:
             job_result.sysbox_multiplier = 1
         else:
-            is_rented_after_cutoff = False
             portion = settings.PORTION_FOR_SYSBOX_RENTED if is_rented_after_cutoff else settings.PORTION_FOR_SYSBOX
             job_result.sysbox_multiplier = 1 - portion
 
@@ -158,6 +162,8 @@ class DefaultIncentive(BaseIncentive):
                     "mining_score": job_result.mining_score,
                     "gpu_portion": job_result.gpu_portion,
                     "total_gpu_count": job_result.total_gpu_count,
+                    "rental_created": job_result.rental_created_at,
+                    "is_rented_after_cutoff": is_rented_after_cutoff,
                 }),
             ).to_full_string()
         )
