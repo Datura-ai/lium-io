@@ -54,8 +54,7 @@ async def test_port_count_insufficient_passes_when_rented(context_factory):
                 miner_hotkey="test-miner",
                 executor_ip_address="127.0.0.1",
                 executor_ip_port="22",
-                pods=[RentedPod(pod_id="pod-1", container_name="container_test")],
-                rented_ports=[8080, 8081],
+                pods=[RentedPod(pod_id="pod-1", container_name="container_test", rented_ports=[8080, 8081])],
             )
         },
     )

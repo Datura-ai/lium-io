@@ -35,7 +35,10 @@ class RentedExecutor(BaseModel):
     executor_ip_port: str
     pods: list[RentedPod]
     owner_flag: bool = False
-    rented_ports: list[int] = []
+
+    def get_rented_ports(self) -> list[int]:
+        """Aggregate rented ports from all pods."""
+        return sorted(port for pod in self.pods for port in pod.rented_ports)
 
 
 class RentedMachine(BaseModel):
