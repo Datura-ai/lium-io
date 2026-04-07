@@ -13,6 +13,7 @@ from .port_connectivity import PortConnectivityCheck
 from .port_count import PortCountCheck
 from .rented_machine import TenantEnforcementCheck
 from .rental_verification import RentalVerificationCheck
+from .tdx_host import TdxHostCheck
 from .score import ScoreCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
 from .spec_change import SpecChangeCheck
@@ -34,6 +35,7 @@ __all__ = [
     "PortConnectivityCheck",
     "PortCountCheck",
     "RentalVerificationCheck",
+    "TdxHostCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
     "StartGPUMonitorCheck",

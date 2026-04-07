@@ -502,6 +502,23 @@ class VerifyXMessages:
     )
 
 
+class TdxHostMessages:
+    TDX_SUPPORTED = MessageTemplate(
+        event="Intel TDX CPU capability detected",
+        reason="TDX_HOST_SUPPORTED",
+        severity="info",
+        category="env",
+        impact="CPU silicon supports Intel TDX workloads",
+    )
+    TDX_NOT_SUPPORTED = MessageTemplate(
+        event="Intel TDX CPU capability not detected",
+        reason="TDX_HOST_NOT_SUPPORTED",
+        severity="info",
+        category="env",
+        impact="CPU does not support TDX; tdx_host_supported=False recorded in spec",
+    )
+
+
 class CapabilityMessages:
     NO_SPECS = MessageTemplate(
         event="GPU capability verification skipped (no specs)",
