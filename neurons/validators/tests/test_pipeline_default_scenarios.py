@@ -530,7 +530,6 @@ async def test_successful_rented_pipeline_flow(context_factory):
                     )
                 ],
                 owner_flag=False,
-                rented_ports=[],
             )
         },
         banned_guids=[],
