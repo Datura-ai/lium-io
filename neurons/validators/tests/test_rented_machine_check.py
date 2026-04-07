@@ -48,7 +48,6 @@ def convert_rented_machine_to_rented_data(
                 executor_ip_port="8080",
                 pods=pods,
                 owner_flag=rented_machine.get("owner_flag", False),
-                rented_ports=[],
             )
         },
         banned_guids=[],
@@ -82,7 +81,6 @@ def build_rented_data(
         executor_ip_port="22",
         pods=pods,
         owner_flag=rented_machine.get("owner_flag", False),
-        rented_ports=[],
     )
 
     return RentedExecutorsResponse(
