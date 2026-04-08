@@ -372,22 +372,8 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.mining_score = 0
             return job_result
 
-        # Rented path: use parent's default scoring logic, then apply CVM bonus if attested
-        job_result = await super().calculate_executor_score(job_result)
-        if job_result.tdx_attestation_passed and job_result.mining_score:
-            job_result.mining_score *= self.config.cvm_mining_multiplier
-            job_result.cvm_multiplier = self.config.cvm_mining_multiplier
-            job_result.incentive_logs.append(
-                _m(
-                    "CVM mining multiplier applied",
-                    extra={
-                        "executor_id": str(job_result.executor_info.uuid),
-                        "cvm_mining_multiplier": self.config.cvm_mining_multiplier,
-                        "mining_score_after": job_result.mining_score,
-                    },
-                ).to_full_string()
-            )
-        return job_result
+        # Rented path: use parent's default scoring logic (includes CVM multiplier)
+        return await super().calculate_executor_score(job_result)
 
     async def estimate_executor(
         self,

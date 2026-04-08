@@ -149,10 +149,16 @@ class DefaultIncentive(BaseIncentive):
         else:
             job_result.uptime_multiplier = 1
 
-        # Apply multiplier
+        # Apply sysbox and uptime multipliers
         job_result.mining_score *= job_result.sysbox_multiplier * job_result.uptime_multiplier
+
+        # CVM multiplier: bonus for TDX-attested executors
+        if job_result.tdx_attestation_passed and job_result.mining_score:
+            job_result.cvm_multiplier = self.config.cvm_mining_multiplier
+            job_result.mining_score *= job_result.cvm_multiplier
+
         log = _m(
-            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier",
+            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier * cvm_multiplier",
             extra=get_extra_info(
                 {
                     "executor_id": str(job_result.executor_info.uuid),
@@ -160,6 +166,7 @@ class DefaultIncentive(BaseIncentive):
                     "gpu_count": job_result.gpu_count,
                     "sysbox_multiplier": job_result.sysbox_multiplier,
                     "uptime_multiplier": job_result.uptime_multiplier,
+                    "cvm_multiplier": job_result.cvm_multiplier,
                     "mining_score": job_result.mining_score,
                     "gpu_portion": job_result.gpu_portion,
                     "total_gpu_count": job_result.total_gpu_count,
