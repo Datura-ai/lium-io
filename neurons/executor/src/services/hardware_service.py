@@ -187,7 +187,8 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
 
         cpu_usage_percent = 0.0
         if system_delta > 0 and cpu_delta > 0:
-            cpu_usage_percent = (cpu_delta / system_delta) * cpu_count * 100.0
+            # Calculate CPU percentage normalized to 0-100% regardless of core count
+            cpu_usage_percent = (cpu_delta / system_delta) * 100.0
 
         # Get CPU limit (from container spec)
         cpu_limit = cpu_count  # Default to all CPUs
