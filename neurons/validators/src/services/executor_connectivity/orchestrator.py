@@ -64,6 +64,10 @@ class ConnectivityOrchestrator:
             host=executor_info.address,
             container_name_prefix=f"container_{miner_hotkey}",
             sysbox_runtime=sysbox_runtime,
+            log_ctx={
+                "executor_uuid": executor_info.uuid,
+                "executor_ip": executor_info.address,
+            },
         )
 
         if dind_result.success:
