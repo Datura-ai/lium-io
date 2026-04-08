@@ -2,6 +2,7 @@ import logging
 import time
 
 import asyncssh
+from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.models import PortVerificationResult
@@ -42,13 +43,30 @@ class ExecutorConnectivityService:
                 sysbox_runtime=sysbox_runtime,
                 rented_ports=rented_ports,
             )
+            sysbox_result = verification.sysbox_runtime
+            if not sysbox_result and rented_ports and sysbox_runtime:
+                logger.info(
+                    _m(
+                        "Sysbox runtime fallback: using known value for rented executor",
+                        extra=get_extra_info({
+                            "executor_uuid": executor_info.uuid,
+                            "executor_ip": executor_info.address,
+                            "miner_hotkey": miner_hotkey,
+                            "rented_ports": rented_ports,
+                            "verification_sysbox": verification.sysbox_runtime,
+                            "fallback_sysbox": sysbox_runtime,
+                        }),
+                    )
+                )
+                sysbox_result = sysbox_runtime
+
             result = PortVerificationResult(
                 selected_ports=verification.selected_ports,
                 successful_ports=verification.successful_ports,
                 failed_ports=verification.failed_ports,
                 dind_port=verification.dind_port,
                 dind_ok=verification.dind_ok,
-                sysbox_runtime=verification.sysbox_runtime,
+                sysbox_runtime=sysbox_result,
                 status=verification.status,
                 error=verification.error,
                 elapsed_sec=time.monotonic() - t1,

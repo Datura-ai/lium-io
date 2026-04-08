@@ -5,6 +5,7 @@ import asyncssh
 from asyncssh import SSHClientConnection
 
 from core.docker_utils import DockerCommand
+from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import DindProbeResult, PortPair
 from services.ssh_service import SSHService
 
@@ -25,12 +26,14 @@ class DindVerifier:
         host: str,
         container_name_prefix: str,
         sysbox: bool,
+        log_ctx: dict | None = None,
     ) -> DindProbeResult:
         """Verify DinD on port."""
         name = f"{container_name_prefix}_{port.external}"
+        log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
 
         try:
-            logger.info("dind: start port=%s", port.internal)
+            logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
 
             private_key, public_key = self.ssh_service.generate_keypair()
             cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
@@ -39,7 +42,7 @@ class DindVerifier:
             result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                logger.error("dind creation failed: %s port=%s", error_msg, port.internal)
+                logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
                 await ssh_client.run(DockerCommand.remove(name))
                 return DindProbeResult(
                     success=False,
@@ -48,7 +51,7 @@ class DindVerifier:
                     port=port,
                 )
 
-            logger.info("dind: docker created")
+            logger.info(_m("DinD container created", extra=get_extra_info(log_ctx)))
             await asyncio.sleep(5)
 
             # Test SSH
@@ -56,20 +59,23 @@ class DindVerifier:
             async with asyncssh.connect(
                 host=host, port=port.external, username="root", client_keys=[pkey], known_hosts=None
             ) as ssh:
-                logger.info("dind: ssh connected")
+                logger.info(_m("DinD SSH connected", extra=get_extra_info(log_ctx)))
 
                 # Test sysbox
                 if sysbox:
                     result = await ssh.run("docker pull hello-world")
                     sysbox_ok = result.exit_status == 0
-                    logger.info("dind: sysbox %s", "ok" if sysbox_ok else "fail")
                     if not sysbox_ok:
                         error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                        logger.debug("sysbox failed: %s", error_msg)
+                        logger.warning(
+                            _m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
+                        )
                         sysbox = False
+                    else:
+                        logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
 
             await ssh_client.run(DockerCommand.remove(name))
-            logger.info("dind: check ok port=%s", port.internal)
+            logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
             return DindProbeResult(
                 success=True,
@@ -79,7 +85,10 @@ class DindVerifier:
             )
 
         except Exception as e:
-            logger.error("dind failed: %s port=%s", str(e), port.internal, exc_info=True)
+            logger.error(
+                _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
+                exc_info=True,
+            )
             await ssh_client.run(DockerCommand.remove(name))
             return DindProbeResult(
                 success=False,
@@ -103,6 +112,7 @@ class DindProbe:
         host: str,
         container_name_prefix: str,
         sysbox_runtime: bool,
+        log_ctx: dict | None = None,
     ) -> DindProbeResult:
         return await self.verifier.verify(
             port,
@@ -110,4 +120,5 @@ class DindProbe:
             host=host,
             container_name_prefix=container_name_prefix,
             sysbox=sysbox_runtime,
+            log_ctx=log_ctx,
         )
