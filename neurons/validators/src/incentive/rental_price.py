@@ -70,6 +70,7 @@ class ExecutorEstimateParams(BaseModel):
     gpu_splitting_min_count: int | None = None
     sysbox_runtime: bool = True
     collateral_deposited: bool = True
+    tdx_attestation_passed: bool = False
 
 
 # ── Estimate model ────────────────────────────────────────────────────────────
@@ -136,9 +137,10 @@ class RentalPriceIncentive(DefaultIncentive):
         # Store the snapshot so estimation can derive per-model totals from it.
         self._seed_snapshot = snapshot
 
-        # validate configs
+        # validate configs — allow "<base> CVM" variants alongside plain base model names
         for base_model in self.config.rental_incentive_gpu_types:
-            assert base_model in BASE_GPU_MAP.values(), f"Base model {base_model} not found in BASE_GPU_MAP"
+            plain = base_model.removesuffix(" CVM")
+            assert plain in BASE_GPU_MAP.values(), f"Base model {base_model} not found in BASE_GPU_MAP"
 
         for gpu_type in self.config.rental_prices_per_hour.keys():
             assert gpu_type in BASE_GPU_MAP.keys(), f"GPU type {gpu_type} not found in BASE_GPU_MAP"
@@ -154,6 +156,20 @@ class RentalPriceIncentive(DefaultIncentive):
         base_model = BASE_GPU_MAP[gpu_model]
         return base_model
 
+    def get_effective_base_model(self, gpu_model: str, tdx_attestation_passed: bool) -> str:
+        """Return the bucket key for this executor.
+
+        For TDX-attested executors, returns '<base> CVM' if that variant has a
+        non-zero cap configured, providing an independent pool. Falls back to the
+        plain base model for non-attested executors or unconfigured CVM types.
+        """
+        base = BASE_GPU_MAP[gpu_model]
+        if tdx_attestation_passed:
+            cvm_key = f"{base} CVM"
+            if self.config.max_unrented_gpus.get(cvm_key, 0) > 0:
+                return cvm_key
+        return base
+
     async def _pre_process_job_result(self, hotkey: str, result: JobResult):
         """Process a job result.
         Aggregate metrics from job result.
@@ -165,8 +181,8 @@ class RentalPriceIncentive(DefaultIncentive):
 
         await super()._pre_process_job_result(hotkey, result)
 
-        # Check if GPU is eligible
-        base_model = self.get_base_model_for_gpu(result.gpu_model)
+        # Check if GPU is eligible — CVM executors may map to a separate "<base> CVM" bucket
+        base_model = self.get_effective_base_model(result.gpu_model, result.tdx_attestation_passed)
         if base_model not in self.config.rental_incentive_gpu_types:
             return
 
@@ -184,6 +200,10 @@ class RentalPriceIncentive(DefaultIncentive):
                     self.config.gpu_count_custom_prices, self.config.rental_prices_per_hour,
                 )
                 result.hourly_rate = max(result.hourly_rate, rate_for_min)
+
+            # CVM rate premium: applied before accumulation so it's baked into weighted_rate_sum
+            if result.tdx_attestation_passed and base_model.endswith(" CVM"):
+                result.hourly_rate *= self.config.cvm_rate_multiplier
 
             # Sysbox penalty: applied later via effective_rate, not baked into hourly_rate
             result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
@@ -259,8 +279,8 @@ class RentalPriceIncentive(DefaultIncentive):
         if not result.eligible_for_rental_share:
             return await super()._post_process_job_result(hotkey, result) # use default incentive logic.
 
-        # state updates
-        base_model = self.get_base_model_for_gpu(result.gpu_model)
+        # state updates — use effective base model so CVM executors look up their own bucket
+        base_model = self.get_effective_base_model(result.gpu_model, result.tdx_attestation_passed)
         result.total_unrented_by_gpu_type = self.unrented_count_by_type.get(base_model, 0)
         result.cap_dilution_applied = result.total_unrented_by_gpu_type > result.max_cap
         result.rental_share = self.rental_share
@@ -322,8 +342,8 @@ class RentalPriceIncentive(DefaultIncentive):
         Returns:
             Calculated score (0 for unrented eligible GPUs, normal score otherwise)
         """
-        # Check if GPU is unrented and eligible (has defined cap in max_unrented_gpus)
-        base_model = self.get_base_model_for_gpu(job_result.gpu_model)
+        # Check if GPU is unrented and eligible — CVM executors may route to "<base> CVM" bucket
+        base_model = self.get_effective_base_model(job_result.gpu_model, job_result.tdx_attestation_passed)
         job_result.eligible_for_rental_share = (
             not job_result.is_rented
             and (base_model in self.config.rental_incentive_gpu_types)
@@ -340,6 +360,8 @@ class RentalPriceIncentive(DefaultIncentive):
                         "reason": "unrented_and_eligible",
                         "score": 0,
                         "pool": "rental_only",
+                        "tdx_attestation_passed": job_result.tdx_attestation_passed,
+                        "effective_base_model": base_model,
                     },
                 )
             )
@@ -350,8 +372,22 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.mining_score = 0
             return job_result
 
-        # For rented or non-eligible GPUs, use parent's default scoring logic
-        return await super().calculate_executor_score(job_result)
+        # Rented path: use parent's default scoring logic, then apply CVM bonus if attested
+        job_result = await super().calculate_executor_score(job_result)
+        if job_result.tdx_attestation_passed and job_result.mining_score:
+            job_result.mining_score *= self.config.cvm_mining_multiplier
+            job_result.cvm_multiplier = self.config.cvm_mining_multiplier
+            job_result.incentive_logs.append(
+                _m(
+                    "CVM mining multiplier applied",
+                    extra={
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "cvm_mining_multiplier": self.config.cvm_mining_multiplier,
+                        "mining_score_after": job_result.mining_score,
+                    },
+                ).to_full_string()
+            )
+        return job_result
 
     async def estimate_executor(
         self,
@@ -375,9 +411,10 @@ class RentalPriceIncentive(DefaultIncentive):
         is_rented = params.is_rented
 
         base_model = BASE_GPU_MAP.get(gpu_model)
+        effective_base = self.get_effective_base_model(gpu_model, params.tdx_attestation_passed) if base_model else None
         eligible_for_unrented_estimate = (
-            base_model is not None
-            and self.config.max_unrented_gpus.get(base_model, 0) > 0
+            effective_base is not None
+            and self.config.max_unrented_gpus.get(effective_base, 0) > 0
         )
         if base_model is None or (not is_rented and not eligible_for_unrented_estimate):
             return RentalPriceEstimate(
@@ -418,6 +455,7 @@ class RentalPriceIncentive(DefaultIncentive):
             gpu_splitting_min_count=params.gpu_splitting_min_count,
             collateral_deposited=params.collateral_deposited,
             sysbox_runtime=params.sysbox_runtime,
+            tdx_attestation_passed=params.tdx_attestation_passed,
         )
 
         await self._pre_process_job_result("estimate", fake_result)

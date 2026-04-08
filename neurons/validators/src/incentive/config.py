@@ -26,6 +26,8 @@ DEFAULT_PRICE = DefaultPrice()
 # High-end GPUs have lower caps (12-24) due to scarcity and high value
 # Mid-tier GPUs have moderate caps (24-48) for balanced incentives
 # Lower-tier GPUs have higher caps (48-96) to accommodate larger deployments
+# CVM variants ("<base> CVM") are separate buckets for TDX-attested executors;
+# they never share cap dilution with their non-CVM counterparts.
 MAX_UNRENTED_GPUS_BY_TYPE = {
     "B300": 0,
     "B200": 8,
@@ -48,6 +50,13 @@ MAX_UNRENTED_GPUS_BY_TYPE = {
     "RTX A4000": 0,
     "A40": 0,
     "A30": 0,
+    # CVM (TDX-attested) variants — independent caps, separate from plain GPU types
+    "H200 CVM": 8,
+    "H100 CVM": 8,
+    "A100 CVM": 8,
+    "RTX 4090 CVM": 8,
+    "RTX A6000 CVM": 8,
+    "RTX 3090 CVM": 8,
 }
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
@@ -142,6 +151,24 @@ class IncentiveConfig(BaseModel):
         default=GPU_COUNT_CUSTOM_PRICES,
         description="Per-(gpu_model, gpu_count) hourly prices. Use DEFAULT_PRICE for MACHINE_PRICES fallback."
     )
+
+    cvm_rate_multiplier: float = Field(
+        default=1.5,
+        description="Rate multiplier applied to unrented CVM (TDX-attested) executor hourly_rate (e.g. 1.5 = +50%)"
+    )
+
+    cvm_mining_multiplier: float = Field(
+        default=1.3,
+        description="Mining score multiplier for rented CVM (TDX-attested) executors (e.g. 1.3 = +30%)"
+    )
+
+    @field_validator("cvm_rate_multiplier", "cvm_mining_multiplier")
+    @classmethod
+    def validate_cvm_multipliers(cls, v: float) -> float:
+        """Validate that CVM multipliers are >= 1.0 (bonus, not penalty)."""
+        if v < 1.0:
+            raise ValueError(f"CVM multipliers must be >= 1.0, got: {v}")
+        return v
 
     @field_validator("algorithm")
     @classmethod

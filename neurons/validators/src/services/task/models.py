@@ -30,6 +30,9 @@ class JobResult(BaseModel):
     tee_type: str | None = None
     tdx_attestation_passed: bool = False
 
+    # CVM incentive tracking
+    cvm_multiplier: float | None = None   # Set when a CVM bonus multiplier is applied
+
     # Incentive relevant fields 
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic

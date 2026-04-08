@@ -2287,3 +2287,306 @@ async def test_sync_logs_successful_gpu_estimate_precompute(
     assert len(success_logs) == 1
     assert success_logs[0].extra["duration_ms"] == 500.0
     assert success_logs[0].extra["gpu_models_count"] == 1
+
+
+# ── CVM (TDX-attested) incentive tests ───────────────────────────────────────
+
+CVM_RATE_MULTIPLIER = 1.5
+CVM_MINING_MULTIPLIER = 1.3
+
+# Config with CVM variants enabled alongside regular GPU types
+MAX_UNRENTED_GPUS_CVM = {
+    **MAX_UNRENTED_GPUS_BY_TYPE,
+    "H100 CVM": 8,
+    "H200 CVM": 8,
+}
+
+
+@pytest.fixture
+def rental_price_config_cvm(rental_price_config):
+    """IncentiveConfig with CVM variants enabled."""
+    return IncentiveConfig(
+        algorithm=ALGORITHM,
+        rental_incentive_gpu_types=[
+            gpu_type for gpu_type, cap in MAX_UNRENTED_GPUS_CVM.items() if cap > 0
+        ],
+        max_unrented_gpus=MAX_UNRENTED_GPUS_CVM,
+        rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
+        cvm_rate_multiplier=CVM_RATE_MULTIPLIER,
+        cvm_mining_multiplier=CVM_MINING_MULTIPLIER,
+    )
+
+
+@pytest.fixture
+def validator_with_cvm(
+    validator_with_mocks,
+    incentive_redis_service,
+    rental_price_config_cvm,
+    price_provider_holder,
+    monkeypatch,
+):
+    original_create = IncentiveFactory.create
+
+    def create_with_price_provider(*args, **kwargs):
+        incentive = original_create(*args, **kwargs)
+        if hasattr(incentive, "price_provider"):
+            incentive.price_provider = price_provider_holder["provider"]
+        return incentive
+
+    monkeypatch.setattr(IncentiveFactory, "create", create_with_price_provider)
+    monkeypatch.setattr(settings, "incentive", rental_price_config_cvm)
+    monkeypatch.setattr(rental_price_module, "BASE_GPU_MAP", BASE_GPU_MAP)
+    validator_with_mocks.incentive = rental_price_config_cvm
+    return validator_with_mocks
+
+
+def _cvm_job(create_job_result, *, executor_id: str, gpu_model: str, gpu_count: int,
+             is_rented: bool, tdx_attestation_passed: bool = False, **kwargs):
+    result = create_job_result(executor_id=executor_id, gpu_model=gpu_model, gpu_count=gpu_count, **kwargs)
+    result.is_rented = is_rented
+    result.tdx_attestation_passed = tdx_attestation_passed
+    return result
+
+
+@pytest.mark.asyncio
+async def test_cvm_unrented_uses_separate_bucket(
+    validator_with_cvm,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """CVM unrented executor routes to '<base> CVM' bucket, not plain base bucket."""
+    validator = validator_with_cvm
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_cvm"),
+        create_neuron_info(uid=3, hotkey="miner_plain"),
+    ]
+
+    # Both miners have unrented H100 GPUs within the cap (8 GPUs), but one is CVM
+    all_job_results = {
+        "miner_cvm": [
+            _cvm_job(create_job_result, executor_id="exec-cvm", gpu_model="H100", gpu_count=8,
+                     is_rented=False, tdx_attestation_passed=True),
+        ],
+        "miner_plain": [
+            _cvm_job(create_job_result, executor_id="exec-plain", gpu_model="H100", gpu_count=8,
+                     is_rented=False, tdx_attestation_passed=False),
+        ],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data([]))
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Both miners should earn rental share (each within their own cap)
+    assert validator.miner_scores.get("miner_cvm", 0) > 0, "CVM miner should earn rental share"
+    assert validator.miner_scores.get("miner_plain", 0) > 0, "Plain miner should earn rental share"
+
+    # CVM miner earns more due to cvm_rate_multiplier applied to hourly_rate
+    # Effective rate for CVM: H100_HOURLY_RATE * CVM_RATE_MULTIPLIER * cap_mult
+    # Effective rate for plain: H100_HOURLY_RATE * cap_mult
+    assert validator.miner_scores["miner_cvm"] > validator.miner_scores["miner_plain"], (
+        "CVM miner should earn more than plain miner due to cvm_rate_multiplier"
+    )
+    # Ratio should equal CVM_RATE_MULTIPLIER since both have equal GPU counts and are within cap
+    ratio = validator.miner_scores["miner_cvm"] / validator.miner_scores["miner_plain"]
+    assert ratio == pytest.approx(CVM_RATE_MULTIPLIER, rel=0.01)
+
+
+@pytest.mark.asyncio
+async def test_cvm_caps_are_independent_from_plain(
+    validator_with_mocks,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    price_provider_holder,
+    monkeypatch,
+):
+    """CVM and plain GPU-type caps dilute independently — CVM is not penalized by non-CVM abundance.
+
+    Scenario: plain H100 pool is over cap (100 GPUs, cap=8) → heavy dilution.
+              CVM H100 pool is exactly at cap (8 GPUs, cap=8) → no dilution.
+    If they shared a bucket, the CVM executor would also be diluted. Because they're separate,
+    CVM still gets full (undiluted) rate.
+    """
+    # Use a config where the plain H100 cap is small (8) so over-cap dilution is visible
+    small_cap_max = {
+        "H100": 8,
+        "H100 CVM": 8,
+        "H200": 8,
+        "A100": 0,
+    }
+    cvm_config = IncentiveConfig(
+        algorithm=ALGORITHM,
+        rental_incentive_gpu_types=[k for k, v in small_cap_max.items() if v > 0],
+        max_unrented_gpus=small_cap_max,
+        rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
+        gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
+        cvm_rate_multiplier=CVM_RATE_MULTIPLIER,
+        cvm_mining_multiplier=CVM_MINING_MULTIPLIER,
+    )
+
+    original_create = IncentiveFactory.create
+
+    def create_with_price_provider(*args, **kwargs):
+        incentive = original_create(*args, **kwargs)
+        if hasattr(incentive, "price_provider"):
+            incentive.price_provider = price_provider_holder["provider"]
+        return incentive
+
+    monkeypatch.setattr(IncentiveFactory, "create", create_with_price_provider)
+    monkeypatch.setattr(settings, "incentive", cvm_config)
+    monkeypatch.setattr(rental_price_module, "BASE_GPU_MAP", BASE_GPU_MAP)
+    validator = validator_with_mocks
+    validator.incentive = cvm_config
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_cvm"),
+        create_neuron_info(uid=3, hotkey="miner_plain"),
+    ]
+
+    # Plain H100: 100 GPUs, cap=8 → diluted (cap_multiplier=8/100=0.08)
+    # CVM H100:   8 GPUs,  cap=8 → no dilution (cap_multiplier=1.0)
+    PLAIN_GPU_COUNT = 100
+    CVM_GPU_COUNT = 8
+    PLAIN_CAP = 8
+
+    all_job_results = {
+        "miner_cvm": [
+            _cvm_job(create_job_result, executor_id="exec-cvm", gpu_model="H100", gpu_count=CVM_GPU_COUNT,
+                     is_rented=False, tdx_attestation_passed=True),
+        ],
+        "miner_plain": [
+            _cvm_job(create_job_result, executor_id="exec-plain", gpu_model="H100", gpu_count=PLAIN_GPU_COUNT,
+                     is_rented=False, tdx_attestation_passed=False),
+        ],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data([]))
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    cvm_score = validator.miner_scores.get("miner_cvm", 0)
+    plain_score = validator.miner_scores.get("miner_plain", 0)
+
+    assert cvm_score > 0
+    assert plain_score > 0
+
+    # CVM: 8 GPUs * H100_rate * 1.5 (CVM mult) * 1.0 (no dilution) = 8 * 3.5 * 1.5 = 42
+    # Plain: 100 GPUs * H100_rate * (8/100) (diluted to cap) = 100 * 3.5 * 0.08 = 28
+    # total = 70; CVM fraction = 42/70 = 0.6; Plain fraction = 28/70 = 0.4
+    cvm_effective = CVM_GPU_COUNT * H100_HOURLY_RATE * CVM_RATE_MULTIPLIER * 1.0
+    plain_effective = PLAIN_GPU_COUNT * H100_HOURLY_RATE * (PLAIN_CAP / PLAIN_GPU_COUNT)
+    expected_cvm_fraction = cvm_effective / (cvm_effective + plain_effective)
+
+    total_rental_score = cvm_score + plain_score
+    actual_cvm_fraction = cvm_score / total_rental_score
+    assert actual_cvm_fraction == pytest.approx(expected_cvm_fraction, rel=0.01)
+
+
+@pytest.mark.asyncio
+async def test_cvm_rented_gets_mining_multiplier(
+    validator_with_cvm,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """Rented CVM executor's mining score is multiplied by cvm_mining_multiplier."""
+    validator = validator_with_cvm
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_cvm"),
+        create_neuron_info(uid=3, hotkey="miner_plain"),
+    ]
+
+    # Both have same GPU count and GPU model, rented; only CVM miner has TDX attestation
+    all_job_results = {
+        "miner_cvm": [
+            _cvm_job(create_job_result, executor_id="exec-cvm", gpu_model="H100", gpu_count=1,
+                     is_rented=True, tdx_attestation_passed=True),
+        ],
+        "miner_plain": [
+            _cvm_job(create_job_result, executor_id="exec-plain", gpu_model="H100", gpu_count=1,
+                     is_rented=True, tdx_attestation_passed=False),
+        ],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(["exec-cvm", "exec-plain"])
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    cvm_score = validator.miner_scores.get("miner_cvm", 0)
+    plain_score = validator.miner_scores.get("miner_plain", 0)
+
+    assert cvm_score > 0
+    assert plain_score > 0
+    # CVM gets cvm_mining_multiplier applied to its mining_score, so its final weight is proportionally higher
+    # mining_score_cvm = base * CVM_MINING_MULTIPLIER
+    # mining_score_plain = base
+    # total = base * (1 + CVM_MINING_MULTIPLIER)
+    # incentive_cvm / incentive_plain = CVM_MINING_MULTIPLIER
+    ratio = cvm_score / plain_score
+    assert ratio == pytest.approx(CVM_MINING_MULTIPLIER, rel=0.01)
+
+
+@pytest.mark.asyncio
+async def test_cvm_falls_back_to_plain_when_no_cvm_cap_configured(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """CVM executor with GPU type that has no CVM variant configured falls back to plain bucket."""
+    validator = validator_with_rental_price  # config has NO CVM variants
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_cvm"),
+        create_neuron_info(uid=3, hotkey="miner_plain"),
+    ]
+
+    # Both unrented H100; CVM flag is set but no "H100 CVM" in config → falls back to "H100"
+    all_job_results = {
+        "miner_cvm": [
+            _cvm_job(create_job_result, executor_id="exec-cvm", gpu_model="H100", gpu_count=1,
+                     is_rented=False, tdx_attestation_passed=True),
+        ],
+        "miner_plain": [
+            _cvm_job(create_job_result, executor_id="exec-plain", gpu_model="H100", gpu_count=1,
+                     is_rented=False, tdx_attestation_passed=False),
+        ],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data([]))
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Both compete in the same "H100" bucket, same rate → equal scores
+    cvm_score = validator.miner_scores.get("miner_cvm", 0)
+    plain_score = validator.miner_scores.get("miner_plain", 0)
+
+    assert cvm_score > 0
+    assert plain_score > 0
+    assert cvm_score == pytest.approx(plain_score, rel=0.001)
