@@ -468,3 +468,4 @@ class GetEstimateRequest(BaseModel):
     gpu_splitting_min_count: int | None = None
     sysbox_runtime: bool = True
     collateral_deposited: bool = True
+    tdx_attestation_passed: bool = False

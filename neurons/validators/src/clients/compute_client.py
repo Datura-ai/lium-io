@@ -666,6 +666,7 @@ class ComputeClient:
                 gpu_splitting_min_count=req.gpu_splitting_min_count,
                 sysbox_runtime=req.sysbox_runtime,
                 collateral_deposited=req.collateral_deposited,
+                tdx_attestation_passed=req.tdx_attestation_passed,
             ),
         )
         async with self.lock:
