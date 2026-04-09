@@ -43,7 +43,7 @@ class ContainerCleanup:
 
             # Get currently rented containers for this executor
             rented_containers = self._get_rented_containers(rented_data, executor_uuid)
-            extra["rented_containers"] = sorted(rented_containers)
+            extra["rented_containers"] = str(rented_containers)
 
             # Check each container
             for container_name in all_containers:
