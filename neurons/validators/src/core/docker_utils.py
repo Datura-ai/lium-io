@@ -33,7 +33,7 @@ class DockerCommand:
     @staticmethod
     def remove(name: str) -> str:
         """Build docker rm command."""
-        return f"/usr/bin/docker rm -f {name} 2>/dev/null || true"
+        return f"/usr/bin/docker rm -f {name}"
 
     @staticmethod
     def ps_filter(*name_patterns: str) -> str:

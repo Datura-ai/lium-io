@@ -12,8 +12,9 @@ logger = logging.getLogger(__name__)
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
 
-    def __init__(self, stale_threshold_minutes: int = 15):
+    def __init__(self, stale_threshold_minutes: int = 15, dry_run: bool = True):
         self.stale_threshold_minutes = stale_threshold_minutes
+        self.dry_run = dry_run
 
     async def cleanup(
         self,
@@ -42,23 +43,38 @@ class ContainerCleanup:
 
             # Get currently rented containers for this executor
             rented_containers = self._get_rented_containers(rented_data, executor_uuid)
-            extra["rented_containers"] = len(rented_containers)
+            extra["rented_containers"] = sorted(rented_containers)
 
             # Check each container
             for container_name in all_containers:
-                if container_name in rented_containers:
+                stripped_name = container_name.strip()
+                if stripped_name in rented_containers:
                     continue
 
-                age_minutes = await self._get_container_age_minutes(ssh_client, container_name)
+                age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
                 if age_minutes and age_minutes > self.stale_threshold_minutes:
-                    if await self._remove_container(ssh_client, container_name):
-                        removed_names.append(container_name)
+                    if self.dry_run:
                         logger.info(
                             _m(
-                                f"Removed stale container {container_name}",
+                                f"[DRY RUN] Would remove stale container {stripped_name}",
                                 extra={
                                     **extra,
-                                    "container_name": container_name,
+                                    "container_name": stripped_name,
+                                    "age_minutes": round(age_minutes, 1),
+                                    "dry_run": True,
+                                }
+                            )
+                        )
+                        continue
+
+                    if await self._remove_container(ssh_client, stripped_name):
+                        removed_names.append(stripped_name)
+                        logger.info(
+                            _m(
+                                f"Removed stale container {stripped_name}",
+                                extra={
+                                    **extra,
+                                    "container_name": stripped_name,
                                     "age_minutes": round(age_minutes, 1),
                                 }
                             )
