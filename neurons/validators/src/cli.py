@@ -242,8 +242,16 @@ async def _debug_validator(count: int):
                     info = task_info.get(task, {})
                     miner_hotkey = info.get("miner_hotkey", "unknown")
                     task.cancel()
-
                     pendings.append({"miner_hotkey": miner_hotkey})
+                
+                # Wait for all cancelled tasks to complete with timeout to prevent resource leaks
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[sync] Some cancelled tasks did not complete within timeout")
 
             logger.info(_m("[sync] All Jobs finished", extra={
                 "success": success,
