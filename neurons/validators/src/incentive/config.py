@@ -51,12 +51,8 @@ MAX_UNRENTED_GPUS_BY_TYPE = {
     "A40": 0,
     "A30": 0,
     # CVM (TDX-attested) variants — independent caps, separate from plain GPU types
+    # Only H200 CVM is enabled for the unrented pool; all others are zeroed out.
     "H200 CVM": 8,
-    "H100 CVM": 8,
-    "A100 CVM": 8,
-    "RTX 4090 CVM": 8,
-    "RTX A6000 CVM": 8,
-    "RTX 3090 CVM": 8,
 }
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
