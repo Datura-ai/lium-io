@@ -50,12 +50,9 @@ RUN mkdir -p /etc/docker \
   && mkdir -p /etc/nvidia-container-runtime \
   && mkdir -p /root/.ssh
 
-ARG SSH_PUBLIC_KEY
-
 RUN useradd -m -s /bin/bash liumuser && \
     mkdir -p /home/liumuser/.ssh && \
-    echo "$SSH_PUBLIC_KEY" > /home/liumuser/.ssh/authorized_keys && \
-    chmod 700 /home/liumuser/.ssh && chmod 600 /home/liumuser/.ssh/authorized_keys && \
+    chmod 700 /home/liumuser/.ssh && \
     chown -R liumuser:liumuser /home/liumuser/.ssh
 
 RUN echo 'AcceptEnv CONTAINER_NAME' >>/etc/ssh/sshd_config && \

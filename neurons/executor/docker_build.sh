@@ -69,8 +69,7 @@ echo -e "${DIM}  Date    : $(date -u '+%Y-%m-%d %H:%M:%S UTC')${RESET}"
 log_step "Validating environment variables"
 
 missing=()
-[[ -z "${TAG:-}"            ]] && missing+=("TAG")
-[[ -z "${SSH_PUBLIC_KEY:-}" ]] && missing+=("SSH_PUBLIC_KEY")
+[[ -z "${TAG:-}" ]] && missing+=("TAG")
 
 if [[ ${#missing[@]} -gt 0 ]]; then
   log_error "The following required environment variables are not set:"
@@ -78,13 +77,12 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     echo -e "    ${RED}•  ${var}${RESET}" >&2
   done
   echo -e "\n${YELLOW}  Usage example:${RESET}"
-  echo -e "  ${DIM}TAG=latest SSH_PUBLIC_KEY=<key> [VALIDATOR_HOTKEY_SS58=<hotkey>] bash docker_build.sh${RESET}\n"
+  echo -e "  ${DIM}TAG=latest [VALIDATOR_HOTKEY_SS58=<hotkey>] bash docker_build.sh${RESET}\n"
   exit 1
 fi
 
 log_success "All required environment variables are set"
-log_kv "TAG:"            "${TAG}"
-log_kv "SSH_PUBLIC_KEY:" "${SSH_PUBLIC_KEY:0:40}..."
+log_kv "TAG:" "${TAG}"
 
 IMAGE_NAME="daturaai/compute-subnet-executor:${TAG}"
 
@@ -116,7 +114,6 @@ echo ""
 
 docker build \
   --build-context datura=../../datura \
-  --build-arg SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY}" \
   --tag "${IMAGE_NAME}" \
   "${SCRIPT_DIR}"
 
