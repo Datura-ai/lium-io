@@ -107,7 +107,7 @@ class PipelineFactory:
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
-        tdx_attesгtation_passed: bool = False,
+        tdx_attestation_passed: bool = False,
     ) -> Context:
         """Build the base validation context with all configuration.
 
