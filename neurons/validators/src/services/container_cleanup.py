@@ -2,7 +2,6 @@ import logging
 from typing import Optional
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from core.config import settings
 from core.docker_utils import DockerCommand
 from core.utils import _m
 from services.const import POD_CONTAINER_PREFIX
@@ -13,8 +12,9 @@ logger = logging.getLogger(__name__)
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
 
-    def __init__(self, stale_threshold_minutes: int = 15):
+    def __init__(self, stale_threshold_minutes: int = 15, dry_run: bool = False):
         self.stale_threshold_minutes = stale_threshold_minutes
+        self.dry_run = dry_run
 
     async def cleanup(
         self,
@@ -53,7 +53,7 @@ class ContainerCleanup:
 
                 age_minutes = await self._get_container_age_minutes(ssh_client, stripped_name)
                 if age_minutes and age_minutes > self.stale_threshold_minutes:
-                    if settings.DRY_RUN:
+                    if self.dry_run:
                         logger.info(
                             _m(
                                 f"[DRY RUN] Would remove stale container {stripped_name}",

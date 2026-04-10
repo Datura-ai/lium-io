@@ -170,7 +170,7 @@ class PipelineFactory:
                 shell=shell,
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
-                container_cleanup=ContainerCleanup(),
+                container_cleanup=self._build_container_cleanup(),
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,
@@ -196,6 +196,12 @@ class PipelineFactory:
             is_rental_succeed=is_rental_succeed,
             tdx_attestation_passed=tdx_attestation_passed,
         )
+
+    @staticmethod
+    def _build_container_cleanup() -> ContainerCleanup:
+        dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
+        logger.info(f"ContainerCleanup dry_run={dry_run}")
+        return ContainerCleanup(dry_run=dry_run)
 
     @staticmethod
     def build_checks() -> list[Check]:
