@@ -93,6 +93,8 @@ class InteractiveShellService:
             username=self.username,
             client_keys=[pkey],
             known_hosts=self.known_hosts,
+            keepalive_interval=15,
+            keepalive_count_max=3,
         )
 
     async def __aenter__(self):
