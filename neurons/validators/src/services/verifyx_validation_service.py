@@ -1,3 +1,4 @@
+import asyncio
 import ctypes
 import hashlib
 import json
@@ -87,13 +88,17 @@ class VerifyXValidationService:
 
     async def _get_executor_checksum(self, shell) -> str:
         """Get the VerifyX library checksum from executor using SCP."""
-        try:
-            checksums = await shell.get_checksums_over_scp(self.lib_name)
-            # Format is "md5:sha256", we need sha256
-            sha256_checksum = checksums.split(":")[1]
-            return sha256_checksum
-        except Exception:
-            return ""
+        max_retries = 2
+        for attempt in range(1, max_retries + 1):
+            try:
+                checksums = await shell.get_checksums_over_scp(self.lib_name)
+                # Format is "md5:sha256", we need sha256
+                sha256_checksum = checksums.split(":")[1]
+                return sha256_checksum
+            except Exception:
+                if attempt < max_retries:
+                    await asyncio.sleep(1.0)
+        return ""
 
     async def validate_verifyx_and_process_job(
         self,
