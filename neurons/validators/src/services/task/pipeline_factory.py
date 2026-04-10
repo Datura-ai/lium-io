@@ -107,7 +107,7 @@ class PipelineFactory:
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
-        tdx_attestation_passed: bool = False,
+        tdx_attesгtation_passed: bool = False,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -170,7 +170,7 @@ class PipelineFactory:
                 shell=shell,
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
-                container_cleanup=ContainerCleanup(),
+                container_cleanup=ContainerCleanup(dry_run=False),
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,
