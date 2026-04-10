@@ -170,7 +170,7 @@ class PipelineFactory:
                 shell=shell,
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
-                container_cleanup=ContainerCleanup(dry_run=False),
+                container_cleanup=ContainerCleanup(),
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,
