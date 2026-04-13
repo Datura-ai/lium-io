@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
 
-    def __init__(self, stale_threshold_minutes: int = 15, dry_run: bool = True):
+    def __init__(self, stale_threshold_minutes: int = 15, dry_run: bool = False):
         self.stale_threshold_minutes = stale_threshold_minutes
         self.dry_run = dry_run
 

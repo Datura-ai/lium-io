@@ -97,6 +97,10 @@ class PipelineFactory:
         self.executor_connectivity_service = executor_connectivity_service
         self.backend_client = backend_client
 
+        dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
+        logger.info(f"ContainerCleanup dry_run={dry_run}")
+        self.container_cleanup = ContainerCleanup(dry_run=dry_run)
+
     async def build_context(
         self,
         shell: InteractiveShellService,
@@ -170,7 +174,7 @@ class PipelineFactory:
                 shell=shell,
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
-                container_cleanup=ContainerCleanup(),
+                container_cleanup=self.container_cleanup,
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,
