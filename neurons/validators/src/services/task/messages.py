@@ -497,69 +497,70 @@ class VerifyXMessages:
         category="env",
         impact="Proceed",
     )
-    # Generic fallback for UNKNOWN classification. Kept populated so callers that
-    # cannot classify a failure still produce a meaningful event.
-    VERIFY_FAILED = MessageTemplate(
-        event="VerifyX validation failed",
-        reason="VERIFYX_FAILED",
+    # Failure templates share event/severity/category/impact/help_uri; only the per-class
+    # label suffix, reason suffix, and remediation differ. Generated from _VERIFY_FAILED_REMEDIATIONS
+    # below and bound as class attributes via a helper.
+
+
+def _make_verify_failed(label: str, reason_suffix: str, remediation: str) -> MessageTemplate:
+    event = "VerifyX validation failed" + (f" ({label})" if label else "")
+    reason = "VERIFYX_FAILED" + (f"_{reason_suffix}" if reason_suffix else "")
+    return MessageTemplate(
+        event=event,
+        reason=reason,
         severity="error",
         category="env",
         impact="Score set to 0",
-        remediation="Run VerifyX locally to debug network, disk, and RAM probes. See the debug doc for detailed steps.",
+        remediation=remediation,
         help_uri=VERIFYX_DEBUG_DOC_URL,
     )
-    VERIFY_FAILED_SSH_TRANSPORT = MessageTemplate(
-        event="VerifyX validation failed (SSH transport)",
-        reason="VERIFYX_FAILED_SSH_TRANSPORT",
-        severity="error",
-        category="env",
-        impact="Score set to 0",
-        remediation=(
-            "Validator could not reach the executor over SSH. Verify the executor is "
-            "running and reachable on its SSH port, and that the validator's SSH key "
-            "is present in the executor's authorized_keys."
-        ),
-        help_uri=VERIFYX_DEBUG_DOC_URL,
-    )
-    VERIFY_FAILED_EXECUTOR_CRASH = MessageTemplate(
-        event="VerifyX validation failed (executor crashed)",
-        reason="VERIFYX_FAILED_EXECUTOR_CRASH",
-        severity="error",
-        category="env",
-        impact="Score set to 0",
-        remediation=(
-            "The verifyx_executor.py process exited with a non-zero status. Read the "
-            "executor container logs (docker logs <executor-container>) for the traceback, "
-            "then reproduce by running verifyx_executor.py directly with the seed and "
-            "cipher_text captured in the validator log line."
-        ),
-        help_uri=VERIFYX_DEBUG_DOC_URL,
-    )
-    VERIFY_FAILED_EMPTY_RESPONSE = MessageTemplate(
-        event="VerifyX validation failed (empty response)",
-        reason="VERIFYX_FAILED_EMPTY_RESPONSE",
-        severity="error",
-        category="env",
-        impact="Score set to 0",
-        remediation=(
-            "The executor returned empty or truncated stdout. Check for OOM-killer events "
-            "(dmesg) and disk-full conditions (df -h) on the executor host."
-        ),
-        help_uri=VERIFYX_DEBUG_DOC_URL,
-    )
-    VERIFY_FAILED_CIPHER_REJECTED = MessageTemplate(
-        event="VerifyX validation failed (cipher rejected)",
-        reason="VERIFYX_FAILED_CIPHER_REJECTED",
-        severity="error",
-        category="env",
-        impact="Score set to 0",
-        remediation=(
-            "The executor returned a response that the validator's libverifyx.so rejected. "
-            "Verify the executor's libverifyx.so SHA256 matches the validator's, and restart "
-            "the executor container (docker compose restart) if it does not."
-        ),
-        help_uri=VERIFYX_DEBUG_DOC_URL,
-    )
+
+
+# (attr_name, label, reason_suffix, remediation)
+_VERIFY_FAILED_TEMPLATES: list[tuple[str, str, str, str]] = [
+    (
+        "VERIFY_FAILED",
+        "",
+        "",
+        "Run VerifyX locally to debug network, disk, and RAM probes. See the debug doc for detailed steps.",
+    ),
+    (
+        "VERIFY_FAILED_SSH_TRANSPORT",
+        "SSH transport",
+        "SSH_TRANSPORT",
+        "Validator could not reach the executor over SSH. Verify the executor is running "
+        "and reachable on its SSH port, and that the validator's SSH key is present in the "
+        "executor's authorized_keys.",
+    ),
+    (
+        "VERIFY_FAILED_EXECUTOR_CRASH",
+        "executor crashed",
+        "EXECUTOR_CRASH",
+        "The verifyx_executor.py process exited with a non-zero status. Read the executor "
+        "container logs (docker logs <executor-container>) for the traceback, then reproduce "
+        "by running verifyx_executor.py directly with the seed and cipher_text captured in "
+        "the validator log line.",
+    ),
+    (
+        "VERIFY_FAILED_EMPTY_RESPONSE",
+        "empty response",
+        "EMPTY_RESPONSE",
+        "The executor returned empty or truncated stdout. Check for OOM-killer events "
+        "(dmesg) and disk-full conditions (df -h) on the executor host.",
+    ),
+    (
+        "VERIFY_FAILED_CIPHER_REJECTED",
+        "cipher rejected",
+        "CIPHER_REJECTED",
+        "The executor returned a response that the validator's libverifyx.so rejected. "
+        "Verify the executor's libverifyx.so SHA256 matches the validator's, and restart "
+        "the executor container (docker compose restart) if it does not.",
+    ),
+]
+
+for _attr, _label, _suffix, _remediation in _VERIFY_FAILED_TEMPLATES:
+    setattr(VerifyXMessages, _attr, _make_verify_failed(_label, _suffix, _remediation))
+del _attr, _label, _suffix, _remediation
 
 
 class TdxHostMessages:

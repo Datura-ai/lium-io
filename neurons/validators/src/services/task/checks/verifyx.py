@@ -115,15 +115,7 @@ class VerifyXCheck:
         template = _FAILURE_TEMPLATE_BY_CLASS.get(
             diagnostics.get("failure_class"), Msg.VERIFY_FAILED
         )
-
-        what: dict[str, Any] = {"errors": error_message}
-        if diagnostics:
-            what["failure_class"] = diagnostics.get("failure_class")
-            what["exit_status"] = diagnostics.get("exit_status")
-            what["stdout_len"] = diagnostics.get("stdout_len")
-            what["stderr_tail"] = diagnostics.get("stderr_tail")
-            if diagnostics.get("transport_error") is not None:
-                what["transport_error"] = diagnostics.get("transport_error")
+        what: dict[str, Any] = {"errors": error_message, **diagnostics}
 
         event = render_message(
             template,

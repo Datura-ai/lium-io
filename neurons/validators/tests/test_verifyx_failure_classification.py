@@ -9,119 +9,63 @@ from neurons.validators.src.services.verifyx_validation_service import (
 )
 
 
-def test_classify_ssh_transport_when_transport_error_set():
+LONG_STDOUT = "a" * (MIN_CIPHER_LEN + 10)
+
+
+@pytest.mark.parametrize(
+    "exit_status,stdout,transport_error,expected",
+    [
+        # transport error wins over everything else
+        (None, None, "ConnectionLost: timeout", VerifyXFailureClass.SSH_TRANSPORT),
+        # non-zero exit wins over stdout shape (even valid-length stdout => CRASH, not CIPHER_REJECTED)
+        (1, "", None, VerifyXFailureClass.EXECUTOR_CRASH),
+        (137, "", None, VerifyXFailureClass.EXECUTOR_CRASH),
+        (1, LONG_STDOUT, None, VerifyXFailureClass.EXECUTOR_CRASH),
+        # zero exit + short stdout => EMPTY_RESPONSE
+        (0, "short", None, VerifyXFailureClass.EMPTY_RESPONSE),
+        # zero exit + valid-length stdout => CIPHER_REJECTED
+        (0, LONG_STDOUT, None, VerifyXFailureClass.CIPHER_REJECTED),
+        # no signals at all => UNKNOWN fallback
+        (None, None, None, VerifyXFailureClass.UNKNOWN),
+    ],
+)
+def test_classify_failure(exit_status, stdout, transport_error, expected):
+    # Arrange / Act
     result = _classify_failure(
-        exit_status=None,
-        stdout=None,
+        exit_status=exit_status,
+        stdout=stdout,
         stderr=None,
-        transport_error="ConnectionLost: timeout",
+        transport_error=transport_error,
     )
-    assert result == VerifyXFailureClass.SSH_TRANSPORT
 
-
-def test_classify_executor_crash_on_nonzero_exit_and_empty_stdout():
-    result = _classify_failure(
-        exit_status=1,
-        stdout="",
-        stderr="Traceback (most recent call last): ...",
-        transport_error=None,
-    )
-    assert result == VerifyXFailureClass.EXECUTOR_CRASH
-
-
-def test_classify_empty_response_on_zero_exit_with_short_stdout():
-    result = _classify_failure(
-        exit_status=0,
-        stdout="short",
-        stderr=None,
-        transport_error=None,
-    )
-    assert result == VerifyXFailureClass.EMPTY_RESPONSE
-
-
-def test_classify_cipher_rejected_on_valid_length_stdout():
-    long_stdout = "a" * (MIN_CIPHER_LEN + 10)
-    result = _classify_failure(
-        exit_status=0,
-        stdout=long_stdout,
-        stderr=None,
-        transport_error=None,
-    )
-    assert result == VerifyXFailureClass.CIPHER_REJECTED
-
-
-def test_classify_unknown_fallback():
-    # No transport error, no exit_status, no stdout — edge case
-    result = _classify_failure(
-        exit_status=None,
-        stdout=None,
-        stderr=None,
-        transport_error=None,
-    )
-    assert result == VerifyXFailureClass.UNKNOWN
-
-
-def test_classify_executor_crash_takes_priority_over_empty_response():
-    # Non-zero exit with empty stdout -> EXECUTOR_CRASH, not EMPTY_RESPONSE
-    result = _classify_failure(
-        exit_status=137,
-        stdout="",
-        stderr="Killed",
-        transport_error=None,
-    )
-    assert result == VerifyXFailureClass.EXECUTOR_CRASH
-
-
-def test_classify_executor_crash_takes_priority_over_cipher_rejected():
-    # A crashing process may flush partial output to stdout before dying — non-zero exit
-    # must win over stdout shape, otherwise the miner sees a misleading "cipher rejected".
-    long_stdout = "a" * (MIN_CIPHER_LEN + 10)
-    result = _classify_failure(
-        exit_status=1,
-        stdout=long_stdout,
-        stderr="Traceback (most recent call last): ...",
-        transport_error=None,
-    )
-    assert result == VerifyXFailureClass.EXECUTOR_CRASH
-
-
-def test_classify_stderr_noise_does_not_beat_valid_stdout():
-    # A warning on stderr with a valid-looking cipher on stdout and exit=0: CIPHER_REJECTED
-    long_stdout = "b" * (MIN_CIPHER_LEN + 1)
-    result = _classify_failure(
-        exit_status=0,
-        stdout=long_stdout,
-        stderr="warning: something",
-        transport_error=None,
-    )
-    assert result == VerifyXFailureClass.CIPHER_REJECTED
-
-
-def test_tail_stderr_truncates_to_last_2kb():
-    long_stderr = "x" * (STDERR_TAIL_BYTES * 2)
-    result = _tail_stderr(long_stderr)
-    assert result is not None
-    # After dropping leading continuation bytes the payload may be a few bytes short of
-    # STDERR_TAIL_BYTES — assert the cap, not exact equality.
-    assert len(result.encode("utf-8")) <= STDERR_TAIL_BYTES
-
-
-def test_tail_stderr_drops_leading_continuation_bytes_to_keep_valid_utf8():
-    # A long payload that ends with a valid multi-byte sequence split by the 2 KB cut.
-    prefix = "x" * (STDERR_TAIL_BYTES + 10)
-    payload = prefix + "Ωabc"  # Ω = 2 bytes in UTF-8
-    result = _tail_stderr(payload)
-    assert result is not None
-    # First character MUST NOT be the replacement marker.
-    assert result[0] != "\ufffd"
-    # End of the original payload MUST survive.
-    assert result.endswith("Ωabc")
+    # Assert — classification follows the priority: transport > exit_status > stdout shape
+    assert result == expected
 
 
 def test_tail_stderr_returns_none_for_none():
+    # None input is passed through unchanged — no stderr available means nothing to tail.
     assert _tail_stderr(None) is None
 
 
 def test_tail_stderr_returns_as_is_when_under_limit():
+    # Arrange
     short = "only a few bytes"
+
+    # Act / Assert — short payloads are not truncated
     assert _tail_stderr(short) == short
+
+
+def test_tail_stderr_truncates_long_payload_and_keeps_valid_utf8_end():
+    # Arrange — payload longer than STDERR_TAIL_BYTES, ending with a multi-byte char
+    # split by the cut. Ω is 2 bytes in UTF-8 so the slice may land mid-character.
+    prefix = "x" * (STDERR_TAIL_BYTES + 10)
+    payload = prefix + "Ωabc"
+
+    # Act
+    result = _tail_stderr(payload)
+
+    # Assert — tail is capped at STDERR_TAIL_BYTES and remains valid UTF-8 (no leading U+FFFD)
+    assert result is not None
+    assert len(result.encode("utf-8")) <= STDERR_TAIL_BYTES
+    assert result[0] != "\ufffd"
+    assert result.endswith("Ωabc")
