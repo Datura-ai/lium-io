@@ -182,3 +182,6 @@ config_override.py
 .claude
 
 CLAUDE.md
+neurons/validators/openspec/
+openspec/
+
