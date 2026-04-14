@@ -12,6 +12,7 @@ from services.task.pipeline import Context
 
 
 SCORE_PORTION_FOR_OLD_CONTRACT = 0
+MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
 
 
 def calculate_scores(
@@ -50,6 +51,18 @@ def calculate_scores(
         actual_score = 0.0
         warning_messages.append(
             f"GPU price exceeds the limit. limit: {base_price * settings.MACHINE_MAX_PRICE_RATE}, actual: {price_per_gpu}"
+        )
+
+    # EMA verifyx download speed check
+    ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
+        "ema_verifyx_download_speed"
+    )
+    if ema_verifyx_download is not None and ema_verifyx_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append(
+            f"EMA verifyx download speed too slow: {ema_verifyx_download:.1f} Mbps "
+            f"(minimum: {MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:.0f} Mbps)"
         )
 
     # Early return for collateral-excluded GPU types
