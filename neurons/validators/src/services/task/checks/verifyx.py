@@ -66,17 +66,25 @@ class VerifyXCheck:
             )
 
             # Store verifyx network measurements under their own keys (additive — does not overwrite speedtest values)
+            prev_ema = (
+                ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
+                if ctx.state.rented_data else None
+            )
             if verifyx_network.get("download_speed") is not None:
                 if "network" not in updated_specs:
                     updated_specs["network"] = {}
                 updated_specs["network"]["verifyx_download_speed"] = verifyx_network.get("download_speed")
-                prev_ema = (
-                    ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
-                    if ctx.state.rented_data else None
-                )
                 updated_specs["network"]["ema_verifyx_download_speed"] = compute_ema(
                     prev_ema.ema_verifyx_download_speed if prev_ema else None,
                     verifyx_network.get("download_speed"),
+                )
+            if verifyx_network.get("upload_speed") is not None:
+                if "network" not in updated_specs:
+                    updated_specs["network"] = {}
+                updated_specs["network"]["verifyx_upload_speed"] = verifyx_network.get("upload_speed")
+                updated_specs["network"]["ema_verifyx_upload_speed"] = compute_ema(
+                    prev_ema.ema_verifyx_upload_speed if prev_ema else None,
+                    verifyx_network.get("upload_speed"),
                 )
 
             # Update storage specs if storage is present

@@ -62,6 +62,7 @@ class NetworkEMA(BaseModel):
     ema_download_speed: float | None = None
     ema_upload_speed: float | None = None
     ema_verifyx_download_speed: float | None = None
+    ema_verifyx_upload_speed: float | None = None
 
 
 class RentedExecutorsResponse(BaseModel):
