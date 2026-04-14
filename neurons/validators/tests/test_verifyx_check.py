@@ -1,16 +1,27 @@
+import logging
+
 import pytest
 
 from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
-from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
+from neurons.validators.src.services.task.messages import (
+    VERIFYX_DEBUG_DOC_URL,
+    VerifyXMessages as Msg,
+)
 
 from tests.helpers import build_context_config, build_services, build_state
 
 
 # Mock VerifyX response matching the real VerifyXResponse
 class MockVerifyXResponse:
-    def __init__(self, data: dict | None = None, error: str | None = None):
+    def __init__(
+        self,
+        data: dict | None = None,
+        error: str | None = None,
+        diagnostics: dict | None = None,
+    ):
         self.data = data
         self.error = error
+        self.diagnostics = diagnostics
 
 
 # Mock VerifyX service
@@ -146,3 +157,105 @@ async def test_verifyx_check(
             if "network" in updated_specs:
                 # verifyx speeds are stored under their own additive keys (do not overwrite speedtest values)
                 assert updated_state.specs["network"].get("verifyx_download_speed") == updated_specs["network"].get("download_speed")
+
+
+class _VerifyXServiceReturning:
+    """Test double that returns a caller-supplied VerifyXResponse."""
+
+    def __init__(self, response: MockVerifyXResponse):
+        self._response = response
+
+    async def validate_verifyx_and_process_job(
+        self, *, shell, executor_info, default_extra, machine_spec
+    ):
+        return self._response
+
+
+@pytest.mark.parametrize(
+    "failure_class,expected_reason",
+    [
+        ("SSH_TRANSPORT", Msg.VERIFY_FAILED_SSH_TRANSPORT.reason),
+        ("EXECUTOR_CRASH", Msg.VERIFY_FAILED_EXECUTOR_CRASH.reason),
+        ("EMPTY_RESPONSE", Msg.VERIFY_FAILED_EMPTY_RESPONSE.reason),
+        ("CIPHER_REJECTED", Msg.VERIFY_FAILED_CIPHER_REJECTED.reason),
+        ("UNKNOWN", Msg.VERIFY_FAILED.reason),
+    ],
+)
+@pytest.mark.asyncio
+async def test_verifyx_failure_classes_pick_per_class_template(
+    failure_class, expected_reason, context_factory
+):
+    diagnostics = {
+        "failure_class": failure_class,
+        "exit_status": 1 if failure_class == "EXECUTOR_CRASH" else 0,
+        "stdout_len": 12 if failure_class == "EMPTY_RESPONSE" else 0,
+        "stderr_tail": "boom" if failure_class == "EXECUTOR_CRASH" else None,
+        "transport_error": (
+            "ConnectionLost: timeout" if failure_class == "SSH_TRANSPORT" else None
+        ),
+    }
+    verifyx_service = _VerifyXServiceReturning(
+        MockVerifyXResponse(error="failure", diagnostics=diagnostics)
+    )
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(specs={"gpu": {"count": 1}})
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == expected_reason
+    # Diagnostic keys surfaced into what_we_saw
+    assert result.event.what_we_saw["failure_class"] == failure_class
+    assert "exit_status" in result.event.what_we_saw
+    assert "stdout_len" in result.event.what_we_saw
+    assert "stderr_tail" in result.event.what_we_saw
+    # help_uri populated on every failure class
+    assert result.event.help_uri == VERIFYX_DEBUG_DOC_URL
+
+
+@pytest.mark.asyncio
+async def test_verifyx_failure_without_diagnostics_falls_back_to_generic_template(
+    context_factory,
+):
+    verifyx_service = _VerifyXServiceReturning(
+        MockVerifyXResponse(error="opaque failure", diagnostics=None)
+    )
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(specs={"gpu": {"count": 1}})
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+    # No diagnostic keys when no diagnostics available
+    assert "failure_class" not in result.event.what_we_saw
+    assert result.event.help_uri == VERIFYX_DEBUG_DOC_URL
+
+
+@pytest.mark.asyncio
+async def test_verifyx_success_path_emits_no_verifyx_failed_log(
+    context_factory, caplog
+):
+    """Regression: success path MUST NOT emit the new VerifyX failure log line."""
+    updated_specs = {"ram": {"total": "64GB"}, "hard_disk": {"total": "1TB"}}
+    verifyx_service = DummyVerifyXService(success=True, updated_specs=updated_specs)
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(specs={"gpu": {"count": 1}, "cpu": {"cores": 4}})
+    ctx = context_factory(services=services, config=config, state=state)
+
+    with caplog.at_level(logging.ERROR):
+        result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+    # Success path never populates diagnostics
+    response_attr = getattr(result.event, "what_we_saw", {})
+    assert "failure_class" not in response_attr
+    # No ERROR log lines naming the new VerifyX failure event
+    assert not any(
+        "VerifyX validation failed" in rec.getMessage() for rec in caplog.records
+    )

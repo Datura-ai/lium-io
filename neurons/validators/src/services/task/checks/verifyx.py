@@ -111,13 +111,39 @@ class VerifyXCheck:
         # Ensure we have an error message for the failure case
         error_message = errors or "Unknown errors"
 
+        diagnostics = getattr(result, "diagnostics", None) or {}
+        template = _select_failure_template(diagnostics.get("failure_class"))
+
+        what: dict[str, Any] = {"errors": error_message}
+        if diagnostics:
+            what["failure_class"] = diagnostics.get("failure_class")
+            what["exit_status"] = diagnostics.get("exit_status")
+            what["stdout_len"] = diagnostics.get("stdout_len")
+            what["stderr_tail"] = diagnostics.get("stderr_tail")
+            if diagnostics.get("transport_error") is not None:
+                what["transport_error"] = diagnostics.get("transport_error")
+
         event = render_message(
-            Msg.VERIFY_FAILED,
+            template,
             ctx=ctx,
             check_id=self.check_id,
-            what={"errors": error_message},
+            what=what,
         )
         return CheckResult(passed=False, event=event)
+
+
+_FAILURE_TEMPLATE_BY_CLASS = {
+    "SSH_TRANSPORT": Msg.VERIFY_FAILED_SSH_TRANSPORT,
+    "EXECUTOR_CRASH": Msg.VERIFY_FAILED_EXECUTOR_CRASH,
+    "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
+    "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
+}
+
+
+def _select_failure_template(failure_class: str | None):
+    if failure_class is None:
+        return Msg.VERIFY_FAILED
+    return _FAILURE_TEMPLATE_BY_CLASS.get(failure_class, Msg.VERIFY_FAILED)
 
 
 def _to_iso(value: Any) -> Any:
