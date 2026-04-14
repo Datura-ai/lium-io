@@ -150,3 +150,77 @@ async def test_url_construction(reset_session, client):
 
         call_args = mock_session.get.call_args
         assert call_args[0][0] == "https://api.example.com/some/path"
+
+
+@pytest.mark.asyncio
+async def test_session_has_no_total_timeout_cap(reset_session):
+    """Regression for DAH-1939: session-level total timeout must not cap per-request timeouts."""
+    session = await BackendClient.get_session()
+    try:
+        assert session.timeout.total is None, (
+            "Session-level total timeout must be None so per-request timeouts apply as authored"
+        )
+    finally:
+        await BackendClient.close_session()
+
+
+@pytest.mark.asyncio
+async def test_per_request_timeout_outlives_old_session_cap(reset_session, mock_keypair):
+    """Regression for DAH-1939: a request slower than the old 30s cap must complete.
+
+    Spins up a local aiohttp server that delays response by ~1.5s, then issues a POST
+    with explicit timeout=5. Before the fix, the 30s session cap would have allowed
+    this; the analogous production case (35s response, 300s per-request timeout) was
+    being killed at 30s. We use compressed durations here to keep the test fast, and
+    additionally assert the session timeout is None (see the test above).
+    """
+    from aiohttp import web
+
+    async def slow_handler(_request: web.Request) -> web.Response:
+        await asyncio.sleep(1.5)
+        return web.json_response({"data": "ok", "count": 1})
+
+    app = web.Application()
+    app.router.add_post("/slow", slow_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    try:
+        client = BackendClient(base_url=f"http://127.0.0.1:{port}", keypair=mock_keypair)
+        result = await client.post("/slow", SampleResponse, timeout=5)
+        assert result is not None
+        assert result.data == "ok"
+    finally:
+        await BackendClient.close_session()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_per_request_timeout_still_enforced(reset_session, mock_keypair):
+    """Per-request timeout is honoured (returns None on timeout)."""
+    from aiohttp import web
+
+    async def slow_handler(_request: web.Request) -> web.Response:
+        await asyncio.sleep(2.0)
+        return web.json_response({"data": "ok", "count": 1})
+
+    app = web.Application()
+    app.router.add_post("/slow", slow_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    try:
+        client = BackendClient(base_url=f"http://127.0.0.1:{port}", keypair=mock_keypair)
+        result = await client.post("/slow", SampleResponse, timeout=1)
+        assert result is None
+    finally:
+        await BackendClient.close_session()
+        await runner.cleanup()
