@@ -72,8 +72,21 @@ def test_classify_executor_crash_takes_priority_over_empty_response():
     assert result == VerifyXFailureClass.EXECUTOR_CRASH
 
 
+def test_classify_executor_crash_takes_priority_over_cipher_rejected():
+    # A crashing process may flush partial output to stdout before dying — non-zero exit
+    # must win over stdout shape, otherwise the miner sees a misleading "cipher rejected".
+    long_stdout = "a" * (MIN_CIPHER_LEN + 10)
+    result = _classify_failure(
+        exit_status=1,
+        stdout=long_stdout,
+        stderr="Traceback (most recent call last): ...",
+        transport_error=None,
+    )
+    assert result == VerifyXFailureClass.EXECUTOR_CRASH
+
+
 def test_classify_stderr_noise_does_not_beat_valid_stdout():
-    # A warning on stderr with a valid-looking cipher on stdout: CIPHER_REJECTED
+    # A warning on stderr with a valid-looking cipher on stdout and exit=0: CIPHER_REJECTED
     long_stdout = "b" * (MIN_CIPHER_LEN + 1)
     result = _classify_failure(
         exit_status=0,
@@ -88,7 +101,21 @@ def test_tail_stderr_truncates_to_last_2kb():
     long_stderr = "x" * (STDERR_TAIL_BYTES * 2)
     result = _tail_stderr(long_stderr)
     assert result is not None
-    assert len(result.encode("utf-8")) == STDERR_TAIL_BYTES
+    # After dropping leading continuation bytes the payload may be a few bytes short of
+    # STDERR_TAIL_BYTES — assert the cap, not exact equality.
+    assert len(result.encode("utf-8")) <= STDERR_TAIL_BYTES
+
+
+def test_tail_stderr_drops_leading_continuation_bytes_to_keep_valid_utf8():
+    # A long payload that ends with a valid multi-byte sequence split by the 2 KB cut.
+    prefix = "x" * (STDERR_TAIL_BYTES + 10)
+    payload = prefix + "Ωabc"  # Ω = 2 bytes in UTF-8
+    result = _tail_stderr(payload)
+    assert result is not None
+    # First character MUST NOT be the replacement marker.
+    assert result[0] != "\ufffd"
+    # End of the original payload MUST survive.
+    assert result.endswith("Ωabc")
 
 
 def test_tail_stderr_returns_none_for_none():

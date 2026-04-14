@@ -37,11 +37,14 @@ def _classify_failure(
     stderr: str | None,
     transport_error: str | None,
 ) -> VerifyXFailureClass:
+    # A non-zero exit is a stronger signal than stdout shape — a crashing process can still
+    # flush partial output or a traceback to stdout before dying, and we must not mislabel
+    # that as a cipher rejection.
     if transport_error is not None:
         return VerifyXFailureClass.SSH_TRANSPORT
-    stdout_stripped = (stdout or "").strip()
-    if exit_status is not None and exit_status != 0 and not stdout_stripped:
+    if exit_status is not None and exit_status != 0:
         return VerifyXFailureClass.EXECUTOR_CRASH
+    stdout_stripped = (stdout or "").strip()
     if exit_status == 0 and len(stdout_stripped) < MIN_CIPHER_LEN:
         return VerifyXFailureClass.EMPTY_RESPONSE
     if stdout_stripped:
@@ -55,7 +58,11 @@ def _tail_stderr(stderr: str | None) -> str | None:
     data = stderr.encode("utf-8", errors="replace")
     if len(data) <= STDERR_TAIL_BYTES:
         return stderr
-    return data[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
+    tail = data[-STDERR_TAIL_BYTES:]
+    # Drop leading UTF-8 continuation bytes so the first character isn't U+FFFD.
+    while tail and 0x80 <= tail[0] < 0xC0:
+        tail = tail[1:]
+    return tail.decode("utf-8", errors="replace")
 
 
 class VerifyXValidator:
@@ -209,8 +216,8 @@ class VerifyXValidationService:
 
             logger.info(_m("Challenge response received", extra=get_extra_info({**log_extra, "challenge_response": challenge_response})))
 
-            # Executor crash: non-zero exit with no usable stdout
-            if ssh_capture["exit_status"] is not None and ssh_capture["exit_status"] != 0 and not challenge_response:
+            # Executor crash: non-zero exit (partial stdout is still a crash — see _classify_failure).
+            if ssh_capture["exit_status"] is not None and ssh_capture["exit_status"] != 0:
                 return self._failure_response(
                     error=f"Executor process exited with status {ssh_capture['exit_status']}",
                     ssh_capture=ssh_capture,
@@ -237,7 +244,22 @@ class VerifyXValidationService:
                 )
 
         except Exception as e:
-            return VerifyXResponse(error=f"unexpected error ({str(e)})")
+            # Catch-all for failures before/around the SSH call (checksum fetch, challenge
+            # generation, etc.) — route through the same failure_response so support gets
+            # a structured log line and the miner gets a populated help_uri. Classified as
+            # UNKNOWN explicitly so the exception text is not mistaken for an SSH transport
+            # error by the generic classifier.
+            return self._failure_response(
+                error=f"unexpected error ({str(e)})",
+                ssh_capture={
+                    "stdout": None,
+                    "stderr": None,
+                    "exit_status": None,
+                    "transport_error": f"{type(e).__name__}: {e}",
+                },
+                default_extra=default_extra,
+                failure_class=VerifyXFailureClass.UNKNOWN,
+            )
 
     async def _run_ssh_command(self, shell, command: str) -> Dict[str, Any]:
         """Run SSH command and capture stdout, stderr, exit_status, transport_error.
@@ -276,13 +298,20 @@ class VerifyXValidationService:
         error: str,
         ssh_capture: Dict[str, Any],
         default_extra: dict,
+        failure_class: Optional[VerifyXFailureClass] = None,
     ) -> "VerifyXResponse":
-        """Build a VerifyXResponse with populated diagnostics and emit one ERROR log line."""
+        """Build a VerifyXResponse with populated diagnostics and emit one ERROR log line.
+
+        `failure_class` is optional; if omitted it is derived from `ssh_capture`. Callers
+        that already know the class (e.g., the internal-error catch-all) pass it explicitly
+        to avoid mislabeling a transport_error string as `SSH_TRANSPORT`.
+        """
         stdout = ssh_capture["stdout"]
         stderr_tail = ssh_capture["stderr"]
         exit_status = ssh_capture["exit_status"]
         transport_error = ssh_capture["transport_error"]
-        failure_class = _classify_failure(exit_status, stdout, stderr_tail, transport_error)
+        if failure_class is None:
+            failure_class = _classify_failure(exit_status, stdout, stderr_tail, transport_error)
 
         stdout_len = len(stdout) if stdout is not None else None
 
