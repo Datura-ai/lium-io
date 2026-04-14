@@ -36,7 +36,7 @@ class BackendClient:
                 if cls._session is None or cls._session.closed:
                     connector = aiohttp.TCPConnector(limit=100, limit_per_host=10)
                     cls._session = aiohttp.ClientSession(
-                        timeout=aiohttp.ClientTimeout(total=30),
+                        timeout=aiohttp.ClientTimeout(total=None),
                         connector=connector,
                     )
         return cls._session
@@ -61,7 +61,7 @@ class BackendClient:
         response_model: type[T],
         *,
         add_signature: bool = True,
-        timeout: int = 10,
+        timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
     ) -> T | None:
         url = f"{self.base_url}/{path.lstrip('/')}"
@@ -128,7 +128,7 @@ class BackendClient:
         *,
         json_data: dict[str, Any] | None = None,
         add_signature: bool = True,
-        timeout: int = 10,
+        timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
     ) -> T | None:
         url = f"{self.base_url}/{path.lstrip('/')}"
