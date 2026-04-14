@@ -112,7 +112,9 @@ class VerifyXCheck:
         error_message = errors or "Unknown errors"
 
         diagnostics = getattr(result, "diagnostics", None) or {}
-        template = _select_failure_template(diagnostics.get("failure_class"))
+        template = _FAILURE_TEMPLATE_BY_CLASS.get(
+            diagnostics.get("failure_class"), Msg.VERIFY_FAILED
+        )
 
         what: dict[str, Any] = {"errors": error_message}
         if diagnostics:
@@ -138,12 +140,6 @@ _FAILURE_TEMPLATE_BY_CLASS = {
     "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
     "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
 }
-
-
-def _select_failure_template(failure_class: str | None):
-    if failure_class is None:
-        return Msg.VERIFY_FAILED
-    return _FAILURE_TEMPLATE_BY_CLASS.get(failure_class, Msg.VERIFY_FAILED)
 
 
 def _to_iso(value: Any) -> Any:
