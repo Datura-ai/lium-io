@@ -469,6 +469,11 @@ class PortCountMessages:
     )
 
 
+VERIFYX_DEBUG_DOC_URL = (
+    "https://github.com/Datura-ai/lium-io/blob/main/docs/lium-io/verifyx-debug.md"
+)
+
+
 class VerifyXMessages:
     DISABLED = MessageTemplate(
         event="VerifyX validation skipped",
@@ -492,13 +497,68 @@ class VerifyXMessages:
         category="env",
         impact="Proceed",
     )
+    # Generic fallback for UNKNOWN classification. Kept populated so callers that
+    # cannot classify a failure still produce a meaningful event.
     VERIFY_FAILED = MessageTemplate(
         event="VerifyX validation failed",
         reason="VERIFYX_FAILED",
         severity="error",
         category="env",
         impact="Score set to 0",
-        remediation="Run VerifyX locally to debug network, disk, and RAM probes.",
+        remediation="Run VerifyX locally to debug network, disk, and RAM probes. See the debug doc for detailed steps.",
+        help_uri=VERIFYX_DEBUG_DOC_URL,
+    )
+    VERIFY_FAILED_SSH_TRANSPORT = MessageTemplate(
+        event="VerifyX validation failed (SSH transport)",
+        reason="VERIFYX_FAILED_SSH_TRANSPORT",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "Validator could not reach the executor over SSH. Verify the executor is "
+            "running and reachable on its SSH port, and that the validator's SSH key "
+            "is present in the executor's authorized_keys."
+        ),
+        help_uri=VERIFYX_DEBUG_DOC_URL,
+    )
+    VERIFY_FAILED_EXECUTOR_CRASH = MessageTemplate(
+        event="VerifyX validation failed (executor crashed)",
+        reason="VERIFYX_FAILED_EXECUTOR_CRASH",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The verifyx_executor.py process exited with a non-zero status. Read the "
+            "executor container logs (docker logs <executor-container>) for the traceback, "
+            "then reproduce by running verifyx_executor.py directly with the seed and "
+            "cipher_text captured in the validator log line."
+        ),
+        help_uri=VERIFYX_DEBUG_DOC_URL,
+    )
+    VERIFY_FAILED_EMPTY_RESPONSE = MessageTemplate(
+        event="VerifyX validation failed (empty response)",
+        reason="VERIFYX_FAILED_EMPTY_RESPONSE",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The executor returned empty or truncated stdout. Check for OOM-killer events "
+            "(dmesg) and disk-full conditions (df -h) on the executor host."
+        ),
+        help_uri=VERIFYX_DEBUG_DOC_URL,
+    )
+    VERIFY_FAILED_CIPHER_REJECTED = MessageTemplate(
+        event="VerifyX validation failed (cipher rejected)",
+        reason="VERIFYX_FAILED_CIPHER_REJECTED",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The executor returned a response that the validator's libverifyx.so rejected. "
+            "Verify the executor's libverifyx.so SHA256 matches the validator's, and restart "
+            "the executor container (docker compose restart) if it does not."
+        ),
+        help_uri=VERIFYX_DEBUG_DOC_URL,
     )
 
 

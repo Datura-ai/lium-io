@@ -4,6 +4,7 @@ import json
 import random
 import os
 import logging
+from enum import Enum
 from typing import Dict, Any, Optional, Tuple, List
 
 from core.config import settings, FeatureFlag
@@ -13,6 +14,48 @@ from core.utils import _m, get_extra_info
 logger = logging.getLogger(__name__)
 
 GB_TO_BYTES = 1024 * 1024 * 1024
+
+# Minimum length of a valid cipher response from verifyx_executor.py stdout.
+# Shorter stdout is treated as empty/truncated (OOM, disk-full, etc.).
+MIN_CIPHER_LEN = 64
+
+# Cap on stderr bytes captured per failure. Last 2 KB is kept when longer.
+STDERR_TAIL_BYTES = 2048
+
+
+class VerifyXFailureClass(str, Enum):
+    SSH_TRANSPORT = "SSH_TRANSPORT"
+    EXECUTOR_CRASH = "EXECUTOR_CRASH"
+    EMPTY_RESPONSE = "EMPTY_RESPONSE"
+    CIPHER_REJECTED = "CIPHER_REJECTED"
+    UNKNOWN = "UNKNOWN"
+
+
+def _classify_failure(
+    exit_status: int | None,
+    stdout: str | None,
+    stderr: str | None,
+    transport_error: str | None,
+) -> VerifyXFailureClass:
+    if transport_error is not None:
+        return VerifyXFailureClass.SSH_TRANSPORT
+    stdout_stripped = (stdout or "").strip()
+    if exit_status is not None and exit_status != 0 and not stdout_stripped:
+        return VerifyXFailureClass.EXECUTOR_CRASH
+    if exit_status == 0 and len(stdout_stripped) < MIN_CIPHER_LEN:
+        return VerifyXFailureClass.EMPTY_RESPONSE
+    if stdout_stripped:
+        return VerifyXFailureClass.CIPHER_REJECTED
+    return VerifyXFailureClass.UNKNOWN
+
+
+def _tail_stderr(stderr: str | None) -> str | None:
+    if stderr is None:
+        return None
+    data = stderr.encode("utf-8", errors="replace")
+    if len(data) <= STDERR_TAIL_BYTES:
+        return stderr
+    return data[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
 
 
 class VerifyXValidator:
@@ -71,9 +114,15 @@ class VerifyXValidator:
 
 
 class VerifyXResponse:
-    def __init__(self, data: Optional[Dict[str, Any]] = None, error: Optional[str] = None):
+    def __init__(
+        self,
+        data: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ):
         self.data = data
         self.error = error
+        self.diagnostics = diagnostics
 
 
 class VerifyXValidationService:
@@ -146,30 +195,113 @@ class VerifyXValidationService:
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(log_extra)))
 
-            try:
-                result = await shell.ssh_client.run(command)
-            except Exception:
-                return VerifyXResponse(error="SSH command execution failed")
+            ssh_capture = await self._run_ssh_command(shell, command)
 
-            if result is None:
-                return VerifyXResponse(error="SSH command returned no result")
+            # Transport failure: SSH call raised or returned None / missing stdout
+            if ssh_capture["transport_error"] is not None:
+                return self._failure_response(
+                    error=f"SSH transport error ({ssh_capture['transport_error']})",
+                    ssh_capture=ssh_capture,
+                    default_extra=default_extra,
+                )
 
-            try:
-                challenge_response = result.stdout.strip()
-            except AttributeError:
-                return VerifyXResponse(error="SSH result missing stdout")
+            challenge_response = (ssh_capture["stdout"] or "").strip()
 
             logger.info(_m("Challenge response received", extra=get_extra_info({**log_extra, "challenge_response": challenge_response})))
+
+            # Executor crash: non-zero exit with no usable stdout
+            if ssh_capture["exit_status"] is not None and ssh_capture["exit_status"] != 0 and not challenge_response:
+                return self._failure_response(
+                    error=f"Executor process exited with status {ssh_capture['exit_status']}",
+                    ssh_capture=ssh_capture,
+                    default_extra=default_extra,
+                )
+
+            # Empty/truncated stdout (OOM, disk-full, etc.)
+            if len(challenge_response) < MIN_CIPHER_LEN:
+                return self._failure_response(
+                    error=f"Executor returned empty or truncated response (stdout_len={len(challenge_response)})",
+                    ssh_capture=ssh_capture,
+                    default_extra=default_extra,
+                )
 
             try:
                 payload = verifyx_validator.verify_response(challenge_response)
                 verification_result = _perform_verification_checks(payload)
                 return VerifyXResponse(data=verification_result)
             except Exception as e:
-                return VerifyXResponse(error=f"challenge verification failed ({str(e)})")
+                return self._failure_response(
+                    error=f"challenge verification failed ({str(e)})",
+                    ssh_capture=ssh_capture,
+                    default_extra=default_extra,
+                )
 
         except Exception as e:
             return VerifyXResponse(error=f"unexpected error ({str(e)})")
+
+    async def _run_ssh_command(self, shell, command: str) -> Dict[str, Any]:
+        """Run SSH command and capture stdout, stderr, exit_status, transport_error.
+
+        `transport_error` is None on a normal completion (even if exit_status != 0).
+        On transport failure (asyncssh exception, None result, missing stdout), the
+        three payload fields are None and transport_error is a "<ExcClass>: <msg>" string.
+        """
+        capture: Dict[str, Any] = {
+            "stdout": None,
+            "stderr": None,
+            "exit_status": None,
+            "transport_error": None,
+        }
+        try:
+            result = await shell.ssh_client.run(command)
+        except Exception as e:
+            capture["transport_error"] = f"{type(e).__name__}: {e}"
+            return capture
+
+        if result is None:
+            capture["transport_error"] = "SSH command returned no result"
+            return capture
+
+        try:
+            capture["stdout"] = result.stdout
+            capture["stderr"] = _tail_stderr(getattr(result, "stderr", None))
+            capture["exit_status"] = getattr(result, "exit_status", None)
+        except AttributeError:
+            capture["transport_error"] = "SSH result missing stdout"
+        return capture
+
+    def _failure_response(
+        self,
+        *,
+        error: str,
+        ssh_capture: Dict[str, Any],
+        default_extra: dict,
+    ) -> "VerifyXResponse":
+        """Build a VerifyXResponse with populated diagnostics and emit one ERROR log line."""
+        stdout = ssh_capture["stdout"]
+        stderr_tail = ssh_capture["stderr"]
+        exit_status = ssh_capture["exit_status"]
+        transport_error = ssh_capture["transport_error"]
+        failure_class = _classify_failure(exit_status, stdout, stderr_tail, transport_error)
+
+        stdout_len = len(stdout) if stdout is not None else None
+
+        diagnostics = {
+            "failure_class": failure_class.value,
+            "exit_status": exit_status,
+            "stdout_len": stdout_len,
+            "stderr_tail": stderr_tail,
+            "transport_error": transport_error,
+        }
+
+        logger.error(
+            _m(
+                "VerifyX validation failed",
+                extra=get_extra_info({**default_extra, **diagnostics, "error": error}),
+            )
+        )
+
+        return VerifyXResponse(error=error, diagnostics=diagnostics)
 
 
 def _get_memory_stats(memory_execution: dict, success: bool) -> dict:
