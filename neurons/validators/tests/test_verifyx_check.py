@@ -84,7 +84,7 @@ class DummyVerifyXService:
             True,
             True,
             "",
-            {"ram": {"total": "64GB"}, "hard_disk": {"total": "1TB"}, "network": {"download_speed": 1000}},
+            {"ram": {"total": "64GB"}, "hard_disk": {"total": "1TB"}, "network": {"download_speed": 1000, "upload_speed": 60.0}},
             True,
             Msg.VERIFY_SUCCESS.reason,
         ),
@@ -157,6 +157,9 @@ async def test_verifyx_check(
             if "network" in updated_specs:
                 # verifyx speeds are stored under their own additive keys (do not overwrite speedtest values)
                 assert updated_state.specs["network"].get("verifyx_download_speed") == updated_specs["network"].get("download_speed")
+                if updated_specs["network"].get("upload_speed") is not None:
+                    assert updated_state.specs["network"].get("verifyx_upload_speed") == updated_specs["network"].get("upload_speed")
+                    assert isinstance(updated_state.specs["network"].get("ema_verifyx_upload_speed"), float)
 
 
 class _VerifyXServiceReturning:

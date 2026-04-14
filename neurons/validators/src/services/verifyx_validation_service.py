@@ -375,6 +375,7 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
         success = False
 
     download_speed = network_execution["download"]["speed_mbps"]
+    upload_speed = network_execution.get("speedtest", {}).get("upload_mbps")
 
     if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
         errors.append(
@@ -384,6 +385,7 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
 
     stats = {
         "download_speed": download_speed,
+        "upload_speed": upload_speed,
         "success": success,
         "execution_time_ms": network_execution["execution_time_ms"],
     }
