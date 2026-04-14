@@ -49,9 +49,9 @@ async def test_outer_catch_all_populates_diagnostics_and_logs(caplog):
     assert result.error is not None
     assert result.diagnostics is not None
     assert result.diagnostics["failure_class"] == VerifyXFailureClass.UNKNOWN.value
-    # Captured the exception class + message as the transport_error field (label is a
-    # slight overload — the catch-all uses it to carry the internal-exception text).
-    assert "RuntimeError: boom" in (result.diagnostics["transport_error"] or "")
+    # Pre-SSH failures record the exception under `internal_error` — not `transport_error` —
+    # so the classifier can't mislabel an internal exception as an SSH transport error.
+    assert "RuntimeError: boom" in (result.diagnostics.get("internal_error") or "")
     # One structured ERROR log line.
     assert any(
         "VerifyX validation failed" in rec.getMessage()
