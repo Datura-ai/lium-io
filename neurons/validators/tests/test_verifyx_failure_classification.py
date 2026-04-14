@@ -25,6 +25,9 @@ LONG_STDOUT = "a" * (MIN_CIPHER_LEN + 10)
         (0, "short", None, VerifyXFailureClass.EMPTY_RESPONSE),
         # zero exit + valid-length stdout => CIPHER_REJECTED
         (0, LONG_STDOUT, None, VerifyXFailureClass.CIPHER_REJECTED),
+        # missing exit_status + short non-empty stdout => EMPTY_RESPONSE
+        # (regression guard: a missing exit code must not fall through to CIPHER_REJECTED)
+        (None, "short", None, VerifyXFailureClass.EMPTY_RESPONSE),
         # no signals at all => UNKNOWN fallback
         (None, None, None, VerifyXFailureClass.UNKNOWN),
     ],

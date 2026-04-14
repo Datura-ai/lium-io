@@ -55,10 +55,12 @@ def _classify_failure(
     if exit_status is not None and exit_status != 0:
         return VerifyXFailureClass.EXECUTOR_CRASH
     stdout_stripped = (stdout or "").strip()
-    if exit_status == 0 and len(stdout_stripped) < MIN_CIPHER_LEN:
-        return VerifyXFailureClass.EMPTY_RESPONSE
-    if stdout_stripped:
+    if len(stdout_stripped) >= MIN_CIPHER_LEN:
         return VerifyXFailureClass.CIPHER_REJECTED
+    # Short/empty stdout, no crash, no transport error. EMPTY_RESPONSE when we have *some*
+    # signal (zero exit code OR non-empty stdout); UNKNOWN only when we have no signal at all.
+    if stdout_stripped or exit_status == 0:
+        return VerifyXFailureClass.EMPTY_RESPONSE
     return VerifyXFailureClass.UNKNOWN
 
 
