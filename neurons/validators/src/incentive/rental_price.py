@@ -169,16 +169,18 @@ class RentalPriceIncentive(DefaultIncentive):
         return base_model
 
     @staticmethod
-    def _resolve_bucket(result: JobResult) -> int:
+    def _resolve_bucket(result: JobResult, cap_spec: dict[int, int]) -> int:
         """Pick the gpu_count bucket the executor is rated against.
 
-        Mirrors the rate-resolution logic in `_pre_process_job_result`: when
-        splitting is enabled the executor is paid at the `min_count` tier, so
-        it must also be accounted in that tier's cap bucket.
+        Non-splitting executor always uses `gpu_count`. A splitting-capable
+        executor prefers the `gpu_count` bucket when it is configured with a
+        positive cap, otherwise falls back to the `min_count` tier.
         """
-        if result.supports_gpu_splitting and result.gpu_splitting_min_count:
-            return result.gpu_splitting_min_count
-        return result.gpu_count
+        if not (result.supports_gpu_splitting and result.gpu_splitting_min_count):
+            return result.gpu_count
+        if cap_spec.get(result.gpu_count, 0) > 0:
+            return result.gpu_count
+        return result.gpu_splitting_min_count
 
     @staticmethod
     def _bucket_key_str(base_model: str, bucket: int) -> str:
@@ -219,7 +221,7 @@ class RentalPriceIncentive(DefaultIncentive):
             result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
 
             cap_spec = self.config.max_unrented_gpus.get(base_model, {})
-            bucket = self._resolve_bucket(result)
+            bucket = self._resolve_bucket(result, cap_spec)
             max_cap = cap_spec.get(bucket, 0)
             result.count_bucket = bucket
             result.max_cap = max_cap
@@ -298,7 +300,11 @@ class RentalPriceIncentive(DefaultIncentive):
 
         # state updates
         base_model = self.get_base_model_for_gpu(result.gpu_model)
-        bucket = result.count_bucket if result.count_bucket is not None else self._resolve_bucket(result)
+        if result.count_bucket is not None:
+            bucket = result.count_bucket
+        else:
+            cap_spec = self.config.max_unrented_gpus.get(base_model, {})
+            bucket = self._resolve_bucket(result, cap_spec)
         key = (base_model, bucket)
         result.total_unrented_by_gpu_type = self.unrented_count_by_bucket.get(key, 0)
         result.cap_dilution_applied = result.total_unrented_by_gpu_type > result.max_cap
