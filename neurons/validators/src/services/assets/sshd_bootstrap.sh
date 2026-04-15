@@ -92,7 +92,11 @@ harden_sshd_config() {
     if grep -q '^# lium-hardened$' "$sshd_config" 2>/dev/null; then
         return 0
     fi
-    printf '\n# lium-hardened\nPasswordAuthentication no\nChallengeResponseAuthentication no\n' >> "$sshd_config"
+    # sshd honors the first matching directive — comment out any existing
+    # occurrences before appending, otherwise our values would be ignored on
+    # base images that ship explicit settings.
+    sed -i -E 's/^[[:space:]]*(PasswordAuthentication|ChallengeResponseAuthentication|KbdInteractiveAuthentication)[[:space:]]+.*/# lium-disabled &/I' "$sshd_config"
+    printf '\n# lium-hardened\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\n' >> "$sshd_config"
 }
 
 prepare_sshd_runtime() {
