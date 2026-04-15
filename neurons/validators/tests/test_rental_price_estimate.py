@@ -9,7 +9,7 @@ from incentive import rental_price as rental_price_module
 from incentive.config import DEFAULT_PRICE, IncentiveConfig
 from incentive.rental_price import (
     ExecutorEstimateParams,
-    GpuTypeRentalState,
+    GpuBucketRentalState,
     RentalPriceEstimate,
     RentalPriceIncentive,
     RentalPriceSnapshot,
@@ -30,11 +30,16 @@ BASE_GPU_MAP = {
     "L4": "L4",
 }
 
-MAX_UNRENTED_GPUS_BY_TYPE = {
-    "H100": 16,
-    "H200": 8,
-    "A100": 0,   # ineligible
-    "L4": 0,     # ineligible
+
+def _bucket_caps(cap: int) -> dict[int, int]:
+    return {i: cap for i in range(1, 33)}
+
+
+MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
+    "H100": _bucket_caps(16),
+    "H200": _bucket_caps(8),
+    "A100": {},   # ineligible
+    "L4": {},     # ineligible
 }
 
 RENTAL_PRICES_PER_HOUR = {
@@ -52,7 +57,9 @@ ALPHA_RATE = 0.5
 def rental_config():
     return IncentiveConfig(
         algorithm=ALGORITHM,
-        rental_incentive_gpu_types=[k for k, v in MAX_UNRENTED_GPUS_BY_TYPE.items() if v > 0],
+        rental_incentive_gpu_types=[
+            k for k, v in MAX_UNRENTED_GPUS_BY_TYPE.items() if any(c > 0 for c in v.values())
+        ],
         max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
         gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
@@ -127,17 +134,15 @@ async def test_get_snapshot_fields_after_calculate_mining_scores(
     expected_emission = TEMPO * TAO_PRICE * ALPHA_RATE
     assert snapshot.epoch_subnet_emission == pytest.approx(expected_emission)
 
-    # H100 and H200 both unrented → both tracked in by_gpu_type
-    assert "H100" in snapshot.rental.by_gpu_type
-    assert "H200" in snapshot.rental.by_gpu_type
-
-    h100_state = snapshot.rental.by_gpu_type["H100"]
+    # H100 and H200 both unrented → each tracked in their own bucket entry.
+    h100_state = snapshot.rental.by_bucket["H100·8"]
+    assert isinstance(h100_state, GpuBucketRentalState)
     assert h100_state.unrented_count == 8
-    assert h100_state.max_cap == MAX_UNRENTED_GPUS_BY_TYPE["H100"]
+    assert h100_state.max_cap == 16
     # weighted_rate_sum = gpu_count * hourly_rate = 8 * 3.50
     assert h100_state.weighted_rate_sum == pytest.approx(8 * RENTAL_PRICES_PER_HOUR["H100"])
 
-    h200_state = snapshot.rental.by_gpu_type["H200"]
+    h200_state = snapshot.rental.by_bucket["H200·4"]
     assert h200_state.unrented_count == 4
     assert h200_state.weighted_rate_sum == pytest.approx(4 * RENTAL_PRICES_PER_HOUR["H200"])
 
@@ -151,7 +156,7 @@ async def test_get_snapshot_cap_multiplier_stored(
     rental_config, mock_redis, mock_price_provider, monkeypatch
 ):
     """Snapshot stores computed cap_multiplier even when unrented count exceeds cap."""
-    # Arrange — H100 cap is 16; 20 GPUs exceeds it
+    # Arrange — H100 cap is 16 per bucket; 20 GPUs in bucket=20 exceeds it
     job_results = {
         "miner_a": [_make_job("exec-a", "H100", 20, is_rented=False)],
     }
@@ -162,7 +167,7 @@ async def test_get_snapshot_cap_multiplier_stored(
     snapshot = incentive.get_snapshot()
 
     # Assert — cap_multiplier = min(20, 16) / 20
-    h100_state = snapshot.rental.by_gpu_type["H100"]
+    h100_state = snapshot.rental.by_bucket["H100·20"]
     assert h100_state.cap_multiplier == pytest.approx(16 / 20)
     assert snapshot.mining.total_gpu_model_count_map == {"H100": 20}
 
@@ -210,14 +215,14 @@ async def test_estimate_executor_unrented_h100_eligible(
 async def test_estimate_executor_unrented_ineligible_gpu_returns_zero(
     rental_config, mock_redis, mock_price_provider, monkeypatch
 ):
-    """GPU with cap=0 (e.g. A100, L4) is ineligible and returns usd_per_epoch=0."""
+    """GPU with empty cap dict (e.g. A100, L4) is ineligible and returns usd_per_epoch=0."""
     # Arrange
     job_results = {"miner_a": [_make_job("exec-a", "H100", 8, is_rented=False)]}
     incentive = _make_incentive(rental_config, mock_redis, mock_price_provider, job_results, monkeypatch)
     await incentive.calculate_mining_scores()
     snapshot = incentive.get_snapshot()
 
-    # Act — A100 has cap=0, ineligible
+    # Act — A100 has empty cap dict, ineligible
     estimator = RentalPriceIncentive(
         rental_config,
         mock_redis,
@@ -336,9 +341,9 @@ async def test_snapshot_seeding_preserves_accumulated_state(
     )
 
     # Assert — accumulated state from original epoch is present in seeded instance.
-    # H100 cap is `int` (16) here, so the bucket sentinel is 0.
-    assert seeded.unrented_count_by_bucket.get(("H100", 0)) == 8
-    assert seeded._weighted_rate_sum_by_bucket.get(("H100", 0)) == pytest.approx(
+    # H100 executor with gpu_count=8 lands in bucket=8.
+    assert seeded.unrented_count_by_bucket.get(("H100", 8)) == 8
+    assert seeded._weighted_rate_sum_by_bucket.get(("H100", 8)) == pytest.approx(
         8 * RENTAL_PRICES_PER_HOUR["H100"]
     )
     assert seeded.epoch_subnet_emission == pytest.approx(TEMPO * TAO_PRICE * ALPHA_RATE)
@@ -390,8 +395,8 @@ async def test_precompute_all_estimates_returns_both_rented_and_unrented_without
         },
         rental={
             "total_rental_cost": 10.0,
-            "by_gpu_type": {
-                "H100": GpuTypeRentalState(
+            "by_bucket": {
+                "H100·1": GpuBucketRentalState(
                     unrented_count=1,
                     max_cap=16,
                     cap_multiplier=1.0,

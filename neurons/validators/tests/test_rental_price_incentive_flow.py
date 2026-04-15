@@ -27,15 +27,29 @@ pytest_plugins = ["fixtures.incentive_fixtures"]
 
 ALGORITHM = "rental_price"
 
-# Per-GPU-type caps for testing (cap 0 = eligible for rental logic but no rental share / 0 miner score)
-MAX_UNRENTED_GPUS_BY_TYPE = {
-    "H100": 1000,
-    "H200": 1000,
-    "A100": 0,
+# Per-GPU-type caps for testing. `max_unrented_gpus` is now
+# `dict[str, dict[int, int]]` — an empty dict opts the family out. To mimic the
+# old aggregate-cap tests we fan the same cap value across a wide range of
+# buckets so any gpu_count used in the tests lands on a populated entry.
+_AGG_CAP_BUCKETS = range(1, 2001)
+
+
+def _as_bucket_caps(cap: int) -> dict[int, int]:
+    return {i: cap for i in _AGG_CAP_BUCKETS}
+
+
+MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
+    "H100": _as_bucket_caps(1000),
+    "H200": _as_bucket_caps(1000),
+    "A100": {},  # not eligible
 }
 
+# Flat per-base aggregate view, consumed by the legacy `expected_emission_splits`
+# / `expected_miner_rental_value` helpers which still reason in int caps.
+MAX_UNRENTED_GPUS_AGGREGATE: dict[str, int] = {"H100": 1000, "H200": 1000, "A100": 0}
+
 RENTAL_INCENTIVE_GPU_TYPES = [
-    gpu_type for gpu_type, cap in MAX_UNRENTED_GPUS_BY_TYPE.items() if cap > 0
+    gpu_type for gpu_type, cap in MAX_UNRENTED_GPUS_BY_TYPE.items() if any(v > 0 for v in cap.values())
 ]
 
 H100_HOURLY_RATE = 3.50
@@ -78,9 +92,7 @@ def _expected_rental_share(total_rental_cost: float, tao_price: float, alpha_rat
 def rental_price_config():
     return IncentiveConfig(
         algorithm=ALGORITHM,
-        rental_incentive_gpu_types=[
-            gpu_type for gpu_type, cap in MAX_UNRENTED_GPUS_BY_TYPE.items() if cap > 0
-        ],
+        rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
         rental_prices_per_hour=RENTAL_PRICES_PER_HOUR,
         gpu_count_custom_prices={"*": {"*": DEFAULT_PRICE}},
@@ -238,7 +250,7 @@ async def test_rental_price_scenario_basic_mixed(
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -315,80 +327,9 @@ async def test_rental_price_scenario_basic_mixed(
 
 
 @pytest.mark.asyncio
-async def test_rental_price_scenario_cap_dilution(
-    validator_with_rental_price,
-    mock_subtensor_client,
-    mock_settings,
-    create_job_result,
-    create_neuron_info,
-    mock_price_provider,
-):
-    validator = validator_with_rental_price
-    validator.miner_scores = {}
-
-    miners = [
-        create_neuron_info(uid=100, hotkey="burner1"),
-        create_neuron_info(uid=101, hotkey="burner2"),
-        create_neuron_info(uid=2, hotkey="miner_a"),
-        create_neuron_info(uid=3, hotkey="miner_b"),
-        create_neuron_info(uid=4, hotkey="miner_c"),
-    ]
-
-    all_job_results = {
-        "miner_a": [
-            _job(create_job_result, executor_id="exec-a", gpu_model="H100", gpu_count=600, is_rented=False),
-        ],
-        "miner_b": [
-            _job(create_job_result, executor_id="exec-b", gpu_model="H100", gpu_count=500, is_rented=False),
-        ],
-        "miner_c": [
-            _job(create_job_result, executor_id="exec-c", gpu_model="H100", gpu_count=400, is_rented=False),
-        ],
-    }
-
-    validator.backend_client.get_all_rented_executors = AsyncMock(return_value=_make_rented_data())
-
-    await _run_sync_with_jobs(validator, miners, all_job_results)
-
-    # Verify cap dilution appears in logs
-    from tests.helpers import assert_incentive_log_present, assert_executor_has_log, assert_log_contains_keys
-
-    for hotkey, results in all_job_results.items():
-        for result in results:
-            if result.score > 0 and result.incentive_logs:
-                assert_incentive_log_present(result.full_log_text)
-                assert_executor_has_log(result.full_log_text, str(result.executor_info.uuid))
-                # Verify cap_dilution_applied is logged (key feature of this test)
-                assert_log_contains_keys(result.full_log_text, [
-                    "effective_rate",
-                    "total_unrented_by_gpu_type",
-                    "cap_dilution_applied",
-                    "rental_share"
-                ])
-
-    total_unrented = 1500
-    expected_effective_rate = H100_HOURLY_RATE * MAX_UNRENTED_GPUS_BY_TYPE["H100"] / total_unrented
-    expected_total_rental_cost = total_unrented * expected_effective_rate
-
-    splits = expected_emission_splits(
-        unrented_gpu_counts={"H100": total_unrented},
-        rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
-        tao_price=TAO_PRICE,
-        alpha_rate=ALPHA_RATE,
-    )
-
-    assert expected_effective_rate == pytest.approx(2.333, abs=0.001)
-    assert expected_total_rental_cost == pytest.approx(3500, abs=1)
-    assert splits["rental_share"] == pytest.approx(0.1146, abs=0.001)
-
-    weights = {
-        "miner_a": validator.miner_scores["miner_a"],
-        "miner_b": validator.miner_scores["miner_b"],
-        "miner_c": validator.miner_scores["miner_c"],
-    }
-    assert weights["miner_a"] / weights["miner_b"] == pytest.approx(600 / 500, abs=0.01)
-    assert weights["miner_b"] / weights["miner_c"] == pytest.approx(500 / 400, abs=0.01)
+# NOTE: Legacy aggregate-cap dilution scenario removed — with per-`(base_model, bucket)`
+# caps, three executors with distinct gpu_counts each land in their own bucket with a
+# 1.0 multiplier, so the original aggregate-dilution assertion no longer applies.
 
 
 @pytest.mark.asyncio
@@ -403,11 +344,13 @@ async def test_different_caps_per_gpu_type(
     monkeypatch,
 ):
     """Test that different GPU types have independent caps applied correctly."""
-    # Create custom config with different caps for H100 and H200
-    different_caps = {
-        "H100": 5,
-        "H200": 3,
+    # Per-bucket caps keyed by the gpu_count each executor in this test reports.
+    different_caps: dict[str, dict[int, int]] = {
+        "H100": {8: 5},
+        "H200": {6: 3},
     }
+    # Flat per-base aggregate value used by the legacy expected_emission_splits helper.
+    different_caps_aggregate = {"H100": 5, "H200": 3}
     custom_config = IncentiveConfig(
         algorithm=ALGORITHM,
         rental_incentive_gpu_types=list(different_caps.keys()),
@@ -462,14 +405,14 @@ async def test_different_caps_per_gpu_type(
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
     # Verify cap dilution for each GPU type independently
-    h100_effective_rate = H100_HOURLY_RATE * different_caps["H100"] / 8
-    h200_effective_rate = H200_HOURLY_RATE * different_caps["H200"] / 6
+    h100_effective_rate = H100_HOURLY_RATE * different_caps_aggregate["H100"] / 8
+    h200_effective_rate = H200_HOURLY_RATE * different_caps_aggregate["H200"] / 6
     expected_total_rental_cost = 8 * h100_effective_rate + 6 * h200_effective_rate
 
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 8, "H200": 6},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=different_caps,
+        max_unrented_gpus=different_caps_aggregate,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -544,7 +487,7 @@ async def test_rental_price_scenario_all_unrented(
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 30, "H200": 15},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -595,7 +538,7 @@ async def test_rental_price_scenario_zero_unrented(
     splits = expected_emission_splits(
         unrented_gpu_counts={},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -647,7 +590,7 @@ async def test_rental_price_scenario_rental_share_cap(
     splits = expected_emission_splits(
         unrented_gpu_counts={"H100": 1000},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         tao_price=0.01,
         alpha_rate=0.01,
     )
@@ -752,7 +695,7 @@ async def test_rental_price_edge_multi_executor_accumulation(
         miner_results=all_job_results["miner_a"],
         rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         total_unrented_counts=total_unrented_counts,
     )
     assert expected_a_rental == pytest.approx(3 * H100_HOURLY_RATE + 4 * H200_HOURLY_RATE)
@@ -760,7 +703,7 @@ async def test_rental_price_edge_multi_executor_accumulation(
     splits = expected_emission_splits(
         unrented_gpu_counts=total_unrented_counts,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -1259,7 +1202,7 @@ async def test_rental_price_failed_unrented_executors_do_not_count_rental(
     splits = expected_emission_splits(
         unrented_gpu_counts={},
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
     )
@@ -1477,6 +1420,7 @@ async def test_rental_price_integration_chain_submission(
     assert "uids" in call_payload
     assert "weights" in call_payload
 
+@pytest.mark.skip(reason="Tests legacy cross-variant aggregation under one aggregate cap; per-bucket caps place each variant in its own bucket so this behavior no longer applies.")
 @pytest.mark.asyncio
 async def test_rental_price_gpu_variants_under_cap(
     validator_with_rental_price,
@@ -1559,7 +1503,7 @@ async def test_rental_price_gpu_variants_under_cap(
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
         base_gpu_map=BASE_GPU_MAP,
@@ -1600,6 +1544,7 @@ async def test_rental_price_gpu_variants_under_cap(
     assert validator.miner_scores["miner_a"] == pytest.approx(expected_a_weight, abs=0.0001)
     assert validator.miner_scores["miner_b"] == pytest.approx(expected_b_weight, abs=0.0001)
 
+@pytest.mark.skip(reason="Tests legacy aggregate cross-variant dilution; replaced by per-`(base, bucket)` semantics.")
 @pytest.mark.asyncio
 async def test_rental_price_gpu_variants_exceeds_cap(
     validator_with_rental_price,
@@ -1781,7 +1726,7 @@ async def test_rental_price_multi_variant_mixed_rental_status(
         miner_results=all_job_results["miner_b"],
         rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         total_unrented_counts=total_unrented_counts,
         base_gpu_map=BASE_GPU_MAP,
     )
@@ -1789,7 +1734,7 @@ async def test_rental_price_multi_variant_mixed_rental_status(
         miner_results=all_job_results["miner_c"],
         rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         total_unrented_counts=total_unrented_counts,
         base_gpu_map=BASE_GPU_MAP,
     )
@@ -1805,6 +1750,7 @@ async def test_rental_price_multi_variant_mixed_rental_status(
     assert sum(validator.miner_scores.values()) == pytest.approx(1.0, abs=0.0001)
 
 
+@pytest.mark.skip(reason="Tests legacy aggregate cross-variant grouping; replaced by per-`(base, bucket)` semantics.")
 @pytest.mark.asyncio
 async def test_rental_price_multiple_base_models_with_variants(
     validator_with_rental_price,
@@ -1984,7 +1930,7 @@ async def test_rental_price_single_miner_multiple_variants(
         miner_results=all_job_results["miner_a"],
         rental_incentive_gpu_types=RENTAL_INCENTIVE_GPU_TYPES,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         total_unrented_counts=total_unrented_counts,
         base_gpu_map=BASE_GPU_MAP,
     )
@@ -1997,6 +1943,7 @@ async def test_rental_price_single_miner_multiple_variants(
     assert sum(validator.miner_scores.values()) == pytest.approx(1.0, abs=0.0001)
 
 
+@pytest.mark.skip(reason="Tests legacy extreme aggregate cross-variant dilution; replaced by per-`(base, bucket)` semantics.")
 @pytest.mark.asyncio
 async def test_rental_price_variant_edge_case_extreme_dilution(
     validator_with_rental_price,
@@ -2119,7 +2066,7 @@ async def test_rental_price_variant_eligibility_check(
     splits = expected_emission_splits(
         unrented_gpu_counts=unrented_counts,
         rental_prices=RENTAL_PRICES_PER_HOUR,
-        max_unrented_gpus=MAX_UNRENTED_GPUS_BY_TYPE,
+        max_unrented_gpus=MAX_UNRENTED_GPUS_AGGREGATE,
         tao_price=TAO_PRICE,
         alpha_rate=ALPHA_RATE,
         base_gpu_map=BASE_GPU_MAP,
@@ -2315,7 +2262,7 @@ PCC_RENTAL_PRICES = {gpu: 4.0 for gpu in PCC_BASE_GPU_MAP.keys()}
 # 1× and 8× tiers eligible; everything else → 0 (mirrors production B200 config).
 PCC_GPU_CUSTOM_PRICES = {gpu: {"*": 0, "1": DEFAULT_PRICE, "8": DEFAULT_PRICE} for gpu in PCC_BASE_GPU_MAP.keys()}
 
-PCC_PER_COUNT_CAPS: dict[str, int | dict[int, int]] = {
+PCC_PER_COUNT_CAPS: dict[str, dict[int, int]] = {
     "B200": {1: 1, 8: 8},
     "H200": {1: 1, 8: 8},
     "H100": {1: 1, 8: 8},
@@ -2329,7 +2276,7 @@ PCC_HOURLY_RATE = 4.0
 PCC_SYSBOX_MULTIPLIER = 1.0  # sysbox_runtime=True → multiplier=1.0
 
 
-def _make_pcc_config(caps: dict[str, int | dict[int, int]] | None = None) -> IncentiveConfig:
+def _make_pcc_config(caps: dict[str, dict[int, int]] | None = None) -> IncentiveConfig:
     return IncentiveConfig(
         algorithm=ALGORITHM,
         rental_incentive_gpu_types=list(PCC_PER_COUNT_CAPS.keys()),
@@ -2548,29 +2495,27 @@ async def test_pcc_per_family_migration(gpu_model, base, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pcc_aggregate_int_cap_regression(monkeypatch):
-    """Regression — int cap form pools all counts into one aggregate bucket (sentinel 0)."""
-    # Aggregate cap of 8 across all B200 counts, like before this change.
-    config = _make_pcc_config(caps={"B200": 8})
-    config.rental_incentive_gpu_types = ["B200"]
-    jobs = {
-        "miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 1)],
-        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
-    }
+async def test_pcc_non_eligible_family_no_subsidy(monkeypatch):
+    """Non-eligible family (`max_unrented_gpus[X] == {}`) contributes nothing."""
+    caps = dict(PCC_PER_COUNT_CAPS)
+    caps["B200"] = {}
+    config = _make_pcc_config(caps=caps)
+    config.rental_incentive_gpu_types = [k for k, v in caps.items() if any(c > 0 for c in v.values())]
+
+    jobs = {"miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 1)]}
 
     incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
 
-    # Both executors land in the aggregate sentinel bucket 0; total 9 vs cap 8.
-    assert incentive.unrented_count_by_bucket[("B200", 0)] == 9
-    assert incentive.cap_multiplier_by_bucket[("B200", 0)] == pytest.approx(8 / 9)
-    for hk in ("miner_a", "miner_b"):
-        assert jobs[hk][0].count_bucket == 0
-        assert jobs[hk][0].unrented_cap_multiplier == pytest.approx(8 / 9)
+    # Nothing accumulated for B200 at all.
+    assert ("B200", 1) not in incentive.unrented_count_by_bucket
+    assert ("B200", 8) not in incentive.unrented_count_by_bucket
+    assert (jobs["miner_a"][0].incentive or 0.0) == pytest.approx(0.0)
 
 
 @pytest.mark.parametrize(
     "bad_cap",
     [
+        {"B200": 8},           # aggregate int no longer accepted
         {"B200": {0: 1}},      # bucket key non-positive
         {"B200": {1: -1}},     # negative cap
         {"B200": "8"},         # wrong outer type
@@ -2592,7 +2537,7 @@ def test_pcc_validator_rejects_malformed_caps(bad_cap):
 
 @pytest.mark.asyncio
 async def test_pcc_snapshot_exposes_by_bucket(monkeypatch):
-    """Snapshot exposes per-bucket state and a legacy aggregated by_gpu_type entry."""
+    """Snapshot exposes per-bucket state via `by_bucket` only (no legacy `by_gpu_type`)."""
     config = _make_pcc_config()
     jobs = {
         "miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 1)],
@@ -2603,11 +2548,11 @@ async def test_pcc_snapshot_exposes_by_bucket(monkeypatch):
     incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
     snapshot = incentive.get_snapshot()
 
-    # New bucket-keyed field has both buckets present.
+    # Bucket-keyed field has both buckets present.
     assert "B200·1" in snapshot.rental.by_bucket
     assert "B200·8" in snapshot.rental.by_bucket
     assert snapshot.rental.by_bucket["B200·1"].unrented_count == 1
     assert snapshot.rental.by_bucket["B200·8"].unrented_count == 16
 
-    # Legacy by_gpu_type aggregates across both buckets (1 + 16 = 17).
-    assert snapshot.rental.by_gpu_type["B200"].unrented_count == 17
+    # Legacy aggregate field no longer exposed on RentalShareState.
+    assert not hasattr(snapshot.rental, "by_gpu_type")
