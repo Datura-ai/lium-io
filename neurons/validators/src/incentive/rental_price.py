@@ -3,9 +3,12 @@
 This module implements the three-phase rental price incentive algorithm that
 rewards unrented high-end GPUs based on their rental market value.
 
-The system uses per-GPU-type caps to dilute incentives when supply exceeds
-demand for specific GPU models. Each GPU type has an independent cap value
-configured in MAX_UNRENTED_GPUS_BY_TYPE.
+The system uses per-`(base_model, gpu_count_bucket)` caps to dilute incentives
+when supply exceeds demand for specific GPU configurations. A base model's cap
+may be configured as either an aggregate `int` (legacy) or a
+`dict[gpu_count_bucket, cap]`. Internally both shapes are normalized onto a
+bucket-keyed state layout where bucket `0` is the sentinel for the aggregate
+path. See `incentive/config.py:MAX_UNRENTED_GPUS_BY_TYPE`.
 """
 
 from __future__ import annotations
@@ -40,6 +43,20 @@ class GpuTypeRentalState(BaseModel):
     weighted_rate_sum: float  # sum(gpu_count * hourly_rate) for this type, cap NOT applied
 
 
+class GpuBucketRentalState(BaseModel):
+    """Per-`(base_model, gpu_count_bucket)` rental state.
+
+    Bucket `0` is the sentinel for base models configured with an aggregate
+    `int` cap (legacy shape). For those, `unrented_count` and
+    `weighted_rate_sum` are the aggregate totals.
+    """
+
+    unrented_count: int
+    max_cap: int
+    cap_multiplier: float
+    weighted_rate_sum: float
+
+
 class RentalMiningState(BaseModel):
     total_gpu_count: int
     total_mining_score: float
@@ -52,6 +69,10 @@ class RentalMiningState(BaseModel):
 class RentalShareState(BaseModel):
     total_rental_cost: float
     by_gpu_type: dict[str, GpuTypeRentalState]
+    # Bucket-keyed state. Key format: f"{base_model}·{bucket}" where bucket=0 for
+    # aggregate-cap base models. `by_gpu_type` remains populated (aggregated per
+    # base model) for one release while internal dashboards migrate.
+    by_bucket: dict[str, GpuBucketRentalState] = Field(default_factory=dict)
 
 
 class RentalPriceSnapshot(BaseModel):
@@ -80,6 +101,7 @@ class RentalPriceEstimate(BaseModel):
     gpu_count: int
     is_rented: bool
     usd_per_epoch: float
+    count_bucket: int | None = None                     # gpu_count_bucket the executor was placed into; 0 for aggregate-cap path
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
     uptime_multiplier: float | None = None              # Multiplier for uptime
@@ -108,8 +130,10 @@ class RentalPriceIncentive(DefaultIncentive):
     - Phase 2: Calculate dynamic emission splits based on rental costs
     - Phase 3: Distribute weights across burn/mining/rental pools
 
-    Cap dilution is applied per GPU type based on max_unrented_gpus dictionary.
-    Each GPU type has an independent cap, allowing different supply/demand dynamics.
+    Cap dilution is applied per `(base_model, gpu_count_bucket)`. Buckets are
+    derived from each executor's `gpu_splitting_min_count` (when GPU splitting
+    is enabled) or its `gpu_count`. Base models configured with an aggregate
+    `int` cap are tracked under sentinel bucket `0`.
     """
 
     price_provider: PriceProvider = PriceProvider()
@@ -126,12 +150,13 @@ class RentalPriceIncentive(DefaultIncentive):
         """
         super().__init__(*args, **kwargs)
 
-        self.unrented_count_by_type: dict[str, int] = {}  # {base_model: raw_gpu_count}
-        self.cap_multiplier_by_base_model: dict[str, float] = {}  # cap dilution multiplier per base model
+        # Bucket-keyed state. Key = (base_model, bucket); bucket=0 for aggregate-cap path.
+        self.unrented_count_by_bucket: dict[tuple[str, int], int] = {}
+        self._weighted_rate_sum_by_bucket: dict[tuple[str, int], float] = {}
+        self.cap_multiplier_by_bucket: dict[tuple[str, int], float] = {}
         self.total_rental_cost = 0.0
         self.rental_share = 0.0
         self.burn_share = 0.0
-        self._weighted_rate_sum_by_type: dict[str, float] = {}  # {base_model: sum(gpu_count * rate)}
         self.epoch_subnet_emission: float = 0.0
         # Store the snapshot so estimation can derive per-model totals from it.
         self._seed_snapshot = snapshot
@@ -144,21 +169,69 @@ class RentalPriceIncentive(DefaultIncentive):
             assert gpu_type in BASE_GPU_MAP.keys(), f"GPU type {gpu_type} not found in BASE_GPU_MAP"
 
         if snapshot:
-            for base_model, state in snapshot.rental.by_gpu_type.items():
-                self.unrented_count_by_type[base_model] = state.unrented_count
-                self._weighted_rate_sum_by_type[base_model] = state.weighted_rate_sum
+            self._seed_state_from_snapshot(snapshot)
             self.total_mining_score = snapshot.mining.total_mining_score
             self.epoch_subnet_emission = snapshot.epoch_subnet_emission
+
+    def _seed_state_from_snapshot(self, snapshot: "RentalPriceSnapshot") -> None:
+        """Restore bucket-keyed state from a snapshot.
+
+        Prefers the new `by_bucket` field. Falls back to `by_gpu_type` (legacy
+        snapshots) by placing each base model into its own aggregate bucket
+        sentinel `0`.
+        """
+        if snapshot.rental.by_bucket:
+            for key_str, state in snapshot.rental.by_bucket.items():
+                base_model, bucket_str = key_str.rsplit("·", 1)
+                key = (base_model, int(bucket_str))
+                self.unrented_count_by_bucket[key] = state.unrented_count
+                self._weighted_rate_sum_by_bucket[key] = state.weighted_rate_sum
+            return
+
+        for base_model, state in snapshot.rental.by_gpu_type.items():
+            key = (base_model, 0)
+            self.unrented_count_by_bucket[key] = state.unrented_count
+            self._weighted_rate_sum_by_bucket[key] = state.weighted_rate_sum
 
     def get_base_model_for_gpu(self, gpu_model: str) -> str:
         base_model = BASE_GPU_MAP[gpu_model]
         return base_model
 
+    @staticmethod
+    def _resolve_bucket(result: JobResult) -> int:
+        """Pick the gpu_count bucket the executor is rated against.
+
+        Mirrors the rate-resolution logic in `_pre_process_job_result`: when
+        splitting is enabled the executor is paid at the `min_count` tier, so
+        it must also be accounted in that tier's cap bucket.
+        """
+        if result.supports_gpu_splitting and result.gpu_splitting_min_count:
+            return result.gpu_splitting_min_count
+        return result.gpu_count
+
+    @staticmethod
+    def _bucket_key_str(base_model: str, bucket: int) -> str:
+        return f"{base_model}·{bucket}"
+
+    def _resolve_cap(self, base_model: str, result: JobResult) -> tuple[int, int]:
+        """Return (count_bucket, max_cap) for a given executor.
+
+        - dict-shaped cap → bucket = `_resolve_bucket(result)`, cap = entry or 0
+        - int-shaped cap (or missing) → bucket = 0 (aggregate sentinel), cap = int
+        """
+        cap_spec = self.config.max_unrented_gpus.get(base_model, 0)
+        if isinstance(cap_spec, dict):
+            bucket = self._resolve_bucket(result)
+            return bucket, int(cap_spec.get(bucket, 0))
+        return 0, int(cap_spec)
+
     async def _pre_process_job_result(self, hotkey: str, result: JobResult):
         """Process a job result.
-        Aggregate metrics from job result.
 
-        Note: max_unrented_gpus is now a dictionary per GPU type.
+        Aggregate per-`(base_model, bucket)` metrics for the rental-share
+        algorithm. Bucket resolution is symmetric with the rate-resolution
+        path so split-capable executors land in the bucket of their
+        `gpu_splitting_min_count`.
         """
         if not result.is_successful:
             return
@@ -188,15 +261,18 @@ class RentalPriceIncentive(DefaultIncentive):
             # Sysbox penalty: applied later via effective_rate, not baked into hourly_rate
             result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
 
-            result.max_cap = self.config.max_unrented_gpus.get(base_model, 0)
+            bucket, max_cap = self._resolve_cap(base_model, result)
+            result.count_bucket = bucket
+            result.max_cap = max_cap
 
-            # accumulate raw unrented GPU count and weighted rate sum per base model (only if rate > 0)
+            # accumulate raw unrented GPU count and weighted rate sum per bucket (only if rate > 0)
             if result.hourly_rate > 0:
-                self.unrented_count_by_type[base_model] = (
-                    self.unrented_count_by_type.get(base_model, 0) + result.gpu_count
+                key = (base_model, bucket)
+                self.unrented_count_by_bucket[key] = (
+                    self.unrented_count_by_bucket.get(key, 0) + result.gpu_count
                 )
-                self._weighted_rate_sum_by_type[base_model] = (
-                    self._weighted_rate_sum_by_type.get(base_model, 0)
+                self._weighted_rate_sum_by_bucket[key] = (
+                    self._weighted_rate_sum_by_bucket.get(key, 0.0)
                     + result.gpu_count * result.hourly_rate * result.sysbox_multiplier
                 )
 
@@ -205,15 +281,21 @@ class RentalPriceIncentive(DefaultIncentive):
 
         - Calculate rental share
         """
-        # Step 1: cap multiplier from raw counts
-        for base_model, unrented_count in self.unrented_count_by_type.items():
-            max_cap = self.config.max_unrented_gpus.get(base_model, 0)
-            if unrented_count > 0:
-                self.cap_multiplier_by_base_model[base_model] = min(unrented_count, max_cap) / unrented_count
+        # Step 1: cap multiplier per (base_model, bucket).
+        for (base_model, bucket), unrented_count in self.unrented_count_by_bucket.items():
+            cap_spec = self.config.max_unrented_gpus.get(base_model, 0)
+            if isinstance(cap_spec, dict):
+                max_cap = int(cap_spec.get(bucket, 0))
+            else:
+                max_cap = int(cap_spec)
+            if unrented_count > 0 and max_cap > 0:
+                self.cap_multiplier_by_bucket[(base_model, bucket)] = (
+                    min(unrented_count, max_cap) / unrented_count
+                )
 
-        # Step 2: total_rental_cost from accumulated weighted rate sums
-        for base_model, weighted_sum in self._weighted_rate_sum_by_type.items():
-            cap_mult = self.cap_multiplier_by_base_model.get(base_model, 0)
+        # Step 2: total_rental_cost from per-bucket weighted rate sums.
+        for key, weighted_sum in self._weighted_rate_sum_by_bucket.items():
+            cap_mult = self.cap_multiplier_by_bucket.get(key, 0.0)
             self.total_rental_cost += cap_mult * weighted_sum
 
         rental_share_raw = await self._calculate_rental_share(self.total_rental_cost)
@@ -261,12 +343,14 @@ class RentalPriceIncentive(DefaultIncentive):
 
         # state updates
         base_model = self.get_base_model_for_gpu(result.gpu_model)
-        result.total_unrented_by_gpu_type = self.unrented_count_by_type.get(base_model, 0)
+        bucket = result.count_bucket if result.count_bucket is not None else 0
+        key = (base_model, bucket)
+        result.total_unrented_by_gpu_type = self.unrented_count_by_bucket.get(key, 0)
         result.cap_dilution_applied = result.total_unrented_by_gpu_type > result.max_cap
         result.rental_share = self.rental_share
         result.burn_share = self.burn_share
         result.total_rental_cost = self.total_rental_cost
-        result.unrented_cap_multiplier = self.cap_multiplier_by_base_model.get(base_model, 0)
+        result.unrented_cap_multiplier = self.cap_multiplier_by_bucket.get(key, 0.0)
         result.effective_rate = result.hourly_rate * result.unrented_cap_multiplier * result.sysbox_multiplier
 
         # calculate incentive score
@@ -290,6 +374,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     "unrented_cap_multiplier": result.unrented_cap_multiplier,
                     "effective_rate": result.effective_rate,
                     "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,
+                    "count_bucket": bucket,
                     "max_cap": result.max_cap,
                     "cap_dilution_applied": result.cap_dilution_applied,
                     "rental_share": result.rental_share,
@@ -375,10 +460,12 @@ class RentalPriceIncentive(DefaultIncentive):
         is_rented = params.is_rented
 
         base_model = BASE_GPU_MAP.get(gpu_model)
-        eligible_for_unrented_estimate = (
-            base_model is not None
-            and self.config.max_unrented_gpus.get(base_model, 0) > 0
-        )
+        cap_spec = self.config.max_unrented_gpus.get(base_model, 0) if base_model else 0
+        if isinstance(cap_spec, dict):
+            cap_present = any(v > 0 for v in cap_spec.values())
+        else:
+            cap_present = cap_spec > 0
+        eligible_for_unrented_estimate = base_model is not None and cap_present
         if base_model is None or (not is_rented and not eligible_for_unrented_estimate):
             return RentalPriceEstimate(
                 gpu_model=gpu_model,
@@ -430,6 +517,7 @@ class RentalPriceIncentive(DefaultIncentive):
             gpu_count=fake_result.gpu_count,
             is_rented=fake_result.is_rented,
             usd_per_epoch=(fake_result.incentive or 0.0) * self.epoch_subnet_emission * FIXED_RATIO,
+            count_bucket=fake_result.count_bucket,
             mining_score=fake_result.mining_score,
             sysbox_multiplier=fake_result.sysbox_multiplier,
             uptime_multiplier=fake_result.uptime_multiplier,
@@ -526,16 +614,45 @@ class RentalPriceIncentive(DefaultIncentive):
 
         total_gpu_count = sum(total_gpu_model_count_map.values())
 
-        by_gpu_type: dict[str, GpuTypeRentalState] = {}
-        for base_model, unrented_count in self.unrented_count_by_type.items():
-            max_cap = self.config.max_unrented_gpus.get(base_model, 0)
-            cap_multiplier = self.cap_multiplier_by_base_model.get(base_model, 0.0)
-            weighted_rate_sum = self._weighted_rate_sum_by_type.get(base_model, 0.0)
-            by_gpu_type[base_model] = GpuTypeRentalState(
+        by_bucket: dict[str, GpuBucketRentalState] = {}
+        # Legacy by_gpu_type aggregates across all buckets of a base model. Kept
+        # for one release so dashboards can migrate; remove in follow-up.
+        agg_count: dict[str, int] = {}
+        agg_weighted: dict[str, float] = {}
+        agg_cap: dict[str, int] = {}
+        agg_cap_weighted: dict[str, float] = {}
+        for (base_model, bucket), unrented_count in self.unrented_count_by_bucket.items():
+            cap_spec = self.config.max_unrented_gpus.get(base_model, 0)
+            if isinstance(cap_spec, dict):
+                max_cap = int(cap_spec.get(bucket, 0))
+            else:
+                max_cap = int(cap_spec)
+            cap_multiplier = self.cap_multiplier_by_bucket.get((base_model, bucket), 0.0)
+            weighted_rate_sum = self._weighted_rate_sum_by_bucket.get((base_model, bucket), 0.0)
+            by_bucket[self._bucket_key_str(base_model, bucket)] = GpuBucketRentalState(
                 unrented_count=unrented_count,
                 max_cap=max_cap,
                 cap_multiplier=cap_multiplier,
                 weighted_rate_sum=weighted_rate_sum,
+            )
+            agg_count[base_model] = agg_count.get(base_model, 0) + unrented_count
+            agg_weighted[base_model] = agg_weighted.get(base_model, 0.0) + weighted_rate_sum
+            agg_cap[base_model] = agg_cap.get(base_model, 0) + max_cap
+            # Aggregate cap_multiplier weighted by unrented_count for visibility.
+            agg_cap_weighted[base_model] = (
+                agg_cap_weighted.get(base_model, 0.0) + cap_multiplier * unrented_count
+            )
+
+        by_gpu_type: dict[str, GpuTypeRentalState] = {}
+        for base_model, unrented_count in agg_count.items():
+            agg_multiplier = (
+                agg_cap_weighted[base_model] / unrented_count if unrented_count > 0 else 0.0
+            )
+            by_gpu_type[base_model] = GpuTypeRentalState(
+                unrented_count=unrented_count,
+                max_cap=agg_cap[base_model],
+                cap_multiplier=agg_multiplier,
+                weighted_rate_sum=agg_weighted[base_model],
             )
 
         return RentalPriceSnapshot(
@@ -550,6 +667,7 @@ class RentalPriceIncentive(DefaultIncentive):
             rental=RentalShareState(
                 total_rental_cost=self.total_rental_cost,
                 by_gpu_type=by_gpu_type,
+                by_bucket=by_bucket,
             ),
         )
 

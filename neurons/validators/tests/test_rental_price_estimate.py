@@ -335,9 +335,12 @@ async def test_snapshot_seeding_preserves_accumulated_state(
         snapshot=snapshot,
     )
 
-    # Assert — accumulated state from original epoch is present in seeded instance
-    assert seeded.unrented_count_by_type.get("H100") == 8
-    assert seeded._weighted_rate_sum_by_type.get("H100") == pytest.approx(8 * RENTAL_PRICES_PER_HOUR["H100"])
+    # Assert — accumulated state from original epoch is present in seeded instance.
+    # H100 cap is `int` (16) here, so the bucket sentinel is 0.
+    assert seeded.unrented_count_by_bucket.get(("H100", 0)) == 8
+    assert seeded._weighted_rate_sum_by_bucket.get(("H100", 0)) == pytest.approx(
+        8 * RENTAL_PRICES_PER_HOUR["H100"]
+    )
     assert seeded.epoch_subnet_emission == pytest.approx(TEMPO * TAO_PRICE * ALPHA_RATE)
     assert seeded.total_mining_score == pytest.approx(incentive.total_mining_score)
 

@@ -2287,3 +2287,327 @@ async def test_sync_logs_successful_gpu_estimate_precompute(
     assert len(success_logs) == 1
     assert success_logs[0].extra["duration_ms"] == 500.0
     assert success_logs[0].extra["gpu_models_count"] == 1
+
+
+# ── Per-count rental subsidy cap (Fish table) ────────────────────────────────
+#
+# Direct-algorithm tests for `IncentiveConfig.max_unrented_gpus = {bucket: cap}`.
+# These test `RentalPriceIncentive` end-to-end (pre + finish + post) without
+# spinning up the full validator sync — the validator-level scoring path is
+# already covered by the scenarios above.
+
+from incentive.rental_price import RentalPriceIncentive  # noqa: E402
+
+# Custom BASE_GPU_MAP/prices for these tests so the per-count cap behavior is
+# exercised against a single base model ("B200") with realistic 1× and 8× tiers.
+PCC_BASE_GPU_MAP = {
+    "NVIDIA B200": "B200",
+    "NVIDIA H200": "H200",
+    "NVIDIA H100 80GB HBM3": "H100",
+    "NVIDIA GeForce RTX 4090": "RTX 4090",
+    "NVIDIA A100 80GB PCIe": "A100",
+    "NVIDIA RTX A6000": "RTX A6000",
+    "NVIDIA GeForce RTX 3090": "RTX 3090",
+}
+
+PCC_RENTAL_PRICES = {gpu: 4.0 for gpu in PCC_BASE_GPU_MAP.keys()}
+
+# 1× and 8× tiers eligible; everything else → 0 (mirrors production B200 config).
+PCC_GPU_CUSTOM_PRICES = {gpu: {"*": 0, "1": DEFAULT_PRICE, "8": DEFAULT_PRICE} for gpu in PCC_BASE_GPU_MAP.keys()}
+
+PCC_PER_COUNT_CAPS: dict[str, int | dict[int, int]] = {
+    "B200": {1: 1, 8: 8},
+    "H200": {1: 1, 8: 8},
+    "H100": {1: 1, 8: 8},
+    "RTX 4090": {1: 1, 8: 8},
+    "A100": {1: 1, 8: 8},
+    "RTX A6000": {1: 1, 8: 8},
+    "RTX 3090": {1: 1, 8: 8},
+}
+
+PCC_HOURLY_RATE = 4.0
+PCC_SYSBOX_MULTIPLIER = 1.0  # sysbox_runtime=True → multiplier=1.0
+
+
+def _make_pcc_config(caps: dict[str, int | dict[int, int]] | None = None) -> IncentiveConfig:
+    return IncentiveConfig(
+        algorithm=ALGORITHM,
+        rental_incentive_gpu_types=list(PCC_PER_COUNT_CAPS.keys()),
+        max_unrented_gpus=caps if caps is not None else PCC_PER_COUNT_CAPS,
+        rental_prices_per_hour=PCC_RENTAL_PRICES,
+        gpu_count_custom_prices=PCC_GPU_CUSTOM_PRICES,
+    )
+
+
+def _make_pcc_job(
+    executor_id: str,
+    gpu_model: str,
+    gpu_count: int,
+    *,
+    is_rented: bool = False,
+    supports_gpu_splitting: bool = False,
+    gpu_splitting_min_count: int | None = None,
+):
+    from datura.requests.miner_requests import ExecutorSSHInfo
+    from services.task_service import JobResult
+
+    return JobResult(
+        executor_info=ExecutorSSHInfo(
+            uuid=executor_id, address="10.0.0.1", port=8080,
+            ssh_username="root", ssh_port=22,
+            python_path="/usr/bin/python3", root_dir="/tmp",
+        ),
+        score=1.0, job_score=1.0, job_batch_id="pcc-batch",
+        log_status="success", log_text="ok",
+        gpu_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented,
+        collateral_deposited=True, sysbox_runtime=True,
+        supports_gpu_splitting=supports_gpu_splitting,
+        gpu_splitting_min_count=gpu_splitting_min_count,
+    )
+
+
+async def _run_pcc_incentive(
+    config: IncentiveConfig,
+    job_results: dict,
+    monkeypatch,
+):
+    """Run the rental-price algorithm directly and return the populated instance."""
+    redis = AsyncMock()
+    redis.get_portion_per_gpu_type = AsyncMock(return_value=0.3)
+    redis.get_executor_uptime = AsyncMock(return_value=9999)
+
+    monkeypatch.setattr(rental_price_module, "BASE_GPU_MAP", PCC_BASE_GPU_MAP)
+
+    incentive = RentalPriceIncentive(
+        config, redis, job_results,
+        total_gpu_model_count_map={k: v for k, v in
+            ((r.gpu_model, sum(j.gpu_count for j in jobs if j.gpu_model == r.gpu_model))
+             for jobs in job_results.values() for r in jobs)},
+    )
+
+    price_provider = AsyncMock()
+    price_provider.get_tao_price.return_value = TAO_PRICE
+    price_provider.get_alpha_rate.return_value = ALPHA_RATE
+    incentive.price_provider = price_provider
+
+    await incentive.calculate_mining_scores()
+    return incentive
+
+
+@pytest.mark.asyncio
+async def test_pcc_case1_single_1xB200_full_payout(monkeypatch):
+    """Fish case 1 — one 1×B200 unrented executor receives full payout."""
+    config = _make_pcc_config()
+    jobs = {"miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 1)]}
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 1
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    result = jobs["miner_a"][0]
+    assert result.count_bucket == 1
+    assert result.effective_rate == pytest.approx(PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+
+
+@pytest.mark.asyncio
+async def test_pcc_case2_two_1xB200_split_budget(monkeypatch):
+    """Fish case 2 — two 1×B200 executors each get half the 1× budget."""
+    config = _make_pcc_config()
+    jobs = {
+        "miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 1)],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 1)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 2
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(0.5)
+    expected_eff = 0.5 * PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER
+    for hk in ("miner_a", "miner_b"):
+        assert jobs[hk][0].effective_rate == pytest.approx(expected_eff)
+
+
+@pytest.mark.asyncio
+async def test_pcc_case3_2xB200_no_split_no_subsidy(monkeypatch):
+    """Fish case 3 — 2×B200 without GPU splitting has rate=0 and is not accumulated."""
+    config = _make_pcc_config()
+    jobs = {"miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 2)]}
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    # 2× tier price is 0 → executor not accumulated into any bucket.
+    assert ("B200", 1) not in incentive.unrented_count_by_bucket
+    assert ("B200", 2) not in incentive.unrented_count_by_bucket
+    assert ("B200", 8) not in incentive.unrented_count_by_bucket
+    result = jobs["miner_a"][0]
+    assert result.hourly_rate == 0.0
+    assert (result.incentive or 0.0) == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_pcc_case4_2xB200_with_split_lands_in_1_bucket(monkeypatch):
+    """Fish case 4 — 2×B200 with `gpu_splitting_min_count=1` lands in the 1× bucket."""
+    config = _make_pcc_config()
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 2,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    # Both GPUs counted into the 1× bucket; with cap=1 → cap_mult = 1/2 = 0.5.
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 2
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(0.5)
+    result = jobs["miner_a"][0]
+    assert result.count_bucket == 1
+    # Per-GPU effective_rate is half of the 1× rate (matches case 2).
+    assert result.effective_rate == pytest.approx(0.5 * PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+
+
+@pytest.mark.asyncio
+async def test_pcc_case5_single_8xB200_full_payout(monkeypatch):
+    """Fish case 5 — one 8×B200 executor gets the full 8-GPU payout."""
+    config = _make_pcc_config()
+    jobs = {"miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 8)]}
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 8
+    assert incentive.cap_multiplier_by_bucket[("B200", 8)] == pytest.approx(1.0)
+    result = jobs["miner_a"][0]
+    assert result.count_bucket == 8
+    assert result.effective_rate == pytest.approx(PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+
+
+@pytest.mark.asyncio
+async def test_pcc_mixed_1x_and_8x_both_full(monkeypatch):
+    """Fish desired steady state — 1× and 8× executors coexist, both receive full payout."""
+    config = _make_pcc_config()
+    jobs = {
+        "miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 1)],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    assert incentive.cap_multiplier_by_bucket[("B200", 8)] == pytest.approx(1.0)
+    assert jobs["miner_a"][0].effective_rate == pytest.approx(PCC_HOURLY_RATE)
+    assert jobs["miner_b"][0].effective_rate == pytest.approx(PCC_HOURLY_RATE)
+
+
+@pytest.mark.asyncio
+async def test_pcc_overflow_isolated_within_bucket(monkeypatch):
+    """Two 8×B200 executors dilute the 8× bucket; the 1× bucket is unaffected."""
+    config = _make_pcc_config()
+    jobs = {
+        "miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 8)],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+        "miner_c": [_make_pcc_job("exec-c", "NVIDIA B200", 1)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    # 8× bucket: 16 unrented vs cap 8 → 0.5 multiplier.
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 16
+    assert incentive.cap_multiplier_by_bucket[("B200", 8)] == pytest.approx(8 / 16)
+    # 1× bucket: 1 unrented vs cap 1 → 1.0 multiplier (no dilution).
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 1
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    # 1× executor's payout is unaffected by the 8× overflow.
+    assert jobs["miner_c"][0].effective_rate == pytest.approx(PCC_HOURLY_RATE)
+
+
+@pytest.mark.parametrize(
+    "gpu_model, base",
+    [
+        ("NVIDIA B200", "B200"),
+        ("NVIDIA H200", "H200"),
+        ("NVIDIA H100 80GB HBM3", "H100"),
+        ("NVIDIA GeForce RTX 4090", "RTX 4090"),
+        ("NVIDIA A100 80GB PCIe", "A100"),
+        ("NVIDIA RTX A6000", "RTX A6000"),
+        ("NVIDIA GeForce RTX 3090", "RTX 3090"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pcc_per_family_migration(gpu_model, base, monkeypatch):
+    """Per-family migration — `{1: 1, 8: 8}` works for every migrated family."""
+    config = _make_pcc_config()
+    jobs = {
+        "miner_a": [_make_pcc_job("exec-a", gpu_model, 1)],
+        "miner_b": [_make_pcc_job("exec-b", gpu_model, 8)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    assert incentive.cap_multiplier_by_bucket[(base, 1)] == pytest.approx(1.0)
+    assert incentive.cap_multiplier_by_bucket[(base, 8)] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_pcc_aggregate_int_cap_regression(monkeypatch):
+    """Regression — int cap form pools all counts into one aggregate bucket (sentinel 0)."""
+    # Aggregate cap of 8 across all B200 counts, like before this change.
+    config = _make_pcc_config(caps={"B200": 8})
+    config.rental_incentive_gpu_types = ["B200"]
+    jobs = {
+        "miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 1)],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    # Both executors land in the aggregate sentinel bucket 0; total 9 vs cap 8.
+    assert incentive.unrented_count_by_bucket[("B200", 0)] == 9
+    assert incentive.cap_multiplier_by_bucket[("B200", 0)] == pytest.approx(8 / 9)
+    for hk in ("miner_a", "miner_b"):
+        assert jobs[hk][0].count_bucket == 0
+        assert jobs[hk][0].unrented_cap_multiplier == pytest.approx(8 / 9)
+
+
+@pytest.mark.parametrize(
+    "bad_cap",
+    [
+        {"B200": {0: 1}},      # bucket key non-positive
+        {"B200": {1: -1}},     # negative cap
+        {"B200": "8"},         # wrong outer type
+        {"B200": {"1": 1}},    # bucket key not int
+        {"B200": {1: "1"}},    # cap not int
+    ],
+)
+def test_pcc_validator_rejects_malformed_caps(bad_cap):
+    """Validator — malformed `max_unrented_gpus` entries raise ValueError."""
+    with pytest.raises(ValueError):
+        IncentiveConfig(
+            algorithm=ALGORITHM,
+            rental_incentive_gpu_types=["B200"],
+            max_unrented_gpus=bad_cap,
+            rental_prices_per_hour=PCC_RENTAL_PRICES,
+            gpu_count_custom_prices=PCC_GPU_CUSTOM_PRICES,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pcc_snapshot_exposes_by_bucket(monkeypatch):
+    """Snapshot exposes per-bucket state and a legacy aggregated by_gpu_type entry."""
+    config = _make_pcc_config()
+    jobs = {
+        "miner_a": [_make_pcc_job("exec-a", "NVIDIA B200", 1)],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+        "miner_c": [_make_pcc_job("exec-c", "NVIDIA B200", 8)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+    snapshot = incentive.get_snapshot()
+
+    # New bucket-keyed field has both buckets present.
+    assert "B200·1" in snapshot.rental.by_bucket
+    assert "B200·8" in snapshot.rental.by_bucket
+    assert snapshot.rental.by_bucket["B200·1"].unrented_count == 1
+    assert snapshot.rental.by_bucket["B200·8"].unrented_count == 16
+
+    # Legacy by_gpu_type aggregates across both buckets (1 + 16 = 17).
+    assert snapshot.rental.by_gpu_type["B200"].unrented_count == 17

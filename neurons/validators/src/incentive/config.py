@@ -22,19 +22,24 @@ class DefaultPrice:
 DEFAULT_PRICE = DefaultPrice()
 
 
-# Maximum unrented GPUs per GPU type before cap dilution is applied
-# High-end GPUs have lower caps (12-24) due to scarcity and high value
-# Mid-tier GPUs have moderate caps (24-48) for balanced incentives
-# Lower-tier GPUs have higher caps (48-96) to accommodate larger deployments
-MAX_UNRENTED_GPUS_BY_TYPE = {
+# Maximum unrented GPUs per GPU type before cap dilution is applied.
+# Values can be either:
+#   * `int` — aggregate cap across all counts of the base model (legacy shape).
+#   * `dict[int, int]` — per-`gpu_count_bucket` caps. Each executor is placed in
+#     the bucket matching its `gpu_splitting_min_count` when GPU splitting is
+#     enabled, otherwise its `gpu_count`. Buckets are independent: the cap
+#     multiplier is computed separately per `(base_model, bucket)`.
+# Families migrated to per-count caps use `{1: 1, 8: 8}` — one single-GPU budget
+# and one full-chassis (8×) budget, matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
+MAX_UNRENTED_GPUS_BY_TYPE: dict[str, int | dict[int, int]] = {
     "B300": 0,
-    "B200": 8,
-    "H200": 8,
-    "H100": 8,
-    "RTX 4090": 8,
-    "A100": 8,
-    "RTX A6000": 8,
-    "RTX 3090": 8,
+    "B200": {1: 1, 8: 8},
+    "H200": {1: 1, 8: 8},
+    "H100": {1: 1, 8: 8},
+    "RTX 4090": {1: 1, 8: 8},
+    "A100": {1: 1, 8: 8},
+    "RTX A6000": {1: 1, 8: 8},
+    "RTX 3090": {1: 1, 8: 8},
     "H800": 0,
     "RTX 5090": 0,
     "RTX 4000 Ada Generation": 0,
@@ -123,14 +128,21 @@ class IncentiveConfig(BaseModel):
 
     rental_incentive_gpu_types: list[str] = Field(
         default=[
-            gpu_type for gpu_type, cap in MAX_UNRENTED_GPUS_BY_TYPE.items() if cap > 0
+            gpu_type
+            for gpu_type, cap in MAX_UNRENTED_GPUS_BY_TYPE.items()
+            if (isinstance(cap, int) and cap > 0)
+            or (isinstance(cap, dict) and any(v > 0 for v in cap.values()))
         ],
         description="GPU types eligible for rental price incentives (excludes types with 0 cap)"
     )
 
-    max_unrented_gpus: dict[str, int] = Field(
+    max_unrented_gpus: dict[str, int | dict[int, int]] = Field(
         default=MAX_UNRENTED_GPUS_BY_TYPE,
-        description="Maximum unrented GPUs per GPU type before cap dilution"
+        description=(
+            "Maximum unrented GPUs per GPU type before cap dilution. "
+            "int = aggregate cap across all counts (legacy). "
+            "dict[int, int] = per-`gpu_count_bucket` caps."
+        ),
     )
 
     rental_prices_per_hour: dict[str, float] = Field(
@@ -154,16 +166,50 @@ class IncentiveConfig(BaseModel):
             )
         return v
 
-    @field_validator("max_unrented_gpus")
+    @field_validator("max_unrented_gpus", mode="before")
     @classmethod
-    def validate_max_unrented_gpus(cls, v: dict[str, int]) -> dict[str, int]:
-        """Validate that max_unrented_gpus values are non-negative."""
-        # Validate all values are non-negative integers
+    def validate_max_unrented_gpus(
+        cls,
+        v: dict[str, int | dict[int, int]],
+    ) -> dict[str, int | dict[int, int]]:
+        """Validate max_unrented_gpus entries.
+
+        Each value must be either a non-negative `int` (aggregate cap) or a
+        `dict[int, int]` mapping positive gpu_count buckets to non-negative
+        caps. Any other shape is rejected with a ValueError naming the offender.
+        """
         for gpu_type, cap in v.items():
-            if cap < 0:
+            if isinstance(cap, bool):
                 raise ValueError(
-                    f"max_unrented_gpus for {gpu_type} must be non-negative, got: {cap}"
+                    f"max_unrented_gpus for {gpu_type} must be int or dict[int, int], "
+                    f"got bool: {cap!r}"
                 )
+            if isinstance(cap, int):
+                if cap < 0:
+                    raise ValueError(
+                        f"max_unrented_gpus for {gpu_type} must be non-negative, got: {cap}"
+                    )
+                continue
+            if isinstance(cap, dict):
+                for bucket, bucket_cap in cap.items():
+                    if not isinstance(bucket, int) or isinstance(bucket, bool) or bucket <= 0:
+                        raise ValueError(
+                            f"max_unrented_gpus[{gpu_type!r}] bucket key must be positive int, "
+                            f"got {bucket!r}"
+                        )
+                    if (
+                        not isinstance(bucket_cap, int)
+                        or isinstance(bucket_cap, bool)
+                        or bucket_cap < 0
+                    ):
+                        raise ValueError(
+                            f"max_unrented_gpus[{gpu_type!r}][{bucket}] cap must be "
+                            f"non-negative int, got {bucket_cap!r}"
+                        )
+                continue
+            raise ValueError(
+                f"max_unrented_gpus for {gpu_type} must be int or dict[int, int], got: {cap!r}"
+            )
 
         return v
 

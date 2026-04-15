@@ -38,10 +38,11 @@ class JobResult(BaseModel):
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
     incentive: float | None = None                      # Incentive score for the executor in this cycle
 
-    # V2 incentive relevant fields 
+    # V2 incentive relevant fields
     effective_rate: float | None = None              # Effective rate for the executor in this cycle for scoring logic
     hourly_rate: float | None = None                  # Hourly rate for the executor in this cycle for scoring logic
     max_cap: int | None = None                        # Max cap for GPU counts in this cycle for scoring logic
+    count_bucket: int | None = None                    # gpu_count_bucket the executor is accounted against; 0 = aggregate-cap path
     total_unrented_by_gpu_type: float | None = None          # Weighted GPU count for the executor in this cycle for scoring logic
     cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
     eligible_for_rental_share: bool = False

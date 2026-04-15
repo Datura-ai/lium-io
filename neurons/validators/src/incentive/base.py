@@ -63,7 +63,7 @@ class BaseIncentive(ABC):
             for result in results:
                 await self._post_process_job_result(hotkey, result)
 
-        log_for_monitoring(self.job_results, t1, getattr(self, "unrented_count_by_type", None))
+        log_for_monitoring(self.job_results, t1, getattr(self, "unrented_count_by_bucket", None))
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Callback before post-processing a job result.
