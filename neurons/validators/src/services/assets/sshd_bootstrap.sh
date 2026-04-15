@@ -86,11 +86,21 @@ ensure_sshd_installed() {
     return 1
 }
 
+harden_sshd_config() {
+    sshd_config="/etc/ssh/sshd_config"
+    [ -f "$sshd_config" ] || return 0
+    if grep -q '^# lium-hardened$' "$sshd_config" 2>/dev/null; then
+        return 0
+    fi
+    printf '\n# lium-hardened\nPasswordAuthentication no\nChallengeResponseAuthentication no\n' >> "$sshd_config"
+}
+
 prepare_sshd_runtime() {
     mkdir -p /run/sshd
     mkdir -p /root/.ssh
     chmod 700 /root/.ssh
     ssh-keygen -A
+    harden_sshd_config
 }
 
 start_sshd_if_needed() {
