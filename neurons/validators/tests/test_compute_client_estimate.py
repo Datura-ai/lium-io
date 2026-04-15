@@ -27,8 +27,8 @@ async def test_handle_get_estimate_queues_protocol_safe_response_and_logs(monkey
             },
             "rental": {
                 "total_rental_cost": 10.0,
-                "by_gpu_type": {
-                    "H100": {
+                "by_bucket": {
+                    "H100·1": {
                         "unrented_count": 1,
                         "max_cap": 16,
                         "cap_multiplier": 1.0,
