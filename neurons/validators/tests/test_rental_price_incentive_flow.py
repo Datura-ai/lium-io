@@ -2429,6 +2429,29 @@ async def test_pcc_case5_single_8xB200_full_payout(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pcc_8xB200_split_prefers_8_bucket(monkeypatch):
+    """8×B200 splitting + min_count=1 should land in the 8× bucket (configured)
+    instead of being forced into the 1× bucket and diluting its subsidy.
+    """
+    config = _make_pcc_config()
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    assert ("B200", 1) not in incentive.unrented_count_by_bucket
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 8
+    assert incentive.cap_multiplier_by_bucket[("B200", 8)] == pytest.approx(1.0)
+    result = jobs["miner_a"][0]
+    assert result.count_bucket == 8
+    assert result.effective_rate == pytest.approx(PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+
+
+@pytest.mark.asyncio
 async def test_pcc_mixed_1x_and_8x_both_full(monkeypatch):
     """Fish desired steady state — 1× and 8× executors coexist, both receive full payout."""
     config = _make_pcc_config()
