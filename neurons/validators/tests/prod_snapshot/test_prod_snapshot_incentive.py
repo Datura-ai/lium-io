@@ -165,6 +165,8 @@ def _build_job_results(prod_snapshot: dict) -> dict[str, list[JobResult]]:
                 job_batch_id=r["job_batch_id"],
                 log_status=r["log_status"],
                 log_text=r["log_text"],
+                supports_gpu_splitting=r.get("supports_gpu_splitting", False),
+                gpu_splitting_min_count=r.get("gpu_splitting_min_count"),
             )
             job_results[hotkey].append(job_result)
     return job_results
