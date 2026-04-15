@@ -58,19 +58,54 @@ def log_for_monitoring(
         burn_share = first_with_rental.burn_share if first_with_rental else float(TOTAL_BURN_EMISSION)
         total_rental_cost = first_with_rental.total_rental_cost if first_with_rental else 0
 
-        # Bucket-keyed map uses tuple keys; serialize as "{base}·{bucket}" for log readability.
+        # Bucket-keyed map uses tuple keys; serialize as "{base}_{bucket}" for Loki unwrap compatibility.
         unrented_count_by_group = {
-            f"{base}·{bucket}": count
+            f"{base}_{bucket}": count
             for (base, bucket), count in (unrented_count_by_bucket or {}).items()
         }
+
+        # Aggregate per-bucket stats from eligible unrented executors for dashboard-friendly logging.
+        unrented_by_bucket: dict[str, dict[str, float]] = {}
+        for results in job_results.values():
+            for r in results:
+                if not r.eligible_for_rental_share:
+                    continue
+                base = BASE_GPU_MAP.get(r.gpu_model, r.gpu_model)
+                bucket = r.count_bucket if r.count_bucket is not None else 0
+                key = f"{base}_{bucket}"
+                eff = r.effective_rate or 0
+                agg = unrented_by_bucket.setdefault(key, {
+                    "base_model": base,
+                    "bucket": bucket,
+                    "count": 0,
+                    "hourly_rate": r.hourly_rate or 0,
+                    "cap_multiplier": r.unrented_cap_multiplier or 0,
+                    "sysbox_multiplier_sum": 0.0,
+                    "cost_per_h": 0.0,
+                })
+                agg["count"] += r.gpu_count
+                agg["cost_per_h"] += r.gpu_count * eff
+                agg["sysbox_multiplier_sum"] += r.gpu_count * (r.sysbox_multiplier or 0)
+
+        for agg in unrented_by_bucket.values():
+            cnt = agg["count"] or 1
+            agg["sysbox_multiplier_avg"] = agg.pop("sysbox_multiplier_sum") / cnt
+            agg["share_of_rental_pool"] = (
+                agg["cost_per_h"] / total_rental_cost if total_rental_cost else 0.0
+            )
+            agg["share_of_emission"] = agg["share_of_rental_pool"] * rental_share
 
         logger.info(_m("Incentive_results", extra={
             "duration": f"{time() - started_at:.2f}s",
             "unrented_count_by_group": unrented_count_by_group,
+            "unrented_by_bucket": unrented_by_bucket,
             "rental_share": rental_share,
             "burn_share": burn_share,
             "total_rental_cost": total_rental_cost,
         }))
+
+        for key, agg in sorted(unrented_by_bucket.items()):
+            logger.info(_m("Unrented_bucket_summary", extra={"bucket_key": key, **agg}))
 
         # Rental breakdown: one line per executor, sorted by gpu name then gpu count
         if any(r.eligible_for_rental_share for results in job_results.values() for r in results):
