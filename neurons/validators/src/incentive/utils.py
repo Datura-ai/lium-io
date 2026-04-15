@@ -47,7 +47,7 @@ def get_hourly_rate(
 def log_for_monitoring(
     job_results: dict[str, list[JobResult]],
     started_at: float,
-    unrented_count_by_type: dict | None = None,
+    unrented_count_by_bucket: dict | None = None,
 ) -> None:
     try:
         first_with_rental = next(
@@ -58,7 +58,11 @@ def log_for_monitoring(
         burn_share = first_with_rental.burn_share if first_with_rental else float(TOTAL_BURN_EMISSION)
         total_rental_cost = first_with_rental.total_rental_cost if first_with_rental else 0
 
-        unrented_count_by_group = unrented_count_by_type or {}
+        # Bucket-keyed map uses tuple keys; serialize as "{base}·{bucket}" for log readability.
+        unrented_count_by_group = {
+            f"{base}·{bucket}": count
+            for (base, bucket), count in (unrented_count_by_bucket or {}).items()
+        }
 
         logger.info(_m("Incentive_results", extra={
             "duration": f"{time() - started_at:.2f}s",
@@ -81,6 +85,8 @@ def log_for_monitoring(
 
         for base, r in sorted(rental_executors, key=lambda x: (x[0], x[1].gpu_count)):
             key = f"{r.gpu_count}x{base}"
+            bucket = r.count_bucket if r.count_bucket is not None else 0
+            bucket_key = f"{base}·{bucket}"
             cap = r.unrented_cap_multiplier or 0
             rate = r.hourly_rate or 0
             eff = r.effective_rate or 0
@@ -88,10 +94,11 @@ def log_for_monitoring(
             ex_cost = r.gpu_count * eff
             ex_id = r.executor_info.uuid[:8] if r.executor_info.uuid else "?"
             logger.info(_m(
-                f"Rental_breakdown | {key} [{ex_id}] | ${rate:.2f} * {cap:.2f} * {sysbox:.2f} = ${eff:.3f}/gpu * {r.gpu_count}gpu = ${ex_cost:.2f}",
-                extra={"group": key, "executor_id": ex_id, "hourly_rate": rate,
-                        "unrented_cap_multiplier": cap, "sysbox_multiplier": sysbox,
-                        "effective_rate": eff, "gpu_count": r.gpu_count, "executor_cost": ex_cost},
+                f"Rental_breakdown | {key} [{ex_id}] {bucket_key} | ${rate:.2f} * {cap:.2f} * {sysbox:.2f} = ${eff:.3f}/gpu * {r.gpu_count}gpu = ${ex_cost:.2f}",
+                extra={"group": key, "bucket_key": bucket_key, "executor_id": ex_id,
+                        "hourly_rate": rate, "unrented_cap_multiplier": cap,
+                        "sysbox_multiplier": sysbox, "effective_rate": eff,
+                        "gpu_count": r.gpu_count, "executor_cost": ex_cost},
             ))
 
         for job_list in job_results.values():
