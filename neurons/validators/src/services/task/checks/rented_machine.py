@@ -284,5 +284,59 @@ async def _collect_pod_diagnostics(ssh_client, container_name: str) -> dict:
     except Exception as exc:
         result["logs_error"] = str(exc)
 
+    host_context = await _collect_host_context(ssh_client)
+    if host_context:
+        result["host_context"] = host_context
+
+    return result
+
+
+async def _collect_host_context(ssh_client) -> dict:
+    """Collect executor-host context that helps distinguish real pod failure from host reboot
+    or executor-container restart.
+
+    Two independent signals:
+      - `host_boot_time` from `uptime -s` — if it is close to the pod's FinishedAt, the host
+        likely rebooted and the pod did not come back up on its own.
+      - `executor_container_started_at` — if far newer than `host_boot_time`, the executor
+        container itself restarted (watchtower, compose restart, autoheal) without a full
+        host reboot. The executor container is located via the compose service label so
+        that the lookup survives renames.
+
+    All failures are swallowed into `*_error` fields — this runs on the already-open SSH
+    session, so we prefer empty signal over raising and losing the rest of the event.
+    """
+    result: dict = {}
+
+    try:
+        uptime_result = await ssh_client.run("uptime -s")
+        boot_time = (uptime_result.stdout or "").strip()
+        if boot_time:
+            result["host_boot_time"] = boot_time
+    except Exception as exc:
+        result["host_boot_error"] = str(exc)
+
+    try:
+        name_cmd = (
+            "/usr/bin/docker ps -a "
+            "--filter label=com.docker.compose.service=executor "
+            "--format '{{.Names}}' | head -n 1"
+        )
+        name_result = await ssh_client.run(name_cmd)
+        executor_name = (name_result.stdout or "").strip().splitlines()[0:1]
+        executor_name = executor_name[0] if executor_name else ""
+        if executor_name:
+            quoted_executor = shlex.quote(executor_name)
+            start_cmd = (
+                f"/usr/bin/docker inspect --format '{{{{.State.StartedAt}}}}' {quoted_executor}"
+            )
+            start_result = await ssh_client.run(start_cmd)
+            started_at = (start_result.stdout or "").strip()
+            if started_at:
+                result["executor_container_name"] = executor_name
+                result["executor_container_started_at"] = started_at
+    except Exception as exc:
+        result["executor_container_error"] = str(exc)
+
     return result
 

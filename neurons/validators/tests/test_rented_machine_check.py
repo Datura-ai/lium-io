@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 from neurons.validators.src.services.task.checks.rented_machine import (
     TenantEnforcementCheck,
+    _collect_host_context,
     _collect_pod_diagnostics,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
@@ -352,13 +353,25 @@ async def test_tenant_enforcement_check(
 
 
 class DiagnosticsSSHClient:
-    """SSH mock returning scripted stdout per docker subcommand for diagnostics tests."""
+    """SSH mock returning scripted stdout per docker/shell subcommand for diagnostics tests."""
 
-    def __init__(self, *, inspect_stdout: str = "", inspect_stderr: str = "",
-                 logs_stdout: str = "", raise_on: str | None = None):
+    def __init__(
+        self,
+        *,
+        inspect_stdout: str = "",
+        inspect_stderr: str = "",
+        logs_stdout: str = "",
+        uptime_stdout: str = "",
+        ps_executor_stdout: str = "",
+        executor_inspect_stdout: str = "",
+        raise_on: str | None = None,
+    ):
         self.inspect_stdout = inspect_stdout
         self.inspect_stderr = inspect_stderr
         self.logs_stdout = logs_stdout
+        self.uptime_stdout = uptime_stdout
+        self.ps_executor_stdout = ps_executor_stdout
+        self.executor_inspect_stdout = executor_inspect_stdout
         self.raise_on = raise_on
         self.commands_called: list[str] = []
 
@@ -367,7 +380,17 @@ class DiagnosticsSSHClient:
         if self.raise_on and self.raise_on in command:
             raise RuntimeError(f"ssh failed on {self.raise_on}")
         result = Mock()
-        if "docker inspect" in command:
+        # Order matters — more specific matches first.
+        if command.startswith("uptime"):
+            result.stdout = self.uptime_stdout
+            result.stderr = ""
+        elif "--filter label=com.docker.compose.service=executor" in command:
+            result.stdout = self.ps_executor_stdout
+            result.stderr = ""
+        elif "{{.State.StartedAt}}" in command:
+            result.stdout = self.executor_inspect_stdout
+            result.stderr = ""
+        elif "docker inspect" in command:
             result.stdout = self.inspect_stdout
             result.stderr = self.inspect_stderr
         elif "docker logs" in command:
@@ -400,7 +423,14 @@ async def test_collect_pod_diagnostics_reports_exited_container():
     assert diagnostics["logs_tail"].endswith("traceback line 2\n")
     assert any("docker inspect" in cmd for cmd in ssh.commands_called)
     assert any("docker logs" in cmd for cmd in ssh.commands_called)
-    assert all("pod_abc" in cmd for cmd in ssh.commands_called)
+    # Pod-scoped commands all carry the pod name; host-context probes do not.
+    pod_scoped = [
+        cmd for cmd in ssh.commands_called
+        if ("docker inspect" in cmd or "docker logs" in cmd)
+        and "{{.State.StartedAt}}" not in cmd
+    ]
+    assert pod_scoped
+    assert all("pod_abc" in cmd for cmd in pod_scoped)
 
 
 @pytest.mark.asyncio
@@ -426,3 +456,60 @@ async def test_collect_pod_diagnostics_never_raises_on_ssh_failure():
 
     assert "inspect_error" in diagnostics
     assert "ssh failed" in diagnostics["inspect_error"]
+
+
+@pytest.mark.asyncio
+async def test_collect_pod_diagnostics_includes_host_context_when_available():
+    state = {
+        "Status": "exited",
+        "ExitCode": 137,
+        "OOMKilled": True,
+        "Error": "",
+        "StartedAt": "2026-04-20T00:00:00Z",
+        "FinishedAt": "2026-04-20T00:05:00Z",
+    }
+    ssh = DiagnosticsSSHClient(
+        inspect_stdout=json.dumps(state),
+        logs_stdout="oom line\n",
+        uptime_stdout="2026-04-03 10:07:20\n",
+        ps_executor_stdout="executor-executor-1\n",
+        executor_inspect_stdout="2026-04-20T03:23:42.619916501Z\n",
+    )
+
+    diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
+
+    assert diagnostics["state"]["OOMKilled"] is True
+    assert diagnostics["host_context"] == {
+        "host_boot_time": "2026-04-03 10:07:20",
+        "executor_container_name": "executor-executor-1",
+        "executor_container_started_at": "2026-04-20T03:23:42.619916501Z",
+    }
+    # executor lookup uses the compose label filter — not a hardcoded container name
+    assert any(
+        "--filter label=com.docker.compose.service=executor" in cmd
+        for cmd in ssh.commands_called
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_host_context_handles_missing_executor_container():
+    ssh = DiagnosticsSSHClient(
+        uptime_stdout="2026-04-03 10:07:20\n",
+        ps_executor_stdout="",  # no container matching the compose label
+    )
+
+    host_context = await _collect_host_context(ssh)
+
+    assert host_context == {"host_boot_time": "2026-04-03 10:07:20"}
+    assert "executor_container_name" not in host_context
+    assert "executor_container_started_at" not in host_context
+
+
+@pytest.mark.asyncio
+async def test_collect_host_context_never_raises_on_ssh_failure():
+    ssh = DiagnosticsSSHClient(raise_on="uptime")
+
+    host_context = await _collect_host_context(ssh)
+
+    assert "host_boot_error" in host_context
+    assert "ssh failed" in host_context["host_boot_error"]
