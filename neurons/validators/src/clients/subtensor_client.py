@@ -31,28 +31,21 @@ SUBTENSOR_BACKOFF_MAX = 300
 
 @contextlib.contextmanager
 def _log_sync_block(name: str, *, extra: dict | None = None):
-    """Bracket a synchronous call that runs inside the asyncio event loop with entry/exit
-    logs. These helpers double as a breadcrumb trail when async HTTP clients report
-    timeouts that were actually caused by the loop being frozen here.
+    """Time a synchronous call that runs inside the asyncio event loop. Emits a single
+    log on exit with elapsed ms — doubles as a breadcrumb trail when async HTTP clients
+    report timeouts that were actually caused by the loop being frozen here.
     """
     start = time.perf_counter()
-    logger.info(
-        _m(
-            f"[sync-block][start] {name}",
-            extra=get_extra_info({**(extra or {}), "sync_block": name, "phase": "start"}),
-        )
-    )
     try:
         yield
     finally:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         logger.info(
             _m(
-                f"[sync-block][end] {name} ({elapsed_ms}ms)",
+                f"[sync-block] {name} ({elapsed_ms}ms)",
                 extra=get_extra_info({
                     **(extra or {}),
                     "sync_block": name,
-                    "phase": "end",
                     "elapsed_ms": elapsed_ms,
                 }),
             )
