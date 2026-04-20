@@ -1,6 +1,8 @@
 import asyncio
 import bittensor
+import contextlib
 import numpy as np
+import time
 from typing import Self, TYPE_CHECKING
 from bittensor.utils.weight_utils import (
     convert_weights_and_uids_for_emit,
@@ -25,6 +27,36 @@ logger = get_logger(__name__)
 SYNC_CYCLE = 12
 SUBTENSOR_BACKOFF_INITIAL = 12
 SUBTENSOR_BACKOFF_MAX = 300
+
+
+@contextlib.contextmanager
+def _log_sync_block(name: str, *, extra: dict | None = None):
+    """Bracket a synchronous call that runs inside the asyncio event loop with entry/exit
+    logs. These helpers double as a breadcrumb trail when async HTTP clients report
+    timeouts that were actually caused by the loop being frozen here.
+    """
+    start = time.perf_counter()
+    logger.info(
+        _m(
+            f"[sync-block][start] {name}",
+            extra=get_extra_info({**(extra or {}), "sync_block": name, "phase": "start"}),
+        )
+    )
+    try:
+        yield
+    finally:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        logger.info(
+            _m(
+                f"[sync-block][end] {name} ({elapsed_ms}ms)",
+                extra=get_extra_info({
+                    **(extra or {}),
+                    "sync_block": name,
+                    "phase": "end",
+                    "elapsed_ms": elapsed_ms,
+                }),
+            )
+        )
 
 
 class SubtensorClient:
@@ -123,7 +155,8 @@ class SubtensorClient:
         ):
             return
 
-        self.initialize_subtensor()
+        with _log_sync_block("set_subtensor.initialize", extra=self.default_extra):
+            self.initialize_subtensor()
 
     def check_registered(self, subtensor: bittensor.subtensor):
         try:
@@ -153,23 +186,27 @@ class SubtensorClient:
             )
 
     def get_metagraph(self):
-        return self.subtensor.metagraph(netuid=self.netuid)
+        with _log_sync_block("get_metagraph", extra=self.default_extra):
+            return self.subtensor.metagraph(netuid=self.netuid)
 
     def get_node(self):
         # return SubstrateInterface(url=self.config.subtensor.chain_endpoint)
         return self.subtensor.substrate
 
     def get_current_block(self):
-        node = self.get_node()
-        return node.query("System", "Number", []).value
+        with _log_sync_block("get_current_block"):
+            node = self.get_node()
+            return node.query("System", "Number", []).value
 
     def get_weights_rate_limit(self):
-        node = self.get_node()
-        return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
+        with _log_sync_block("get_weights_rate_limit"):
+            node = self.get_node()
+            return node.query("SubtensorModule", "WeightsSetRateLimit", [self.netuid]).value
 
     def get_last_mechansim_step_block(self):
-        node = self.get_node()
-        return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
+        with _log_sync_block("get_last_mechansim_step_block"):
+            node = self.get_node()
+            return node.query("SubtensorModule", "LastMechansimStepBlock", [self.netuid]).value
 
     def get_uid_for_hotkey(self, hotkey):
         metagraph = self.get_metagraph()
@@ -179,16 +216,17 @@ class SubtensorClient:
         return self.hotkey_to_evm_address.get(hotkey, None)
 
     def sync_evm_address_maps(self):
-        node = self.get_node()
-        associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
-        for uid, evm_address in associated_evms:
-            address_bytes = evm_address.value[0][0]
-            evm_address_hex = "0x" + bytes(address_bytes).hex()
-            self.uid_to_evm_address[uid] = evm_address_hex
+        with _log_sync_block("sync_evm_address_maps", extra=self.default_extra):
+            node = self.get_node()
+            associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
+            for uid, evm_address in associated_evms:
+                address_bytes = evm_address.value[0][0]
+                evm_address_hex = "0x" + bytes(address_bytes).hex()
+                self.uid_to_evm_address[uid] = evm_address_hex
 
-        """Update the map of miner_hotkey -> evm_address for all miners."""
-        for miner in self.miners:
-            self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
+            """Update the map of miner_hotkey -> evm_address for all miners."""
+            for miner in self.miners:
+                self.hotkey_to_evm_address[miner.hotkey] = self.uid_to_evm_address.get(miner.uid, None)
 
         logger.info(
             _m(

@@ -49,7 +49,10 @@ class ValidatorPortalAPI:
                 "signature": signature,
             }
 
-            timeout = aiohttp.ClientTimeout(total=10)
+            # Generous total timeout so we survive short event-loop stalls from concurrent
+            # sync bittensor/subtensor calls in this process. aiohttp's timer is driven by
+            # the event loop, so a 10s cap fires spuriously whenever the loop stays blocked.
+            timeout = aiohttp.ClientTimeout(total=60)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 try:
                     async with session.get(url, headers=headers) as resp:
