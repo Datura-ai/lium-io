@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 SYNC_CYCLE = 12
+SUBTENSOR_BACKOFF_INITIAL = 12
+SUBTENSOR_BACKOFF_MAX = 300
 
 
 class SubtensorClient:
@@ -99,7 +101,7 @@ class SubtensorClient:
 
             SubtensorClient._subtensor = subtensor
         except Exception as e:
-            logger.info(
+            logger.error(
                 _m(
                     "[Error] failed initializing subtensor",
                     extra=get_extra_info(
@@ -520,9 +522,13 @@ class SubtensorClient:
 
     async def _warm_up_subtensor(self):
         count = 0
+        backoff = SUBTENSOR_BACKOFF_INITIAL
         while True:
             try:
                 self.set_subtensor()
+
+                if SubtensorClient._subtensor is None:
+                    raise RuntimeError("subtensor is not initialized")
 
                 if count == 0:
                     await self.fetch_miners()
@@ -534,18 +540,22 @@ class SubtensorClient:
                     self.sync_evm_address_maps()
                     count = 1
 
-                # sync every 12 seconds
+                backoff = SUBTENSOR_BACKOFF_INITIAL
                 await asyncio.sleep(SYNC_CYCLE)
             except Exception as e:
                 logger.error(
                     _m(
                         "[_warm_up_subtensor] Failed to connect into subtensor",
-                        extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                        extra=get_extra_info({
+                            **self.default_extra,
+                            "error": str(e),
+                            "backoff": backoff,
+                        }),
                     ),
                     exc_info=True,
                 )
-                self.initialize_subtensor()
-                await asyncio.sleep(SYNC_CYCLE)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, SUBTENSOR_BACKOFF_MAX)
 
     @classmethod
     async def initialize(cls) -> Self:
