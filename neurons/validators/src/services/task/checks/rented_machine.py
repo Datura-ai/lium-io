@@ -1,3 +1,5 @@
+import json
+import shlex
 from typing import Iterable
 from dataclasses import replace
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
@@ -130,6 +132,7 @@ class TenantEnforcementCheck:
             pod_id = pod.pod_id
             pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_container_name)
             if not pod_running:
+                diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 event = render_message(
                     Msg.POD_NOT_RUNNING,
                     ctx=ctx,
@@ -139,6 +142,7 @@ class TenantEnforcementCheck:
                         "pod_id": pod_id,
                         "container_name": pod_container_name,
                         "executor_uuid": ctx.executor.uuid,
+                        "diagnostics": diagnostics,
                     },
                     extra=extra,
                 )
@@ -231,4 +235,54 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
         ssh_keys = []
 
     return pod_running, ssh_keys
+
+
+_POD_LOG_TAIL_LINES = 50
+_POD_LOG_TAIL_CHAR_LIMIT = 4000
+
+
+async def _collect_pod_diagnostics(ssh_client, container_name: str) -> dict:
+    """Collect raw Docker diagnostics for a pod that the ps-running check reported as down.
+
+    Uses the already-open SSH session to query the executor's local Docker daemon. Returns
+    whatever it can: container state (ExitCode, OOMKilled, Error, FinishedAt, ...) and a
+    tail of stdout/stderr logs. When the container has been removed both calls fail and we
+    surface the errors so the operator can distinguish "exited in place" from "rm'd".
+    """
+    quoted_name = shlex.quote(container_name)
+    result: dict = {}
+
+    try:
+        state_cmd = f"/usr/bin/docker inspect --format '{{{{json .State}}}}' {quoted_name}"
+        inspect_result = await ssh_client.run(state_cmd)
+        raw_state = (inspect_result.stdout or "").strip()
+        if raw_state:
+            state = json.loads(raw_state)
+            result["state"] = {
+                "Status": state.get("Status"),
+                "ExitCode": state.get("ExitCode"),
+                "OOMKilled": state.get("OOMKilled"),
+                "Error": state.get("Error"),
+                "StartedAt": state.get("StartedAt"),
+                "FinishedAt": state.get("FinishedAt"),
+            }
+        else:
+            stderr = getattr(inspect_result, "stderr", "")
+            stderr = stderr.strip() if isinstance(stderr, str) else ""
+            result["inspect_error"] = stderr or "empty stdout"
+    except Exception as exc:
+        result["inspect_error"] = str(exc)
+
+    try:
+        logs_cmd = (
+            f"/usr/bin/docker logs --tail {_POD_LOG_TAIL_LINES} {quoted_name} 2>&1"
+        )
+        logs_result = await ssh_client.run(logs_cmd)
+        tail = (logs_result.stdout or "")[-_POD_LOG_TAIL_CHAR_LIMIT:]
+        if tail:
+            result["logs_tail"] = tail
+    except Exception as exc:
+        result["logs_error"] = str(exc)
+
+    return result
 

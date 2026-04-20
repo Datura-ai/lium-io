@@ -1,7 +1,12 @@
+import json
+
 import pytest
 from unittest.mock import Mock
 
-from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
+from neurons.validators.src.services.task.checks.rented_machine import (
+    TenantEnforcementCheck,
+    _collect_pod_diagnostics,
+)
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
@@ -344,3 +349,80 @@ async def test_tenant_enforcement_check(
             assert "gpu_utilization" in result.event.what_we_saw
             assert "vram_utilization" in result.event.what_we_saw
             assert "process_count" in result.event.what_we_saw
+
+
+class DiagnosticsSSHClient:
+    """SSH mock returning scripted stdout per docker subcommand for diagnostics tests."""
+
+    def __init__(self, *, inspect_stdout: str = "", inspect_stderr: str = "",
+                 logs_stdout: str = "", raise_on: str | None = None):
+        self.inspect_stdout = inspect_stdout
+        self.inspect_stderr = inspect_stderr
+        self.logs_stdout = logs_stdout
+        self.raise_on = raise_on
+        self.commands_called: list[str] = []
+
+    async def run(self, command: str):
+        self.commands_called.append(command)
+        if self.raise_on and self.raise_on in command:
+            raise RuntimeError(f"ssh failed on {self.raise_on}")
+        result = Mock()
+        if "docker inspect" in command:
+            result.stdout = self.inspect_stdout
+            result.stderr = self.inspect_stderr
+        elif "docker logs" in command:
+            result.stdout = self.logs_stdout
+            result.stderr = ""
+        else:
+            result.stdout = ""
+            result.stderr = ""
+        return result
+
+
+@pytest.mark.asyncio
+async def test_collect_pod_diagnostics_reports_exited_container():
+    state = {
+        "Status": "exited",
+        "ExitCode": 137,
+        "OOMKilled": False,
+        "Error": "",
+        "StartedAt": "2026-04-20T00:00:00Z",
+        "FinishedAt": "2026-04-20T00:05:00Z",
+    }
+    ssh = DiagnosticsSSHClient(
+        inspect_stdout=json.dumps(state),
+        logs_stdout="traceback line 1\ntraceback line 2\n",
+    )
+
+    diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
+
+    assert diagnostics["state"] == state
+    assert diagnostics["logs_tail"].endswith("traceback line 2\n")
+    assert any("docker inspect" in cmd for cmd in ssh.commands_called)
+    assert any("docker logs" in cmd for cmd in ssh.commands_called)
+    assert all("pod_abc" in cmd for cmd in ssh.commands_called)
+
+
+@pytest.mark.asyncio
+async def test_collect_pod_diagnostics_handles_removed_container():
+    ssh = DiagnosticsSSHClient(
+        inspect_stdout="",
+        inspect_stderr="Error: No such object: pod_abc",
+        logs_stdout="",
+    )
+
+    diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
+
+    assert "state" not in diagnostics
+    assert diagnostics["inspect_error"] == "Error: No such object: pod_abc"
+    assert "logs_tail" not in diagnostics
+
+
+@pytest.mark.asyncio
+async def test_collect_pod_diagnostics_never_raises_on_ssh_failure():
+    ssh = DiagnosticsSSHClient(raise_on="docker inspect")
+
+    diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
+
+    assert "inspect_error" in diagnostics
+    assert "ssh failed" in diagnostics["inspect_error"]
