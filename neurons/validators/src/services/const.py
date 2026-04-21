@@ -11,10 +11,21 @@ GPU_MODEL_RATES = {
     "NVIDIA H800 80GB HBM3": 0.02,
     "NVIDIA H800 NVL": 0.01,
     "NVIDIA H800 PCIe": 0.01,
+    # Supported operationally, but excluded from the unrented pool by default.
+    "NVIDIA GeForce RTX 5080": 0.0,
+    "NVIDIA GeForce RTX 5070 Ti": 0.0,
+    "NVIDIA GeForce RTX 5070": 0.0,
     "NVIDIA GeForce RTX 5090": 0.025,
+    # Supported operationally, but excluded from the unrented pool by default.
+    "NVIDIA GeForce RTX 4080 SUPER": 0.0,
+    "NVIDIA GeForce RTX 4080": 0.0,
+    "NVIDIA GeForce RTX 4070 Ti": 0.0,
+    "NVIDIA GeForce RTX 4070 SUPER": 0.0,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
+    "NVIDIA RTX 5000 Ada Generation": 0.0,
+    "NVIDIA RTX 5880 Ada Generation": 0.0,
     "NVIDIA RTX 6000 Ada Generation": 0.01,
     "NVIDIA L4": 0.01,
     "NVIDIA L40S": 0.01,
@@ -22,6 +33,7 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     "NVIDIA A100-SXM4-80GB": 0.05,
+    "NVIDIA A10 Tensor Core GPU": 0.0,
     "NVIDIA RTX A6000": 0.009,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.025, # 2.5x 6000 ada
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.027, # 2.7x 6000 ada
@@ -30,7 +42,12 @@ GPU_MODEL_RATES = {
     "NVIDIA RTX A4000": 0.002,
     # "NVIDIA A40": 0.002,
     # "NVIDIA A30": 0.002,
+    "NVIDIA T4 Tensor Core GPU": 0.0,
+    "NVIDIA Tesla V100 Tensor Core GPU": 0.0,
+    "NVIDIA GeForce RTX 3090 Ti": 0.0,
     "NVIDIA GeForce RTX 3090": 0.02,
+    "NVIDIA GeForce RTX 3080 Ti": 0.0,
+    "NVIDIA GeForce RTX 3080": 0.0,
 }
 
 # GPU Price * 24 / TAO Price
@@ -45,10 +62,19 @@ REQUIRED_DEPOSIT_AMOUNT = {
     'NVIDIA H800 80GB HBM3': 0.051,
     'NVIDIA H800 NVL': 0.045,
     'NVIDIA H800 PCIe': 0.045,
+    'NVIDIA GeForce RTX 5080': 0.012,
+    'NVIDIA GeForce RTX 5070 Ti': 0.010,
+    'NVIDIA GeForce RTX 5070': 0.007,
     'NVIDIA GeForce RTX 5090': 0.014,
+    'NVIDIA GeForce RTX 4080 SUPER': 0.011,
+    'NVIDIA GeForce RTX 4080': 0.011,
+    'NVIDIA GeForce RTX 4070 Ti': 0.008,
+    'NVIDIA GeForce RTX 4070 SUPER': 0.006,
     'NVIDIA GeForce RTX 4090': 0.010,
     'NVIDIA GeForce RTX 4090 D': 0.008,
     # 'NVIDIA RTX 4000 Ada Generation': 0.009,
+    'NVIDIA RTX 5000 Ada Generation': 0.015,
+    'NVIDIA RTX 5880 Ada Generation': 0.019,
     'NVIDIA RTX 6000 Ada Generation': 0.017,
     'NVIDIA L4': 0.008,
     'NVIDIA L40S': 0.027,
@@ -56,6 +82,7 @@ REQUIRED_DEPOSIT_AMOUNT = {
     # 'NVIDIA RTX 2000 Ada Generation': 0.005,
     'NVIDIA A100 80GB PCIe': 0.027,
     'NVIDIA A100-SXM4-80GB': 0.031,
+    'NVIDIA A10 Tensor Core GPU': 0.010,
     'NVIDIA RTX A6000': 0.018,
     'NVIDIA RTX PRO 6000 Blackwell Server Edition': 0.0425, # 2.5x 6000 ada
     'NVIDIA RTX PRO 6000 Blackwell Workstation Edition': 0.0459, # 2.7x 6000 ada
@@ -64,7 +91,12 @@ REQUIRED_DEPOSIT_AMOUNT = {
     'NVIDIA RTX A4000': 0.008,
     # 'NVIDIA A40': 0.008,
     # 'NVIDIA A30': 0.005,
-    'NVIDIA GeForce RTX 3090': 0.008
+    'NVIDIA T4 Tensor Core GPU': 0.011,
+    'NVIDIA Tesla V100 Tensor Core GPU': 0.013,
+    'NVIDIA GeForce RTX 3090 Ti': 0.010,
+    'NVIDIA GeForce RTX 3090': 0.008,
+    'NVIDIA GeForce RTX 3080 Ti': 0.006,
+    'NVIDIA GeForce RTX 3080': 0.006,
 }
 
 MACHINE_PRICES = {
@@ -78,10 +110,19 @@ MACHINE_PRICES = {
     "NVIDIA H800 80GB HBM3": 0.88,
     "NVIDIA H800 NVL": 0.80,
     "NVIDIA H800 PCIe": 0.80,
+    "NVIDIA GeForce RTX 5080": 0.15,
+    "NVIDIA GeForce RTX 5070 Ti": 0.12,
+    "NVIDIA GeForce RTX 5070": 0.09,
     "NVIDIA GeForce RTX 5090": 0.17,
+    "NVIDIA GeForce RTX 4080 SUPER": 0.16,
+    "NVIDIA GeForce RTX 4080": 0.16,
+    "NVIDIA GeForce RTX 4070 Ti": 0.11,
+    "NVIDIA GeForce RTX 4070 SUPER": 0.09,
     "NVIDIA GeForce RTX 4090": 0.14,
     "NVIDIA GeForce RTX 4090 D": 0.11,
     "NVIDIA RTX 4000 Ada Generation": 0.16,
+    "NVIDIA RTX 5000 Ada Generation": 0.27,
+    "NVIDIA RTX 5880 Ada Generation": 0.34,
     "NVIDIA RTX 6000 Ada Generation": 0.31,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.77, # 2.5x 6000 ada
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.84, # 2.7x 6000 ada
@@ -91,13 +132,19 @@ MACHINE_PRICES = {
     "NVIDIA RTX 2000 Ada Generation": 0.07,
     "NVIDIA A100 80GB PCIe": 0.36,
     "NVIDIA A100-SXM4-80GB": 0.43,
+    "NVIDIA A10 Tensor Core GPU": 0.20,
     "NVIDIA RTX A6000": 0.24,
     "NVIDIA RTX A5000": 0.16,
     "NVIDIA RTX A4500": 0.13,
     "NVIDIA RTX A4000": 0.12,
     "NVIDIA A40": 0.12,
     "NVIDIA A30": 0.10,
-    "NVIDIA GeForce RTX 3090": 0.13
+    "NVIDIA T4 Tensor Core GPU": 0.15,
+    "NVIDIA Tesla V100 Tensor Core GPU": 0.17,
+    "NVIDIA GeForce RTX 3090 Ti": 0.16,
+    "NVIDIA GeForce RTX 3090": 0.13,
+    "NVIDIA GeForce RTX 3080 Ti": 0.10,
+    "NVIDIA GeForce RTX 3080": 0.09,
 }
 
 MAX_UPLOAD_SPEED = 1000

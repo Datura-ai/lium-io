@@ -38,7 +38,7 @@ class GpuModelValidCheck:
         if gpu_count > 0 and len(gpu_details) > 0:
             gpu_model = gpu_details[0].get("name", None)
 
-        if not gpu_model_rates_map.get(gpu_model):
+        if gpu_model not in gpu_model_rates_map:
             supported_models = list(gpu_model_rates_map.keys())
             event = render_message(
                 Msg.MODEL_UNSUPPORTED,
