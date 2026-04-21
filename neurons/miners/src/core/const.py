@@ -9,10 +9,19 @@ REQUIRED_DEPOSIT_AMOUNT = {
     'NVIDIA H800 80GB HBM3': 0.051,
     'NVIDIA H800 NVL': 0.045,
     'NVIDIA H800 PCIe': 0.045,
+    'NVIDIA GeForce RTX 5080': 0.012,
+    'NVIDIA GeForce RTX 5070 Ti': 0.010,
+    'NVIDIA GeForce RTX 5070': 0.007,
     'NVIDIA GeForce RTX 5090': 0.014,
+    'NVIDIA GeForce RTX 4080 SUPER': 0.011,
+    'NVIDIA GeForce RTX 4080': 0.011,
+    'NVIDIA GeForce RTX 4070 Ti': 0.008,
+    'NVIDIA GeForce RTX 4070 SUPER': 0.006,
     'NVIDIA GeForce RTX 4090': 0.010,
     'NVIDIA GeForce RTX 4090 D': 0.008,
     # 'NVIDIA RTX 4000 Ada Generation': 0.009,
+    'NVIDIA RTX 5000 Ada Generation': 0.015,
+    'NVIDIA RTX 5880 Ada Generation': 0.019,
     'NVIDIA RTX 6000 Ada Generation': 0.017,
     'NVIDIA L4': 0.008,
     'NVIDIA L40S': 0.027,
@@ -20,6 +29,7 @@ REQUIRED_DEPOSIT_AMOUNT = {
     # 'NVIDIA RTX 2000 Ada Generation': 0.005,
     'NVIDIA A100 80GB PCIe': 0.027,
     'NVIDIA A100-SXM4-80GB': 0.031,
+    'NVIDIA A10 Tensor Core GPU': 0.010,
     'NVIDIA RTX A6000': 0.018,
     'NVIDIA RTX PRO 6000 Blackwell Server Edition': 0.0425, # 2.5x 6000 ada
     'NVIDIA RTX PRO 6000 Blackwell Workstation Edition': 0.0459, # 2.7x 6000 ada
@@ -28,5 +38,10 @@ REQUIRED_DEPOSIT_AMOUNT = {
     'NVIDIA RTX A4000': 0.008,
     # 'NVIDIA A40': 0.008,
     # 'NVIDIA A30': 0.005,
+    'NVIDIA T4 Tensor Core GPU': 0.011,
+    'NVIDIA Tesla V100 Tensor Core GPU': 0.013,
+    'NVIDIA GeForce RTX 3090 Ti': 0.010,
+    'NVIDIA GeForce RTX 3080 Ti': 0.006,
+    'NVIDIA GeForce RTX 3080': 0.006,
     'NVIDIA GeForce RTX 3090': 0.008
 }

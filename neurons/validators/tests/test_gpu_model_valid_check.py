@@ -34,6 +34,16 @@ from tests.helpers import build_context_config, build_services, build_state
             True,
             Msg.MODEL_OK.reason,
         ),
+        (
+            {"NVIDIA GeForce RTX 3080": 0.0},
+            {
+                "specs": {"gpu": {"count": 1, "details": [{"name": "NVIDIA GeForce RTX 3080"}]}},
+                "gpu_count": 1,
+                "gpu_details": [{"name": "NVIDIA GeForce RTX 3080"}],
+            },
+            True,
+            Msg.MODEL_OK.reason,
+        ),
     ],
 )
 @pytest.mark.asyncio
