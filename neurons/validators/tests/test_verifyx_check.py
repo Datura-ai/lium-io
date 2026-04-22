@@ -7,6 +7,7 @@ from neurons.validators.src.services.task.messages import (
     VERIFYX_DEBUG_DOC_URL,
     VerifyXMessages as Msg,
 )
+from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -237,6 +238,108 @@ async def test_verifyx_failure_without_diagnostics_falls_back_to_generic_templat
     # No diagnostic keys when no diagnostics available
     assert "failure_class" not in result.event.what_we_saw
     assert result.event.help_uri == VERIFYX_DEBUG_DOC_URL
+
+
+def _rented_data_with_ema(executor_uuid: str, *, download: float | None = None, upload: float | None = None) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={},
+        banned_guids=[],
+        network_ema={
+            executor_uuid: NetworkEMA(
+                ema_verifyx_download_speed=download,
+                ema_verifyx_upload_speed=upload,
+            )
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_verifyx_failure_propagates_prev_ema_when_present(context_factory):
+    """On probe failure, prior EMA (download) should be carried forward into specs."""
+    verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", download=250.0),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert "state" in result.updates
+    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == 250.0
+
+
+@pytest.mark.asyncio
+async def test_verifyx_failure_propagates_upload_ema_when_present(context_factory):
+    """On probe failure, prior EMA (upload) should also be carried forward."""
+    verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", upload=40.0),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert "state" in result.updates
+    assert result.updates["state"].specs["network"]["ema_verifyx_upload_speed"] == 40.0
+
+
+@pytest.mark.asyncio
+async def test_verifyx_failure_does_not_decay_prev_ema(context_factory):
+    """Carried-forward value must equal prev_ema exactly — no decay, no 0-sample EMA update."""
+    verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", download=250.0, upload=40.0),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == 250.0
+    assert result.updates["state"].specs["network"]["ema_verifyx_upload_speed"] == 40.0
+
+
+@pytest.mark.asyncio
+async def test_verifyx_failure_without_prev_ema_leaves_specs_empty(context_factory):
+    """No prior EMA anywhere — failure branch must not fabricate a state update."""
+    verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=RentedExecutorsResponse(executors={}, banned_guids=[], network_ema={}),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert "state" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_verifyx_failure_without_rented_data_does_not_update_state(context_factory):
+    """rented_data is None — failure branch must not attempt to read from it."""
+    verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(specs={"gpu": {"count": 1}}, rented_data=None)
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert "state" not in result.updates
 
 
 @pytest.mark.asyncio

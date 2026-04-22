@@ -53,6 +53,11 @@ class VerifyXCheck:
         # Extract errors with clear priority: data.errors > result.error
         errors = self._extract_errors(result)
 
+        prev_ema = (
+            ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
+            if ctx.state.rented_data else None
+        )
+
         if result.data and result.data.get("success"):
             base_specs = ctx.state.specs
             sanitized = _to_iso(result.data)
@@ -66,10 +71,6 @@ class VerifyXCheck:
             )
 
             # Store verifyx network measurements under their own keys (additive — does not overwrite speedtest values)
-            prev_ema = (
-                ctx.state.rented_data.network_ema.get(ctx.executor.uuid)
-                if ctx.state.rented_data else None
-            )
             if verifyx_network.get("download_speed") is not None:
                 if "network" not in updated_specs:
                     updated_specs["network"] = {}
@@ -131,6 +132,20 @@ class VerifyXCheck:
             check_id=self.check_id,
             what=what,
         )
+
+        if prev_ema and (
+            prev_ema.ema_verifyx_download_speed is not None
+            or prev_ema.ema_verifyx_upload_speed is not None
+        ):
+            specs = ctx.state.specs or {}
+            net = dict(specs.get("network") or {})
+            if prev_ema.ema_verifyx_download_speed is not None:
+                net["ema_verifyx_download_speed"] = prev_ema.ema_verifyx_download_speed
+            if prev_ema.ema_verifyx_upload_speed is not None:
+                net["ema_verifyx_upload_speed"] = prev_ema.ema_verifyx_upload_speed
+            updated_state = replace(ctx.state, specs={**specs, "network": net})
+            return CheckResult(passed=False, event=event, updates={"state": updated_state})
+
         return CheckResult(passed=False, event=event)
 
 
