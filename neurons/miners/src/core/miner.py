@@ -51,7 +51,6 @@ class Miner:
 
     async def initialize_subtensor(self):
         self.bootstrap_complete = False
-        subtensor = None
         try:
             logger.info(
                 _m(
@@ -61,32 +60,12 @@ class Miner:
             )
 
             await self.close_subtensor()
-            if self.should_exit:
-                return
-
-            subtensor = await bittensor.async_subtensor(config=self.config).initialize()
-            if self.should_exit:
-                await subtensor.close()
-                return
-
-            self.subtensor = subtensor
+            self.subtensor = await bittensor.async_subtensor(config=self.config).initialize()
 
             # check registered
             await self.check_registered()
         except Exception as e:
             self.subtensor = None
-            if subtensor is not None:
-                try:
-                    await subtensor.close()
-                except Exception as close_error:
-                    logger.warning(
-                        _m(
-                            "Failed to close subtensor cleanly",
-                            extra=get_extra_info(
-                                {**self.default_extra, "error": str(close_error)}
-                            ),
-                        ),
-                    )
             logger.info(
                 _m(
                     "[Error] failed initializing subtensor",
@@ -292,8 +271,7 @@ class Miner:
                     ),
                 ),
             )
-            if not self.should_exit:
-                await self.initialize_subtensor()
+            await self.initialize_subtensor()
 
     async def start(self):
         logger.info(
