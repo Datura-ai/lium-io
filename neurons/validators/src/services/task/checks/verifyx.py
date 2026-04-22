@@ -8,6 +8,8 @@ from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .network_ema import compute_ema
 
+MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+
 
 class VerifyXCheck:
     """Run the optional VerifyX hardware probe and update specs with its findings.
@@ -70,23 +72,24 @@ class VerifyXCheck:
                 }
             )
 
-            # Store verifyx network measurements under their own keys (additive — does not overwrite speedtest values)
-            if verifyx_network.get("download_speed") is not None:
-                if "network" not in updated_specs:
-                    updated_specs["network"] = {}
-                updated_specs["network"]["verifyx_download_speed"] = verifyx_network.get("download_speed")
-                updated_specs["network"]["ema_verifyx_download_speed"] = compute_ema(
-                    prev_ema.ema_verifyx_download_speed if prev_ema else None,
-                    verifyx_network.get("download_speed"),
-                )
-            if verifyx_network.get("upload_speed") is not None:
-                if "network" not in updated_specs:
-                    updated_specs["network"] = {}
-                updated_specs["network"]["verifyx_upload_speed"] = verifyx_network.get("upload_speed")
-                updated_specs["network"]["ema_verifyx_upload_speed"] = compute_ema(
-                    prev_ema.ema_verifyx_upload_speed if prev_ema else None,
-                    verifyx_network.get("upload_speed"),
-                )
+            # Always compute verifyx network EMA — use 0.0 when network measurement failed
+            # so EMA decays toward 0 on repeated failures, eventually triggering exclusion
+            if "network" not in updated_specs:
+                updated_specs["network"] = {}
+            download_speed = verifyx_network.get("download_speed")
+            if download_speed is not None:
+                updated_specs["network"]["verifyx_download_speed"] = download_speed
+            updated_specs["network"]["ema_verifyx_download_speed"] = compute_ema(
+                prev_ema.ema_verifyx_download_speed if prev_ema else None,
+                download_speed if download_speed is not None else 0.0,
+            )
+            upload_speed = verifyx_network.get("upload_speed")
+            if upload_speed is not None:
+                updated_specs["network"]["verifyx_upload_speed"] = upload_speed
+            updated_specs["network"]["ema_verifyx_upload_speed"] = compute_ema(
+                prev_ema.ema_verifyx_upload_speed if prev_ema else None,
+                upload_speed if upload_speed is not None else 0.0,
+            )
 
             # Update storage specs if storage is present
             if "hard_disk" in sanitized:
@@ -108,6 +111,19 @@ class VerifyXCheck:
                 event.what_we_saw["errors"] = errors
 
             updated_state = replace(ctx.state, specs=updated_specs)
+
+            ema_download = updated_specs["network"]["ema_verifyx_download_speed"]
+            if ema_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+                slow_event = render_message(
+                    Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "ema_verifyx_download_speed": ema_download,
+                        "min_download_speed_mbps": MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
+                    },
+                )
+                return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
 
             return CheckResult(
                 passed=True,
@@ -132,19 +148,6 @@ class VerifyXCheck:
             check_id=self.check_id,
             what=what,
         )
-
-        if prev_ema and (
-            prev_ema.ema_verifyx_download_speed is not None
-            or prev_ema.ema_verifyx_upload_speed is not None
-        ):
-            specs = ctx.state.specs or {}
-            net = dict(specs.get("network") or {})
-            if prev_ema.ema_verifyx_download_speed is not None:
-                net["ema_verifyx_download_speed"] = compute_ema(prev_ema.ema_verifyx_download_speed, 0.0)
-            if prev_ema.ema_verifyx_upload_speed is not None:
-                net["ema_verifyx_upload_speed"] = compute_ema(prev_ema.ema_verifyx_upload_speed, 0.0)
-            updated_state = replace(ctx.state, specs={**specs, "network": net})
-            return CheckResult(passed=False, event=event, updates={"state": updated_state})
 
         return CheckResult(passed=False, event=event)
 
