@@ -57,7 +57,13 @@ def calculate_scores(
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"
     )
-    if ema_verifyx_download is not None and ema_verifyx_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
+    if not rented and ema_verifyx_download is None:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append(
+            "EMA verifyx download speed unavailable (probe failed or never measured)"
+        )
+    elif ema_verifyx_download is not None and ema_verifyx_download < MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append(
