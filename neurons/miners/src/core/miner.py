@@ -1,19 +1,16 @@
-import asyncio
+from typing import TYPE_CHECKING
 import logging
 import traceback
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
-
+import asyncio
 import bittensor
-from sqlmodel import Session, select
+from websockets.protocol import State as WebSocketClientState
 
 from core.config import settings
-from core.db import engine
+from core.db import get_db
 from core.utils import _m, get_extra_info
-from models.validator import Validator
+from daos.validator import ValidatorDao, Validator
 
 if TYPE_CHECKING:
-    from bittensor.core.async_subtensor import AsyncSubtensor
     from bittensor_wallet import bittensor_wallet
 
 logger = logging.getLogger(__name__)
@@ -24,7 +21,7 @@ SYNC_CYCLE = 2 * 60
 
 class Miner:
     wallet: "bittensor_wallet"
-    subtensor: "AsyncSubtensor | None"
+    subtensor: bittensor.subtensor
     netuid: int
 
     def __init__(self):
@@ -45,11 +42,14 @@ class Miner:
             ip=settings.EXTERNAL_IP_ADDRESS,
         )
         self.subtensor = None
+        self.initialize_subtensor()
 
         self.should_exit = False
+        self.session = next(get_db())
+        self.validator_dao = ValidatorDao(session=self.session)
         self.last_announced_block = 0
 
-    async def initialize_subtensor(self):
+    def initialize_subtensor(self):
         try:
             logger.info(
                 _m(
@@ -58,60 +58,42 @@ class Miner:
                 ),
             )
 
-            await self.close_subtensor()
-            self.subtensor = await bittensor.async_subtensor(config=self.config).initialize()
+            self.subtensor = bittensor.subtensor(config=self.config)
 
             # check registered
-            await self.check_registered()
+            self.check_registered()
         except Exception as e:
-            self.subtensor = None
             logger.info(
                 _m(
                     "[Error] failed initializing subtensor",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
+                    extra=get_extra_info({
+                        ** self.default_extra,
+                        "error": str(e),
+                    }),
                 ),
             )
 
-    async def close_subtensor(self):
-        subtensor = self.subtensor
-        self.subtensor = None
-        if subtensor is None:
+    def set_subtensor(self):
+        if (
+            self.subtensor
+            and self.subtensor.substrate
+            and self.subtensor.substrate.ws
+            and not self.subtensor.substrate.ws.close_code
+        ):
             return
 
-        try:
-            await subtensor.close()
-        except Exception as e:
-            logger.warning(
-                _m(
-                    "Failed to close subtensor cleanly",
-                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
-                ),
-            )
+        self.initialize_subtensor()
 
-    async def set_subtensor(self):
-        if self.subtensor is not None:
-            return
-
-        await self.initialize_subtensor()
-
-    async def check_registered(self):
+    def check_registered(self):
         try:
             logger.info(
                 _m(
-                    "[check_registered] checking miner is registered",
+                    '[check_registered] checking miner is registered',
                     extra=get_extra_info(self.default_extra),
                 ),
             )
 
-            if self.subtensor is None:
-                raise RuntimeError("Subtensor is not initialized")
-
-            if not await self.subtensor.is_hotkey_registered(
+            if not self.subtensor.is_hotkey_registered(
                 netuid=self.netuid,
                 hotkey_ss58=self.wallet.get_hotkey().ss58_address,
             ):
@@ -125,144 +107,105 @@ class Miner:
         except Exception as e:
             logger.error(
                 _m(
-                    "[check_registered] Checking miner registered failed",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
+                    '[check_registered] Checking miner registered failed',
+                    extra=get_extra_info({
+                        **self.default_extra,
+                        "error": str(e)
+                    }),
                 ),
             )
 
     def get_node(self):
-        if self.subtensor is None:
-            raise RuntimeError("Subtensor is not initialized")
+        # return SubstrateInterface(url=self.config.subtensor.chain_endpoint)
         return self.subtensor.substrate
 
-    async def get_current_block(self):
-        if self.subtensor is None:
-            raise RuntimeError("Subtensor is not initialized")
-        return await self.subtensor.get_current_block()
-
-    async def get_tempo(self):
-        if self.subtensor is None:
-            raise RuntimeError("Subtensor is not initialized")
-        return await self.subtensor.tempo(self.netuid)
-
-    async def get_serving_rate_limit(self):
+    def get_current_block(self):
         node = self.get_node()
-        result = await node.query("SubtensorModule", "ServingRateLimit", [self.netuid])
-        return result.value
+        return node.query("System", "Number", []).value
 
-    async def announce(self):
+    def get_tempo(self):
+        return self.subtensor.tempo(self.netuid)
+
+    def get_serving_rate_limit(self):
+        node = self.get_node()
+        return node.query("SubtensorModule", "ServingRateLimit", [self.netuid]).value
+
+    def announce(self):
         try:
-            if self.subtensor is None:
-                raise RuntimeError("Subtensor is not initialized")
-
-            current_block = await self.get_current_block()
-            tempo = await self.get_tempo()
+            current_block = self.get_current_block()
+            tempo = self.get_tempo()
 
             if current_block - self.last_announced_block >= tempo:
                 self.last_announced_block = current_block
 
                 logger.info(
                     _m(
-                        "[announce] Announce miner",
+                        '[announce] Announce miner',
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
-                await self.subtensor.serve_axon(netuid=self.netuid, axon=self.axon)
+                self.axon.serve(netuid=self.netuid, subtensor=self.subtensor)
         except Exception as e:
             logger.error(
                 _m(
-                    "[announce] Announcing miner error",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
+                    '[announce] Announcing miner error',
+                    extra=get_extra_info({
+                        **self.default_extra,
+                        "error": str(e)
+                    }),
                 ),
             )
 
     async def fetch_validators(self):
-        if self.subtensor is None:
-            raise RuntimeError("Subtensor is not initialized")
-
-        metagraph_info = await self.subtensor.get_metagraph_info(self.netuid)
-        metagraph = await self.subtensor.metagraph(netuid=self.netuid)
+        a = self.subtensor.get_metagraph_info(self.netuid)
+        metagraph = self.subtensor.metagraph(netuid=self.netuid)
         neurons = [
-            neuron
-            for neuron in metagraph.neurons
-            if (
-                neuron.stake.tao >= settings.MIN_ALPHA_STAKE
-                and metagraph_info.total_stake[neuron.uid] >= settings.MIN_TOTAL_STAKE
-            )
+            n for n in metagraph.neurons
+            if (n.stake.tao >= settings.MIN_ALPHA_STAKE and a.total_stake[n.uid] >= settings.MIN_TOTAL_STAKE)
         ]
         return neurons
 
     async def save_validators(self, validators):
         logger.info(
             _m(
-                "[save_validators] Sync validators",
+                '[save_validators] Sync validators',
                 extra=get_extra_info(self.default_extra),
             ),
         )
-        validator_hotkeys = [validator.hotkey for validator in validators]
-        await asyncio.to_thread(self._save_validators_sync, validator_hotkeys)
-
-    @staticmethod
-    def _save_validators_sync(validator_hotkeys: Sequence[str]):
-        unique_hotkeys = list(dict.fromkeys(validator_hotkeys))
-        if not unique_hotkeys:
-            return
-
-        with Session(engine) as session:
-            existing_hotkeys = set(
-                session.exec(
-                    select(Validator.validator_hotkey).where(
-                        Validator.validator_hotkey.in_(unique_hotkeys)
+        for v in validators:
+            existing = self.validator_dao.get_validator_by_hotkey(v.hotkey)
+            if not existing:
+                self.validator_dao.save(
+                    Validator(
+                        validator_hotkey=v.hotkey,
+                        active=True
                     )
-                ).all()
-            )
-            missing_hotkeys = [
-                hotkey for hotkey in unique_hotkeys if hotkey not in existing_hotkeys
-            ]
-
-            if not missing_hotkeys:
-                return
-
-            session.add_all(
-                [Validator(validator_hotkey=hotkey, active=True) for hotkey in missing_hotkeys]
-            )
-            session.commit()
+                )
 
     async def sync(self):
         try:
-            await self.set_subtensor()
-            await self.announce()
+            self.set_subtensor()
+
+            self.announce()
 
             validators = await self.fetch_validators()
             await self.save_validators(validators)
         except Exception as e:
             logger.error(
                 _m(
-                    "[sync] Miner sync failed",
-                    extra=get_extra_info(
-                        {
-                            **self.default_extra,
-                            "error": str(e),
-                        }
-                    ),
+                    '[sync] Miner sync failed',
+                    extra=get_extra_info({
+                        **self.default_extra,
+                        "error": str(e)
+                    }),
                 ),
             )
-            await self.initialize_subtensor()
+            self.initialize_subtensor()
 
     async def start(self):
         logger.info(
             _m(
-                "Start Miner in background",
+                'Start Miner in background',
                 extra=get_extra_info(self.default_extra),
             ),
         )
@@ -274,17 +217,16 @@ class Miner:
                 # sync every 2 mins
                 await asyncio.sleep(SYNC_CYCLE)
         except KeyboardInterrupt:
-            logger.debug("Miner killed by keyboard interrupt.")
+            logger.debug('Miner killed by keyboard interrupt.')
             exit()
-        except Exception:
+        except Exception as e:
             logger.error(traceback.format_exc())
 
     async def stop(self):
         logger.info(
             _m(
-                "Stop Miner process",
+                'Stop Miner process',
                 extra=get_extra_info(self.default_extra),
             ),
         )
         self.should_exit = True
-        await self.close_subtensor()
