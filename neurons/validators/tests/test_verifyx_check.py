@@ -254,8 +254,8 @@ def _rented_data_with_ema(executor_uuid: str, *, download: float | None = None, 
 
 
 @pytest.mark.asyncio
-async def test_verifyx_failure_propagates_prev_ema_when_present(context_factory):
-    """On probe failure, prior EMA (download) should be carried forward into specs."""
+async def test_verifyx_failure_decays_prev_ema_download(context_factory):
+    """On probe failure, download EMA decays by one step toward 0 (0.7 × prev)."""
     verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
     services = build_services(verifyx=verifyx_service)
     config = build_context_config(verifyx_enabled=True)
@@ -269,12 +269,13 @@ async def test_verifyx_failure_propagates_prev_ema_when_present(context_factory)
 
     assert result.passed is False
     assert "state" in result.updates
-    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == 250.0
+    # compute_ema(250.0, 0.0) = 0.3*0 + 0.7*250 = 175.0
+    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(175.0)
 
 
 @pytest.mark.asyncio
-async def test_verifyx_failure_propagates_upload_ema_when_present(context_factory):
-    """On probe failure, prior EMA (upload) should also be carried forward."""
+async def test_verifyx_failure_decays_prev_ema_upload(context_factory):
+    """On probe failure, upload EMA also decays by one step toward 0 (0.7 × prev)."""
     verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
     services = build_services(verifyx=verifyx_service)
     config = build_context_config(verifyx_enabled=True)
@@ -288,25 +289,28 @@ async def test_verifyx_failure_propagates_upload_ema_when_present(context_factor
 
     assert result.passed is False
     assert "state" in result.updates
-    assert result.updates["state"].specs["network"]["ema_verifyx_upload_speed"] == 40.0
+    # compute_ema(40.0, 0.0) = 0.3*0 + 0.7*40 = 28.0
+    assert result.updates["state"].specs["network"]["ema_verifyx_upload_speed"] == pytest.approx(28.0)
 
 
 @pytest.mark.asyncio
-async def test_verifyx_failure_does_not_decay_prev_ema(context_factory):
-    """Carried-forward value must equal prev_ema exactly — no decay, no 0-sample EMA update."""
-    verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
-    services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
-    state = build_state(
-        specs={"gpu": {"count": 1}},
-        rented_data=_rented_data_with_ema("executor-123", download=250.0, upload=40.0),
-    )
-    ctx = context_factory(services=services, config=config, state=state)
+async def test_verifyx_failure_repeated_decays_below_threshold(context_factory):
+    """After 5 consecutive failures starting from 500 Mbps, EMA drops below 100 Mbps threshold."""
+    # 500 * 0.7^5 ≈ 84.0 < 100 Mbps
+    ema = 500.0
+    for _ in range(5):
+        verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
+        services = build_services(verifyx=verifyx_service)
+        config = build_context_config(verifyx_enabled=True)
+        state = build_state(
+            specs={"gpu": {"count": 1}},
+            rented_data=_rented_data_with_ema("executor-123", download=ema),
+        )
+        ctx = context_factory(services=services, config=config, state=state)
+        result = await VerifyXCheck().run(ctx)
+        ema = result.updates["state"].specs["network"]["ema_verifyx_download_speed"]
 
-    result = await VerifyXCheck().run(ctx)
-
-    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == 250.0
-    assert result.updates["state"].specs["network"]["ema_verifyx_upload_speed"] == 40.0
+    assert ema < 100.0
 
 
 @pytest.mark.asyncio
