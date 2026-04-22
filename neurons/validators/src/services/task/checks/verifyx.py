@@ -140,9 +140,9 @@ class VerifyXCheck:
             specs = ctx.state.specs or {}
             net = dict(specs.get("network") or {})
             if prev_ema.ema_verifyx_download_speed is not None:
-                net["ema_verifyx_download_speed"] = prev_ema.ema_verifyx_download_speed
+                net["ema_verifyx_download_speed"] = compute_ema(prev_ema.ema_verifyx_download_speed, 0.0)
             if prev_ema.ema_verifyx_upload_speed is not None:
-                net["ema_verifyx_upload_speed"] = prev_ema.ema_verifyx_upload_speed
+                net["ema_verifyx_upload_speed"] = compute_ema(prev_ema.ema_verifyx_upload_speed, 0.0)
             updated_state = replace(ctx.state, specs={**specs, "network": net})
             return CheckResult(passed=False, event=event, updates={"state": updated_state})
 
