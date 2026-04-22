@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 VALIDATORS_LIMIT = 24
-RECONNECT_POLL_CYCLE = 2 * 60
+SYNC_CYCLE = 2 * 60
 
 
 class Miner:
@@ -47,10 +47,9 @@ class Miner:
         self.subtensor = None
 
         self.should_exit = False
-        self.bootstrap_complete = False
+        self.last_announced_block = 0
 
     async def initialize_subtensor(self):
-        self.bootstrap_complete = False
         try:
             logger.info(
                 _m(
@@ -141,50 +140,43 @@ class Miner:
             raise RuntimeError("Subtensor is not initialized")
         return self.subtensor.substrate
 
+    async def get_current_block(self):
+        if self.subtensor is None:
+            raise RuntimeError("Subtensor is not initialized")
+        return await self.subtensor.get_current_block()
+
+    async def get_tempo(self):
+        if self.subtensor is None:
+            raise RuntimeError("Subtensor is not initialized")
+        return await self.subtensor.tempo(self.netuid)
+
     async def get_serving_rate_limit(self):
         node = self.get_node()
         result = await node.query("SubtensorModule", "ServingRateLimit", [self.netuid])
         return result.value
 
-    def _axon_info_matches_local_config(self, axon_info) -> bool:
-        if axon_info is None or not getattr(axon_info, "is_serving", False):
-            return False
-
-        expected_ip = str(self.default_extra["external_ip"])
-        expected_port = int(self.default_extra["external_port"])
-        actual_ip = str(getattr(axon_info, "ip", ""))
-
+    async def announce(self):
         try:
-            actual_port = int(getattr(axon_info, "port", -1))
-        except (TypeError, ValueError):
-            return False
+            if self.subtensor is None:
+                raise RuntimeError("Subtensor is not initialized")
 
-        return actual_ip == expected_ip and actual_port == expected_port
+            current_block = await self.get_current_block()
+            tempo = await self.get_tempo()
 
-    async def ensure_axon_registration(self):
-        if self.subtensor is None:
-            raise RuntimeError("Subtensor is not initialized")
+            if current_block - self.last_announced_block >= tempo:
+                self.last_announced_block = current_block
 
-        try:
-            neuron = await self.subtensor.get_neuron_for_pubkey_and_subnet(
-                hotkey_ss58=self.wallet.get_hotkey().ss58_address,
-                netuid=self.netuid,
-            )
-
-            if self._axon_info_matches_local_config(getattr(neuron, "axon_info", None)):
-                return
-
-            logger.info(
-                _m(
-                    "[ensure_axon_registration] Announce miner",
-                    extra=get_extra_info(self.default_extra),
-                ),
-            )
-            await self.subtensor.serve_axon(netuid=self.netuid, axon=self.axon)
+                logger.info(
+                    _m(
+                        "[announce] Announce miner",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+                await self.subtensor.serve_axon(netuid=self.netuid, axon=self.axon)
         except Exception as e:
             logger.error(
                 _m(
-                    "[ensure_axon_registration] Axon registration check failed",
+                    "[announce] Announcing miner error",
                     extra=get_extra_info(
                         {
                             **self.default_extra,
@@ -193,7 +185,6 @@ class Miner:
                     ),
                 ),
             )
-            raise
 
     async def fetch_validators(self):
         if self.subtensor is None:
@@ -247,18 +238,13 @@ class Miner:
             )
             session.commit()
 
-    async def bootstrap(self):
-        await self.ensure_axon_registration()
-
-        validators = await self.fetch_validators()
-        await self.save_validators(validators)
-        self.bootstrap_complete = True
-
     async def sync(self):
         try:
             await self.set_subtensor()
-            if not self.bootstrap_complete:
-                await self.bootstrap()
+            await self.announce()
+
+            validators = await self.fetch_validators()
+            await self.save_validators(validators)
         except Exception as e:
             logger.error(
                 _m(
@@ -285,7 +271,8 @@ class Miner:
                 if not settings.debug.SKIP_SYNC_FLOW:
                     await self.sync()
 
-                await asyncio.sleep(RECONNECT_POLL_CYCLE)
+                # sync every 2 mins
+                await asyncio.sleep(SYNC_CYCLE)
         except KeyboardInterrupt:
             logger.debug("Miner killed by keyboard interrupt.")
             exit()

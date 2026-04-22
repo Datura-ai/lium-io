@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,7 +15,7 @@ def _make_miner() -> Miner:
     miner.netuid = 51
     miner.axon = object()
     miner.subtensor = None
-    miner.bootstrap_complete = False
+    miner.last_announced_block = 0
     miner.should_exit = False
     miner.default_extra = {"external_ip": "127.0.0.1", "external_port": 8000}
     miner.wallet = SimpleNamespace(
@@ -24,59 +25,24 @@ def _make_miner() -> Miner:
 
 
 @pytest.mark.asyncio
-async def test_ensure_axon_registration_awaits_serve_axon_when_on_chain_info_differs():
-    """Startup axon verification should announce only when local config differs from chain."""
+async def test_announce_awaits_serve_axon_when_tempo_elapsed():
+    """Tempo threshold should trigger async axon serving exactly once."""
     # Arrange
     miner = _make_miner()
-    get_neuron = AsyncMock(
-        return_value=SimpleNamespace(
-            axon_info=SimpleNamespace(ip="203.0.113.10", port=9000, is_serving=True)
-        )
-    )
+    miner.last_announced_block = 5
+    miner.get_current_block = AsyncMock(return_value=25)
+    miner.get_tempo = AsyncMock(return_value=10)
     serve_axon = AsyncMock(return_value=True)
-    miner.subtensor = SimpleNamespace(
-        get_neuron_for_pubkey_and_subnet=get_neuron,
-        serve_axon=serve_axon,
-    )
+    miner.subtensor = SimpleNamespace(serve_axon=serve_axon)
 
     # Act
-    await miner.ensure_axon_registration()
+    await miner.announce()
 
-    # Assert — startup verification should read the current neuron state first
-    get_neuron.assert_awaited_once_with(
-        hotkey_ss58="test-hotkey",
-        netuid=miner.netuid,
-    )
-
-    # Assert — mismatched axon info should trigger a fresh announce
+    # Assert — crossing one tempo interval should trigger async announce
     serve_axon.assert_awaited_once_with(netuid=miner.netuid, axon=miner.axon)
 
-
-@pytest.mark.asyncio
-async def test_ensure_axon_registration_skips_serve_axon_when_on_chain_info_matches():
-    """Startup axon verification should avoid announcing when chain state already matches."""
-    # Arrange
-    miner = _make_miner()
-    get_neuron = AsyncMock(
-        return_value=SimpleNamespace(
-            axon_info=SimpleNamespace(
-                ip=miner.default_extra["external_ip"],
-                port=miner.default_extra["external_port"],
-                is_serving=True,
-            )
-        )
-    )
-    serve_axon = AsyncMock(return_value=True)
-    miner.subtensor = SimpleNamespace(
-        get_neuron_for_pubkey_and_subnet=get_neuron,
-        serve_axon=serve_axon,
-    )
-
-    # Act
-    await miner.ensure_axon_registration()
-
-    # Assert
-    serve_axon.assert_not_awaited()
+    # Assert — the last announced block should advance to the current block
+    assert miner.last_announced_block == 25
 
 
 @pytest.mark.asyncio
@@ -134,91 +100,45 @@ async def test_save_validators_offloads_persistence_to_thread(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_registers_axon_and_syncs_validators_once():
-    """Bootstrap should verify axon state before the one-time validator sync."""
+async def test_sync_allows_other_coroutines_to_run_while_waiting_on_async_chain_calls():
+    """Sync should yield control while awaiting chain I/O instead of monopolizing the loop."""
     # Arrange
     miner = _make_miner()
-    execution_order: list[str | tuple[str, int]] = []
+    execution_order: list[str] = []
 
-    async def ensure_axon_registration():
-        execution_order.append("axon")
+    async def set_subtensor():
+        execution_order.append("set_subtensor:start")
+        await asyncio.sleep(0.01)
+        execution_order.append("set_subtensor:end")
+
+    async def announce():
+        execution_order.append("announce:start")
+        await asyncio.sleep(0.01)
+        execution_order.append("announce:end")
 
     async def fetch_validators():
         execution_order.append("fetch:start")
+        await asyncio.sleep(0.01)
         execution_order.append("fetch:end")
         return [SimpleNamespace(hotkey="validator-1")]
 
     async def save_validators(validators):
-        execution_order.append(("save", len(validators)))
+        execution_order.append(f"save:{len(validators)}")
 
-    miner.ensure_axon_registration = ensure_axon_registration
+    async def concurrent_marker():
+        await asyncio.sleep(0)
+        execution_order.append("marker")
+
+    miner.set_subtensor = set_subtensor
+    miner.announce = announce
     miner.fetch_validators = fetch_validators
     miner.save_validators = save_validators
 
     # Act
-    await miner.bootstrap()
+    await asyncio.gather(miner.sync(), concurrent_marker())
 
-    # Assert
-    assert execution_order == ["axon", "fetch:start", "fetch:end", ("save", 1)]
-    assert miner.bootstrap_complete is True
-
-
-@pytest.mark.asyncio
-async def test_sync_bootstraps_only_once_per_connection():
-    """The repeating loop should skip axon and validator bootstrap after the first success."""
-    # Arrange
-    miner = _make_miner()
-    bootstrap_calls: list[str] = []
-    miner.set_subtensor = AsyncMock()
-
-    async def bootstrap():
-        bootstrap_calls.append("bootstrap")
-        miner.bootstrap_complete = True
-
-    miner.bootstrap = bootstrap
-
-    # Act
-    await miner.sync()
-    await miner.sync()
-
-    # Assert
-    assert miner.set_subtensor.await_count == 2
-    assert bootstrap_calls == ["bootstrap"]
-
-
-@pytest.mark.asyncio
-async def test_sync_retries_bootstrap_after_reinitialize_on_failure():
-    """A failed startup bootstrap should reinitialize subtensor and retry on the next cycle."""
-    # Arrange
-    miner = _make_miner()
-    miner.set_subtensor = AsyncMock()
-    bootstrap_attempts = 0
-    reinitializations = 0
-
-    async def bootstrap():
-        nonlocal bootstrap_attempts
-        bootstrap_attempts += 1
-        if bootstrap_attempts == 1:
-            raise RuntimeError("temporary bootstrap failure")
-        miner.bootstrap_complete = True
-
-    async def initialize_subtensor():
-        nonlocal reinitializations
-        reinitializations += 1
-        miner.subtensor = object()
-        miner.bootstrap_complete = False
-
-    miner.bootstrap = bootstrap
-    miner.initialize_subtensor = initialize_subtensor
-
-    # Act
-    await miner.sync()
-    await miner.sync()
-
-    # Assert
-    assert reinitializations == 1
-    assert bootstrap_attempts == 2
-    assert miner.bootstrap_complete is True
+    # Assert — another coroutine should run before sync reaches its final save step
+    assert execution_order.index("marker") < execution_order.index("save:1")
 
 
 def test_save_validators_sync_inserts_only_missing_validators_and_commits_once(tmp_path, monkeypatch):
