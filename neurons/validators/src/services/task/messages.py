@@ -554,6 +554,15 @@ class VerifyXMessages:
             "the executor container (docker compose restart) if it does not."
         ),
     )
+    VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW = _verify_failed(
+        label="network speed too slow",
+        reason_suffix="NETWORK_SPEED_TOO_SLOW",
+        remediation=(
+            "EMA download speed is below the minimum threshold. "
+            "Improve the executor's network connection or wait for the EMA to recover "
+            "once speeds improve."
+        ),
+    )
 
 
 class TdxHostMessages:

@@ -4,10 +4,8 @@ via integration in test_score_check.py and test_pipeline_default_scenarios.py.
 """
 import pytest
 
-from neurons.validators.src.services.task.score_calculator import (
-    MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS,
-    calculate_scores,
-)
+from neurons.validators.src.services.task.score_calculator import calculate_scores
+from neurons.validators.src.services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from helpers import build_context_config, build_services, build_state, default_executor, make_context
 
 
@@ -35,17 +33,12 @@ def _ctx(ema_verifyx_download_speed, price_per_gpu=None):
 @pytest.mark.parametrize(
     "ema_speed, scores_zeroed, warning_fragment",
     [
-        # No EMA available for a non-rented executor — zero (regression guard for DAH verifyx null fix)
+        # No EMA available for a non-rented executor — zero (verifyx disabled or first-run edge case)
         (None, True, "unavailable"),
-        # Above threshold — no penalty
+        # At or above threshold — no penalty (threshold enforcement is in VerifyXCheck, not here)
         (MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS, False, None),
         (120.0, False, None),
         (500.0, False, None),
-        # Just below threshold — both scores zeroed with warning
-        (MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS - 0.1, True, "EMA verifyx download speed too slow"),
-        (99.9, True, "99.9 Mbps"),
-        (50.0, True, "50.0 Mbps"),
-        (0.0, True, "0.0 Mbps"),
     ],
 )
 def test_ema_verifyx_download_speed_scoring_unrented(ema_speed, scores_zeroed, warning_fragment):
@@ -69,16 +62,6 @@ def test_ema_download_missing_rented_does_not_zero():
     assert actual_score == 1.0
     assert job_score == 1.0
     assert "unavailable" not in warning
-
-
-def test_ema_download_below_threshold_rented_still_zeros_actual_score():
-    """Rented executor below threshold: actual_score zeroed, final job_score forced to 1.0 by _format_return."""
-    ctx = _ctx(50.0)
-    actual_score, job_score, warning = calculate_scores(ctx, rented=True)
-    assert actual_score == 0.0
-    # job_score is forced to 1.0 for rented in _format_return
-    assert job_score == 1.0
-    assert "too slow" in warning
 
 
 def test_no_network_specs_unrented_zeros():

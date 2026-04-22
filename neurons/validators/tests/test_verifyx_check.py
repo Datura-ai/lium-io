@@ -89,8 +89,8 @@ class DummyVerifyXService:
             True,
             Msg.VERIFY_SUCCESS.reason,
         ),
-        # VerifyX succeeds without additional specs
-        (True, True, True, "", {}, True, Msg.VERIFY_SUCCESS.reason),
+        # VerifyX succeeds without network data → EMA=0 < threshold → fails
+        (True, True, True, "", {}, False, Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason),
         # VerifyX fails with error message
         (True, True, False, "Checksum mismatch", {}, False, Msg.VERIFY_FAILED.reason),
         # VerifyX fails with data errors
@@ -254,66 +254,6 @@ def _rented_data_with_ema(executor_uuid: str, *, download: float | None = None, 
 
 
 @pytest.mark.asyncio
-async def test_verifyx_failure_decays_prev_ema_download(context_factory):
-    """On probe failure, download EMA decays by one step toward 0 (0.7 × prev)."""
-    verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
-    services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
-    state = build_state(
-        specs={"gpu": {"count": 1}},
-        rented_data=_rented_data_with_ema("executor-123", download=250.0),
-    )
-    ctx = context_factory(services=services, config=config, state=state)
-
-    result = await VerifyXCheck().run(ctx)
-
-    assert result.passed is False
-    assert "state" in result.updates
-    # compute_ema(250.0, 0.0) = 0.3*0 + 0.7*250 = 175.0
-    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(175.0)
-
-
-@pytest.mark.asyncio
-async def test_verifyx_failure_decays_prev_ema_upload(context_factory):
-    """On probe failure, upload EMA also decays by one step toward 0 (0.7 × prev)."""
-    verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
-    services = build_services(verifyx=verifyx_service)
-    config = build_context_config(verifyx_enabled=True)
-    state = build_state(
-        specs={"gpu": {"count": 1}},
-        rented_data=_rented_data_with_ema("executor-123", upload=40.0),
-    )
-    ctx = context_factory(services=services, config=config, state=state)
-
-    result = await VerifyXCheck().run(ctx)
-
-    assert result.passed is False
-    assert "state" in result.updates
-    # compute_ema(40.0, 0.0) = 0.3*0 + 0.7*40 = 28.0
-    assert result.updates["state"].specs["network"]["ema_verifyx_upload_speed"] == pytest.approx(28.0)
-
-
-@pytest.mark.asyncio
-async def test_verifyx_failure_repeated_decays_below_threshold(context_factory):
-    """After 5 consecutive failures starting from 500 Mbps, EMA drops below 100 Mbps threshold."""
-    # 500 * 0.7^5 ≈ 84.0 < 100 Mbps
-    ema = 500.0
-    for _ in range(5):
-        verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
-        services = build_services(verifyx=verifyx_service)
-        config = build_context_config(verifyx_enabled=True)
-        state = build_state(
-            specs={"gpu": {"count": 1}},
-            rented_data=_rented_data_with_ema("executor-123", download=ema),
-        )
-        ctx = context_factory(services=services, config=config, state=state)
-        result = await VerifyXCheck().run(ctx)
-        ema = result.updates["state"].specs["network"]["ema_verifyx_download_speed"]
-
-    assert ema < 100.0
-
-
-@pytest.mark.asyncio
 async def test_verifyx_failure_without_prev_ema_leaves_specs_empty(context_factory):
     """No prior EMA anywhere — failure branch must not fabricate a state update."""
     verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))
@@ -347,11 +287,111 @@ async def test_verifyx_failure_without_rented_data_does_not_update_state(context
 
 
 @pytest.mark.asyncio
+async def test_verifyx_success_ema_below_threshold_fails_check(context_factory):
+    """Verifyx passes but EMA drops below 100 Mbps threshold → check fails with specific reason."""
+    # prev_ema=110, current=0 → new EMA = 0.7*110 = 77 < 100
+    verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", download=110.0),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(77.0)
+
+
+@pytest.mark.asyncio
+async def test_verifyx_success_ema_at_threshold_passes(context_factory):
+    """EMA exactly at 100 Mbps passes (threshold is strictly less-than)."""
+    # prev_ema=None, current=100 → EMA = 100.0 (bootstrap)
+    verifyx_service = DummyVerifyXService(
+        success=True,
+        updated_specs={"network": {"download_speed": 100.0, "upload_speed": 50.0}},
+    )
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(specs={"gpu": {"count": 1}}, rented_data=None)
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_verifyx_success_null_network_bootstraps_ema_to_zero_and_fails(context_factory):
+    """First run: verifyx passes but network failed → EMA=0.0 < threshold → check fails."""
+    verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(specs={"gpu": {"count": 1}}, rented_data=None)
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(0.0)
+    assert result.updates["state"].specs["network"]["ema_verifyx_upload_speed"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_verifyx_success_null_network_decays_prev_ema(context_factory):
+    """Verifyx passes but network failed → EMA decays: compute_ema(prev, 0.0) = 0.7 × prev."""
+    verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=_rented_data_with_ema("executor-123", download=500.0, upload=100.0),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+    net = result.updates["state"].specs["network"]
+    # compute_ema(500.0, 0.0) = 0.7 * 500 = 350.0
+    assert net["ema_verifyx_download_speed"] == pytest.approx(350.0)
+    # compute_ema(100.0, 0.0) = 0.7 * 100 = 70.0
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(70.0)
+    # raw speed keys must NOT be set when there was no measurement
+    assert "verifyx_download_speed" not in net
+    assert "verifyx_upload_speed" not in net
+
+
+@pytest.mark.asyncio
+async def test_verifyx_success_null_network_repeated_decays_below_threshold(context_factory):
+    """5 consecutive verifyx-pass / network-fail cycles from 500 Mbps → EMA below 100 Mbps."""
+    # 500 * 0.7^5 ≈ 84.0 < 100 Mbps
+    ema = 500.0
+    for _ in range(5):
+        verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
+        services = build_services(verifyx=verifyx_service)
+        config = build_context_config(verifyx_enabled=True)
+        state = build_state(
+            specs={"gpu": {"count": 1}},
+            rented_data=_rented_data_with_ema("executor-123", download=ema),
+        )
+        ctx = context_factory(services=services, config=config, state=state)
+        result = await VerifyXCheck().run(ctx)
+        ema = result.updates["state"].specs["network"]["ema_verifyx_download_speed"]
+
+    assert ema < 100.0
+
+
+@pytest.mark.asyncio
 async def test_verifyx_success_path_emits_no_verifyx_failed_log(
     context_factory, caplog
 ):
     """Regression: success path MUST NOT emit the new VerifyX failure log line."""
-    updated_specs = {"ram": {"total": "64GB"}, "hard_disk": {"total": "1TB"}}
+    updated_specs = {"ram": {"total": "64GB"}, "hard_disk": {"total": "1TB"}, "network": {"download_speed": 500.0, "upload_speed": 100.0}}
     verifyx_service = DummyVerifyXService(success=True, updated_specs=updated_specs)
     services = build_services(verifyx=verifyx_service)
     config = build_context_config(verifyx_enabled=True)
