@@ -216,6 +216,15 @@ PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 2
 
 POD_CONTAINER_PREFIX = "pod_"
 
+# Container name prefixes that count as "rental-related" on an executor.
+# All producers of short-lived containers competing for the 9100-9130 port range
+# MUST be listed here so that container_cleanup and wait_for_port_check_containers
+# both see them. Adding a new prefix is a one-line edit that both guards inherit.
+#   pod_*          — long-lived user rentals (validator-owned)
+#   container_*    — validator DinD/port-check probes (hotkey-scoped)
+#   health_check_* — backend executor_health_check probes (hotkey-agnostic, epoch-suffixed)
+RENTAL_CONTAINER_PREFIXES = ("pod_", "container_", "health_check_")
+
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
 TDX_WHITELIST = {
     "OS_IMAGE_HASH": set(

@@ -1,5 +1,6 @@
 import asyncio
 import random
+import re
 from datetime import datetime
 import logging
 import time
@@ -66,6 +67,15 @@ DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
 }
 
+# DAH-1991: retry on Docker port-allocated race with concurrent short-lived
+# containers (health_check_*, container_*) on the executor. Full sentinel phrase
+# to avoid matching unrelated docker failures.
+_PORT_ALLOCATED_RE = re.compile(
+    r"Bind for 0\.0\.0\.0:(\d+) failed: port is already allocated"
+)
+_PORT_ALLOCATED_MAX_RETRIES = 2
+_PORT_ALLOCATED_RETRY_BACKOFF_SEC = 3
+
 
 class DockerService:
     def __init__(
@@ -84,6 +94,29 @@ class DockerService:
 
     def _ssh_bootstrap_script_path(self) -> Path:
         return Path(__file__).resolve().parent / "assets" / "sshd_bootstrap.sh"
+
+    @staticmethod
+    def _parse_allocated_port(err_str: str) -> int | None:
+        """Extract the colliding external port from a Docker port-allocated error.
+
+        Returns None if the message is not a port-allocated error. Anchor the full
+        sentinel phrase to avoid false positives on unrelated docker stderrs.
+        """
+        match = _PORT_ALLOCATED_RE.search(err_str or "")
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _drop_external_port(
+        available_ports_raw: list["PayloadPortMapping"] | None,
+        colliding_port: int,
+    ) -> list["PayloadPortMapping"]:
+        """Return a new list with the colliding external_port removed.
+
+        Used before regenerating port mappings on retry so `generate_portMappings`
+        cannot deterministically re-pick the same port via `max()/min()` selection
+        in the SSH/Jupyter port slots (DAH-1991, Architect ask 5).
+        """
+        return [p for p in (available_ports_raw or []) if p.external_port != colliding_port]
 
     async def _prepare_known_hosts_policy(
         self,
@@ -390,7 +423,11 @@ class DockerService:
     ) -> tuple[bool, str]:
         """Wait for port check containers to finish before creating rental containers.
 
-        Port check containers have the prefix 'container_{miner_hotkey}_'
+        Matches two prefix patterns:
+        - 'container_{miner_hotkey}_*' — validator DinD/port-check probes (hotkey-scoped,
+          preserved for cross-miner isolation on shared physical hosts)
+        - 'health_check_*' — backend executor_health_check probes (hotkey-agnostic,
+          backend creates these without a hotkey segment — see DAH-1991)
 
         Args:
             executor_info: Executor SSH connection info
@@ -407,6 +444,7 @@ class DockerService:
             - (False, "Port check containers still exist after max retries") - Failed to clear
         """
         container_prefix = f"container_{miner_hotkey}_"
+        health_check_prefix = "health_check_"
 
         # Decrypt private key and establish SSH connection
         decrypted_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
@@ -421,8 +459,12 @@ class DockerService:
                 known_hosts=None,
             ) as ssh_client:
                 for attempt in range(max_retries + 1):
-                    # Check if port check containers exist
-                    command = f'/usr/bin/docker ps --format "{{{{.Names}}}}" --filter "name=^{container_prefix}"'
+                    # docker ps OR-s multiple --filter name= flags
+                    command = (
+                        '/usr/bin/docker ps --format "{{.Names}}" '
+                        f'--filter "name=^{container_prefix}" '
+                        f'--filter "name=^{health_check_prefix}"'
+                    )
                     result = await ssh_client.run(command)
 
                     if not result.stdout or not result.stdout.strip():
@@ -447,9 +489,13 @@ class DockerService:
                             f"forcing cleanup: {container_names}"
                         )
 
-                        # Force remove all containers with the prefix in one command
-                        # docker rm -f will stop and remove the containers
-                        remove_cmd = f"docker ps -q --filter 'name=^{container_prefix}' | xargs -r docker rm -f"
+                        # Force remove containers matching either prefix.
+                        remove_cmd = (
+                            "docker ps -q "
+                            f"--filter 'name=^{container_prefix}' "
+                            f"--filter 'name=^{health_check_prefix}' "
+                            "| xargs -r docker rm -f"
+                        )
                         result = await ssh_client.run(remove_cmd)
 
                         logger.info(f"Forced removal of stale port check containers completed")
@@ -1145,15 +1191,103 @@ class DockerService:
                 timeout = 120
                 logger.info(f"Running command: {command} with timeout={timeout}")
 
+                # DAH-1991: retry narrowly on Docker "port is already allocated" races
+                # with concurrent short-lived containers (health_check_*, container_*)
+                # on the executor. On collision: parse colliding external port from
+                # stderr, drop it from the available pool, regenerate mappings, rebuild
+                # the run command, and retry. Non-port-allocated errors surface as today.
+                available_ports_raw = payload.available_ports
+                for attempt in range(_PORT_ALLOCATED_MAX_RETRIES + 1):
+                    try:
+                        await self.execute_and_stream_logs(
+                            ssh_client=ssh_client,
+                            command=command,
+                            log_tag=log_tag,
+                            log_text="Creating docker container",
+                            log_extra=default_extra,
+                            timeout=timeout
+                        )
+                        break
+                    except Exception as e:
+                        colliding_port = self._parse_allocated_port(str(e))
+                        if colliding_port is None or attempt >= _PORT_ALLOCATED_MAX_RETRIES:
+                            raise
+                        old_ports = [ep for _, _, ep in port_maps]
+                        available_ports_raw = self._drop_external_port(
+                            available_ports_raw, colliding_port
+                        )
+                        logger.info(
+                            _m(
+                                "PORT_ALREADY_ALLOCATED_RETRY",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "attempt": attempt + 1,
+                                    "max_retries": _PORT_ALLOCATED_MAX_RETRIES,
+                                    "colliding_port": colliding_port,
+                                    "old_ports": old_ports,
+                                    "sleep_seconds": _PORT_ALLOCATED_RETRY_BACKOFF_SEC,
+                                }),
+                            )
+                        )
+                        await asyncio.sleep(_PORT_ALLOCATED_RETRY_BACKOFF_SEC)
+                        port_maps, jupyter_port_map = await self.generate_portMappings(
+                            payload.miner_hotkey,
+                            payload.executor_id,
+                            UUID(payload.pod_id),
+                            custom_options.internal_ports,
+                            custom_options.initial_port_count,
+                            payload.enable_jupyter,
+                            available_ports_raw,
+                            payload.pod_mapping,
+                        )
+                        if not port_maps:
+                            logger.error(
+                                _m(
+                                    "Failed to regenerate port mappings on retry",
+                                    extra=get_extra_info({
+                                        **default_extra,
+                                        "attempt": attempt + 1,
+                                    }),
+                                )
+                            )
+                            raise
+                        new_ports = [ep for _, _, ep in port_maps]
+                        logger.info(
+                            _m(
+                                "PORT_MAPPINGS_REGENERATED",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "attempt": attempt + 1,
+                                    "new_ports": new_ports,
+                                }),
+                            )
+                        )
+                        port_flags = " ".join(
+                            [
+                                f"-p {internal_port}:{docker_port}"
+                                for docker_port, internal_port, _ in port_maps
+                            ]
+                        )
+                        command = (
+                            f'/usr/bin/docker run -d '
+                            f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
+                            f'{net_perm_flags} '  # Network permission flags
+                            f'{port_flags} '
+                            f'{volume_flag} '
+                            f'{entrypoint_flag} '
+                            f'{env_flags} '
+                            f'{shm_size_flag} '
+                            f'{gpu_flags} '  # GPU restriction flags
+                            f'{cpu_flag} '  # CPU restriction flags
+                            f'{memory_flag} '  # Memory restriction flags
+                            f'{storage_flag} '  # Storage restriction flags
+                            f'--restart unless-stopped '
+                            f'--name {container_name} '
+                            f'{payload.docker_image} '
+                            f'{startup_commands}'
+                        )
+                        logger.info(f"Retry {attempt + 1}: {command}")
 
-                await self.execute_and_stream_logs(
-                    ssh_client=ssh_client,
-                    command=command,
-                    log_tag=log_tag,
-                    log_text="Creating docker container",
-                    log_extra=default_extra,
-                    timeout=timeout
-                )
                 logger.info(f"Container creation step finished")
 
                 # check if the container is running correctly

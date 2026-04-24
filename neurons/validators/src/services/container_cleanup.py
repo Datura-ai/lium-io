@@ -4,7 +4,7 @@ from typing import Optional
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from core.docker_utils import DockerCommand
 from core.utils import _m
-from services.const import POD_CONTAINER_PREFIX
+from services.const import POD_CONTAINER_PREFIX, RENTAL_CONTAINER_PREFIXES
 
 logger = logging.getLogger(__name__)
 
@@ -103,12 +103,16 @@ class ContainerCleanup:
         return len(removed_names), removed_names
 
     async def _get_all_rental_containers(self, ssh_client) -> list[str]:
-        """Get all containers with rental-related prefixes."""
+        """Get all containers with rental-related prefixes.
+
+        Iterates RENTAL_CONTAINER_PREFIXES (services/const.py) so any short-lived
+        container that competes for the rental port range is caught by cleanup.
+        A stale running `health_check_*` from a crashed backend would otherwise
+        hold ports 9100-9130 indefinitely.
+        """
         try:
-            # Get both pod_ and container_ prefixed containers in one command
-            result = await ssh_client.run(
-                DockerCommand.ps_filter(f"{POD_CONTAINER_PREFIX}*", "container_*")
-            )
+            patterns = [f"{prefix}*" for prefix in RENTAL_CONTAINER_PREFIXES]
+            result = await ssh_client.run(DockerCommand.ps_filter(*patterns))
             if result.stdout and result.stdout.strip():
                 return result.stdout.strip().split('\n')
         except Exception as e:
