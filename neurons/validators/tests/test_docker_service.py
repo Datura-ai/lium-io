@@ -977,3 +977,187 @@ def test_build_docker_login_command_quotes_username_too():
 
     # Assert — the entire username appears as one token after --username.
     assert tokens[6] == malicious_username
+
+
+# ---------------------------------------------------------------------------
+# DAH-1991: port-9101 race — retry on "port is already allocated" + extended
+# wait_for_port_check_containers to include `health_check_*`.
+# ---------------------------------------------------------------------------
+
+
+class TestParseAllocatedPort:
+    def test_parses_port_from_full_docker_error(self):
+        err = (
+            "docker: Error response from daemon: failed to set up container "
+            "networking: driver failed programming external connectivity on "
+            "endpoint pod_599e3ed0-...: Bind for 0.0.0.0:9101 failed: port is "
+            "already allocated"
+        )
+        assert DockerService._parse_allocated_port(err) == 9101
+
+    def test_returns_none_on_unrelated_error(self):
+        err = "docker: Error response from daemon: No such image: bogus:latest"
+        assert DockerService._parse_allocated_port(err) is None
+
+    def test_returns_none_on_empty_string(self):
+        assert DockerService._parse_allocated_port("") is None
+
+    def test_returns_none_on_partial_match(self):
+        # "port is already allocated" appears but without the Bind sentinel — do not match
+        err = "some other layer said port is already allocated somewhere"
+        assert DockerService._parse_allocated_port(err) is None
+
+    def test_parses_different_ports(self):
+        assert DockerService._parse_allocated_port(
+            "Bind for 0.0.0.0:20000 failed: port is already allocated"
+        ) == 20000
+        assert DockerService._parse_allocated_port(
+            "Bind for 0.0.0.0:9130 failed: port is already allocated"
+        ) == 9130
+
+
+class TestDropExternalPort:
+    def test_drops_matching_port(self):
+        ports = [
+            PayloadPortMapping(internal_port=9100, external_port=9100, docker_port=None),
+            PayloadPortMapping(internal_port=9101, external_port=9101, docker_port=None),
+            PayloadPortMapping(internal_port=9102, external_port=9102, docker_port=None),
+        ]
+        result = DockerService._drop_external_port(ports, 9101)
+        assert len(result) == 2
+        assert 9101 not in {p.external_port for p in result}
+        assert {p.external_port for p in result} == {9100, 9102}
+
+    def test_returns_empty_when_input_none(self):
+        assert DockerService._drop_external_port(None, 9101) == []
+
+    def test_returns_same_when_port_absent(self):
+        ports = [
+            PayloadPortMapping(internal_port=9100, external_port=9100, docker_port=None),
+        ]
+        result = DockerService._drop_external_port(ports, 9999)
+        assert len(result) == 1
+        assert result[0].external_port == 9100
+
+
+@pytest.mark.asyncio
+async def test_wait_for_port_check_filter_includes_health_check(docker_service):
+    """wait_for_port_check_containers must OR-filter container_{hotkey}_* AND health_check_*.
+
+    DAH-1991: backend-created health_check_* probes (hotkey-agnostic) compete
+    for the same port range as user rentals. Without this filter, the wait
+    guard would proceed while a probe holds port 9101, causing `docker run` to
+    fail with "port is already allocated".
+    """
+    from unittest.mock import patch
+
+    seen_commands: list[str] = []
+
+    class FakeSSHClient:
+        async def run(self, cmd):
+            seen_commands.append(cmd)
+            return MagicMock(stdout="", stderr="", exit_status=0)
+
+    class FakeConnect:
+        async def __aenter__(self_inner):
+            return FakeSSHClient()
+
+        async def __aexit__(self_inner, *_):
+            return None
+
+    # Mock asyncssh.connect to return our fake client and bypass pkey decoding
+    with patch("services.docker_service.asyncssh.connect", return_value=FakeConnect()), \
+         patch("services.docker_service.asyncssh.import_private_key", return_value=MagicMock()):
+        docker_service.ssh_service.decrypt_payload = Mock(return_value="---BEGIN---\n---END---")
+        executor_info = ExecutorSSHInfo(
+            uuid=str(uuid4()),
+            address="127.0.0.1",
+            port=10001,
+            ssh_username="root",
+            ssh_port=2201,
+            python_path="/usr/bin/python",
+            root_dir="/root",
+            port_range="9100-9130",
+            port_mappings=None,
+            price_per_gpu=0.17,
+            ssh_host_key=None,
+            tdx_quote=None,
+        )
+        keypair_mock = MagicMock()
+        keypair_mock.ss58_address = "5Test"
+
+        ok, msg = await docker_service.wait_for_port_check_containers(
+            executor_info=executor_info,
+            miner_hotkey="5TestMiner",
+            keypair=keypair_mock,
+            private_key="encrypted-private-key",
+            max_retries=0,
+        )
+
+    assert ok is True
+    assert msg == "No port check containers found"
+    # Inspect the docker ps command
+    ps_cmd = next((c for c in seen_commands if "docker ps" in c), "")
+    assert ps_cmd, f"No docker ps command issued. Commands seen: {seen_commands}"
+    # Both filters must be present
+    assert "name=^container_5TestMiner_" in ps_cmd
+    assert "name=^health_check_" in ps_cmd
+
+
+@pytest.mark.asyncio
+async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
+    """A container_<other_hotkey>_* container on a shared host does NOT block us.
+
+    Regression guard for Scenario 3 in the DAH-1991 pre-mortem: the hotkey
+    scope on `container_*` must be preserved; adding health_check_* must NOT
+    accidentally collapse the cross-miner isolation.
+    """
+    from unittest.mock import patch
+
+    class FakeSSHClient:
+        def __init__(self, stdout):
+            self._stdout = stdout
+
+        async def run(self, cmd):
+            # Return empty — neither our prefix nor health_check_ matches
+            return MagicMock(stdout="", stderr="", exit_status=0)
+
+    class FakeConnect:
+        async def __aenter__(self_inner):
+            # stdout empty means nothing matches; simulating OTHER-miner container is
+            # invisible under filter name=^container_{our_hotkey}_
+            return FakeSSHClient(stdout="")
+
+        async def __aexit__(self_inner, *_):
+            return None
+
+    with patch("services.docker_service.asyncssh.connect", return_value=FakeConnect()), \
+         patch("services.docker_service.asyncssh.import_private_key", return_value=MagicMock()):
+        docker_service.ssh_service.decrypt_payload = Mock(return_value="x")
+        executor_info = ExecutorSSHInfo(
+            uuid=str(uuid4()),
+            address="127.0.0.1",
+            port=10001,
+            ssh_username="root",
+            ssh_port=2201,
+            python_path="/usr/bin/python",
+            root_dir="/root",
+            port_range="9100-9130",
+            port_mappings=None,
+            price_per_gpu=0.17,
+            ssh_host_key=None,
+            tdx_quote=None,
+        )
+        keypair_mock = MagicMock()
+        keypair_mock.ss58_address = "5Test"
+
+        ok, msg = await docker_service.wait_for_port_check_containers(
+            executor_info=executor_info,
+            miner_hotkey="5OurHotkey",
+            keypair=keypair_mock,
+            private_key="x",
+            max_retries=0,
+        )
+
+    assert ok is True
+    assert msg == "No port check containers found"
