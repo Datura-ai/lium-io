@@ -242,6 +242,13 @@ class DockerService:
 
         return available_ports, pod_mapping
 
+    @staticmethod
+    def _build_docker_login_command(username: str, password: str) -> str:
+        return (
+            f"echo {shlex.quote(password)} | "
+            f"/usr/bin/docker login --username {shlex.quote(username)} --password-stdin"
+        )
+
     async def execute_and_stream_logs(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -972,7 +979,9 @@ class DockerService:
                 #     log_extra=default_extra,
                 # )
                 if payload.docker_username and payload.docker_password:
-                    command = f"echo '{payload.docker_password}' | /usr/bin/docker login --username '{payload.docker_username}' --password-stdin"
+                    command = self._build_docker_login_command(
+                        payload.docker_username, payload.docker_password
+                    )
                     await self.execute_and_stream_logs(
                         ssh_client=ssh_client,
                         command=command,
