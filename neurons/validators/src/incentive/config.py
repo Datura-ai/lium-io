@@ -78,7 +78,7 @@ GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
     # RTX A6000
     "NVIDIA RTX A6000": {"*": 0, "1": D12, "8": D12},
     # RTX PRO 6000
-    "NVIDIA RTX A6000": {"*": 0, "1": D12, "8": D12},
+    "RTX PRO 6000": {"*": 0, "1": D12, "8": D12},
 }
 
 
