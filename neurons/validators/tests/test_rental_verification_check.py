@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import patch
 
 from neurons.validators.src.protocol.vc_protocol.compute_requests import ExecutorHealthCheckResponse
+from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
 
@@ -49,7 +50,7 @@ async def test_rental_verification_skip(
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, details={})
     )
-    services = build_services(backend=backend_client)
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080]})
 
     ctx = context_factory(services=services, state=state)
@@ -74,7 +75,7 @@ async def test_rental_verification_no_ports():
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, details={})
     )
-    services = build_services(backend=backend_client)
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     # No verified ports
     state = build_state(specs={})
 
@@ -102,7 +103,7 @@ async def test_rental_verification_success():
             details={"container_healthy": True}
         )
     )
-    services = build_services(backend=backend_client)
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080, 8081, 8082]})
 
     from tests.helpers import make_context
@@ -137,7 +138,7 @@ async def test_rental_verification_failed():
             details={"timeout": True}
         )
     )
-    services = build_services(backend=backend_client)
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080]})
 
     from tests.helpers import make_context
@@ -158,7 +159,7 @@ async def test_rental_verification_failed():
 async def test_rental_verification_api_error():
     """Test handling of API errors (returns None)."""
     backend_client = DummyBackendClient(response=None)  # API failure
-    services = build_services(backend=backend_client)
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080]})
 
     from tests.helpers import make_context
@@ -181,7 +182,7 @@ async def test_rental_verification_exception():
             raise Exception("Network timeout")
 
     backend_client = ExceptionBackendClient()
-    services = build_services(backend=backend_client)
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(specs={"verified_ports": [8080]})
 
     from tests.helpers import make_context
@@ -202,7 +203,7 @@ async def test_rental_verification_uses_first_verified_port():
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, details={})
     )
-    services = build_services(backend=backend_client)
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     # Multiple verified ports
     state = build_state(specs={"verified_ports": [9001, 9002, 9003]})
 
@@ -216,3 +217,147 @@ async def test_rental_verification_uses_first_verified_port():
     assert result.passed is True
     # Should use first port (9001)
     assert backend_client.called_with["container_port"] == 9001
+
+
+# ---------------------------------------------------------------------------
+# DAH-1991: post-rental-check cleanup of `health_check_*` containers.
+# Force-remove must run on success, on backend failure, and on exception
+# paths — but never alter the check's outcome.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSSH:
+    def __init__(self):
+        self.commands: list[str] = []
+
+    async def run(self, cmd):
+        self.commands.append(cmd)
+
+        class _R:
+            stdout = ""
+            stderr = ""
+            exit_status = 0
+
+        return _R()
+
+
+def _has_health_check_cleanup(commands: list[str]) -> bool:
+    return any(
+        "docker ps" in c
+        and "name=^health_check_" in c
+        and "docker rm -f" in c
+        for c in commands
+    )
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_cleans_health_check_on_success():
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ssh = _RecordingSSH()
+    ctx = make_context(services=services, state=state, ssh=ssh)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert _has_health_check_cleanup(ssh.commands)
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_cleans_health_check_on_failure():
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(
+            success=False, error="Container not responding", details={}
+        )
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ssh = _RecordingSSH()
+    ctx = make_context(services=services, state=state, ssh=ssh)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert _has_health_check_cleanup(ssh.commands)
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_cleans_health_check_on_exception():
+    class ExceptionBackendClient:
+        async def check_executor_health(self, **kwargs):
+            raise Exception("Network timeout")
+
+    services = build_services(backend=ExceptionBackendClient(), container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ssh = _RecordingSSH()
+    ctx = make_context(services=services, state=state, ssh=ssh)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert _has_health_check_cleanup(ssh.commands)
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_cleanup_failure_does_not_change_result():
+    """SSH error during cleanup must not flip the check's outcome."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    class FailingSSH:
+        async def run(self, cmd):
+            raise Exception("ssh broken")
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state, ssh=FailingSSH())
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    # Cleanup blew up, but verification still passed.
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_skips_cleanup_when_no_ports():
+    """When the check exits early (no verified ports) the cleanup must NOT run.
+
+    The early-return paths happen before any health_check_* probe could exist,
+    so issuing a destructive cleanup there would be wasted work.
+    """
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={})
+
+    from tests.helpers import make_context
+    ssh = _RecordingSSH()
+    ctx = make_context(services=services, state=state, ssh=ssh)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    # Early-return path: no docker rm -f issued.
+    assert not _has_health_check_cleanup(ssh.commands)

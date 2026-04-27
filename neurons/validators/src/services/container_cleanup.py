@@ -102,6 +102,53 @@ class ContainerCleanup:
 
         return len(removed_names), removed_names
 
+    async def force_remove_health_checks(
+        self,
+        ssh_client,
+        executor_uuid: str,
+    ) -> int:
+        """Force-remove every `health_check_*` container on the executor.
+
+        DAH-1991: backend-spawned `health_check_<epoch>` probes compete for
+        the rental port range during the 20-60s gap inside
+        DockerService.create_container. Cleaning them at the spawn site
+        (RentalVerificationCheck) closes the orphan window from minutes
+        (the 15-min stale sweep) to seconds. No age threshold is applied —
+        the caller has just finished the API call that produced the probe,
+        so any matching container is already done.
+
+        Failures are swallowed; the caller treats this as best-effort and
+        must not flip its own outcome based on cleanup result.
+        """
+        try:
+            result = await ssh_client.run(
+                "docker ps -q --filter 'name=^health_check_' | xargs -r docker rm -f"
+            )
+            removed = [
+                line for line in (result.stdout or "").strip().split("\n")
+                if line.strip()
+            ]
+            count = len(removed)
+            if count:
+                logger.info(
+                    _m(
+                        f"Force-removed {count} health_check_ container(s)",
+                        extra={
+                            "executor_uuid": executor_uuid,
+                            "removed_count": count,
+                        },
+                    )
+                )
+            return count
+        except Exception as e:
+            logger.warning(
+                _m(
+                    "health_check_ post-verification cleanup failed",
+                    extra={"executor_uuid": executor_uuid, "error": str(e)},
+                )
+            )
+            return 0
+
     async def _get_all_rental_containers(self, ssh_client) -> list[str]:
         """Get all containers with rental-related prefixes.
 

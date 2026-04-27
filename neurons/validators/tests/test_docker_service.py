@@ -980,64 +980,130 @@ def test_build_docker_login_command_quotes_username_too():
 
 
 # ---------------------------------------------------------------------------
-# DAH-1991: port-9101 race — retry on "port is already allocated" + extended
-# wait_for_port_check_containers to include `health_check_*`.
+# DAH-1991: port-9101 race — same-command retry on "port is already allocated"
+# + wait_for_port_check_containers extended to include `health_check_*`.
 # ---------------------------------------------------------------------------
 
 
-class TestParseAllocatedPort:
-    def test_parses_port_from_full_docker_error(self):
-        err = (
-            "docker: Error response from daemon: failed to set up container "
-            "networking: driver failed programming external connectivity on "
-            "endpoint pod_599e3ed0-...: Bind for 0.0.0.0:9101 failed: port is "
-            "already allocated"
+_PORT_ALLOCATED_ERR = (
+    "docker: Error response from daemon: failed to set up container "
+    "networking: driver failed programming external connectivity on "
+    "endpoint pod_599e3ed0-...: Bind for 0.0.0.0:9101 failed: port is "
+    "already allocated"
+)
+
+
+@pytest.mark.asyncio
+async def test_create_container_retries_on_port_allocated_then_succeeds(
+    docker_service, monkeypatch,
+):
+    """First docker run hits port-allocated; retry with the SAME command succeeds.
+
+    DAH-1991: the retry must NOT regenerate ports or rebuild the docker run
+    command — it relies on the probe's bounded TTL. So both calls must see
+    the identical command string.
+    """
+    seen_commands: list[str] = []
+    calls = {"n": 0}
+
+    async def fake_execute(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        seen_commands.append(command)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise Exception(_PORT_ALLOCATED_ERR)
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", fake_execute)
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(s):
+        sleep_calls.append(s)
+
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+
+    await docker_service._run_docker_create_with_port_retry(
+        ssh_client=Mock(),
+        command="/usr/bin/docker run -d -p 9101:9101 --name pod_test img",
+        log_tag="t",
+        default_extra={},
+        timeout=120,
+    )
+
+    assert calls["n"] == 2
+    # Same command on both attempts — no regeneration, no rebuild.
+    assert seen_commands[0] == seen_commands[1]
+    # Slept exactly once between attempts at the configured backoff.
+    assert sleep_calls == [5]
+
+
+@pytest.mark.asyncio
+async def test_create_container_exhausts_retry_budget(docker_service, monkeypatch):
+    """When port-allocated keeps firing past the 90s budget, the error propagates."""
+    calls = {"n": 0}
+
+    async def always_fail(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        calls["n"] += 1
+        raise Exception(_PORT_ALLOCATED_ERR)
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", always_fail)
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+
+    # Move time forward past the 90s deadline after one attempt.
+    times = iter([1000.0, 1000.0, 1095.0, 1095.0, 1100.0, 1100.0])
+
+    monkeypatch.setattr(
+        "services.docker_service.time.monotonic",
+        lambda: next(times),
+    )
+
+    with pytest.raises(Exception) as exc:
+        await docker_service._run_docker_create_with_port_retry(
+            ssh_client=Mock(),
+            command="/usr/bin/docker run -d -p 9101:9101 --name pod_test img",
+            log_tag="t",
+            default_extra={},
+            timeout=120,
         )
-        assert DockerService._parse_allocated_port(err) == 9101
 
-    def test_returns_none_on_unrelated_error(self):
-        err = "docker: Error response from daemon: No such image: bogus:latest"
-        assert DockerService._parse_allocated_port(err) is None
-
-    def test_returns_none_on_empty_string(self):
-        assert DockerService._parse_allocated_port("") is None
-
-    def test_returns_none_on_partial_match(self):
-        # "port is already allocated" appears but without the Bind sentinel — do not match
-        err = "some other layer said port is already allocated somewhere"
-        assert DockerService._parse_allocated_port(err) is None
-
-    def test_parses_different_ports(self):
-        assert DockerService._parse_allocated_port(
-            "Bind for 0.0.0.0:20000 failed: port is already allocated"
-        ) == 20000
-        assert DockerService._parse_allocated_port(
-            "Bind for 0.0.0.0:9130 failed: port is already allocated"
-        ) == 9130
+    assert _PORT_ALLOCATED_ERR in str(exc.value)
+    # At least one attempt was made; we exit on the deadline, not a fixed count.
+    assert calls["n"] >= 1
 
 
-class TestDropExternalPort:
-    def test_drops_matching_port(self):
-        ports = [
-            PayloadPortMapping(internal_port=9100, external_port=9100, docker_port=None),
-            PayloadPortMapping(internal_port=9101, external_port=9101, docker_port=None),
-            PayloadPortMapping(internal_port=9102, external_port=9102, docker_port=None),
-        ]
-        result = DockerService._drop_external_port(ports, 9101)
-        assert len(result) == 2
-        assert 9101 not in {p.external_port for p in result}
-        assert {p.external_port for p in result} == {9100, 9102}
+@pytest.mark.asyncio
+async def test_create_container_does_not_retry_on_other_docker_errors(
+    docker_service, monkeypatch,
+):
+    """Non-port-allocated errors must propagate immediately without any retry."""
+    calls = {"n": 0}
 
-    def test_returns_empty_when_input_none(self):
-        assert DockerService._drop_external_port(None, 9101) == []
+    async def fail_other(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        calls["n"] += 1
+        raise Exception("docker: Error response from daemon: No such image: bogus:latest")
 
-    def test_returns_same_when_port_absent(self):
-        ports = [
-            PayloadPortMapping(internal_port=9100, external_port=9100, docker_port=None),
-        ]
-        result = DockerService._drop_external_port(ports, 9999)
-        assert len(result) == 1
-        assert result[0].external_port == 9100
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", fail_other)
+
+    sleep_called = {"n": 0}
+
+    async def fake_sleep(s):
+        sleep_called["n"] += 1
+
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(Exception, match="No such image"):
+        await docker_service._run_docker_create_with_port_retry(
+            ssh_client=Mock(),
+            command="/usr/bin/docker run -d --name pod_test bogus:latest",
+            log_tag="t",
+            default_extra={},
+            timeout=120,
+        )
+
+    assert calls["n"] == 1
+    assert sleep_called["n"] == 0
 
 
 @pytest.mark.asyncio

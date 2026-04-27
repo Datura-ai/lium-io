@@ -182,3 +182,79 @@ async def test_cleanup_filter_includes_all_rental_prefixes():
     assert "pod_*" in ps_cmd
     assert "container_*" in ps_cmd
     assert "health_check_*" in ps_cmd
+
+
+# ---------------------------------------------------------------------------
+# DAH-1991: force_remove_health_checks — eager cleanup at the spawn site
+# (RentalVerificationCheck), no age threshold.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_force_remove_health_checks_issues_filtered_rm_command():
+    """The cleanup must issue a single docker ps | xargs docker rm -f scoped to health_check_."""
+    seen_cmds: list[str] = []
+
+    async def handler(cmd, *args, **kwargs):
+        seen_cmds.append(cmd)
+        # Two container IDs echoed (one per line) on docker rm -f stdout.
+        return MagicMock(exit_status=0, stdout="abc123\ndef456\n", stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=handler)
+    cleanup = ContainerCleanup()
+
+    count = await cleanup.force_remove_health_checks(ssh_client=ssh, executor_uuid=EXECUTOR_UUID)
+
+    assert count == 2
+    assert len(seen_cmds) == 1
+    cmd = seen_cmds[0]
+    assert "docker ps -q" in cmd
+    assert "name=^health_check_" in cmd
+    assert "docker rm -f" in cmd
+    # Must NOT mention pod_ or container_ — this method is health_check_-only.
+    assert "pod_" not in cmd
+    assert "name=^container_" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_force_remove_health_checks_returns_zero_when_nothing_found():
+    """Empty stdout from `docker rm -f` means no containers matched."""
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout="", stderr=""))
+    cleanup = ContainerCleanup()
+
+    count = await cleanup.force_remove_health_checks(ssh_client=ssh, executor_uuid=EXECUTOR_UUID)
+
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_force_remove_health_checks_ignores_age_threshold():
+    """Even with stale_threshold_minutes=15, fresh probes are still removed.
+
+    The whole point of this method is to bypass the age check, since the caller
+    has just produced the probe and wants it gone now.
+    """
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout="abc123\n", stderr=""))
+    cleanup = ContainerCleanup(stale_threshold_minutes=15)
+
+    count = await cleanup.force_remove_health_checks(ssh_client=ssh, executor_uuid=EXECUTOR_UUID)
+
+    # No `docker inspect ... Created` calls were issued — age was never consulted.
+    issued = [call.args[0] for call in ssh.run.await_args_list]
+    assert not any("docker inspect" in cmd for cmd in issued)
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_force_remove_health_checks_swallows_exceptions():
+    """SSH failure during cleanup must not propagate — it's best-effort."""
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=Exception("ssh broken"))
+    cleanup = ContainerCleanup()
+
+    count = await cleanup.force_remove_health_checks(ssh_client=ssh, executor_uuid=EXECUTOR_UUID)
+
+    assert count == 0
