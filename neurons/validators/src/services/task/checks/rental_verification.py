@@ -148,3 +148,10 @@ class RentalVerificationCheck:
                 event=event,
                 updates={},
             )
+
+        finally:
+            # DAH-1991: force-remove the health_check_* probe the backend just
+            # spawned so it cannot race a subsequent rental on this executor.
+            await ctx.services.container_cleanup.force_remove_health_checks(
+                ctx.ssh, ctx.executor.uuid
+            )
