@@ -47,7 +47,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
     "RTX 5090": {1: 4, 8: 16},
     "RTX 4000 Ada Generation": {},
     "RTX 6000 Ada Generation": {},
-    "RTX PRO 6000": { 8: 8},
+    "RTX PRO 6000": {1: 2, 8: 8},
     "L4": {},
     "L40S": {},
     "RTX 2000 Ada Generation": {},
@@ -76,6 +76,8 @@ GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
     "NVIDIA A100 80GB PCIe": {"*": 0, "1": D12, "8": D12},
     "NVIDIA A100-SXM4-80GB": {"*": 0, "1": D12, "8": D12},
     # RTX A6000
+    "NVIDIA RTX A6000": {"*": 0, "1": D12, "8": D12},
+    # RTX PRO 6000
     "NVIDIA RTX A6000": {"*": 0, "1": D12, "8": D12},
 }
 
