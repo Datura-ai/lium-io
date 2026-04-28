@@ -70,15 +70,16 @@ async def test_whole_host_rental_enumerates_all_minors():
 @pytest.mark.asyncio
 async def test_partial_rental_resolves_uuid_to_minor():
     ssh = fake_ssh(FakeRun("GPU-aaa, 0\nGPU-bbb, 1\nGPU-ccc, 2\n"))
-    nodes = await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
+    nodes, host_total = await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
 
     assert nodes == ("/dev/nvidia1",)
+    assert host_total == 3
 
 
 @pytest.mark.asyncio
 async def test_partial_rental_preserves_uuid_order_in_per_gpu():
     ssh = fake_ssh(FakeRun("GPU-aaa, 0\nGPU-bbb, 1\nGPU-ccc, 2\n"))
-    nodes = await _query_gpu_nodes_for_uuids(ssh, ["GPU-ccc", "GPU-aaa"])
+    nodes, _ = await _query_gpu_nodes_for_uuids(ssh, ["GPU-ccc", "GPU-aaa"])
 
     assert nodes == ("/dev/nvidia2", "/dev/nvidia0")
 
@@ -122,6 +123,26 @@ async def test_host_without_optional_shared_nodes_has_empty_shared():
     assert nodes == ()
 
 
+@pytest.mark.asyncio
+async def test_query_shared_nodes_skips_caps_when_include_caps_false():
+    ssh = fake_ssh(FakeRun(""))
+    await _query_shared_nodes(ssh, include_caps=False)
+
+    cmd = ssh.run.call_args.args[0]
+    assert "/dev/nvidia-caps" not in cmd
+    assert "/dev/nvidia-caps-imex-channels" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_query_shared_nodes_includes_caps_by_default():
+    ssh = fake_ssh(FakeRun(""))
+    await _query_shared_nodes(ssh)
+
+    cmd = ssh.run.call_args.args[0]
+    assert "/dev/nvidia-caps" in cmd
+    assert "/dev/nvidia-caps-imex-channels" in cmd
+
+
 # ---------------------------- build_gpu_flags ----------------------------
 
 
@@ -155,6 +176,41 @@ async def test_build_gpu_flags_no_shared_nodes_only_per_gpu():
     flags = await build_gpu_flags(ssh, gpu_uuids=None)
 
     assert flags == "--gpus all --device=/dev/nvidia0"
+
+
+@pytest.mark.asyncio
+async def test_build_gpu_flags_partial_rental_skips_caps_query():
+    # 8-GPU host, tenant rents only 1 — caps must not be probed/forwarded.
+    nvidia_smi_csv = "".join(f"GPU-{i:03d}, {i}\n" for i in range(8))
+    ssh = fake_ssh(
+        FakeRun(nvidia_smi_csv),
+        FakeRun("/dev/nvidiactl\n/dev/nvidia-uvm\n"),
+    )
+    flags = await build_gpu_flags(ssh, gpu_uuids=["GPU-003"])
+
+    # Inspect the shared-nodes probe — it must not look at /dev/nvidia-caps.
+    shared_probe_cmd = ssh.run.call_args_list[1].args[0]
+    assert "/dev/nvidia-caps" not in shared_probe_cmd
+
+    # Per-GPU minor is correct, no cap-node leak.
+    assert (
+        flags == '--gpus \'"device=GPU-003"\' '
+        "--device=/dev/nvidia3 --device=/dev/nvidiactl --device=/dev/nvidia-uvm"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_gpu_flags_whole_host_via_explicit_uuids_keeps_caps():
+    # Tenant rents ALL host GPUs explicitly — not partial, caps should be probed.
+    ssh = fake_ssh(
+        FakeRun("GPU-aaa, 0\nGPU-bbb, 1\n"),
+        FakeRun("/dev/nvidiactl\n/dev/nvidia-caps/nvidia-cap1\n"),
+    )
+    flags = await build_gpu_flags(ssh, gpu_uuids=["GPU-aaa", "GPU-bbb"])
+
+    shared_probe_cmd = ssh.run.call_args_list[1].args[0]
+    assert "/dev/nvidia-caps" in shared_probe_cmd
+    assert "/dev/nvidia-caps/nvidia-cap1" in flags
 
 
 # ---------------------------- build_gpu_flags fallback ----------------------------
