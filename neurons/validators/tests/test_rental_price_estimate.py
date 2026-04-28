@@ -405,80 +405,19 @@ async def test_precompute_all_estimates_returns_both_rented_and_unrented_without
             },
         },
     )
-    estimates_by_key = {
-        ("H100", False): RentalPriceEstimate(
-            gpu_model="H100",
-            base_model="H100",
-            gpu_count=1,
-            is_rented=False,
+    def _make_estimate(gpu_model: str, gpu_count: int, is_rented: bool) -> RentalPriceEstimate:
+        return RentalPriceEstimate(
+            gpu_model=gpu_model,
+            base_model=gpu_model,
+            gpu_count=gpu_count,
+            is_rented=is_rented,
             usd_per_epoch=1.0,
-        ),
-        ("H100", True): RentalPriceEstimate(
-            gpu_model="H100",
-            base_model="H100",
-            gpu_count=1,
-            is_rented=True,
-            usd_per_epoch=2.0,
-        ),
-        ("H100 NVL", False): RentalPriceEstimate(
-            gpu_model="H100 NVL",
-            base_model="H100",
-            gpu_count=1,
-            is_rented=False,
-            usd_per_epoch=3.0,
-        ),
-        ("H100 NVL", True): RentalPriceEstimate(
-            gpu_model="H100 NVL",
-            base_model="H100",
-            gpu_count=1,
-            is_rented=True,
-            usd_per_epoch=4.0,
-        ),
-        ("H200", False): RentalPriceEstimate(
-            gpu_model="H200",
-            base_model="H200",
-            gpu_count=1,
-            is_rented=False,
-            usd_per_epoch=5.0,
-        ),
-        ("H200", True): RentalPriceEstimate(
-            gpu_model="H200",
-            base_model="H200",
-            gpu_count=1,
-            is_rented=True,
-            usd_per_epoch=6.0,
-        ),
-        ("A100", False): RentalPriceEstimate(
-            gpu_model="A100",
-            base_model="A100",
-            gpu_count=1,
-            is_rented=False,
-            usd_per_epoch=7.0,
-        ),
-        ("A100", True): RentalPriceEstimate(
-            gpu_model="A100",
-            base_model="A100",
-            gpu_count=1,
-            is_rented=True,
-            usd_per_epoch=8.0,
-        ),
-        ("L4", False): RentalPriceEstimate(
-            gpu_model="L4",
-            base_model="L4",
-            gpu_count=1,
-            is_rented=False,
-            usd_per_epoch=9.0,
-        ),
-        ("L4", True): RentalPriceEstimate(
-            gpu_model="L4",
-            base_model="L4",
-            gpu_count=1,
-            is_rented=True,
-            usd_per_epoch=10.0,
-        ),
-    }
+        )
+
     estimate_executor_mock = AsyncMock(
-        side_effect=lambda _config, _redis, _snapshot, params: estimates_by_key[(params.gpu_model, params.is_rented)]
+        side_effect=lambda _config, _redis, _snapshot, params: _make_estimate(
+            params.gpu_model, params.gpu_count, params.is_rented
+        )
     )
 
     monkeypatch.setattr(rental_price_module, "BASE_GPU_MAP", BASE_GPU_MAP)
@@ -498,11 +437,18 @@ async def test_precompute_all_estimates_returns_both_rented_and_unrented_without
 
     assert set(estimates) == set(BASE_GPU_MAP)
     for gpu_model in BASE_GPU_MAP:
-        assert estimates[gpu_model]["unrented"] == estimates_by_key[(gpu_model, False)]
-        assert estimates[gpu_model]["rented"] == estimates_by_key[(gpu_model, True)]
+        assert estimates[gpu_model]["unrented"].gpu_count == 1
+        assert estimates[gpu_model]["unrented"].is_rented is False
+        assert estimates[gpu_model]["rented"].gpu_count == 1
+        assert estimates[gpu_model]["rented"].is_rented is True
+        assert estimates[gpu_model]["unrented_8x"].gpu_count == 8
+        assert estimates[gpu_model]["unrented_8x"].is_rented is False
 
-    assert estimate_executor_mock.await_count == len(BASE_GPU_MAP) * 2
-    assert estimate_executor_mock.await_args_list[0].args[3].gpu_model == "H100"
-    assert estimate_executor_mock.await_args_list[0].args[3].is_rented is False
-    assert estimate_executor_mock.await_args_list[1].args[3].gpu_model == "H100"
-    assert estimate_executor_mock.await_args_list[1].args[3].is_rented is True
+    # 3 calls per GPU model: unrented(1), rented(1), unrented_8x(8) — sequential, no gather.
+    assert estimate_executor_mock.await_count == len(BASE_GPU_MAP) * 3
+    first_three = estimate_executor_mock.await_args_list[:3]
+    assert [(c.args[3].gpu_count, c.args[3].is_rented) for c in first_three] == [
+        (1, False),
+        (1, True),
+        (8, False),
+    ]
