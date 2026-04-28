@@ -47,6 +47,7 @@ from services.redis_service import (
     RedisService,
 )
 from services.attestation_service import AttestationService, AttestationError
+from services.nvidia_devices import build_gpu_flags
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -1105,12 +1106,11 @@ class DockerService:
                     "--device /dev/net/tun "
                 )
 
-                # GPU restriction flags
-                if payload.gpu_uuids:
-                    gpu_devices = ",".join(payload.gpu_uuids)
-                    gpu_flags = f'--gpus \'"device={gpu_devices}"\' '
-                else:
-                    gpu_flags = "--gpus all "
+                # GPU flags. --gpus injects userspace libs (libnvidia-ml.so, nvidia-smi);
+                # explicit --device entries persist the device cgroup across systemd
+                # daemon-reload (cgroup v2 + systemd cgroup driver wipe the transient
+                # nvidia hook program; HostConfig.Devices is reapplied by Docker).
+                gpu_flags = await build_gpu_flags(ssh_client, payload.gpu_uuids) + " "
 
                 # CPU and memory restriction flags
                 # --cpus flag isn't working inside cvm. skip to use it when tdx_quote is present
