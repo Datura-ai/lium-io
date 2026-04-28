@@ -60,11 +60,18 @@ async def build_gpu_flags(
     """
     try:
         if gpu_uuids:
-            per_gpu = await _query_gpu_nodes_for_uuids(ssh_client, gpu_uuids)
+            per_gpu, host_total = await _query_gpu_nodes_for_uuids(ssh_client, gpu_uuids)
+            is_partial_rental = len(per_gpu) < host_total
         else:
             per_gpu = await _query_all_gpu_nodes(ssh_client)
+            is_partial_rental = False
 
-        shared = await _query_shared_nodes(ssh_client)
+        # On partial rentals (some-but-not-all GPUs on the host), skip /dev/nvidia-caps/*.
+        # Caps are per-GPU/per-MIG control nodes; forwarding all of them lets a tenant
+        # peek at or manipulate MIG state of another tenant's GPU on the same host.
+        # We don't sell MIG slices today, but stripping caps under partial rental
+        # closes the leak before that ever ships.
+        shared = await _query_shared_nodes(ssh_client, include_caps=not is_partial_rental)
         device_flags = _device_flags((*per_gpu, *shared))
         return " ".join(flag for flag in (_gpus_flag(gpu_uuids), device_flags) if flag)
     except Exception:
@@ -96,41 +103,61 @@ async def _query_all_gpu_nodes(ssh: asyncssh.SSHClientConnection) -> tuple[str, 
 async def _query_gpu_nodes_for_uuids(
     ssh: asyncssh.SSHClientConnection,
     gpu_uuids: Sequence[str],
-) -> tuple[str, ...]:
-    res = await ssh.run("nvidia-smi --query-gpu=uuid,index --format=csv,noheader")
+) -> tuple[tuple[str, ...], int]:
+    """Resolve requested UUIDs to /dev/nvidiaN nodes, plus return host GPU count.
+
+    Returns (per_gpu_nodes_in_request_order, host_total_gpu_count). The host
+    total lets the caller decide whether this is a partial-host rental.
+    """
+    # `minor_number` is the documented driver-assigned minor that maps to /dev/nvidiaN,
+    # unlike `index` which is the CUDA enumeration order (PCI BDF) and is not formally
+    # guaranteed to equal the device-node minor.
+    res = await ssh.run("nvidia-smi --query-gpu=uuid,minor_number --format=csv,noheader")
     if res.exit_status != 0:
         raise RuntimeError(f"nvidia-smi query failed on executor: {res.stderr!r}")
 
-    uuid_to_index: dict[str, int] = {}
+    uuid_to_minor: dict[str, int] = {}
     for line in _stdout_lines(res.stdout):
-        uuid, _, index = line.partition(",")
+        uuid, _, minor = line.partition(",")
         try:
-            uuid_to_index[uuid.strip()] = int(index.strip())
+            uuid_to_minor[uuid.strip()] = int(minor.strip())
         except ValueError:
             continue
 
-    missing = [uuid for uuid in gpu_uuids if uuid not in uuid_to_index]
+    missing = [uuid for uuid in gpu_uuids if uuid not in uuid_to_minor]
     if missing:
         raise RuntimeError(
             f"GPU {missing[0]!r} requested by tenant not present on executor; "
-            f"visible: {sorted(uuid_to_index)}"
+            f"visible: {sorted(uuid_to_minor)}"
         )
 
-    return tuple(f"/dev/nvidia{uuid_to_index[uuid]}" for uuid in gpu_uuids)
+    per_gpu = tuple(f"/dev/nvidia{uuid_to_minor[uuid]}" for uuid in gpu_uuids)
+    return per_gpu, len(uuid_to_minor)
 
 
-async def _query_shared_nodes(ssh: asyncssh.SSHClientConnection) -> tuple[str, ...]:
-    # One round-trip enumerates every nvidia control / MIG / NVSwitch / IMEX node
-    # that actually exists on this host.
+async def _query_shared_nodes(
+    ssh: asyncssh.SSHClientConnection,
+    *,
+    include_caps: bool = True,
+) -> tuple[str, ...]:
+    """Enumerate shared NVIDIA control nodes that exist on the host.
+
+    `include_caps=False` skips /dev/nvidia-caps/* and IMEX channel nodes — used
+    for partial-host rentals so we don't leak per-GPU MIG/IMEX caps belonging
+    to neighbouring tenants on the same host.
+    """
     cmd = (
         "for p in /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
         "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
         "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*; do "
         '[ -e "$p" ] && printf "%s\\n" "$p"; '
-        "done; "
-        "find /dev/nvidia-caps /dev/nvidia-caps-imex-channels "
-        "-mindepth 1 -maxdepth 1 -print 2>/dev/null || true"
+        "done"
     )
+    if include_caps:
+        cmd += (
+            "; find /dev/nvidia-caps /dev/nvidia-caps-imex-channels "
+            "-mindepth 1 -maxdepth 1 -print 2>/dev/null || true"
+        )
     res = await ssh.run(cmd)
     return _stdout_lines(res.stdout)
 
