@@ -627,7 +627,11 @@ async def precompute_all_estimates(
 ) -> dict[str, dict]:
     """Precompute rented and unrented estimates for every GPU model in BASE_GPU_MAP.
 
-    Returns a dict keyed by full GPU model name with "rented" and "unrented" estimates.
+    Returns a dict keyed by full GPU model name with "rented", "unrented" (gpu_count=1)
+    and "unrented_8x" (gpu_count=8) estimates. The 8x variant exposes per-bucket capacity
+    (max_cap, total_unrented_by_gpu_type, hourly_rate) for the 8-GPU rig bucket so that
+    downstream consumers can render network-wide bucket fill state without an extra
+    on-demand request to the validator.
     """
     gpu_models = list(BASE_GPU_MAP.keys())
     estimates: dict[str, dict] = {}
@@ -644,6 +648,12 @@ async def precompute_all_estimates(
                 redis_service,
                 snapshot,
                 ExecutorEstimateParams(gpu_model=gpu_model, is_rented=True),
+            ),
+            "unrented_8x": await estimate_executor(
+                config,
+                redis_service,
+                snapshot,
+                ExecutorEstimateParams(gpu_model=gpu_model, gpu_count=8, is_rented=False),
             ),
         }
 
