@@ -20,13 +20,25 @@ Public surface
     flags = await build_gpu_flags(ssh_client, gpu_uuids)
         # full ready-to-paste string, e.g.
         # --gpus all --device=/dev/nvidia0 --device=/dev/nvidiactl ...
+
+Failure handling
+----------------
+`build_gpu_flags` never raises: any probe failure (SSH error, missing
+nvidia-smi, unknown UUID, etc.) is logged at WARNING and the function falls
+back to the legacy `--gpus`-only string. The pod still gets created — it
+just doesn't get the daemon-reload protection. This trades a known
+regression (back to today's behaviour) for resilience against unforeseen
+executor-side issues.
 """
 from __future__ import annotations
 
+import logging
 import shlex
 from collections.abc import Sequence
 
 import asyncssh
+
+logger = logging.getLogger(__name__)
 
 
 async def build_gpu_flags(
@@ -41,15 +53,28 @@ async def build_gpu_flags(
       `nvidia-smi` binary into the container.
     - `--device /dev/nvidia*`: persists the device cgroup across systemd
       `daemon-reload` and `systemctl restart containerd`.
-    """
-    if gpu_uuids:
-        per_gpu = await _query_gpu_nodes_for_uuids(ssh_client, gpu_uuids)
-    else:
-        per_gpu = await _query_all_gpu_nodes(ssh_client)
 
-    shared = await _query_shared_nodes(ssh_client)
-    device_flags = _device_flags((*per_gpu, *shared))
-    return " ".join(flag for flag in (_gpus_flag(gpu_uuids), device_flags) if flag)
+    Falls back to a legacy `--gpus`-only string on any probe failure (logged
+    at WARNING). The pod will still be created in the legacy path; it just
+    won't survive `systemctl daemon-reload` on the executor host.
+    """
+    try:
+        if gpu_uuids:
+            per_gpu = await _query_gpu_nodes_for_uuids(ssh_client, gpu_uuids)
+        else:
+            per_gpu = await _query_all_gpu_nodes(ssh_client)
+
+        shared = await _query_shared_nodes(ssh_client)
+        device_flags = _device_flags((*per_gpu, *shared))
+        return " ".join(flag for flag in (_gpus_flag(gpu_uuids), device_flags) if flag)
+    except Exception:
+        logger.warning(
+            "nvidia_devices: probe failed, falling back to legacy --gpus only "
+            "(pod will not survive systemd daemon-reload on the executor)",
+            exc_info=True,
+            extra={"gpu_uuids": list(gpu_uuids) if gpu_uuids else None},
+        )
+        return _gpus_flag(gpu_uuids)
 
 
 def _gpus_flag(gpu_uuids: Sequence[str] | None) -> str:

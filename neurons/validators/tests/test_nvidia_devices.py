@@ -155,3 +155,46 @@ async def test_build_gpu_flags_no_shared_nodes_only_per_gpu():
     flags = await build_gpu_flags(ssh, gpu_uuids=None)
 
     assert flags == "--gpus all --device=/dev/nvidia0"
+
+
+# ---------------------------- build_gpu_flags fallback ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_gpu_flags_falls_back_when_nvidia_smi_fails(caplog):
+    # Partial rental → first call is nvidia-smi which we make fail.
+    ssh = fake_ssh(FakeRun(stderr="nvidia-smi: not found", exit_status=127))
+
+    with caplog.at_level("WARNING"):
+        flags = await build_gpu_flags(ssh, gpu_uuids=["GPU-aaa"])
+
+    # Falls back to legacy --gpus only — no --device flags.
+    assert flags == '--gpus \'"device=GPU-aaa"\''
+    assert any(
+        "probe failed, falling back to legacy --gpus only" in rec.message
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_gpu_flags_falls_back_when_uuid_unknown(caplog):
+    ssh = fake_ssh(FakeRun("GPU-aaa, 0\n"))  # GPU-bbb is not present
+
+    with caplog.at_level("WARNING"):
+        flags = await build_gpu_flags(ssh, gpu_uuids=["GPU-bbb"])
+
+    assert flags == '--gpus \'"device=GPU-bbb"\''
+    assert any("probe failed" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_build_gpu_flags_falls_back_when_ssh_raises(caplog):
+    ssh = AsyncMock()
+    ssh.run.side_effect = ConnectionError("ssh transport closed")
+
+    with caplog.at_level("WARNING"):
+        flags = await build_gpu_flags(ssh, gpu_uuids=None)
+
+    # Whole-host rental falls back to plain `--gpus all`.
+    assert flags == "--gpus all"
+    assert any("probe failed" in rec.message for rec in caplog.records)

@@ -1227,6 +1227,40 @@ class DockerService:
 
                 # check if the container is running correctly
                 if not await self.check_container_running(ssh_client, container_name):
+                    # Capture the failure reason and check whether it points to our
+                    # --device flags (DAH-1987). State.Error covers cgroup / device
+                    # failures; logs --tail covers entrypoint failures.
+                    failure_reason = ""
+                    try:
+                        inspect = await ssh_client.run(
+                            f"/usr/bin/docker inspect -f '{{{{.State.Error}}}}' {container_name}"
+                        )
+                        logs_tail = await ssh_client.run(
+                            f"/usr/bin/docker logs --tail 50 {container_name} 2>&1 || true"
+                        )
+                        failure_reason = (inspect.stdout or "") + "\n" + (logs_tail.stdout or "")
+                    except Exception:
+                        failure_reason = "(failure_reason capture failed)"
+
+                    nvidia_signal = any(
+                        marker in failure_reason.lower()
+                        for marker in ("/dev/nvidia", "device cgroup", "no such device", "operation not permitted")
+                    )
+                    log_extra = get_extra_info({
+                        **default_extra,
+                        "container_name": container_name,
+                        "gpu_flags": gpu_flags,
+                        "failure_reason": failure_reason[:2000],
+                    })
+                    if nvidia_signal:
+                        logger.error(_m(
+                            "docker run failed with NVIDIA-device-related error — "
+                            "possible regression from build_gpu_flags --device flag set",
+                            extra=log_extra,
+                        ))
+                    else:
+                        logger.error(_m("docker run failed", extra=log_extra))
+
                     await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra, pod_name=container_name, active_container_names=payload.active_container_names)
                     raise Exception("Run docker run command but container is not running")
 
