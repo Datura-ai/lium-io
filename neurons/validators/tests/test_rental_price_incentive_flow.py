@@ -1404,13 +1404,13 @@ async def test_rental_price_integration_chain_submission(
     mock_subtensor_client.get_miners = AsyncMock(return_value=miners)
 
     with patch("clients.subtensor_client.process_weights_for_netuid") as process_mock, patch(
-        "clients.subtensor_client.convert_weights_and_uids_for_emit"
+        "clients.subtensor_client._convert_weights_with_positive_floor"
     ) as convert_mock:
         def process_side_effect(uids, weights, netuid, subtensor, metagraph):
             return uids, weights
 
         process_mock.side_effect = process_side_effect
-        convert_mock.return_value = (list(range(len(miners))), [10000] * len(miners))
+        convert_mock.return_value = (list(range(len(miners))), [10000] * len(miners), 0)
 
         await mock_subtensor_client.set_weights(miner_scores=validator.miner_scores)
 
