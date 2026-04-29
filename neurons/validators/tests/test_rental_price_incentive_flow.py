@@ -1410,7 +1410,7 @@ async def test_rental_price_integration_chain_submission(
             return uids, weights
 
         process_mock.side_effect = process_side_effect
-        convert_mock.return_value = (list(range(len(miners))), [10000] * len(miners), 0)
+        convert_mock.return_value = (list(range(len(miners))), [10000] * len(miners), [])
 
         await mock_subtensor_client.set_weights(miner_scores=validator.miner_scores)
 

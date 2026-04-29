@@ -52,24 +52,24 @@ def _log_sync_block(name: str, *, extra: dict | None = None):
 def _convert_weights_with_positive_floor(
     uids,
     weights,
-) -> tuple[list[int], list[int], int]:
+) -> tuple[list[int], list[int], list[int]]:
     """Max-upscale floats to u16 like bittensor's `convert_weights_and_uids_for_emit`,
     but bump u16=0 → u16=1 whenever the source float was strictly positive. SDK-zeroed
     entries (quantile/permit/max-limit exclusions) stay dropped.
 
-    Returns (uids, weights, floored_count) where floored_count is the number of
-    entries that would have rounded to 0 but were lifted to 1.
+    Returns (uids, weights, floored_uids) where floored_uids is the list of uids
+    whose float weight was positive but rounded to 0 and were lifted to 1.
     """
     uids_l = uids.tolist() if hasattr(uids, "tolist") else list(uids)
     weights_l = weights.tolist() if hasattr(weights, "tolist") else list(weights)
     if not weights_l:
-        return [], [], 0
+        return [], [], []
     max_w = float(max(weights_l))
     if max_w <= 0:
-        return [], [], 0
+        return [], [], []
     out_uids: list[int] = []
     out_vals: list[int] = []
-    floored_count = 0
+    floored_uids: list[int] = []
     for u, w in zip(uids_l, weights_l):
         wf = float(w)
         if wf <= 0:
@@ -77,10 +77,10 @@ def _convert_weights_with_positive_floor(
         v = round(wf / max_w * 65535)
         if v == 0:
             v = 1
-            floored_count += 1
+            floored_uids.append(int(u))
         out_uids.append(int(u))
         out_vals.append(int(v))
-    return out_uids, out_vals, floored_count
+    return out_uids, out_vals, floored_uids
 
 
 class SubtensorClient:
@@ -420,9 +420,13 @@ class SubtensorClient:
             ),
         )
 
-        uint_uids, uint_weights, floored_count = _convert_weights_with_positive_floor(
+        uint_uids, uint_weights, floored_uids = _convert_weights_with_positive_floor(
             processed_uids, processed_weights
         )
+
+        # Resolve floored uids back to hotkeys so the log row is human-debuggable.
+        uid_to_hotkey = dict(zip([int(u) for u in uids], miner_hotkeys))
+        floored_hotkeys = [uid_to_hotkey.get(u) for u in floored_uids]
 
         logger.info(
             _m(
@@ -430,7 +434,9 @@ class SubtensorClient:
                 extra=get_extra_info({
                     **self.default_extra,
                     "version_key": self.version_key,
-                    "floored_from_zero_count": floored_count,
+                    "floored_from_zero_count": len(floored_uids),
+                    "floored_from_zero_uids": floored_uids,
+                    "floored_from_zero_hotkeys": floored_hotkeys,
                 }),
             ),
         )
