@@ -47,6 +47,10 @@ class Validator:
         self.default_extra = {}
 
         self.miner_scores = {}
+        # Number of fully-completed sync cycles since this process started.
+        # Used to skip the first post-restart set_weights when the in-memory
+        # accumulator may have been re-built from a partial cycle.
+        self.completed_cycles_since_start = 0
 
         # set incentive algorithm from setting
         self.incentive = settings.incentive
@@ -105,22 +109,20 @@ class Validator:
             attestation_service=self.attestation_service,
         )
 
-        # init miner_scores
+        # init miner_scores: always load from Redis if present so accumulated
+        # scores survive an unclean restart (SIGKILL / OOM / liveness preempt).
         try:
-            if await self.subtensor_client.should_set_weights():
+            miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
+            if miner_scores_json is None:
+                logger.info(
+                    _m(
+                        "[initiate_services] No data found in Redis for MINER_SCORES_KEY, initializing empty miner_scores.",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
                 self.miner_scores = {}
             else:
-                miner_scores_json = await self.redis_service.get(MINER_SCORES_KEY)
-                if miner_scores_json is None:
-                    logger.info(
-                        _m(
-                            "[initiate_services] No data found in Redis for MINER_SCORES_KEY, initializing empty miner_scores.",
-                            extra=get_extra_info(self.default_extra),
-                        ),
-                    )
-                    self.miner_scores = {}
-                else:
-                    self.miner_scores = json.loads(miner_scores_json)
+                self.miner_scores = json.loads(miner_scores_json)
 
             # remove pod renting-in-progress status
             await self.redis_service.delete(PENDING_PODS_PREFIX)
@@ -159,16 +161,30 @@ class Validator:
 
             try:
                 if await self.subtensor_client.should_set_weights():
-                    if settings.DRY_RUN:
-                        logger.info(
+                    if self.completed_cycles_since_start < 1:
+                        logger.warning(
                             _m(
-                                "[sync] DRY_RUN: Skipping set_weights to Bittensor",
-                                extra=get_extra_info({**self.default_extra, "miner_scores": self.miner_scores}),
-                            )
+                                "[set_weights] post-restart warm-up: skipping until first cycle completes",
+                                extra=get_extra_info(
+                                    {
+                                        **self.default_extra,
+                                        "completed_cycles_since_start": self.completed_cycles_since_start,
+                                        "miner_scores_size": len(self.miner_scores),
+                                    }
+                                ),
+                            ),
                         )
                     else:
-                        await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
-                    self.miner_scores = {}
+                        if settings.DRY_RUN:
+                            logger.info(
+                                _m(
+                                    "[sync] DRY_RUN: Skipping set_weights to Bittensor",
+                                    extra=get_extra_info({**self.default_extra, "miner_scores": self.miner_scores}),
+                                )
+                            )
+                        else:
+                            await self.subtensor_client.set_weights(miner_scores=self.miner_scores)
+                        self.miner_scores = {}
             except Exception as e:
                 logger.error(
                     _m(
@@ -427,6 +443,8 @@ class Validator:
                         if miner_coldkey:
                             await self.miner_service.publish_machine_specs(results, miner_hotkey, miner_coldkey)
 
+                    self.completed_cycles_since_start += 1
+
                     logger.info(
                         _m(
                             "[sync] All Jobs finished",
@@ -440,6 +458,7 @@ class Validator:
                                     "total_executors": incentive.total_executors,
                                     "successful_executors": incentive.successful_executors,
                                     "failed_executors": incentive.failed_executors,
+                                    "completed_cycles_since_start": self.completed_cycles_since_start,
                                 }
                             ),
                         ),
@@ -490,6 +509,23 @@ class Validator:
                 ),
                 exc_info=True,
             )
+        finally:
+            # Persist the current accumulator on every cycle so an unclean
+            # restart (SIGKILL / OOM / liveness preempt) does not lose the
+            # in-memory state — graceful stop() alone is not enough.
+            try:
+                await self.redis_service.set(
+                    MINER_SCORES_KEY, json.dumps(self.miner_scores)
+                )
+            except Exception as e:
+                logger.warning(
+                    _m(
+                        "[sync] Failed to persist miner_scores",
+                        extra=get_extra_info(
+                            {**self.default_extra, "error": str(e)}
+                        ),
+                    ),
+                )
 
     async def start(self):
         logger.info(
