@@ -138,7 +138,7 @@ class DefaultIncentive(BaseIncentive):
             job_result.sysbox_multiplier = 1 - portion
 
         # Uptime multiplier
-        if settings.ENABLE_NO_COLLATERAL or job_result.collateral_deposited:
+        if settings.SKIP_COLLATERAL_PENALTY or job_result.collateral_deposited:
             job_result.uptime_multiplier = 1
         else:
             uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
