@@ -138,7 +138,9 @@ class DefaultIncentive(BaseIncentive):
             job_result.sysbox_multiplier = 1 - portion
 
         # Uptime multiplier
-        if not job_result.collateral_deposited:
+        if settings.ENABLE_NO_COLLATERAL or job_result.collateral_deposited:
+            job_result.uptime_multiplier = 1
+        else:
             uptime_in_minutes = await self.redis_service.get_executor_uptime(job_result.executor_info)
             job_result.uptime_multiplier = (
                 1
@@ -146,8 +148,6 @@ class DefaultIncentive(BaseIncentive):
                 + settings.PORTION_FOR_UPTIME
                 * min(1, uptime_in_minutes / settings.UPTIME_REQUIRED_MINUTES)
             )
-        else:
-            job_result.uptime_multiplier = 1
 
         # Apply multiplier
         job_result.mining_score *= job_result.sysbox_multiplier * job_result.uptime_multiplier
