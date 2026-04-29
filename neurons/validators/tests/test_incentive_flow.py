@@ -1212,7 +1212,9 @@ def test_convert_weights_with_positive_floor_lifts_tiny_positive():
 
     assert out_uids == [1, 2]
     assert out_vals == [65535, 1]
-    assert floored == [2]
+    assert len(floored) == 1
+    assert floored[0][0] == 2
+    assert floored[0][1] == pytest.approx(1e-9, rel=1e-3)
 
 
 def test_convert_weights_with_positive_floor_passes_through_normal_weights():
