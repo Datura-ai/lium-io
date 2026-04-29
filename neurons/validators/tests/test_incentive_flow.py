@@ -1212,7 +1212,7 @@ def test_convert_weights_with_positive_floor_lifts_tiny_positive():
 
     assert out_uids == [1, 2]
     assert out_vals == [65535, 1]
-    assert floored == 1
+    assert floored == [2]
 
 
 def test_convert_weights_with_positive_floor_passes_through_normal_weights():
@@ -1226,7 +1226,7 @@ def test_convert_weights_with_positive_floor_passes_through_normal_weights():
 
     assert out_uids == [10, 20]
     assert out_vals == [65535, round(0.5 * 65535)]
-    assert floored == 0
+    assert floored == []
 
 
 def test_convert_weights_with_positive_floor_handles_empty_and_all_zero():
@@ -1236,12 +1236,12 @@ def test_convert_weights_with_positive_floor_handles_empty_and_all_zero():
     empty = _convert_weights_with_positive_floor(
         _np.array([], dtype=_np.int64), _np.array([], dtype=_np.float32)
     )
-    assert empty == ([], [], 0)
+    assert empty == ([], [], [])
 
     all_zero = _convert_weights_with_positive_floor(
         _np.array([7, 8], dtype=_np.int64), _np.array([0.0, 0.0], dtype=_np.float32)
     )
-    assert all_zero == ([], [], 0)
+    assert all_zero == ([], [], [])
 
 
 @pytest.mark.asyncio
