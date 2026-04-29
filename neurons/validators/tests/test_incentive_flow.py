@@ -1193,3 +1193,83 @@ async def test_scenario_zero_gpu_count_edge_case(
     assert weights_by_uid[100] == pytest.approx(TOTAL_BURN_EMISSION / BURNER_COUNT)
     assert weights_by_uid[101] == pytest.approx(TOTAL_BURN_EMISSION / BURNER_COUNT)
     assert weights_by_uid[2] == 0
+
+
+# ---------------------------------------------------------------------------
+# Quantization floor: positive scores must never silently collapse to u16=0
+# ---------------------------------------------------------------------------
+
+
+def test_convert_weights_with_positive_floor_lifts_tiny_positive():
+    import numpy as _np
+    from clients.subtensor_client import _convert_weights_with_positive_floor
+
+    uids = _np.array([1, 2, 3], dtype=_np.int64)
+    # uid 1: cap, uid 2: tiny positive that rounds to 0, uid 3: SDK-zeroed
+    weights = _np.array([1.0, 1e-9, 0.0], dtype=_np.float32)
+
+    out_uids, out_vals, floored = _convert_weights_with_positive_floor(uids, weights)
+
+    assert out_uids == [1, 2]
+    assert out_vals == [65535, 1]
+    assert floored == 1
+
+
+def test_convert_weights_with_positive_floor_passes_through_normal_weights():
+    import numpy as _np
+    from clients.subtensor_client import _convert_weights_with_positive_floor
+
+    uids = _np.array([10, 20], dtype=_np.int64)
+    weights = _np.array([1.0, 0.5], dtype=_np.float32)
+
+    out_uids, out_vals, floored = _convert_weights_with_positive_floor(uids, weights)
+
+    assert out_uids == [10, 20]
+    assert out_vals == [65535, round(0.5 * 65535)]
+    assert floored == 0
+
+
+def test_convert_weights_with_positive_floor_handles_empty_and_all_zero():
+    import numpy as _np
+    from clients.subtensor_client import _convert_weights_with_positive_floor
+
+    empty = _convert_weights_with_positive_floor(
+        _np.array([], dtype=_np.int64), _np.array([], dtype=_np.float32)
+    )
+    assert empty == ([], [], 0)
+
+    all_zero = _convert_weights_with_positive_floor(
+        _np.array([7, 8], dtype=_np.int64), _np.array([0.0, 0.0], dtype=_np.float32)
+    )
+    assert all_zero == ([], [], 0)
+
+
+@pytest.mark.asyncio
+async def test_set_weights_floors_positive_scores_to_min_one(
+    mock_subtensor_client,
+    create_neuron_info,
+):
+    """A miner with a tiny but positive score must be submitted with weight >= 1,
+    while a miner with score 0 (absent from miner_scores) must be excluded.
+    """
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner"),
+        create_neuron_info(uid=2, hotkey="tiny"),
+        create_neuron_info(uid=3, hotkey="zero"),
+    ]
+    miner_scores = {"burner": 1.0, "tiny": 1e-9}  # "zero" deliberately absent
+
+    # normalize=True → captured floats sum to ~1, mirroring the SDK's real output
+    await _run_set_weights_and_capture(
+        mock_subtensor_client, miners, miner_scores, normalize=True
+    )
+
+    call = mock_subtensor_client.subtensor.set_weights.call_args
+    submitted_uids = list(call.kwargs["uids"])
+    submitted_weights = list(call.kwargs["weights"])
+    by_uid = dict(zip(submitted_uids, submitted_weights))
+
+    assert 2 in by_uid, f"tiny-positive uid was dropped: {by_uid}"
+    assert by_uid[2] >= 1
+    assert by_uid[100] == 65535
+    assert 3 not in by_uid

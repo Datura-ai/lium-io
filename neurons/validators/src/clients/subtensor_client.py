@@ -4,10 +4,7 @@ import contextlib
 import numpy as np
 import time
 from typing import Self, TYPE_CHECKING
-from bittensor.utils.weight_utils import (
-    convert_weights_and_uids_for_emit,
-    process_weights_for_netuid,
-)
+from bittensor.utils.weight_utils import process_weights_for_netuid
 from websockets.protocol import State as WebSocketClientState
 from datetime import datetime
 import json
@@ -50,6 +47,40 @@ def _log_sync_block(name: str, *, extra: dict | None = None):
                 }),
             )
         )
+
+
+def _convert_weights_with_positive_floor(
+    uids,
+    weights,
+) -> tuple[list[int], list[int], int]:
+    """Max-upscale floats to u16 like bittensor's `convert_weights_and_uids_for_emit`,
+    but bump u16=0 → u16=1 whenever the source float was strictly positive. SDK-zeroed
+    entries (quantile/permit/max-limit exclusions) stay dropped.
+
+    Returns (uids, weights, floored_count) where floored_count is the number of
+    entries that would have rounded to 0 but were lifted to 1.
+    """
+    uids_l = uids.tolist() if hasattr(uids, "tolist") else list(uids)
+    weights_l = weights.tolist() if hasattr(weights, "tolist") else list(weights)
+    if not weights_l:
+        return [], [], 0
+    max_w = float(max(weights_l))
+    if max_w <= 0:
+        return [], [], 0
+    out_uids: list[int] = []
+    out_vals: list[int] = []
+    floored_count = 0
+    for u, w in zip(uids_l, weights_l):
+        wf = float(w)
+        if wf <= 0:
+            continue
+        v = round(wf / max_w * 65535)
+        if v == 0:
+            v = 1
+            floored_count += 1
+        out_uids.append(int(u))
+        out_vals.append(int(v))
+    return out_uids, out_vals, floored_count
 
 
 class SubtensorClient:
@@ -389,8 +420,8 @@ class SubtensorClient:
             ),
         )
 
-        uint_uids, uint_weights = convert_weights_and_uids_for_emit(
-            uids=processed_uids, weights=processed_weights
+        uint_uids, uint_weights, floored_count = _convert_weights_with_positive_floor(
+            processed_uids, processed_weights
         )
 
         logger.info(
@@ -399,6 +430,7 @@ class SubtensorClient:
                 extra=get_extra_info({
                     **self.default_extra,
                     "version_key": self.version_key,
+                    "floored_from_zero_count": floored_count,
                 }),
             ),
         )
