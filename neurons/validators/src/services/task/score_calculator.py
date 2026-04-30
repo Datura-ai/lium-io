@@ -32,17 +32,12 @@ def calculate_scores(
     """
     gpu_model = ctx.state.gpu_model or ""
     collateral_deposited = ctx.collateral_deposited
-    is_rental_succeed = ctx.is_rental_succeed
     contract_version = ctx.contract_version or ""
     price_per_gpu = ctx.executor.price_per_gpu
 
     warning_messages = []
     job_score = 1.0
     actual_score = 1.0
-
-    if not is_rental_succeed and not settings.SKIP_RENTAL_VERIFICATION:
-        actual_score = 0.0
-        warning_messages.append("Score set to 0 pending rental verification")
 
     # Machine price check
     base_price = MACHINE_PRICES.get(gpu_model, 0)
