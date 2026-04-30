@@ -39,8 +39,8 @@ class DummyScoreCalculator:
     [
         # Normal success case: full scores, no warnings
         ("NVIDIA RTX 4090", True, True, "v1.0.0", False, 10, 1.0, 1.0, "", True),
-        # Success with warning
-        ("NVIDIA RTX 3090", True, False, "v1.0.0", False, 10, 0.0, 1.0, " WARNING: Score set to 0 pending rental verification", True),
+        # Success with warning (e.g. price exceeds limit — exact text is not asserted, only propagation)
+        ("NVIDIA RTX 3090", True, False, "v1.0.0", False, 10, 0.0, 1.0, " WARNING: GPU price exceeds the limit", True),
         # Low collateral warning
         ("NVIDIA RTX 3080", False, True, "v1.0.0", False, 10, 1.0, 1.0, " WARNING: No collateral deposited", True),
         # Rented machine
