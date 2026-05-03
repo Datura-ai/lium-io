@@ -8,6 +8,7 @@ import asyncssh  # noqa: E402
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo  # noqa: E402
 from neurons.validators.src.services.attestation_service import AttestationService  # noqa: E402
+from core.config import settings  # noqa: E402
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -51,6 +52,8 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
 
     monkeypatch.setattr(AttestationService, "_call_verifier", fake_call_verifier)
     monkeypatch.setattr(asyncssh, "import_public_key", lambda value: object())
+    monkeypatch.setattr(settings, "ENABLE_TDX_ATTESTATION", True)
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
 
     service = AttestationService()
     assert service.enabled is True

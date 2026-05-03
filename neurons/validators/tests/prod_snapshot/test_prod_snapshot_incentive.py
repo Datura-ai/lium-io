@@ -131,6 +131,7 @@ def prod_settings(monkeypatch, prod_snapshot: dict) -> None:
     monkeypatch.setattr(settings, "BURNERS", s["BURNERS"])
     monkeypatch.setattr(settings, "NEW_BURNERS", s["NEW_BURNERS"])
     monkeypatch.setattr(settings, "ENABLE_NEW_BURN_LOGIC", s["ENABLE_NEW_BURN_LOGIC"])
+    monkeypatch.setattr(settings, "SKIP_COLLATERAL_PENALTY", False)
     monkeypatch.setattr(settings, "incentive", IncentiveConfig(algorithm="default"))
 
 
