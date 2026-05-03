@@ -186,3 +186,6 @@ CLAUDE.md
 neurons/validators/openspec/
 openspec/
 
+.omx/
+.codex/
+AGENTS.md
