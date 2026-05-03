@@ -97,6 +97,7 @@ class DockerService:
         self,
         ssh_client,
         command: str,
+        container_name: str,
         log_tag: str,
         default_extra: dict,
         timeout: int,
@@ -109,6 +110,14 @@ class DockerService:
         `clean_existing_containers(sleep=10)`, and volume creation). Wait
         through the probe's natural lifetime by retrying the same command on
         a 90s budget. Non-port-allocated errors propagate immediately.
+
+        DAH-2018: Docker reserves the container name during command parse,
+        before port-bind. A port-bind failure therefore leaves a Created-state
+        container holding `pod_<id>`, and the next same-command attempt would
+        otherwise collide with "container name already in use". Between
+        attempts (after the backoff sleep, just before the next `docker run`)
+        we issue `docker rm -f <container_name>` so the rm→run window stays
+        tight. Cleanup failures are warning-logged but do not abort the loop.
         """
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
@@ -142,6 +151,25 @@ class DockerService:
                     )
                 )
                 await asyncio.sleep(_PORT_ALLOCATED_RETRY_SLEEP_SEC)
+                # DAH-2018: drop the Created-state container Docker reserved
+                # during the prior `docker run` parse, so the next same-command
+                # attempt cannot collide with "container name already in use".
+                try:
+                    rm_cmd = f"/usr/bin/docker rm -f {shlex.quote(container_name)}"
+                    await ssh_client.run(rm_cmd)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as rm_exc:
+                    logger.warning(
+                        _m(
+                            "PORT_RETRY_STALE_RM_FAILED",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "container_name": container_name,
+                                "rm_error": str(rm_exc),
+                            }),
+                        )
+                    )
 
     async def _prepare_known_hosts_policy(
         self,
@@ -444,7 +472,8 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
         max_retries: int = 2,
-        retry_delay: int = 60
+        retry_delay: int = 60,
+        ssh_client: asyncssh.SSHClientConnection | None = None,
     ) -> tuple[bool, str]:
         """Wait for port check containers to finish before creating rental containers.
 
@@ -454,13 +483,22 @@ class DockerService:
         - 'health_check_*' — backend executor_health_check probes (hotkey-agnostic,
           backend creates these without a hotkey segment — see DAH-1991)
 
+        DAH-2018: when the caller already holds an open SSH connection, pass it
+        in via ``ssh_client`` to avoid the cost (and TOCTOU widening) of a
+        second connect — the late re-check inside ``create_container`` runs
+        right before ``docker run`` and reuses the existing session.
+
         Args:
-            executor_info: Executor SSH connection info
+            executor_info: Executor SSH connection info (ignored when
+                ``ssh_client`` is provided).
             miner_hotkey: The miner's hotkey to check containers for
-            keypair: Bittensor keypair for decrypting private key
-            private_key: Encrypted SSH private key
+            keypair: Bittensor keypair for decrypting private key (ignored when
+                ``ssh_client`` is provided).
+            private_key: Encrypted SSH private key (ignored when ``ssh_client``
+                is provided).
             max_retries: Maximum number of times to check (default 2)
             retry_delay: Seconds to wait between checks (default 60)
+            ssh_client: Optional pre-opened SSH session to reuse.
 
         Returns:
             Tuple of (success: bool, message: str)
@@ -471,10 +509,63 @@ class DockerService:
         container_prefix = f"container_{miner_hotkey}_"
         health_check_prefix = "health_check_"
 
-        # Decrypt private key and establish SSH connection
+        async def _run_checks(client: asyncssh.SSHClientConnection) -> tuple[bool, str]:
+            for attempt in range(max_retries + 1):
+                # docker ps OR-s multiple --filter name= flags
+                command = (
+                    '/usr/bin/docker ps --format "{{.Names}}" '
+                    f'--filter "name=^{container_prefix}" '
+                    f'--filter "name=^{health_check_prefix}"'
+                )
+                result = await client.run(command)
+
+                if not result.stdout or not result.stdout.strip():
+                    if attempt == 0:
+                        return True, "No port check containers found"
+                    else:
+                        return True, f"Port check containers cleared after {attempt} attempt(s)"
+
+                # Found port check containers
+                container_names = result.stdout.strip()
+
+                if attempt < max_retries:
+                    logger.info(
+                        f"Port check containers exist ({container_names}), "
+                        f"waiting {retry_delay}s (attempt {attempt + 1}/{max_retries + 1})"
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    # Max retries reached, containers still exist - force cleanup
+                    logger.warning(
+                        f"Port check containers still running after {max_retries} retries, "
+                        f"forcing cleanup: {container_names}"
+                    )
+
+                    # Force remove containers matching either prefix.
+                    remove_cmd = (
+                        "docker ps -q "
+                        f"--filter 'name=^{container_prefix}' "
+                        f"--filter 'name=^{health_check_prefix}' "
+                        "| xargs -r docker rm -f"
+                    )
+                    await client.run(remove_cmd)
+
+                    logger.info("Forced removal of stale port check containers completed")
+                    return True, f"Port check containers forcefully removed after {max_retries} retries"
+
+            # Should never reach here, but just in case
+            return False, "Unexpected error in wait_for_port_check_containers"
+
+        if ssh_client is not None:
+            try:
+                return await _run_checks(ssh_client)
+            except Exception as e:
+                logger.error(f"Error checking for port check containers: {e}")
+                return True, "Unable to check for port check containers, proceeding"
+
+        # No reusable session — open a dedicated SSH connection.
         decrypted_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(decrypted_key)
-
         try:
             async with asyncssh.connect(
                 host=executor_info.address,
@@ -482,52 +573,8 @@ class DockerService:
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
                 known_hosts=None,
-            ) as ssh_client:
-                for attempt in range(max_retries + 1):
-                    # docker ps OR-s multiple --filter name= flags
-                    command = (
-                        '/usr/bin/docker ps --format "{{.Names}}" '
-                        f'--filter "name=^{container_prefix}" '
-                        f'--filter "name=^{health_check_prefix}"'
-                    )
-                    result = await ssh_client.run(command)
-
-                    if not result.stdout or not result.stdout.strip():
-                        if attempt == 0:
-                            return True, "No port check containers found"
-                        else:
-                            return True, f"Port check containers cleared after {attempt} attempt(s)"
-
-                    # Found port check containers
-                    container_names = result.stdout.strip()
-
-                    if attempt < max_retries:
-                        logger.info(
-                            f"Port check containers exist ({container_names}), "
-                            f"waiting {retry_delay}s (attempt {attempt + 1}/{max_retries + 1})"
-                        )
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        # Max retries reached, containers still exist - force cleanup
-                        logger.warning(
-                            f"Port check containers still running after {max_retries} retries, "
-                            f"forcing cleanup: {container_names}"
-                        )
-
-                        # Force remove containers matching either prefix.
-                        remove_cmd = (
-                            "docker ps -q "
-                            f"--filter 'name=^{container_prefix}' "
-                            f"--filter 'name=^{health_check_prefix}' "
-                            "| xargs -r docker rm -f"
-                        )
-                        result = await ssh_client.run(remove_cmd)
-
-                        logger.info(f"Forced removal of stale port check containers completed")
-                        return True, f"Port check containers forcefully removed after {max_retries} retries"
-
-                # Should never reach here, but just in case
-                return False, "Unexpected error in wait_for_port_check_containers"
+            ) as new_client:
+                return await _run_checks(new_client)
         except Exception as e:
             logger.error(f"Error connecting to check for port check containers: {e}")
             # If we can't connect, assume it's safe to proceed
@@ -1215,9 +1262,37 @@ class DockerService:
                 timeout = 120
                 logger.info(f"Running command: {command} with timeout={timeout}")
 
+                # DAH-2018: re-check for backend health_check_* / validator
+                # port-test containers immediately before `docker run`. The
+                # early check in miner_service runs before the image pull, but
+                # the backend's RentalVerificationCheck can spin up a
+                # health_check container during the pull window and grab a
+                # host port from the same verified-port pool the rental
+                # allocated. Reuse the open ssh_client so we don't pay the
+                # cost of a second connect (and don't widen the TOCTOU gap).
+                # Tighter budget than the early call: by this point HC should
+                # be near completion, and the port-allocated retry loop +
+                # `docker rm -f` are the backstop for any residual race.
+                wait_ok, wait_msg = await self.wait_for_port_check_containers(
+                    executor_info=executor_info,
+                    miner_hotkey=payload.miner_hotkey,
+                    keypair=keypair,
+                    private_key=private_key,
+                    max_retries=1,
+                    retry_delay=30,
+                    ssh_client=ssh_client,
+                )
+                logger.info(
+                    _m(
+                        f"Port check container pre-run wait result: {wait_msg}",
+                        extra=get_extra_info({**default_extra, "ok": wait_ok}),
+                    )
+                )
+
                 await self._run_docker_create_with_port_retry(
                     ssh_client=ssh_client,
                     command=command,
+                    container_name=container_name,
                     log_tag=log_tag,
                     default_extra=default_extra,
                     timeout=timeout,

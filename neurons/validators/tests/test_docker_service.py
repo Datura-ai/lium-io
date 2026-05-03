@@ -1023,6 +1023,7 @@ async def test_create_container_retries_on_port_allocated_then_succeeds(
     await docker_service._run_docker_create_with_port_retry(
         ssh_client=Mock(),
         command="/usr/bin/docker run -d -p 9101:9101 --name pod_test img",
+        container_name="pod_test",
         log_tag="t",
         default_extra={},
         timeout=120,
@@ -1063,6 +1064,7 @@ async def test_create_container_exhausts_retry_budget(docker_service, monkeypatc
         await docker_service._run_docker_create_with_port_retry(
             ssh_client=Mock(),
             command="/usr/bin/docker run -d -p 9101:9101 --name pod_test img",
+            container_name="pod_test",
             log_tag="t",
             default_extra={},
             timeout=120,
@@ -1097,6 +1099,7 @@ async def test_create_container_does_not_retry_on_other_docker_errors(
         await docker_service._run_docker_create_with_port_retry(
             ssh_client=Mock(),
             command="/usr/bin/docker run -d --name pod_test bogus:latest",
+            container_name="pod_test",
             log_tag="t",
             default_extra={},
             timeout=120,
@@ -1227,3 +1230,259 @@ async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
 
     assert ok is True
     assert msg == "No port check containers found"
+
+
+# ---------------------------------------------------------------------------
+# DAH-2018: container-name conflict — between port-allocated retries we
+# `docker rm -f <container_name>` to release the name Docker reserved during
+# the prior `docker run` parse. Cleanup runs AFTER the backoff sleep so the
+# rm→run window stays tight; cleanup failures warn-log but never abort.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_container_removes_stale_container_between_port_retries(
+    docker_service, monkeypatch,
+):
+    """Between port-allocated retries: sleep first, then docker rm -f, then re-run.
+
+    Pins both the rm command itself and the ordering vs the backoff sleep, so
+    the rm→run window stays as tight as possible.
+    """
+    events: list[tuple] = []
+    calls = {"n": 0}
+
+    async def fake_execute(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        calls["n"] += 1
+        events.append(("execute", calls["n"]))
+        if calls["n"] == 1:
+            raise Exception(_PORT_ALLOCATED_ERR)
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", fake_execute)
+
+    async def fake_sleep(s):
+        events.append(("sleep", s))
+
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+
+    ssh_client = Mock()
+
+    async def fake_ssh_run(cmd):
+        events.append(("ssh_run", cmd))
+        return Mock(exit_status=0, stdout="", stderr="")
+
+    ssh_client.run = fake_ssh_run
+
+    await docker_service._run_docker_create_with_port_retry(
+        ssh_client=ssh_client,
+        command="/usr/bin/docker run -d -p 9101:9101 --name pod_test img",
+        container_name="pod_test",
+        log_tag="t",
+        default_extra={},
+        timeout=120,
+    )
+
+    assert calls["n"] == 2
+    assert events == [
+        ("execute", 1),
+        ("sleep", 5),
+        ("ssh_run", "/usr/bin/docker rm -f pod_test"),
+        ("execute", 2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_port_retry_continues_when_rm_cleanup_fails(
+    docker_service, monkeypatch,
+):
+    """A failing `docker rm -f` must warning-log but not abort the retry loop."""
+    calls = {"n": 0}
+
+    async def fake_execute(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise Exception(_PORT_ALLOCATED_ERR)
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", fake_execute)
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+
+    rm_calls: list[str] = []
+    ssh_client = Mock()
+
+    async def fake_ssh_run(cmd):
+        # Raise only on docker rm to avoid masking unrelated future ssh calls.
+        if "docker rm" in cmd:
+            rm_calls.append(cmd)
+            raise Exception("rm failed")
+        return Mock(exit_status=0, stdout="", stderr="")
+
+    ssh_client.run = fake_ssh_run
+
+    warning_msgs: list[str] = []
+
+    def capture_warning(msg, *args, **kwargs):
+        warning_msgs.append(str(msg))
+
+    monkeypatch.setattr("services.docker_service.logger.warning", capture_warning)
+
+    # Should NOT raise — second attempt succeeds after the rm failure.
+    await docker_service._run_docker_create_with_port_retry(
+        ssh_client=ssh_client,
+        command="/usr/bin/docker run -d -p 9101:9101 --name pod_test img",
+        container_name="pod_test",
+        log_tag="t",
+        default_extra={},
+        timeout=120,
+    )
+
+    assert calls["n"] == 2
+    # rm was attempted exactly once (between the two execute attempts).
+    assert rm_calls == ["/usr/bin/docker rm -f pod_test"]
+    # And the failure was warning-logged with the documented tag.
+    assert any("PORT_RETRY_STALE_RM_FAILED" in m for m in warning_msgs)
+
+
+@pytest.mark.asyncio
+async def test_other_docker_errors_skip_rm_cleanup(
+    docker_service, monkeypatch,
+):
+    """Non-port-allocated errors must propagate immediately and never trigger rm."""
+    async def fail_other(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        raise Exception("docker: Error response from daemon: No such image: bogus:latest")
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", fail_other)
+
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock()
+
+    with pytest.raises(Exception, match="No such image"):
+        await docker_service._run_docker_create_with_port_retry(
+            ssh_client=ssh_client,
+            command="/usr/bin/docker run -d --name pod_test bogus:latest",
+            container_name="pod_test",
+            log_tag="t",
+            default_extra={},
+            timeout=120,
+        )
+
+    # Non-port-allocated path must NOT issue any rm.
+    ssh_client.run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# DAH-2018: late re-check of port_check containers right before `docker run`
+# (after the image pull) reuses the open ssh_client instead of dialing again.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
+    """When ssh_client is passed, the wait must reuse it — no asyncssh.connect.
+
+    The early call in miner_service runs before image pull; the late call
+    inside create_container runs after image pull, on the already-open
+    rental session. Opening a second SSH connection here would be wasteful
+    and would widen the TOCTOU gap. The function must skip both
+    decrypt_payload and asyncssh.connect when ssh_client is supplied.
+    """
+    from unittest.mock import patch
+
+    seen_commands: list[str] = []
+
+    class FakeSSHClient:
+        async def run(self, cmd):
+            seen_commands.append(cmd)
+            return MagicMock(stdout="", stderr="", exit_status=0)
+
+    ssh_client = FakeSSHClient()
+
+    decrypt_called = {"n": 0}
+    docker_service.ssh_service.decrypt_payload = Mock(
+        side_effect=lambda *a, **k: (_inc(decrypt_called) or "x")
+    )
+
+    with patch("services.docker_service.asyncssh.connect") as connect_mock, \
+         patch("services.docker_service.asyncssh.import_private_key") as pkey_mock:
+        ok, msg = await docker_service.wait_for_port_check_containers(
+            executor_info=MagicMock(),
+            miner_hotkey="5TestMiner",
+            keypair=MagicMock(),
+            private_key="ignored",
+            max_retries=0,
+            ssh_client=ssh_client,
+        )
+
+    assert ok is True
+    assert msg == "No port check containers found"
+    # The reused-session path must skip the connect dance entirely.
+    connect_mock.assert_not_called()
+    pkey_mock.assert_not_called()
+    assert decrypt_called["n"] == 0
+    # And the docker ps probe must still run on the supplied client.
+    assert any("docker ps" in c for c in seen_commands)
+
+
+def _inc(d):
+    d["n"] += 1
+
+
+@pytest.mark.asyncio
+async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
+    docker_service,
+):
+    """If a health_check_* probe is still up at the late re-check, force-clean it.
+
+    Reproduces the May-1 incident: backend HC bound the same host port the
+    rental allocated, image pull (~3min) elapsed, and the early wait result
+    was stale by `docker run` time. The late call (max_retries=1) must
+    detect the lingering health_check_* container and force-remove it
+    before the rental's docker run.
+    """
+    calls = {"n": 0}
+
+    class FakeSSHClient:
+        seen: list[str] = []
+
+        async def run(self_inner, cmd):
+            FakeSSHClient.seen.append(cmd)
+            calls["n"] += 1
+            # First docker ps reports an HC still alive; second (after wait)
+            # also reports it (so the loop exhausts retries and force-cleans).
+            if "docker ps --format" in cmd:
+                return MagicMock(
+                    stdout="health_check_1777635787\n",
+                    stderr="", exit_status=0,
+                )
+            # The xargs force-rm command — return success.
+            return MagicMock(stdout="", stderr="", exit_status=0)
+
+    async def instant_sleep(_):
+        return None
+
+    import services.docker_service as svc_mod
+    real_sleep = svc_mod.asyncio.sleep
+    svc_mod.asyncio.sleep = instant_sleep
+    try:
+        ok, msg = await docker_service.wait_for_port_check_containers(
+            executor_info=MagicMock(),
+            miner_hotkey="5TestMiner",
+            keypair=MagicMock(),
+            private_key="ignored",
+            max_retries=1,
+            retry_delay=30,
+            ssh_client=FakeSSHClient(),
+        )
+    finally:
+        svc_mod.asyncio.sleep = real_sleep
+
+    assert ok is True
+    assert "forcefully removed" in msg
+    # Must have issued the force-rm xargs command targeting both prefixes.
+    assert any(
+        "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
+        for c in FakeSSHClient.seen
+    ), f"force-rm xargs missing. Seen: {FakeSSHClient.seen}"
