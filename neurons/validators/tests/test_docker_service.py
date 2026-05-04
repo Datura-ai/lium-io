@@ -1486,3 +1486,109 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
         "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
         for c in FakeSSHClient.seen
     ), f"force-rm xargs missing. Seen: {FakeSSHClient.seen}"
+
+
+# =====================================================================
+# DAH-2044: orphan vloopback volume cleanup on create_container failure.
+# =====================================================================
+
+
+class _FakeRunResult:
+    def __init__(self, exit_status=0, stdout="", stderr=""):
+        self.exit_status = exit_status
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _FakeSSHClient:
+    """Minimal asyncssh-style stub. queue is a list of either _FakeRunResult or
+    Exception instances; each ssh_client.run() pops one from the head."""
+
+    def __init__(self, queue):
+        self.queue = list(queue)
+        self.seen: list[str] = []
+
+    async def run(self, command):
+        self.seen.append(command)
+        item = self.queue.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+@pytest.mark.asyncio
+async def test_cleanup_orphan_local_volume_removes_existing(docker_service):
+    ssh = _FakeSSHClient([
+        _FakeRunResult(exit_status=0),  # docker volume inspect -> exists
+        _FakeRunResult(exit_status=0),  # docker volume rm -f -> ok
+    ])
+
+    status = await docker_service._cleanup_orphan_local_volume(
+        ssh, "volume_e7e5b2f8-2ffe-45d4-acef-4949e3cda820", {"pod_id": "p"}
+    )
+
+    assert status == "removed"
+    assert any("docker volume inspect" in c for c in ssh.seen)
+    assert any("docker volume rm -f" in c for c in ssh.seen)
+    # shlex.quote'd volume name must appear in the rm command.
+    assert any("volume_e7e5b2f8-2ffe-45d4-acef-4949e3cda820" in c for c in ssh.seen)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_orphan_local_volume_not_present(docker_service):
+    ssh = _FakeSSHClient([
+        _FakeRunResult(exit_status=1),  # docker volume inspect -> missing
+    ])
+
+    status = await docker_service._cleanup_orphan_local_volume(
+        ssh, "volume_missing", {}
+    )
+
+    assert status == "not_present"
+    # rm must NOT be called when inspect reports missing — saves an SSH round-trip.
+    assert not any("docker volume rm" in c for c in ssh.seen)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_orphan_local_volume_rm_failed(docker_service):
+    ssh = _FakeSSHClient([
+        _FakeRunResult(exit_status=0),  # inspect -> exists
+        _FakeRunResult(exit_status=1, stderr="volume is in use"),  # rm fails
+    ])
+
+    status = await docker_service._cleanup_orphan_local_volume(
+        ssh, "volume_in_use", {}
+    )
+
+    assert status == "rm_failed"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_orphan_local_volume_swallows_ssh_exception(docker_service):
+    """Cleanup must never raise — that would mask the original create_container error."""
+    ssh = _FakeSSHClient([
+        ConnectionError("ssh broke mid-cleanup"),
+    ])
+
+    status = await docker_service._cleanup_orphan_local_volume(
+        ssh, "volume_x", {}
+    )
+
+    assert status == "rm_failed"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_orphan_local_volume_quotes_volume_name(docker_service):
+    """Defense-in-depth: untrusted-looking volume names get shell-quoted before SSH."""
+    ssh = _FakeSSHClient([
+        _FakeRunResult(exit_status=1),  # inspect -> not present
+    ])
+
+    weird_name = "volume_x; rm -rf /"
+    await docker_service._cleanup_orphan_local_volume(ssh, weird_name, {})
+
+    inspect_cmd = ssh.seen[0]
+    # The dangerous payload must be enclosed in single quotes by shlex.quote and
+    # must not appear unquoted (that would be `; rm -rf /`).
+    assert shlex.quote(weird_name) in inspect_cmd
+    assert "; rm -rf /" not in inspect_cmd.replace(shlex.quote(weird_name), "")
