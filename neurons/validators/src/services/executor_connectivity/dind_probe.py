@@ -11,15 +11,6 @@ from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
 
-_DOCKER_HUB_RATELIMIT_MARKERS = ("toomanyrequests", "pull rate limit")
-
-
-def _is_dockerhub_ratelimit(stderr: str) -> bool:
-    if not stderr:
-        return False
-    lowered = stderr.lower()
-    return any(marker in lowered for marker in _DOCKER_HUB_RATELIMIT_MARKERS)
-
 
 class DindVerifier:
     """Verifies Docker-in-Docker capability."""
@@ -76,20 +67,10 @@ class DindVerifier:
                     sysbox_ok = result.exit_status == 0
                     if not sysbox_ok:
                         error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                        # Docker Hub rate-limit response proves Docker daemon and network are healthy,
-                        # so it should not count as a sysbox failure.
-                        if _is_dockerhub_ratelimit(error_msg):
-                            logger.warning(
-                                _m(
-                                    "Sysbox check: Docker Hub ratelimit, treating as ok",
-                                    extra=get_extra_info({**log_ctx, "error": error_msg}),
-                                )
-                            )
-                        else:
-                            logger.warning(
-                                _m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
-                            )
-                            sysbox = False
+                        logger.warning(
+                            _m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
+                        )
+                        sysbox = False
                     else:
                         logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
 
