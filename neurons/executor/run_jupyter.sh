@@ -139,12 +139,15 @@ install_python_packages() {
     pip install --upgrade pip
     
     # Install Jupyter and common packages
+    # Jupyter stack is pinned: an unpinned upstream release on 2026-05-04 added
+    # strict preferred_dir/root_dir validation that broke pod startup (DAH-2050).
     echo "Installing Jupyter and Python packages..."
     pip install \
         jupyter \
-        jupyterlab \
-        notebook \
-        ipykernel \
+        jupyterlab==4.5.7 \
+        jupyter-server==2.18.0 \
+        notebook==7.5.6 \
+        ipykernel==7.2.0 \
         matplotlib \
         numpy \
         pandas \
@@ -198,7 +201,7 @@ start_jupyter() {
         --ServerApp.terminado_settings="{\"shell_command\":[\"$shell_cmd\"]}" \
         --IdentityProvider.token=$JUPYTER_PASSWORD \
         --ServerApp.allow_origin=* \
-        --FileContentsManager.preferred_dir=/root \
+        --ServerApp.root_dir=/root \
         --ServerApp.disable_check_xsrf=True \
         --ServerApp.tornado_settings="{\"max_body_size\": 536870912}" \
         --ServerApp.log_level=ERROR \
