@@ -293,6 +293,14 @@ FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
 IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
 DOCKER_DIND_IMAGE = "daturaai/dind:0.0.0"
 
+# Probe image used inside DinD to confirm the inner dockerd can pull and run a tiny image.
+# Pinned by digest to public.ecr.aws (AWS official mirror of Docker Hub library/) — same bytes
+# as docker.io/library/hello-world but without anonymous pull rate limits.
+DIND_PROBE_IMAGE = (
+    "public.ecr.aws/docker/library/hello-world"
+    "@sha256:f9078146db2e05e794366b1bfe584a14ea6317f44027d10ef7dad65279026885"
+)
+
 LIB_NVIDIA_ML_DIGESTS = {
     "535.54.03": "49e63c42aa95bba6b9aa562ee57e496c:15a37892671187547b6dd21a07e8149315e529211dc30ca6ee8d8d089a338d53",
     "535.86.10": "7351f43a025ecdde1208a7a4e2f1cf26:ec9b270c4fdf2b51515c9eb5f185cbc0478322c43a3876caab80ebfb5cd1dab1",

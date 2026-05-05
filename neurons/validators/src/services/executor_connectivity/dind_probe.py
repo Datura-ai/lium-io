@@ -6,6 +6,7 @@ from asyncssh import SSHClientConnection
 
 from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
+from services.const import DIND_PROBE_IMAGE
 from services.executor_connectivity.models import DindProbeResult, PortPair
 from services.ssh_service import SSHService
 
@@ -61,18 +62,24 @@ class DindVerifier:
             ) as ssh:
                 logger.info(_m("DinD SSH connected", extra=get_extra_info(log_ctx)))
 
-                # Test sysbox
+                # Probe that the inner dockerd can actually pull+run a tiny image. We use a
+                # sha256-pinned mirror on public.ecr.aws (same bytes as docker.io/library/hello-world)
+                # to avoid Docker Hub anonymous-pull rate limits, which were the original failure mode.
+                # This is also the only end-to-end signal that sysbox-runc is wired up correctly:
+                # without sysbox, nested dockerd cannot start the container, so a successful run
+                # implies the runtime works. We do NOT trust this probe as proof of sysbox by itself —
+                # an attacker could rig the inner daemon to lie — it is a functional health check.
                 if sysbox:
-                    result = await ssh.run("docker pull hello-world")
-                    sysbox_ok = result.exit_status == 0
-                    if not sysbox_ok:
+                    result = await ssh.run(f"docker run --rm {DIND_PROBE_IMAGE}")
+                    probe_ok = result.exit_status == 0
+                    if not probe_ok:
                         error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                         logger.warning(
-                            _m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
+                            _m("DinD run probe failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
                         )
                         sysbox = False
                     else:
-                        logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
+                        logger.info(_m("DinD run probe ok", extra=get_extra_info(log_ctx)))
 
             await ssh_client.run(DockerCommand.remove(name))
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
