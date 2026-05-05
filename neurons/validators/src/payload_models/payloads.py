@@ -242,6 +242,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
+    active_volume_names: list[str] | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
