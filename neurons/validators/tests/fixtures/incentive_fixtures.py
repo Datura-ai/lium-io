@@ -41,11 +41,6 @@ def mock_settings(monkeypatch):
     monkeypatch.setattr(settings, "NEW_BURNERS", [100, 101])
     monkeypatch.setattr(settings, "ENABLE_NEW_BURN_LOGIC", True)
     monkeypatch.setattr(settings, "DRY_RUN", False)
-    # Restore the historical uptime/collateral penalty math so tests in this
-    # module exercise the same branch their `expected_score()` helper models.
-    # Production default flipped to True under DAH-2016 (PR #1011) to disable
-    # the penalty until slashing ships; the logic itself still lives in
-    # incentive/default.py and must stay covered.
     monkeypatch.setattr(settings, "SKIP_COLLATERAL_PENALTY", False)
     monkeypatch.setattr(settings, "incentive", IncentiveConfig(
         algorithm="default",
