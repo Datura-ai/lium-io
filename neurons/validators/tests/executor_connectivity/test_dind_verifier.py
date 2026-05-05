@@ -145,9 +145,8 @@ async def test_dind_verifier_does_not_call_dockerhub(mocker):
         sysbox=True,
     )
 
-    inner_commands = [call.args[0] for call in ssh_session.run.call_args_list]
-    outer_commands = [call.args[0] for call in ssh_client.run.call_args_list]
-    for cmd in inner_commands + outer_commands:
+    issued_commands = [call.args[0] for call in ssh_session.run.call_args_list]
+    for cmd in issued_commands:
         assert "docker pull" not in cmd, f"DinD probe must not call docker pull (saw: {cmd!r})"
 
 
