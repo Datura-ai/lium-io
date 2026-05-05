@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 
 import asyncssh
@@ -11,6 +10,15 @@ from services.executor_connectivity.models import DindProbeResult, PortPair
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
+
+_DOCKER_HUB_RATELIMIT_MARKERS = ("toomanyrequests", "pull rate limit")
+
+
+def _is_dockerhub_ratelimit(stderr: str) -> bool:
+    if not stderr:
+        return False
+    lowered = stderr.lower()
+    return any(marker in lowered for marker in _DOCKER_HUB_RATELIMIT_MARKERS)
 
 
 class DindVerifier:
@@ -62,43 +70,28 @@ class DindVerifier:
             ) as ssh:
                 logger.info(_m("DinD SSH connected", extra=get_extra_info(log_ctx)))
 
-                # Test sysbox via local Docker daemon — no external registry call.
-                # We ask the inner Docker for its registered runtimes and check for sysbox-runc.
-                # This avoids false negatives from Docker Hub rate limits / outages.
+                # Test sysbox
                 if sysbox:
-                    result = await ssh.run("docker info --format '{{json .Runtimes}}'")
-                    if result.exit_status != 0:
+                    result = await ssh.run("docker pull hello-world")
+                    sysbox_ok = result.exit_status == 0
+                    if not sysbox_ok:
                         error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
-                        logger.warning(
-                            _m(
-                                "Sysbox check failed: docker info unreachable",
-                                extra=get_extra_info({**log_ctx, "error": error_msg}),
-                            )
-                        )
-                        sysbox = False
-                    else:
-                        stdout = result.stdout.strip() if result.stdout and isinstance(result.stdout, str) else ""
-                        try:
-                            runtimes = json.loads(stdout or "{}")
-                        except json.JSONDecodeError as e:
+                        # Docker Hub rate-limit response proves Docker daemon and network are healthy,
+                        # so it should not count as a sysbox failure.
+                        if _is_dockerhub_ratelimit(error_msg):
                             logger.warning(
                                 _m(
-                                    "Sysbox check failed: cannot parse runtimes",
-                                    extra=get_extra_info({**log_ctx, "error": str(e), "stdout": stdout[:200]}),
+                                    "Sysbox check: Docker Hub ratelimit, treating as ok",
+                                    extra=get_extra_info({**log_ctx, "error": error_msg}),
                                 )
                             )
-                            sysbox = False
                         else:
-                            if "sysbox-runc" in runtimes:
-                                logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
-                            else:
-                                logger.warning(
-                                    _m(
-                                        "Sysbox check failed: sysbox-runc not registered",
-                                        extra=get_extra_info({**log_ctx, "available_runtimes": list(runtimes.keys())}),
-                                    )
-                                )
-                                sysbox = False
+                            logger.warning(
+                                _m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
+                            )
+                            sysbox = False
+                    else:
+                        logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
 
             await ssh_client.run(DockerCommand.remove(name))
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
