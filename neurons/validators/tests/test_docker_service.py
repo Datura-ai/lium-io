@@ -939,7 +939,15 @@ async def test_clean_stale_vloopback_volumes_skips_mounted_and_backend_known(
     ssh_client.run = AsyncMock(
         side_effect=[
             _make_ssh_command_result(
-                stdout="volume_orphan\nvolume_mounted\nvolume_backend_known\nhc_probe\ncustom_loopback\n"
+                stdout=(
+                    "volume_orphan vloopback:latest\n"
+                    "volume_mounted vloopback\n"
+                    "volume_backend_known vloopback:latest\n"
+                    "hc_probe vloopback:latest\n"
+                    "custom_loopback vloopback:latest\n"
+                    "volume_local local\n"
+                    "volume_other other:latest\n"
+                )
             ),
             _make_ssh_command_result(stdout="volume_mounted\n"),
         ]
@@ -960,6 +968,34 @@ async def test_clean_stale_vloopback_volumes_skips_mounted_and_backend_known(
     assert "volume_backend_known" not in volume_command
     assert "hc_probe" not in volume_command
     assert "custom_loopback" not in volume_command
+    assert "volume_local" not in volume_command
+    assert "volume_other" not in volume_command
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_vloopback_volumes_accepts_tagged_driver(
+    docker_service,
+    retry_ssh_mock,
+):
+    """Docker reports plugin drivers with tags, for example vloopback:latest."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(stdout="volume_tagged vloopback:latest\n"),
+            _make_ssh_command_result(stdout=""),
+        ]
+    )
+
+    # Act
+    await docker_service.clean_stale_vloopback_volumes(
+        ssh_client=ssh_client,
+        default_extra={},
+    )
+
+    # Assert
+    assert retry_ssh_mock.call_count == 1
+    assert "volume_tagged" in retry_ssh_mock.call_args_list[0][0][1]
 
 
 @pytest.mark.asyncio

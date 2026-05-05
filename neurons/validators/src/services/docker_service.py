@@ -639,7 +639,7 @@ class DockerService:
         skip_volume_names: list[str] | set[str] | None = None,
     ) -> None:
         skip_set = {name for name in (skip_volume_names or []) if name}
-        list_volumes_cmd = '/usr/bin/docker volume ls --filter driver=vloopback --format "{{.Name}}"'
+        list_volumes_cmd = '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
         mounted_volumes_cmd = (
             "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
             "'{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}}{{\"\\n\"}}{{end}}{{end}}'"
@@ -659,11 +659,18 @@ class DockerService:
                 )
                 return
 
-            vloopback_volumes = {
-                name.strip()
-                for name in (volume_result.stdout or "").splitlines()
-                if name.strip().startswith("volume_")
-            }
+            vloopback_volumes = set()
+            for line in (volume_result.stdout or "").splitlines():
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                name, driver = parts
+                if not (
+                    name.startswith("volume_")
+                    and (driver == "vloopback" or driver.startswith("vloopback:"))
+                ):
+                    continue
+                vloopback_volumes.add(name)
             if not vloopback_volumes:
                 return
 
