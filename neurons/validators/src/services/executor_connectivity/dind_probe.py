@@ -63,7 +63,12 @@ class DindVerifier:
 
                 # Test sysbox
                 if sysbox:
-                    result = await ssh.run("docker pull hello-world")
+                    # daturaai/dind:0.0.1 bundles the hello-world image into the inner dockerd
+                    # at container start (DAH-1959), so `docker run` resolves it locally with no
+                    # registry round-trip. If the bundled load failed for any reason the local
+                    # image is absent and docker falls back to a Docker Hub pull, matching the
+                    # previous behaviour.
+                    result = await ssh.run("docker run --rm hello-world")
                     sysbox_ok = result.exit_status == 0
                     if not sysbox_ok:
                         error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
