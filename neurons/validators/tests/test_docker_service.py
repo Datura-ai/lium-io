@@ -7,9 +7,12 @@ import pytest
 import pytest_asyncio
 
 from services.docker_service import DockerService
-from payload_models.payloads import PayloadPortMapping
+from payload_models.payloads import (
+    ContainerCreateRequest,
+    ContainerStartRequest,
+    PayloadPortMapping,
+)
 from datura.requests.miner_requests import ExecutorSSHInfo
-from payload_models.payloads import ContainerStartRequest
 
 
 def create_mock_port_dict(
@@ -996,6 +999,90 @@ async def test_clean_stale_vloopback_volumes_accepts_tagged_driver(
     # Assert
     assert retry_ssh_mock.call_count == 1
     assert "volume_tagged" in retry_ssh_mock.call_args_list[0][0][1]
+
+
+@pytest.mark.asyncio
+async def test_create_container_cleans_stale_vloopback_when_active_volumes_missing(
+    docker_service,
+    monkeypatch,
+):
+    """Connector requests may omit active_volume_names; cleanup should still run."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.add_pending_pod = AsyncMock()
+    docker_service.redis_service.remove_pending_pod = AsyncMock()
+    docker_service.redis_service.add_rented_pod = AsyncMock()
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        docker_service,
+        "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], None)),
+    )
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_existing_containers", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
+    monkeypatch.setattr(
+        docker_service,
+        "wait_for_port_check_containers",
+        AsyncMock(return_value=(True, "ok")),
+    )
+    monkeypatch.setattr(docker_service, "_run_docker_create_with_port_retry", AsyncMock())
+    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=None,
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    # Act
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    # Assert
+    docker_service.clean_stale_vloopback_volumes.assert_awaited_once()
+    assert docker_service.clean_stale_vloopback_volumes.await_args.kwargs[
+        "skip_volume_names"
+    ] == set()
 
 
 @pytest.mark.asyncio

@@ -1317,12 +1317,11 @@ class DockerService:
                     active_volume_names=payload.active_volume_names,
                 )
 
-                if payload.active_volume_names is not None:
-                    await self.clean_stale_vloopback_volumes(
-                        ssh_client=ssh_client,
-                        default_extra=default_extra,
-                        skip_volume_names=protected_volume_names,
-                    )
+                await self.clean_stale_vloopback_volumes(
+                    ssh_client=ssh_client,
+                    default_extra=default_extra,
+                    skip_volume_names=protected_volume_names,
+                )
 
                 # Add profiler for docker volume creation
                 profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
