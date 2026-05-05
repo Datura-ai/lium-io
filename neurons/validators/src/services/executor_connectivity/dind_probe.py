@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 
 import asyncssh
 from asyncssh import SSHClientConnection
@@ -11,6 +12,17 @@ from services.executor_connectivity.models import DindProbeResult, PortPair
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
+
+# public.ecr.aws enforces 1 unauthenticated image pull / sec / IP. Miners with several
+# executors behind one NAT see concurrent waves of probes from a single validator, plus
+# concurrent waves from multiple validators on the subnet, which still trips the limit
+# even after we left docker.io. Retrying once with a randomised 2–10 s wait lets the
+# bursts de-phase across executors of the same IP and brings residual 429s back down to
+# real-failure noise. We only retry on the throttling signature so genuine "daemon dead"
+# failures continue to surface immediately.
+_RATELIMIT_MARKERS = ("toomanyrequests", "rate exceeded")
+_PROBE_RETRY_MIN_S = 2
+_PROBE_RETRY_MAX_S = 10
 
 
 class DindVerifier:
@@ -70,10 +82,39 @@ class DindVerifier:
                 # implies the runtime works. We do NOT trust this probe as proof of sysbox by itself —
                 # an attacker could rig the inner daemon to lie — it is a functional health check.
                 if sysbox:
-                    result = await ssh.run(f"docker run --rm {DIND_PROBE_IMAGE}")
+                    probe_cmd = f"docker run --rm {DIND_PROBE_IMAGE}"
+                    result = await ssh.run(probe_cmd)
                     probe_ok = result.exit_status == 0
+                    error_msg = (
+                        result.stderr.strip()
+                        if result.stderr and isinstance(result.stderr, str)
+                        else "unknown error"
+                    )
+
+                    # Retry once on registry rate-limit. ECR public's 1 pull/sec/IP limit gets
+                    # exhausted whenever a miner runs many executors behind one NAT and the
+                    # whole subnet's validators dispatch their probe waves at the same block.
+                    # A single retry with random 2-10 s wait de-phases the bursts so each
+                    # executor of one IP lands in a different one-second window.
+                    if not probe_ok and any(m in error_msg.lower() for m in _RATELIMIT_MARKERS):
+                        backoff = random.uniform(_PROBE_RETRY_MIN_S, _PROBE_RETRY_MAX_S)
+                        logger.info(
+                            _m(
+                                "DinD run probe ratelimited, retrying",
+                                extra=get_extra_info({**log_ctx, "backoff_s": round(backoff, 2)}),
+                            )
+                        )
+                        await asyncio.sleep(backoff)
+                        result = await ssh.run(probe_cmd)
+                        probe_ok = result.exit_status == 0
+                        if not probe_ok:
+                            error_msg = (
+                                result.stderr.strip()
+                                if result.stderr and isinstance(result.stderr, str)
+                                else "unknown error"
+                            )
+
                     if not probe_ok:
-                        error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                         logger.warning(
                             _m("DinD run probe failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
                         )
