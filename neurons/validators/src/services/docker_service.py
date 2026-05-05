@@ -588,6 +588,7 @@ class DockerService:
         sleep: int = 0,
         clear_volume: bool = True,
         active_container_names: list[str] | None = None,
+        active_volume_names: list[str] | None = None,
     ):
         command = f'/usr/bin/docker ps -a --format "{{{{.Names}}}}"'
         result = await ssh_client.run(command)
@@ -596,12 +597,13 @@ class DockerService:
             await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
+            active_volume_set = set(active_volume_names) if active_volume_names else set()
             pod_containers = [
                 name for name in result.stdout.strip().split("\n")
                 if name == pod_name or name.startswith(POD_CONTAINER_PREFIX)
             ]
             stale_containers = [name for name in pod_containers if name not in active_set]
-            container_names = " ".join(stale_containers)
+            container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return
 
@@ -620,12 +622,137 @@ class DockerService:
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
-                if active_set:
-                    volumes = " ".join(f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}" for name in stale_containers)
+                volumes_to_remove = [
+                    f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}"
+                    for name in stale_containers
+                    if f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}" not in active_volume_set
+                ]
+                if volumes_to_remove:
+                    volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
-                else:
-                    command = '/usr/bin/docker volume prune -af'
-                await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+                    await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+
+    async def clean_stale_vloopback_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        skip_volume_names: list[str] | set[str] | None = None,
+    ) -> None:
+        skip_set = {name for name in (skip_volume_names or []) if name}
+        list_volumes_cmd = '/usr/bin/docker volume ls --filter driver=vloopback --format "{{.Name}}"'
+        mounted_volumes_cmd = (
+            "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
+            "'{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}}{{\"\\n\"}}{{end}}{{end}}'"
+        )
+
+        try:
+            volume_result = await ssh_client.run(list_volumes_cmd)
+            if getattr(volume_result, "exit_status", 0) != 0:
+                logger.warning(
+                    _m(
+                        "Unable to list vloopback volumes",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "stderr": getattr(volume_result, "stderr", ""),
+                        }),
+                    )
+                )
+                return
+
+            vloopback_volumes = {
+                name.strip()
+                for name in (volume_result.stdout or "").splitlines()
+                if name.strip().startswith("volume_")
+            }
+            if not vloopback_volumes:
+                return
+
+            mounted_result = await ssh_client.run(mounted_volumes_cmd)
+            if getattr(mounted_result, "exit_status", 0) != 0:
+                logger.warning(
+                    _m(
+                        "Unable to inspect mounted Docker volumes",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "stderr": getattr(mounted_result, "stderr", ""),
+                        }),
+                    )
+                )
+                return
+
+            mounted_volumes = {
+                name.strip() for name in (mounted_result.stdout or "").splitlines() if name.strip()
+            }
+            stale_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
+            if not stale_volumes:
+                return
+
+            logger.info(
+                _m(
+                    "Cleaning stale vloopback Docker volumes",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "stale_volumes": stale_volumes,
+                        "skipped_volumes": sorted(skip_set),
+                    }),
+                )
+            )
+            volumes = " ".join(shlex.quote(volume) for volume in stale_volumes)
+            await retry_ssh_command(
+                ssh_client,
+                f"/usr/bin/docker volume rm {volumes} 2>/dev/null || true",
+                "clean_stale_vloopback_volumes",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to clean stale vloopback volumes",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+
+    async def cleanup_failed_container_creation(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        container_name: str,
+        volume_name: str | None = None,
+        remove_volume: bool = False,
+    ) -> None:
+        try:
+            container = shlex.quote(container_name)
+            await retry_ssh_command(
+                ssh_client,
+                f"/usr/bin/docker rm -f {container} 2>/dev/null || true",
+                "cleanup_failed_container_creation",
+            )
+
+            if remove_volume and volume_name:
+                volume = shlex.quote(volume_name)
+                await retry_ssh_command(
+                    ssh_client,
+                    f"/usr/bin/docker volume rm {volume} 2>/dev/null || true",
+                    "cleanup_failed_container_creation",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to clean up failed container creation artifacts",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": container_name,
+                        "volume_name": volume_name,
+                        "remove_volume": remove_volume,
+                        "error": str(exc),
+                    }),
+                ),
+                exc_info=True,
+            )
 
     async def install_open_ssh_server_and_start_ssh_service(
         self,
@@ -1168,6 +1295,10 @@ class DockerService:
                 )
 
                 container_name = f"{POD_CONTAINER_PREFIX}{payload.pod_id}"
+                created_local_volume = False
+                protected_volume_names = set(payload.active_volume_names or [])
+                if local_volume:
+                    protected_volume_names.add(local_volume)
 
                 await self.clean_existing_containers(
                     ssh_client=ssh_client,
@@ -1176,7 +1307,15 @@ class DockerService:
                     sleep=10,
                     clear_volume=False if local_volume else True,
                     active_container_names=payload.active_container_names,
+                    active_volume_names=payload.active_volume_names,
                 )
+
+                if payload.active_volume_names is not None:
+                    await self.clean_stale_vloopback_volumes(
+                        ssh_client=ssh_client,
+                        default_extra=default_extra,
+                        skip_volume_names=protected_volume_names,
+                    )
 
                 # Add profiler for docker volume creation
                 profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -1193,6 +1332,7 @@ class DockerService:
                         log_extra=default_extra,
                         limit=payload.volume_limit_gb,
                     )
+                    created_local_volume = True
 
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
 
@@ -1289,55 +1429,64 @@ class DockerService:
                     )
                 )
 
-                await self._run_docker_create_with_port_retry(
-                    ssh_client=ssh_client,
-                    command=command,
-                    container_name=container_name,
-                    log_tag=log_tag,
-                    default_extra=default_extra,
-                    timeout=timeout,
-                )
-
-                logger.info(f"Container creation step finished")
-
-                # check if the container is running correctly
-                if not await self.check_container_running(ssh_client, container_name):
-                    # Capture the failure reason and check whether it points to our
-                    # --device flags (DAH-1987). State.Error covers cgroup / device
-                    # failures; logs --tail covers entrypoint failures.
-                    failure_reason = ""
-                    try:
-                        inspect = await ssh_client.run(
-                            f"/usr/bin/docker inspect -f '{{{{.State.Error}}}}' {container_name}"
-                        )
-                        logs_tail = await ssh_client.run(
-                            f"/usr/bin/docker logs --tail 50 {container_name} 2>&1 || true"
-                        )
-                        failure_reason = (inspect.stdout or "") + "\n" + (logs_tail.stdout or "")
-                    except Exception:
-                        failure_reason = "(failure_reason capture failed)"
-
-                    nvidia_signal = any(
-                        marker in failure_reason.lower()
-                        for marker in ("/dev/nvidia", "device cgroup", "no such device", "operation not permitted")
+                try:
+                    await self._run_docker_create_with_port_retry(
+                        ssh_client=ssh_client,
+                        command=command,
+                        container_name=container_name,
+                        log_tag=log_tag,
+                        default_extra=default_extra,
+                        timeout=timeout,
                     )
-                    log_extra = get_extra_info({
-                        **default_extra,
-                        "container_name": container_name,
-                        "gpu_flags": gpu_flags,
-                        "failure_reason": failure_reason[:2000],
-                    })
-                    if nvidia_signal:
-                        logger.error(_m(
-                            "docker run failed with NVIDIA-device-related error — "
-                            "possible regression from build_gpu_flags --device flag set",
-                            extra=log_extra,
-                        ))
-                    else:
-                        logger.error(_m("docker run failed", extra=log_extra))
 
-                    await self.clean_existing_containers(ssh_client=ssh_client, default_extra=default_extra, pod_name=container_name, active_container_names=payload.active_container_names)
-                    raise Exception("Run docker run command but container is not running")
+                    logger.info(f"Container creation step finished")
+
+                    # check if the container is running correctly
+                    if not await self.check_container_running(ssh_client, container_name):
+                        # Capture the failure reason and check whether it points to our
+                        # --device flags (DAH-1987). State.Error covers cgroup / device
+                        # failures; logs --tail covers entrypoint failures.
+                        failure_reason = ""
+                        try:
+                            inspect = await ssh_client.run(
+                                f"/usr/bin/docker inspect -f '{{{{.State.Error}}}}' {container_name}"
+                            )
+                            logs_tail = await ssh_client.run(
+                                f"/usr/bin/docker logs --tail 50 {container_name} 2>&1 || true"
+                            )
+                            failure_reason = (inspect.stdout or "") + "\n" + (logs_tail.stdout or "")
+                        except Exception:
+                            failure_reason = "(failure_reason capture failed)"
+
+                        nvidia_signal = any(
+                            marker in failure_reason.lower()
+                            for marker in ("/dev/nvidia", "device cgroup", "no such device", "operation not permitted")
+                        )
+                        log_extra = get_extra_info({
+                            **default_extra,
+                            "container_name": container_name,
+                            "gpu_flags": gpu_flags,
+                            "failure_reason": failure_reason[:2000],
+                        })
+                        if nvidia_signal:
+                            logger.error(_m(
+                                "docker run failed with NVIDIA-device-related error — "
+                                "possible regression from build_gpu_flags --device flag set",
+                                extra=log_extra,
+                            ))
+                        else:
+                            logger.error(_m("docker run failed", extra=log_extra))
+
+                        raise Exception("Run docker run command but container is not running")
+                except Exception:
+                    await self.cleanup_failed_container_creation(
+                        ssh_client=ssh_client,
+                        default_extra=default_extra,
+                        container_name=container_name,
+                        volume_name=local_volume,
+                        remove_volume=created_local_volume,
+                    )
+                    raise
 
                 # Add profiler for docker container creation
                 profilers.append({"name": "Docker container creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -1361,57 +1510,67 @@ class DockerService:
                 #         ),
                 #     )
                 # else:
-                await self.install_open_ssh_server_and_start_ssh_service(
-                    ssh_client=ssh_client,
-                    container_name=container_name,
-                    log_tag=log_tag,
-                    log_extra=default_extra,
-                )
-
-                jupyter_url = None
-                if payload.enable_jupyter and jupyter_port_map:
-                    jupyter_token = secrets.token_hex(16)
-                    await self.run_jupyter(
+                try:
+                    await self.install_open_ssh_server_and_start_ssh_service(
                         ssh_client=ssh_client,
                         container_name=container_name,
-                        jupyter_token=jupyter_token,
-                        jupyter_port=jupyter_port_map[0],
                         log_tag=log_tag,
                         log_extra=default_extra,
-                        local_volume=local_volume,
-                        local_volume_path=local_volume_path,
                     )
-                    jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
-                # Add profiler for ssh service installation
-                profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    jupyter_url = None
+                    if payload.enable_jupyter and jupyter_port_map:
+                        jupyter_token = secrets.token_hex(16)
+                        await self.run_jupyter(
+                            ssh_client=ssh_client,
+                            container_name=container_name,
+                            jupyter_token=jupyter_token,
+                            jupyter_port=jupyter_port_map[0],
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                            local_volume=local_volume,
+                            local_volume_path=local_volume_path,
+                        )
+                        jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
-                # add rest of public keys
-                for public_key in payload.user_public_keys:
-                    command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
-                    await ssh_client.run(command)
+                    # Add profiler for ssh service installation
+                    profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
-                # add environment variables
-                if custom_options and custom_options.environment:
-                    for k, v in custom_options.environment.items():
-                        if k and v and k.strip() and str(v).strip():
-                            env_line = f"{k}={v}"
-                            # Execute each variable addition separately for better error handling
-                            script = f'printf "%s\\n" {shlex.quote(env_line)} >> /etc/environment'
-                            command = f"/usr/bin/docker exec {container_name} sh -c {shlex.quote(script)}"
-                            try:
-                                await ssh_client.run(command)
-                            except Exception as e:
-                                print(f"Failed to set environment variable {k}: {e}")
+                    # add rest of public keys
+                    for public_key in payload.user_public_keys:
+                        command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
+                        await ssh_client.run(command)
 
-                # Add profiler for adding public keys
-                profilers.append({"name": "Adding public keys step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    # add environment variables
+                    if custom_options and custom_options.environment:
+                        for k, v in custom_options.environment.items():
+                            if k and v and k.strip() and str(v).strip():
+                                env_line = f"{k}={v}"
+                                # Execute each variable addition separately for better error handling
+                                script = f'printf "%s\\n" {shlex.quote(env_line)} >> /etc/environment'
+                                command = f"/usr/bin/docker exec {container_name} sh -c {shlex.quote(script)}"
+                                try:
+                                    await ssh_client.run(command)
+                                except Exception as e:
+                                    print(f"Failed to set environment variable {k}: {e}")
 
-                await self.finish_stream_logs()
+                    # Add profiler for adding public keys
+                    profilers.append({"name": "Adding public keys step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
-                await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
+                    await self.finish_stream_logs()
+
+                    await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
+                except Exception:
+                    await self.cleanup_failed_container_creation(
+                        ssh_client=ssh_client,
+                        default_extra=default_extra,
+                        container_name=container_name,
+                        volume_name=local_volume,
+                        remove_volume=created_local_volume,
+                    )
+                    raise
 
                 # Add profiler for ssh service installation
                 profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})

@@ -877,8 +877,8 @@ async def test_clean_containers_targeted_volume_rm(docker_service, retry_ssh_moc
 
 
 @pytest.mark.asyncio
-async def test_clean_containers_empty_active_list_falls_back_to_prune(docker_service, retry_ssh_mock):
-    """When active_container_names is empty list, volume prune -af is used (old behavior)."""
+async def test_clean_containers_empty_active_list_uses_targeted_volume_rm(docker_service, retry_ssh_mock):
+    """Container cleanup never runs global docker volume prune."""
     # Arrange
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
@@ -894,10 +894,72 @@ async def test_clean_containers_empty_active_list_falls_back_to_prune(docker_ser
         active_container_names=[],
     )
 
-    # Assert — falls back to prune, not targeted volume rm
+    # Assert — targeted volume rm, not global prune
     assert retry_ssh_mock.call_count == 2
     volume_command = retry_ssh_mock.call_args_list[1][0][1]
-    assert "volume prune -af" in volume_command
+    assert "volume_target" in volume_command
+    assert "volume_stale" in volume_command
+    assert "volume prune" not in volume_command
+
+
+@pytest.mark.asyncio
+async def test_clean_containers_respects_active_volume_names(docker_service, retry_ssh_mock):
+    """Backend-known pod volumes are skipped even if the pod container is removed."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
+        "pod_target\npod_rebooting\n"
+    ))
+
+    # Act
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={},
+        pod_name="pod_target",
+        clear_volume=True,
+        active_container_names=[],
+        active_volume_names=["volume_rebooting"],
+    )
+
+    # Assert
+    volume_command = retry_ssh_mock.call_args_list[1][0][1]
+    assert "volume_target" in volume_command
+    assert "volume_rebooting" not in volume_command
+    assert "volume prune" not in volume_command
+
+
+@pytest.mark.asyncio
+async def test_clean_stale_vloopback_volumes_skips_mounted_and_backend_known(
+    docker_service,
+    retry_ssh_mock,
+):
+    """Only unmounted vloopback volumes absent from backend's skip list are removed."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(
+                stdout="volume_orphan\nvolume_mounted\nvolume_backend_known\nhc_probe\ncustom_loopback\n"
+            ),
+            _make_ssh_command_result(stdout="volume_mounted\n"),
+        ]
+    )
+
+    # Act
+    await docker_service.clean_stale_vloopback_volumes(
+        ssh_client=ssh_client,
+        default_extra={},
+        skip_volume_names={"volume_backend_known"},
+    )
+
+    # Assert
+    assert retry_ssh_mock.call_count == 1
+    volume_command = retry_ssh_mock.call_args_list[0][0][1]
+    assert "volume_orphan" in volume_command
+    assert "volume_mounted" not in volume_command
+    assert "volume_backend_known" not in volume_command
+    assert "hc_probe" not in volume_command
+    assert "custom_loopback" not in volume_command
 
 
 @pytest.mark.asyncio
