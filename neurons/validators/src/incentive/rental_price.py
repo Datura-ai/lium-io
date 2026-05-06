@@ -368,6 +368,24 @@ class RentalPriceIncentive(DefaultIncentive):
         Returns:
             Calculated score (0 for unrented eligible GPUs, normal score otherwise)
         """
+        if job_result.is_spot:
+            logger.info(
+                _m(
+                    "Executor excluded from both pools - spot tier",
+                    extra={
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "gpu_model": job_result.gpu_model,
+                        "gpu_count": job_result.gpu_count,
+                        "reason": "spot_tier",
+                        "score": 0,
+                        "pool": "none",
+                    },
+                )
+            )
+            job_result.mining_score = 0
+            job_result.eligible_for_rental_share = False
+            return job_result
+
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
         base_model = self.get_base_model_for_gpu(job_result.gpu_model)
         job_result.eligible_for_rental_share = (
