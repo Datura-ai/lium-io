@@ -102,6 +102,11 @@ class ResultHandler:
         # add TDX attestation passed to specs
         specs = {**(context.state.specs or {}), "tdx_attestation_passed": context.tdx_attestation_passed}
 
+        is_spot = bool(
+            context.state.rented_data
+            and executor_info.uuid in context.state.rented_data.spot_executor_ids
+        )
+
         # Build and return JobResult
         return JobResult(
             spec=specs,
@@ -119,6 +124,7 @@ class ResultHandler:
             gpu_splitting_min_count=context.state.gpu_splitting_min_count,
             ssh_pub_keys=context.ssh_pub_keys,
             is_rented=context.rented,
+            is_spot=is_spot,
             rental_created_at=self._get_rental_created_at(context),
             tdx_attestation_passed=context.tdx_attestation_passed,
         )

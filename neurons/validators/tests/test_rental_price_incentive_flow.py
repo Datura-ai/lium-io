@@ -138,6 +138,7 @@ def validator_with_rental_price(
 def _make_rented_data(
     rented_executor_ids: list[str] | None = None,
     gpu_splitting_config: dict[str, int] | None = None,
+    spot_executor_ids: list[str] | None = None,
 ) -> RentedExecutorsResponse:
     executors = {}
     for executor_id in rented_executor_ids or []:
@@ -151,6 +152,7 @@ def _make_rented_data(
         executors=executors,
         banned_guids=[],
         gpu_splitting_config=gpu_splitting_config or {},
+        spot_executor_ids=spot_executor_ids or [],
     )
 
 
@@ -2579,3 +2581,81 @@ async def test_pcc_snapshot_exposes_by_bucket(monkeypatch):
 
     # Legacy aggregate field no longer exposed on RentalShareState.
     assert not hasattr(snapshot.rental, "by_gpu_type")
+
+
+@pytest.mark.asyncio
+async def test_rental_price_spot_excluded_from_both_pools(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """A spot executor must produce zero mining and rental incentive, and must
+    not affect the share earned by secure executors sharing the same GPU model:
+    - secure unrented in the same bucket: per-bucket cap multiplier stays 1.0
+    - secure rented: mining_score denominator (total_gpu_count) excludes spot
+    """
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_secure_unrented"),
+        create_neuron_info(uid=3, hotkey="miner_secure_rented"),
+        create_neuron_info(uid=4, hotkey="miner_spot"),
+    ]
+
+    secure_unrented = _job(
+        create_job_result, executor_id="exec-secure-unrented",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    secure_rented = _job(
+        create_job_result, executor_id="exec-secure-rented",
+        gpu_model="H100", gpu_count=8, is_rented=True,
+    )
+    spot = _job(
+        create_job_result, executor_id="exec-spot",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    spot.is_spot = True
+
+    all_job_results = {
+        "miner_secure_unrented": [secure_unrented],
+        "miner_secure_rented": [secure_rented],
+        "miner_spot": [spot],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(
+            rented_executor_ids=["exec-secure-rented"],
+            spot_executor_ids=["exec-spot"],
+        )
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Spot is zeroed on both axes
+    assert spot.mining_score == 0
+    assert spot.eligible_for_rental_share is False
+    assert (spot.incentive or 0.0) == 0.0
+    assert validator.miner_scores.get("miner_spot", 0.0) == pytest.approx(0.0, abs=0.0001)
+
+    # Secure unrented stays in rental pool and is NOT diluted by spot
+    # in the per-bucket cap. If spot leaked into the bucket,
+    # total_unrented_by_gpu_type would be 16, not 8.
+    assert secure_unrented.eligible_for_rental_share is True
+    assert secure_unrented.total_unrented_by_gpu_type == 8
+    assert secure_unrented.unrented_cap_multiplier == pytest.approx(1.0)
+    assert (secure_unrented.incentive or 0.0) > 0.0
+    assert validator.miner_scores["miner_secure_unrented"] > 0
+
+    # Secure rented mining denominator excludes spot. The map includes the two
+    # secure H100 executors (8+8=16) but must NOT include the spot's 8 GPUs;
+    # an inflated denominator (24) would silently reduce the rented executor's
+    # mining incentive by 1/3 (formula: score * gpu_portion * gpu_count / total).
+    assert secure_rented.is_rented is True
+    assert secure_rented.total_gpu_count == 16
+    assert validator.miner_scores["miner_secure_rented"] > 0

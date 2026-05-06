@@ -23,6 +23,7 @@ class JobResult(BaseModel):
     gpu_splitting_min_count: int | None = None
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
+    is_spot: bool = False
     rental_created_at: datetime | None = None
 
     # tdx attestation relevant fields
