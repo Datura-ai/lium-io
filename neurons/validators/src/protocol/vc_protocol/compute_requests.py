@@ -71,6 +71,7 @@ class RentedExecutorsResponse(BaseModel):
     banned_guids: list[str] = []
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
+    spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
 
 
 class ExecutorUptimeResponse(BaseModel):
