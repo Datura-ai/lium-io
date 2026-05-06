@@ -99,13 +99,18 @@ class ResultHandler:
             gpu_model = parts[0]
             gpu_count = int(parts[1])
 
-        # add TDX attestation passed to specs
-        specs = {**(context.state.specs or {}), "tdx_attestation_passed": context.tdx_attestation_passed}
-
         is_spot = bool(
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.spot_executor_ids
         )
+
+        # add TDX attestation and spot tier to specs (propagated to compute-app
+        # via MACHINE_SPEC_CHANNEL → executor.specs)
+        specs = {
+            **(context.state.specs or {}),
+            "tdx_attestation_passed": context.tdx_attestation_passed,
+            "is_spot": is_spot,
+        }
 
         # Build and return JobResult
         return JobResult(
