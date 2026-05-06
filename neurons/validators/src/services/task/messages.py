@@ -23,7 +23,7 @@ class MessageTemplate:
 def render_message(
     template: MessageTemplate,
     *,
-    ctx: "Context",
+    ctx: Context,
     check_id: str,
     what: dict[str, Any] | None = None,
     severity: str | None = None,
@@ -367,6 +367,17 @@ class TenantEnforcementMessages:
         category="runtime",
         impact="Score set to 0; verification cleared",
         remediation="Start container and ensure it stays healthy.",
+    )
+    EXECUTOR_TRANSPORT_UNREACHABLE = MessageTemplate(
+        event="Executor unreachable over SSH",
+        reason="EXECUTOR_TRANSPORT_UNREACHABLE",
+        severity="warning",
+        category="transport",
+        impact="No verdict for this cycle - pod state unknown",
+        remediation=(
+            "Transient SSH transport failure (network blip, conntrack flush). "
+            "Persistent unreachability is handled by the stale-executor sweep."
+        ),
     )
     GPU_OUTSIDE_TENANT = MessageTemplate(
         event="Tenant container does not own GPU",
