@@ -1,17 +1,18 @@
 import json
 import shlex
-from typing import Iterable
-from dataclasses import replace
+from collections.abc import Iterable
+
+import asyncssh
+from core.docker_utils import DockerCommand
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
-from core.docker_utils import DockerCommand
-from ..messages import TenantEnforcementMessages as Msg, render_message
-from ..pipeline import CheckResult, Context
 from ...const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
-    MIN_PORT_COUNT,
 )
+from ..messages import TenantEnforcementMessages as Msg
+from ..messages import render_message
+from ..pipeline import CheckResult, Context
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
@@ -130,7 +131,30 @@ class TenantEnforcementCheck:
         for pod in rented_pods:
             pod_container_name = pod.container_name
             pod_id = pod.pod_id
-            pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_container_name)
+            try:
+                pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, pod_container_name)
+            except (asyncssh.Error, OSError) as exc:
+                # SSH transport died mid-cycle. Pod state is unknown; do NOT set
+                # clear_verified_job_*: that path triggers immediate executor flip
+                # in compute-app and would punish honest miners for a network blip.
+                # Persistent unreachability is handled by the stale-executor sweep.
+                event = render_message(
+                    Msg.EXECUTOR_TRANSPORT_UNREACHABLE,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "pod_id": pod_id,
+                        "container_name": pod_container_name,
+                        "executor_uuid": ctx.executor.uuid,
+                        "transport_error": repr(exc),
+                    },
+                    extra=extra,
+                )
+                return CheckResult(
+                    passed=False,
+                    event=event,
+                    updates={"default_extra": extra},
+                )
             if not pod_running:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
                 event = render_message(
@@ -220,9 +244,14 @@ class TenantEnforcementCheck:
 
 
 async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, list[str]]:
+    # asyncssh.Error / OSError mean the SSH session itself is dead -> caller must
+    # treat this as "pod state unknown", not "pod down". Other exceptions are
+    # genuine docker / business failures and keep the legacy fall-through.
     try:
         ps_result = await ssh_client.run(DockerCommand.ps_running(container_name))
         pod_running = bool(ps_result.stdout.strip())
+    except (asyncssh.Error, OSError):
+        raise
     except Exception:
         pod_running = False
 
@@ -231,6 +260,8 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
             DockerCommand.exec_command(container_name, 'cat ~/.ssh/authorized_keys')
         )
         ssh_keys = keys_result.stdout.strip().split("\n") if keys_result.stdout else []
+    except (asyncssh.Error, OSError):
+        raise
     except Exception:
         ssh_keys = []
 

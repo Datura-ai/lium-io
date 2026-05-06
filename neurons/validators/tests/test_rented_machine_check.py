@@ -1,18 +1,17 @@
 import json
-
-import pytest
 from unittest.mock import Mock
 
+import asyncssh
+import pytest
+from helpers import build_context_config, build_services, build_state
 from neurons.validators.src.services.task.checks.rented_machine import (
     TenantEnforcementCheck,
     _collect_host_context,
     _collect_pod_diagnostics,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse, RentedExecutor, RentedPod
-
-from helpers import build_context_config, build_services, build_state
 
 
 class MockContainerCleanup:
@@ -98,21 +97,33 @@ def build_rented_data(
 class DummySSHClient:
     """Mock SSH client for pod health and SSH keys checks."""
 
-    def __init__(self, *, pod_running: bool = True, ssh_keys: list[str] | None = None, should_raise: bool = False):
+    def __init__(
+        self,
+        *,
+        pod_running: bool = True,
+        ssh_keys: list[str] | None = None,
+        should_raise: bool = False,
+        raise_on_run: BaseException | None = None,
+    ):
         """
         Args:
             pod_running: Whether the container is running
             ssh_keys: SSH keys to return from authorized_keys
-            should_raise: Whether to raise an exception
+            should_raise: Whether to raise a generic RuntimeError
+            raise_on_run: Specific exception to raise on every .run() call
         """
         self.pod_running = pod_running
         self.ssh_keys = ssh_keys or []
         self.should_raise = should_raise
+        self.raise_on_run = raise_on_run
         self.commands_called: list[str] = []
 
     async def run(self, command: str):
         """Mock SSH run command."""
         self.commands_called.append(command)
+
+        if self.raise_on_run is not None:
+            raise self.raise_on_run
 
         if self.should_raise:
             raise RuntimeError("SSH command failed")
@@ -513,3 +524,95 @@ async def test_collect_host_context_never_raises_on_ssh_failure():
 
     assert "host_boot_error" in host_context
     assert "ssh failed" in host_context["host_boot_error"]
+
+
+@pytest.mark.parametrize(
+    "transport_exc",
+    [
+        pytest.param(asyncssh.ConnectionLost("conntrack flush"), id="connection_lost"),
+        pytest.param(asyncssh.DisconnectError(11, "network", "en"), id="disconnect_error"),
+        pytest.param(OSError("socket closed"), id="os_error"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tenant_enforcement_emits_transport_unreachable_on_ssh_failure(
+    transport_exc, context_factory
+):
+    """DAH-2055: SSH transport failure mid-cycle must NOT trigger immediate
+    executor flip. Validator emits EXECUTOR_TRANSPORT_UNREACHABLE without any
+    clear_verified_job_* in updates so compute-app's reset_verified_job is bypassed."""
+    executor_uuid = "executor-123"
+    rented_machine = {
+        "containers": [{"name": "tenant-123", "pod_id": "pod-1"}],
+        "owner_flag": False,
+    }
+    rented_data = build_rented_data(executor_uuid, rented_machine)
+
+    ssh_client = DummySSHClient(raise_on_run=transport_exc)
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+    )
+    state = build_state(
+        gpu_processes=[],
+        gpu_details=[],
+        gpu_model="NVIDIA RTX 4090",
+        rented_data=rented_data,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=ssh_client,
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert "clear_verified_job_info" not in result.updates
+    assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_keeps_pod_not_running_for_non_transport_errors(context_factory):
+    """Regression guard: a non-transport exception (e.g. RuntimeError from a
+    misbehaving docker daemon) must keep its legacy POD_NOT_RUNNING classification
+    and continue to set clear_verified_job_reason."""
+    executor_uuid = "executor-123"
+    rented_machine = {
+        "containers": [{"name": "tenant-123", "pod_id": "pod-1"}],
+        "owner_flag": False,
+    }
+    rented_data = build_rented_data(executor_uuid, rented_machine)
+
+    ssh_client = DummySSHClient(should_raise=True)  # raises RuntimeError
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+    )
+    state = build_state(
+        gpu_processes=[],
+        gpu_details=[],
+        gpu_model="NVIDIA RTX 4090",
+        rented_data=rented_data,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=ssh_client,
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert result.updates.get("clear_verified_job_info") is True
+    assert result.updates.get("clear_verified_job_reason") == ResetVerifiedJobReason.POD_NOT_RUNNING.value
