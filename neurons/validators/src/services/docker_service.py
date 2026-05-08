@@ -70,7 +70,7 @@ DOCKER_VOLUME_PLUGINS = {
 # DAH-1991: tolerate concurrent health_check_* / container_* on the executor.
 # Probe TTL is short (~30s); same-command retry within a 90s budget covers the
 # documented race without regenerating port mappings.
-_PORT_ALLOCATED_PHRASE = "port is already allocated"
+_PORT_ALLOCATED_PHRASES = ("port is already allocated", "address already in use", "failed to bind host port")
 _PORT_ALLOCATED_RETRY_BUDGET_SEC = 90
 _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
 
@@ -133,10 +133,8 @@ class DockerService:
                 )
                 return
             except Exception as e:
-                if (
-                    _PORT_ALLOCATED_PHRASE not in str(e)
-                    or time.monotonic() >= deadline
-                ):
+                matched_phrase = next((p for p in _PORT_ALLOCATED_PHRASES if p in str(e)), None)
+                if matched_phrase is None or time.monotonic() >= deadline:
                     raise
                 attempt += 1
                 logger.info(
@@ -147,6 +145,7 @@ class DockerService:
                             "attempt": attempt,
                             "remaining_sec": int(deadline - time.monotonic()),
                             "sleep_seconds": _PORT_ALLOCATED_RETRY_SLEEP_SEC,
+                            "matched_phrase": matched_phrase,
                         }),
                     )
                 )
