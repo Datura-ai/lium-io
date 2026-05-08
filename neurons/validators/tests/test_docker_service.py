@@ -1221,6 +1221,47 @@ async def test_create_container_retries_on_port_allocated_then_succeeds(
     assert sleep_calls == [5]
 
 
+# DAH-2065: kernel bind(2) EADDRINUSE — same retry path as port-allocated.
+_EADDRINUSE_ERR = (
+    "docker: Error response from daemon: failed to bind host port "
+    "0.0.0.0:9030/tcp: address already in use"
+)
+
+
+@pytest.mark.asyncio
+async def test_create_container_retries_on_eaddrinuse_then_succeeds(
+    docker_service, monkeypatch,
+):
+    """DAH-2065: kernel-level bind(2) EADDRINUSE takes the same retry path."""
+    calls = {"n": 0}
+
+    async def fake_execute(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise Exception(_EADDRINUSE_ERR)
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", fake_execute)
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout="", stderr=""))
+
+    await docker_service._run_docker_create_with_port_retry(
+        ssh_client=ssh_client,
+        command="/usr/bin/docker run -d -p 9030:9030 --name pod_test img",
+        container_name="pod_test",
+        log_tag="t",
+        default_extra={},
+        timeout=120,
+    )
+
+    assert calls["n"] == 2
+
+
 @pytest.mark.asyncio
 async def test_create_container_exhausts_retry_budget(docker_service, monkeypatch):
     """When port-allocated keeps firing past the 90s budget, the error propagates."""
