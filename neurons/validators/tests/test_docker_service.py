@@ -415,6 +415,53 @@ async def test_pod_mapping_reuse(docker_service, test_executor_id, test_miner_ho
 
 
 @pytest.mark.asyncio
+async def test_pod_mapping_reuse_no_duplicate_external_port(docker_service, test_executor_id, test_miner_hotkey):
+    """DAH-2068: new user-defined port must not steal an external_port already reused from pod_mapping.
+
+    Reproduces the production failure where edit_pod=true and a new container port
+    (e.g. 8091) was not in pod_mapping.  Before the fix, random.choice(available_ports)
+    could return an external_port that was also reused by a pod_mapping entry, producing
+    two mappings with the same internal_port and a Docker "port is already allocated" error.
+    """
+    pod_id = uuid4()
+
+    # Existing pod has ssh→40040 and data ports 40001-40009 already mapped.
+    pod_mapping_raw = [
+        PayloadPortMapping(internal_port=40040, external_port=40040, docker_port=22),
+        *[
+            PayloadPortMapping(internal_port=p, external_port=p, docker_port=p)
+            for p in range(40001, 40010)
+        ],
+    ]
+
+    # Backend returns the pod's own external ports as available (excluded from busy_set).
+    available_ports_raw = [
+        PayloadPortMapping(internal_port=p, external_port=p, docker_port=None)
+        for p in range(40001, 40041)  # 40001-40040
+    ]
+
+    # User edits the pod and adds container port 8091 (new, not in old mapping).
+    requested_ports = [22, 8091, *range(40001, 40010)]
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, pod_id, requested_ports,
+        available_ports_raw=available_ports_raw, pod_mapping_raw=pod_mapping_raw
+    )
+
+    assert result, "expected non-empty port mappings"
+
+    # No two mappings may share the same external_port (index 2 of each tuple).
+    external_ports = [m[2] for m in result]
+    assert len(external_ports) == len(set(external_ports)), (
+        f"duplicate external_ports in mappings: {result}"
+    )
+
+    # SSH must keep its original external_port.
+    ssh_mapping = next((m for m in result if m[0] == 22), None)
+    assert ssh_mapping is not None
+    assert ssh_mapping[2] == 40040
+
+
+@pytest.mark.asyncio
 async def test_min_port_count_validation(docker_service, test_executor_id, test_miner_hotkey, monkeypatch):
     """Test that generate_portMappings returns empty when MIN_PORT_COUNT is not met."""
     # Set MIN_PORT_COUNT to 3
