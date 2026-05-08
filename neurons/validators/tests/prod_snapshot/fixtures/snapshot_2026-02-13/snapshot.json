@@ -129,7 +129,9 @@
       "216.81.245.228:8001": 20160,
       "213.184.224.88:9003": 20160,
       "213.184.224.88:9001": 20160,
-      "213.184.224.88:9002": 20160
+      "213.184.224.88:9002": 20160,
+      "192.0.2.1:8001": 20160,
+      "192.0.2.2:8001": 20160
     }
   },
   "miners": [
@@ -1378,6 +1380,40 @@
         "log_status": "success",
         "log_text": "OK"
       }
+    ],
+    "5DAH2058SpotTier00000000000000000000000000000000": [
+      {
+        "executor_id": "dad2058a-0000-0000-0000-000000000001",
+        "address": "192.0.2.1",
+        "port": 8001,
+        "score": 1.0,
+        "job_score": 1.0,
+        "gpu_model": "NVIDIA GeForce RTX 5090",
+        "gpu_count": 2,
+        "collateral_deposited": true,
+        "sysbox_runtime": true,
+        "is_rented": false,
+        "is_spot": true,
+        "job_batch_id": "2026-02-13 11:57:48",
+        "log_status": "success",
+        "log_text": "OK"
+      },
+      {
+        "executor_id": "dad2058a-0000-0000-0000-000000000002",
+        "address": "192.0.2.2",
+        "port": 8001,
+        "score": 1.0,
+        "job_score": 1.0,
+        "gpu_model": "NVIDIA GeForce RTX 5090",
+        "gpu_count": 2,
+        "collateral_deposited": true,
+        "sysbox_runtime": true,
+        "is_rented": true,
+        "is_spot": true,
+        "job_batch_id": "2026-02-13 11:57:48",
+        "log_status": "success",
+        "log_text": "OK"
+      }
     ]
   },
   "expected_output_default": {
@@ -1453,37 +1489,40 @@
       "f411c030-eb3e-4e11-bc82-eb2c1b228374": 0.009548778614110921,
       "fa0e0f18-d72b-4cdf-88d3-dadb5c69f52b": 0.00044677009286794487,
       "d5de2dcd-c051-483c-9ec7-1073ef3fa7b7": 0.00044677009286794487,
-      "907af9bf-9aa0-4767-8393-1de9f1d176f2": 0.00044677009286794487
+      "907af9bf-9aa0-4767-8393-1de9f1d176f2": 0.00044677009286794487,
+      "dad2058a-0000-0000-0000-000000000001": 0.0019016857736283215,
+      "dad2058a-0000-0000-0000-000000000002": 0.0019016857736283215
     },
-    "total_mining_score": 0.7921244411645184,
+    "total_mining_score": 0.7959278127117752,
     "miner_incentives": {
-      "5G4MNptjsxfj8XGpgCZ8Jt6yBhzbo8qmNdUCWFQ6zUVf25zJ": 0.0004321334142270253,
-      "5CCwGES74ZGuyNey5mdLMZYCvGpMPi8Haz8744EyonfNWgZp": 0.006525080064002277,
-      "5G1EwkW88XLkAkE8YTmYuXncuph8uLGuGXk9A1fSiXExwhL6": 0.0002986753460190767,
-      "5Hiwc4kPcBvkmbkEtAKK8EgevWMGU8VVT73EG2KsvGVSNW4g": 0.00866396278888926,
-      "5HbCthcf52ZJSKmFsY1ZhbjRPARRvKLrcPbmSJRk5gBKSFf2": 0.002261322284577986,
-      "5HHVMkkoL5d4rRb7dL8eNXmSqD6cxqA5isLH1WMPiFDPGgXA": 0.0006834467094031301,
-      "5CzG7GN8bas2rcJNrqRtAZKJ5u2ad3wQjRwguoRB2KyamTfA": 5.076135297504833e-05,
-      "5GEt8xmrb4ubrsD3PizXK7aUv9XDvFZgpPLuwC85i1JXj3A8": 8.642668284540506e-05,
+      "5G4MNptjsxfj8XGpgCZ8Jt6yBhzbo8qmNdUCWFQ6zUVf25zJ": 0.00043006844815090563,
+      "5CCwGES74ZGuyNey5mdLMZYCvGpMPi8Haz8744EyonfNWgZp": 0.006493899718922433,
+      "5G1EwkW88XLkAkE8YTmYuXncuph8uLGuGXk9A1fSiXExwhL6": 0.00029724811443503936,
+      "5Hiwc4kPcBvkmbkEtAKK8EgevWMGU8VVT73EG2KsvGVSNW4g": 0.008622561710761985,
+      "5HbCthcf52ZJSKmFsY1ZhbjRPARRvKLrcPbmSJRk5gBKSFf2": 0.0022505164694035687,
+      "5HHVMkkoL5d4rRb7dL8eNXmSqD6cxqA5isLH1WMPiFDPGgXA": 0.0006801808331174983,
+      "5CzG7GN8bas2rcJNrqRtAZKJ5u2ad3wQjRwguoRB2KyamTfA": 5.051878790504811e-05,
+      "5GEt8xmrb4ubrsD3PizXK7aUv9XDvFZgpPLuwC85i1JXj3A8": 8.601368963018112e-05,
       "5GFEyhb4hExZeuvmg3MGRF78t5o1ReJh4ammxSFGSPEGnLGn": 0.0,
-      "5HYKyVUb6dprbN7NzfhgXRpB9Wgm7Vc7GZhQTYoVivVhVCKD": 9.012306406199158e-05,
-      "5E9dhZ8zGkaQcTg4R3k2yE9XmccUpmGbWAseV7epKVwoYmvP": 0.0002842635766602706,
+      "5HYKyVUb6dprbN7NzfhgXRpB9Wgm7Vc7GZhQTYoVivVhVCKD": 8.969240754750553e-05,
+      "5E9dhZ8zGkaQcTg4R3k2yE9XmccUpmGbWAseV7epKVwoYmvP": 0.00028290521226826944,
       "5EkHKUDk3ZKZViHfzXZ3TgPj7j9mw1zutEXeaptqYxA4RsPW": 0.0,
-      "5DhzqmmkD99d8MFbEEFgtQYSUWyYHRLNJKpVjYQFn5d6hJsv": 0.006780737585297958,
-      "5ExwvZeo3XRKN1XU3hAc1G2s11g6BCG4BC7y9cga9z2T6ock": 0.00034147000147055997,
-      "5G1YLwQurC794BqNVCyf6V2kULLvSN5UvambjFB5Hkn8Z5Yo": 0.00017766473541266914,
-      "5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS": 0.02599188836666778,
-      "5GnXmo223xKAs1QkEtHrRgC2DHUb5TKAbGfhmHbU2xob5iXN": 0.0005359913893803534,
-      "5CkM4uub6wkipume69CtY38K3YxpygoTRDektH8xUHa6Yxfz": 0.02599188836666778,
-      "5HSmo1xhdZz4Y82KCfj2cJRucaCR15qAQfyKM7uh85Andw8x": 0.0003606097491532926,
-      "5DWu2VKAMd8TbNGFFjtgDxr8zd8SKZAJbaQuZhWSJtvJ5xh3": 0.003390368792648979,
-      "5DiD9W8BB7LPFeXJmodLiDwSkr3yDShfR1MptxCKMAfvmV4t": 0.00012016408541598879,
-      "5CUQK1orC4gBwCwV36AtSvHX4ZDJzqF2ibeWmw69usiG277u": 0.006780737585297958,
-      "5FZ32Hs29mNJ94cAU1J6kRaU7dij3ACqQ6ZqqZ1Hi7Qi6tAX": 0.000152284058925145
+      "5DhzqmmkD99d8MFbEEFgtQYSUWyYHRLNJKpVjYQFn5d6hJsv": 0.00674833557095765,
+      "5ExwvZeo3XRKN1XU3hAc1G2s11g6BCG4BC7y9cga9z2T6ock": 0.0003398382739858651,
+      "5G1YLwQurC794BqNVCyf6V2kULLvSN5UvambjFB5Hkn8Z5Yo": 0.00017681575766766836,
+      "5GRLX6wcARnVVTJEh9eHCry9DkKQPgyAP2Jx97hwpNFEgsSS": 0.025867685132285954,
+      "5GnXmo223xKAs1QkEtHrRgC2DHUb5TKAbGfhmHbU2xob5iXN": 0.0005334301339908749,
+      "5CkM4uub6wkipume69CtY38K3YxpygoTRDektH8xUHa6Yxfz": 0.025867685132285954,
+      "5HSmo1xhdZz4Y82KCfj2cJRucaCR15qAQfyKM7uh85Andw8x": 0.0003588865616509987,
+      "5DWu2VKAMd8TbNGFFjtgDxr8zd8SKZAJbaQuZhWSJtvJ5xh3": 0.003374167785478825,
+      "5DiD9W8BB7LPFeXJmodLiDwSkr3yDShfR1MptxCKMAfvmV4t": 0.00011958987673000737,
+      "5CUQK1orC4gBwCwV36AtSvHX4ZDJzqF2ibeWmw69usiG277u": 0.00674833557095765,
+      "5FZ32Hs29mNJ94cAU1J6kRaU7dij3ACqQ6ZqqZ1Hi7Qi6tAX": 0.00015155636371514433,
+      "5DAH2058SpotTier00000000000000000000000000000000": 0.00043006844815090563
     },
     "metrics": {
-      "total_executors": 72,
-      "successful_executors": 70,
+      "total_executors": 74,
+      "successful_executors": 72,
       "failed_executors": 2
     }
   },
@@ -1560,7 +1599,9 @@
       "f411c030-eb3e-4e11-bc82-eb2c1b228374": 0.009548778614110921,
       "fa0e0f18-d72b-4cdf-88d3-dadb5c69f52b": 0.00044677009286794487,
       "d5de2dcd-c051-483c-9ec7-1073ef3fa7b7": 0.00044677009286794487,
-      "907af9bf-9aa0-4767-8393-1de9f1d176f2": 0.00044677009286794487
+      "907af9bf-9aa0-4767-8393-1de9f1d176f2": 0.00044677009286794487,
+      "dad2058a-0000-0000-0000-000000000001": 0,
+      "dad2058a-0000-0000-0000-000000000002": 0
     },
     "total_mining_score": 0.6742926630318253,
     "miner_incentives": {
@@ -1585,11 +1626,12 @@
       "5DWu2VKAMd8TbNGFFjtgDxr8zd8SKZAJbaQuZhWSJtvJ5xh3": 0.0006063410227598211,
       "5DiD9W8BB7LPFeXJmodLiDwSkr3yDShfR1MptxCKMAfvmV4t": 0.0001411626052405868,
       "5CUQK1orC4gBwCwV36AtSvHX4ZDJzqF2ibeWmw69usiG277u": 0.006691156737314907,
-      "5FZ32Hs29mNJ94cAU1J6kRaU7dij3ACqQ6ZqqZ1Hi7Qi6tAX": 0.0001788955029288991
+      "5FZ32Hs29mNJ94cAU1J6kRaU7dij3ACqQ6ZqqZ1Hi7Qi6tAX": 0.0001788955029288991,
+      "5DAH2058SpotTier00000000000000000000000000000000": 0.0
     },
     "metrics": {
-      "total_executors": 70,
-      "successful_executors": 70,
+      "total_executors": 72,
+      "successful_executors": 72,
       "failed_executors": 0
     }
   }
