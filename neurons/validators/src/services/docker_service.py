@@ -247,6 +247,7 @@ class DockerService:
                         port_mapping = pod_mapping[port]
                         mappings.append((port, port_mapping["internal_port"], port_mapping["external_port"]))
                         reused_count += 1
+                        available_ports.pop(port_mapping["external_port"], None)
                         continue
 
                     if not len(available_ports):
