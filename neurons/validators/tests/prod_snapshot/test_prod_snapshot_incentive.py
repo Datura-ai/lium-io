@@ -44,6 +44,7 @@ CSV_COLUMNS = [
     "collateral_deposited",
     "sysbox_runtime",
     "is_rented",
+    "is_spot",
     # V1 scoring fields
     "mining_score",
     "sysbox_multiplier",
@@ -168,6 +169,7 @@ def _build_job_results(prod_snapshot: dict) -> dict[str, list[JobResult]]:
                 log_text=r["log_text"],
                 supports_gpu_splitting=r.get("supports_gpu_splitting", False),
                 gpu_splitting_min_count=r.get("gpu_splitting_min_count"),
+                is_spot=r.get("is_spot", False),
             )
             job_results[hotkey].append(job_result)
     return job_results
@@ -267,6 +269,7 @@ def _dump_results_csv(
                     "collateral_deposited": r.collateral_deposited,
                     "sysbox_runtime": r.sysbox_runtime,
                     "is_rented": r.is_rented,
+                    "is_spot": r.is_spot,
                     "mining_score": r.mining_score,
                     "sysbox_multiplier": r.sysbox_multiplier,
                     "uptime_multiplier": r.uptime_multiplier,
