@@ -398,7 +398,7 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
     return stats, errors
 
 
-def _verify_speed_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+def _verify_storage_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
     storage_execution = response_data["storage_execution"]
 
     if storage_execution.get("error"):
@@ -426,7 +426,7 @@ def _perform_verification_checks(payload: dict) -> Dict[str, Any]:
 
     network_stats, network_errors = _verify_network_test(challenge_data, response_data)
     memory_stats, memory_errors = _verify_memory_test(challenge_data, response_data)
-    storage_stats, storage_errors = _verify_speed_test(challenge_data, response_data)
+    storage_stats, storage_errors = _verify_storage_test(challenge_data, response_data)
     all_errors = network_errors + memory_errors + storage_errors
 
     # Determine which checks are required
