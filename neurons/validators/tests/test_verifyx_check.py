@@ -289,7 +289,7 @@ async def test_verifyx_failure_without_rented_data_does_not_update_state(context
 @pytest.mark.asyncio
 async def test_verifyx_success_ema_below_threshold_fails_check(context_factory):
     """Verifyx passes but EMA drops below 100 Mbps threshold → check fails with specific reason."""
-    # prev_ema=110, current=0 → new EMA = 0.7*110 = 77 < 100
+    # prev_ema=110, current=0 → new EMA = 0.5*0 + 0.5*110 = 55 < 100
     verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
     services = build_services(verifyx=verifyx_service)
     config = build_context_config(verifyx_enabled=True)
@@ -303,7 +303,7 @@ async def test_verifyx_success_ema_below_threshold_fails_check(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
-    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(77.0)
+    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(55.0)
 
 
 @pytest.mark.asyncio
@@ -343,7 +343,7 @@ async def test_verifyx_success_null_network_bootstraps_ema_to_zero_and_fails(con
 
 @pytest.mark.asyncio
 async def test_verifyx_success_null_network_decays_prev_ema(context_factory):
-    """Verifyx passes but network failed → EMA decays: compute_ema(prev, 0.0) = 0.7 × prev."""
+    """Verifyx passes but network failed → EMA decays: compute_ema(prev, 0.0) = 0.5 × prev."""
     verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
     services = build_services(verifyx=verifyx_service)
     config = build_context_config(verifyx_enabled=True)
@@ -357,10 +357,10 @@ async def test_verifyx_success_null_network_decays_prev_ema(context_factory):
 
     assert result.passed is True
     net = result.updates["state"].specs["network"]
-    # compute_ema(500.0, 0.0) = 0.7 * 500 = 350.0
-    assert net["ema_verifyx_download_speed"] == pytest.approx(350.0)
-    # compute_ema(100.0, 0.0) = 0.7 * 100 = 70.0
-    assert net["ema_verifyx_upload_speed"] == pytest.approx(70.0)
+    # compute_ema(500.0, 0.0) = 0.5 * 500 = 250.0
+    assert net["ema_verifyx_download_speed"] == pytest.approx(250.0)
+    # compute_ema(100.0, 0.0) = 0.5 * 100 = 50.0
+    assert net["ema_verifyx_upload_speed"] == pytest.approx(50.0)
     # raw speed keys must NOT be set when there was no measurement
     assert "verifyx_download_speed" not in net
     assert "verifyx_upload_speed" not in net
@@ -369,7 +369,7 @@ async def test_verifyx_success_null_network_decays_prev_ema(context_factory):
 @pytest.mark.asyncio
 async def test_verifyx_success_null_network_repeated_decays_below_threshold(context_factory):
     """5 consecutive verifyx-pass / network-fail cycles from 500 Mbps → EMA below 100 Mbps."""
-    # 500 * 0.7^5 ≈ 84.0 < 100 Mbps
+    # 500 * 0.5^5 = 15.625 < 100 Mbps
     ema = 500.0
     for _ in range(5):
         verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
