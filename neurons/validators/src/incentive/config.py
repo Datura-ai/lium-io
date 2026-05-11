@@ -34,7 +34,7 @@ DEFAULT_PRICE = DefaultPrice()
 # Families migrated to per-count caps use `{1: 1, 8: 8}` — one single-GPU budget
 # and one full-chassis (8×) budget, matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
-    "B300": {},
+    "B300": {1: 1},
     "B200": {1: 4, 8: 8},
     "H200": {1: 4, 8: 16},
     "H100": {1: 4, 8: 16},
