@@ -1099,8 +1099,8 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
         gpu_uuids=["GPU-test"],
         cpu_count=1,
         memory_gb=1,
-        volume_limit_gb=2,
-        storage_limit_gb=1,
+        volume_limit_gb=1024,
+        storage_limit_gb=3985,
         available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
         pod_mapping=[],
         active_container_names=[],
@@ -1130,6 +1130,12 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
     assert docker_service.clean_stale_vloopback_volumes.await_args.kwargs[
         "skip_volume_names"
     ] == set()
+    # DAH-2082: backend overflow goes into Docker overlay quota, not the mounted path.
+    docker_service.create_local_volume.assert_awaited_once()
+    assert docker_service.create_local_volume.await_args.kwargs["limit"] == 1024
+    docker_run_command = docker_service._run_docker_create_with_port_retry.await_args.kwargs["command"]
+    assert f"-v volume_{payload.pod_id}:/root" in docker_run_command
+    assert "--storage-opt size=3985g" in docker_run_command
 
 
 @pytest.mark.asyncio
@@ -1209,6 +1215,53 @@ def test_build_docker_login_command_quotes_username_too():
 
     # Assert — the entire username appears as one token after --username.
     assert tokens[6] == malicious_username
+
+
+def test_local_volume_timeout_stays_default_for_small_or_unlimited_volumes():
+    assert DockerService._get_local_volume_create_timeout(None, 10) == 10
+    assert DockerService._get_local_volume_create_timeout(100, 10) == 10
+
+
+def test_local_volume_timeout_scales_for_large_limited_volumes():
+    assert DockerService._get_local_volume_create_timeout(1024, 10) == 133
+    assert DockerService._get_local_volume_create_timeout(5064, 10) == 180
+
+
+def test_local_volume_timeout_preserves_larger_explicit_timeout():
+    assert DockerService._get_local_volume_create_timeout(1024, 160) == 160
+    assert DockerService._get_local_volume_create_timeout(1024, 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
+    execute = AsyncMock()
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", execute)
+
+    await docker_service.create_local_volume(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        log_tag="tag",
+        log_text="Creating docker volume volume_test",
+        log_extra={},
+        limit=1024,
+        timeout=10,
+    )
+
+    execute.assert_awaited_once()
+    assert execute.await_args.kwargs["timeout"] == 133
+    assert execute.await_args.kwargs["log_extra"] == {
+        "local_volume": "volume_test",
+        "volume_limit_gb": 1024,
+        "requested_timeout_seconds": 10,
+        "effective_timeout_seconds": 133,
+        "timeout_scaled": True,
+        "loopback_plugin": "vloopback",
+    }
 
 
 # ---------------------------------------------------------------------------

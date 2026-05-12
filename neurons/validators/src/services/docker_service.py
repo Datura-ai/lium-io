@@ -73,6 +73,10 @@ DOCKER_VOLUME_PLUGINS = {
 _PORT_ALLOCATED_PHRASES = ("port is already allocated", "address already in use", "failed to bind host port")
 _PORT_ALLOCATED_RETRY_BUDGET_SEC = 90
 _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
+_LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
+_LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
+_LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
+_LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 
 
 class DockerService:
@@ -350,7 +354,8 @@ class DockerService:
                 log_text,
                 extra=get_extra_info({
                     **log_extra,
-                    "command": command
+                    "command": command,
+                    "timeout_seconds": timeout,
                 }),
             ),
         )
@@ -369,6 +374,17 @@ class DockerService:
             status = False
             error = "Process timed out"
             await self.stream_log(error, "error", log_tag)
+            logger.warning(
+                _m(
+                    "Docker command timed out",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "command": command,
+                        "timeout_seconds": timeout,
+                        "log_text": log_text,
+                    }),
+                )
+            )
 
         if not status and raise_exception:
             raise Exception(f"Failed {log_text}. command: {command} error: {error}")
@@ -1022,13 +1038,26 @@ class DockerService:
             "Connection refused", "Port already in use", "Failed to start"
         ]):
             raise Exception(error)
-    
+
     async def get_docker_root_dir(self, ssh_client: asyncssh.SSHClientConnection):
         """Get Docker storage info using docker info command"""
         command = f"/usr/bin/docker info --format '{{{{.DockerRootDir}}}}'"
         result = await ssh_client.run(command)
         return result.stdout.strip()
-    
+
+    @staticmethod
+    def _get_local_volume_create_timeout(limit: int | None, requested_timeout: int) -> int:
+        if requested_timeout == 0:
+            return requested_timeout
+        if not limit or limit <= _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB:
+            return requested_timeout
+
+        scaled_timeout = _LOCAL_VOLUME_TIMEOUT_BASE_SEC + (
+            (limit + _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC - 1)
+            // _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC
+        )
+        return max(requested_timeout, min(scaled_timeout, _LOCAL_VOLUME_TIMEOUT_MAX_SEC))
+
     async def create_local_volume(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -1039,26 +1068,44 @@ class DockerService:
         limit: int | None = None,
         timeout: int = 10,
     ):
+        requested_timeout = timeout
         if limit:
             # install loopback plugin
             loopback_plugin_name = "vloopback"
 
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
             logger.info(_m(f"Docker data root: {docker_root_dir}", extra=get_extra_info(log_extra)))
-            
+
             command = f'/usr/bin/docker plugin install ashald/docker-volume-loopback --alias {loopback_plugin_name} --grant-all-permissions DATA_DIR="{docker_root_dir}/loopback"'
             await ssh_client.run(command)
-            
+
             command = f'/usr/bin/docker volume create -d {loopback_plugin_name} {local_volume} -o size={limit}g'
         else:
+            loopback_plugin_name = None
             command = f"/usr/bin/docker volume create {local_volume}"
 
+        timeout = self._get_local_volume_create_timeout(limit, timeout)
+        volume_log_extra = {
+            **log_extra,
+            "local_volume": local_volume,
+            "volume_limit_gb": limit,
+            "requested_timeout_seconds": requested_timeout,
+            "effective_timeout_seconds": timeout,
+            "timeout_scaled": timeout != requested_timeout,
+            "loopback_plugin": loopback_plugin_name,
+        }
+        logger.info(
+            _m(
+                "Preparing local Docker volume creation",
+                extra=get_extra_info(volume_log_extra),
+            )
+        )
         await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
             log_tag=log_tag,
             log_text=log_text,
-            log_extra=log_extra,
+            log_extra=volume_log_extra,
             timeout=timeout,
         )
 
