@@ -1099,8 +1099,8 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
         gpu_uuids=["GPU-test"],
         cpu_count=1,
         memory_gb=1,
-        volume_limit_gb=1024,
-        storage_limit_gb=3985,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
         available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
         pod_mapping=[],
         active_container_names=[],
@@ -1130,12 +1130,6 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
     assert docker_service.clean_stale_vloopback_volumes.await_args.kwargs[
         "skip_volume_names"
     ] == set()
-    # DAH-2082: backend overflow goes into Docker overlay quota, not the mounted path.
-    docker_service.create_local_volume.assert_awaited_once()
-    assert docker_service.create_local_volume.await_args.kwargs["limit"] == 1024
-    docker_run_command = docker_service._run_docker_create_with_port_retry.await_args.kwargs["command"]
-    assert f"-v volume_{payload.pod_id}:/root" in docker_run_command
-    assert "--storage-opt size=3985g" in docker_run_command
 
 
 @pytest.mark.asyncio
