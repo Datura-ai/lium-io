@@ -5,6 +5,7 @@ supporting both the old burner selection algorithm and the new equal distributio
 """
 
 import random
+from collections import Counter
 
 import bittensor
 
@@ -80,47 +81,57 @@ class BurnService:
         miners: list[bittensor.NeuronInfo],
         burn_share: float,
     ) -> dict[str, float]:
-        """Calculate burn scores using new logic (equal distribution).
+        """Calculate burn scores using new logic (slot-weighted distribution).
 
-        All burners in NEW_BURNERS receive equal share of burn_share.
+        Burners in NEW_BURNERS share burn_share by slot count. A UID listed
+        multiple times receives a proportionally larger share — this lets a
+        single UID absorb the emission of retired burners.
 
         Args:
             miners: List of all miner neuron information
             burn_share: Dynamic burn emission share to distribute
 
         Returns:
-            dict[str, float]: Burner hotkeys to equal burn scores
+            dict[str, float]: Burner hotkeys to weighted burn scores
         """
         burn_scores = {}
-        burners = settings.NEW_BURNERS
-        burn_score_per_burner = burn_share / len(burners)
+        burner_slots = settings.NEW_BURNERS
+        slot_weights = Counter(burner_slots)
+        total_slots = len(burner_slots)
+        burn_score_per_slot = burn_share / total_slots
 
         for miner in miners:
-            if miner.uid in burners:
-                burn_scores[miner.hotkey] = burn_score_per_burner
+            slots = slot_weights.get(miner.uid, 0)
+            if slots == 0:
+                continue
 
-                logger.debug(
-                    _m(
-                        "Miner assigned to burn pool (new logic)",
-                        extra={
-                            "miner_uid": miner.uid,
-                            "miner_hotkey": miner.hotkey,
-                            "burn_share": burn_share,
-                            "num_burners": len(burners),
-                            "score": burn_score_per_burner,
-                            "pool": "burn",
-                            "logic": "new_equal_distribution",
-                        },
-                    )
+            score = burn_score_per_slot * slots
+            burn_scores[miner.hotkey] = score
+
+            logger.debug(
+                _m(
+                    "Miner assigned to burn pool (new logic)",
+                    extra={
+                        "miner_uid": miner.uid,
+                        "miner_hotkey": miner.hotkey,
+                        "burn_share": burn_share,
+                        "total_slots": total_slots,
+                        "miner_slots": slots,
+                        "score": score,
+                        "pool": "burn",
+                        "logic": "new_slot_weighted_distribution",
+                    },
                 )
+            )
 
         logger.info(
             _m(
-                "New burn logic applied - equal distribution",
+                "New burn logic applied - slot-weighted distribution",
                 extra={
-                    "total_burners": len(burners),
-                    "burner_uids": list(burners),
-                    "score_per_burner": burn_score_per_burner,
+                    "total_slots": total_slots,
+                    "unique_burners": len(slot_weights),
+                    "slot_weights": dict(slot_weights),
+                    "score_per_slot": burn_score_per_slot,
                     "burn_share": burn_share,
                 },
             )
