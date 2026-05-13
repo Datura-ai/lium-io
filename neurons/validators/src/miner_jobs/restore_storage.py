@@ -57,8 +57,10 @@ def pull_aws_cli():
     run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"])
 
 
-def docker_base_command(args, volumes=None, entrypoint=None):
+def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
     command = ["/usr/bin/docker", "run", "--rm"]
+    if interactive:
+        command.append("-i")
     for volume in volumes or []:
         command.extend(["-v", volume])
     if entrypoint:
@@ -98,7 +100,12 @@ def aws_restore(args):
         f"s3://{args.backup_volume_name}/{args.backup_source_path}",
         "-",
     ]
-    tar_command = docker_base_command(args, volumes=[f"{args.target_volume}:{args.target_volume_path}"], entrypoint="tar") + [
+    tar_command = docker_base_command(
+        args,
+        volumes=[f"{args.target_volume}:{args.target_volume_path}"],
+        entrypoint="tar",
+        interactive=True,
+    ) + [
         "--xattrs",
         "--acls",
         "-xzpf",
