@@ -26,16 +26,14 @@ def sanitize_report_text(text: str | None) -> str:
         return ""
     # Use one sanitizer for backend payloads and local executor logs so credentials
     # cannot leak and diagnostic text does not block FAILED status updates.
-    text = re.sub(r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)=\S+", r"\1=<redacted>", text)
+    text = re.sub(
+        r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)",
+        r"\1=<redacted>",
+        text,
+    )
     for unsafe_path, replacement in STREAM_PATH_REPLACEMENTS.items():
         text = text.replace(unsafe_path, replacement)
     return text
-
-
-def command_for_log(command: str | list[str]) -> str:
-    if isinstance(command, list):
-        return sanitize_report_text(" ".join(command))
-    return sanitize_report_text(command)
 
 
 def compact_output(label: str, output: str | None, limit: int = 500) -> str:
@@ -71,28 +69,28 @@ def restore_failure_message(
     return message
 
 
-def run_command(command):
+def run_command(command, command_label: str = "command"):
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {command_for_log(command)}")
+        logger.error(f"Command failed: {command_label}")
         raise RuntimeError(
-            f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
+            f"{command_label} failed with exit code {result.returncode}\n"
             f"{compact_output('stderr', result.stderr)}"
         )
     else:
-        logger.info(f"Command succeeded: {command_for_log(command)}")
+        logger.info(f"Command succeeded: {command_label}")
     return result
 
 
-def run_command_args(command: list[str]):
+def run_command_args(command: list[str], command_label: str = "command"):
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {command_for_log(command)}")
+        logger.error(f"Command failed: {command_label}")
         raise RuntimeError(
-            f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
+            f"{command_label} failed with exit code {result.returncode}\n"
             f"{compact_output('stderr', result.stderr)}"
         )
-    logger.info(f"Command succeeded: {command_for_log(command)}")
+    logger.info(f"Command succeeded: {command_label}")
     return result
 
 
@@ -135,7 +133,7 @@ def update_restore_log(
 
 
 def pull_aws_cli():
-    run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"])
+    run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"], command_label="docker pull daturaai/aws-cli")
 
 
 def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
@@ -168,7 +166,7 @@ def aws_head_object(args):
         "--output",
         "json",
     ]
-    run_command_args(command)
+    run_command_args(command, command_label="docker run aws s3api head-object")
 
 
 def aws_restore(args):

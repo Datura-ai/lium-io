@@ -32,16 +32,14 @@ def redact_sensitive_text(text: str | None) -> str:
         return ""
     # Use one sanitizer for backend payloads and local executor logs so credentials
     # cannot leak and diagnostic text does not block FAILED status updates.
-    text = re.sub(r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)=\S+", r"\1=<redacted>", text)
+    text = re.sub(
+        r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s]+)",
+        r"\1=<redacted>",
+        text,
+    )
     for unsafe_path, replacement in STREAM_PATH_REPLACEMENTS.items():
         text = text.replace(unsafe_path, replacement)
     return text
-
-
-def command_for_log(command: str | list[str]) -> str:
-    if isinstance(command, list):
-        return redact_sensitive_text(" ".join(command))
-    return redact_sensitive_text(command)
 
 
 def compact_output(label: str, output: str | None, limit: int = 500) -> str:
@@ -77,71 +75,71 @@ def upload_failure_message(
     return message
 
 
-def run_command(command):
+def run_command(command, command_label: str = "command"):
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {command_for_log(command)}")
+        logger.error(f"Command failed: {command_label}")
         raise RuntimeError(
-            f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
+            f"{command_label} failed with exit code {result.returncode}\n"
             f"{compact_output('stderr', result.stderr)}"
         )
     else:
-        logger.info(f"Command succeeded: {command_for_log(command)}")
+        logger.info(f"Command succeeded: {command_label}")
     return result
 
 
-def run_command_args(command: list[str], input_stream=None, stdout=None):
+def run_command_args(command: list[str], input_stream=None, stdout=None, command_label: str = "command"):
     result = subprocess.run(command, stdin=input_stream, stdout=stdout, capture_output=stdout is None, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {command_for_log(command)}")
+        logger.error(f"Command failed: {command_label}")
         raise RuntimeError(
-            f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
+            f"{command_label} failed with exit code {result.returncode}\n"
             f"{compact_output('stderr', result.stderr)}"
         )
-    logger.info(f"Command succeeded: {command_for_log(command)}")
+    logger.info(f"Command succeeded: {command_label}")
     return result
 
 
 def create_backup_container(args):
     # install docker volume plugin
     command = f"/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias {plugin_name} --grant-all-permissions --disable"
-    run_command(command)
+    run_command(command, command_label="docker plugin install mochoa/s3fs-volume-plugin")
 
     # disable volume plugin and set credential
     command = f"/usr/bin/docker plugin disable {plugin_name} -f"
-    run_command(command)
+    run_command(command, command_label="docker plugin disable s3fs-backup")
     command = f"/usr/bin/docker plugin set {plugin_name} AWSACCESSKEYID={args.backup_volume_iam_user_access_key} AWSSECRETACCESSKEY={args.backup_volume_iam_user_secret_key}"
-    run_command(command)
+    run_command(command, command_label="docker plugin set s3fs-backup credentials")
     command = f'/usr/bin/docker plugin set s3fs-backup DEFAULT_S3FSOPTS="url=https://s3-accelerate.amazonaws.com"'
-    run_command(command)
+    run_command(command, command_label="docker plugin set s3fs-backup options")
     command = f"/usr/bin/docker plugin enable {plugin_name}"
-    run_command(command)
+    run_command(command, command_label="docker plugin enable s3fs-backup")
 
     # clean up all existing volumes and containers for s3 backup 
     # Find and remove all containers whose names start with s3fs-backup
     list_cmd = "/usr/bin/docker ps -a --filter 'name=^/s3fs-backup' --format '{{.Names}}'"
-    result = run_command(list_cmd)
+    result = run_command(list_cmd, command_label="docker ps s3fs-backup containers")
     container_names = [name for name in result.stdout.strip().split('\n') if name]
     if container_names:
         names_str = " ".join(container_names)
         rm_cmd = f"/usr/bin/docker rm -f {names_str}"
-        run_command(rm_cmd)
+        run_command(rm_cmd, command_label="docker rm stale s3fs-backup containers")
 
     # Find and remove all Docker volumes whose names start with "celium-backup-volume"
     list_volumes_cmd = "/usr/bin/docker volume ls --format '{{.Name}}'"
-    result = run_command(list_volumes_cmd)
+    result = run_command(list_volumes_cmd, command_label="docker volume ls")
     volume_names = [name for name in result.stdout.strip().split('\n') if name.startswith("celium-backup-volume")]
     if volume_names:
         names_str = " ".join(volume_names)
         rm_volumes_cmd = f"/usr/bin/docker volume rm {names_str}"
-        run_command(rm_volumes_cmd)
+        run_command(rm_volumes_cmd, command_label="docker volume rm stale backup volumes")
     
     # create volume
     volume_name = args.backup_volume_name
     command = " ".join([
         "/usr/bin/docker", "volume", "create", "-d", plugin_name, volume_name,
     ])
-    run_command(command)
+    run_command(command, command_label="docker volume create s3fs-backup")
 
     # create s3fs backup container
     container_name = f"s3fs-backup-{args.backup_log_id}"
@@ -153,28 +151,31 @@ def create_backup_container(args):
         f"--entrypoint bash "
         f'ubuntu -c "tail -f /dev/null"'
     )
-    run_command(command)
+    run_command(command, command_label="docker run s3fs-backup container")
     return container_name
 
 
 def start_backup(args, container_name):
     # Run cp command inside the container to copy from source_volume_path to /mnt
-    run_command(f"/usr/bin/docker exec {container_name} sh -lc 'mkdir -p /mnt/{args.backup_target_path}'")
+    run_command(
+        f"/usr/bin/docker exec {container_name} sh -lc 'mkdir -p /mnt/{args.backup_target_path}'",
+        command_label="docker exec mkdir backup target",
+    )
     command = f"/usr/bin/docker exec {container_name} sh -lc 'cp -a {args.backup_path} /mnt/{args.backup_target_path}'"
-    run_command(command)
+    run_command(command, command_label="docker exec cp backup path")
 
 
 def clean_backup_container(container_name):
     command = f"/usr/bin/docker rm -f {container_name}"
-    run_command(command)
+    run_command(command, command_label="docker rm backup container")
 
 def clean_backup_volume(volume_name):
     command = f"/usr/bin/docker volume rm {volume_name}"
-    run_command(command)
+    run_command(command, command_label="docker volume rm backup volume")
 
 def disable_backup_volume_plugin():
     command = f"/usr/bin/docker plugin disable {plugin_name} -f"
-    run_command(command)
+    run_command(command, command_label="docker plugin disable s3fs-backup")
 
 
 def update_backup_log(
@@ -229,7 +230,7 @@ def update_backup_log(
 
 
 def pull_aws_cli():
-    run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"])
+    run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"], command_label="docker pull daturaai/aws-cli")
 
 
 def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
@@ -256,14 +257,17 @@ def estimate_backup_sizes(args, backup_path) -> tuple[int, int]:
     # Run du inside Docker with the workload volume mounted; the miner host may not have this path.
     du_command = docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sb", backup_path]
     try:
-        result = run_command_args(du_command)
+        result = run_command_args(du_command, command_label="docker run du -sb <backup_path>")
         source_bytes = int(result.stdout.split()[0])
     except Exception:
-        result = run_command_args(docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sk", backup_path])
+        result = run_command_args(
+            docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sk", backup_path],
+            command_label="docker run du -sk <backup_path>",
+        )
         source_bytes = int(result.stdout.split()[0]) * 1024
 
     find_command = docker_base_command(args, volumes=[source_volume], entrypoint="find") + [backup_path, "-print"]
-    entry_count = count_command_output_lines(find_command)
+    entry_count = count_command_output_lines(find_command, command_label="docker run find <backup_path> -print")
     entry_count = max(entry_count, 1)
 
     # source_bytes is the user-facing estimate. expected_upload_size is only for AWS CLI's
@@ -278,7 +282,7 @@ def estimate_expected_size(args, backup_path):
     return expected_upload_size
 
 
-def count_command_output_lines(command: list[str]) -> int:
+def count_command_output_lines(command: list[str], command_label: str = "command") -> int:
     # Stream line counting instead of materializing potentially huge find output in memory.
     with tempfile.TemporaryFile(mode="w+") as stderr_file:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr_file, text=True)
@@ -294,12 +298,12 @@ def count_command_output_lines(command: list[str]) -> int:
             raise
 
     if status != 0:
-        logger.error(f"Command failed: {command_for_log(command)}")
+        logger.error(f"Command failed: {command_label}")
         raise RuntimeError(
-            f"Command failed with exit code {status}: {command_for_log(command)}\n"
+            f"{command_label} failed with exit code {status}\n"
             f"{compact_output('stderr', stderr)}"
         )
-    logger.info(f"Command succeeded: {command_for_log(command)}")
+    logger.info(f"Command succeeded: {command_label}")
     return count
 
 
@@ -377,7 +381,7 @@ def aws_head_object(args):
         "--output",
         "json",
     ]
-    result = run_command_args(command)
+    result = run_command_args(command, command_label="docker run aws s3api head-object")
     return json.loads(result.stdout)
 
 
