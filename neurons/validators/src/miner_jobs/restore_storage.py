@@ -9,6 +9,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("restore_storage")
 
 plugin_name = "s3fs-restore"
+# These scripts are copied to executor hosts and report status through the public API.
+# Some diagnostic path strings can be rejected before they reach the backend, so
+# normalize stream paths before sending status updates or writing command logs.
 STREAM_PATH_REPLACEMENTS = {
     "/dev/stdout": "stdout",
     "/dev/stderr": "stderr",
@@ -20,33 +23,46 @@ GENERIC_RESTORE_FAILURE_MESSAGE = "Restore failed. Detailed error could not be r
 def sanitize_report_text(text: str | None) -> str:
     if not text:
         return ""
+    # Use one sanitizer for backend payloads and local executor logs so credentials
+    # cannot leak and diagnostic text does not block FAILED status updates.
     text = re.sub(r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)=\S+", r"\1=<redacted>", text)
-    # Sanitize the JSON bodies
     for unsafe_path, replacement in STREAM_PATH_REPLACEMENTS.items():
         text = text.replace(unsafe_path, replacement)
     return text
 
 
+def command_for_log(command: str | list[str]) -> str:
+    if isinstance(command, list):
+        return sanitize_report_text(" ".join(command))
+    return sanitize_report_text(command)
+
+
 def run_command(command):
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {command}")
+        logger.error(f"Command failed: {command_for_log(command)}")
         logger.error(f"stdout: {result.stdout}")
         logger.error(f"stderr: {result.stderr}")
-        raise RuntimeError(f"Command failed with exit code {result.returncode}: {command}\nstderr: {result.stderr}")
+        raise RuntimeError(
+            f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
+            f"stderr: {sanitize_report_text(result.stderr)}"
+        )
     else:
-        logger.info(f"Command succeeded: {command}")
+        logger.info(f"Command succeeded: {command_for_log(command)}")
     return result
 
 
 def run_command_args(command: list[str]):
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {' '.join(command)}")
+        logger.error(f"Command failed: {command_for_log(command)}")
         logger.error(f"stdout: {result.stdout}")
         logger.error(f"stderr: {result.stderr}")
-        raise RuntimeError(f"Command failed with exit code {result.returncode}: {' '.join(command)}\nstderr: {result.stderr}")
-    logger.info(f"Command succeeded: {' '.join(command)}")
+        raise RuntimeError(
+            f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
+            f"stderr: {sanitize_report_text(result.stderr)}"
+        )
+    logger.info(f"Command succeeded: {command_for_log(command)}")
     return result
 
 
@@ -79,6 +95,8 @@ def update_restore_log(
     except requests.HTTPError:
         if status != "FAILED":
             raise
+        # If a future diagnostic string is still rejected by the API edge, preserve
+        # state correctness by marking the job failed with a known-safe message.
         logger.warning("Detailed restore failure update was rejected; retrying with a generic error message")
         fallback_payload = dict(payload)
         fallback_payload["error_message"] = GENERIC_RESTORE_FAILURE_MESSAGE
