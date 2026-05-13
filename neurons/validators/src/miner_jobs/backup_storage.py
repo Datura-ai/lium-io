@@ -16,6 +16,9 @@ plugin_name = "s3fs-backup"
 # behavior and return without a usable object, so keep small backups simple.
 AWS_CLI_EXPECTED_SIZE_THRESHOLD_BYTES = 50 * 1024 * 1024 * 1024
 MAX_ERROR_DETAIL_CHARS = 1200
+# These scripts are copied to executor hosts and report status through the public API.
+# Some diagnostic path strings can be rejected before they reach the backend, so
+# normalize stream paths before sending status updates or writing command logs.
 STREAM_PATH_REPLACEMENTS = {
     "/dev/stdout": "stdout",
     "/dev/stderr": "stderr",
@@ -27,8 +30,9 @@ GENERIC_BACKUP_FAILURE_MESSAGE = "Backup failed. Detailed error could not be rep
 def redact_sensitive_text(text: str | None) -> str:
     if not text:
         return ""
+    # Use one sanitizer for backend payloads and local executor logs so credentials
+    # cannot leak and diagnostic text does not block FAILED status updates.
     text = re.sub(r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)=\S+", r"\1=<redacted>", text)
-    # sanitize the JSON bodies
     for unsafe_path, replacement in STREAM_PATH_REPLACEMENTS.items():
         text = text.replace(unsafe_path, replacement)
     return text
@@ -219,6 +223,8 @@ def update_backup_log(
     except requests.HTTPError:
         if status != "FAILED":
             raise
+        # If a future diagnostic string is still rejected by the API edge, preserve
+        # state correctness by marking the job failed with a known-safe message.
         logger.warning("Detailed backup failure update was rejected; retrying with a generic error message")
         fallback_payload = dict(payload)
         fallback_payload["error_message"] = GENERIC_BACKUP_FAILURE_MESSAGE
