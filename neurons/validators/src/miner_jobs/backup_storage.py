@@ -3,6 +3,7 @@ import subprocess
 import logging
 import json
 import tempfile
+import re
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -14,28 +15,80 @@ plugin_name = "s3fs-backup"
 # large guessed value for small gzip streams can make aws-cli use multipart
 # behavior and return without a usable object, so keep small backups simple.
 AWS_CLI_EXPECTED_SIZE_THRESHOLD_BYTES = 50 * 1024 * 1024 * 1024
+MAX_ERROR_DETAIL_CHARS = 1200
+
+
+def redact_sensitive_text(text: str | None) -> str:
+    if not text:
+        return ""
+    return re.sub(r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)=\S+", r"\1=<redacted>", text)
+
+
+def command_for_log(command: str | list[str]) -> str:
+    if isinstance(command, list):
+        return redact_sensitive_text(" ".join(command))
+    return redact_sensitive_text(command)
+
+
+def compact_output(label: str, output: str | None, limit: int = 500) -> str:
+    output = redact_sensitive_text((output or "").strip())
+    if not output:
+        return ""
+    output = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+    if len(output) > limit:
+        output = f"{output[:limit]}...<truncated>"
+    return f"{label}: {output}"
+
+
+def upload_failure_message(
+    tar_status: int,
+    aws_status: int,
+    tar_stderr: str | None,
+    aws_stdout: str | None,
+    aws_stderr: str | None,
+) -> str:
+    parts = [f"Backup upload failed: tar_status={tar_status}, aws_status={aws_status}"]
+    parts.extend(
+        detail
+        for detail in [
+            compact_output("tar stderr", tar_stderr),
+            compact_output("aws stdout", aws_stdout),
+            compact_output("aws stderr", aws_stderr),
+        ]
+        if detail
+    )
+    message = "; ".join(parts)
+    if len(message) > MAX_ERROR_DETAIL_CHARS:
+        message = f"{message[:MAX_ERROR_DETAIL_CHARS]}...<truncated>"
+    return message
 
 
 def run_command(command):
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {command}")
+        logger.error(f"Command failed: {command_for_log(command)}")
         logger.error(f"stdout: {result.stdout}")
         logger.error(f"stderr: {result.stderr}")
-        raise RuntimeError(f"Command failed with exit code {result.returncode}: {command}\nstderr: {result.stderr}")
+        raise RuntimeError(
+            f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
+            f"{compact_output('stderr', result.stderr)}"
+        )
     else:
-        logger.info(f"Command succeeded: {command}")
+        logger.info(f"Command succeeded: {command_for_log(command)}")
     return result
 
 
 def run_command_args(command: list[str], input_stream=None, stdout=None):
     result = subprocess.run(command, stdin=input_stream, stdout=stdout, capture_output=stdout is None, text=True)
     if result.returncode != 0:
-        logger.error(f"Command failed: {' '.join(command)}")
+        logger.error(f"Command failed: {command_for_log(command)}")
         logger.error(f"stdout: {result.stdout}")
         logger.error(f"stderr: {result.stderr}")
-        raise RuntimeError(f"Command failed with exit code {result.returncode}: {' '.join(command)}\nstderr: {result.stderr}")
-    logger.info(f"Command succeeded: {' '.join(command)}")
+        raise RuntimeError(
+            f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
+            f"{compact_output('stderr', result.stderr)}"
+        )
+    logger.info(f"Command succeeded: {command_for_log(command)}")
     return result
 
 
@@ -212,10 +265,13 @@ def count_command_output_lines(command: list[str]) -> int:
             raise
 
     if status != 0:
-        logger.error(f"Command failed: {' '.join(command)}")
+        logger.error(f"Command failed: {command_for_log(command)}")
         logger.error(f"stderr: {stderr}")
-        raise RuntimeError(f"Command failed with exit code {status}: {' '.join(command)}\nstderr: {stderr}")
-    logger.info(f"Command succeeded: {' '.join(command)}")
+        raise RuntimeError(
+            f"Command failed with exit code {status}: {command_for_log(command)}\n"
+            f"{compact_output('stderr', stderr)}"
+        )
+    logger.info(f"Command succeeded: {command_for_log(command)}")
     return count
 
 
@@ -227,9 +283,6 @@ def aws_cp(args, expected_size: int | None = None):
     backup_path_parent = os.path.dirname(backup_path) or "."
     backup_path_current = os.path.basename(backup_path)
     source_volume = f"{args.source_volume}:{args.source_volume_path}"
-    # Caller normally passes this from estimate_backup_sizes() to avoid running du/find twice.
-    if expected_size is None:
-        expected_size = estimate_expected_size(args, backup_path)
 
     # tar runs inside Docker with the source volume mounted and writes the archive to stdout.
     tar_command = docker_base_command(args, volumes=[source_volume], entrypoint="tar") + [
@@ -282,9 +335,7 @@ def aws_cp(args, expected_size: int | None = None):
         logger.error(f"tar stderr: {tar_stderr}")
         logger.error(f"aws stdout: {aws_stdout}")
         logger.error(f"aws stderr: {aws_stderr}")
-        raise RuntimeError(
-            f"Backup upload failed: tar_status={tar_status}, aws_status={aws_proc.returncode}"
-        )
+        raise RuntimeError(upload_failure_message(tar_status, aws_proc.returncode, tar_stderr, aws_stdout, aws_stderr))
 
     logger.info("Tar-to-S3 streaming backup completed")
 
