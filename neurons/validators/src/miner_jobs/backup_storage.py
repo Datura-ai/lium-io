@@ -205,8 +205,10 @@ def pull_aws_cli():
     run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"])
 
 
-def docker_base_command(args, volumes=None, entrypoint=None):
+def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
     command = ["/usr/bin/docker", "run", "--rm"]
+    if interactive:
+        command.append("-i")
     for volume in volumes or []:
         command.extend(["-v", volume])
     if entrypoint:
@@ -295,7 +297,7 @@ def aws_cp(args, expected_size: int | None = None):
         backup_path_current,
     ]
     # AWS CLI reads stdin and uploads directly to S3; no local archive is created on miner disk.
-    aws_command = docker_base_command(args, entrypoint="aws") + [
+    aws_command = docker_base_command(args, entrypoint="aws", interactive=True) + [
         "s3",
         "cp",
         "-",
