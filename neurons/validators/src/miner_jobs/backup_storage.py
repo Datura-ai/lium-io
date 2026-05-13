@@ -427,7 +427,7 @@ def backup_storage(args):
         logger.info("Step 3: Copying to aws s3...")
         expected_size_arg = (
             expected_upload_size
-            if estimated_size_bytes >= AWS_CLI_EXPECTED_SIZE_THRESHOLD_BYTES
+            if estimated_backup_size_bytes >= AWS_CLI_EXPECTED_SIZE_THRESHOLD_BYTES
             else None
         )
         aws_cp(args, expected_size=expected_size_arg)
