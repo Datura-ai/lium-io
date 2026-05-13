@@ -246,12 +246,17 @@ class DockerService:
                         docker_internal_ports.remove(jupyter_port)
                     docker_internal_ports.insert(1, jupyter_port)
 
+                # Pre-strip every external_port that will be reused so the random.choice
+                # / min branch below cannot pick a port still owned by pod_mapping.
+                for port in docker_internal_ports:
+                    if port in pod_mapping:
+                        available_ports.pop(pod_mapping[port]["external_port"], None)
+
                 for port in docker_internal_ports:
                     if port in pod_mapping:
                         port_mapping = pod_mapping[port]
                         mappings.append((port, port_mapping["internal_port"], port_mapping["external_port"]))
                         reused_count += 1
-                        available_ports.pop(port_mapping["external_port"], None)
                         continue
 
                     if not len(available_ports):
