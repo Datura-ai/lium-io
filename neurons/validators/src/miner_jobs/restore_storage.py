@@ -1,5 +1,7 @@
 import logging
+import os
 import subprocess
+import tempfile
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -14,8 +16,20 @@ def run_command(command):
         logger.error(f"Command failed: {command}")
         logger.error(f"stdout: {result.stdout}")
         logger.error(f"stderr: {result.stderr}")
+        raise RuntimeError(f"Command failed with exit code {result.returncode}: {command}\nstderr: {result.stderr}")
     else:
         logger.info(f"Command succeeded: {command}")
+    return result
+
+
+def run_command_args(command: list[str]):
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"Command failed: {' '.join(command)}")
+        logger.error(f"stdout: {result.stdout}")
+        logger.error(f"stderr: {result.stderr}")
+        raise RuntimeError(f"Command failed with exit code {result.returncode}: {' '.join(command)}\nstderr: {result.stderr}")
+    logger.info(f"Command succeeded: {' '.join(command)}")
     return result
 
 
@@ -40,24 +54,93 @@ def update_restore_log(
 
 
 def pull_aws_cli():
-    run_command("/usr/bin/docker pull daturaai/aws-cli")
+    run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"])
+
+
+def docker_base_command(args, volumes=None, entrypoint=None):
+    command = ["/usr/bin/docker", "run", "--rm"]
+    for volume in volumes or []:
+        command.extend(["-v", volume])
+    if entrypoint:
+        command.extend(["--entrypoint", entrypoint])
+    command.extend(
+        [
+            "-e", f"AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key}",
+            "-e", f"AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key}",
+            "-e", "AWS_DEFAULT_REGION=us-east-1",
+            "daturaai/aws-cli",
+        ]
+    )
+    return command
+
+
+def aws_head_object(args):
+    command = docker_base_command(args, entrypoint="aws") + [
+        "s3api",
+        "head-object",
+        "--bucket",
+        args.backup_volume_name,
+        "--key",
+        args.backup_source_path,
+        "--output",
+        "json",
+    ]
+    run_command_args(command)
 
 
 def aws_restore(args):
     # aws s3 cp s3://$BUCKET_NAME/backups/my-folder-2025-09-02.tar.gz - \
     # | tar -xzpf - -C $RESTORE_PATH
-    command = (
-        "docker run --rm "
-        f"-v {args.target_volume}:{args.target_volume_path} "
-        f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
-        f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
-        f"-e AWS_DEFAULT_REGION=us-east-1 "
-        "--entrypoint sh "
-        "daturaai/aws-cli  -lc "
-        f'"aws s3 cp s3://{args.backup_volume_name}/{args.backup_source_path} - '
-        f'| tar --xattrs --acls -xzpf - -C {args.restore_path} --strip-components=1 "'
-    )
-    run_command(command)
+    restore_path = os.path.expanduser(args.restore_path)
+    aws_command = docker_base_command(args, entrypoint="aws") + [
+        "s3",
+        "cp",
+        f"s3://{args.backup_volume_name}/{args.backup_source_path}",
+        "-",
+    ]
+    tar_command = docker_base_command(args, volumes=[f"{args.target_volume}:{args.target_volume_path}"], entrypoint="tar") + [
+        "--xattrs",
+        "--acls",
+        "-xzpf",
+        "-",
+        "-C",
+        restore_path,
+        "--strip-components=1",
+    ]
+
+    logger.info("Starting S3-to-tar streaming restore")
+    tar_proc = None
+    with tempfile.TemporaryFile() as aws_stderr_file:
+        aws_proc = subprocess.Popen(aws_command, stdout=subprocess.PIPE, stderr=aws_stderr_file)
+        try:
+            # tar reads the S3 object stream directly; no local archive is written.
+            tar_proc = subprocess.Popen(
+                tar_command,
+                stdin=aws_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            aws_proc.stdout.close()
+            tar_stdout, tar_stderr = tar_proc.communicate()
+            aws_status = aws_proc.wait()
+            aws_stderr_file.seek(0)
+            aws_stderr = aws_stderr_file.read().decode(errors="replace")
+        except Exception:
+            aws_proc.kill()
+            if tar_proc:
+                tar_proc.kill()
+            raise
+
+    if aws_status != 0 or tar_proc.returncode != 0:
+        logger.error(f"aws stderr: {aws_stderr}")
+        logger.error(f"tar stdout: {tar_stdout}")
+        logger.error(f"tar stderr: {tar_stderr}")
+        raise RuntimeError(
+            f"Restore failed: aws_status={aws_status}, tar_status={tar_proc.returncode}"
+        )
+
+    logger.info("S3-to-tar streaming restore completed")
 
 
 def restore_storage(args):
@@ -81,7 +164,11 @@ def restore_storage(args):
             args.restore_log_id,
         )
 
-        logger.info("Step 2: Restoring from aws s3...")
+        logger.info("Step 2: Verifying aws s3 object...")
+        aws_head_object(args)
+        logger.info("Aws s3 object verified")
+
+        logger.info("Step 3: Restoring from aws s3...")
         aws_restore(args)
         logger.info("Restore from aws s3 completed")
         progress += 70  # 100

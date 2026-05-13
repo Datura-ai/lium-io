@@ -1,6 +1,8 @@
 import os
 import subprocess
 import logging
+import json
+import tempfile
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
@@ -15,8 +17,20 @@ def run_command(command):
         logger.error(f"Command failed: {command}")
         logger.error(f"stdout: {result.stdout}")
         logger.error(f"stderr: {result.stderr}")
+        raise RuntimeError(f"Command failed with exit code {result.returncode}: {command}\nstderr: {result.stderr}")
     else:
         logger.info(f"Command succeeded: {command}")
+    return result
+
+
+def run_command_args(command: list[str], input_stream=None, stdout=None):
+    result = subprocess.run(command, stdin=input_stream, stdout=stdout, capture_output=stdout is None, text=True)
+    if result.returncode != 0:
+        logger.error(f"Command failed: {' '.join(command)}")
+        logger.error(f"stdout: {result.stdout}")
+        logger.error(f"stderr: {result.stderr}")
+        raise RuntimeError(f"Command failed with exit code {result.returncode}: {' '.join(command)}\nstderr: {result.stderr}")
+    logger.info(f"Command succeeded: {' '.join(command)}")
     return result
 
 
@@ -96,39 +110,194 @@ def disable_backup_volume_plugin():
 
 
 def update_backup_log(
-        api_url: str, status: str, logs: list[str], error_message: str, progress: float, auth_token: str
+        api_url: str,
+        backup_log_id: str,
+        status: str,
+        logs: list[str],
+        error_message: str,
+        progress: float,
+        auth_token: str,
+        s3_metadata: dict | None = None,
+        estimated_backup_size_bytes: int | None = None,
     ):
     import requests
-    url = f"{api_url}/backup-logs/{args.backup_log_id}/progress"
+
+    payload = {"status": status, "logs": logs, "error_message": error_message, "progress": progress}
+    # Size estimate is sent before upload so API/UI can show expected backup size while the job is running.
+    if estimated_backup_size_bytes is not None:
+        payload["estimated_backup_size_bytes"] = estimated_backup_size_bytes
+    if s3_metadata:
+        payload.update(
+            {
+                "s3_content_length": s3_metadata.get("ContentLength"),
+                "s3_last_modified": s3_metadata.get("LastModified"),
+                "s3_etag": s3_metadata.get("ETag"),
+            }
+        )
+
+    url = f"{api_url}/backup-logs/{backup_log_id}/progress"
     response = requests.put(
-        url, json={"status": status, "logs": logs, "error_message": error_message, "progress": progress},
+        url, json=payload,
         headers={"Authorization": f"Bearer {auth_token}"}
     )
     response.raise_for_status()
 
 
 def pull_aws_cli():
-    run_command("/usr/bin/docker pull daturaai/aws-cli")
+    run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"])
 
 
-def aws_cp(args):
-    backup_path = (args.backup_path or '').rstrip('/')
-    backup_path_parent = os.path.dirname(backup_path)
-    backup_path_current = os.path.basename(backup_path)
-
-    command = (
-        "docker run --rm "
-        f"-v {args.source_volume}:{args.source_volume_path} "
-        f"-e AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key} "
-        f"-e AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key} "
-        f"-e AWS_DEFAULT_REGION=us-east-1 "
-        "--entrypoint sh "
-        "daturaai/aws-cli  -lc "
-        f'"tar --xattrs --acls -C {backup_path_parent} -czf - {backup_path_current} '
-        f"| aws s3 cp - s3://{args.backup_volume_name}/{args.backup_target_path} "
-        f'  --sse AES256 --expected-size $(tar -C {backup_path_parent} -cf - {backup_path_current} | wc -c)" '
+def docker_base_command(args, volumes=None, entrypoint=None):
+    command = ["/usr/bin/docker", "run", "--rm"]
+    for volume in volumes or []:
+        command.extend(["-v", volume])
+    if entrypoint:
+        command.extend(["--entrypoint", entrypoint])
+    command.extend(
+        [
+            "-e", f"AWS_ACCESS_KEY_ID={args.backup_volume_iam_user_access_key}",
+            "-e", f"AWS_SECRET_ACCESS_KEY={args.backup_volume_iam_user_secret_key}",
+            "-e", "AWS_DEFAULT_REGION=us-east-1",
+            "daturaai/aws-cli",
+        ]
     )
-    run_command(command)
+    return command
+
+
+def estimate_backup_sizes(args, backup_path) -> tuple[int, int]:
+    source_volume = f"{args.source_volume}:{args.source_volume_path}"
+    # Run du inside Docker with the workload volume mounted; the miner host may not have this path.
+    du_command = docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sb", backup_path]
+    try:
+        result = run_command_args(du_command)
+        source_bytes = int(result.stdout.split()[0])
+    except Exception:
+        result = run_command_args(docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sk", backup_path])
+        source_bytes = int(result.stdout.split()[0]) * 1024
+
+    find_command = docker_base_command(args, volumes=[source_volume], entrypoint="find") + [backup_path, "-print"]
+    entry_count = count_command_output_lines(find_command)
+    entry_count = max(entry_count, 1)
+
+    # source_bytes is the user-facing estimate. expected_upload_size is only for AWS CLI's
+    # streamed multipart upload planner and intentionally has a safety cushion.
+    cushion = max(source_bytes // 20, 100 * 1024 * 1024)
+    expected_upload_size = source_bytes + cushion + entry_count * 4096
+    return source_bytes, expected_upload_size
+
+
+def estimate_expected_size(args, backup_path):
+    _, expected_upload_size = estimate_backup_sizes(args, backup_path)
+    return expected_upload_size
+
+
+def count_command_output_lines(command: list[str]) -> int:
+    # Stream line counting instead of materializing potentially huge find output in memory.
+    with tempfile.TemporaryFile(mode="w+") as stderr_file:
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=stderr_file, text=True)
+        count = 0
+        try:
+            for _ in proc.stdout:
+                count += 1
+            status = proc.wait()
+            stderr_file.seek(0)
+            stderr = stderr_file.read()
+        except Exception:
+            proc.kill()
+            raise
+
+    if status != 0:
+        logger.error(f"Command failed: {' '.join(command)}")
+        logger.error(f"stderr: {stderr}")
+        raise RuntimeError(f"Command failed with exit code {status}: {' '.join(command)}\nstderr: {stderr}")
+    logger.info(f"Command succeeded: {' '.join(command)}")
+    return count
+
+
+def aws_cp(args, expected_size: int | None = None):
+    backup_path = os.path.expanduser((args.backup_path or '').rstrip('/'))
+    if not backup_path:
+        raise ValueError("Backup path is required")
+
+    backup_path_parent = os.path.dirname(backup_path) or "."
+    backup_path_current = os.path.basename(backup_path)
+    source_volume = f"{args.source_volume}:{args.source_volume_path}"
+    # Caller normally passes this from estimate_backup_sizes() to avoid running du/find twice.
+    if expected_size is None:
+        expected_size = estimate_expected_size(args, backup_path)
+
+    # tar runs inside Docker with the source volume mounted and writes the archive to stdout.
+    tar_command = docker_base_command(args, volumes=[source_volume], entrypoint="tar") + [
+        "--xattrs",
+        "--acls",
+        "-C",
+        backup_path_parent,
+        "-czf",
+        "-",
+        backup_path_current,
+    ]
+    # AWS CLI reads stdin and uploads directly to S3; no local archive is created on miner disk.
+    aws_command = docker_base_command(args, entrypoint="aws") + [
+        "s3",
+        "cp",
+        "-",
+        f"s3://{args.backup_volume_name}/{args.backup_target_path}",
+        "--sse",
+        "AES256",
+        "--expected-size",
+        str(expected_size),
+    ]
+
+    logger.info("Starting tar-to-S3 streaming backup")
+    aws_proc = None
+    with tempfile.TemporaryFile() as tar_stderr_file:
+        # Keep tar stderr in a temp file so verbose warnings cannot fill a pipe and deadlock the stream.
+        tar_proc = subprocess.Popen(tar_command, stdout=subprocess.PIPE, stderr=tar_stderr_file)
+        try:
+            # AWS reads tar stdout directly; no archive is written to local disk.
+            aws_proc = subprocess.Popen(
+                aws_command,
+                stdin=tar_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            tar_proc.stdout.close()
+            aws_stdout, aws_stderr = aws_proc.communicate()
+            tar_status = tar_proc.wait()
+            tar_stderr_file.seek(0)
+            tar_stderr = tar_stderr_file.read().decode(errors="replace")
+        except Exception:
+            tar_proc.kill()
+            if aws_proc:
+                aws_proc.kill()
+            raise
+
+    if tar_status != 0 or aws_proc.returncode != 0:
+        logger.error(f"tar stderr: {tar_stderr}")
+        logger.error(f"aws stdout: {aws_stdout}")
+        logger.error(f"aws stderr: {aws_stderr}")
+        raise RuntimeError(
+            f"Backup upload failed: tar_status={tar_status}, aws_status={aws_proc.returncode}"
+        )
+
+    logger.info("Tar-to-S3 streaming backup completed")
+
+
+def aws_head_object(args):
+    # A successful upload alone is not enough; completion requires S3 to acknowledge the object exists.
+    command = docker_base_command(args, entrypoint="aws") + [
+        "s3api",
+        "head-object",
+        "--bucket",
+        args.backup_volume_name,
+        "--key",
+        args.backup_target_path,
+        "--output",
+        "json",
+    ]
+    result = run_command_args(command)
+    return json.loads(result.stdout)
 
 
 def backup_storage(args):
@@ -179,17 +348,58 @@ def backup_storage(args):
         logger.info("Step 1: Pulling aws cli...")
         pull_aws_cli()
         logger.info("Aws cli pulled")
-        progress += 30 # 30
-        update_backup_log(args.api_url, "IN_PROGRESS", ["Info: Aws cli pulled"], "", progress, args.auth_token)
+        progress = 10
+        update_backup_log(args.api_url, args.backup_log_id, "IN_PROGRESS", ["Info: Aws cli pulled"], "", progress, args.auth_token)
 
-        logger.info("Step 2: Copying to aws s3...")
-        aws_cp(args)
+        backup_path = os.path.expanduser((args.backup_path or '').rstrip('/'))
+        if not backup_path:
+            raise ValueError("Backup path is required")
+        logger.info("Step 2: Estimating backup size...")
+        estimated_backup_size_bytes, expected_upload_size = estimate_backup_sizes(args, backup_path)
+        progress = 20
+        update_backup_log(
+            args.api_url,
+            args.backup_log_id,
+            "IN_PROGRESS",
+            ["Info: Backup size estimated"],
+            "",
+            progress,
+            args.auth_token,
+            estimated_backup_size_bytes=estimated_backup_size_bytes,
+        )
+
+        logger.info("Step 3: Copying to aws s3...")
+        aws_cp(args, expected_size=expected_upload_size)
         logger.info("Copying to aws s3 completed")
-        progress += 70 # 100
-        update_backup_log(args.api_url, "COMPLETED", ["Info: Copying to aws s3 completed"], "", progress, args.auth_token)
+        progress = 90
+        update_backup_log(
+            args.api_url,
+            args.backup_log_id,
+            "IN_PROGRESS",
+            ["Info: Copying to aws s3 completed"],
+            "",
+            progress,
+            args.auth_token,
+        )
+
+        logger.info("Step 4: Verifying aws s3 object...")
+        s3_metadata = aws_head_object(args)
+        logger.info("Aws s3 object verified")
+
+        progress = 100
+        update_backup_log(
+            args.api_url,
+            args.backup_log_id,
+            "COMPLETED",
+            ["Info: Aws s3 object verified"],
+            "",
+            progress,
+            args.auth_token,
+            s3_metadata=s3_metadata,
+        )
     except Exception as e:
         logger.error(f"Backup failed: {e}", exc_info=True)
-        update_backup_log(args.api_url, "FAILED", ["Error: Backup failed"], str(e), progress, args.auth_token)
+        update_backup_log(args.api_url, args.backup_log_id, "FAILED", ["Error: Backup failed"], str(e), progress, args.auth_token)
         raise e
 
 
