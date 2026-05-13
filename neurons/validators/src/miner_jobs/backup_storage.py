@@ -81,8 +81,6 @@ def run_command(command):
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"Command failed: {command_for_log(command)}")
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
         raise RuntimeError(
             f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
             f"{compact_output('stderr', result.stderr)}"
@@ -96,8 +94,6 @@ def run_command_args(command: list[str], input_stream=None, stdout=None):
     result = subprocess.run(command, stdin=input_stream, stdout=stdout, capture_output=stdout is None, text=True)
     if result.returncode != 0:
         logger.error(f"Command failed: {command_for_log(command)}")
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
         raise RuntimeError(
             f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
             f"{compact_output('stderr', result.stderr)}"
@@ -299,7 +295,6 @@ def count_command_output_lines(command: list[str]) -> int:
 
     if status != 0:
         logger.error(f"Command failed: {command_for_log(command)}")
-        logger.error(f"stderr: {stderr}")
         raise RuntimeError(
             f"Command failed with exit code {status}: {command_for_log(command)}\n"
             f"{compact_output('stderr', stderr)}"
@@ -365,9 +360,6 @@ def aws_cp(args, expected_size: int | None = None):
             raise
 
     if tar_status != 0 or aws_proc.returncode != 0:
-        logger.error(f"tar stderr: {tar_stderr}")
-        logger.error(f"aws stdout: {aws_stdout}")
-        logger.error(f"aws stderr: {aws_stderr}")
         raise RuntimeError(upload_failure_message(tar_status, aws_proc.returncode, tar_stderr, aws_stdout, aws_stderr))
 
     logger.info("Tar-to-S3 streaming backup completed")

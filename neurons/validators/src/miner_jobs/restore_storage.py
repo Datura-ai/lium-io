@@ -9,6 +9,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("restore_storage")
 
 plugin_name = "s3fs-restore"
+MAX_ERROR_DETAIL_CHARS = 1200
 # These scripts are copied to executor hosts and report status through the public API.
 # Some diagnostic path strings can be rejected before they reach the backend, so
 # normalize stream paths before sending status updates or writing command logs.
@@ -37,15 +38,46 @@ def command_for_log(command: str | list[str]) -> str:
     return sanitize_report_text(command)
 
 
+def compact_output(label: str, output: str | None, limit: int = 500) -> str:
+    output = sanitize_report_text((output or "").strip())
+    if not output:
+        return ""
+    output = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+    if len(output) > limit:
+        output = f"{output[:limit]}...<truncated>"
+    return f"{label}: {output}"
+
+
+def restore_failure_message(
+    aws_status: int,
+    tar_status: int,
+    aws_stderr: str | None,
+    tar_stdout: str | None,
+    tar_stderr: str | None,
+) -> str:
+    parts = [f"Restore failed: aws_status={aws_status}, tar_status={tar_status}"]
+    parts.extend(
+        detail
+        for detail in [
+            compact_output("aws stderr", aws_stderr),
+            compact_output("tar stdout", tar_stdout),
+            compact_output("tar stderr", tar_stderr),
+        ]
+        if detail
+    )
+    message = "; ".join(parts)
+    if len(message) > MAX_ERROR_DETAIL_CHARS:
+        message = f"{message[:MAX_ERROR_DETAIL_CHARS]}...<truncated>"
+    return message
+
+
 def run_command(command):
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"Command failed: {command_for_log(command)}")
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
         raise RuntimeError(
             f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
-            f"stderr: {sanitize_report_text(result.stderr)}"
+            f"{compact_output('stderr', result.stderr)}"
         )
     else:
         logger.info(f"Command succeeded: {command_for_log(command)}")
@@ -56,11 +88,9 @@ def run_command_args(command: list[str]):
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"Command failed: {command_for_log(command)}")
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
         raise RuntimeError(
             f"Command failed with exit code {result.returncode}: {command_for_log(command)}\n"
-            f"stderr: {sanitize_report_text(result.stderr)}"
+            f"{compact_output('stderr', result.stderr)}"
         )
     logger.info(f"Command succeeded: {command_for_log(command)}")
     return result
@@ -191,12 +221,7 @@ def aws_restore(args):
             raise
 
     if aws_status != 0 or tar_proc.returncode != 0:
-        logger.error(f"aws stderr: {aws_stderr}")
-        logger.error(f"tar stdout: {tar_stdout}")
-        logger.error(f"tar stderr: {tar_stderr}")
-        raise RuntimeError(
-            f"Restore failed: aws_status={aws_status}, tar_status={tar_proc.returncode}"
-        )
+        raise RuntimeError(restore_failure_message(aws_status, tar_proc.returncode, aws_stderr, tar_stdout, tar_stderr))
 
     logger.info("S3-to-tar streaming restore completed")
 
