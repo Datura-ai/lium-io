@@ -16,12 +16,22 @@ plugin_name = "s3fs-backup"
 # behavior and return without a usable object, so keep small backups simple.
 AWS_CLI_EXPECTED_SIZE_THRESHOLD_BYTES = 50 * 1024 * 1024 * 1024
 MAX_ERROR_DETAIL_CHARS = 1200
+STREAM_PATH_REPLACEMENTS = {
+    "/dev/stdout": "stdout",
+    "/dev/stderr": "stderr",
+    "/dev/stdin": "stdin",
+}
+GENERIC_BACKUP_FAILURE_MESSAGE = "Backup failed. Detailed error could not be reported; check executor logs."
 
 
 def redact_sensitive_text(text: str | None) -> str:
     if not text:
         return ""
-    return re.sub(r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)=\S+", r"\1=<redacted>", text)
+    text = re.sub(r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)=\S+", r"\1=<redacted>", text)
+    # sanitize the JSON bodies
+    for unsafe_path, replacement in STREAM_PATH_REPLACEMENTS.items():
+        text = text.replace(unsafe_path, replacement)
+    return text
 
 
 def command_for_log(command: str | list[str]) -> str:
@@ -180,7 +190,12 @@ def update_backup_log(
     ):
     import requests
 
-    payload = {"status": status, "logs": logs, "error_message": error_message, "progress": progress}
+    payload = {
+        "status": status,
+        "logs": [redact_sensitive_text(log) for log in logs],
+        "error_message": redact_sensitive_text(error_message),
+        "progress": progress,
+    }
     # Size estimate is sent before upload so API/UI can show expected backup size while the job is running.
     if estimated_backup_size_bytes is not None:
         payload["estimated_backup_size_bytes"] = estimated_backup_size_bytes
@@ -194,11 +209,21 @@ def update_backup_log(
         )
 
     url = f"{api_url}/backup-logs/{backup_log_id}/progress"
+    headers = {"Authorization": f"Bearer {auth_token}"}
     response = requests.put(
         url, json=payload,
-        headers={"Authorization": f"Bearer {auth_token}"}
+        headers=headers,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        if status != "FAILED":
+            raise
+        logger.warning("Detailed backup failure update was rejected; retrying with a generic error message")
+        fallback_payload = dict(payload)
+        fallback_payload["error_message"] = GENERIC_BACKUP_FAILURE_MESSAGE
+        fallback_response = requests.put(url, json=fallback_payload, headers=headers)
+        fallback_response.raise_for_status()
 
 
 def pull_aws_cli():
@@ -462,8 +487,11 @@ def backup_storage(args):
         )
     except Exception as e:
         logger.error(f"Backup failed: {e}", exc_info=True)
-        update_backup_log(args.api_url, args.backup_log_id, "FAILED", ["Error: Backup failed"], str(e), progress, args.auth_token)
-        raise e
+        try:
+            update_backup_log(args.api_url, args.backup_log_id, "FAILED", ["Error: Backup failed"], str(e), progress, args.auth_token)
+        except Exception:
+            logger.error("Failed to update backup log after backup failure", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

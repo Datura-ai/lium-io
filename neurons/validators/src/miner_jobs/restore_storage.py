@@ -2,12 +2,29 @@ import logging
 import os
 import subprocess
 import tempfile
+import re
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("restore_storage")
 
 plugin_name = "s3fs-restore"
+STREAM_PATH_REPLACEMENTS = {
+    "/dev/stdout": "stdout",
+    "/dev/stderr": "stderr",
+    "/dev/stdin": "stdin",
+}
+GENERIC_RESTORE_FAILURE_MESSAGE = "Restore failed. Detailed error could not be reported; check executor logs."
+
+
+def sanitize_report_text(text: str | None) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"(AWS_SECRET_ACCESS_KEY|AWSSECRETACCESSKEY)=\S+", r"\1=<redacted>", text)
+    # Sanitize the JSON bodies
+    for unsafe_path, replacement in STREAM_PATH_REPLACEMENTS.items():
+        text = text.replace(unsafe_path, replacement)
+    return text
 
 
 def run_command(command):
@@ -45,12 +62,28 @@ def update_restore_log(
     import requests
 
     url = f"{api_url}/restore-logs/{restore_log_id}/progress"
+    payload = {
+        "status": status,
+        "logs": [sanitize_report_text(log) for log in logs],
+        "error_message": sanitize_report_text(error_message),
+        "progress": progress,
+    }
+    headers = {"Authorization": f"Bearer {auth_token}"}
     response = requests.put(
         url,
-        json={"status": status, "logs": logs, "error_message": error_message, "progress": progress},
-        headers={"Authorization": f"Bearer {auth_token}"},
+        json=payload,
+        headers=headers,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        if status != "FAILED":
+            raise
+        logger.warning("Detailed restore failure update was rejected; retrying with a generic error message")
+        fallback_payload = dict(payload)
+        fallback_payload["error_message"] = GENERIC_RESTORE_FAILURE_MESSAGE
+        fallback_response = requests.put(url, json=fallback_payload, headers=headers)
+        fallback_response.raise_for_status()
 
 
 def pull_aws_cli():
@@ -190,16 +223,19 @@ def restore_storage(args):
         )
     except Exception as e:
         logger.error(f"Restore failed: {e}", exc_info=True)
-        update_restore_log(
-            args.api_url,
-            "FAILED",
-            ["Error: Restore failed"],
-            str(e),
-            progress,
-            args.auth_token,
-            args.restore_log_id,
-        )
-        raise e
+        try:
+            update_restore_log(
+                args.api_url,
+                "FAILED",
+                ["Error: Restore failed"],
+                str(e),
+                progress,
+                args.auth_token,
+                args.restore_log_id,
+            )
+        except Exception:
+            logger.error("Failed to update restore log after restore failure", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
