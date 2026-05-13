@@ -10,6 +10,11 @@ logger = logging.getLogger("backup_storage")
 
 plugin_name = "s3fs-backup"
 
+# AWS CLI only needs --expected-size for very large stdin uploads. Passing a
+# large guessed value for small gzip streams can make aws-cli use multipart
+# behavior and return without a usable object, so keep small backups simple.
+AWS_CLI_EXPECTED_SIZE_THRESHOLD_BYTES = 50 * 1024 * 1024 * 1024
+
 
 def run_command(command):
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
@@ -244,9 +249,9 @@ def aws_cp(args, expected_size: int | None = None):
         f"s3://{args.backup_volume_name}/{args.backup_target_path}",
         "--sse",
         "AES256",
-        "--expected-size",
-        str(expected_size),
     ]
+    if expected_size is not None:
+        aws_command.extend(["--expected-size", str(expected_size)])
 
     logger.info("Starting tar-to-S3 streaming backup")
     aws_proc = None
@@ -369,7 +374,12 @@ def backup_storage(args):
         )
 
         logger.info("Step 3: Copying to aws s3...")
-        aws_cp(args, expected_size=expected_upload_size)
+        expected_size_arg = (
+            expected_upload_size
+            if estimated_size_bytes >= AWS_CLI_EXPECTED_SIZE_THRESHOLD_BYTES
+            else None
+        )
+        aws_cp(args, expected_size=expected_size_arg)
         logger.info("Copying to aws s3 completed")
         progress = 90
         update_backup_log(
