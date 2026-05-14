@@ -234,7 +234,7 @@ def restore_storage(args):
         logger.info("Step 1: Pulling aws cli...")
         pull_aws_cli()
         logger.info("Aws cli pulled")
-        progress += 30  # 30
+        progress = 10
         update_restore_log(
             args.api_url,
             "IN_PROGRESS",
@@ -248,15 +248,46 @@ def restore_storage(args):
         logger.info("Step 2: Verifying aws s3 object...")
         aws_head_object(args)
         logger.info("Aws s3 object verified")
+        progress = 20
+        update_restore_log(
+            args.api_url,
+            "IN_PROGRESS",
+            ["Info: Restore source object verified"],
+            "",
+            progress,
+            args.auth_token,
+            args.restore_log_id,
+        )
 
         logger.info("Step 3: Restoring from aws s3...")
+        progress = 30
+        update_restore_log(
+            args.api_url,
+            "IN_PROGRESS",
+            ["Info: Restore stream started"],
+            "",
+            progress,
+            args.auth_token,
+            args.restore_log_id,
+        )
         aws_restore(args)
         logger.info("Restore from aws s3 completed")
-        progress += 70  # 100
+        progress = 90
+        update_restore_log(
+            args.api_url,
+            "IN_PROGRESS",
+            ["Info: Restore from aws s3 completed"],
+            "",
+            progress,
+            args.auth_token,
+            args.restore_log_id,
+        )
+
+        progress = 100
         update_restore_log(
             args.api_url,
             "COMPLETED",
-            ["Info: Restore from aws s3 completed"],
+            ["Info: Restore completed"],
             "",
             progress,
             args.auth_token,

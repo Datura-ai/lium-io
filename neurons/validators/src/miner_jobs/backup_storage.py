@@ -459,6 +459,16 @@ def backup_storage(args):
             if estimated_backup_size_bytes >= AWS_CLI_EXPECTED_SIZE_THRESHOLD_BYTES
             else None
         )
+        progress = 30
+        update_backup_log(
+            args.api_url,
+            args.backup_log_id,
+            "IN_PROGRESS",
+            ["Info: Backup upload started"],
+            "",
+            progress,
+            args.auth_token,
+        )
         aws_cp(args, expected_size=expected_size_arg)
         logger.info("Copying to aws s3 completed")
         progress = 90
