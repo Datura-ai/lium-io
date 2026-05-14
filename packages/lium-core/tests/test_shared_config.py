@@ -60,6 +60,7 @@ def test_default_shared_config_has_all_fields() -> None:
     assert DEFAULT_SHARED_CONFIG.volume_gb_hour_price_usd == 0.00005
     assert DEFAULT_SHARED_CONFIG.max_initial_port_count == 200
     assert DEFAULT_SHARED_CONFIG.total_burn_emission == 0.91
+    assert DEFAULT_SHARED_CONFIG.require_storage_limit_supported is False
 
 
 def test_shared_config_serializes_to_json() -> None:
@@ -67,6 +68,7 @@ def test_shared_config_serializes_to_json() -> None:
     assert isinstance(data, dict)
     assert "machine_prices" in data
     assert "gpu_architectures" in data
+    assert "require_storage_limit_supported" in data
     assert isinstance(data["gpu_architectures"]["NVIDIA B200"]["arch"], str)
 
 

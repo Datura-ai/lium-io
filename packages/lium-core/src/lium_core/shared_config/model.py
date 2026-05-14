@@ -20,3 +20,4 @@ class SharedConfig(BaseModel):
     volume_gb_hour_price_usd: float
     max_initial_port_count: int
     total_burn_emission: float
+    require_storage_limit_supported: bool = False
