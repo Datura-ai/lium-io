@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     COMPUTE_REST_API_URL_EXTERNAL: str | None = Field(
         env="COMPUTE_REST_API_URL_EXTERNAL", default="https://lium.io/api"
     )
+    SHARED_CONFIG_REFRESH_INTERVAL: int = Field(env="SHARED_CONFIG_REFRESH_INTERVAL", default=60)
     MINER_PORTAL_REST_API_URL: str = Field(
         env="MINER_PORTAL_REST_API_URL", default="https://provider-api.lium.io/"
     )

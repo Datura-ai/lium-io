@@ -1,26 +1,29 @@
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Protocol, Tuple
+from typing import Any, Protocol
 
 import asyncssh
-from pydantic import BaseModel, Field
-
-from datura.requests.miner_requests import ExecutorSSHInfo
-
-from core.utils import _m
 from clients.backend_client import BackendClient
-from services.ssh_service import SSHService
-from services.redis_service import RedisService
+from datura.requests.miner_requests import ExecutorSSHInfo
+from lium_core.shared_config.client import SharedConfigClient
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from pydantic import BaseModel, Field
 from services.collateral_contract_service import CollateralContractService
-from services.matrix_validation_service import ValidationService
-from services.verifyx_validation_service import VerifyXValidationService
+from services.container_cleanup import ContainerCleanup
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
-from services.container_cleanup import ContainerCleanup
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from services.matrix_validation_service import ValidationService
+from services.redis_service import RedisService
+from services.verifyx_validation_service import VerifyXValidationService
+
+from core.utils import _m
+from services.ssh_service import SSHService
+
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
+
 
 @dataclass(frozen=True)
 class ContextServices:
@@ -31,9 +34,10 @@ class ContextServices:
     verifyx: VerifyXValidationService
     connectivity: ExecutorConnectivityService
     shell: InteractiveShellService
-    score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
+    score_calculator: Callable[[str, bool, bool, str, bool, int], tuple[float, float, str]]
     backend: BackendClient
     container_cleanup: ContainerCleanup
+    shared_config_client: SharedConfigClient | None = None
 
 
 @dataclass(frozen=True)
@@ -44,32 +48,32 @@ class ContextConfig:
     machine_scrape_filename: str
     machine_scrape_timeout: int
     obfuscation_keys: Any
-    validator_keypair: Optional[Any] = None
-    max_gpu_count: Optional[int] = None
-    gpu_model_rates: Optional[dict[str, Any]] = None
-    nvml_digest_map: Optional[dict[str, str]] = None
+    validator_keypair: Any | None = None
+    max_gpu_count: int | None = None
+    gpu_model_rates: dict[str, Any] | None = None
+    nvml_digest_map: dict[str, str] | None = None
     enable_no_collateral: bool = False
     verifyx_enabled: bool = False
-    port_private_key: Optional[str] = None
-    port_public_key: Optional[str] = None
-    job_batch_id: Optional[str] = None
+    port_private_key: str | None = None
+    port_public_key: str | None = None
+    job_batch_id: str | None = None
 
 
 @dataclass(frozen=True)
 class ContextState:
-    upload_local_dir: Optional[str] = None
-    upload_remote_dir: Optional[str] = None
-    remote_dir: Optional[str] = None
+    upload_local_dir: str | None = None
+    upload_remote_dir: str | None = None
+    remote_dir: str | None = None
     specs: dict[str, Any] = field(default_factory=dict)
-    gpu_model: Optional[str] = None
-    gpu_count: Optional[int] = None
+    gpu_model: str | None = None
+    gpu_count: int | None = None
     gpu_details: list[dict] = field(default_factory=list)
     gpu_processes: list[dict] = field(default_factory=list)
     sysbox_runtime: bool = False
     supports_gpu_splitting: bool = False
     gpu_splitting_min_count: int | None = None
-    gpu_model_count: Optional[str] = None
-    gpu_uuids: Optional[str] = None
+    gpu_model_count: str | None = None
+    gpu_uuids: str | None = None
     verified_port_count: int = 0
     rented_data: RentedExecutorsResponse | None = None
 
@@ -137,11 +141,11 @@ class LoggerSink:
 
 
 class Pipeline:
-    def __init__(self, checks: List[Check], sink: EventSink):
+    def __init__(self, checks: list[Check], sink: EventSink):
         self.checks = checks
         self.sink = sink
 
-    async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+    async def run(self, ctx: Context) -> tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()

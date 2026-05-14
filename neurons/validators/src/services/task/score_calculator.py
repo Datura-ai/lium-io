@@ -4,12 +4,12 @@ This module contains the business logic for calculating actual and job scores
 based on collateral status, rental state, and contract versions.
 """
 
-from typing import Tuple
 
-from core.config import settings
+from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
 from services.const import MACHINE_PRICES
 from services.task.pipeline import Context
 
+from core.config import settings
 
 SCORE_PORTION_FOR_OLD_CONTRACT = 0
 
@@ -17,7 +17,7 @@ SCORE_PORTION_FOR_OLD_CONTRACT = 0
 def calculate_scores(
     ctx: Context,
     rented: bool = False,
-) -> Tuple[float, float, str]:
+) -> tuple[float, float, str]:
     """Calculate actual and job scores for an executor validation.
 
     Args:
@@ -39,6 +39,9 @@ def calculate_scores(
     job_score = 1.0
     actual_score = 1.0
 
+    shared_config_client = getattr(ctx.services, "shared_config_client", None)
+    shared_config = shared_config_client.config if shared_config_client else DEFAULT_SHARED_CONFIG
+
     # Machine price check
     base_price = MACHINE_PRICES.get(gpu_model, 0)
     if price_per_gpu and price_per_gpu > base_price * settings.MACHINE_MAX_PRICE_RATE:
@@ -57,6 +60,15 @@ def calculate_scores(
         warning_messages.append(
             "EMA verifyx download speed unavailable (probe failed or never measured)"
         )
+
+    if (
+        shared_config.require_storage_limit_supported
+        and not rented
+        and (ctx.state.specs or {}).get("storage_limit_supported") is not True
+    ):
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Storage limit support required but unavailable")
 
     # Early return for collateral-excluded GPU types
     if gpu_model in settings.COLLATERAL_EXCLUDED_GPU_TYPES:
@@ -91,7 +103,7 @@ def _format_return(
     job_score: float,
     warning_messages: list[str],
     rented: bool,
-) -> Tuple[float, float, str]:
+) -> tuple[float, float, str]:
     """Format the return values for score calculation."""
     # Rented machines always report job_score=1.0
     final_job_score = 1.0 if rented else job_score

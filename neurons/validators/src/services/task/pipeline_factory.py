@@ -9,20 +9,22 @@ import uuid
 from typing import cast
 
 import bittensor
-from datura.requests.miner_requests import ExecutorSSHInfo
-from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
-
 from clients.backend_client import BackendClient
-from core.config import settings
+from datura.requests.miner_requests import ExecutorSSHInfo
+from lium_core.shared_config.client import SharedConfigClient
+from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
-from services.executor_connectivity_service import ExecutorConnectivityService
 from services.container_cleanup import ContainerCleanup
+from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.redis_service import RENTAL_SUCCEED_MACHINE_SET, RedisService
-from services.ssh_service import SSHService
 from services.verifyx_validation_service import VerifyXValidationService
+
+from core.config import settings
+from services.ssh_service import SSHService
 
 from .checks import (
     BannedGpuCheck,
@@ -48,7 +50,6 @@ from .checks import (
     UploadFilesCheck,
     VerifyXCheck,
 )
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .pipeline import (
     Check,
     Context,
@@ -97,6 +98,10 @@ class PipelineFactory:
         self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
         self.backend_client = backend_client
+        self.shared_config_client = SharedConfigClient(
+            api_url=f"{(settings.COMPUTE_REST_API_URL or '').rstrip('/')}/v1/shared-config",
+            refresh_interval=settings.SHARED_CONFIG_REFRESH_INTERVAL,
+        )
 
         dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
         logger.info(f"ContainerCleanup dry_run={dry_run}")
@@ -176,6 +181,7 @@ class PipelineFactory:
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
                 container_cleanup=self.container_cleanup,
+                shared_config_client=self.shared_config_client,
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,
