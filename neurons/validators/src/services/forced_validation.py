@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 FORCED_VALIDATION_REQUEST_PREFIX = "forced_validation:request"
 FORCED_VALIDATION_ACTIVE_PREFIX = "forced_validation:active_executor"
+FORCED_VALIDATION_LATEST_PREFIX = "forced_validation:latest_executor"
 DEFAULT_REQUEST_TTL_SECONDS = 24 * 60 * 60
 
 
@@ -52,6 +53,9 @@ class ForceValidationRequestStore:
 
     def _active_key(self, executor_id: str) -> str:
         return f"{FORCED_VALIDATION_ACTIVE_PREFIX}:{executor_id}"
+
+    def _latest_key(self, executor_id: str) -> str:
+        return f"{FORCED_VALIDATION_LATEST_PREFIX}:{executor_id}"
 
     async def create_request(
         self, *, executor_id: str, miner_hotkey: str
@@ -83,6 +87,14 @@ class ForceValidationRequestStore:
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         return ForceValidationRequestRecord.model_validate_json(raw)
+
+    async def get_latest_request(self, executor_id: str) -> ForceValidationRequestRecord:
+        request_id = await self.redis_service.redis.get(self._latest_key(executor_id))
+        if request_id is None:
+            raise ForceValidationNotFound()
+        if isinstance(request_id, bytes):
+            request_id = request_id.decode("utf-8")
+        return await self.get_request(request_id)
 
     async def update(
         self,
@@ -125,6 +137,11 @@ class ForceValidationRequestStore:
             record.model_dump_json(),
             ex=self.request_ttl_seconds,
         )
+        await self.redis_service.redis.set(
+            self._latest_key(record.executor_id),
+            record.request_id,
+            ex=self.request_ttl_seconds,
+        )
 
 
 class ForceValidationService:
@@ -157,6 +174,9 @@ class ForceValidationService:
 
     async def get_request(self, request_id: str) -> ForceValidationRequestRecord:
         return await self.store.get_request(request_id)
+
+    async def get_latest_request(self, executor_id: str) -> ForceValidationRequestRecord:
+        return await self.store.get_latest_request(executor_id)
 
     async def validate(self, request_id: str) -> ForceValidationRequestRecord:
         record = await self.store.get_request(request_id)

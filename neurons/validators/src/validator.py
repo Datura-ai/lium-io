@@ -89,6 +89,21 @@ async def create_forced_validation(
 
 
 @app.get(
+    "/internal/forced-validations/executors/{executor_id}/latest",
+    response_model=ForceValidationRequestRecord,
+    dependencies=[Depends(validate_internal_token)],
+)
+async def get_latest_forced_validation(
+    executor_id: str,
+    service=Depends(get_force_validation_service),
+):
+    try:
+        return await service.get_latest_request(executor_id)
+    except ForceValidationNotFound:
+        raise HTTPException(status_code=404, detail="Forced validation request not found")
+
+
+@app.get(
     "/internal/forced-validations/{request_id}",
     response_model=ForceValidationRequestRecord,
     dependencies=[Depends(validate_internal_token)],

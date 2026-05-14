@@ -99,6 +99,27 @@ async def test_store_accepts_request_and_returns_status():
 
 
 @pytest.mark.asyncio
+async def test_store_returns_latest_request_for_executor():
+    store = ForceValidationRequestStore(
+        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
+    )
+    first_record = await store.create_request(
+        executor_id="exec-1",
+        miner_hotkey="miner-hotkey",
+    )
+    await store.update(first_record.request_id, status="failed", stage="completed")
+    await store.release_active_executor("exec-1", first_record.request_id)
+    second_record = await store.create_request(
+        executor_id="exec-1",
+        miner_hotkey="miner-hotkey",
+    )
+
+    loaded = await store.get_latest_request("exec-1")
+
+    assert loaded.request_id == second_record.request_id
+
+
+@pytest.mark.asyncio
 async def test_store_rejects_duplicate_active_executor():
     store = ForceValidationRequestStore(
         FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
