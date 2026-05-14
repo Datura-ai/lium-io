@@ -118,6 +118,7 @@ class ExecutorService:
                 address=payload.executor.address,
                 port=payload.executor.port,
                 price_per_gpu=payload.executor.price_per_gpu,
+                tier=payload.executor.tier or "secure",
             )
             self.executor_dao.update_by_uuid(executor.uuid, executor)
 
