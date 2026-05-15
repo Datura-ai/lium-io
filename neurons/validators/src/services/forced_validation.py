@@ -91,12 +91,17 @@ class ForceValidationRequestStore:
         return ForceValidationRequestRecord.model_validate_json(raw)
 
     async def get_latest_request(self, executor_id: str) -> ForceValidationRequestRecord:
-        request_id = await self.redis_service.redis.get(self._latest_key(executor_id))
+        latest_key = self._latest_key(executor_id)
+        request_id = await self.redis_service.redis.get(latest_key)
         if request_id is None:
             raise ForceValidationNotFound()
         if isinstance(request_id, bytes):
             request_id = request_id.decode("utf-8")
-        return await self.get_request(request_id)
+        record = await self.get_request(request_id)
+        if record.status in TERMINAL_STATUSES:
+            await self._delete_latest_pointer(latest_key, record.request_id)
+            raise ForceValidationNotFound()
+        return record
 
     async def update(
         self,
@@ -141,11 +146,7 @@ class ForceValidationRequestStore:
             ex=self.request_ttl_seconds,
         )
         if record.status in TERMINAL_STATUSES:
-            latest_request_id = await self.redis_service.redis.get(latest_key)
-            if isinstance(latest_request_id, bytes):
-                latest_request_id = latest_request_id.decode("utf-8")
-            if latest_request_id == record.request_id:
-                await self.redis_service.redis.delete(latest_key)
+            await self._delete_latest_pointer(latest_key, record.request_id)
             return
 
         await self.redis_service.redis.set(
@@ -153,6 +154,13 @@ class ForceValidationRequestStore:
             record.request_id,
             ex=self.request_ttl_seconds,
         )
+
+    async def _delete_latest_pointer(self, latest_key: str, request_id: str) -> None:
+        latest_request_id = await self.redis_service.redis.get(latest_key)
+        if isinstance(latest_request_id, bytes):
+            latest_request_id = latest_request_id.decode("utf-8")
+        if latest_request_id == request_id:
+            await self.redis_service.redis.delete(latest_key)
 
 
 class ForceValidationService:

@@ -190,6 +190,23 @@ async def test_store_keeps_newer_latest_pointer_when_old_request_finishes_late()
 
 
 @pytest.mark.asyncio
+async def test_store_hides_existing_terminal_latest_request():
+    store = ForceValidationRequestStore(
+        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
+    )
+    record = await store.create_request(
+        executor_id="exec-1",
+        miner_hotkey="miner-hotkey",
+    )
+    await store.update(record.request_id, status="failed", stage="completed")
+    await store.redis_service.redis.set(store._latest_key("exec-1"), record.request_id)
+
+    with pytest.raises(ForceValidationNotFound):
+        await store.get_latest_request("exec-1")
+    assert await store.redis_service.redis.get(store._latest_key("exec-1")) is None
+
+
+@pytest.mark.asyncio
 async def test_single_executor_validation_runs_matching_executor_and_cleans_up(monkeypatch):
     executor = _executor("exec-1")
     service = MinerService.__new__(MinerService)
