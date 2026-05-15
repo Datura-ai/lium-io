@@ -8,6 +8,7 @@ import services.miner_service as miner_service_module
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.forced_validation import (
     ForceValidationConflict,
+    ForceValidationNotFound,
     ForceValidationRequestStore,
 )
 from services.miner_service import MinerService
@@ -147,6 +148,45 @@ async def test_store_releases_active_marker_after_terminal_state():
         miner_hotkey="miner-hotkey",
     )
     assert next_record.request_id != record.request_id
+
+
+@pytest.mark.asyncio
+async def test_store_removes_latest_pointer_after_terminal_state():
+    store = ForceValidationRequestStore(
+        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
+    )
+    record = await store.create_request(
+        executor_id="exec-1",
+        miner_hotkey="miner-hotkey",
+    )
+
+    await store.update(record.request_id, status="failed", stage="completed")
+
+    loaded = await store.get_request(record.request_id)
+    assert loaded.status == "failed"
+    with pytest.raises(ForceValidationNotFound):
+        await store.get_latest_request("exec-1")
+
+
+@pytest.mark.asyncio
+async def test_store_keeps_newer_latest_pointer_when_old_request_finishes_late():
+    store = ForceValidationRequestStore(
+        FakeRedisService(), request_ttl_seconds=60, active_ttl_seconds=60
+    )
+    old_record = await store.create_request(
+        executor_id="exec-1",
+        miner_hotkey="miner-hotkey",
+    )
+    await store.release_active_executor("exec-1", old_record.request_id)
+    new_record = await store.create_request(
+        executor_id="exec-1",
+        miner_hotkey="miner-hotkey",
+    )
+
+    await store.update(old_record.request_id, status="failed", stage="completed")
+
+    loaded = await store.get_latest_request("exec-1")
+    assert loaded.request_id == new_record.request_id
 
 
 @pytest.mark.asyncio

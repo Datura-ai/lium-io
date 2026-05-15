@@ -27,6 +27,7 @@ FORCED_VALIDATION_REQUEST_PREFIX = "forced_validation:request"
 FORCED_VALIDATION_ACTIVE_PREFIX = "forced_validation:active_executor"
 FORCED_VALIDATION_LATEST_PREFIX = "forced_validation:latest_executor"
 DEFAULT_REQUEST_TTL_SECONDS = 24 * 60 * 60
+TERMINAL_STATUSES = {"succeeded", "failed"}
 
 
 class ForceValidationConflict(Exception):
@@ -133,13 +134,22 @@ class ForceValidationRequestStore:
             await self.redis_service.redis.delete(active_key)
 
     async def _save(self, record: ForceValidationRequestRecord) -> None:
+        latest_key = self._latest_key(record.executor_id)
         await self.redis_service.redis.set(
             self._request_key(record.request_id),
             record.model_dump_json(),
             ex=self.request_ttl_seconds,
         )
+        if record.status in TERMINAL_STATUSES:
+            latest_request_id = await self.redis_service.redis.get(latest_key)
+            if isinstance(latest_request_id, bytes):
+                latest_request_id = latest_request_id.decode("utf-8")
+            if latest_request_id == record.request_id:
+                await self.redis_service.redis.delete(latest_key)
+            return
+
         await self.redis_service.redis.set(
-            self._latest_key(record.executor_id),
+            latest_key,
             record.request_id,
             ex=self.request_ttl_seconds,
         )
