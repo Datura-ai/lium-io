@@ -14,6 +14,7 @@ from payload_models.payloads import MinerJobRequestPayload
 from clients.backend_client import BackendClient
 from clients.subtensor_client import SubtensorClient
 from core.config import settings
+from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.file_encrypt_service import FileEncryptService
 from services.miner_service import MinerService
@@ -169,6 +170,12 @@ class ForceValidationService:
             executor_id=executor_id,
             miner_hotkey=miner_hotkey,
         )
+        logger.info(
+            _m(
+                "Force validation queued",
+                extra=get_extra_info(self._get_log_extra(record)),
+            )
+        )
         self.task_factory(self.validate(record.request_id))
         return record
 
@@ -180,15 +187,21 @@ class ForceValidationService:
 
     async def validate(self, request_id: str) -> ForceValidationRequestRecord:
         record = await self.store.get_request(request_id)
+        logger.info(
+            _m(
+                "Force validation started",
+                extra=get_extra_info(self._get_log_extra(record)),
+            )
+        )
         try:
-            await self.store.update(
-                request_id,
+            record = await self._update_request(
+                record,
                 status="running",
                 stage="resolving_miner",
             )
             miner = await self._resolve_miner(record.miner_hotkey)
 
-            await self.store.update(request_id, stage="preparing_validation")
+            record = await self._update_request(record, stage="preparing_validation")
             rented_data = await self.backend_client.get_all_rented_executors()
             if rented_data is None:
                 rented_data = RentedExecutorsResponse(executors={})
@@ -202,7 +215,7 @@ class ForceValidationService:
                 miner_port=miner.axon_info.port,
             )
 
-            await self.store.update(request_id, stage="running_validation")
+            record = await self._update_request(record, stage="running_validation")
             result = await self.miner_service.request_single_executor_validation(
                 payload=payload,
                 encrypted_files=encrypted_files,
@@ -210,7 +223,7 @@ class ForceValidationService:
                 executor_id=record.executor_id,
             )
 
-            await self.store.update(request_id, stage="finalizing")
+            record = await self._update_request(record, stage="finalizing")
             await self.miner_service.publish_machine_specs(
                 [result],
                 record.miner_hotkey,
@@ -218,27 +231,50 @@ class ForceValidationService:
             )
 
             terminal_result = self._build_terminal_result(result)
-            return await self.store.update(
+            record = await self.store.update(
                 request_id,
                 status="succeeded" if terminal_result.success else "failed",
                 stage="completed",
                 result=terminal_result,
             )
+            logger.info(
+                _m(
+                    "Force validation finished",
+                    extra=get_extra_info(
+                        self._get_log_extra(
+                            record,
+                            success=terminal_result.success,
+                            score=terminal_result.score,
+                            job_score=terminal_result.job_score,
+                        )
+                    ),
+                )
+            )
+            return record
         except Exception as exc:
             logger.exception(
-                "Forced validation failed",
-                extra={
-                    "request_id": request_id,
-                    "executor_id": record.executor_id,
-                    "miner_hotkey": record.miner_hotkey,
-                },
+                _m(
+                    "Force validation failed",
+                    extra=get_extra_info(
+                        self._get_log_extra(record, error=str(exc))
+                    ),
+                )
             )
-            return await self.store.update(
+            record = await self.store.update(
                 request_id,
                 status="failed",
                 stage="completed",
                 error=ForceValidationError(message=str(exc)),
             )
+            logger.info(
+                _m(
+                    "Force validation finished",
+                    extra=get_extra_info(
+                        self._get_log_extra(record, success=False, error=str(exc))
+                    ),
+                )
+            )
+            return record
         finally:
             await self.store.release_active_executor(record.executor_id, request_id)
 
@@ -260,3 +296,49 @@ class ForceValidationService:
             gpu_model=result.gpu_model,
             gpu_count=result.gpu_count,
         )
+
+    async def _update_request(
+        self,
+        record: ForceValidationRequestRecord,
+        *,
+        status: str | None = None,
+        stage: str | None = None,
+    ) -> ForceValidationRequestRecord:
+        updated = await self.store.update(
+            record.request_id,
+            status=status,
+            stage=stage,
+        )
+        logger.info(
+            _m(
+                "Force validation stage changed",
+                extra=get_extra_info(self._get_log_extra(updated)),
+            )
+        )
+        return updated
+
+    @staticmethod
+    def _get_log_extra(
+        record: ForceValidationRequestRecord,
+        *,
+        success: bool | None = None,
+        score: float | None = None,
+        job_score: float | None = None,
+        error: str | None = None,
+    ) -> dict:
+        extra = {
+            "request_id": record.request_id,
+            "executor_id": record.executor_id,
+            "miner_hotkey": record.miner_hotkey,
+            "status": record.status,
+            "stage": record.stage,
+        }
+        if success is not None:
+            extra["success"] = success
+        if score is not None:
+            extra["score"] = score
+        if job_score is not None:
+            extra["job_score"] = job_score
+        if error is not None:
+            extra["error"] = error
+        return extra
