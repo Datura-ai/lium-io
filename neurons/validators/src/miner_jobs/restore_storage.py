@@ -169,6 +169,21 @@ def aws_head_object(args):
     run_command_args(command, command_label="docker run aws s3api head-object")
 
 
+def ensure_restore_path(args):
+    restore_path = os.path.expanduser(args.restore_path)
+    # tar's -C target must exist before the S3 stream starts. Creating it in the
+    # same mounted-volume context avoids a broken pipe from aws when tar exits early.
+    command = docker_base_command(
+        args,
+        volumes=[f"{args.target_volume}:{args.target_volume_path}"],
+        entrypoint="mkdir",
+    ) + [
+        "-p",
+        restore_path,
+    ]
+    run_command_args(command, command_label="docker run mkdir restore target")
+
+
 def aws_restore(args):
     # aws s3 cp s3://$BUCKET_NAME/backups/my-folder-2025-09-02.tar.gz - \
     # | tar -xzpf - -C $RESTORE_PATH
@@ -259,7 +274,11 @@ def restore_storage(args):
             args.restore_log_id,
         )
 
-        logger.info("Step 3: Restoring from aws s3...")
+        logger.info("Step 3: Preparing restore destination...")
+        ensure_restore_path(args)
+        logger.info("Restore destination verified")
+
+        logger.info("Step 4: Restoring from aws s3...")
         progress = 30
         update_restore_log(
             args.api_url,
