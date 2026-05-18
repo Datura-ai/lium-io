@@ -121,4 +121,5 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
     volume_gb_hour_price_usd=0.00005,
     max_initial_port_count=200,
     total_burn_emission=0.91,
+    require_storage_limit_supported=False,
 )
