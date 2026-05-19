@@ -1,0 +1,5 @@
+services:
+  executor:
+    image: daturaai/compute-subnet-executor:latest
+  monitor:
+    image: daturaai/compute-subnet-executor:latest

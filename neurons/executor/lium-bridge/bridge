@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# bridge — one-command setup for lium-bridge on the local GPU host.
+#
+# Usage:
+#   sudo ./lium-bridge/bridge enable    # full bridge infrastructure setup
+#   sudo ./lium-bridge/bridge disable   # flip CHUTES_BRIDGE_ENABLED=false
+#   ./lium-bridge/bridge status         # health check (no root needed)
+set -euo pipefail
+
+# --- Paths ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXECUTOR_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ENV_FILE="${EXECUTOR_DIR}/.env"
+ENV_TEMPLATE="${EXECUTOR_DIR}/.env.template"
+STAGE_SECRETS="${EXECUTOR_DIR}/stage-secrets"
+SSH_KEY="${STAGE_SECRETS}/chutes_bridge_key"
+SSH_PUBKEY="${SSH_KEY}.pub"
+KNOWN_HOSTS="${STAGE_SECRETS}/chutes_bridge_known_hosts"
+BRIDGE_USER="lium-bridge"
+BRIDGE_HOME="/var/lib/${BRIDGE_USER}"
+AUTHORIZED_KEYS="${BRIDGE_HOME}/.ssh/authorized_keys"
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+step()  { echo -e "\n${CYAN}==> $*${NC}"; }
+
+# ===================================================================
+#  enable
+# ===================================================================
+cmd_enable() {
+    # --- Step 1: Preflight ---
+    step "1/6  Preflight checks"
+
+    [[ $EUID -eq 0 ]] || err "enable requires root (use sudo)"
+
+    if ! command -v docker &>/dev/null; then
+        err "docker not found — install Docker first"
+    fi
+
+    if [[ ! -f "${ENV_FILE}" ]]; then
+        if [[ ! -f "${ENV_TEMPLATE}" ]]; then
+            err "Neither .env nor .env.template found in ${EXECUTOR_DIR}"
+        fi
+        cp "${ENV_TEMPLATE}" "${ENV_FILE}"
+        info "Created .env from .env.template — fill MINER_HOTKEY_SS58_ADDRESS before starting"
+    else
+        info ".env exists"
+    fi
+
+    # --- Step 2: Install lium-bridge (idempotent) ---
+    step "2/6  Install lium-bridge"
+
+    if id "${BRIDGE_USER}" &>/dev/null && [[ -d /opt/lium-bridge ]]; then
+        info "lium-bridge already installed, skipping"
+    else
+        local installer="${SCRIPT_DIR}/install_chutes_bridge.sh"
+        if [[ ! -f "${installer}" ]]; then
+            err "Installer not found: ${installer}"
+        fi
+        info "Running install_chutes_bridge.sh ..."
+        bash "${installer}"
+    fi
+
+    # --- Step 3: Generate SSH keypair (idempotent) ---
+    step "3/6  Generate SSH keypair"
+
+    mkdir -p "${STAGE_SECRETS}"
+    chmod 700 "${STAGE_SECRETS}"
+    # Give ownership to the calling user so docker compose can read secrets
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        chown "${SUDO_USER}:${SUDO_USER}" "${STAGE_SECRETS}"
+    fi
+
+    if [[ -f "${SSH_KEY}" ]]; then
+        info "SSH key already exists at ${SSH_KEY}"
+    else
+        ssh-keygen -t ed25519 -f "${SSH_KEY}" -N "" -C "executor-bridge-key"
+        chmod 600 "${SSH_KEY}"
+        chmod 644 "${SSH_PUBKEY}"
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            chown "${SUDO_USER}:${SUDO_USER}" "${SSH_KEY}" "${SSH_PUBKEY}"
+        fi
+        info "Generated ed25519 keypair"
+    fi
+
+    # --- Step 4: Install pubkey into authorized_keys (idempotent) ---
+    step "4/6  Install pubkey into authorized_keys"
+
+    if [[ ! -f "${SSH_PUBKEY}" ]]; then
+        err "Public key not found: ${SSH_PUBKEY}"
+    fi
+
+    local pubkey
+    pubkey="$(cat "${SSH_PUBKEY}")"
+
+    mkdir -p "$(dirname "${AUTHORIZED_KEYS}")"
+    touch "${AUTHORIZED_KEYS}"
+
+    if grep -qF "${pubkey}" "${AUTHORIZED_KEYS}" 2>/dev/null; then
+        info "Pubkey already in authorized_keys"
+    else
+        echo "${pubkey}" >> "${AUTHORIZED_KEYS}"
+        info "Appended pubkey to ${AUTHORIZED_KEYS}"
+    fi
+
+    chmod 700 "$(dirname "${AUTHORIZED_KEYS}")"
+    chmod 600 "${AUTHORIZED_KEYS}"
+    chown -R "${BRIDGE_USER}:${BRIDGE_USER}" "$(dirname "${AUTHORIZED_KEYS}")"
+
+    # --- Step 5: Generate known_hosts ---
+    step "5/6  Generate known_hosts"
+
+    info "Scanning host SSH fingerprint via ssh-keyscan ..."
+    docker run --rm --add-host=host.docker.internal:host-gateway \
+        alpine sh -c "apk add --no-cache -q openssh-client >/dev/null 2>&1 && ssh-keyscan -H host.docker.internal 2>/dev/null" \
+        > "${KNOWN_HOSTS}"
+
+    if [[ -s "${KNOWN_HOSTS}" ]]; then
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            chown "${SUDO_USER}:${SUDO_USER}" "${KNOWN_HOSTS}"
+        fi
+        info "Wrote $(wc -l < "${KNOWN_HOSTS}") entries to ${KNOWN_HOSTS}"
+    else
+        warn "ssh-keyscan returned empty — the executor may fail StrictHostKeyChecking"
+    fi
+
+    # --- Step 6: Update .env ---
+    step "6/6  Update .env"
+
+    bash "${SCRIPT_DIR}/chutes-install.sh" \
+        --env-file "${ENV_FILE}" \
+        --stage-secrets-dir "${STAGE_SECRETS}" \
+        --bridge-host "host.docker.internal"
+
+    # --- Done ---
+    echo ""
+    info "Bridge setup complete!"
+    echo ""
+    echo -e "Start the executor with:"
+    echo ""
+    echo -e "  ${CYAN}docker compose \\"
+    echo -e "    -f docker-compose.app.yml \\"
+    echo -e "    -f docker-compose.chutes-stage.override.yml \\"
+    echo -e "    -f docker-compose.local-image.override.yml \\"
+    echo -e "    up -d --force-recreate db executor monitor autoheal${NC}"
+    echo ""
+    echo -e "Then verify:  ${CYAN}curl http://127.0.0.1:8001/chutes/status${NC}"
+}
+
+# ===================================================================
+#  disable
+# ===================================================================
+cmd_disable() {
+    [[ $EUID -eq 0 ]] || err "disable requires root (use sudo)"
+
+    if [[ ! -f "${ENV_FILE}" ]]; then
+        err ".env not found at ${ENV_FILE}"
+    fi
+
+    if grep -q "^CHUTES_BRIDGE_ENABLED=" "${ENV_FILE}"; then
+        sed -i.bak "s|^CHUTES_BRIDGE_ENABLED=.*|CHUTES_BRIDGE_ENABLED=false|" "${ENV_FILE}"
+        rm -f "${ENV_FILE}.bak"
+    else
+        echo "CHUTES_BRIDGE_ENABLED=false" >> "${ENV_FILE}"
+    fi
+
+    info "Set CHUTES_BRIDGE_ENABLED=false in ${ENV_FILE}"
+    info "Restart executor for this to take effect."
+}
+
+# ===================================================================
+#  status
+# ===================================================================
+cmd_status() {
+    local ok=true
+
+    echo -e "${CYAN}Bridge Status${NC}"
+    echo "──────────────────────────────────"
+
+    # Bridge user
+    if id "${BRIDGE_USER}" &>/dev/null; then
+        echo -e "  Bridge user:       ${GREEN}installed${NC}"
+    else
+        echo -e "  Bridge user:       ${RED}missing${NC}"
+        ok=false
+    fi
+
+    # Bridge dir
+    if [[ -d /opt/lium-bridge ]]; then
+        echo -e "  Bridge dir:        ${GREEN}/opt/lium-bridge${NC}"
+    else
+        echo -e "  Bridge dir:        ${RED}missing${NC}"
+        ok=false
+    fi
+
+    # SSH key
+    if [[ -f "${SSH_KEY}" ]]; then
+        echo -e "  SSH key:           ${GREEN}present${NC}"
+    else
+        echo -e "  SSH key:           ${RED}missing${NC}"
+        ok=false
+    fi
+
+    # known_hosts
+    if [[ -s "${KNOWN_HOSTS}" ]]; then
+        echo -e "  known_hosts:       ${GREEN}present${NC}"
+    else
+        echo -e "  known_hosts:       ${YELLOW}missing or empty${NC}"
+        ok=false
+    fi
+
+    # .env
+    if [[ -f "${ENV_FILE}" ]]; then
+        local bridge_enabled
+        bridge_enabled=$(grep "^CHUTES_BRIDGE_ENABLED=" "${ENV_FILE}" 2>/dev/null | cut -d= -f2 || echo "unset")
+        if [[ "${bridge_enabled}" == "true" ]]; then
+            echo -e "  CHUTES_BRIDGE:     ${GREEN}enabled${NC}"
+        else
+            echo -e "  CHUTES_BRIDGE:     ${YELLOW}${bridge_enabled}${NC}"
+        fi
+    else
+        echo -e "  .env:              ${RED}missing${NC}"
+        ok=false
+    fi
+
+    # Executor health
+    if curl -sf http://127.0.0.1:8001/chutes/status &>/dev/null; then
+        echo -e "  Executor:          ${GREEN}responding${NC}"
+    else
+        echo -e "  Executor:          ${YELLOW}not responding${NC}"
+    fi
+
+    echo "──────────────────────────────────"
+    if $ok; then
+        echo -e "  Overall:           ${GREEN}ready${NC}"
+    else
+        echo -e "  Overall:           ${YELLOW}incomplete — run 'sudo ./lium-bridge/bridge enable'${NC}"
+    fi
+}
+
+# ===================================================================
+#  main
+# ===================================================================
+case "${1:-}" in
+    enable)  cmd_enable ;;
+    disable) cmd_disable ;;
+    status)  cmd_status ;;
+    *)
+        echo "Usage: $0 {enable|disable|status}"
+        echo ""
+        echo "  enable   — install bridge, generate keys, configure .env"
+        echo "  disable  — set CHUTES_BRIDGE_ENABLED=false in .env"
+        echo "  status   — check bridge health"
+        exit 1
+        ;;
+esac

@@ -148,3 +148,54 @@ The above command should show the `nvidia-smi` result if sysbox is installed cor
 sudo systemctl restart docker
 ```
 
+## chutes-install
+
+Staging Chutes activation on executor currently has two separate steps:
+
+1. One-time host bootstrap on the same GPU machine:
+```shell
+cd /path/to/chutes/lium-bridge
+sudo ./install_chutes_bridge.sh
+```
+This installs `/opt/lium-bridge/`, the restricted `lium-bridge` SSH user, `ForceCommand`, sudoers allowlist, and bridge state. It does not write executor env values and does not add the executor relay key to `authorized_keys`.
+
+2. Executor relay activation in this checkout:
+```shell
+cd neurons/executor
+./chutes-install.sh --bridge-host host.docker.internal
+```
+
+`chutes-install.sh` prepares `.env` and `stage-secrets/` for the staging relay path. It writes:
+- `CHUTES_BRIDGE_ENABLED=true`
+- `CHUTES_BRIDGE_SSH_HOST`
+- `CHUTES_BRIDGE_SSH_PORT`
+- `CHUTES_BRIDGE_SSH_USER`
+- `CHUTES_BRIDGE_SSH_KEY_PATH=/run/secrets/chutes_bridge_key`
+- `CHUTES_BRIDGE_CONNECT_TIMEOUT_SEC`
+- `CHUTES_BRIDGE_COMMAND_TIMEOUT_SEC`
+- `CHUTES_BRIDGE_SSH_KEY_HOST_PATH`
+- `CHUTES_BRIDGE_SSH_KNOWN_HOSTS_HOST_PATH`
+
+Before the relay can work, you still need to:
+- add the dedicated executor relay public key to `/var/lib/lium-bridge/.ssh/authorized_keys` on the GPU host
+- put the matching private key at `./stage-secrets/chutes_bridge_key`
+- put the bridge host fingerprint at `./stage-secrets/chutes_bridge_known_hosts`
+
+Then restart executor with the staging override:
+```shell
+docker compose -f docker-compose.app.yml -f docker-compose.chutes-stage.override.yml up -d --force-recreate executor
+```
+
+After that, the staging-only Chutes relay endpoints can call the host bridge:
+- `POST /chutes/install` -> `bridgectl setup`
+- `POST /chutes/start` -> `bridgectl start`
+- `POST /chutes/stop` -> `bridgectl stop`
+- `GET /chutes/status` -> `bridgectl status`
+
+Relay contract:
+- `POST /chutes/install`, `POST /chutes/start`, and `POST /chutes/stop` require validator-signed headers: `X-Validator-Hotkey`, `X-Miner-Hotkey`, `X-Timestamp`, and `X-Signature`
+- The signed blob must match the canonical validator/miner REST auth payload (`validator_hotkey`, `miner_hotkey`, `timestamp` with sorted JSON keys)
+- The executor only trusts the configured validator hotkey and requires `X-Miner-Hotkey` to match the executor miner hotkey
+- `POST /chutes/install` validates `validator_hotkey` and `hotkey_ss58` as SS58, `hotkey_seed` as 64 hex chars with optional `0x`, and `node_name` against the bridge hostname pattern
+- `POST /chutes/start` is fail-closed: if the agent pod does not become healthy within the bridge timeout window, the API returns `500` instead of a degraded `200`
+- `GET /chutes/status` can report `bridge.state=error` together with `last_error` after a failed `start`
