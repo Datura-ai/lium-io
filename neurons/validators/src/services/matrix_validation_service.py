@@ -233,8 +233,6 @@ class ValidationService:
                 verifier_params.uuid,
             )
 
-            command = f"{executor_info.python_path} {script_path} {verifier_params}"
-
             log_extra = {
                 **default_extra,
                 "dim_n": verifier_params.dim_n,
@@ -244,6 +242,21 @@ class ValidationService:
                 "cipher_text": verifier_params.cipher_text,
                 "machine_info": machine_info,
             }
+
+            # Short-circuit if encrypt_challenge returned empty. This happens when
+            # the Python pre-check rejected the spec (typed GpuPrecheckError) or
+            # the native call raised. No point SSHing an empty cipher to the
+            # executor — it would surface as a misleading "UUID mismatch" downstream.
+            if not verifier_params.cipher_text:
+                error_msg = "Cipher text generation failed (precheck rejection or native error)"
+                logger.warning(_m(error_msg, extra=get_extra_info(log_extra)))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    error_message=error_msg,
+                )
+
+            command = f"{executor_info.python_path} {script_path} {verifier_params}"
 
             logger.info(_m("Matrix Multiplication Python Script Command", extra=get_extra_info(log_extra)))
 

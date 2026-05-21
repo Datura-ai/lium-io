@@ -71,3 +71,49 @@ def test_malformed_json_safe_return(service_with_mock_wrapper):
     cipher = svc.encrypt_challenge(1000, 2000, 42, "{not valid json", "uuid-xyz")
     assert cipher == ""
     wrapper.setDimension.assert_not_called()
+
+
+# --- validate_gpu_model_and_process_job short-circuits on empty cipher ------
+@pytest.mark.asyncio
+async def test_validate_short_circuits_on_empty_cipher(service_with_mock_wrapper):
+    """When encrypt_challenge returns "" (precheck rejection), no SSH happens
+    and we return a clean ValidationResult(success=False) without sending an
+    empty cipher to the executor.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    svc, _wrapper = service_with_mock_wrapper
+
+    # Force encrypt_challenge to return "" — simulates precheck rejection.
+    svc.encrypt_challenge = lambda *a, **kw: ""
+
+    ssh_client = SimpleNamespace(run=AsyncMock())
+    executor_info = SimpleNamespace(
+        root_dir="/root/app",
+        python_path="/root/app/.venv/bin/python",
+    )
+    machine_spec = {
+        "gpu": {
+            "count": 1,
+            "details": [
+                {
+                    "name": "NVIDIA RTX A4000",
+                    "uuid": "GPU-abc",
+                    "capacity": 15352,
+                },
+            ],
+        },
+    }
+
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh_client,
+        executor_info=executor_info,
+        default_extra={},
+        machine_spec=machine_spec,
+    )
+
+    assert result.success is False
+    assert "precheck rejection" in result.error_message.lower() or "native" in result.error_message.lower()
+    # Critically: no SSH round-trip.
+    ssh_client.run.assert_not_called()
