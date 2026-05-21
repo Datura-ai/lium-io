@@ -45,13 +45,19 @@ def test_unknown_model_raises():
 
 # --- VRAM range checks ------------------------------------------------------
 @pytest.mark.parametrize("model,mb,expected_ok", [
-    ("NVIDIA H100 80GB HBM3", 77824, True),   # vmin inclusive
-    ("NVIDIA H100 80GB HBM3", 77823, False),  # just below vmin
+    # H100 80GB HBM3 range: (73728, 86016)
+    ("NVIDIA H100 80GB HBM3", 73728, True),   # vmin inclusive
+    ("NVIDIA H100 80GB HBM3", 73727, False),  # just below vmin
     ("NVIDIA H100 80GB HBM3", 86016, True),   # vmax inclusive
     ("NVIDIA H100 80GB HBM3", 86017, False),  # just above vmax
-    ("NVIDIA GeForce RTX 4090", 23347, True), # vmin
-    ("NVIDIA GeForce RTX 4090", 25805, True), # vmax
-    ("NVIDIA H100 80GB HBM3", 24064, False),  # wildly off
+    ("NVIDIA H100 80GB HBM3", 81559, True),   # prod-observed
+    # RTX 4090 range: (22118, 25805)
+    ("NVIDIA GeForce RTX 4090", 22118, True), # vmin inclusive
+    ("NVIDIA GeForce RTX 4090", 22117, False),# just below vmin
+    ("NVIDIA GeForce RTX 4090", 23028, True), # prod-observed low end
+    ("NVIDIA GeForce RTX 4090", 25805, True), # vmax inclusive
+    # Wildly off should still fail
+    ("NVIDIA H100 80GB HBM3", 24064, False),
 ])
 def test_vram_boundaries(model, mb, expected_ok):
     if expected_ok:
