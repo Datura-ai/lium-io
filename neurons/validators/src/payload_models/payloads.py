@@ -194,6 +194,11 @@ class ContainerRequestType(enum.Enum):
     InstallJupyterServer = "InstallJupyterServer"
 
 
+class WorkloadKind(enum.Enum):
+    CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
+    FILLER = "FILLER"
+
+
 class BaseServerRequest(BaseRequest):
     message_type: ContainerRequestType
     miner_hotkey: str
@@ -204,6 +209,7 @@ class BaseServerRequest(BaseRequest):
 
 class ContainerBaseRequest(BaseServerRequest):
     pod_id: str
+    workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
 
 
 class ExternalVolumeInfo(BaseModel):
@@ -350,6 +356,7 @@ class ContainerWarningCode(enum.Enum):
 
 class ContainerBaseResponse(BaseValidatorResponse):
     pod_id: str
+    workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
 
 class ContainerCreated(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerCreated

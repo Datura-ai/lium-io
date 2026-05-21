@@ -379,6 +379,7 @@ NETWORK_MIN_DOWNLOAD_SPEED_MBPS = 50.0
 PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 20008, 20009]
 
 POD_CONTAINER_PREFIX = "pod_"
+FILLER_CONTAINER_PREFIX = "filler_"
 
 # Container name prefixes that count as "rental-related" on an executor.
 # All producers of short-lived containers competing for the 9100-9130 port range

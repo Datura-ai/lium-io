@@ -876,6 +876,36 @@ async def test_clean_containers_stale_pods_removed(docker_service, retry_ssh_moc
 
 
 @pytest.mark.asyncio
+async def test_clean_containers_stale_fillers_removed(docker_service, retry_ssh_mock):
+    """Stale filler_ containers are removed before creating a new container."""
+    # Arrange
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result(
+        "pod_target\nfiller_stale\nfiller_active\nsome_other_container\n"
+    ))
+
+    # Act
+    await docker_service.clean_existing_containers(
+        ssh_client=ssh_client,
+        default_extra={},
+        pod_name="pod_target",
+        active_container_names=["filler_active"],
+    )
+
+    # Assert
+    rm_command = retry_ssh_mock.call_args_list[0][0][1]
+    assert "pod_target" in rm_command
+    assert "filler_stale" in rm_command
+    assert "filler_active" not in rm_command
+    assert "some_other_container" not in rm_command
+
+    volume_command = retry_ssh_mock.call_args_list[1][0][1]
+    assert "volume_target" in volume_command
+    assert "volume_stale" in volume_command
+    assert "volume_filler_stale" not in volume_command
+
+
+@pytest.mark.asyncio
 async def test_clean_containers_none_fallback_removes_all_pods(docker_service, retry_ssh_mock):
     """When active_container_names is None (old backend), all pod_ containers are removed."""
     # Arrange

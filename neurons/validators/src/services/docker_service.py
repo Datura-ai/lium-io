@@ -16,6 +16,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
     ContainerCreateRequest,
+    ContainerBaseRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -37,11 +38,17 @@ from payload_models.payloads import (
     CustomOptions,
     ContainerWarningCode,
     PayloadPortMapping,
+    WorkloadKind,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
-from services.const import POD_CONTAINER_PREFIX, PREFERRED_POD_PORTS, MIN_PORT_COUNT
+from services.const import (
+    FILLER_CONTAINER_PREFIX,
+    POD_CONTAINER_PREFIX,
+    PREFERRED_POD_PORTS,
+    MIN_PORT_COUNT,
+)
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
@@ -93,6 +100,12 @@ class DockerService:
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
         self.is_realtime_logging = False
+
+    @staticmethod
+    def get_container_name(payload: ContainerBaseRequest) -> str:
+        if payload.workload_kind == WorkloadKind.FILLER:
+            return f"{FILLER_CONTAINER_PREFIX}{payload.pod_id}"
+        return f"{POD_CONTAINER_PREFIX}{payload.pod_id}"
 
     def _ssh_bootstrap_script_path(self) -> Path:
         return Path(__file__).resolve().parent / "assets" / "sshd_bootstrap.sh"
@@ -621,7 +634,9 @@ class DockerService:
             active_volume_set = set(active_volume_names) if active_volume_names else set()
             pod_containers = [
                 name for name in result.stdout.strip().split("\n")
-                if name == pod_name or name.startswith(POD_CONTAINER_PREFIX)
+                if name == pod_name
+                or name.startswith(POD_CONTAINER_PREFIX)
+                or name.startswith(FILLER_CONTAINER_PREFIX)
             ]
             stale_containers = [name for name in pod_containers if name not in active_set]
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
@@ -643,11 +658,16 @@ class DockerService:
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
-                volumes_to_remove = [
-                    f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}"
-                    for name in stale_containers
-                    if f"volume_{name.removeprefix(POD_CONTAINER_PREFIX)}" not in active_volume_set
-                ]
+                volumes_to_remove = []
+                for name in stale_containers:
+                    volume_id = name
+                    for prefix in (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX):
+                        if name.startswith(prefix):
+                            volume_id = name.removeprefix(prefix)
+                            break
+                    volume_name = f"volume_{volume_id}"
+                    if volume_name not in active_volume_set:
+                        volumes_to_remove.append(volume_name)
                 if volumes_to_remove:
                     volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
@@ -1128,6 +1148,7 @@ class DockerService:
         default_extra = {
             "miner_hotkey": payload.miner_hotkey,
             "pod_id": payload.pod_id,
+            "workload_kind": payload.workload_kind.value,
             "executor_uuid": payload.executor_id,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
@@ -1181,6 +1202,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
@@ -1204,6 +1226,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoJupyterPortMapping,
@@ -1222,6 +1245,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -1250,6 +1274,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.UnknownError,
@@ -1353,7 +1378,7 @@ class DockerService:
                     else ""
                 )
 
-                container_name = f"{POD_CONTAINER_PREFIX}{payload.pod_id}"
+                container_name = self.get_container_name(payload)
                 created_local_volume = False
                 protected_volume_names = set(payload.active_volume_names or [])
                 if local_volume:
@@ -1637,6 +1662,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                     container_name=container_name,
                     volume_name=local_volume,
                     port_maps=[
@@ -1667,6 +1693,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1838,6 +1865,7 @@ class DockerService:
             "miner_hotkey": payload.miner_hotkey,
             "executor_uuid": payload.executor_id,
             "pod_id": payload.pod_id,
+            "workload_kind": payload.workload_kind.value,
             "executor_ip_address": executor_info.address,
             "executor_port": executor_info.port,
             "executor_ssh_username": executor_info.ssh_username,
@@ -1871,6 +1899,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1929,6 +1958,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                 )
         except Exception as e:
             log_text = _m(
@@ -1941,6 +1971,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
