@@ -130,20 +130,6 @@ class ValidationService:
 
     def encrypt_challenge(self, m_dim_n, m_dim_k, seed, machine_info, uuid):
         try:
-            # Python-side pre-check before the native call (fail-fast UX).
-            try:
-                mi = json.loads(machine_info) if isinstance(machine_info, str) else dict(machine_info or {})
-            except Exception:
-                mi = {}
-            try:
-                precheck_gpu_spec(
-                    gpu_model=mi.get("gpu_model", ""),
-                    gpu_capacity_mb=int(mi.get("gpu_capacity_mb", 0) or 0),
-                )
-            except GpuPrecheckError as e:
-                logger.warning("encrypt_challenge: precheck rejected: %s", e)
-                return ""
-
             # Example of usage:
             # Create a new DMCompVerify object
             self.wrapper.setDimension(self.verifier_ptr, m_dim_n, m_dim_k)
@@ -209,17 +195,34 @@ class ValidationService:
             gpu_count = machine_spec.get("gpu", {}).get("count", 0)
             gpu_uuids = ','.join([detail.get('uuid', '') for detail in gpu_details])
 
-            # gpu_capacity_mb is included so libdmcompverify can cross-check the
-            # declared gpu_model against the expected VRAM range for that model.
-            # Sourced from machine_spec.gpu.details[0].capacity (MB).
-            gpu_capacity_mb = self.get_gpu_memory(machine_spec)
+            # NOTE: machine_info MUST exactly match what the executor's libdmcompverify
+            # reconstructs locally via getGPUInfo() — otherwise the hash-derived AES key
+            # will not match and the executor's decrypt will fail. Adding any new field
+            # to this JSON (e.g. gpu_capacity_mb) requires a corresponding change in the
+            # .so's getGPUInfo(). The Python-side pre-check below uses gpu_capacity_mb
+            # as a separate local variable; it is NEVER embedded into machine_info.
             gpu_info = {
                 "uuids": gpu_uuids,
                 "gpu_count": gpu_count,
                 "gpu_model": gpu_model,
-                "gpu_capacity_mb": gpu_capacity_mb,
             }
             machine_info = json.dumps(gpu_info, sort_keys=True)
+
+            # Python-side GPU model+VRAM pre-check. Runs before any native call so
+            # we don't waste an SSH round-trip on obviously-bad specs.
+            gpu_capacity_mb = self.get_gpu_memory(machine_spec)
+            try:
+                precheck_gpu_spec(
+                    gpu_model=gpu_model,
+                    gpu_capacity_mb=int(gpu_capacity_mb or 0),
+                )
+            except GpuPrecheckError as e:
+                error_msg = f"GPU spec precheck rejected: {e}"
+                logger.warning(_m(error_msg, extra={**default_extra, "machine_info": machine_info}))
+                return ValidationResult(
+                    success=False,
+                    error_message=error_msg,
+                )
 
             verifier_params = VerifierParams()
             verifier_params.generate()

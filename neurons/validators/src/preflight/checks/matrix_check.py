@@ -237,15 +237,16 @@ class MatrixValidationCheck(PreflightCheck):
         challenge_uuid: str,
     ) -> str:
         """Generate cipher text (encryption side)."""
+        # NOTE: machine_info MUST exactly match what libdmcompverify reconstructs
+        # locally via getGPUInfo() on the decrypt side — otherwise the hash-derived
+        # AES key will not match and decrypt will fail. The Python-side pre-check
+        # below uses gpu_memory_mb directly from gpu_info; it is NEVER embedded
+        # in machine_info.
         machine_info = json.dumps(
             {
                 "uuids": gpu_info["gpu_uuids"],
                 "gpu_count": gpu_info["gpu_count"],
                 "gpu_model": gpu_info["gpu_model"],
-                # libdmcompverify cross-checks this against the expected VRAM
-                # range for gpu_model. get_gpu_info(include_memory=True) above
-                # populates gpu_memory_mb via pynvml on the local validator GPU.
-                "gpu_capacity_mb": gpu_info["gpu_memory_mb"],
             },
             sort_keys=True,
         )
