@@ -1,8 +1,15 @@
-"""Integration tests for ValidationService.encrypt_challenge() pre-check wiring."""
+"""Integration tests for the validator-side GPU pre-check.
+
+Pre-check now lives at the top of `validate_gpu_model_and_process_job` (the
+caller), NOT inside `encrypt_challenge`. This is required because anything
+embedded in `machine_info` JSON passed to libdmcompverify must exactly
+match what the executor's .so reconstructs locally via getGPUInfo() —
+adding fields breaks the cryptographic binding.
+"""
 from __future__ import annotations
 
-import json
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -19,101 +26,129 @@ def service_with_mock_wrapper(monkeypatch):
     return mvs.ValidationService(), mock_wrapper
 
 
-def _machine_info(**override) -> str:
-    info = {
-        "gpu_model": "NVIDIA H100 80GB HBM3",
-        "gpu_capacity_mb": 81920,
-        "gpu_count": 1,
-        "uuids": "GPU-abc",
-    }
-    info.update(override)
-    return json.dumps(info, sort_keys=True)
-
-
-# --- Bad spec short-circuits before any native call -------------------------
-def test_bad_spec_short_circuits(service_with_mock_wrapper):
-    svc, wrapper = service_with_mock_wrapper
-    bad_mi = _machine_info(gpu_capacity_mb=24064)  # out of range for H100
-    cipher = svc.encrypt_challenge(1000, 2000, 42, bad_mi, "uuid-xyz")
-    assert cipher == ""
-    wrapper.setDimension.assert_not_called()
-    wrapper.generateChallenge.assert_not_called()
-
-
-def test_unknown_model_short_circuits(service_with_mock_wrapper):
-    svc, wrapper = service_with_mock_wrapper
-    bad_mi = _machine_info(gpu_model="Totally Unknown GPU", gpu_capacity_mb=24064)
-    cipher = svc.encrypt_challenge(1000, 2000, 42, bad_mi, "uuid-xyz")
-    assert cipher == ""
-    wrapper.setDimension.assert_not_called()
-
-
-def test_missing_field_short_circuits(service_with_mock_wrapper):
-    svc, wrapper = service_with_mock_wrapper
-    bad_mi = _machine_info(gpu_model="", gpu_capacity_mb=0)
-    cipher = svc.encrypt_challenge(1000, 2000, 42, bad_mi, "uuid-xyz")
-    assert cipher == ""
-    wrapper.setDimension.assert_not_called()
-
-
-# --- Happy path proceeds ----------------------------------------------------
-def test_happy_path_proceeds(service_with_mock_wrapper):
-    svc, wrapper = service_with_mock_wrapper
-    cipher = svc.encrypt_challenge(1000, 2000, 42, _machine_info(), "uuid-xyz")
-    assert cipher == "deadbeef"
-    wrapper.setDimension.assert_called_once_with("fake_verifier_ptr", 1000, 2000)
-    wrapper.generateChallenge.assert_called_once()
-
-
-# --- Malformed JSON returns safely (treated as missing_field) ---------------
-def test_malformed_json_safe_return(service_with_mock_wrapper):
-    svc, wrapper = service_with_mock_wrapper
-    cipher = svc.encrypt_challenge(1000, 2000, 42, "{not valid json", "uuid-xyz")
-    assert cipher == ""
-    wrapper.setDimension.assert_not_called()
-
-
-# --- validate_gpu_model_and_process_job short-circuits on empty cipher ------
-@pytest.mark.asyncio
-async def test_validate_short_circuits_on_empty_cipher(service_with_mock_wrapper):
-    """When encrypt_challenge returns "" (precheck rejection), no SSH happens
-    and we return a clean ValidationResult(success=False) without sending an
-    empty cipher to the executor.
-    """
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
-
-    svc, _wrapper = service_with_mock_wrapper
-
-    # Force encrypt_challenge to return "" — simulates precheck rejection.
-    svc.encrypt_challenge = lambda *a, **kw: ""
-
-    ssh_client = SimpleNamespace(run=AsyncMock())
-    executor_info = SimpleNamespace(
-        root_dir="/root/app",
-        python_path="/root/app/.venv/bin/python",
-    )
-    machine_spec = {
+def _machine_spec(*, gpu_model="NVIDIA H100 80GB HBM3", capacity=81920, count=1):
+    return {
         "gpu": {
-            "count": 1,
+            "count": count,
             "details": [
-                {
-                    "name": "NVIDIA RTX A4000",
-                    "uuid": "GPU-abc",
-                    "capacity": 15352,
-                },
+                {"name": gpu_model, "uuid": "GPU-abc", "capacity": capacity},
             ],
         },
     }
 
-    result = await svc.validate_gpu_model_and_process_job(
-        ssh_client=ssh_client,
-        executor_info=executor_info,
-        default_extra={},
-        machine_spec=machine_spec,
+
+def _ssh_client():
+    """Mock SSH client whose .run is async."""
+    return SimpleNamespace(run=AsyncMock())
+
+
+def _executor_info():
+    return SimpleNamespace(
+        root_dir="/root/app",
+        python_path="/root/app/.venv/bin/python",
     )
 
+
+# --- Bad spec short-circuits before any native call AND no SSH --------------
+@pytest.mark.asyncio
+async def test_bad_vram_short_circuits(service_with_mock_wrapper):
+    """Out-of-range VRAM → ValidationResult(success=False), no .so call, no SSH."""
+    svc, wrapper = service_with_mock_wrapper
+    ssh = _ssh_client()
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(gpu_model="NVIDIA H100 80GB HBM3", capacity=24064),
+    )
     assert result.success is False
-    assert "precheck rejection" in result.error_message.lower() or "native" in result.error_message.lower()
-    # Critically: no SSH round-trip.
-    ssh_client.run.assert_not_called()
+    assert "precheck" in result.error_message.lower()
+    wrapper.setDimension.assert_not_called()
+    wrapper.generateChallenge.assert_not_called()
+    ssh.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_short_circuits(service_with_mock_wrapper):
+    svc, wrapper = service_with_mock_wrapper
+    ssh = _ssh_client()
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(gpu_model="Totally Unknown GPU", capacity=24064),
+    )
+    assert result.success is False
+    assert "precheck" in result.error_message.lower()
+    wrapper.setDimension.assert_not_called()
+    ssh.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_missing_capacity_short_circuits(service_with_mock_wrapper):
+    svc, wrapper = service_with_mock_wrapper
+    ssh = _ssh_client()
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(capacity=0),
+    )
+    assert result.success is False
+    wrapper.setDimension.assert_not_called()
+    ssh.run.assert_not_called()
+
+
+# --- Happy path: pre-check passes, machine_info has no gpu_capacity_mb ------
+@pytest.mark.asyncio
+async def test_machine_info_does_not_contain_gpu_capacity_mb(
+    service_with_mock_wrapper,
+):
+    """Critical invariant: machine_info passed to libdmcompverify must NOT
+    contain gpu_capacity_mb — the executor's .so reconstructs machine_info
+    via getGPUInfo() locally, which produces {gpu_count, gpu_model, uuids}
+    only. Including gpu_capacity_mb breaks the cryptographic AES-key binding
+    and the executor's decrypt fails with returned_uuid=None.
+    """
+    svc, wrapper = service_with_mock_wrapper
+    # SSH returns a stdout that the validator will parse — we don't care
+    # about the UUID match outcome; we just want to inspect the call args.
+    ssh = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(stdout="UUID: foo", stderr=""))
+    )
+    await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(),
+    )
+    # Inspect the machine_info string that was handed to the native call.
+    assert wrapper.generateChallenge.called, "generateChallenge should have been called"
+    args, _kwargs = wrapper.generateChallenge.call_args
+    machine_info_str = args[2]  # signature: (verifier_ptr, seed, machine_info, uuid)
+    assert "gpu_capacity_mb" not in machine_info_str, (
+        f"machine_info contains gpu_capacity_mb, which breaks libdmcompverify "
+        f"cryptographic binding: {machine_info_str!r}"
+    )
+    # Sanity: required fields still present
+    assert "gpu_model" in machine_info_str
+    assert "gpu_count" in machine_info_str
+    assert "uuids" in machine_info_str
+
+
+# --- Empty cipher_text from encrypt_challenge → short-circuit before SSH ----
+@pytest.mark.asyncio
+async def test_empty_cipher_text_short_circuits_ssh(service_with_mock_wrapper):
+    """If encrypt_challenge returns "" (e.g. unexpected .so failure), no SSH."""
+    svc, _wrapper = service_with_mock_wrapper
+    svc.encrypt_challenge = lambda *a, **kw: ""
+    ssh = _ssh_client()
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(),
+    )
+    assert result.success is False
+    assert "cipher" in result.error_message.lower()
+    ssh.run.assert_not_called()
