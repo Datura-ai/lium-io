@@ -1,12 +1,14 @@
 import time
 import random
 import logging
-import json 
+import json
 import os
 import uuid as uuid4
 from dataclasses import dataclass
 from core.utils import _m, get_extra_info
 from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
+
+from services.gpu_precheck import GpuPrecheckError, precheck_gpu_spec
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +130,20 @@ class ValidationService:
 
     def encrypt_challenge(self, m_dim_n, m_dim_k, seed, machine_info, uuid):
         try:
+            # Python-side pre-check before the native call (fail-fast UX).
+            try:
+                mi = json.loads(machine_info) if isinstance(machine_info, str) else dict(machine_info or {})
+            except Exception:
+                mi = {}
+            try:
+                precheck_gpu_spec(
+                    gpu_model=mi.get("gpu_model", ""),
+                    gpu_capacity_mb=int(mi.get("gpu_capacity_mb", 0) or 0),
+                )
+            except GpuPrecheckError as e:
+                logger.warning("encrypt_challenge: precheck rejected: %s", e)
+                return ""
+
             # Example of usage:
             # Create a new DMCompVerify object
             self.wrapper.setDimension(self.verifier_ptr, m_dim_n, m_dim_k)
@@ -193,13 +209,21 @@ class ValidationService:
             gpu_count = machine_spec.get("gpu", {}).get("count", 0)
             gpu_uuids = ','.join([detail.get('uuid', '') for detail in gpu_details])
 
-            gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
+            # gpu_capacity_mb is included so libdmcompverify can cross-check the
+            # declared gpu_model against the expected VRAM range for that model.
+            # Sourced from machine_spec.gpu.details[0].capacity (MB).
+            gpu_capacity_mb = self.get_gpu_memory(machine_spec)
+            gpu_info = {
+                "uuids": gpu_uuids,
+                "gpu_count": gpu_count,
+                "gpu_model": gpu_model,
+                "gpu_capacity_mb": gpu_capacity_mb,
+            }
             machine_info = json.dumps(gpu_info, sort_keys=True)
 
             verifier_params = VerifierParams()
             verifier_params.generate()
-            gpu_memory = self.get_gpu_memory(machine_spec)
-            verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
+            verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_capacity_mb, verifier_params.dim_n))
 
             verifier_params.cipher_text = self.encrypt_challenge(
                 verifier_params.dim_n,
