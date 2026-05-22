@@ -8,8 +8,6 @@ from dataclasses import dataclass
 from core.utils import _m, get_extra_info
 from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
 
-from services.gpu_precheck import GpuPrecheckError, precheck_gpu_spec
-
 logger = logging.getLogger(__name__)
 
 
@@ -208,21 +206,10 @@ class ValidationService:
             }
             machine_info = json.dumps(gpu_info, sort_keys=True)
 
-            # Python-side GPU model+VRAM pre-check. Runs before any native call so
-            # we don't waste an SSH round-trip on obviously-bad specs.
+            # GPU model<->VRAM consistency is gated earlier in the pipeline by
+            # GpuVramPrecheck (before the rented short-circuit), so it is NOT
+            # repeated here. gpu_capacity_mb is still needed to size the matmul.
             gpu_capacity_mb = self.get_gpu_memory(machine_spec)
-            try:
-                precheck_gpu_spec(
-                    gpu_model=gpu_model,
-                    gpu_capacity_mb=int(gpu_capacity_mb or 0),
-                )
-            except GpuPrecheckError as e:
-                error_msg = f"GPU spec precheck rejected: {e}"
-                logger.warning(_m(error_msg, extra={**default_extra, "machine_info": machine_info}))
-                return ValidationResult(
-                    success=False,
-                    error_message=error_msg,
-                )
 
             verifier_params = VerifierParams()
             verifier_params.generate()
@@ -247,11 +234,10 @@ class ValidationService:
             }
 
             # Short-circuit if encrypt_challenge returned empty. This happens when
-            # the Python pre-check rejected the spec (typed GpuPrecheckError) or
             # the native call raised. No point SSHing an empty cipher to the
             # executor — it would surface as a misleading "UUID mismatch" downstream.
             if not verifier_params.cipher_text:
-                error_msg = "Cipher text generation failed (precheck rejection or native error)"
+                error_msg = "Cipher text generation failed (native error)"
                 logger.warning(_m(error_msg, extra=get_extra_info(log_extra)))
                 return ValidationResult(
                     success=False,

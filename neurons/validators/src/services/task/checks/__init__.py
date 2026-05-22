@@ -7,6 +7,7 @@ from .gpu_count import GpuCountCheck
 from .gpu_fingerprint import GpuFingerprintCheck
 from .gpu_model_valid import GpuModelValidCheck
 from .gpu_usage import GpuUsageCheck
+from .gpu_vram_precheck import GpuVramPrecheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
@@ -30,6 +31,7 @@ __all__ = [
     "GpuFingerprintCheck",
     "GpuModelValidCheck",
     "GpuUsageCheck",
+    "GpuVramPrecheck",
     "MachineSpecScrapeCheck",
     "NvmlDigestCheck",
     "PortConnectivityCheck",

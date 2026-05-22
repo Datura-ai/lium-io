@@ -228,6 +228,25 @@ class GpuModelMessages:
     )
 
 
+class GpuVramMessages:
+    VRAM_REJECTED = MessageTemplate(
+        event="GPU model/VRAM precheck rejected",
+        reason="GPU_VRAM_MISMATCH",
+        severity="warning",
+        category="policy",
+        impact="Job skipped; score set to 0",
+        remediation="Reported GPU model and VRAM capacity are inconsistent. "
+        "Ensure the executor advertises unmodified, matching GPU specs.",
+    )
+    VRAM_OK = MessageTemplate(
+        event="GPU model/VRAM precheck passed",
+        reason="GPU_VRAM_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class NvmlDigestMessages:
     DIGEST_MISMATCH = MessageTemplate(
         event="NVML library digest mismatch",

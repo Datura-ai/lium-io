@@ -1,10 +1,13 @@
-"""Integration tests for the validator-side GPU pre-check.
+"""Tests for `validate_gpu_model_and_process_job` invariants.
 
-Pre-check now lives at the top of `validate_gpu_model_and_process_job` (the
-caller), NOT inside `encrypt_challenge`. This is required because anything
-embedded in `machine_info` JSON passed to libdmcompverify must exactly
-match what the executor's .so reconstructs locally via getGPUInfo() —
-adding fields breaks the cryptographic binding.
+The GPU model<->VRAM pre-check no longer lives here — it moved to the
+GpuVramPrecheck pipeline check (see tests/test_gpu_vram_precheck_check.py),
+which runs before the rented short-circuit so it gates rented and idle
+executors alike. What remains tested here:
+  - machine_info passed to libdmcompverify must NOT contain gpu_capacity_mb
+    (anything embedded must exactly match what the executor's .so reconstructs
+    locally via getGPUInfo(), or the cryptographic binding breaks);
+  - an empty cipher_text from the native call short-circuits before SSH.
 """
 from __future__ import annotations
 
@@ -49,57 +52,7 @@ def _executor_info():
     )
 
 
-# --- Bad spec short-circuits before any native call AND no SSH --------------
-@pytest.mark.asyncio
-async def test_bad_vram_short_circuits(service_with_mock_wrapper):
-    """Out-of-range VRAM → ValidationResult(success=False), no .so call, no SSH."""
-    svc, wrapper = service_with_mock_wrapper
-    ssh = _ssh_client()
-    result = await svc.validate_gpu_model_and_process_job(
-        ssh_client=ssh,
-        executor_info=_executor_info(),
-        default_extra={},
-        machine_spec=_machine_spec(gpu_model="NVIDIA H100 80GB HBM3", capacity=24064),
-    )
-    assert result.success is False
-    assert "precheck" in result.error_message.lower()
-    wrapper.setDimension.assert_not_called()
-    wrapper.generateChallenge.assert_not_called()
-    ssh.run.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_unknown_model_short_circuits(service_with_mock_wrapper):
-    svc, wrapper = service_with_mock_wrapper
-    ssh = _ssh_client()
-    result = await svc.validate_gpu_model_and_process_job(
-        ssh_client=ssh,
-        executor_info=_executor_info(),
-        default_extra={},
-        machine_spec=_machine_spec(gpu_model="Totally Unknown GPU", capacity=24064),
-    )
-    assert result.success is False
-    assert "precheck" in result.error_message.lower()
-    wrapper.setDimension.assert_not_called()
-    ssh.run.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_missing_capacity_short_circuits(service_with_mock_wrapper):
-    svc, wrapper = service_with_mock_wrapper
-    ssh = _ssh_client()
-    result = await svc.validate_gpu_model_and_process_job(
-        ssh_client=ssh,
-        executor_info=_executor_info(),
-        default_extra={},
-        machine_spec=_machine_spec(capacity=0),
-    )
-    assert result.success is False
-    wrapper.setDimension.assert_not_called()
-    ssh.run.assert_not_called()
-
-
-# --- Happy path: pre-check passes, machine_info has no gpu_capacity_mb ------
+# --- machine_info must not contain gpu_capacity_mb -------------------------
 @pytest.mark.asyncio
 async def test_machine_info_does_not_contain_gpu_capacity_mb(
     service_with_mock_wrapper,
