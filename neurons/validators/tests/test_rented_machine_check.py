@@ -10,7 +10,7 @@ from neurons.validators.src.services.task.checks.rented_machine import (
     _collect_pod_diagnostics,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
-from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutor, RentedExecutorsResponse, RentedPod
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 
@@ -639,7 +639,16 @@ async def test_tenant_enforcement_protects_filler_only_without_marking_rented(co
     state = build_state(
         gpu_processes=[{"container_name": filler_container, "pid": 1234}],
         gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
-        rented_data=build_filler_data(executor_uuid, filler_container),
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            filler_containers_by_executor={executor_uuid: filler_container},
+            network_ema={
+                executor_uuid: NetworkEMA(
+                    ema_verifyx_download_speed=250.0,
+                    ema_verifyx_upload_speed=50.0,
+                )
+            },
+        ),
     )
     ctx = context_factory(
         services=services,
@@ -657,6 +666,8 @@ async def test_tenant_enforcement_protects_filler_only_without_marking_rented(co
     assert result.updates["rented"] is False
     assert result.updates["success"] is True
     assert score_calculator.called_with["rented"] is False
+    assert score_calculator.called_with["ctx"].state.specs["network"]["ema_verifyx_download_speed"] == 250.0
+    assert score_calculator.called_with["ctx"].state.specs["network"]["ema_verifyx_upload_speed"] == 50.0
     assert not any("docker ps" in cmd for cmd in ssh_client.commands_called)
 
 

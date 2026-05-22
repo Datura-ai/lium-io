@@ -1,6 +1,7 @@
 import json
 import shlex
 from collections.abc import Iterable
+from dataclasses import replace
 
 import asyncssh
 from core.docker_utils import DockerCommand
@@ -79,6 +80,25 @@ def _gpu_usage_violation_details(
     }
 
 
+def _with_last_known_verifyx_ema(ctx: Context) -> Context:
+    rented_data = ctx.state.rented_data
+    if not rented_data:
+        return ctx
+
+    network_ema = rented_data.network_ema.get(ctx.executor.uuid)
+    if not network_ema or network_ema.ema_verifyx_download_speed is None:
+        return ctx
+
+    specs = dict(ctx.state.specs or {})
+    network = dict(specs.get("network") or {})
+    network.setdefault("ema_verifyx_download_speed", network_ema.ema_verifyx_download_speed)
+    if network_ema.ema_verifyx_upload_speed is not None:
+        network.setdefault("ema_verifyx_upload_speed", network_ema.ema_verifyx_upload_speed)
+    specs["network"] = network
+
+    return ctx.model_copy(update={"state": replace(ctx.state, specs=specs)})
+
+
 class TenantEnforcementCheck:
     """Handle the specialised flow when the executor is already rented to a tenant.
 
@@ -136,8 +156,9 @@ class TenantEnforcementCheck:
                         updates={"default_extra": extra},
                     )
 
+                score_ctx = _with_last_known_verifyx_ema(ctx)
                 score_calculator = ctx.services.score_calculator
-                actual_score, job_score, warning_message = score_calculator(ctx, False)
+                actual_score, job_score, warning_message = score_calculator(score_ctx, False)
                 event = render_message(
                     Msg.NOT_RENTED,
                     ctx=ctx,
