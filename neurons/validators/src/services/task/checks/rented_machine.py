@@ -1,7 +1,6 @@
 import json
 import shlex
 from collections.abc import Iterable
-from dataclasses import replace
 
 import asyncssh
 from core.docker_utils import DockerCommand
@@ -80,25 +79,6 @@ def _gpu_usage_violation_details(
     }
 
 
-def _with_last_known_verifyx_ema(ctx: Context) -> Context:
-    rented_data = ctx.state.rented_data
-    if not rented_data:
-        return ctx
-
-    network_ema = rented_data.network_ema.get(ctx.executor.uuid)
-    if not network_ema or network_ema.ema_verifyx_download_speed is None:
-        return ctx
-
-    specs = dict(ctx.state.specs or {})
-    network = dict(specs.get("network") or {})
-    network.setdefault("ema_verifyx_download_speed", network_ema.ema_verifyx_download_speed)
-    if network_ema.ema_verifyx_upload_speed is not None:
-        network.setdefault("ema_verifyx_upload_speed", network_ema.ema_verifyx_upload_speed)
-    specs["network"] = network
-
-    return ctx.model_copy(update={"state": replace(ctx.state, specs=specs)})
-
-
 class TenantEnforcementCheck:
     """Handle the specialised flow when the executor is already rented to a tenant.
 
@@ -121,77 +101,21 @@ class TenantEnforcementCheck:
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        filler_container = (
-            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
-            if rented_data else None
-        )
+        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
 
         if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}
             if filler_container:
                 extra["filler_container"] = filler_container
-                gpu_processes = list(ctx.state.gpu_processes)
-                gpu_running_outside = _has_gpu_process_outside_container(
-                    [filler_container],
-                    gpu_processes,
-                )
-                if gpu_running_outside and not _is_gpu_usage_within_limits(ctx.state.gpu_details, gpu_processes):
-                    observation = _gpu_usage_violation_details(ctx.state.gpu_details, gpu_processes)
-                    event = render_message(
-                        Msg.GPU_OUTSIDE_TENANT,
-                        ctx=ctx,
-                        check_id=self.check_id,
-                        what={
-                            "expected_containers": [filler_container],
-                            "process_count": observation["process_count"],
-                            "gpu_utilization": observation["gpu_utilization"],
-                            "vram_utilization": observation["vram_utilization"],
-                            "gpu_processes": gpu_processes,
-                        },
-                        extra=extra,
-                    )
-                    return CheckResult(
-                        passed=False,
-                        event=event,
-                        updates={"default_extra": extra},
-                    )
 
-                score_ctx = _with_last_known_verifyx_ema(ctx)
-                score_calculator = ctx.services.score_calculator
-                actual_score, job_score, warning_message = score_calculator(score_ctx, False)
-                event = render_message(
-                    Msg.NOT_RENTED,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    impact=f"Active filler runtime preserved; reported unrented score={job_score} (actual={actual_score})",
-                    what={
-                        "executor_uuid": ctx.executor.uuid,
-                        "filler_container": filler_container,
-                    },
-                    extra=extra,
-                )
-                return CheckResult(
-                    passed=True,
-                    event=event,
-                    updates={
-                        "default_extra": extra,
-                        "rented": False,
-                        "ssh_pub_keys": None,
-                        "score": actual_score,
-                        "job_score": job_score,
-                        "score_warning": warning_message or None,
-                        "log_status": "info",
-                        "log_text": event.event,
-                        "success": True,
-                    },
-                    halt=True,
-                )
-
+            what = {"executor_uuid": ctx.executor.uuid}
+            if filler_container:
+                what["filler_container"] = filler_container
             event = render_message(
                 Msg.NOT_RENTED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"executor_uuid": ctx.executor.uuid},
+                what=what,
                 extra=extra
             )
             return CheckResult(

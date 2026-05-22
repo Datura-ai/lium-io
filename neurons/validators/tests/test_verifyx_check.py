@@ -254,6 +254,41 @@ def _rented_data_with_ema(executor_uuid: str, *, download: float | None = None, 
 
 
 @pytest.mark.asyncio
+async def test_verifyx_skips_active_filler_and_reuses_prev_ema(context_factory):
+    verifyx_service = DummyVerifyXService(
+        success=True,
+        updated_specs={"network": {"download_speed": 500.0, "upload_speed": 100.0}},
+    )
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            filler_containers_by_executor={"executor-123": "filler_active"},
+            network_ema={
+                "executor-123": NetworkEMA(
+                    ema_verifyx_download_speed=350.0,
+                    ema_verifyx_upload_speed=70.0,
+                )
+            },
+        ),
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert verifyx_service.called_with is None
+    network = result.updates["state"].specs["network"]
+    assert network["ema_verifyx_download_speed"] == pytest.approx(350.0)
+    assert network["ema_verifyx_upload_speed"] == pytest.approx(70.0)
+    assert "verifyx_download_speed" not in network
+
+
+@pytest.mark.asyncio
 async def test_verifyx_failure_without_prev_ema_leaves_specs_empty(context_factory):
     """No prior EMA anywhere — failure branch must not fabricate a state update."""
     verifyx_service = _VerifyXServiceReturning(MockVerifyXResponse(error="failure"))

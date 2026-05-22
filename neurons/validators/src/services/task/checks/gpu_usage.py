@@ -25,10 +25,7 @@ class GpuUsageCheck:
             return CheckResult(passed=True, event=event)
 
         rented_data = ctx.state.rented_data
-        filler_container = (
-            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
-            if rented_data else None
-        )
+        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
         if filler_container and all(
             process.get("container_name") == filler_container for process in gpu_processes
         ):
