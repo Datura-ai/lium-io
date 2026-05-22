@@ -11,9 +11,17 @@ from services.port_utils import get_all_ports
 class PortSelector:
     """Selects which ports to verify."""
 
-    def select(self, executor_info: ExecutorSSHInfo, size: int, rented: set[int]) -> list[PortPair]:
+    def select(
+        self,
+        executor_info: ExecutorSSHInfo,
+        size: int,
+        rented: set[int],
+        runtime_active: bool = False,
+    ) -> list[PortPair]:
         """Select ports to check, based on executor params and info about rented external ports."""
+        if runtime_active:
+            return []
+
         all_ports = get_all_ports(executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port)
         available_ports = [PortPair(internal, external) for internal, external in all_ports if external not in rented]
         return available_ports[:size]
-

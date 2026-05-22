@@ -62,6 +62,7 @@ def _rented_data(executor_uuid: str, pods: list[str]):
     executor_mock = MagicMock(pods=pod_mocks)
     resp = MagicMock()
     resp.executors = {executor_uuid: executor_mock}
+    resp.filler_containers_by_executor = {}
     return resp
 
 
@@ -180,8 +181,71 @@ async def test_cleanup_filter_includes_all_rental_prefixes():
 
     ps_cmd = next((c for c in seen_cmds if "docker ps -a" in c), "")
     assert "pod_*" in ps_cmd
+    assert "filler_*" in ps_cmd
     assert "container_*" in ps_cmd
     assert "health_check_*" in ps_cmd
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_active_filler_container():
+    name = "filler_active"
+    ssh, rm_calls = _make_ssh_mock(
+        containers=[name],
+        ages_by_name={name: 60},
+    )
+    cleanup = ContainerCleanup(stale_threshold_minutes=15)
+    rented_data = _rented_data(EXECUTOR_UUID, [])
+    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: name}
+
+    removed_count, removed_names = await cleanup.cleanup(
+        ssh_client=ssh,
+        rented_data=rented_data,
+        executor_uuid=EXECUTOR_UUID,
+    )
+
+    assert removed_count == 0
+    assert removed_names == []
+    assert not any("docker rm -f" in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_young_unknown_filler_container():
+    name = "filler_young"
+    ssh, rm_calls = _make_ssh_mock(
+        containers=[name],
+        ages_by_name={name: 5},
+    )
+    cleanup = ContainerCleanup(stale_threshold_minutes=15)
+
+    removed_count, removed_names = await cleanup.cleanup(
+        ssh_client=ssh,
+        rented_data=None,
+        executor_uuid=EXECUTOR_UUID,
+    )
+
+    assert removed_count == 0
+    assert removed_names == []
+    assert not any("docker rm -f" in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_removes_stale_unknown_filler_container():
+    name = "filler_stale"
+    ssh, rm_calls = _make_ssh_mock(
+        containers=[name],
+        ages_by_name={name: 30},
+    )
+    cleanup = ContainerCleanup(stale_threshold_minutes=15)
+
+    removed_count, removed_names = await cleanup.cleanup(
+        ssh_client=ssh,
+        rented_data=None,
+        executor_uuid=EXECUTOR_UUID,
+    )
+
+    assert removed_count == 1
+    assert removed_names == [name]
+    assert any("docker rm -f" in c and name in c for c in rm_calls)
 
 
 # ---------------------------------------------------------------------------

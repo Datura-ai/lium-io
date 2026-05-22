@@ -68,6 +68,7 @@ class NetworkEMA(BaseModel):
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
+    filler_containers_by_executor: dict[str, str] = {}  # executor_id -> filler_<FillerRun.id>
     banned_guids: list[str] = []
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors

@@ -24,6 +24,25 @@ class GpuUsageCheck:
             )
             return CheckResult(passed=True, event=event)
 
+        rented_data = ctx.state.rented_data
+        filler_container = (
+            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
+            if rented_data else None
+        )
+        if filler_container and all(
+            process.get("container_name") == filler_container for process in gpu_processes
+        ):
+            event = render_message(
+                Msg.USAGE_OK,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "process_count": len(gpu_processes),
+                    "filler_container": filler_container,
+                },
+            )
+            return CheckResult(passed=True, event=event)
+
         # Check for orphaned rental containers
         for process in gpu_processes:
             container_name = process.get("container_name")

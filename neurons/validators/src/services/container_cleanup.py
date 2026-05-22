@@ -4,7 +4,11 @@ from typing import Optional
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from core.docker_utils import DockerCommand
 from core.utils import _m
-from services.const import POD_CONTAINER_PREFIX, RENTAL_CONTAINER_PREFIXES
+from services.const import (
+    FILLER_CONTAINER_GRACE_MINUTES,
+    POD_CONTAINER_PREFIX,
+    RENTAL_CONTAINER_PREFIXES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +16,7 @@ logger = logging.getLogger(__name__)
 class ContainerCleanup:
     """Service for cleaning up stale containers on executor machines."""
 
-    def __init__(self, stale_threshold_minutes: int = 15, dry_run: bool = False):
+    def __init__(self, stale_threshold_minutes: int = FILLER_CONTAINER_GRACE_MINUTES, dry_run: bool = False):
         self.stale_threshold_minutes = stale_threshold_minutes
         self.dry_run = dry_run
 
@@ -34,7 +38,7 @@ class ContainerCleanup:
         }
 
         try:
-            # Get all containers with rental prefixes (both pod_ and container_)
+            # Get all containers with rental prefixes.
             all_containers = await self._get_all_rental_containers(ssh_client)
             if not all_containers:
                 return 0, []
@@ -180,11 +184,19 @@ class ContainerCleanup:
         executor_uuid: str
     ) -> set[str]:
         """Get currently rented container names for this executor."""
-        if not rented_data or executor_uuid not in rented_data.executors:
+        if not rented_data:
             return set()
 
-        executor = rented_data.executors[executor_uuid]
-        return {pod.container_name for pod in executor.pods}
+        rented_containers = set()
+        executor = rented_data.executors.get(executor_uuid)
+        if executor:
+            rented_containers.update(pod.container_name for pod in executor.pods)
+
+        filler_container = rented_data.filler_containers_by_executor.get(executor_uuid)
+        if filler_container:
+            rented_containers.add(filler_container)
+
+        return rented_containers
 
     async def _get_container_age_minutes(self, ssh_client, container_name: str) -> Optional[float]:
         """Get container age in minutes, returns None if unable to determine."""

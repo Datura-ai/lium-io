@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from neurons.validators.src.services.executor_connectivity.models import PortPair, PortVerificationResult
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -184,3 +185,33 @@ async def test_port_connectivity_check(
                 assert result.updates["state"].verified_port_count == 100
             else:
                 assert result.updates["state"].verified_port_count == 0
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_preserves_inventory_when_filler_active(context_factory):
+    connectivity_service = DummyConnectivityService(success=True, verified_port_count=100)
+    services = build_services(
+        backend=DummyBackendService(),
+        connectivity=connectivity_service,
+    )
+    state = build_state(
+        specs={
+            "verified_ports": [20000, 20001, 20002],
+            "available_port_count": 3,
+            "port_mappings": "[[20000, 20000]]",
+        },
+        verified_port_count=3,
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            filler_containers_by_executor={"executor-123": "filler_active"},
+        ),
+    )
+    ctx = context_factory(services=services, state=state)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFY_OK.reason
+    assert connectivity_service.called_with is None
+    assert result.updates["state"].specs == state.specs
+    assert result.updates["state"].verified_port_count == 3

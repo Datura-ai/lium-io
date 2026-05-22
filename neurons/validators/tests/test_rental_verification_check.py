@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import patch
 
 from neurons.validators.src.protocol.vc_protocol.compute_requests import ExecutorHealthCheckResponse
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
@@ -361,3 +362,29 @@ async def test_rental_verification_skips_cleanup_when_no_ports():
     assert result.passed is False
     # Early-return path: no docker rm -f issued.
     assert not _has_health_check_cleanup(ssh.commands)
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_skips_filler_only_executor():
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={"verified_ports": [8080]},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            filler_containers_by_executor={"executor-123": "filler_active"},
+        ),
+    )
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SKIPPED.reason
+    assert backend_client.called_with is None
