@@ -259,12 +259,28 @@ def test_rented_executors_response_keeps_customer_rentals_separate_from_filler()
     assert result.filler_containers_by_executor == {"executor-123": "filler_active"}
 
 
+def test_rented_executors_response_filters_non_filler_container_names():
+    result = RentedExecutorsResponse.model_validate(
+        {
+            "executors": {},
+            "filler_containers_by_executor": {
+                "executor-123": "filler_active",
+                "executor-456": "pod_customer-rental",
+                "executor-789": "container_arbitrary",
+            },
+        }
+    )
+
+    assert result.filler_containers_by_executor == {"executor-123": "filler_active"}
+
+
 @pytest.mark.asyncio
 async def test_get_all_rented_executors_parses_filler_mapping(reset_session, client):
     response_data = {
         "executors": {},
         "filler_containers_by_executor": {
-            "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+            "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a",
+            "executor-456": "pod_customer-rental",
         },
     }
     mock_response = create_mock_response(200, response_data)
@@ -275,4 +291,6 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
 
     assert result is not None
     assert result.executors == {}
-    assert result.filler_containers_by_executor == response_data["filler_containers_by_executor"]
+    assert result.filler_containers_by_executor == {
+        "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    }

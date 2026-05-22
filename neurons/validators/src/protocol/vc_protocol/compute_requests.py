@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from services.const import FILLER_CONTAINER_PREFIX
 
 
 class Error(BaseModel, extra="allow"):
@@ -73,6 +75,15 @@ class RentedExecutorsResponse(BaseModel):
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
     spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
+
+    @field_validator("filler_containers_by_executor")
+    @classmethod
+    def keep_only_filler_containers(cls, value: dict[str, str]) -> dict[str, str]:
+        return {
+            executor_id: container_name
+            for executor_id, container_name in value.items()
+            if container_name.startswith(FILLER_CONTAINER_PREFIX)
+        }
 
 
 class ExecutorUptimeResponse(BaseModel):
