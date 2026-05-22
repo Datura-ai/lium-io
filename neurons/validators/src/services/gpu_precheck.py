@@ -12,7 +12,7 @@ from typing import Optional
 
 from .gpu_spec_table import (
     KNOWN_UNRANGED,
-    get_expected_vram_range,
+    get_expected_vram_windows,
     normalize_gpu_model,
 )
 
@@ -28,7 +28,7 @@ class UnsupportedGpuModelError(GpuPrecheckError):
 
 
 class VramRangeMismatchError(GpuPrecheckError):
-    """gpu_capacity_mb is outside the expected range for the normalized model."""
+    """gpu_capacity_mb falls in none of the expected windows for the normalized model."""
 
 
 class MissingGpuFieldError(GpuPrecheckError):
@@ -41,7 +41,7 @@ def precheck_gpu_spec(gpu_model: Optional[str], gpu_capacity_mb: int) -> None:
     Raises:
         MissingGpuFieldError: gpu_model empty or gpu_capacity_mb <= 0.
         UnsupportedGpuModelError: normalized model not in GPU_VRAM_RANGES.
-        VramRangeMismatchError: VRAM outside the expected range.
+        VramRangeMismatchError: VRAM falls in none of the expected windows.
 
     Returns:
         None on pass (including models in KNOWN_UNRANGED).
@@ -59,14 +59,13 @@ def precheck_gpu_spec(gpu_model: Optional[str], gpu_capacity_mb: int) -> None:
         logger.debug("precheck: %r in KNOWN_UNRANGED; passthrough", normalized)
         return
 
-    rng = get_expected_vram_range(normalized)
-    if rng is None:
+    windows = get_expected_vram_windows(normalized)
+    if windows is None:
         raise UnsupportedGpuModelError(
-            f"no VRAM range for normalized model {normalized!r} (raw={raw!r})"
+            f"no VRAM windows for normalized model {normalized!r} (raw={raw!r})"
         )
 
-    vmin, vmax = rng
-    if not (vmin <= gpu_capacity_mb <= vmax):
+    if not any(vmin <= gpu_capacity_mb <= vmax for vmin, vmax in windows):
         raise VramRangeMismatchError(
-            f"gpu_capacity_mb={gpu_capacity_mb} outside [{vmin},{vmax}] for {normalized!r}"
+            f"gpu_capacity_mb={gpu_capacity_mb} in none of {windows} for {normalized!r}"
         )
