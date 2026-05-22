@@ -45,6 +45,27 @@ class VerifyXCheck:
                 check_id=self.check_id,
             )
             return CheckResult(passed=False, event=event)
+
+        filler_container = _get_filler_only_container(ctx)
+        if filler_container:
+            updated_specs = _with_last_known_verifyx_ema(ctx)
+            event = render_message(
+                Msg.FILLER_SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "filler_container": filler_container,
+                    "ema_verifyx_download_speed": (
+                        (updated_specs.get("network") or {}).get("ema_verifyx_download_speed")
+                    ),
+                },
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={"state": replace(ctx.state, specs=updated_specs)},
+            )
+
         result = await verifyx_service.validate_verifyx_and_process_job(
             shell=ctx.services.shell,
             executor_info=ctx.executor,
@@ -158,6 +179,32 @@ _FAILURE_TEMPLATE_BY_CLASS = {
     "EMPTY_RESPONSE": Msg.VERIFY_FAILED_EMPTY_RESPONSE,
     "CIPHER_REJECTED": Msg.VERIFY_FAILED_CIPHER_REJECTED,
 }
+
+
+def _get_filler_only_container(ctx: Context) -> str | None:
+    rented_data = ctx.state.rented_data
+    if not rented_data:
+        return None
+
+    filler_container = rented_data.get_filler_container(ctx.executor.uuid)
+    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    has_customer_rental = bool(rented_executor and rented_executor.pods)
+    return filler_container if filler_container and not has_customer_rental else None
+
+
+def _with_last_known_verifyx_ema(ctx: Context) -> dict:
+    specs = dict(ctx.state.specs or {})
+    rented_data = ctx.state.rented_data
+    network_ema = rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
+    if not network_ema or network_ema.ema_verifyx_download_speed is None:
+        return specs
+
+    network = dict(specs.get("network") or {})
+    network.setdefault("ema_verifyx_download_speed", network_ema.ema_verifyx_download_speed)
+    if network_ema.ema_verifyx_upload_speed is not None:
+        network.setdefault("ema_verifyx_upload_speed", network_ema.ema_verifyx_upload_speed)
+    specs["network"] = network
+    return specs
 
 
 def _to_iso(value: Any) -> Any:

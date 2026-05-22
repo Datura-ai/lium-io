@@ -25,10 +25,7 @@ class PortCountCheck:
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
-        filler_container = (
-            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
-            if rented_data else None
-        )
+        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
         active_runtime = is_rented or bool(filler_container)
 
         if active_runtime:

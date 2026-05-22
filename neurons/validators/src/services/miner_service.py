@@ -538,6 +538,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=msg,
                 error_type=FailedContainerErrorTypes.UnknownRequest,
                 error_code=error_code,

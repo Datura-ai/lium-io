@@ -10,7 +10,7 @@ from neurons.validators.src.services.task.checks.rented_machine import (
     _collect_pod_diagnostics,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
-from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutor, RentedExecutorsResponse, RentedPod
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 
@@ -627,7 +627,7 @@ async def test_tenant_enforcement_keeps_pod_not_running_for_non_transport_errors
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_protects_filler_only_without_marking_rented(context_factory):
+async def test_tenant_enforcement_marks_filler_only_as_not_rented_without_halting(context_factory):
     executor_uuid = "executor-123"
     filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     ssh_client = DummySSHClient()
@@ -642,12 +642,6 @@ async def test_tenant_enforcement_protects_filler_only_without_marking_rented(co
         rented_data=RentedExecutorsResponse(
             executors={},
             filler_containers_by_executor={executor_uuid: filler_container},
-            network_ema={
-                executor_uuid: NetworkEMA(
-                    ema_verifyx_download_speed=250.0,
-                    ema_verifyx_upload_speed=50.0,
-                )
-            },
         ),
     )
     ctx = context_factory(
@@ -661,18 +655,17 @@ async def test_tenant_enforcement_protects_filler_only_without_marking_rented(co
     result = await TenantEnforcementCheck().run(ctx)
 
     assert result.passed is True
-    assert result.halt is True
+    assert result.halt is False
     assert result.event.reason_code == Msg.NOT_RENTED.reason
+    assert result.event.what_we_saw["filler_container"] == filler_container
     assert result.updates["rented"] is False
-    assert result.updates["success"] is True
-    assert score_calculator.called_with["rented"] is False
-    assert score_calculator.called_with["ctx"].state.specs["network"]["ema_verifyx_download_speed"] == 250.0
-    assert score_calculator.called_with["ctx"].state.specs["network"]["ema_verifyx_upload_speed"] == 50.0
+    assert "success" not in result.updates
+    assert score_calculator.called_with is None
     assert not any("docker ps" in cmd for cmd in ssh_client.commands_called)
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_rejects_unmapped_filler_process(context_factory):
+async def test_tenant_enforcement_keeps_filler_only_not_rented_for_unmapped_process(context_factory):
     executor_uuid = "executor-123"
     filler_container = "filler_active"
     services = build_services(
@@ -694,9 +687,10 @@ async def test_tenant_enforcement_rejects_unmapped_filler_process(context_factor
 
     result = await TenantEnforcementCheck().run(ctx)
 
-    assert result.passed is False
-    assert result.event.reason_code == Msg.GPU_OUTSIDE_TENANT.reason
-    assert result.event.what_we_saw["expected_containers"] == [filler_container]
+    assert result.passed is True
+    assert result.halt is False
+    assert result.event.reason_code == Msg.NOT_RENTED.reason
+    assert result.event.what_we_saw["filler_container"] == filler_container
 
 
 @pytest.mark.asyncio

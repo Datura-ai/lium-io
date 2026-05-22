@@ -1793,6 +1793,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerStopFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -1859,6 +1860,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerStartFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -2063,6 +2065,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -2107,6 +2110,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                     jupyter_url=f"http://{executor_info.address}:{payload.jupyter_port_map[1]}/lab?token={jupyter_token}",
                 )
         except Exception as e:
@@ -2120,6 +2124,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
             )
 
@@ -2167,6 +2172,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -2195,6 +2201,7 @@ class DockerService:
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
                         pod_id=payload.pod_id,
+                        workload_kind=payload.workload_kind,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -2232,6 +2239,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -2245,6 +2253,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -2294,6 +2303,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
@@ -2322,6 +2332,7 @@ class DockerService:
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
                         pod_id=payload.pod_id,
+                        workload_kind=payload.workload_kind,
                         msg=str(log_text),
                         error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                         error_code=FailedContainerErrorCodes.NoSshKeys,
@@ -2345,6 +2356,7 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
                     pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
                     user_public_keys=payload.user_public_keys,
                 )
         except Exception as e:
@@ -2358,6 +2370,7 @@ class DockerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,

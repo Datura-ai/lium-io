@@ -85,6 +85,9 @@ class RentedExecutorsResponse(BaseModel):
             if container_name.startswith(FILLER_CONTAINER_PREFIX)
         }
 
+    def get_filler_container(self, executor_uuid: str) -> str | None:
+        return self.filler_containers_by_executor.get(str(executor_uuid))
+
 
 class ExecutorUptimeResponse(BaseModel):
     executor_ip_address: str

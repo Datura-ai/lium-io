@@ -34,10 +34,7 @@ class PortConnectivityCheck:
         rented_ports = rented_executor.get_rented_ports() if rented_executor else []
         rented_pod_names = [p.container_name for p in rented_executor.pods] if rented_executor else []
         has_customer_rental = bool(rented_executor and rented_executor.pods)
-        filler_container = (
-            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
-            if rented_data else None
-        )
+        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
 
         if has_customer_rental or filler_container:
             verified_ports = ctx.state.specs.get("verified_ports", [])

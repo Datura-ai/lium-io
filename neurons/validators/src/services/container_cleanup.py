@@ -192,7 +192,7 @@ class ContainerCleanup:
         if executor:
             rented_containers.update(pod.container_name for pod in executor.pods)
 
-        filler_container = rented_data.filler_containers_by_executor.get(executor_uuid)
+        filler_container = rented_data.get_filler_container(executor_uuid)
         if filler_container:
             rented_containers.add(filler_container)
 

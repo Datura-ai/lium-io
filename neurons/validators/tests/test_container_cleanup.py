@@ -63,6 +63,7 @@ def _rented_data(executor_uuid: str, pods: list[str]):
     resp = MagicMock()
     resp.executors = {executor_uuid: executor_mock}
     resp.filler_containers_by_executor = {}
+    resp.get_filler_container.side_effect = lambda key: resp.filler_containers_by_executor.get(str(key))
     return resp
 
 
