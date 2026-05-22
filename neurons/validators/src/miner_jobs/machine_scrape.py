@@ -101,6 +101,7 @@ COMMANDS = {
         "--gpus", "all",
         "daturaai/compute-subnet-executor:latest", "nvidia-smi"
     ],
+    "GET_DOCKER_INFO": ["docker", "info"],
 }
 
 
@@ -892,13 +893,88 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
 
 
 
+def _normalize_docker_info_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+
+
+def _parse_docker_storage_info(docker_info: str) -> dict[str, str]:
+    storage_info = {}
+    in_storage_section = False
+
+    for line in docker_info.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("Storage Driver:"):
+            storage_info["storage_driver"] = stripped.split(":", 1)[1].strip().lower()
+            in_storage_section = True
+            continue
+
+        if not in_storage_section:
+            continue
+
+        if not line[:1].isspace() and ":" in stripped:
+            break
+
+        if ":" in stripped:
+            key, value = stripped.split(":", 1)
+            storage_info[_normalize_docker_info_key(key)] = value.strip().lower()
+
+    return storage_info
+
+
+def _docker_info_supports_storage_limit(docker_info: str) -> tuple[bool, str]:
+    storage_info = _parse_docker_storage_info(docker_info)
+    storage_driver = storage_info.get("storage_driver", "")
+
+    if storage_driver == "overlay2":
+        backing_filesystem = storage_info.get("backing_filesystem", "")
+        if backing_filesystem == "xfs":
+            if storage_info.get("supports_d_type") == "false":
+                return False, "Docker overlay2 storage driver uses xfs without d_type support."
+            return True, "Docker overlay2 storage driver uses xfs backing filesystem."
+
+        return (
+            False,
+            "Docker overlay2 storage driver requires xfs backing filesystem for storage limits; "
+            f"found {backing_filesystem or 'unknown'}.",
+        )
+
+    if storage_driver == "overlayfs":
+        return False, "Docker uses containerd overlayfs snapshotter, which does not support size storage-opt."
+
+    if not storage_driver:
+        return False, "Docker storage driver was not found in docker info."
+
+    return False, f"Docker storage driver {storage_driver} is not supported for size storage-opt."
+
+
 def check_storage_limit_ability() -> tuple[bool, str]:
     """
     Checks if the system supports limiting the storage size of a container.
     """
+    docker_info_command = COMMANDS["GET_DOCKER_INFO"]
     test_command = COMMANDS["CHECK_STORAGE_LIMIT_ABILITY"]
 
     try:
+        info_result = subprocess.run(
+            docker_info_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30
+        )
+
+        if info_result.returncode != 0:
+            return False, "Docker info command failed."
+
+        docker_info_supported, docker_info_message = _docker_info_supports_storage_limit(
+            info_result.stdout
+        )
+        if not docker_info_supported:
+            return False, docker_info_message
+
         result = subprocess.run(
             test_command,
             stdout=subprocess.PIPE,
@@ -910,7 +986,7 @@ def check_storage_limit_ability() -> tuple[bool, str]:
         if result.returncode == 0:
             return True, "Storage limit is supported."
         else:
-            return False, "Storage limit is not supported."
+            return False, f"Storage limit is not supported. {docker_info_message}"
 
     except subprocess.TimeoutExpired:
         return False, "Test command timed out."
