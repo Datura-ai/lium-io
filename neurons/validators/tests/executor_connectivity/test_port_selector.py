@@ -74,3 +74,12 @@ def test_port_selector_empty_when_all_rented():
     result = selector.select(info, size=2, rented={9000, 9001})
 
     assert result == []
+
+
+def test_port_selector_empty_when_runtime_active():
+    info = _executor_info(port_range="9000-9001")
+
+    selector = PortSelector()
+    result = selector.select(info, size=2, rented=set(), runtime_active=True)
+
+    assert result == []

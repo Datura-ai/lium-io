@@ -25,6 +25,25 @@ class PortCountCheck:
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
+        filler_container = (
+            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
+            if rented_data else None
+        )
+        active_runtime = is_rented or bool(filler_container)
+
+        if active_runtime:
+            preserved_count = ctx.state.specs.get("available_port_count", port_count)
+            event = render_message(
+                Msg.PORT_COUNT_RECORDED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"available_port_count": preserved_count},
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={"port_count": preserved_count, "state": ctx.state},
+            )
 
         updated_state = replace(
             ctx.state,
@@ -36,7 +55,7 @@ class PortCountCheck:
             },
         )
 
-        if not is_rented and port_count < MIN_PORT_COUNT:
+        if port_count < MIN_PORT_COUNT:
             event = render_message(
                 Msg.INSUFFICIENT_PORTS,
                 ctx=ctx,

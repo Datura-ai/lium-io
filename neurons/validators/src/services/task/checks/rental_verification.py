@@ -39,6 +39,30 @@ class RentalVerificationCheck:
                 updates={},
             )
 
+        rented_data = ctx.state.rented_data
+        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        has_customer_rental = bool(rented_executor and rented_executor.pods)
+        filler_container = (
+            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
+            if rented_data else None
+        )
+        if filler_container and not has_customer_rental:
+            event = render_message(
+                Msg.SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "skipped": True,
+                    "reason": "active filler runtime",
+                    "filler_container": filler_container,
+                },
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={},
+            )
+
         # Get required info from context
         backend_client = ctx.services.backend
         executor = ctx.executor

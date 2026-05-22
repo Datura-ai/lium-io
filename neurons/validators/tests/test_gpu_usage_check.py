@@ -1,6 +1,7 @@
 import pytest
 
 from neurons.validators.src.services.const import POD_CONTAINER_PREFIX
+from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 
@@ -107,3 +108,41 @@ async def test_gpu_usage_orphaned_container(context_factory):
     assert result.event.what_we_saw.get("rental_status") == "ended"
     assert result.event.what_we_saw.get("container_status") == "still running"
     assert f"docker stop {container_name}" in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_gpu_usage_allows_exact_mapped_filler_container(context_factory):
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 3217038, "container_name": filler_container}],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            filler_containers_by_executor={"executor-123": filler_container},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+    assert result.event.what_we_saw["filler_container"] == filler_container
+
+
+@pytest.mark.asyncio
+async def test_gpu_usage_rejects_unmapped_filler_container(context_factory):
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 3217038, "container_name": "filler_other"}],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            filler_containers_by_executor={"executor-123": "filler_active"},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason

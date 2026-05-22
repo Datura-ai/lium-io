@@ -94,6 +94,14 @@ def build_rented_data(
     )
 
 
+def build_filler_data(executor_uuid: str, filler_container: str) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={executor_uuid: filler_container},
+        banned_guids=[],
+    )
+
+
 class DummySSHClient:
     """Mock SSH client for pod health and SSH keys checks."""
 
@@ -616,3 +624,102 @@ async def test_tenant_enforcement_keeps_pod_not_running_for_non_transport_errors
     assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
     assert result.updates.get("clear_verified_job_info") is True
     assert result.updates.get("clear_verified_job_reason") == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_protects_filler_only_without_marking_rented(context_factory):
+    executor_uuid = "executor-123"
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    ssh_client = DummySSHClient()
+    score_calculator = DummyScoreCalculator(actual_score=0.7, job_score=0.7)
+    services = build_services(
+        score_calculator=score_calculator,
+        container_cleanup=MockContainerCleanup(),
+    )
+    state = build_state(
+        gpu_processes=[{"container_name": filler_container, "pid": 1234}],
+        gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
+        rented_data=build_filler_data(executor_uuid, filler_container),
+    )
+    ctx = context_factory(
+        services=services,
+        state=state,
+        ssh=ssh_client,
+        collateral_deposited=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.halt is True
+    assert result.event.reason_code == Msg.NOT_RENTED.reason
+    assert result.updates["rented"] is False
+    assert result.updates["success"] is True
+    assert score_calculator.called_with["rented"] is False
+    assert not any("docker ps" in cmd for cmd in ssh_client.commands_called)
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_rejects_unmapped_filler_process(context_factory):
+    executor_uuid = "executor-123"
+    filler_container = "filler_active"
+    services = build_services(
+        score_calculator=DummyScoreCalculator(),
+        container_cleanup=MockContainerCleanup(),
+    )
+    state = build_state(
+        gpu_processes=[{"container_name": "filler_other", "pid": 1234}],
+        gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
+        rented_data=build_filler_data(executor_uuid, filler_container),
+    )
+    ctx = context_factory(
+        services=services,
+        state=state,
+        ssh=DummySSHClient(),
+        collateral_deposited=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_OUTSIDE_TENANT.reason
+    assert result.event.what_we_saw["expected_containers"] == [filler_container]
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_allows_mapped_filler_with_customer_rental(context_factory):
+    executor_uuid = "executor-123"
+    pod_container = "tenant-123"
+    filler_container = "filler_active"
+    rented_data = build_rented_data(
+        executor_uuid,
+        {"containers": [{"name": pod_container, "pod_id": "pod-1"}], "owner_flag": False},
+    )
+    rented_data.filler_containers_by_executor[executor_uuid] = filler_container
+    score_calculator = DummyScoreCalculator(actual_score=1.0, job_score=1.0)
+    services = build_services(
+        score_calculator=score_calculator,
+        container_cleanup=MockContainerCleanup(),
+    )
+    state = build_state(
+        gpu_processes=[{"container_name": filler_container, "pid": 1234}],
+        gpu_details=[{"gpu_utilization": 95, "memory_utilization": 80}],
+        rented_data=rented_data,
+    )
+    ctx = context_factory(
+        services=services,
+        state=state,
+        ssh=DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa AAA..."]),
+        collateral_deposited=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.halt is True
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert result.updates["rented"] is True
+    assert score_calculator.called_with["rented"] is True

@@ -101,9 +101,71 @@ class TenantEnforcementCheck:
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        filler_container = (
+            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
+            if rented_data else None
+        )
 
         if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}
+            if filler_container:
+                extra["filler_container"] = filler_container
+                gpu_processes = list(ctx.state.gpu_processes)
+                gpu_running_outside = _has_gpu_process_outside_container(
+                    [filler_container],
+                    gpu_processes,
+                )
+                if gpu_running_outside and not _is_gpu_usage_within_limits(ctx.state.gpu_details, gpu_processes):
+                    observation = _gpu_usage_violation_details(ctx.state.gpu_details, gpu_processes)
+                    event = render_message(
+                        Msg.GPU_OUTSIDE_TENANT,
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        what={
+                            "expected_containers": [filler_container],
+                            "process_count": observation["process_count"],
+                            "gpu_utilization": observation["gpu_utilization"],
+                            "vram_utilization": observation["vram_utilization"],
+                            "gpu_processes": gpu_processes,
+                        },
+                        extra=extra,
+                    )
+                    return CheckResult(
+                        passed=False,
+                        event=event,
+                        updates={"default_extra": extra},
+                    )
+
+                score_calculator = ctx.services.score_calculator
+                actual_score, job_score, warning_message = score_calculator(ctx, False)
+                event = render_message(
+                    Msg.NOT_RENTED,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    impact=f"Active filler runtime preserved; reported unrented score={job_score} (actual={actual_score})",
+                    what={
+                        "executor_uuid": ctx.executor.uuid,
+                        "filler_container": filler_container,
+                    },
+                    extra=extra,
+                )
+                return CheckResult(
+                    passed=True,
+                    event=event,
+                    updates={
+                        "default_extra": extra,
+                        "rented": False,
+                        "ssh_pub_keys": None,
+                        "score": actual_score,
+                        "job_score": job_score,
+                        "score_warning": warning_message or None,
+                        "log_status": "info",
+                        "log_text": event.event,
+                        "success": True,
+                    },
+                    halt=True,
+                )
+
             event = render_message(
                 Msg.NOT_RENTED,
                 ctx=ctx,
@@ -181,6 +243,8 @@ class TenantEnforcementCheck:
                 )
 
         container_names = [pod.container_name for pod in rented_pods]
+        if filler_container:
+            container_names.append(filler_container)
         gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
 
@@ -370,4 +434,3 @@ async def _collect_host_context(ssh_client) -> dict:
         result["executor_container_error"] = str(exc)
 
     return result
-

@@ -44,6 +44,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.utils import _m, get_extra_info, retry_ssh_command
 from services.const import (
+    FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
@@ -638,7 +639,15 @@ class DockerService:
                 or name.startswith(POD_CONTAINER_PREFIX)
                 or name.startswith(FILLER_CONTAINER_PREFIX)
             ]
-            stale_containers = [name for name in pod_containers if name not in active_set]
+            stale_containers = []
+            for name in pod_containers:
+                if name in active_set:
+                    continue
+                if name.startswith(FILLER_CONTAINER_PREFIX):
+                    age_minutes = await self._get_container_age_minutes(ssh_client, name)
+                    if age_minutes is not None and age_minutes < FILLER_CONTAINER_GRACE_MINUTES:
+                        continue
+                stale_containers.append(name)
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return
@@ -672,6 +681,39 @@ class DockerService:
                     volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+
+    async def _get_container_age_minutes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+    ) -> float | None:
+        try:
+            quoted_name = shlex.quote(container_name)
+            created_result = await ssh_client.run(
+                f"/usr/bin/docker inspect {quoted_name} "
+                "--format '{{json .Created}}' | xargs -I {} date -d {} +%s"
+            )
+            if getattr(created_result, "exit_status", 0) != 0:
+                return None
+
+            current_result = await ssh_client.run("date +%s")
+            if getattr(current_result, "exit_status", 0) != 0:
+                return None
+
+            created_timestamp = int(created_result.stdout.strip())
+            current_timestamp = int(current_result.stdout.strip())
+            return (current_timestamp - created_timestamp) / 60
+        except Exception as e:
+            logger.warning(
+                _m(
+                    "Error checking filler container age",
+                    extra=get_extra_info({
+                        "container_name": container_name,
+                        "error": str(e),
+                    }),
+                )
+            )
+            return None
 
     async def clean_stale_vloopback_volumes(
         self,

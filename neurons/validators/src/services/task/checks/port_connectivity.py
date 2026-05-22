@@ -33,6 +33,40 @@ class PortConnectivityCheck:
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         rented_ports = rented_executor.get_rented_ports() if rented_executor else []
         rented_pod_names = [p.container_name for p in rented_executor.pods] if rented_executor else []
+        has_customer_rental = bool(rented_executor and rented_executor.pods)
+        filler_container = (
+            rented_data.filler_containers_by_executor.get(ctx.executor.uuid)
+            if rented_data else None
+        )
+
+        if has_customer_rental or filler_container:
+            verified_ports = ctx.state.specs.get("verified_ports", [])
+            verified_port_count = ctx.state.verified_port_count or len(verified_ports)
+            extra_info = {
+                "sysbox_runtime": ctx.state.sysbox_runtime,
+                "verified_port_count": verified_port_count,
+            }
+            runtime_kind = "customer_rental" if has_customer_rental else "filler"
+            updated_state = replace(ctx.state, verified_port_count=verified_port_count)
+            event = render_message(
+                Msg.VERIFY_OK,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "message": (
+                        f"active {runtime_kind} runtime detected; preserving last-known port inventory"
+                    )
+                },
+                extra=extra_info,
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={
+                    "default_extra": {**extra, **extra_info},
+                    "state": updated_state,
+                },
+            )
 
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(

@@ -8,6 +8,7 @@ import aiohttp
 from pydantic import BaseModel
 
 from neurons.validators.src.clients.backend_client import BackendClient
+from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
 
 class SampleResponse(BaseModel):
@@ -224,3 +225,54 @@ async def test_per_request_timeout_still_enforced(reset_session, mock_keypair):
     finally:
         await BackendClient.close_session()
         await runner.cleanup()
+
+
+def test_rented_executors_response_defaults_filler_mapping():
+    result = RentedExecutorsResponse.model_validate({"executors": {}})
+
+    assert result.executors == {}
+    assert result.filler_containers_by_executor == {}
+
+
+def test_rented_executors_response_keeps_customer_rentals_separate_from_filler():
+    result = RentedExecutorsResponse.model_validate(
+        {
+            "executors": {
+                "executor-123": {
+                    "miner_hotkey": "miner-hotkey",
+                    "executor_ip_address": "127.0.0.1",
+                    "executor_ip_port": "22",
+                    "pods": [
+                        {
+                            "pod_id": "pod-1",
+                            "container_name": "pod_pod-1",
+                            "rented_ports": [8080],
+                        }
+                    ],
+                }
+            },
+            "filler_containers_by_executor": {"executor-123": "filler_active"},
+        }
+    )
+
+    assert result.executors["executor-123"].pods[0].container_name == "pod_pod-1"
+    assert result.filler_containers_by_executor == {"executor-123": "filler_active"}
+
+
+@pytest.mark.asyncio
+async def test_get_all_rented_executors_parses_filler_mapping(reset_session, client):
+    response_data = {
+        "executors": {},
+        "filler_containers_by_executor": {
+            "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+        },
+    }
+    mock_response = create_mock_response(200, response_data)
+    mock_session = create_mock_session(mock_response, "get")
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        result = await client.get_all_rented_executors()
+
+    assert result is not None
+    assert result.executors == {}
+    assert result.filler_containers_by_executor == response_data["filler_containers_by_executor"]
