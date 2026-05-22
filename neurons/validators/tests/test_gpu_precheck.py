@@ -126,10 +126,53 @@ def test_gpu_model_rates_parity():
 
 
 def test_gpu_vram_ranges_well_formed():
-    """Every range tuple is (int, int) with vmin <= vmax and both positive."""
-    for model, rng in gpu_spec_table.GPU_VRAM_RANGES.items():
-        assert isinstance(rng, tuple) and len(rng) == 2, f"{model}: not a 2-tuple"
-        vmin, vmax = rng
-        assert isinstance(vmin, int) and isinstance(vmax, int), f"{model}: non-int bounds"
-        assert vmin > 0 and vmax > 0, f"{model}: non-positive bounds"
-        assert vmin <= vmax, f"{model}: vmin {vmin} > vmax {vmax}"
+    """Every model maps to a non-empty list of (int, int) windows with
+    vmin <= vmax, both positive, and windows sorted/non-overlapping."""
+    for model, windows in gpu_spec_table.GPU_VRAM_RANGES.items():
+        assert isinstance(windows, list) and windows, f"{model}: not a non-empty list"
+        prev_max = None
+        for rng in windows:
+            assert isinstance(rng, tuple) and len(rng) == 2, f"{model}: window not a 2-tuple"
+            vmin, vmax = rng
+            assert isinstance(vmin, int) and isinstance(vmax, int), f"{model}: non-int bounds"
+            assert vmin > 0 and vmax > 0, f"{model}: non-positive bounds"
+            assert vmin <= vmax, f"{model}: vmin {vmin} > vmax {vmax}"
+            if prev_max is not None:
+                assert vmin > prev_max, f"{model}: windows overlap/unsorted at {rng}"
+            prev_max = vmax
+
+
+# --- Multi-variant: impostor rejection in the inter-variant gap -------------
+@pytest.mark.parametrize("model,mb", [
+    # Tesla V100 16/32 GB: a 24 GB reading (e.g. RTX 4090) must NOT pass.
+    ("NVIDIA Tesla V100 Tensor Core GPU", 24564),
+    # RTX 4060 Ti 8/16 GB: a 12 GB reading must NOT pass.
+    ("NVIDIA GeForce RTX 4060 Ti", 12030),
+    # Tesla M40 12/24 GB: 16 GB and 20 GB readings must NOT pass.
+    ("NVIDIA Tesla M40", 16376),
+    ("NVIDIA Tesla M40", 20480),
+    # RTX A2000 6/12 GB: an 8 GB reading must NOT pass.
+    ("NVIDIA RTX A2000", 8192),
+    # B200 192 GB only: the ~48 GB MIG/outlier and an 80 GB H100 must NOT pass.
+    ("NVIDIA B200", 49140),
+    ("NVIDIA B200", 81559),
+])
+def test_multivariant_intermediate_rejected(model, mb):
+    with pytest.raises(VramRangeMismatchError):
+        precheck_gpu_spec(model, mb)
+
+
+@pytest.mark.parametrize("model,mb", [
+    # Each real variant of a multi-variant card must pass.
+    ("NVIDIA Tesla V100 Tensor Core GPU", 16384),   # 16 GB
+    ("NVIDIA Tesla V100 Tensor Core GPU", 32768),   # 32 GB
+    ("NVIDIA GeForce RTX 4060 Ti", 8192),           # 8 GB
+    ("NVIDIA GeForce RTX 4060 Ti", 16376),          # 16 GB
+    ("NVIDIA Tesla M40", 12288),                    # 12 GB
+    ("NVIDIA Tesla M40", 24564),                    # 24 GB
+    ("NVIDIA RTX PRO 5000 Blackwell", 49140),       # 48 GB
+    ("NVIDIA RTX PRO 5000 Blackwell", 73728),       # 72 GB (previously false-rejected)
+    ("NVIDIA B200", 183359),                        # 192 GB
+])
+def test_multivariant_real_variants_pass(model, mb):
+    assert precheck_gpu_spec(model, mb) is None
