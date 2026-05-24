@@ -11,6 +11,7 @@ from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerStartRequest,
     PayloadPortMapping,
+    WorkloadKind,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -509,6 +510,31 @@ async def test_reserve_ports_with_backend_data(docker_service, test_executor_id,
     assert 22 in docker_ports_used  # SSH port should be included
     external_ports_used = {m[2] for m in result}
     assert external_ports_used.issubset({20000, 20001, 20002})
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_offsets_filler_custom_external_port(
+    docker_service,
+    test_executor_id,
+    test_miner_hotkey,
+):
+    available_ports_raw = [
+        PayloadPortMapping(internal_port=p, external_port=p, docker_port=None)
+        for p in range(20000, 20026)
+    ]
+
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey,
+        test_executor_id,
+        UUID(test_executor_id),
+        [20000],
+        available_ports_raw=available_ports_raw,
+        pod_mapping_raw=[],
+        workload_kind=WorkloadKind.FILLER,
+    )
+
+    assert (20000, 20020, 20020) in result
+    assert (20000, 20000, 20000) not in result
 
 
 @pytest.mark.asyncio

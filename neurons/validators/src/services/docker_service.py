@@ -85,6 +85,7 @@ _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
 _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
+_FILLER_EXTERNAL_PORT_OFFSET = 20
 
 
 class DockerService:
@@ -219,7 +220,8 @@ class DockerService:
         initial_port_count: int | None = None,
         enable_jupyter: bool | None = False,
         available_ports_raw: list[PayloadPortMapping] | None = None,
-        pod_mapping_raw: list[PayloadPortMapping] | None = None
+        pod_mapping_raw: list[PayloadPortMapping] | None = None,
+        workload_kind: WorkloadKind | None = None,
     ) -> tuple[list[tuple[int, int, int]], tuple[int, int] | None]:
         executor_uuid = UUID(executor_id)
 
@@ -276,7 +278,16 @@ class DockerService:
                     if not len(available_ports):
                         break
 
-                    if port in available_ports:
+                    filler_external_port = port + _FILLER_EXTERNAL_PORT_OFFSET
+                    if (
+                        workload_kind == WorkloadKind.FILLER
+                        and user_defined
+                        and port not in {ssh_port, jupyter_port}
+                        and filler_external_port in available_ports
+                    ):
+                        docker_port = port
+                        external_port = filler_external_port
+                    elif port in available_ports:
                         docker_port = port
                         external_port = port
                     elif port == ssh_port or port == jupyter_port:
@@ -1226,7 +1237,15 @@ class DockerService:
             custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
             port_maps, jupyter_port_map = await self.generate_portMappings(
-                payload.miner_hotkey, payload.executor_id, UUID(payload.pod_id), custom_options.internal_ports, custom_options.initial_port_count, payload.enable_jupyter, payload.available_ports, payload.pod_mapping
+                payload.miner_hotkey,
+                payload.executor_id,
+                UUID(payload.pod_id),
+                custom_options.internal_ports,
+                custom_options.initial_port_count,
+                payload.enable_jupyter,
+                payload.available_ports,
+                payload.pod_mapping,
+                payload.workload_kind,
             )
 
             # Add profiler for port mappings generation

@@ -68,7 +68,7 @@ async def test_port_count_insufficient_passes_when_rented(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_port_count_preserves_inventory_when_filler_active(context_factory):
+async def test_port_count_records_inventory_when_filler_active(context_factory):
     rented_data = RentedExecutorsResponse(
         executors={},
         filler_containers_by_executor={"executor-123": "filler_active"},
@@ -81,7 +81,7 @@ async def test_port_count_preserves_inventory_when_filler_active(context_factory
     ctx = context_factory(
         state=build_state(
             specs=specs,
-            verified_port_count=0,
+            verified_port_count=MIN_PORT_COUNT + 1,
             rented_data=rented_data,
         )
     )
@@ -90,5 +90,5 @@ async def test_port_count_preserves_inventory_when_filler_active(context_factory
 
     assert result.passed is True
     assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
-    assert result.updates["port_count"] == 3
-    assert result.updates["state"].specs == specs
+    assert result.updates["port_count"] == MIN_PORT_COUNT + 1
+    assert result.updates["state"].specs["available_port_count"] == MIN_PORT_COUNT + 1

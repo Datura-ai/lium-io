@@ -188,8 +188,8 @@ async def test_port_connectivity_check(
 
 
 @pytest.mark.asyncio
-async def test_port_connectivity_preserves_inventory_when_filler_active(context_factory):
-    connectivity_service = DummyConnectivityService(success=True, verified_port_count=100)
+async def test_port_connectivity_runs_when_filler_active(context_factory):
+    connectivity_service = DummyConnectivityService(success=True, verified_port_count=4)
     services = build_services(
         backend=DummyBackendService(),
         connectivity=connectivity_service,
@@ -212,6 +212,6 @@ async def test_port_connectivity_preserves_inventory_when_filler_active(context_
 
     assert result.passed is True
     assert result.event.reason_code == Msg.VERIFY_OK.reason
-    assert connectivity_service.called_with is None
-    assert result.updates["state"].specs == state.specs
-    assert result.updates["state"].verified_port_count == 3
+    assert connectivity_service.called_with is not None
+    assert result.updates["state"].specs["verified_ports"] == [8000, 8001, 8002, 8003]
+    assert result.updates["state"].verified_port_count == 4
