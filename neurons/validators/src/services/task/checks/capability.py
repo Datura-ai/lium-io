@@ -25,6 +25,16 @@ class CapabilityCheck:
             )
             return CheckResult(passed=False, event=event)
 
+        filler_container = _get_filler_only_container(ctx)
+        if filler_container:
+            event = render_message(
+                Msg.FILLER_SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"filler_container": filler_container},
+            )
+            return CheckResult(passed=True, event=event)
+
         validation_service = ctx.services.validation
 
         result = None
@@ -67,3 +77,14 @@ class CapabilityCheck:
             what=failure_details,
         )
         return CheckResult(passed=False, event=event)
+
+
+def _get_filler_only_container(ctx: Context) -> str | None:
+    rented_data = ctx.state.rented_data
+    if not rented_data:
+        return None
+
+    filler_container = rented_data.get_filler_container(ctx.executor.uuid)
+    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    has_customer_rental = bool(rented_executor and rented_executor.pods)
+    return filler_container if filler_container and not has_customer_rental else None

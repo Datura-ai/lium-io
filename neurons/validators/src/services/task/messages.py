@@ -635,6 +635,13 @@ class CapabilityMessages:
         category="env",
         impact="Proceed",
     )
+    FILLER_SKIPPED = MessageTemplate(
+        event="GPU capability validation skipped for active filler",
+        reason="GPU_VERIFY_SKIPPED_ACTIVE_FILLER",
+        severity="info",
+        category="policy",
+        impact="Active filler runtime preserved; capability probe would compete for VRAM.",
+    )
     VERIFY_FAILED = MessageTemplate(
         event="GPU capability verification failed",
         reason="GPU_VERIFY_FAILED",
