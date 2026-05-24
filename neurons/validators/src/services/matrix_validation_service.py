@@ -1,7 +1,7 @@
 import time
 import random
 import logging
-import json 
+import json
 import os
 import uuid as uuid4
 from dataclasses import dataclass
@@ -193,13 +193,27 @@ class ValidationService:
             gpu_count = machine_spec.get("gpu", {}).get("count", 0)
             gpu_uuids = ','.join([detail.get('uuid', '') for detail in gpu_details])
 
-            gpu_info = {"uuids": gpu_uuids, "gpu_count": gpu_count, "gpu_model": gpu_model}
+            # NOTE: machine_info MUST exactly match what the executor's libdmcompverify
+            # reconstructs locally via getGPUInfo() — otherwise the hash-derived AES key
+            # will not match and the executor's decrypt will fail. Adding any new field
+            # to this JSON (e.g. gpu_capacity_mb) requires a corresponding change in the
+            # .so's getGPUInfo(). The Python-side pre-check below uses gpu_capacity_mb
+            # as a separate local variable; it is NEVER embedded into machine_info.
+            gpu_info = {
+                "uuids": gpu_uuids,
+                "gpu_count": gpu_count,
+                "gpu_model": gpu_model,
+            }
             machine_info = json.dumps(gpu_info, sort_keys=True)
+
+            # GPU model<->VRAM consistency is gated earlier in the pipeline by
+            # GpuVramPrecheck (before the rented short-circuit), so it is NOT
+            # repeated here. gpu_capacity_mb is still needed to size the matmul.
+            gpu_capacity_mb = self.get_gpu_memory(machine_spec)
 
             verifier_params = VerifierParams()
             verifier_params.generate()
-            gpu_memory = self.get_gpu_memory(machine_spec)
-            verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_memory, verifier_params.dim_n))
+            verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_capacity_mb, verifier_params.dim_n))
 
             verifier_params.cipher_text = self.encrypt_challenge(
                 verifier_params.dim_n,
@@ -208,8 +222,6 @@ class ValidationService:
                 machine_info,
                 verifier_params.uuid,
             )
-
-            command = f"{executor_info.python_path} {script_path} {verifier_params}"
 
             log_extra = {
                 **default_extra,
@@ -220,6 +232,20 @@ class ValidationService:
                 "cipher_text": verifier_params.cipher_text,
                 "machine_info": machine_info,
             }
+
+            # Short-circuit if encrypt_challenge returned empty. This happens when
+            # the native call raised. No point SSHing an empty cipher to the
+            # executor — it would surface as a misleading "UUID mismatch" downstream.
+            if not verifier_params.cipher_text:
+                error_msg = "Cipher text generation failed (native error)"
+                logger.warning(_m(error_msg, extra=get_extra_info(log_extra)))
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    error_message=error_msg,
+                )
+
+            command = f"{executor_info.python_path} {script_path} {verifier_params}"
 
             logger.info(_m("Matrix Multiplication Python Script Command", extra=get_extra_info(log_extra)))
 

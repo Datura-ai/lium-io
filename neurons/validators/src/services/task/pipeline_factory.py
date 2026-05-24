@@ -34,6 +34,7 @@ from .checks import (
     GpuFingerprintCheck,
     GpuModelValidCheck,
     GpuUsageCheck,
+    GpuVramPrecheck,
     MachineSpecScrapeCheck,
     NvmlDigestCheck,
     PortConnectivityCheck,
@@ -216,6 +217,10 @@ class PipelineFactory:
                 MachineSpecScrapeCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
+                # Pure-data model<->VRAM gate. No SSH/GPU dependency, so it runs
+                # here — before the rented short-circuit (TenantEnforcementCheck)
+                # — to gate rented and idle executors alike.
+                GpuVramPrecheck(),
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
@@ -256,6 +261,7 @@ class PipelineFactory:
                 MachineSpecScrapeCheck(),
                 GpuCountCheck(),
                 GpuModelValidCheck(),
+                GpuVramPrecheck(),
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
