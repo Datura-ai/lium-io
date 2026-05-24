@@ -3,6 +3,7 @@ import pytest
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.messages import CapabilityMessages as Msg
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -107,3 +108,59 @@ async def test_capability_check(
         assert validation_service.called_with is not None
         assert validation_service.called_with["machine_spec"] == specs
         assert validation_service.called_with["executor_info"] == ctx.executor
+
+
+@pytest.mark.asyncio
+async def test_capability_check_skips_active_filler_only_executor(context_factory):
+    validation_service = DummyValidationService(success=True)
+    services = build_services(validation=validation_service)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            filler_containers_by_executor={"executor-123": "filler_active"},
+        ),
+    )
+    ctx = context_factory(services=services, state=state)
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert result.event.what_we_saw == {"filler_container": "filler_active"}
+    assert validation_service.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_capability_check_runs_for_customer_rental_even_with_filler_mapping(context_factory):
+    validation_service = DummyValidationService(success=True)
+    services = build_services(validation=validation_service)
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        rented_data=RentedExecutorsResponse(
+            executors={
+                "executor-123": RentedExecutor(
+                    miner_hotkey="test-miner",
+                    executor_ip_address="127.0.0.1",
+                    executor_ip_port="22",
+                    pods=[
+                        RentedPod(
+                            pod_id="pod-1",
+                            container_name="container_test",
+                            rented_ports=[8080],
+                        )
+                    ],
+                )
+            },
+            banned_guids=[],
+            filler_containers_by_executor={"executor-123": "filler_active"},
+        ),
+    )
+    ctx = context_factory(services=services, state=state)
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFY_OK.reason
+    assert validation_service.called_with is not None
