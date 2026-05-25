@@ -1719,6 +1719,13 @@ class DockerService:
                 # Add profiler for ssh service installation
                 profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
 
+                if payload.workload_kind == WorkloadKind.FILLER:
+                    await self.redis_service.remove_pending_pod(
+                        payload.miner_hotkey,
+                        payload.executor_id,
+                        payload.pod_id,
+                    )
+
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
