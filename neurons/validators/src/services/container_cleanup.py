@@ -231,8 +231,8 @@ class ContainerCleanup:
     async def _remove_container(self, ssh_client, container_name: str) -> bool:
         """Remove a container and its associated resources."""
         try:
-            # Remove container
-            result = await ssh_client.run(DockerCommand.remove(container_name))
+            # Remove stale containers together with anonymous Docker volumes.
+            result = await ssh_client.run(DockerCommand.remove_with_volumes(container_name))
             if result.exit_status != 0:
                 return False
 

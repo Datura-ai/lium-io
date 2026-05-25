@@ -23,7 +23,7 @@ def _make_ssh_mock(containers: list[str], ages_by_name: dict[str, int], current_
       - docker ps -a filter -> newline list of containers
       - docker inspect ... Created -> age seconds (current_ts - age_seconds*60)
       - date +%s -> current_ts
-      - docker rm -f / volume rm -> success
+      - docker rm -fv / volume rm -> success
     """
     rm_calls: list[str] = []
 
@@ -43,7 +43,7 @@ def _make_ssh_mock(containers: list[str], ages_by_name: dict[str, int], current_
                     created_ts = current_ts - int(age_min * 60)
                     return MagicMock(exit_status=0, stdout=str(created_ts), stderr="")
             return MagicMock(exit_status=1, stdout="", stderr="not found")
-        # docker rm -f
+        # docker rm -f / docker rm -fv
         if "docker rm -f" in cmd:
             rm_calls.append(cmd)
             return MagicMock(exit_status=0, stdout="", stderr="")
@@ -247,6 +247,7 @@ async def test_cleanup_removes_stale_unknown_filler_container():
     assert removed_count == 1
     assert removed_names == [name]
     assert any("docker rm -f" in c and name in c for c in rm_calls)
+    assert any("docker rm -fv" in c and name in c for c in rm_calls)
 
 
 # ---------------------------------------------------------------------------

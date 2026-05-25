@@ -36,6 +36,11 @@ class DockerCommand:
         return f"/usr/bin/docker rm -f {name}"
 
     @staticmethod
+    def remove_with_volumes(name: str) -> str:
+        """Build docker rm command that also removes anonymous volumes."""
+        return f"/usr/bin/docker rm -fv {name}"
+
+    @staticmethod
     def ps_filter(*name_patterns: str) -> str:
         """Build docker ps command with one or more filters."""
         filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
