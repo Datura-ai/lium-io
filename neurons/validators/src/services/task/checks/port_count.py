@@ -21,25 +21,6 @@ class PortCountCheck:
     async def run(self, ctx: Context) -> CheckResult:
         port_count = ctx.state.verified_port_count
 
-        # Check if executor is rented (same pattern as rented_machine.py)
-        rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
-        is_rented = rented_executor is not None and len(rented_executor.pods) > 0
-
-        if is_rented:
-            preserved_count = ctx.state.specs.get("available_port_count", port_count)
-            event = render_message(
-                Msg.PORT_COUNT_RECORDED,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={"available_port_count": preserved_count},
-            )
-            return CheckResult(
-                passed=True,
-                event=event,
-                updates={"port_count": preserved_count, "state": ctx.state},
-            )
-
         updated_state = replace(
             ctx.state,
             specs={

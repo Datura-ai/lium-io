@@ -46,8 +46,8 @@ async def test_port_count_insufficient_fails_when_not_rented(context_factory, po
 
 
 @pytest.mark.asyncio
-async def test_port_count_insufficient_passes_when_rented(context_factory):
-    """Check passes when port count < MIN_PORT_COUNT but executor is rented."""
+async def test_port_count_insufficient_fails_when_rented(context_factory):
+    """Check fails when port count < MIN_PORT_COUNT even if executor is rented."""
     rented_data = RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
@@ -62,9 +62,10 @@ async def test_port_count_insufficient_passes_when_rented(context_factory):
 
     result = await PortCountCheck().run(ctx)
 
-    assert result.passed is True
-    assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
+    assert result.passed is False
+    assert result.event.reason_code == Msg.INSUFFICIENT_PORTS.reason
     assert result.updates["port_count"] == MIN_PORT_COUNT - 1
+    assert result.updates["state"].specs["available_port_count"] == MIN_PORT_COUNT - 1
 
 
 @pytest.mark.asyncio

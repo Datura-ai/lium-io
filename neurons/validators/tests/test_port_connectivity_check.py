@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from neurons.validators.src.services.executor_connectivity.models import PortPair, PortVerificationResult
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
 from tests.helpers import build_context_config, build_services, build_state
 
@@ -204,6 +204,42 @@ async def test_port_connectivity_runs_when_filler_active(context_factory):
         rented_data=RentedExecutorsResponse(
             executors={},
             filler_containers_by_executor={"executor-123": "filler_active"},
+        ),
+    )
+    ctx = context_factory(services=services, state=state)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFY_OK.reason
+    assert connectivity_service.called_with is not None
+    assert result.updates["state"].specs["verified_ports"] == [8000, 8001, 8002, 8003]
+    assert result.updates["state"].verified_port_count == 4
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_runs_when_customer_rental_active(context_factory):
+    connectivity_service = DummyConnectivityService(success=True, verified_port_count=4)
+    services = build_services(
+        backend=DummyBackendService(),
+        connectivity=connectivity_service,
+    )
+    state = build_state(
+        specs={
+            "verified_ports": [20000, 20001, 20002],
+            "available_port_count": 3,
+            "port_mappings": "[[20000, 20000]]",
+        },
+        verified_port_count=3,
+        rented_data=RentedExecutorsResponse(
+            executors={
+                "executor-123": RentedExecutor(
+                    miner_hotkey="test-miner",
+                    executor_ip_address="127.0.0.1",
+                    executor_ip_port="22",
+                    pods=[RentedPod(pod_id="pod-1", container_name="pod_active", rented_ports=[20000])],
+                )
+            },
         ),
     )
     ctx = context_factory(services=services, state=state)

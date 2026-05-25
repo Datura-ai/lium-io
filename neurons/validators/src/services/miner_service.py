@@ -50,6 +50,7 @@ from payload_models.payloads import (
     InstallJupyterServerRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
+    WorkloadKind,
 )
 from tenacity import RetryError
 
@@ -128,6 +129,13 @@ def _parse_miner_response(response_data: dict) -> AcceptSSHKeyRequest | FailedRe
             message_type=RequestType.FailedRequest,
             details=f"Unexpected message_type: {message_type}"
         )
+
+
+def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
+    return (
+        isinstance(payload, ContainerDeleteRequest)
+        and payload.workload_kind == WorkloadKind.FILLER
+    )
 
 
 JOB_LENGTH = 30
@@ -665,7 +673,7 @@ class MinerService:
                         )
 
                     renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-                    if renting_in_progress:
+                    if renting_in_progress and not _bypasses_renting_in_progress(payload):
                         log_text = _m(
                             "Decline renting pod request. Renting is still in progress",
                             extra=get_extra_info(default_extra),
@@ -1697,7 +1705,7 @@ class MinerService:
                     )
 
                 renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-                if renting_in_progress:
+                if renting_in_progress and not _bypasses_renting_in_progress(payload):
                     log_text = _m(
                         "Decline renting pod request. Renting is still in progress",
                         extra=get_extra_info(default_extra),
