@@ -932,21 +932,9 @@ async def test_clean_containers_stale_fillers_removed(docker_service, retry_ssh_
 
 
 @pytest.mark.asyncio
-async def test_clean_containers_preserves_young_unknown_filler(docker_service, retry_ssh_mock):
-    current_ts = 1_000_000_000
-    created_ts = current_ts - 5 * 60
-
-    async def run(cmd):
-        if 'docker ps -a --format "{{.Names}}"' in cmd:
-            return _make_ssh_command_result(stdout="pod_target\nfiller_young\n")
-        if "docker inspect filler_young" in cmd:
-            return _make_ssh_command_result(stdout=str(created_ts))
-        if cmd == "date +%s":
-            return _make_ssh_command_result(stdout=str(current_ts))
-        return _make_ssh_command_result()
-
+async def test_clean_containers_removes_young_unknown_filler(docker_service, retry_ssh_mock):
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=run)
+    ssh_client.run = AsyncMock(return_value=_make_ssh_run_result("pod_target\nfiller_young\n"))
 
     await docker_service.clean_existing_containers(
         ssh_client=ssh_client,
@@ -957,7 +945,7 @@ async def test_clean_containers_preserves_young_unknown_filler(docker_service, r
 
     rm_command = retry_ssh_mock.call_args_list[0][0][1]
     assert "pod_target" in rm_command
-    assert "filler_young" not in rm_command
+    assert "filler_young" in rm_command
 
 
 @pytest.mark.asyncio

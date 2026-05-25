@@ -6,9 +6,11 @@ from payload_models.payloads import (
     BaseValidatorResponse,
     ContainerCreateRequest,
     ContainerCreated,
+    ContainerDeleteRequest,
     WorkloadKind,
 )
 from services.docker_service import DockerService
+from services.miner_service import _bypasses_renting_in_progress
 
 
 def _base_create_request(**overrides):
@@ -80,3 +82,28 @@ def test_validator_runtime_name_is_derived_from_workload_kind():
 
     assert DockerService.get_container_name(customer_request) == f"pod_{pod_id}"
     assert DockerService.get_container_name(filler_request) == f"filler_{filler_run_id}"
+
+
+def test_filler_delete_bypasses_pending_rent_guard():
+    filler_run_id = str(uuid4())
+    request = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=filler_run_id,
+        workload_kind=WorkloadKind.FILLER,
+        container_name=f"filler_{filler_run_id}",
+    )
+
+    assert _bypasses_renting_in_progress(request) is True
+
+
+def test_customer_delete_does_not_bypass_pending_rent_guard():
+    pod_id = str(uuid4())
+    request = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        container_name=f"pod_{pod_id}",
+    )
+
+    assert _bypasses_renting_in_progress(request) is False
