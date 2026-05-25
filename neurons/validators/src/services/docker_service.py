@@ -674,7 +674,7 @@ class DockerService:
                 ),
             )
 
-            command = f'/usr/bin/docker rm {container_names} -f'
+            command = f'/usr/bin/docker rm -fv {container_names}'
             await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
 
             if clear_volume:
@@ -827,7 +827,7 @@ class DockerService:
             container = shlex.quote(container_name)
             await retry_ssh_command(
                 ssh_client,
-                f"/usr/bin/docker rm -f {container} 2>/dev/null || true",
+                f"/usr/bin/docker rm -fv {container} 2>/dev/null || true",
                 "cleanup_failed_container_creation",
             )
 
@@ -1977,7 +1977,7 @@ class DockerService:
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
                 # await ssh_client.run(f"docker stop {payload.container_name}")
-                command = f"/usr/bin/docker rm {payload.container_name} -f"
+                command = f"/usr/bin/docker rm -fv {payload.container_name}"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
                 command = f"/usr/bin/docker image prune -f"
