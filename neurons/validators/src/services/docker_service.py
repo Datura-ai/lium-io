@@ -14,6 +14,7 @@ import bittensor
 import redis.exceptions
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
+from tenacity import RetryError
 from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerBaseRequest,
@@ -85,6 +86,19 @@ _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
 _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
+_DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
+
+
+def _is_missing_docker_container_error(exc: Exception) -> bool:
+    if _DOCKER_NO_SUCH_CONTAINER_PHRASE in str(exc):
+        return True
+    if isinstance(exc, RetryError):
+        last_exception = exc.last_attempt.exception()
+        return (
+            last_exception is not None
+            and _DOCKER_NO_SUCH_CONTAINER_PHRASE in str(last_exception)
+        )
+    return False
 
 
 class DockerService:
@@ -1947,7 +1961,26 @@ class DockerService:
             ) as ssh_client:
                 # await ssh_client.run(f"docker stop {payload.container_name}")
                 command = f"/usr/bin/docker rm -fv {payload.container_name}"
-                await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+                try:
+                    await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+                except Exception as exc:
+                    if (
+                        payload.workload_kind != WorkloadKind.FILLER
+                        or not _is_missing_docker_container_error(exc)
+                    ):
+                        raise
+                    logger.info(
+                        _m(
+                            "Filler container is already absent",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "container_name": payload.container_name,
+                                    "error": str(exc),
+                                }
+                            ),
+                        ),
+                    )
 
                 command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
