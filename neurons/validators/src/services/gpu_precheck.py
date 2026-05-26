@@ -24,7 +24,7 @@ class GpuPrecheckError(Exception):
 
 
 class UnsupportedGpuModelError(GpuPrecheckError):
-    """Normalized model name has no entry in GPU_VRAM_RANGES or KNOWN_UNRANGED."""
+    """Normalized model name has no entry in GPU_VRAM_SIZES_MB or KNOWN_UNRANGED."""
 
 
 class VramRangeMismatchError(GpuPrecheckError):
@@ -40,7 +40,7 @@ def precheck_gpu_spec(gpu_model: Optional[str], gpu_capacity_mb: int) -> None:
 
     Raises:
         MissingGpuFieldError: gpu_model empty or gpu_capacity_mb <= 0.
-        UnsupportedGpuModelError: normalized model not in GPU_VRAM_RANGES.
+        UnsupportedGpuModelError: normalized model not in GPU_VRAM_SIZES_MB.
         VramRangeMismatchError: VRAM falls in none of the expected windows.
 
     Returns:
