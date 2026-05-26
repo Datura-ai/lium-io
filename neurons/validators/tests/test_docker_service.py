@@ -5,10 +5,13 @@ from datetime import datetime
 
 import pytest
 import pytest_asyncio
+from tenacity import Future, RetryError
 
 from services.docker_service import DockerService
 from payload_models.payloads import (
     ContainerCreateRequest,
+    ContainerDeleteRequest,
+    ContainerDeleted,
     ContainerStartRequest,
     PayloadPortMapping,
     WorkloadKind,
@@ -682,6 +685,69 @@ def _make_ssh_command_result(exit_status: int = 0, stdout: str = "", stderr: str
     result.stdout = stdout
     result.stderr = stderr
     return result
+
+
+def _make_retry_error(exc: Exception) -> RetryError:
+    future = Future(1)
+    future.set_exception(exc)
+    return RetryError(future)
+
+
+@pytest.mark.asyncio
+async def test_delete_filler_container_treats_missing_container_as_deleted(
+    docker_service,
+    retry_ssh_mock,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    retry_ssh_mock.side_effect = [
+        _make_retry_error(Exception("Error response from daemon: No such container: filler_missing")),
+        None,
+    ]
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        container_name="filler_missing",
+        local_volume="volume_missing",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert retry_ssh_mock.await_count == 2
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info,
+        payload.container_name,
+    )
 
 
 @pytest.mark.asyncio
