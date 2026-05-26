@@ -21,6 +21,11 @@ class PortCountCheck:
     async def run(self, ctx: Context) -> CheckResult:
         port_count = ctx.state.verified_port_count
 
+        # Check if executor is rented (same pattern as rented_machine.py)
+        rented_data = ctx.state.rented_data
+        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        is_rented = rented_executor is not None and len(rented_executor.pods) > 0
+
         updated_state = replace(
             ctx.state,
             specs={
@@ -31,7 +36,7 @@ class PortCountCheck:
             },
         )
 
-        if port_count < MIN_PORT_COUNT:
+        if not is_rented and port_count < MIN_PORT_COUNT:
             event = render_message(
                 Msg.INSUFFICIENT_PORTS,
                 ctx=ctx,

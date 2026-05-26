@@ -16,3 +16,4 @@ class PortSelector:
         all_ports = get_all_ports(executor_info.port_range, executor_info.port_mappings, executor_info.ssh_port)
         available_ports = [PortPair(internal, external) for internal, external in all_ports if external not in rented]
         return available_ports[:size]
+

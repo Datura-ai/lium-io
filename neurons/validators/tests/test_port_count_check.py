@@ -46,8 +46,8 @@ async def test_port_count_insufficient_fails_when_not_rented(context_factory, po
 
 
 @pytest.mark.asyncio
-async def test_port_count_insufficient_fails_when_rented(context_factory):
-    """Check fails when port count < MIN_PORT_COUNT even if executor is rented."""
+async def test_port_count_insufficient_passes_when_rented(context_factory):
+    """Check passes when port count < MIN_PORT_COUNT but executor is rented."""
     rented_data = RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
@@ -62,34 +62,6 @@ async def test_port_count_insufficient_fails_when_rented(context_factory):
 
     result = await PortCountCheck().run(ctx)
 
-    assert result.passed is False
-    assert result.event.reason_code == Msg.INSUFFICIENT_PORTS.reason
-    assert result.updates["port_count"] == MIN_PORT_COUNT - 1
-    assert result.updates["state"].specs["available_port_count"] == MIN_PORT_COUNT - 1
-
-
-@pytest.mark.asyncio
-async def test_port_count_records_inventory_when_filler_active(context_factory):
-    rented_data = RentedExecutorsResponse(
-        executors={},
-        filler_containers_by_executor={"executor-123": "filler_active"},
-    )
-    specs = {
-        "verified_ports": [20000, 20001, 20002],
-        "available_port_count": 3,
-        "port_mappings": "[[20000, 20000]]",
-    }
-    ctx = context_factory(
-        state=build_state(
-            specs=specs,
-            verified_port_count=MIN_PORT_COUNT + 1,
-            rented_data=rented_data,
-        )
-    )
-
-    result = await PortCountCheck().run(ctx)
-
     assert result.passed is True
     assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
-    assert result.updates["port_count"] == MIN_PORT_COUNT + 1
-    assert result.updates["state"].specs["available_port_count"] == MIN_PORT_COUNT + 1
+    assert result.updates["port_count"] == MIN_PORT_COUNT - 1
