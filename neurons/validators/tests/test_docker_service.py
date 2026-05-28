@@ -1269,6 +1269,9 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
     assert docker_service.clean_stale_vloopback_volumes.await_args.kwargs[
         "skip_volume_names"
     ] == set()
+    assert docker_service._run_docker_create_with_port_retry.await_args.kwargs[
+        "local_volume"
+    ] == f"volume_{payload.pod_id}"
 
 
 @pytest.mark.asyncio
@@ -1541,6 +1544,13 @@ _EADDRINUSE_ERR = (
     "docker: Error response from daemon: failed to bind host port "
     "0.0.0.0:9030/tcp: address already in use"
 )
+_VLOOPBACK_STALE_MOUNT_ERR = (
+    "docker: Error response from daemon: failed to populate volume: "
+    "error while mounting volume '/mnt/volume_test': "
+    "VolumeDriver.Mount: error while mounting volume: "
+    "cannot create mount point dir '/mnt/volume_test': "
+    "mkdir /mnt/volume_test: file exists"
+)
 
 
 @pytest.mark.asyncio
@@ -1648,6 +1658,220 @@ async def test_create_container_does_not_retry_on_other_docker_errors(
 
     assert calls["n"] == 1
     assert sleep_called["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_create_container_repairs_stale_vloopback_mountpoint_then_retries(
+    docker_service, monkeypatch,
+):
+    calls = {"n": 0}
+    seen_commands: list[str] = []
+
+    async def fake_execute(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        calls["n"] += 1
+        seen_commands.append(command)
+        if calls["n"] == 1:
+            raise Exception(_VLOOPBACK_STALE_MOUNT_ERR)
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", fake_execute)
+    repair = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair)
+
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout="", stderr=""))
+
+    await docker_service._run_docker_create_with_port_retry(
+        ssh_client=ssh_client,
+        command="/usr/bin/docker run -d -v volume_test:/root --name pod_test img",
+        container_name="pod_test",
+        log_tag="t",
+        default_extra={},
+        timeout=120,
+        local_volume="volume_test",
+    )
+
+    assert calls["n"] == 2
+    assert seen_commands[0] == seen_commands[1]
+    repair.assert_awaited_once_with(ssh_client, "volume_test", {})
+    ssh_client.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_container_does_not_repair_vloopback_mountpoint_twice(
+    docker_service, monkeypatch,
+):
+    async def always_fail(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        raise Exception(_VLOOPBACK_STALE_MOUNT_ERR)
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", always_fail)
+    repair = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair)
+
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout="", stderr=""))
+
+    with pytest.raises(Exception) as exc:
+        await docker_service._run_docker_create_with_port_retry(
+            ssh_client=ssh_client,
+            command="/usr/bin/docker run -d -v volume_test:/root --name pod_test img",
+            container_name="pod_test",
+            log_tag="t",
+            default_extra={},
+            timeout=120,
+            local_volume="volume_test",
+        )
+
+    assert _VLOOPBACK_STALE_MOUNT_ERR in str(exc.value)
+    repair.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_container_skips_mountpoint_repair_without_local_volume(
+    docker_service, monkeypatch,
+):
+    async def fail_stale_mount(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
+        raise Exception(_VLOOPBACK_STALE_MOUNT_ERR)
+
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", fail_stale_mount)
+    repair = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair)
+
+    with pytest.raises(Exception) as exc:
+        await docker_service._run_docker_create_with_port_retry(
+            ssh_client=Mock(),
+            command="/usr/bin/docker run -d --name pod_test img",
+            container_name="pod_test",
+            log_tag="t",
+            default_extra={},
+            timeout=120,
+        )
+
+    assert _VLOOPBACK_STALE_MOUNT_ERR in str(exc.value)
+    repair.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_service):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
+            _make_ssh_command_result(exit_status=1),
+            _make_ssh_command_result(exit_status=0),
+        ]
+    )
+
+    repaired = await docker_service.repair_stale_vloopback_mountpoint(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        default_extra={},
+    )
+
+    assert repaired is True
+    helper_cmd = ssh_client.run.await_args_list[-1].args[0]
+    assert "docker.io/library/alpine:3.19" in helper_cmd
+    assert "rmdir" in helper_cmd
+    assert "rm -rf" not in helper_cmd
+    assert "-v /mnt:/mnt" in helper_cmd
+    assert "/mnt/volume_test" in helper_cmd
+    assert all(
+        call.kwargs.get("timeout") == 30
+        for call in ssh_client.run.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_refuses_active_mount(docker_service):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
+            _make_ssh_command_result(exit_status=0),
+        ]
+    )
+
+    repaired = await docker_service.repair_stale_vloopback_mountpoint(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        default_extra={},
+    )
+
+    assert repaired is False
+    assert ssh_client.run.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_refuses_unsafe_volume_name(docker_service):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock()
+
+    for local_volume in ("../volume_test", ".", "volume test"):
+        repaired = await docker_service.repair_stale_vloopback_mountpoint(
+            ssh_client=ssh_client,
+            local_volume=local_volume,
+            default_extra={},
+        )
+        assert repaired is False
+
+    ssh_client.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_refuses_non_vloopback_driver(docker_service):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(stdout="local /mnt/volume_test\n"),
+        ]
+    )
+
+    repaired = await docker_service.repair_stale_vloopback_mountpoint(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        default_extra={},
+    )
+
+    assert repaired is False
+    ssh_client.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_refuses_unexpected_mountpoint(docker_service):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(stdout="vloopback:latest /tmp/volume_test\n"),
+        ]
+    )
+
+    repaired = await docker_service.repair_stale_vloopback_mountpoint(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        default_extra={},
+    )
+
+    assert repaired is False
+    ssh_client.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker_service):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
+            _make_ssh_command_result(exit_status=1),
+            _make_ssh_command_result(exit_status=12, stderr="not empty"),
+        ]
+    )
+
+    repaired = await docker_service.repair_stale_vloopback_mountpoint(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        default_extra={},
+    )
+
+    assert repaired is False
 
 
 @pytest.mark.asyncio
