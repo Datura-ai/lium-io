@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -8,6 +9,13 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
+
+# Settings is instantiated during test collection through app imports. These
+# defaults keep unit tests self-contained without requiring a local validator env.
+os.environ.setdefault("BITTENSOR_WALLET_NAME", "test-wallet")
+os.environ.setdefault("BITTENSOR_WALLET_HOTKEY_NAME", "test-hotkey")
+os.environ.setdefault("SQLALCHEMY_DATABASE_URI", "sqlite:///:memory:")
+os.environ.setdefault("ASYNC_SQLALCHEMY_DATABASE_URI", "sqlite+aiosqlite:///:memory:")
 
 from helpers import make_context
 
@@ -172,5 +180,4 @@ def port_mapping_dao(mock_async_session_maker):
     from daos.port_mapping_dao import PortMappingDao
 
     return PortMappingDao()
-
 
