@@ -2,6 +2,7 @@ import asyncio
 import random
 from datetime import datetime
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Annotated, Any
@@ -81,6 +82,15 @@ DOCKER_VOLUME_PLUGINS = {
 _PORT_ALLOCATED_PHRASES = ("port is already allocated", "address already in use", "failed to bind host port")
 _PORT_ALLOCATED_RETRY_BUDGET_SEC = 90
 _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
+_VLOOPBACK_MOUNT_ERROR_PHRASES = (
+    "VolumeDriver.Mount",
+    "cannot create mount point dir",
+    "file exists",
+)
+_VLOOPBACK_DRIVER_PREFIX = "vloopback"
+_VLOOPBACK_REPAIR_IMAGE = "docker.io/library/alpine:3.19"
+_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
+_DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -99,6 +109,31 @@ def _is_missing_docker_container_error(exc: Exception) -> bool:
             and _DOCKER_NO_SUCH_CONTAINER_PHRASE in str(last_exception)
         )
     return False
+
+
+def _is_stale_vloopback_mountpoint_error(exc: Exception) -> bool:
+    text = str(exc)
+    return all(phrase in text for phrase in _VLOOPBACK_MOUNT_ERROR_PHRASES)
+
+
+def _is_safe_docker_volume_name(volume_name: str) -> bool:
+    return bool(_DOCKER_VOLUME_NAME_RE.fullmatch(volume_name))
+
+
+def _is_vloopback_driver(driver: str) -> bool:
+    return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
+
+
+def _should_repair_stale_mountpoint(
+    exc: Exception,
+    local_volume: str | None,
+    already_repaired: bool,
+) -> bool:
+    return (
+        bool(local_volume)
+        and not already_repaired
+        and _is_stale_vloopback_mountpoint_error(exc)
+    )
 
 
 class DockerService:
@@ -133,8 +168,9 @@ class DockerService:
         log_tag: str,
         default_extra: dict,
         timeout: int,
+        local_volume: str | None = None,
     ) -> None:
-        """Run `docker run` with same-command retry on port-allocated races.
+        """Run `docker run` with same-command retry on known Docker races.
 
         DAH-1991: backend-spawned `health_check_*` probes (TTL ~30s) can land
         on a port we already accepted into `port_maps` during the 20-60s gap
@@ -150,9 +186,14 @@ class DockerService:
         attempts (after the backoff sleep, just before the next `docker run`)
         we issue `docker rm -f <container_name>` so the rm→run window stays
         tight. Cleanup failures are warning-logged but do not abort the loop.
+
+        DAH-2133: if Docker fails to mount an existing vloopback volume because
+        an empty stale plugin mountpoint already exists, repair only that
+        empty unmounted mountpoint and retry the same command once.
         """
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
+        vloopback_mount_repair_attempted = False
         while True:
             try:
                 await self.execute_and_stream_logs(
@@ -165,42 +206,139 @@ class DockerService:
                 )
                 return
             except Exception as e:
-                matched_phrase = next((p for p in _PORT_ALLOCATED_PHRASES if p in str(e)), None)
-                if matched_phrase is None or time.monotonic() >= deadline:
-                    raise
-                attempt += 1
-                logger.info(
-                    _m(
-                        "PORT_ALREADY_ALLOCATED_RETRY",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "attempt": attempt,
-                            "remaining_sec": int(deadline - time.monotonic()),
-                            "sleep_seconds": _PORT_ALLOCATED_RETRY_SLEEP_SEC,
-                            "matched_phrase": matched_phrase,
-                        }),
-                    )
-                )
-                await asyncio.sleep(_PORT_ALLOCATED_RETRY_SLEEP_SEC)
-                # DAH-2018: drop the Created-state container Docker reserved
-                # during the prior `docker run` parse, so the next same-command
-                # attempt cannot collide with "container name already in use".
-                try:
-                    rm_cmd = f"/usr/bin/docker rm -f {shlex.quote(container_name)}"
-                    await ssh_client.run(rm_cmd)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as rm_exc:
-                    logger.warning(
+                # Known Docker races:
+                # repair stale vloopback mountpoints once;
+                # retry port allocation failures until the short budget expires.
+                if _should_repair_stale_mountpoint(e, local_volume, vloopback_mount_repair_attempted):
+                    vloopback_mount_repair_attempted = True
+                    if await self.repair_stale_vloopback_mountpoint(ssh_client, local_volume, default_extra):
+                        logger.info(
+                            _m(
+                                "VLOOPBACK_STALE_MOUNTPOINT_RETRY",
+                                extra=get_extra_info({**default_extra, "local_volume": local_volume}),
+                            )
+                        )
+                        continue
+
+                port_allocation_phrase = next((p for p in _PORT_ALLOCATED_PHRASES if p in str(e)), None)
+                port_retry_deadline_expired = time.monotonic() >= deadline
+                port_retry_needed = bool(port_allocation_phrase) and not port_retry_deadline_expired
+                if port_retry_needed:
+                    attempt += 1
+                    logger.info(
                         _m(
-                            "PORT_RETRY_STALE_RM_FAILED",
+                            "PORT_ALREADY_ALLOCATED_RETRY",
                             extra=get_extra_info({
                                 **default_extra,
-                                "container_name": container_name,
-                                "rm_error": str(rm_exc),
+                                "attempt": attempt,
+                                "remaining_sec": int(deadline - time.monotonic()),
+                                "sleep_seconds": _PORT_ALLOCATED_RETRY_SLEEP_SEC,
+                                "port_allocation_phrase": port_allocation_phrase,
                             }),
                         )
                     )
+                    await asyncio.sleep(_PORT_ALLOCATED_RETRY_SLEEP_SEC)
+                    await self._remove_failed_container_for_retry(
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        default_extra=default_extra,
+                        warning_event="PORT_RETRY_STALE_RM_FAILED",
+                    )
+
+                    continue
+
+                raise
+
+    async def _remove_failed_container_for_retry(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        default_extra: dict,
+        warning_event: str,
+    ) -> None:
+        try:
+            # Remove only the failed container object; named volumes stay intact.
+            await ssh_client.run(f"/usr/bin/docker rm -f {shlex.quote(container_name)}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as rm_exc:
+            logger.warning(
+                _m(
+                    warning_event,
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": container_name,
+                        "rm_error": str(rm_exc),
+                    }),
+                )
+            )
+
+    async def repair_stale_vloopback_mountpoint(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        local_volume: str,
+        default_extra: dict,
+    ) -> bool:
+        if not _is_safe_docker_volume_name(local_volume):
+            return False
+
+        # Get the exact Docker-reported mountpoint path as the repair target.
+        volume = shlex.quote(local_volume)
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker volume inspect {volume} --format '{{{{.Driver}}}} {{{{.Mountpoint}}}}'",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        if getattr(inspect_result, "exit_status", 0) != 0:
+            return False
+
+        driver, _, target = (inspect_result.stdout or "").strip().partition(" ")
+        if not _is_vloopback_driver(driver) or target != f"/mnt/{local_volume}":
+            return False
+
+        # Recheck that the target is not currently mounted before removing it.
+        mounted_result = await ssh_client.run(
+            f"/usr/bin/findmnt {shlex.quote(target)} >/dev/null 2>&1",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        mounted_exit_status = getattr(mounted_result, "exit_status", 1)
+        if mounted_exit_status == 0:
+            logger.warning(
+                _m(
+                    "VLOOPBACK_STALE_MOUNTPOINT_STILL_MOUNTED",
+                    extra=get_extra_info({**default_extra, "local_volume": local_volume}),
+                )
+            )
+            return False
+        if mounted_exit_status != 1:
+            return False
+
+        # Repair by removing only the empty stale mountpoint directory.
+        helper_cmd = (
+            "/usr/bin/docker run --rm "
+            f"-v /mnt:/mnt {_VLOOPBACK_REPAIR_IMAGE} rmdir {shlex.quote(target)}"
+        )
+        repair_result = await ssh_client.run(helper_cmd, timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC)
+        if getattr(repair_result, "exit_status", 0) != 0:
+            logger.warning(
+                _m(
+                    "VLOOPBACK_STALE_MOUNTPOINT_REPAIR_SKIPPED",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "local_volume": local_volume,
+                        "exit_status": getattr(repair_result, "exit_status", None),
+                        "stderr": getattr(repair_result, "stderr", ""),
+                    }),
+                )
+            )
+            return False
+
+        logger.info(
+            _m(
+                "VLOOPBACK_STALE_MOUNTPOINT_REPAIRED",
+                extra=get_extra_info({**default_extra, "local_volume": local_volume}),
+            )
+        )
+        return True
 
     async def _prepare_known_hosts_policy(
         self,
@@ -1093,10 +1231,17 @@ class DockerService:
         ]):
             raise Exception(error)
 
-    async def get_docker_root_dir(self, ssh_client: asyncssh.SSHClientConnection):
+    async def get_docker_root_dir(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        timeout: int | None = None,
+    ):
         """Get Docker storage info using docker info command"""
         command = f"/usr/bin/docker info --format '{{{{.DockerRootDir}}}}'"
-        result = await ssh_client.run(command)
+        if timeout is None:
+            result = await ssh_client.run(command)
+        else:
+            result = await ssh_client.run(command, timeout=timeout)
         return result.stdout.strip()
 
     @staticmethod
@@ -1557,6 +1702,7 @@ class DockerService:
                         log_tag=log_tag,
                         default_extra=default_extra,
                         timeout=timeout,
+                        local_volume=local_volume,
                     )
 
                     logger.info(f"Container creation step finished")
