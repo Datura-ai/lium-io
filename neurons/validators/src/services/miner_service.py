@@ -168,6 +168,19 @@ class MinerService:
         pubkey = self._normalize_public_key(public_key)
         return f"0x{keypair.sign(pubkey).hex()}"
 
+    @staticmethod
+    def _filter_new_rentals_paused_executors(executors: list, rented_data: RentedExecutorsResponse) -> list:
+        paused_ids = set(rented_data.new_rentals_paused_executor_ids or [])
+        if not paused_ids:
+            return executors
+
+        rented_ids = set(rented_data.executors.keys())
+        return [
+            executor
+            for executor in executors
+            if str(executor.uuid) not in paused_ids or str(executor.uuid) in rented_ids
+        ]
+
     async def request_job_to_miner(
         self,
         payload: MinerJobRequestPayload,
@@ -272,6 +285,12 @@ class MinerService:
                             payload,
                             "Miner returned zero executors in AcceptSSHKeyRequest",
                         )
+                    eligible_executors = self._filter_new_rentals_paused_executors(msg.executors, rented_data)
+                    if len(eligible_executors) == 0:
+                        return self._build_failed_job_result(
+                            payload,
+                            "Miner returned zero eligible executors after new rentals pause filter",
+                        )
 
                     tasks = [
                         asyncio.create_task(
@@ -288,7 +307,7 @@ class MinerService:
                                 timeout=settings.JOB_TIME_OUT - 120
                             )
                         )
-                        for executor_info in msg.executors
+                        for executor_info in eligible_executors
                     ]
 
                     results = [
@@ -1496,6 +1515,12 @@ class MinerService:
                         payload,
                         "Miner returned zero executors in AcceptSSHKeyRequest",
                     )
+                eligible_executors = self._filter_new_rentals_paused_executors(msg.executors, rented_data)
+                if len(eligible_executors) == 0:
+                    return self._build_failed_job_result(
+                        payload,
+                        "Miner returned zero eligible executors after new rentals pause filter",
+                    )
 
                 tasks = [
                     asyncio.create_task(
@@ -1512,7 +1537,7 @@ class MinerService:
                             timeout=settings.JOB_TIME_OUT - 120
                         )
                     )
-                    for executor_info in msg.executors
+                    for executor_info in eligible_executors
                 ]
 
                 results = [
