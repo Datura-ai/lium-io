@@ -371,6 +371,16 @@ class CollateralMessages:
     )
 
 
+class StaleContainerCleanupMessages:
+    CLEANED = MessageTemplate(
+        event="Stale container cleanup complete",
+        reason="STALE_CLEANUP_DONE",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+
+
 class TenantEnforcementMessages:
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
