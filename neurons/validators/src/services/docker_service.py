@@ -294,6 +294,14 @@ class DockerService:
         driver, _, target = (inspect_result.stdout or "").strip().partition(" ")
         if not _is_vloopback_driver(driver) or target != f"/mnt/{local_volume}":
             return False
+        plugin_result = await ssh_client.run(
+            f"/usr/bin/docker plugin inspect {shlex.quote(driver)} --format '{{{{.Id}}}}'",
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        plugin_id = (plugin_result.stdout or "").strip()
+        if getattr(plugin_result, "exit_status", 0) != 0 or not plugin_id:
+            return False
+        target = f"/var/lib/docker/plugins/{plugin_id}/propagated-mount/{local_volume}"
 
         # Recheck that the target is not currently mounted before removing it.
         mounted_result = await ssh_client.run(
@@ -315,7 +323,8 @@ class DockerService:
         # Repair by removing only the empty stale mountpoint directory.
         helper_cmd = (
             "/usr/bin/docker run --rm "
-            f"-v /mnt:/mnt {_VLOOPBACK_REPAIR_IMAGE} rmdir {shlex.quote(target)}"
+            f"-v {shlex.quote(str(Path(target).parent))}:/mnt "
+            f"{_VLOOPBACK_REPAIR_IMAGE} rmdir /mnt/{shlex.quote(local_volume)}"
         )
         repair_result = await ssh_client.run(helper_cmd, timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC)
         if getattr(repair_result, "exit_status", 0) != 0:
