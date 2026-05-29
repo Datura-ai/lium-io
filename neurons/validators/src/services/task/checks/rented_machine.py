@@ -3,6 +3,7 @@ import shlex
 from collections.abc import Iterable
 
 import asyncssh
+
 from core.docker_utils import DockerCommand
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
@@ -91,12 +92,9 @@ class TenantEnforcementCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        # Clean up stale containers
-        await ctx.services.container_cleanup.cleanup(
-            ssh_client=ctx.ssh,
-            rented_data=ctx.state.rented_data,
-            executor_uuid=ctx.executor.uuid,
-        )
+        # NOTE: stale-container cleanup now runs earlier, in StaleContainerCleanupCheck
+        # (before the port checks), so an orphaned non-rented container can't deadlock
+        # port verification. See that check for the full rationale (DAH-2164 follow-up).
 
         # Get rented executor from context instead of Redis
         rented_data = ctx.state.rented_data

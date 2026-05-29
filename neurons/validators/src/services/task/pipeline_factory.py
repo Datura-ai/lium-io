@@ -14,10 +14,11 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 
 from clients.backend_client import BackendClient
 from core.config import settings
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
-from services.executor_connectivity_service import ExecutorConnectivityService
 from services.container_cleanup import ContainerCleanup
+from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.redis_service import RENTAL_SUCCEED_MACHINE_SET, RedisService
@@ -42,13 +43,13 @@ from .checks import (
     RentalVerificationCheck,
     ScoreCheck,
     SpecChangeCheck,
+    StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
     TdxHostCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
 )
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .pipeline import (
     Check,
     Context,
@@ -227,6 +228,13 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
+                # Reap orphaned (non-rented) rental containers BEFORE the port checks.
+                # A pod container that outlives its rental (e.g. BROKEN_BY_PROVIDER, which the
+                # platform deliberately does not tear down) keeps binding the rental port range.
+                # Cleaning it here frees those ports so PortConnectivityCheck can bind them this
+                # cycle; otherwise PortCountCheck (fatal) halts the pipeline before the cleanup
+                # that used to live in TenantEnforcementCheck ever runs -> executor stuck at 0.
+                StaleContainerCleanupCheck(),
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 TenantEnforcementCheck(),
@@ -268,6 +276,7 @@ class PipelineFactory:
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
+                # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 TenantEnforcementCheck(),

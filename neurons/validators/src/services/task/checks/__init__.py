@@ -12,12 +12,13 @@ from .machine_spec_scrape import MachineSpecScrapeCheck
 from .nvml_digest import NvmlDigestCheck
 from .port_connectivity import PortConnectivityCheck
 from .port_count import PortCountCheck
-from .rented_machine import TenantEnforcementCheck
 from .rental_verification import RentalVerificationCheck
-from .tdx_host import TdxHostCheck
+from .rented_machine import TenantEnforcementCheck
 from .score import ScoreCheck
-from .start_gpu_monitor import StartGPUMonitorCheck
 from .spec_change import SpecChangeCheck
+from .stale_container_cleanup import StaleContainerCleanupCheck
+from .start_gpu_monitor import StartGPUMonitorCheck
+from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
 from .verifyx import VerifyXCheck
 
@@ -40,6 +41,7 @@ __all__ = [
     "TdxHostCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
+    "StaleContainerCleanupCheck",
     "StartGPUMonitorCheck",
     "SpecChangeCheck",
     "UploadFilesCheck",
