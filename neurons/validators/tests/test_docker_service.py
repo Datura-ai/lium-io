@@ -1756,6 +1756,7 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
     ssh_client.run = AsyncMock(
         side_effect=[
             _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
+            _make_ssh_command_result(stdout="plugin123\n"),
             _make_ssh_command_result(exit_status=1),
             _make_ssh_command_result(exit_status=0),
         ]
@@ -1772,7 +1773,7 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
     assert "docker.io/library/alpine:3.19" in helper_cmd
     assert "rmdir" in helper_cmd
     assert "rm -rf" not in helper_cmd
-    assert "-v /mnt:/mnt" in helper_cmd
+    assert "-v /var/lib/docker/plugins/plugin123/propagated-mount:/mnt" in helper_cmd
     assert "/mnt/volume_test" in helper_cmd
     assert all(
         call.kwargs.get("timeout") == 30
@@ -1786,6 +1787,7 @@ async def test_repair_stale_vloopback_mountpoint_refuses_active_mount(docker_ser
     ssh_client.run = AsyncMock(
         side_effect=[
             _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
+            _make_ssh_command_result(stdout="plugin123\n"),
             _make_ssh_command_result(exit_status=0),
         ]
     )
@@ -1797,7 +1799,7 @@ async def test_repair_stale_vloopback_mountpoint_refuses_active_mount(docker_ser
     )
 
     assert repaired is False
-    assert ssh_client.run.await_count == 2
+    assert ssh_client.run.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -1860,6 +1862,7 @@ async def test_repair_stale_vloopback_mountpoint_refuses_non_empty_target(docker
     ssh_client.run = AsyncMock(
         side_effect=[
             _make_ssh_command_result(stdout="vloopback:latest /mnt/volume_test\n"),
+            _make_ssh_command_result(stdout="plugin123\n"),
             _make_ssh_command_result(exit_status=1),
             _make_ssh_command_result(exit_status=12, stderr="not empty"),
         ]
