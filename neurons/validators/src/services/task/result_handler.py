@@ -103,6 +103,10 @@ class ResultHandler:
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.spot_executor_ids
         )
+        is_new_rentals_paused = bool(
+            context.state.rented_data
+            and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
+        )
 
         # add TDX attestation and spot tier to specs (propagated to compute-app
         # via MACHINE_SPEC_CHANNEL → executor.specs)
@@ -130,6 +134,7 @@ class ResultHandler:
             ssh_pub_keys=context.ssh_pub_keys,
             is_rented=context.rented,
             is_spot=is_spot,
+            is_new_rentals_paused=is_new_rentals_paused,
             rental_created_at=self._get_rental_created_at(context),
             tdx_attestation_passed=context.tdx_attestation_passed,
         )

@@ -24,6 +24,7 @@ class JobResult(BaseModel):
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
     is_spot: bool = False
+    is_new_rentals_paused: bool = False
     rental_created_at: datetime | None = None
 
     # tdx attestation relevant fields
