@@ -128,7 +128,7 @@ def test_rented_executors_response_defaults_new_rentals_paused_executor_ids():
 
 
 def test_rented_executors_response_parses_new_rentals_paused_executor_ids():
-    """Backend paused executor IDs are available to validator filtering."""
+    """Backend paused executor IDs are available to incentive handling."""
     result = RentedExecutorsResponse.model_validate(
         {
             "executors": {},
@@ -139,54 +139,9 @@ def test_rented_executors_response_parses_new_rentals_paused_executor_ids():
     assert result.new_rentals_paused_executor_ids == ["paused-executor"]
 
 
-def test_filter_removes_paused_unrented_executors():
-    """Fully paused, unrented executors are skipped for validation and incentives."""
-    executors = [_executor("paused-executor"), _executor("available-executor")]
-    rented_data = _rented_data(paused_ids=["paused-executor"])
-
-    result = MinerService._filter_new_rentals_paused_executors(
-        executors,
-        rented_data,
-    )
-
-    assert [executor.uuid for executor in result] == ["available-executor"]
-
-
-def test_filter_keeps_paused_executor_when_currently_rented():
-    """Pending pause must not hide the executor while an active rental exists."""
-    executors = [_executor("paused-rented-executor"), _executor("available-executor")]
-    rented_data = _rented_data(
-        rented_ids=["paused-rented-executor"],
-        paused_ids=["paused-rented-executor"],
-    )
-
-    result = MinerService._filter_new_rentals_paused_executors(
-        executors,
-        rented_data,
-    )
-
-    assert [executor.uuid for executor in result] == [
-        "paused-rented-executor",
-        "available-executor",
-    ]
-
-
-def test_filter_noops_when_backend_reports_no_paused_executor_ids():
-    """Normal validator behavior is unchanged when the backend reports no paused IDs."""
-    executors = [_executor("executor-a"), _executor("executor-b")]
-    rented_data = _rented_data()
-
-    result = MinerService._filter_new_rentals_paused_executors(
-        executors,
-        rented_data,
-    )
-
-    assert result is executors
-
-
 @pytest.mark.asyncio
-async def test_websocket_request_job_filters_paused_unrented_executors(monkeypatch):
-    """The WebSocket miner path only schedules validation for eligible executors."""
+async def test_websocket_request_job_validates_paused_unrented_executors(monkeypatch):
+    """Paused executors are still scheduled for validation and spec updates."""
     service = _miner_service()
     service.task_service.create_task = AsyncMock(side_effect=_create_task_result)
     keypair = _keypair()
@@ -210,19 +165,17 @@ async def test_websocket_request_job_filters_paused_unrented_executors(monkeypat
             rented_data,
         )
 
-    assert [job.executor_info.uuid for job in result["results"]] == [
-        "available-executor"
-    ]
+    assert [job.executor_info.uuid for job in result["results"]] == ["paused-executor", "available-executor"]
     created_executor_ids = [
         call.kwargs["executor_info"].uuid
         for call in service.task_service.create_task.call_args_list
     ]
-    assert created_executor_ids == ["available-executor"]
+    assert created_executor_ids == ["paused-executor", "available-executor"]
 
 
 @pytest.mark.asyncio
-async def test_rest_request_job_filters_paused_unrented_executors(monkeypatch):
-    """The REST miner path applies the same paused executor filter."""
+async def test_rest_request_job_validates_paused_unrented_executors(monkeypatch):
+    """The REST miner path also validates paused executors."""
     service = _miner_service()
     service.task_service.create_task = AsyncMock(side_effect=_create_task_result)
     service._generate_auth_headers = MagicMock(return_value={})
@@ -252,11 +205,9 @@ async def test_rest_request_job_filters_paused_unrented_executors(monkeypatch):
         rented_data,
     )
 
-    assert [job.executor_info.uuid for job in result["results"]] == [
-        "available-executor"
-    ]
+    assert [job.executor_info.uuid for job in result["results"]] == ["paused-executor", "available-executor"]
     created_executor_ids = [
         call.kwargs["executor_info"].uuid
         for call in service.task_service.create_task.call_args_list
     ]
-    assert created_executor_ids == ["available-executor"]
+    assert created_executor_ids == ["paused-executor", "available-executor"]

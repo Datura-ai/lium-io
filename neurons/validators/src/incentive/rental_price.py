@@ -386,6 +386,24 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.eligible_for_rental_share = False
             return job_result
 
+        if job_result.is_new_rentals_paused and not job_result.is_rented:
+            logger.info(
+                _m(
+                    "Executor excluded from both pools - paused for new rentals",
+                    extra={
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "gpu_model": job_result.gpu_model,
+                        "gpu_count": job_result.gpu_count,
+                        "reason": "new_rentals_paused",
+                        "score": 0,
+                        "pool": "none",
+                    },
+                )
+            )
+            job_result.mining_score = 0
+            job_result.eligible_for_rental_share = False
+            return job_result
+
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
         base_model = self.get_base_model_for_gpu(job_result.gpu_model)
         job_result.eligible_for_rental_share = (
