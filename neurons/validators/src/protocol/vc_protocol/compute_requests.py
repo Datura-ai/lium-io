@@ -5,6 +5,8 @@ from pydantic import BaseModel, field_validator
 
 from services.const import FILLER_CONTAINER_PREFIX
 
+GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
+
 
 class Error(BaseModel, extra="allow"):
     msg: str
@@ -104,3 +106,4 @@ class ExecutorHealthCheckResponse(BaseModel):
     success: bool
     error: str | None = None
     details: dict | None = None
+    reason_code: str | None = None

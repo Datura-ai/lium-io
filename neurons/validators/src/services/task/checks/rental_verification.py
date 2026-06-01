@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from core.config import settings
+from protocol.vc_protocol.compute_requests import GPU_RUNTIME_NVML_MISMATCH_REASON
+from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
+
 from ..messages import RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -133,6 +136,34 @@ class RentalVerificationCheck:
                     passed=True,
                     event=event,
                     updates={},
+                )
+            elif response.reason_code == GPU_RUNTIME_NVML_MISMATCH_REASON:
+                details = response.details or {}
+                stderr = details.get("docker_stderr") or response.error
+                event = render_message(
+                    Msg.GPU_RUNTIME_NVML_MISMATCH,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "verified": False,
+                        "executor_uuid": executor.uuid,
+                        "source": "rental_verification",
+                        "reason_code": response.reason_code,
+                        "stderr": stderr,
+                        "details": details,
+                    },
+                    extra={"gpu_runtime_issue_code": response.reason_code},
+                )
+                return CheckResult(
+                    passed=False,
+                    event=event,
+                    updates={
+                        "score": 0.0,
+                        "job_score": 0.0,
+                        "score_warning": "GPU runtime NVML driver/library mismatch",
+                        "clear_verified_job_info": True,
+                        "clear_verified_job_reason": ResetVerifiedJobReason.GPU_RUNTIME_NVML_MISMATCH.value,
+                    },
                 )
             else:
                 # Verification failed - this is fatal
