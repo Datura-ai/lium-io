@@ -724,6 +724,17 @@ class RentalVerificationMessages:
         impact="Validation halted",
         remediation="Check executor health with backend or review rental status",
     )
+    GPU_RUNTIME_NVML_MISMATCH = MessageTemplate(
+        event="GPU runtime health check failed",
+        reason="GPU_RUNTIME_NVML_MISMATCH",
+        severity="error",
+        category="runtime",
+        impact="New rentals are disabled because Docker cannot initialize NVIDIA NVML on this host.",
+        remediation=(
+            "Reconcile the NVIDIA driver, libnvidia-ml.so.1, NVIDIA Container "
+            "Toolkit, and Docker runtime. Then reboot the host with `sudo reboot`."
+        ),
+    )
     API_ERROR = MessageTemplate(
         event="Rental verification API error",
         reason="RENTAL_CHECK_API_ERROR",
