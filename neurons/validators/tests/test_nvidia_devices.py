@@ -4,11 +4,28 @@ import pytest
 from neurons.validators.src.services.nvidia_devices import (
     _device_flags,
     _gpus_flag,
+    _parse_nvidia_smi_xml_minor_map,
     _query_all_gpu_nodes,
     _query_gpu_nodes_for_uuids,
     _query_shared_nodes,
     build_gpu_flags,
 )
+
+PROC_GPU_INFO_OUTPUT = "GPU-aaa, 0\nGPU-bbb, 1\nGPU-ccc, 2\n"
+
+NVIDIA_SMI_XML_OUTPUT = """\
+<?xml version="1.0" ?>
+<nvidia_smi_log>
+    <gpu id="00000000:02:00.0">
+        <uuid>GPU-aaa</uuid>
+        <minor_number>0</minor_number>
+    </gpu>
+    <gpu id="00000000:03:00.0">
+        <uuid>GPU-bbb</uuid>
+        <minor_number>1</minor_number>
+    </gpu>
+</nvidia_smi_log>
+"""
 
 
 class FakeRun:
@@ -69,7 +86,7 @@ async def test_whole_host_rental_enumerates_all_minors():
 
 @pytest.mark.asyncio
 async def test_partial_rental_resolves_uuid_to_minor():
-    ssh = fake_ssh(FakeRun("GPU-aaa, 0\nGPU-bbb, 1\nGPU-ccc, 2\n"))
+    ssh = fake_ssh(FakeRun(PROC_GPU_INFO_OUTPUT))
     nodes, host_total = await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
 
     assert nodes == ("/dev/nvidia1",)
@@ -78,26 +95,58 @@ async def test_partial_rental_resolves_uuid_to_minor():
 
 @pytest.mark.asyncio
 async def test_partial_rental_preserves_uuid_order_in_per_gpu():
-    ssh = fake_ssh(FakeRun("GPU-aaa, 0\nGPU-bbb, 1\nGPU-ccc, 2\n"))
+    ssh = fake_ssh(FakeRun("GPU-aaa, 4\nGPU-bbb, 7\nGPU-ccc, 2\n"))
     nodes, _ = await _query_gpu_nodes_for_uuids(ssh, ["GPU-ccc", "GPU-aaa"])
 
-    assert nodes == ("/dev/nvidia2", "/dev/nvidia0")
+    assert nodes == ("/dev/nvidia2", "/dev/nvidia4")
+
+
+@pytest.mark.asyncio
+async def test_partial_rental_falls_back_to_nvidia_smi_xml_when_proc_is_empty():
+    ssh = fake_ssh(FakeRun(""), FakeRun(NVIDIA_SMI_XML_OUTPUT))
+    nodes, host_total = await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
+
+    assert nodes == ("/dev/nvidia1",)
+    assert host_total == 2
+
+
+@pytest.mark.asyncio
+async def test_partial_rental_falls_back_to_nvidia_smi_xml_when_proc_is_incomplete():
+    ssh = fake_ssh(FakeRun("GPU-aaa, 0\n"), FakeRun(NVIDIA_SMI_XML_OUTPUT))
+    nodes, host_total = await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
+
+    assert nodes == ("/dev/nvidia1",)
+    assert host_total == 2
 
 
 @pytest.mark.asyncio
 async def test_partial_rental_unknown_uuid_raises():
-    ssh = fake_ssh(FakeRun("GPU-aaa, 0\n"))
+    ssh = fake_ssh(FakeRun("GPU-aaa, 0\n"), FakeRun(""))
 
     with pytest.raises(RuntimeError, match="not present on executor"):
         await _query_gpu_nodes_for_uuids(ssh, ["GPU-bbb"])
 
 
 @pytest.mark.asyncio
-async def test_nvidia_smi_failure_raises():
-    ssh = fake_ssh(FakeRun(stderr="nvidia-smi: not found", exit_status=127))
+async def test_gpu_minor_discovery_failure_raises_with_stdout_and_stderr():
+    ssh = fake_ssh(
+        FakeRun(stdout="proc stdout", stderr="proc stderr", exit_status=1),
+        FakeRun(
+            stdout='Field "minor_number" is not a valid field to query.\n',
+            stderr="",
+            exit_status=2,
+        ),
+    )
 
-    with pytest.raises(RuntimeError, match="nvidia-smi query failed"):
+    with pytest.raises(RuntimeError, match="minor_number"):
         await _query_gpu_nodes_for_uuids(ssh, ["GPU-aaa"])
+
+
+def test_parse_nvidia_smi_xml_minor_map():
+    assert _parse_nvidia_smi_xml_minor_map(NVIDIA_SMI_XML_OUTPUT) == {
+        "GPU-aaa": 0,
+        "GPU-bbb": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -168,6 +217,8 @@ async def test_build_gpu_flags_partial_rental():
     assert flags == (
         '--gpus \'"device=GPU-bbb"\' --device=/dev/nvidia1 --device=/dev/nvidiactl'
     )
+    commands = "\n".join(call.args[0] for call in ssh.run.call_args_list)
+    assert "nvidia-smi --query-gpu=uuid,minor_number" not in commands
 
 
 @pytest.mark.asyncio
@@ -218,8 +269,11 @@ async def test_build_gpu_flags_whole_host_via_explicit_uuids_keeps_caps():
 
 @pytest.mark.asyncio
 async def test_build_gpu_flags_falls_back_when_nvidia_smi_fails(caplog):
-    # Partial rental → first call is nvidia-smi which we make fail.
-    ssh = fake_ssh(FakeRun(stderr="nvidia-smi: not found", exit_status=127))
+    # Partial rental → both minor-discovery paths fail.
+    ssh = fake_ssh(
+        FakeRun(stderr="proc unavailable", exit_status=1),
+        FakeRun(stderr="nvidia-smi: not found", exit_status=127),
+    )
 
     with caplog.at_level("WARNING"):
         flags = await build_gpu_flags(ssh, gpu_uuids=["GPU-aaa"])
