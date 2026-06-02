@@ -484,6 +484,30 @@ def nvmlDeviceGetPowerManagementLimit(handle):
     return c_limit.value
 
 
+def nvmlDeviceGetPowerManagementDefaultLimit(handle):
+    c_limit = c_uint()
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetPowerManagementDefaultLimit")
+    ret = fn(handle, byref(c_limit))
+    _nvmlCheckReturn(ret)
+    return c_limit.value
+
+
+def nvmlDeviceGetPowerManagementLimitConstraints(handle):
+    c_min_limit = c_uint()
+    c_max_limit = c_uint()
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetPowerManagementLimitConstraints")
+    ret = fn(handle, byref(c_min_limit), byref(c_max_limit))
+    _nvmlCheckReturn(ret)
+    return c_min_limit.value, c_max_limit.value
+
+
+def safeNvmlValue(get_value):
+    try:
+        return get_value()
+    except Exception:
+        return None
+
+
 def nvmlDeviceGetClockInfo(handle, type_clock):
     c_clock = c_uint()
     fn = _nvmlGetFunctionPointer("nvmlDeviceGetClockInfo")
@@ -972,6 +996,12 @@ def get_machine_specs():
                     "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_total / (1024 ** 2),  # in MB
                     "gpu.cuda": f"{major}.{minor}",
                     "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
+                    "gpu.power_default_limit": safeNvmlValue(
+                        lambda: nvmlDeviceGetPowerManagementDefaultLimit(handle) / 1000
+                    ),
+                    "gpu.power_max_limit": safeNvmlValue(
+                        lambda: nvmlDeviceGetPowerManagementLimitConstraints(handle)[1] / 1000
+                    ),
                     "gpu.graphics_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_GRAPHICS),
                     "gpu.memory_speed": nvmlDeviceGetClockInfo(handle, NVML_CLOCK_MEM),
                     "gpu.pcie": nvmlDeviceGetCurrPcieLinkWidth(handle),

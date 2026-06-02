@@ -247,6 +247,35 @@ class GpuVramMessages:
     )
 
 
+class GpuPowerLimitMessages:
+    LIMIT_BELOW_DEFAULT = MessageTemplate(
+        event="GPU power limit below default threshold",
+        reason="GPU_POWER_LIMIT_BELOW_DEFAULT",
+        severity="warning",
+        category="policy",
+        impact="Job skipped; score set to 0",
+        remediation=(
+            "Restore the GPU power limit to at least 80% of the default limit "
+            "reported by NVML."
+        ),
+    )
+    DATA_INCOMPLETE = MessageTemplate(
+        event="GPU power limit baseline incomplete",
+        reason="GPU_POWER_LIMIT_BASELINE_INCOMPLETE",
+        severity="info",
+        category="env",
+        impact="Proceed without power-limit penalty",
+        remediation="Ensure NVML exposes the current and default power limits for every GPU.",
+    )
+    LIMIT_OK = MessageTemplate(
+        event="GPU power limit check passed",
+        reason="GPU_POWER_LIMIT_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class NvmlDigestMessages:
     DIGEST_MISMATCH = MessageTemplate(
         event="NVML library digest mismatch",
