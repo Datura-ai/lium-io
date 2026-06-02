@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from core.config import settings
 from protocol.vc_protocol.compute_requests import GPU_RUNTIME_NVML_MISMATCH_REASON
-from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ..messages import RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -162,7 +161,6 @@ class RentalVerificationCheck:
                         "job_score": 0.0,
                         "score_warning": "GPU runtime NVML driver/library mismatch",
                         "clear_verified_job_info": True,
-                        "clear_verified_job_reason": ResetVerifiedJobReason.GPU_RUNTIME_NVML_MISMATCH.value,
                     },
                 )
             else:

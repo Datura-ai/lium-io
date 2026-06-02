@@ -5,7 +5,6 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     ExecutorHealthCheckResponse,
 )
-from neurons.validators.src.protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
@@ -192,10 +191,7 @@ async def test_rental_verification_nvml_mismatch_clears_verified_job_info():
     assert result.event.what_we_saw["source"] == "rental_verification"
     assert "failed to initialize NVML" in result.event.what_we_saw["stderr"]
     assert result.updates["clear_verified_job_info"] is True
-    assert (
-        result.updates["clear_verified_job_reason"]
-        == ResetVerifiedJobReason.GPU_RUNTIME_NVML_MISMATCH.value
-    )
+    assert "clear_verified_job_reason" not in result.updates
 
 
 @pytest.mark.asyncio

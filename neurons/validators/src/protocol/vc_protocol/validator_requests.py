@@ -88,7 +88,6 @@ class LogStreamRequest(BaseValidatorRequest):
 class ResetVerifiedJobReason(int, enum.Enum):
     DEFAULT = 0
     POD_NOT_RUNNING = 1         # container for pod is not running
-    GPU_RUNTIME_NVML_MISMATCH = 2
 
 
 class ResetVerifiedJobRequest(BaseValidatorRequest):
