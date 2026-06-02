@@ -34,11 +34,26 @@ from __future__ import annotations
 
 import logging
 import shlex
+import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 
 import asyncssh
 
 logger = logging.getLogger(__name__)
+
+_PROC_GPU_INFO_CMD = (
+    "for f in /proc/driver/nvidia/gpus/*/information; do "
+    '[ -r "$f" ] || continue; '
+    "awk -F: '"
+    '$1 == "GPU UUID" { uuid = $2 } '
+    '$1 == "Device Minor" { minor = $2 } '
+    "END { "
+    'gsub(/^[[:space:]]+|[[:space:]]+$/, "", uuid); '
+    'gsub(/^[[:space:]]+|[[:space:]]+$/, "", minor); '
+    'if (uuid != "" && minor != "") printf "%s, %s\\n", uuid, minor; '
+    "}' \"$f\"; "
+    "done 2>/dev/null"
+)
 
 
 async def build_gpu_flags(
@@ -109,22 +124,27 @@ async def _query_gpu_nodes_for_uuids(
     Returns (per_gpu_nodes_in_request_order, host_total_gpu_count). The host
     total lets the caller decide whether this is a partial-host rental.
     """
-    # `minor_number` is the documented driver-assigned minor that maps to /dev/nvidiaN,
-    # unlike `index` which is the CUDA enumeration order (PCI BDF) and is not formally
-    # guaranteed to equal the device-node minor.
-    res = await ssh.run("nvidia-smi --query-gpu=uuid,minor_number --format=csv,noheader")
-    if res.exit_status != 0:
-        raise RuntimeError(f"nvidia-smi query failed on executor: {res.stderr!r}")
+    errors: list[str] = []
+    try:
+        uuid_to_minor = await _query_gpu_minor_map_from_proc(ssh)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        uuid_to_minor = {}
 
-    uuid_to_minor: dict[str, int] = {}
-    for line in _stdout_lines(res.stdout):
-        uuid, _, minor = line.partition(",")
+    if not uuid_to_minor or _missing_gpu_uuids(gpu_uuids, uuid_to_minor):
         try:
-            uuid_to_minor[uuid.strip()] = int(minor.strip())
-        except ValueError:
-            continue
+            xml_uuid_to_minor = await _query_gpu_minor_map_from_nvidia_smi_xml(ssh)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        else:
+            if xml_uuid_to_minor:
+                uuid_to_minor = xml_uuid_to_minor
 
-    missing = [uuid for uuid in gpu_uuids if uuid not in uuid_to_minor]
+    if not uuid_to_minor:
+        details = f": {'; '.join(errors)}" if errors else ""
+        raise RuntimeError(f"GPU minor discovery returned no UUID/minor rows{details}")
+
+    missing = _missing_gpu_uuids(gpu_uuids, uuid_to_minor)
     if missing:
         raise RuntimeError(
             f"GPU {missing[0]!r} requested by tenant not present on executor; "
@@ -133,6 +153,34 @@ async def _query_gpu_nodes_for_uuids(
 
     per_gpu = tuple(f"/dev/nvidia{uuid_to_minor[uuid]}" for uuid in gpu_uuids)
     return per_gpu, len(uuid_to_minor)
+
+
+def _missing_gpu_uuids(gpu_uuids: Sequence[str], uuid_to_minor: dict[str, int]) -> list[str]:
+    return [uuid for uuid in gpu_uuids if uuid not in uuid_to_minor]
+
+
+async def _query_gpu_minor_map_from_proc(
+    ssh: asyncssh.SSHClientConnection,
+) -> dict[str, int]:
+    res = await ssh.run(_PROC_GPU_INFO_CMD)
+    if res.exit_status != 0:
+        raise RuntimeError(
+            "NVIDIA /proc GPU minor query failed on executor: "
+            f"exit_status={res.exit_status}, stdout={res.stdout!r}, stderr={res.stderr!r}"
+        )
+    return _parse_uuid_minor_csv(res.stdout)
+
+
+async def _query_gpu_minor_map_from_nvidia_smi_xml(
+    ssh: asyncssh.SSHClientConnection,
+) -> dict[str, int]:
+    res = await ssh.run("nvidia-smi -q -x")
+    if res.exit_status != 0:
+        raise RuntimeError(
+            "nvidia-smi XML query failed on executor: "
+            f"exit_status={res.exit_status}, stdout={res.stdout!r}, stderr={res.stderr!r}"
+        )
+    return _parse_nvidia_smi_xml_minor_map(res.stdout)
 
 
 async def _query_shared_nodes(
@@ -164,6 +212,50 @@ async def _query_shared_nodes(
 
 def _stdout_lines(stdout: str) -> tuple[str, ...]:
     return tuple(line.strip() for line in stdout.splitlines() if line.strip())
+
+
+def _parse_uuid_minor_csv(stdout: str) -> dict[str, int]:
+    uuid_to_minor: dict[str, int] = {}
+    for line in _stdout_lines(stdout):
+        uuid, _, minor = line.partition(",")
+        try:
+            uuid_to_minor[uuid.strip()] = int(minor.strip())
+        except ValueError:
+            continue
+    return uuid_to_minor
+
+
+def _parse_nvidia_smi_xml_minor_map(stdout: str) -> dict[str, int]:
+    try:
+        root = ET.fromstring(stdout)
+    except ET.ParseError as exc:
+        raise RuntimeError("nvidia-smi XML output could not be parsed") from exc
+
+    uuid_to_minor: dict[str, int] = {}
+    for gpu in root.iter():
+        if _xml_local_name(gpu.tag) != "gpu":
+            continue
+
+        uuid = _xml_child_text(gpu, "uuid")
+        minor = _xml_child_text(gpu, "minor_number")
+        if not uuid or not minor:
+            continue
+        try:
+            uuid_to_minor[uuid.strip()] = int(minor.strip())
+        except ValueError:
+            continue
+    return uuid_to_minor
+
+
+def _xml_child_text(parent: ET.Element, child_name: str) -> str | None:
+    for child in parent:
+        if _xml_local_name(child.tag) == child_name:
+            return child.text
+    return None
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
 
 
 if __name__ == "__main__":
