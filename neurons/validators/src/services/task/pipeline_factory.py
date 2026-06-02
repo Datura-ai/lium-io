@@ -34,6 +34,7 @@ from .checks import (
     GpuCountCheck,
     GpuFingerprintCheck,
     GpuModelValidCheck,
+    GpuPowerLimitCheck,
     GpuUsageCheck,
     GpuVramPrecheck,
     MachineSpecScrapeCheck,
@@ -222,6 +223,7 @@ class PipelineFactory:
                 # here — before the rented short-circuit (TenantEnforcementCheck)
                 # — to gate rented and idle executors alike.
                 GpuVramPrecheck(),
+                GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
@@ -270,6 +272,7 @@ class PipelineFactory:
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
+                GpuPowerLimitCheck(),
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),

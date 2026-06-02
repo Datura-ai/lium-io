@@ -6,6 +6,7 @@ from .finalize import FinalizeCheck
 from .gpu_count import GpuCountCheck
 from .gpu_fingerprint import GpuFingerprintCheck
 from .gpu_model_valid import GpuModelValidCheck
+from .gpu_power_limit import GpuPowerLimitCheck
 from .gpu_usage import GpuUsageCheck
 from .gpu_vram_precheck import GpuVramPrecheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
@@ -31,6 +32,7 @@ __all__ = [
     "GpuCountCheck",
     "GpuFingerprintCheck",
     "GpuModelValidCheck",
+    "GpuPowerLimitCheck",
     "GpuUsageCheck",
     "GpuVramPrecheck",
     "MachineSpecScrapeCheck",
