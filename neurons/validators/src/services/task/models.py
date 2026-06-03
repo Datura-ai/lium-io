@@ -12,8 +12,6 @@ class JobResult(BaseModel):
     executor_info: ExecutorSSHInfo
     score: float
     job_score: float
-    persist_zero_score_specs: bool = False
-    zero_score_persistence_reason: str | None = None
     collateral_deposited: bool = False
     job_batch_id: str
     log_status: str

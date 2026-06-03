@@ -68,8 +68,6 @@ class GpuPowerLimitCheck:
                 updates={
                     "score": 0.0,
                     "job_score": 0.0,
-                    "persist_zero_score_specs": True,
-                    "zero_score_persistence_reason": "GPU_POWER_LIMIT_BELOW_DEFAULT",
                     "score_warning": (
                         " WARNING: GPU power limit is below 80% of the default power limit"
                     ),

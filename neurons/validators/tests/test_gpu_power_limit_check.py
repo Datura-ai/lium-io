@@ -40,8 +40,6 @@ async def test_power_limit_rejects_below_threshold(context_factory):
     assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
     assert result.updates["score"] == 0.0
     assert result.updates["job_score"] == 0.0
-    assert result.updates["persist_zero_score_specs"] is True
-    assert result.updates["zero_score_persistence_reason"] == "GPU_POWER_LIMIT_BELOW_DEFAULT"
     assert result.event.what_we_saw["rejected_gpus"][0]["power_limit_ratio"] == 0.3
 
 

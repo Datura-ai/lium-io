@@ -296,8 +296,6 @@ class ComputeClient:
                                     "executor_uuid": data["executor_uuid"],
                                     "actual_score": data["score"],
                                     "synthetic_job_score": data["synthetic_job_score"],
-                                    "persist_zero_score_specs": data.get("persist_zero_score_specs", False),
-                                    "zero_score_persistence_reason": data.get("zero_score_persistence_reason"),
                                 }),
                             )
                         )
@@ -305,8 +303,6 @@ class ComputeClient:
                             specs=data["specs"],
                             score=data["score"],
                             synthetic_job_score=data["synthetic_job_score"],
-                            persist_zero_score_specs=data.get("persist_zero_score_specs", False),
-                            zero_score_persistence_reason=data.get("zero_score_persistence_reason"),
                             log_status=data["log_status"],
                             job_batch_id=data['job_batch_id'],
                             log_text=data["log_text"],
