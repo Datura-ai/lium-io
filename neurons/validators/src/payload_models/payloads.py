@@ -432,6 +432,7 @@ class FailedContainerRequest(ContainerBaseResponse):
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     msg: str
     error_code: FailedContainerErrorCodes | None = None
+    failure_step: str | None = None
 
 
 class DuplicateExecutorsResponse(BaseModel):

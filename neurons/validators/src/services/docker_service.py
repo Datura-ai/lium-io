@@ -97,6 +97,11 @@ _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
 _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
+# Keep the rental create_container SSH session alive while long docker pulls
+# are quiet. With 30s/4, AsyncSSH declares a dead peer after about 2 minutes.
+_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
+_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
+_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60 # 3 hours
 
 
 def _is_missing_docker_container_error(exc: Exception) -> bool:
@@ -1362,10 +1367,13 @@ class DockerService:
         )
 
         log_tag = "container_creation"
+        current_step = "start"
 
         try:
+            current_step = "prepare_request"
             custom_options = CustomOptions.sanitize(payload.custom_options)
             # generate port maps
+            current_step = "port_mapping"
             port_maps, jupyter_port_map = await self.generate_portMappings(
                 payload.miner_hotkey,
                 payload.executor_id,
@@ -1397,6 +1405,7 @@ class DockerService:
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoPortMappings,
+                    failure_step=current_step,
                 )
 
             default_extra = {
@@ -1421,8 +1430,10 @@ class DockerService:
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoJupyterPortMapping,
+                    failure_step=current_step,
                 )
 
+            current_step = "validate_request"
             if not payload.user_public_keys:
                 log_text = _m(
                     "No public keys",
@@ -1440,16 +1451,20 @@ class DockerService:
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.NoSshKeys,
+                    failure_step=current_step,
                 )
 
             # add executor in pending status dict
+            current_step = "pending_pod"
             await self.redis_service.add_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
+            current_step = "ssh_key_import"
             private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
             pkey = asyncssh.import_private_key(private_key)
 
             known_hosts_policy: asyncssh.SSHKnownHosts | None = None
             try:
+                current_step = "attestation"
                 known_hosts_policy = await self._prepare_known_hosts_policy(
                     executor_info,
                     payload.miner_hotkey,
@@ -1469,14 +1484,18 @@ class DockerService:
                     msg=str(log_text),
                     error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                     error_code=FailedContainerErrorCodes.UnknownError,
+                    failure_step=current_step,
                 )
 
+            current_step = "ssh_connect"
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
+                keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
+                keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
             ) as ssh_client:
                 # Add profiler for ssh connection
                 profilers.append({"name": "SSH connection established", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
@@ -1499,6 +1518,7 @@ class DockerService:
                 #     log_extra=default_extra,
                 # )
                 if payload.docker_username and payload.docker_password:
+                    current_step = "docker_login"
                     command = self._build_docker_login_command(
                         payload.docker_username, payload.docker_password
                     )
@@ -1515,6 +1535,7 @@ class DockerService:
                 profilers.append({"name": "Docker login step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
+                current_step = "docker_pull"
                 command = f"/usr/bin/docker pull {payload.docker_image}"
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
@@ -1522,6 +1543,7 @@ class DockerService:
                     log_tag=log_tag,
                     log_text=f"Pulling docker image {payload.docker_image}",
                     log_extra=default_extra,
+                    timeout=_DOCKER_PULL_TIMEOUT_SECONDS,
                 )
 
                 # Add profiler for docker pull
@@ -1575,6 +1597,7 @@ class DockerService:
                 if local_volume:
                     protected_volume_names.add(local_volume)
 
+                current_step = "container_cleanup"
                 await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
@@ -1597,6 +1620,7 @@ class DockerService:
 
                 if not local_volume:
                     # create docker volume
+                    current_step = "volume_creation"
                     local_volume = f"volume_{payload.pod_id}"
                     await self.create_local_volume(
                         ssh_client=ssh_client,
@@ -1611,6 +1635,7 @@ class DockerService:
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
 
                 if external_volume_info:
+                    current_step = "external_volume_creation"
                     success, msg = await self.create_s3fs_volume(
                         ssh_client=ssh_client,
                         log_extra=default_extra,
@@ -1641,6 +1666,7 @@ class DockerService:
                 # explicit --device entries persist the device cgroup across systemd
                 # daemon-reload (cgroup v2 + systemd cgroup driver wipe the transient
                 # nvidia hook program; HostConfig.Devices is reapplied by Docker).
+                current_step = "gpu_flags"
                 gpu_flags = await build_gpu_flags(ssh_client, payload.gpu_uuids) + " "
 
                 # CPU and memory restriction flags
@@ -1687,6 +1713,7 @@ class DockerService:
                 # Tighter budget than the early call: by this point HC should
                 # be near completion, and the port-allocated retry loop +
                 # `docker rm -f` are the backstop for any residual race.
+                current_step = "port_check_wait"
                 wait_ok, wait_msg = await self.wait_for_port_check_containers(
                     executor_info=executor_info,
                     miner_hotkey=payload.miner_hotkey,
@@ -1704,6 +1731,7 @@ class DockerService:
                 )
 
                 try:
+                    current_step = "docker_run"
                     await self._run_docker_create_with_port_retry(
                         ssh_client=ssh_client,
                         command=command,
@@ -1717,6 +1745,7 @@ class DockerService:
                     logger.info(f"Container creation step finished")
 
                     # check if the container is running correctly
+                    current_step = "container_health_check"
                     if not await self.check_container_running(ssh_client, container_name):
                         # Capture the failure reason and check whether it points to our
                         # --device flags (DAH-1987). State.Error covers cgroup / device
@@ -1786,6 +1815,7 @@ class DockerService:
                 #     )
                 # else:
                 try:
+                    current_step = "ssh_bootstrap"
                     await self.install_open_ssh_server_and_start_ssh_service(
                         ssh_client=ssh_client,
                         container_name=container_name,
@@ -1795,6 +1825,7 @@ class DockerService:
 
                     jupyter_url = None
                     if payload.enable_jupyter and jupyter_port_map:
+                        current_step = "jupyter_setup"
                         jupyter_token = secrets.token_hex(16)
                         await self.run_jupyter(
                             ssh_client=ssh_client,
@@ -1813,11 +1844,13 @@ class DockerService:
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                     # add rest of public keys
+                    current_step = "add_public_keys"
                     for public_key in payload.user_public_keys:
                         command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
                         await ssh_client.run(command)
 
                     # add environment variables
+                    current_step = "set_environment"
                     if custom_options and custom_options.environment:
                         for k, v in custom_options.environment.items():
                             if k and v and k.strip() and str(v).strip():
@@ -1836,6 +1869,7 @@ class DockerService:
 
                     await self.finish_stream_logs()
 
+                    current_step = "finalize"
                     await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
                 except Exception:
                     await self.cleanup_failed_container_creation(
@@ -1879,7 +1913,11 @@ class DockerService:
         except Exception as e:
             log_text = _m(
                 "Failed create_container",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
+                extra=get_extra_info({
+                    **default_extra,
+                    "error": str(e),
+                    "failure_step": current_step,
+                }),
             )
             logger.error(log_text, exc_info=True)
 
@@ -1896,6 +1934,7 @@ class DockerService:
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
+                failure_step=current_step,
             )
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
