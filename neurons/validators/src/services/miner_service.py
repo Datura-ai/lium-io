@@ -479,8 +479,6 @@ class MinerService:
                         "price_per_gpu": result.executor_info.price_per_gpu,
                         "score": result.score,
                         "synthetic_job_score": result.job_score,
-                        "persist_zero_score_specs": result.persist_zero_score_specs,
-                        "zero_score_persistence_reason": result.zero_score_persistence_reason,
                         "job_batch_id": result.job_batch_id,
                         "log_status": result.log_status,
                         "log_text": result.full_log_text,
