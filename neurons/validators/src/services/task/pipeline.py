@@ -110,6 +110,8 @@ class Context(BaseModel):
     score: float = 0.0
     job_score: float = 0.0
     score_warning: str | None = None
+    persist_zero_score_specs: bool = False
+    zero_score_persistence_reason: str | None = None
     log_status: str = "info"
     log_text: str | None = None
     success: bool = False
