@@ -62,13 +62,6 @@ services:
       - executor
     cap_add:
       - SYSLOG
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [ gpu ]
 
   autoheal:
     restart: always
