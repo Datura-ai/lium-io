@@ -65,6 +65,8 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     specs: dict | None
     score: float | None
     synthetic_job_score: float | None
+    persist_zero_score_specs: bool = False
+    zero_score_persistence_reason: str | None = None
     log_text: str | None
     log_status: str | None
     job_batch_id: str

@@ -122,6 +122,8 @@ class ResultHandler:
             executor_info=executor_info,
             score=context.score,
             job_score=context.job_score,
+            persist_zero_score_specs=context.persist_zero_score_specs,
+            zero_score_persistence_reason=context.zero_score_persistence_reason,
             collateral_deposited=context.collateral_deposited,
             job_batch_id=miner_info.job_batch_id,
             log_status=log_status,
