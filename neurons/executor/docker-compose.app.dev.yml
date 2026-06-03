@@ -59,13 +59,6 @@ services:
       - DB_URI=postgresql://postgres:password@db:5432/compute-subnet-db
     depends_on:
       - executor
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [ gpu ]
 
   autoheal:
     restart: always
