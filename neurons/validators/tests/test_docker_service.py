@@ -1,4 +1,7 @@
+import asyncio
 import shlex
+import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, MagicMock
 from uuid import uuid4, UUID
 from datetime import datetime
@@ -75,6 +78,529 @@ def test_executor_id():
 def test_miner_hotkey():
     """Fixture for test miner hotkey."""
     return "test_miner"
+
+
+class FakeAsyncLineStream:
+    def __init__(
+        self,
+        lines: list[tuple[float, str]] | None = None,
+        close_delay: float = 0,
+    ):
+        self.lines = list(lines or [])
+        self.close_delay = close_delay
+        self.close_delay_done = False
+        self.cancelled = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            if self.lines:
+                delay, line = self.lines.pop(0)
+                if delay:
+                    await asyncio.sleep(delay)
+                return line
+
+            if self.close_delay and not self.close_delay_done:
+                self.close_delay_done = True
+                await asyncio.sleep(self.close_delay)
+
+            raise StopAsyncIteration
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+# The no-output warning loop depends on asyncio.sleep() and time.monotonic().
+# Tiny real sleeps made these tests scheduling-sensitive in CI, so the helpers
+# below let each test advance time and release the warning sleep explicitly.
+# Patch the docker_service module bindings only, not the shared stdlib modules,
+# so asyncio.wait_for() test watchdogs keep using the real event-loop clock.
+class FakeClock:
+    """Minimal monotonic clock controlled by the test."""
+
+    def __init__(self):
+        self.now = 0
+
+    def monotonic(self):
+        return self.now
+
+
+class ControlledWarningSleep:
+    """Drive the warning loop without relying on real millisecond sleeps.
+
+    The first sleep blocks until the test releases it. The second sleep blocks
+    forever so tests can prove the warning loop advanced once before cleanup.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.first_sleep_started = asyncio.Event()
+        self.first_sleep_released = asyncio.Event()
+        self.second_sleep_started = asyncio.Event()
+
+    async def __call__(self, seconds):
+        self.calls.append(seconds)
+        if not self.first_sleep_started.is_set():
+            self.first_sleep_started.set()
+            await self.first_sleep_released.wait()
+            return
+
+        self.second_sleep_started.set()
+        await asyncio.Event().wait()
+
+    def release_first_sleep(self):
+        self.first_sleep_released.set()
+
+
+def patch_docker_service_timing(monkeypatch, fake_clock, warning_sleep):
+    import services.docker_service as docker_service_module
+
+    monkeypatch.setattr(
+        docker_service_module,
+        "time",
+        SimpleNamespace(monotonic=fake_clock.monotonic),
+    )
+    monkeypatch.setattr(
+        docker_service_module,
+        "asyncio",
+        SimpleNamespace(
+            sleep=warning_sleep,
+            create_task=asyncio.create_task,
+            gather=asyncio.gather,
+            wait_for=asyncio.wait_for,
+            TimeoutError=asyncio.TimeoutError,
+        ),
+    )
+
+
+class CloseControlledLineStream:
+    """Async stream which stays open until the test explicitly closes it."""
+
+    def __init__(self, close_event: asyncio.Event):
+        self.close_event = close_event
+        self.cancelled = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            await self.close_event.wait()
+            raise StopAsyncIteration
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class EventControlledLineStream:
+    """Async stream which emits one line only after the test allows it."""
+
+    def __init__(
+        self,
+        line: str,
+        emit_event: asyncio.Event,
+        close_event: asyncio.Event,
+    ):
+        self.line = line
+        self.emit_event = emit_event
+        self.close_event = close_event
+        self.emitted = False
+        self.cancelled = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            if not self.emitted:
+                await self.emit_event.wait()
+                self.emitted = True
+                return self.line
+
+            await self.close_event.wait()
+            raise StopAsyncIteration
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class FakeProcess:
+    def __init__(
+        self,
+        stdout: FakeAsyncLineStream | None = None,
+        stderr: FakeAsyncLineStream | None = None,
+    ):
+        self.stdout = stdout or FakeAsyncLineStream()
+        self.stderr = stderr or FakeAsyncLineStream()
+
+
+class FakeProcessContext:
+    def __init__(self, process: FakeProcess):
+        self.process = process
+
+    async def __aenter__(self):
+        return self.process
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+
+class FakeCreateProcessClient:
+    def __init__(self, process: FakeProcess):
+        self.process = process
+        self.commands = []
+
+    def create_process(self, command):
+        self.commands.append(command)
+        return FakeProcessContext(self.process)
+
+
+class SubprocessLineStream:
+    def __init__(self, reader: asyncio.StreamReader):
+        self.reader = reader
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        line = await self.reader.readline()
+        if not line:
+            raise StopAsyncIteration
+        return line.decode()
+
+
+class LocalSubprocessContext:
+    def __init__(self, args: list[str]):
+        self.args = args
+        self.process = None
+
+    async def __aenter__(self):
+        self.process = await asyncio.create_subprocess_exec(
+            *self.args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        return Mock(
+            stdout=SubprocessLineStream(self.process.stdout),
+            stderr=SubprocessLineStream(self.process.stderr),
+        )
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.process.returncode is not None:
+            return None
+
+        if exc_type is not None:
+            self.process.terminate()
+
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            self.process.kill()
+            await self.process.wait()
+
+        return None
+
+
+class LocalSubprocessClient:
+    def __init__(self, args: list[str]):
+        self.args = args
+        self.commands = []
+
+    def create_process(self, command):
+        self.commands.append(command)
+        return LocalSubprocessContext(self.args)
+
+
+def capture_stream_logs(docker_service):
+    events = []
+
+    async def stream_log(text, status, tag):
+        events.append((text, status, tag))
+
+    docker_service.stream_log = stream_log
+    return events
+
+
+def capture_warning_messages(monkeypatch):
+    messages = []
+    monkeypatch.setattr(
+        "services.docker_service.logger.warning",
+        lambda message, *args, **kwargs: messages.append(str(message)),
+    )
+    return messages
+
+
+async def run_fake_execute_and_stream_logs(
+    docker_service,
+    process: FakeProcess,
+    **kwargs,
+):
+    ssh_client = FakeCreateProcessClient(process)
+    defaults = {
+        "command": "/usr/bin/docker pull daturaai/pytorch:test",
+        "log_tag": "tag",
+        "log_text": "Pulling docker image daturaai/pytorch:test",
+    }
+
+    result = await docker_service.execute_and_stream_logs(
+        ssh_client=ssh_client,
+        **{**defaults, **kwargs},
+    )
+
+    return result, ssh_client
+
+
+@pytest.mark.asyncio
+async def test_stream_process_output_does_not_block_stderr_behind_stdout(docker_service):
+    """stderr must be observed immediately even while stdout is still open."""
+    events = capture_stream_logs(docker_service)
+    process = FakeProcess(
+        stdout=FakeAsyncLineStream([(0.03, "stdout-line")]),
+        stderr=FakeAsyncLineStream([(0, "stderr-line")]),
+    )
+
+    status, error = await docker_service._stream_process_output(process, "tag")
+
+    assert status is False
+    assert error == "stderr-line\n"
+    assert events == [
+        ("stderr-line", "error", "tag"),
+        ("stdout-line", "success", "tag"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_and_stream_logs_drains_real_subprocess_streams_concurrently(
+    docker_service,
+):
+    """Use real OS pipes to guard against blocking stderr behind stdout."""
+    events = capture_stream_logs(docker_service)
+    script = (
+        "import sys, time; "
+        "sys.stderr.write('stderr-line\\n'); "
+        "sys.stderr.flush(); "
+        "time.sleep(0.05); "
+        "sys.stdout.write('stdout-line\\n'); "
+        "sys.stdout.flush()"
+    )
+    ssh_client = LocalSubprocessClient([sys.executable, "-u", "-c", script])
+
+    status, error = await docker_service.execute_and_stream_logs(
+        ssh_client=ssh_client,
+        command="local subprocess command",
+        log_tag="tag",
+        log_text="Running local subprocess",
+        raise_exception=False,
+    )
+
+    assert status is False
+    assert error == "stderr-line\n"
+    assert ssh_client.commands == ["local subprocess command"]
+    assert events == [
+        ("Running local subprocess", "success", "tag"),
+        ("stderr-line", "error", "tag"),
+        ("stdout-line", "success", "tag"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_process_output_preserves_multiple_interleaved_stream_lines(
+    docker_service,
+):
+    """Concurrent draining must not drop lines when stdout and stderr interleave."""
+    events = capture_stream_logs(docker_service)
+    process = FakeProcess(
+        stdout=FakeAsyncLineStream([(0.005, "out-one"), (0.03, "out-two")]),
+        stderr=FakeAsyncLineStream([(0.015, "err-one"), (0.005, "err-two")]),
+    )
+
+    status, error = await docker_service._stream_process_output(process, "tag")
+
+    assert status is False
+    assert error == "err-one\nerr-two\n"
+    assert len(events) == 4
+    assert set(events) == {
+        ("out-one", "success", "tag"),
+        ("err-one", "error", "tag"),
+        ("err-two", "error", "tag"),
+        ("out-two", "success", "tag"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_and_stream_logs_warns_on_quiet_output_without_failing(
+    docker_service,
+    monkeypatch,
+):
+    """The quiet-output warning is observability only and must not fail the command."""
+    events = capture_stream_logs(docker_service)
+    warning_messages = capture_warning_messages(monkeypatch)
+    fake_clock = FakeClock()
+    warning_sleep = ControlledWarningSleep()
+    patch_docker_service_timing(monkeypatch, fake_clock, warning_sleep)
+    close_event = asyncio.Event()
+    process = FakeProcess(
+        stdout=CloseControlledLineStream(close_event),
+        stderr=CloseControlledLineStream(close_event),
+    )
+
+    execute_task = asyncio.create_task(
+        run_fake_execute_and_stream_logs(
+            docker_service,
+            process,
+            no_output_warning_seconds=1,
+        )
+    )
+
+    # Let the warning task start its sleep, then move fake time past the
+    # threshold and release that sleep. No stream output occurs before release.
+    await asyncio.wait_for(warning_sleep.first_sleep_started.wait(), timeout=1)
+    fake_clock.now = 1
+    warning_sleep.release_first_sleep()
+    await asyncio.wait_for(warning_sleep.second_sleep_started.wait(), timeout=1)
+    close_event.set()
+    (status, error), ssh_client = await asyncio.wait_for(execute_task, timeout=1)
+
+    assert status is True
+    assert error == ""
+    assert ssh_client.commands == ["/usr/bin/docker pull daturaai/pytorch:test"]
+    assert events == [("Pulling docker image daturaai/pytorch:test", "success", "tag")]
+    assert warning_sleep.calls == [1, 1]
+    assert any("DOCKER_COMMAND_NO_OUTPUT_WARNING" in msg for msg in warning_messages)
+
+
+@pytest.mark.asyncio
+async def test_stderr_output_prevents_quiet_output_warning(
+    docker_service,
+    monkeypatch,
+):
+    """stderr activity must reset the quiet-output clock just like stdout."""
+    events = []
+    stderr_logged = asyncio.Event()
+
+    async def stream_log(text, status, tag):
+        events.append((text, status, tag))
+        if text == "stderr-output":
+            stderr_logged.set()
+
+    docker_service.stream_log = stream_log
+    warning_messages = capture_warning_messages(monkeypatch)
+    fake_clock = FakeClock()
+    warning_sleep = ControlledWarningSleep()
+    patch_docker_service_timing(monkeypatch, fake_clock, warning_sleep)
+    emit_stderr = asyncio.Event()
+    close_event = asyncio.Event()
+    process = FakeProcess(
+        stdout=CloseControlledLineStream(close_event),
+        stderr=EventControlledLineStream("stderr-output", emit_stderr, close_event),
+    )
+
+    stream_task = asyncio.create_task(
+        docker_service._stream_process_output(
+            process,
+            "tag",
+            no_output_warning_seconds=1,
+            no_output_warning_extra={"command": "/usr/bin/docker pull image"},
+        )
+    )
+
+    # Emit stderr while the warning task is parked in its first sleep, then
+    # release the sleep with less than one threshold elapsed since that output.
+    # The next sleep should be only the remaining quiet time, not another full
+    # interval from the original watcher start.
+    await asyncio.wait_for(warning_sleep.first_sleep_started.wait(), timeout=1)
+    fake_clock.now = 10
+    emit_stderr.set()
+    await asyncio.wait_for(stderr_logged.wait(), timeout=1)
+    fake_clock.now = 10.5
+    warning_sleep.release_first_sleep()
+    await asyncio.wait_for(warning_sleep.second_sleep_started.wait(), timeout=1)
+    close_event.set()
+    status, error = await asyncio.wait_for(stream_task, timeout=1)
+
+    assert status is False
+    assert error == "stderr-output\n"
+    assert events == [("stderr-output", "error", "tag")]
+    assert warning_sleep.calls == [1, 0.5]
+    assert warning_messages == []
+
+
+@pytest.mark.asyncio
+async def test_execute_and_stream_logs_raises_with_stderr_text(
+    docker_service,
+):
+    """raise_exception=True must preserve stderr details in the raised message."""
+    capture_stream_logs(docker_service)
+    process = FakeProcess(
+        stderr=FakeAsyncLineStream([(0, "pull failed"), (0, "unauthorized")]),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        await run_fake_execute_and_stream_logs(docker_service, process)
+
+    message = str(exc_info.value)
+    assert "Failed Pulling docker image daturaai/pytorch:test" in message
+    assert "pull failed\nunauthorized\n" in message
+
+
+@pytest.mark.asyncio
+async def test_execute_and_stream_logs_returns_stderr_when_raise_disabled(
+    docker_service,
+):
+    """raise_exception=False should return failure status and collected stderr."""
+    events = capture_stream_logs(docker_service)
+    process = FakeProcess(
+        stderr=FakeAsyncLineStream([(0, "manifest unknown")]),
+    )
+
+    (status, error), _ = await run_fake_execute_and_stream_logs(
+        docker_service,
+        process,
+        raise_exception=False,
+    )
+
+    assert status is False
+    assert error == "manifest unknown\n"
+    assert events == [
+        ("Pulling docker image daturaai/pytorch:test", "success", "tag"),
+        ("manifest unknown", "error", "tag"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_and_stream_logs_timeout_still_returns_timeout(
+    docker_service,
+    monkeypatch,
+):
+    """The existing hard timeout must still cancel active stream reads cleanly."""
+    events = capture_stream_logs(docker_service)
+    warning_messages = capture_warning_messages(monkeypatch)
+    stdout = FakeAsyncLineStream(close_delay=0.05)
+    stderr = FakeAsyncLineStream(close_delay=0.05)
+    process = FakeProcess(
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    (status, error), _ = await run_fake_execute_and_stream_logs(
+        docker_service,
+        process,
+        timeout=0.01,
+        raise_exception=False,
+        no_output_warning_seconds=0.02,
+    )
+
+    assert status is False
+    assert error == "Process timed out"
+    assert events == [
+        ("Pulling docker image daturaai/pytorch:test", "success", "tag"),
+        ("Process timed out", "error", "tag"),
+    ]
+    assert any("Docker command timed out" in msg for msg in warning_messages)
+    assert stdout.cancelled is True
+    assert stderr.cancelled is True
 
 
 @pytest.mark.asyncio
@@ -1361,6 +1887,7 @@ async def test_create_container_uses_keepalives_and_docker_pull_timeout(
     docker_service,
     monkeypatch,
 ):
+    """create_container should keep SSH alive and scope pull-only timeouts/warnings."""
     import services.docker_service as docker_service_module
 
     ssh_client = AsyncMock()
@@ -1439,6 +1966,15 @@ async def test_create_container_uses_keepalives_and_docker_pull_timeout(
     ]
     assert len(pull_calls) == 1
     assert pull_calls[0].kwargs["timeout"] == docker_service_module._DOCKER_PULL_TIMEOUT_SECONDS
+    assert (
+        pull_calls[0].kwargs["no_output_warning_seconds"]
+        == docker_service_module._DOCKER_PULL_NO_OUTPUT_WARNING_SECONDS
+    )
+    non_pull_calls = [
+        call for call in execute_mock.await_args_list
+        if call.kwargs["command"] != f"/usr/bin/docker pull {payload.docker_image}"
+    ]
+    assert all(call.kwargs.get("no_output_warning_seconds") is None for call in non_pull_calls)
 
 
 @pytest.mark.asyncio
@@ -1446,6 +1982,7 @@ async def test_create_container_reports_docker_pull_failure_step(
     docker_service,
     monkeypatch,
 ):
+    """A failure during docker pull should be reported as failure_step=docker_pull."""
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
     monkeypatch.setattr(

@@ -101,7 +101,9 @@ _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 # are quiet. With 30s/4, AsyncSSH declares a dead peer after about 2 minutes.
 _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
-_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60 # 3 hours
+_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60  # 3 hours
+# Observability only: warn about quiet docker pulls without cancelling them.
+_DOCKER_PULL_NO_OUTPUT_WARNING_SECONDS = 15 * 60
 
 
 def _is_missing_docker_container_error(exc: Exception) -> bool:
@@ -543,15 +545,26 @@ class DockerService:
         log_extra: dict = {},
         timeout: int = 0,
         raise_exception: bool = True,
+        no_output_warning_seconds: float | None = None,
     ) -> tuple[bool, str]:
+        command_extra = {
+            **log_extra,
+            "command": command,
+            "timeout_seconds": timeout,
+        }
+        if no_output_warning_seconds:
+            command_extra["no_output_warning_seconds"] = no_output_warning_seconds
+        no_output_warning_extra = {
+            **log_extra,
+            "command": command,
+            "log_text": log_text,
+            "no_output_warning_seconds": no_output_warning_seconds,
+        } if no_output_warning_seconds else None
+
         logger.info(
             _m(
                 log_text,
-                extra=get_extra_info({
-                    **log_extra,
-                    "command": command,
-                    "timeout_seconds": timeout,
-                }),
+                extra=get_extra_info(command_extra),
             ),
         )
 
@@ -562,9 +575,22 @@ class DockerService:
         try:
             async with ssh_client.create_process(command) as process:
                 if timeout != 0:
-                    status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
+                    status, error = await asyncio.wait_for(
+                        self._stream_process_output(
+                            process,
+                            log_tag,
+                            no_output_warning_seconds=no_output_warning_seconds,
+                            no_output_warning_extra=no_output_warning_extra,
+                        ),
+                        timeout=timeout,
+                    )
                 else:
-                    status, error = await self._stream_process_output(process, log_tag)
+                    status, error = await self._stream_process_output(
+                        process,
+                        log_tag,
+                        no_output_warning_seconds=no_output_warning_seconds,
+                        no_output_warning_extra=no_output_warning_extra,
+                    )
         except asyncio.TimeoutError:
             status = False
             error = "Process timed out"
@@ -586,17 +612,83 @@ class DockerService:
 
         return status, error
 
-    async def _stream_process_output(self, process, log_tag):
-        status = True
+    async def _stream_process_output(
+        self,
+        process,
+        log_tag,
+        no_output_warning_seconds: float | None = None,
+        no_output_warning_extra: dict | None = None,
+    ):
         error = ''
+        stream_state = {
+            "last_output_at": time.monotonic(),
+            "last_warning_at": None,
+        }
+        no_output_warning_task = None
 
-        async for line in process.stdout:
-            await self.stream_log(line.strip(), "success", log_tag)
+        async def warn_on_no_output():
+            while True:
+                last_warning_at = stream_state["last_warning_at"]
+                last_activity_at = max(
+                    stream_state["last_output_at"],
+                    last_warning_at if last_warning_at is not None else stream_state["last_output_at"],
+                )
+                sleep_seconds = max(
+                    last_activity_at + no_output_warning_seconds - time.monotonic(),
+                    0,
+                )
+                if sleep_seconds:
+                    await asyncio.sleep(sleep_seconds)
 
-        async for line in process.stderr:
-            status = False
-            error += line.strip() + "\n"
-            await self.stream_log(line.strip(), "error", log_tag)
+                now = time.monotonic()
+                no_output_seconds = now - stream_state["last_output_at"]
+                if no_output_seconds >= no_output_warning_seconds:
+                    logger.warning(
+                        _m(
+                            "DOCKER_COMMAND_NO_OUTPUT_WARNING",
+                            extra=get_extra_info({
+                                **(no_output_warning_extra or {}),
+                                "no_output_seconds": int(no_output_seconds),
+                            }),
+                        )
+                    )
+                    stream_state["last_warning_at"] = now
+
+        if no_output_warning_seconds and no_output_warning_seconds > 0:
+            no_output_warning_task = asyncio.create_task(warn_on_no_output())
+
+        stderr_lines = []
+
+        async def stream_stdout():
+            async for line in process.stdout:
+                stream_state["last_output_at"] = time.monotonic()
+                await self.stream_log(line.strip(), "success", log_tag)
+
+        async def stream_stderr():
+            async for line in process.stderr:
+                stream_state["last_output_at"] = time.monotonic()
+                stderr_line = line.strip()
+                stderr_lines.append(stderr_line)
+                await self.stream_log(stderr_line, "error", log_tag)
+
+        # Docker commands can write meaningful output to stderr, so drain both
+        # streams concurrently before deciding whether the command was quiet.
+        stream_tasks = [
+            asyncio.create_task(stream_stdout()),
+            asyncio.create_task(stream_stderr()),
+        ]
+        try:
+            await asyncio.gather(*stream_tasks)
+            error = "".join(f"{line}\n" for line in stderr_lines)
+            status = not stderr_lines
+        finally:
+            for task in stream_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*stream_tasks, return_exceptions=True)
+            if no_output_warning_task:
+                no_output_warning_task.cancel()
+                await asyncio.gather(no_output_warning_task, return_exceptions=True)
 
         return status, error
 
@@ -1544,6 +1636,7 @@ class DockerService:
                     log_text=f"Pulling docker image {payload.docker_image}",
                     log_extra=default_extra,
                     timeout=_DOCKER_PULL_TIMEOUT_SECONDS,
+                    no_output_warning_seconds=_DOCKER_PULL_NO_OUTPUT_WARNING_SECONDS,
                 )
 
                 # Add profiler for docker pull
