@@ -13,7 +13,7 @@ from core.logger import _m, get_logger
 
 logger = get_logger(__name__)
 
-AUTHENTICATED_REQUEST_TIMEOUT_SECONDS = 8
+AUTHENTICATED_REQUEST_TIMEOUT_SECONDS = 30
 
 
 class MinerMiddleware(BaseHTTPMiddleware):
