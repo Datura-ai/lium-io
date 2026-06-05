@@ -1,4 +1,7 @@
+import asyncio
 import re
+import time
+
 import bittensor
 from fastapi.responses import JSONResponse
 from payloads.miner import MinerAuthPayload
@@ -9,6 +12,8 @@ from core.config import settings
 from core.logger import _m, get_logger
 
 logger = get_logger(__name__)
+
+AUTHENTICATED_REQUEST_TIMEOUT_SECONDS = 8
 
 
 class MinerMiddleware(BaseHTTPMiddleware):
@@ -83,7 +88,43 @@ class MinerMiddleware(BaseHTTPMiddleware):
                 )
                 return JSONResponse(status_code=401, content="Unauthorized")
 
-            response = await call_next(request)
+            started = time.monotonic()
+            try:
+                response = await asyncio.wait_for(
+                    call_next(request),
+                    timeout=AUTHENTICATED_REQUEST_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.error(
+                    _m(
+                        "Authenticated request timed out before route response",
+                        extra={
+                            **default_extra,
+                            "stage": "call_next",
+                            "duration_ms": int((time.monotonic() - started) * 1000),
+                        },
+                    )
+                )
+                return JSONResponse(
+                    status_code=504,
+                    content={
+                        "status": "failed",
+                        "failure_code": "EXECUTOR_AUTHENTICATED_REQUEST_TIMEOUT",
+                        "stage": "call_next",
+                        "message": "Request authenticated but executor route did not return before timeout",
+                    },
+                )
+
+            logger.info(
+                _m(
+                    "Authenticated request completed",
+                    extra={
+                        **default_extra,
+                        "status_code": response.status_code,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                    },
+                )
+            )
             return response
         except ValidationError as e:
             # Handle validation error if needed
