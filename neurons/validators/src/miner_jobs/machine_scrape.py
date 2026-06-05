@@ -755,6 +755,7 @@ def get_docker_info(content: bytes):
     data = {
         "docker_version": "",
         "docker_container_id": "",
+        "docker_root_dir": "",
         "docker_containers": []
     }
 
@@ -767,6 +768,9 @@ def get_docker_info(content: bytes):
 
         result = run_cmd(f'{docker_path} version --format "{{{{.Client.Version}}}}"')
         data["docker_version"] = result.strip()
+
+        result = run_cmd(f'{docker_path} info --format "{{{{.DockerRootDir}}}}"')
+        data["docker_root_dir"] = result.strip()
 
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
@@ -1096,6 +1100,12 @@ def get_machine_specs():
             "hard_disk_free": disk_usage.free // 1024,
             "hard_disk_utilization": (disk_usage.used / disk_usage.total) * 100
         }
+
+        docker_root_dir = data.get("data_docker", {}).get("docker_root_dir")
+        if docker_root_dir:
+            docker_disk_usage = shutil.disk_usage(docker_root_dir)
+            data["data_hard_disk"]["hard_disk_docker_root_dir"] = docker_root_dir
+            data["data_hard_disk"]["hard_disk_docker_free"] = docker_disk_usage.free // 1024
     except Exception as exc:
         # print(f"Error getting disk_usage from shutil: {exc}", file=sys.stderr)
         data["hard_disk_scrape_error"] = repr(exc)
