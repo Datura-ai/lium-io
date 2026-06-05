@@ -72,18 +72,30 @@ def _validate_validator_signature(payload: UploadSShKeyPayload) -> None:
 async def upload_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
+    logger.info("upload_ssh_key route entered")
     _validate_ssh_key_consistency(payload)
+    logger.info("upload_ssh_key SSH key consistency validated")
     _validate_validator_signature(payload)
-    return await miner_service.upload_ssh_key(payload)
+    logger.info("upload_ssh_key validator signature validated")
+    logger.info("upload_ssh_key service call started")
+    response = await miner_service.upload_ssh_key(payload)
+    logger.info("upload_ssh_key service call completed")
+    return response
 
 
 @apis_router.post("/remove_ssh_key")
 async def remove_ssh_key(
     payload: UploadSShKeyPayload, miner_service: Annotated[MinerService, Depends(MinerService)]
 ):
+    logger.info("remove_ssh_key route entered")
     _validate_ssh_key_consistency(payload)
+    logger.info("remove_ssh_key SSH key consistency validated")
     _validate_validator_signature(payload)
-    return await miner_service.remove_ssh_key(payload)
+    logger.info("remove_ssh_key validator signature validated")
+    logger.info("remove_ssh_key service call started")
+    response = await miner_service.remove_ssh_key(payload)
+    logger.info("remove_ssh_key service call completed")
+    return response
 
 
 @apis_router.post("/pod_logs")
