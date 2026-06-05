@@ -3,6 +3,7 @@ import sys
 import os
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -756,6 +757,7 @@ def get_docker_info(content: bytes):
         "docker_version": "",
         "docker_container_id": "",
         "docker_root_dir": "",
+        "docker_root_free": "",
         "docker_containers": []
     }
 
@@ -771,6 +773,11 @@ def get_docker_info(content: bytes):
 
         result = run_cmd(f'{docker_path} info --format "{{{{.DockerRootDir}}}}"')
         data["docker_root_dir"] = result.strip()
+        try:
+            result = run_cmd(f'{docker_path} run --rm -v {shlex.quote(data["docker_root_dir"])}:/docker-root:ro daturaai/compute-subnet-executor:latest df -Pk /docker-root')
+            data["docker_root_free"] = int(result.strip().splitlines()[-1].split()[3])
+        except Exception:
+            pass
 
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
@@ -1103,9 +1110,11 @@ def get_machine_specs():
 
         docker_root_dir = data.get("data_docker", {}).get("docker_root_dir")
         if docker_root_dir:
-            docker_disk_usage = shutil.disk_usage(docker_root_dir)
             data["data_hard_disk"]["hard_disk_docker_root_dir"] = docker_root_dir
-            data["data_hard_disk"]["hard_disk_docker_free"] = docker_disk_usage.free // 1024
+        docker_root_free = data.get("data_docker", {}).get("docker_root_free")
+        if docker_root_free != "":
+            data["data_hard_disk"]["hard_disk_docker_free"] = docker_root_free
+        data.get("data_docker", {}).pop("docker_root_free", None)
     except Exception as exc:
         # print(f"Error getting disk_usage from shutil: {exc}", file=sys.stderr)
         data["hard_disk_scrape_error"] = repr(exc)
