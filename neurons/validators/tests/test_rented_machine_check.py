@@ -10,6 +10,7 @@ from neurons.validators.src.services.task.checks.rented_machine import (
     _collect_pod_diagnostics,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
+
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
@@ -164,6 +165,18 @@ class DummyScoreCalculator:
         return self.actual_score, self.job_score, self.warning
 
 
+class DummyBackendClient:
+    def __init__(self, *, active: bool | None = True):
+        self.active = active
+        self.called_with: list[str] = []
+
+    async def get_pod_rental_active(self, pod_id: str):
+        self.called_with.append(pod_id)
+        if self.active is None:
+            return None
+        return Mock(active=self.active, rental_closed_at=None)
+
+
 @pytest.mark.parametrize(
     "rented_machine,pod_running,ssh_keys,owner_flag,gpu_processes,gpu_details,port_count_db,port_maps,expected_pass,expected_reason,expect_halt",
     [
@@ -296,6 +309,7 @@ async def test_tenant_enforcement_check(
     services = build_services(
         score_calculator=score_calculator,
         container_cleanup=MockContainerCleanup(),
+        backend=DummyBackendClient(active=True),
     )
 
     # Setup config
@@ -369,6 +383,82 @@ async def test_tenant_enforcement_check(
             assert "gpu_utilization" in result.event.what_we_saw
             assert "vram_utilization" in result.event.what_we_saw
             assert "process_count" in result.event.what_we_saw
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_skips_pod_not_running_when_backend_says_inactive(context_factory):
+    executor_uuid = "executor-123"
+    rented_data = build_rented_data(
+        executor_uuid,
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False},
+    )
+    backend = DummyBackendClient(active=False)
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend,
+    )
+    state = build_state(
+        gpu_processes=[],
+        gpu_details=[],
+        gpu_model="NVIDIA RTX 4090",
+        rented_data=rented_data,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=DummySSHClient(pod_running=False),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+    assert backend.called_with == ["pod-1"]
+    assert "clear_verified_job_info" not in result.updates
+    assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_keeps_pod_not_running_when_backend_state_unknown(context_factory):
+    executor_uuid = "executor-123"
+    rented_data = build_rented_data(
+        executor_uuid,
+        {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False},
+    )
+    backend = DummyBackendClient(active=None)
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend,
+    )
+    state = build_state(
+        gpu_processes=[],
+        gpu_details=[],
+        gpu_model="NVIDIA RTX 4090",
+        rented_data=rented_data,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=DummySSHClient(pod_running=False),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert backend.called_with == ["pod-1"]
+    assert result.updates["clear_verified_job_info"] is True
+    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
 
 
 class DiagnosticsSSHClient:
@@ -560,6 +650,7 @@ async def test_tenant_enforcement_emits_transport_unreachable_on_ssh_failure(
     services = build_services(
         score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
         container_cleanup=MockContainerCleanup(),
+        backend=DummyBackendClient(active=True),
     )
     state = build_state(
         gpu_processes=[],
@@ -601,6 +692,7 @@ async def test_tenant_enforcement_keeps_pod_not_running_for_non_transport_errors
     services = build_services(
         score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
         container_cleanup=MockContainerCleanup(),
+        backend=DummyBackendClient(active=True),
     )
     state = build_state(
         gpu_processes=[],

@@ -92,6 +92,11 @@ class RentedExecutorsResponse(BaseModel):
         return self.filler_containers_by_executor.get(str(executor_uuid))
 
 
+class PodRentalActiveResponse(BaseModel):
+    active: bool
+    rental_closed_at: datetime | None = None
+
+
 class ExecutorUptimeResponse(BaseModel):
     executor_ip_address: str
     executor_ip_port: str
