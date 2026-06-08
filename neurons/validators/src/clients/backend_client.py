@@ -12,7 +12,11 @@ from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
 from core.utils import _m, get_extra_info
-from protocol.vc_protocol.compute_requests import ExecutorHealthCheckResponse, RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import (
+    ExecutorHealthCheckResponse,
+    PodRentalActiveResponse,
+    RentedExecutorsResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +205,14 @@ class BackendClient:
             "/internal/executors/rented",
             RentedExecutorsResponse,
             timeout=30,
+        )
+
+    async def get_pod_rental_active(self, pod_id: str) -> PodRentalActiveResponse | None:
+        """Fetch whether the backend still considers a pod rental active."""
+        return await self.get(
+            f"/internal/pods/{pod_id}/rental-active",
+            PodRentalActiveResponse,
+            timeout=10,
         )
 
     async def check_executor_health(

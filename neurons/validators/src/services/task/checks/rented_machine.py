@@ -162,6 +162,35 @@ class TenantEnforcementCheck:
                 )
             if not pod_running:
                 diagnostics = await _collect_pod_diagnostics(ctx.ssh, pod_container_name)
+                rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
+                if rental_active and not rental_active.active:
+                    event = render_message(
+                        Msg.STALE_POD_NOT_RUNNING,
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        what={
+                            "pod_id": pod_id,
+                            "container_name": pod_container_name,
+                            "executor_uuid": ctx.executor.uuid,
+                            "rental_closed_at": (
+                                rental_active.rental_closed_at.isoformat()
+                                if rental_active.rental_closed_at
+                                else None
+                            ),
+                            "diagnostics": diagnostics,
+                        },
+                        extra=extra,
+                    )
+                    return CheckResult(
+                        passed=True,
+                        event=event,
+                        updates={
+                            "default_extra": extra,
+                            "rented": False,
+                            "ssh_pub_keys": None,
+                        },
+                    )
+
                 event = render_message(
                     Msg.POD_NOT_RUNNING,
                     ctx=ctx,

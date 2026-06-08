@@ -426,6 +426,14 @@ class TenantEnforcementMessages:
         impact="Score set to 0; verification cleared",
         remediation="Start container and ensure it stays healthy.",
     )
+    STALE_POD_NOT_RUNNING = MessageTemplate(
+        event="Stale rented pod not running signal skipped",
+        reason="STALE_POD_NOT_RUNNING",
+        severity="info",
+        category="runtime",
+        impact="No reset sent because backend no longer considers the pod rental active",
+        remediation="No action needed.",
+    )
     EXECUTOR_TRANSPORT_UNREACHABLE = MessageTemplate(
         event="Executor unreachable over SSH",
         reason="EXECUTOR_TRANSPORT_UNREACHABLE",

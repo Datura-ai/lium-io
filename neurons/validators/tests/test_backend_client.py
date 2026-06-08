@@ -1,14 +1,13 @@
 """Tests for BackendClient."""
 
 import asyncio
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import aiohttp
+import pytest
+from neurons.validators.src.clients.backend_client import BackendClient
 from pydantic import BaseModel
 
-from neurons.validators.src.clients.backend_client import BackendClient
-from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import PodRentalActiveResponse, RentedExecutorsResponse
 
 
 class SampleResponse(BaseModel):
@@ -77,6 +76,21 @@ async def test_get_success(reset_session, client):
 
 
 @pytest.mark.asyncio
+async def test_get_pod_rental_active_uses_internal_endpoint(client):
+    expected = MagicMock()
+
+    with patch.object(client, "get", AsyncMock(return_value=expected)) as mock_get:
+        result = await client.get_pod_rental_active("pod-1")
+
+    assert result is expected
+    mock_get.assert_awaited_once_with(
+        "/internal/pods/pod-1/rental-active",
+        PodRentalActiveResponse,
+        timeout=10,
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_non_200_status(reset_session, client):
     mock_response = create_mock_response(500)
     mock_session = create_mock_session(mock_response, "get")
@@ -101,7 +115,7 @@ async def test_get_validation_error(reset_session, client):
 async def test_get_timeout(reset_session, client):
     mock_session = AsyncMock()
     async_cm = AsyncMock()
-    async_cm.__aenter__ = AsyncMock(side_effect=asyncio.TimeoutError())
+    async_cm.__aenter__ = AsyncMock(side_effect=TimeoutError())
     async_cm.__aexit__ = AsyncMock()
     mock_session.get = MagicMock(return_value=async_cm)
 
