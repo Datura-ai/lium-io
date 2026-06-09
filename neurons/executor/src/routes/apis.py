@@ -1,10 +1,15 @@
+import asyncio
 import logging
-from typing import Annotated, Optional
+import os
+import threading
+import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Annotated, Optional
 
-import docker
 import bittensor
+import docker
 from fastapi import APIRouter, Depends, Query, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from services.miner_service import MinerService
@@ -19,6 +24,90 @@ from dependencies.auth import verify_allowed_hotkey_signature, verify_ping_signa
 logger = logging.getLogger(__name__)
 
 apis_router = APIRouter()
+
+MAX_CONTAINER_LOG_TAIL_LINES = int(os.getenv("EXECUTOR_CONTAINER_LOGS_MAX_TAIL", "500"))
+MAX_FOLLOW_LOG_STREAMS = int(os.getenv("EXECUTOR_CONTAINER_LOGS_MAX_FOLLOW_STREAMS", "2"))
+FOLLOW_LOG_STREAM_MAX_SECONDS = float(os.getenv("EXECUTOR_CONTAINER_LOGS_FOLLOW_MAX_SECONDS", "300"))
+
+_CONTAINER_LOG_STREAM_END = object()
+_container_log_stream_executor = ThreadPoolExecutor(
+    max_workers=max(1, MAX_FOLLOW_LOG_STREAMS),
+    thread_name_prefix="container-log-stream",
+)
+_active_follow_log_streams = 0
+_active_follow_log_streams_lock = asyncio.Lock()
+
+
+def _normalize_log_tail(tail: Optional[int]) -> int:
+    if tail is None:
+        return MAX_CONTAINER_LOG_TAIL_LINES
+    return max(1, min(tail, MAX_CONTAINER_LOG_TAIL_LINES))
+
+
+def _queue_log_stream_item(loop, queue: asyncio.Queue, item) -> None:
+    loop.call_soon_threadsafe(queue.put_nowait, item)
+
+
+def _release_follow_log_stream_on_loop(loop) -> None:
+    loop.call_soon_threadsafe(lambda: asyncio.create_task(_release_follow_log_stream()))
+
+
+def _produce_follow_container_logs(
+    *,
+    container,
+    tail: int,
+    since: Optional[int],
+    stdout: bool,
+    stderr: bool,
+    loop,
+    queue: asyncio.Queue,
+    stop_event: threading.Event,
+    stream_ref: dict,
+) -> None:
+    log_iterator = None
+    try:
+        log_iterator = iter(
+            container.logs(
+                stream=True,
+                follow=True,
+                tail=tail,
+                since=since,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        )
+        stream_ref["iterator"] = log_iterator
+
+        for log in log_iterator:
+            if stop_event.is_set():
+                break
+            _queue_log_stream_item(loop, queue, log)
+    except Exception as exc:
+        _queue_log_stream_item(loop, queue, exc)
+    finally:
+        close = getattr(log_iterator, "close", None)
+        if close:
+            try:
+                close()
+            except Exception:
+                logger.debug("Failed to close container logs iterator", exc_info=True)
+        _queue_log_stream_item(loop, queue, _CONTAINER_LOG_STREAM_END)
+        _release_follow_log_stream_on_loop(loop)
+
+
+async def _reserve_follow_log_stream() -> bool:
+    global _active_follow_log_streams
+    async with _active_follow_log_streams_lock:
+        if _active_follow_log_streams >= MAX_FOLLOW_LOG_STREAMS:
+            return False
+        _active_follow_log_streams += 1
+        return True
+
+
+async def _release_follow_log_stream() -> None:
+    global _active_follow_log_streams
+    async with _active_follow_log_streams_lock:
+        _active_follow_log_streams = max(0, _active_follow_log_streams - 1)
 
 
 def _get_version() -> str:
@@ -191,18 +280,93 @@ async def stream_container_logs(
     """
     await verify_container_logs_signature(container_name, x_timestamp, x_signature)
 
-    client = docker.from_env()
-    container = client.containers.get(container_name)
+    reserved_follow_stream = False
+    if follow:
+        reserved_follow_stream = await _reserve_follow_log_stream()
+        if not reserved_follow_stream:
+            raise HTTPException(status_code=429, detail="Too many active live log streams")
 
-    def generate():
-        for log in container.logs(
-            stream=True,
-            follow=follow,
-            tail=tail if tail else "all",
-            since=since,
-            stdout=stdout,
-            stderr=stderr,
-        ):
-            yield log
+    try:
+        client = docker.from_env()
+        container = client.containers.get(container_name)
+    except Exception:
+        if reserved_follow_stream:
+            await _release_follow_log_stream()
+        raise
+
+    if not follow:
+        def generate():
+            for log in container.logs(
+                stream=True,
+                follow=False,
+                tail=tail if tail else "all",
+                since=since,
+                stdout=stdout,
+                stderr=stderr,
+            ):
+                yield log
+
+        return StreamingResponse(generate(), media_type="text/plain")
+
+    tail = _normalize_log_tail(tail)
+
+    async def generate():
+        loop = asyncio.get_running_loop()
+        started = time.monotonic()
+        queue = asyncio.Queue()
+        stop_event = threading.Event()
+        stream_ref = {}
+
+        try:
+            _container_log_stream_executor.submit(
+                _produce_follow_container_logs,
+                container=container,
+                tail=tail,
+                since=since,
+                stdout=stdout,
+                stderr=stderr,
+                loop=loop,
+                queue=queue,
+                stop_event=stop_event,
+                stream_ref=stream_ref,
+            )
+        except Exception:
+            await _release_follow_log_stream()
+            raise
+
+        try:
+            while True:
+                remaining_seconds = FOLLOW_LOG_STREAM_MAX_SECONDS - (time.monotonic() - started)
+                if remaining_seconds <= 0:
+                    logger.info(
+                        "Stopping live container log stream after %.1f seconds for %s",
+                        FOLLOW_LOG_STREAM_MAX_SECONDS,
+                        container_name,
+                    )
+                    break
+
+                try:
+                    log = await asyncio.wait_for(queue.get(), timeout=remaining_seconds)
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "Stopping live container log stream after %.1f seconds for %s",
+                        FOLLOW_LOG_STREAM_MAX_SECONDS,
+                        container_name,
+                    )
+                    break
+
+                if log is _CONTAINER_LOG_STREAM_END:
+                    break
+                if isinstance(log, Exception):
+                    raise log
+                yield log
+        finally:
+            stop_event.set()
+            close = getattr(stream_ref.get("iterator"), "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Failed to close container logs iterator", exc_info=True)
 
     return StreamingResponse(generate(), media_type="text/plain")
