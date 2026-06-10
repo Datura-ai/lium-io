@@ -4,7 +4,7 @@ import os
 import threading
 import time
 import tomllib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -28,6 +28,8 @@ apis_router = APIRouter()
 MAX_CONTAINER_LOG_TAIL_LINES = int(os.getenv("EXECUTOR_CONTAINER_LOGS_MAX_TAIL", "500"))
 MAX_FOLLOW_LOG_STREAMS = int(os.getenv("EXECUTOR_CONTAINER_LOGS_MAX_FOLLOW_STREAMS", "2"))
 FOLLOW_LOG_STREAM_MAX_SECONDS = float(os.getenv("EXECUTOR_CONTAINER_LOGS_FOLLOW_MAX_SECONDS", "300"))
+FOLLOW_LOG_STREAM_QUEUE_MAX_SIZE = max(1, int(os.getenv("EXECUTOR_CONTAINER_LOGS_QUEUE_MAX_SIZE", "100")))
+FOLLOW_LOG_STREAM_QUEUE_PUT_TIMEOUT_SECONDS = 0.1
 
 _CONTAINER_LOG_STREAM_END = object()
 _container_log_stream_executor = ThreadPoolExecutor(
@@ -44,8 +46,19 @@ def _normalize_log_tail(tail: Optional[int]) -> int:
     return max(1, min(tail, MAX_CONTAINER_LOG_TAIL_LINES))
 
 
-def _queue_log_stream_item(loop, queue: asyncio.Queue, item) -> None:
-    loop.call_soon_threadsafe(queue.put_nowait, item)
+def _queue_log_stream_item(loop, queue: asyncio.Queue, item, stop_event: threading.Event) -> bool:
+    if stop_event.is_set():
+        return False
+
+    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+    while True:
+        try:
+            future.result(timeout=FOLLOW_LOG_STREAM_QUEUE_PUT_TIMEOUT_SECONDS)
+            return True
+        except FutureTimeoutError:
+            if stop_event.is_set():
+                future.cancel()
+                return False
 
 
 def _release_follow_log_stream_on_loop(loop) -> None:
@@ -81,9 +94,10 @@ def _produce_follow_container_logs(
         for log in log_iterator:
             if stop_event.is_set():
                 break
-            _queue_log_stream_item(loop, queue, log)
+            if not _queue_log_stream_item(loop, queue, log, stop_event):
+                break
     except Exception as exc:
-        _queue_log_stream_item(loop, queue, exc)
+        _queue_log_stream_item(loop, queue, exc, stop_event)
     finally:
         close = getattr(log_iterator, "close", None)
         if close:
@@ -91,7 +105,7 @@ def _produce_follow_container_logs(
                 close()
             except Exception:
                 logger.debug("Failed to close container logs iterator", exc_info=True)
-        _queue_log_stream_item(loop, queue, _CONTAINER_LOG_STREAM_END)
+        _queue_log_stream_item(loop, queue, _CONTAINER_LOG_STREAM_END, stop_event)
         _release_follow_log_stream_on_loop(loop)
 
 
@@ -313,7 +327,7 @@ async def stream_container_logs(
     async def generate():
         loop = asyncio.get_running_loop()
         started = time.monotonic()
-        queue = asyncio.Queue()
+        queue = asyncio.Queue(maxsize=FOLLOW_LOG_STREAM_QUEUE_MAX_SIZE)
         stop_event = threading.Event()
         stream_ref = {}
 

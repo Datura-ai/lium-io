@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -107,5 +108,64 @@ def test_live_container_logs_duration_limit_releases_stream_slot(monkeypatch):
 
         assert apis._active_follow_log_streams == 0
         fake_client.containers.get.assert_called_once_with("test-container")
+
+    asyncio.run(run_test())
+
+
+def test_live_container_logs_queue_applies_backpressure():
+    async def run_test():
+        loop = asyncio.get_running_loop()
+        produced_count = 0
+        producer_finished = threading.Event()
+
+        class FakeContainer:
+            def logs(self, **_kwargs):
+                nonlocal produced_count
+                for index in range(1000):
+                    produced_count += 1
+                    yield f"log {index}\n".encode()
+
+        queue = asyncio.Queue(maxsize=1)
+        stop_event = threading.Event()
+        stream_ref = {}
+
+        def produce_logs():
+            apis._produce_follow_container_logs(
+                container=FakeContainer(),
+                tail=100,
+                since=None,
+                stdout=True,
+                stderr=True,
+                loop=loop,
+                queue=queue,
+                stop_event=stop_event,
+                stream_ref=stream_ref,
+            )
+            producer_finished.set()
+
+        thread = threading.Thread(target=produce_logs)
+        thread.start()
+
+        for _ in range(20):
+            if queue.qsize() == 1 and produced_count >= 2:
+                break
+            await asyncio.sleep(0.01)
+
+        await asyncio.sleep(0.2)
+
+        assert queue.qsize() == 1
+        assert produced_count <= 2
+        assert not producer_finished.is_set()
+
+        stop_event.set()
+        await queue.get()
+
+        for _ in range(20):
+            if producer_finished.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+        assert producer_finished.is_set()
+        thread.join(timeout=1)
 
     asyncio.run(run_test())
