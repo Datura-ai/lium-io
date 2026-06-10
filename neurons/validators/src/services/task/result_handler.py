@@ -107,6 +107,7 @@ class ResultHandler:
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
         )
+        provider_discord_connected = self._get_provider_discord_connected(context)
 
         # add TDX attestation and spot tier to specs (propagated to compute-app
         # via MACHINE_SPEC_CHANNEL → executor.specs)
@@ -135,6 +136,7 @@ class ResultHandler:
             is_rented=context.rented,
             is_spot=is_spot,
             is_new_rentals_paused=is_new_rentals_paused,
+            provider_discord_connected=provider_discord_connected,
             rental_created_at=self._get_rental_created_at(context),
             tdx_attestation_passed=context.tdx_attestation_passed,
         )
@@ -149,6 +151,18 @@ class ResultHandler:
             return None
         created_dates = [p.created_at for p in rented_executor.pods if p.created_at]
         return max(created_dates) if created_dates else None
+
+    @staticmethod
+    def _get_provider_discord_connected(context: Context) -> bool:
+        rented_data = context.state.rented_data
+        if not rented_data:
+            return True
+
+        connected_executor_ids = rented_data.provider_discord_connected_executor_ids
+        if connected_executor_ids is None:
+            return True
+
+        return str(context.executor.uuid) in connected_executor_ids
 
     async def _persist_verification_data(
         self,
