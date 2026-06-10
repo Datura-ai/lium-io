@@ -17,6 +17,7 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 from services.miner_service import MinerService
+from services.task.result_handler import ResultHandler
 
 
 def _executor(executor_id: str) -> ExecutorSSHInfo:
@@ -137,6 +138,60 @@ def test_rented_executors_response_parses_new_rentals_paused_executor_ids():
     )
 
     assert result.new_rentals_paused_executor_ids == ["paused-executor"]
+
+
+def test_rented_executors_response_defaults_provider_discord_connected_executor_ids_to_unknown():
+    """Older backend responses without Discord executor IDs remain non-penalizing."""
+    result = RentedExecutorsResponse.model_validate({"executors": {}})
+
+    assert result.provider_discord_connected_executor_ids is None
+
+
+def test_rented_executors_response_parses_provider_discord_connected_executor_ids():
+    """Backend Discord executor IDs are available to incentive handling."""
+    result = RentedExecutorsResponse.model_validate(
+        {
+            "executors": {},
+            "provider_discord_connected_executor_ids": ["discord-executor"],
+        }
+    )
+
+    assert result.provider_discord_connected_executor_ids == ["discord-executor"]
+
+
+def test_result_handler_treats_missing_provider_discord_list_as_connected():
+    """Missing backend field means unknown, so do not penalize during rollout."""
+    context = SimpleNamespace(
+        state=SimpleNamespace(rented_data=RentedExecutorsResponse.model_validate({"executors": {}})),
+        executor=SimpleNamespace(uuid="executor-with-unknown-discord"),
+    )
+
+    assert ResultHandler._get_provider_discord_connected(context) is True
+
+
+def test_result_handler_reads_provider_discord_connected_executor_ids():
+    """A present backend list determines whether an executor provider has Discord."""
+    connected_context = SimpleNamespace(
+        state=SimpleNamespace(
+            rented_data=RentedExecutorsResponse(
+                executors={},
+                provider_discord_connected_executor_ids=["connected-executor"],
+            )
+        ),
+        executor=SimpleNamespace(uuid="connected-executor"),
+    )
+    disconnected_context = SimpleNamespace(
+        state=SimpleNamespace(
+            rented_data=RentedExecutorsResponse(
+                executors={},
+                provider_discord_connected_executor_ids=["connected-executor"],
+            )
+        ),
+        executor=SimpleNamespace(uuid="disconnected-executor"),
+    )
+
+    assert ResultHandler._get_provider_discord_connected(connected_context) is True
+    assert ResultHandler._get_provider_discord_connected(disconnected_context) is False
 
 
 @pytest.mark.asyncio

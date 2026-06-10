@@ -25,6 +25,7 @@ class JobResult(BaseModel):
     is_rented: bool = False
     is_spot: bool = False
     is_new_rentals_paused: bool = False
+    provider_discord_connected: bool = True
     rental_created_at: datetime | None = None
 
     # tdx attestation relevant fields
@@ -35,6 +36,7 @@ class JobResult(BaseModel):
     # Incentive relevant fields 
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
+    discord_multiplier: float | None = None             # Multiplier for provider Discord connection for scoring logic
     uptime_multiplier: float | None = None              # Multiplier for uptime
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model

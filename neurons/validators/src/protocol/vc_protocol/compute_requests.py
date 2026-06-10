@@ -78,6 +78,7 @@ class RentedExecutorsResponse(BaseModel):
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
     spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
     new_rentals_paused_executor_ids: list[str] = []  # executor_ids paused from unrented incentives
+    provider_discord_connected_executor_ids: list[str] | None = None  # executor_ids whose provider has connected Discord
 
     @field_validator("filler_containers_by_executor")
     @classmethod

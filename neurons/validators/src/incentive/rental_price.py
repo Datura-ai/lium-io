@@ -40,7 +40,7 @@ class GpuBucketRentalState(BaseModel):
     unrented_count: int
     max_cap: int
     cap_multiplier: float
-    weighted_rate_sum: float  # sum(gpu_count * hourly_rate * sysbox_multiplier) in this bucket
+    weighted_rate_sum: float  # sum(gpu_count * hourly_rate * sysbox_multiplier * discord_multiplier) in this bucket
 
 
 class RentalMiningState(BaseModel):
@@ -87,6 +87,8 @@ class RentalPriceEstimate(BaseModel):
     count_bucket: int | None = None                     # gpu_count_bucket the executor was placed into
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
+    provider_discord_connected: bool = True             # Whether provider Discord is connected for scoring logic
+    discord_multiplier: float | None = None             # Multiplier for provider Discord connection for scoring logic
     uptime_multiplier: float | None = None              # Multiplier for uptime
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
@@ -217,8 +219,9 @@ class RentalPriceIncentive(DefaultIncentive):
                 )
                 result.hourly_rate = max(result.hourly_rate, rate_for_min)
 
-            # Sysbox penalty: applied later via effective_rate, not baked into hourly_rate
+            # Sysbox and Discord penalties are applied later via effective_rate, not baked into hourly_rate
             result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
+            result.discord_multiplier = self.get_discord_multiplier(result)
 
             cap_spec = self.config.max_unrented_gpus.get(base_model, {})
             bucket = self._resolve_bucket(result, cap_spec)
@@ -234,7 +237,10 @@ class RentalPriceIncentive(DefaultIncentive):
                 )
                 self._weighted_rate_sum_by_bucket[key] = (
                     self._weighted_rate_sum_by_bucket.get(key, 0.0)
-                    + result.gpu_count * result.hourly_rate * result.sysbox_multiplier
+                    + result.gpu_count
+                    * result.hourly_rate
+                    * result.sysbox_multiplier
+                    * result.discord_multiplier
                 )
 
     async def _on_finish_pre_process(self) -> None:
@@ -312,7 +318,12 @@ class RentalPriceIncentive(DefaultIncentive):
         result.burn_share = self.burn_share
         result.total_rental_cost = self.total_rental_cost
         result.unrented_cap_multiplier = self.cap_multiplier_by_bucket.get(key, 0.0)
-        result.effective_rate = result.hourly_rate * result.unrented_cap_multiplier * result.sysbox_multiplier
+        result.effective_rate = (
+            result.hourly_rate
+            * result.unrented_cap_multiplier
+            * result.sysbox_multiplier
+            * result.discord_multiplier
+        )
 
         # calculate incentive score
         result.incentive = (
@@ -332,6 +343,8 @@ class RentalPriceIncentive(DefaultIncentive):
                     "hourly_rate": result.hourly_rate,
                     "sysbox_runtime": result.sysbox_runtime,
                     "sysbox_multiplier": result.sysbox_multiplier,
+                    "provider_discord_connected": result.provider_discord_connected,
+                    "discord_multiplier": result.discord_multiplier,
                     "unrented_cap_multiplier": result.unrented_cap_multiplier,
                     "effective_rate": result.effective_rate,
                     "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,
@@ -515,6 +528,8 @@ class RentalPriceIncentive(DefaultIncentive):
             count_bucket=fake_result.count_bucket,
             mining_score=fake_result.mining_score,
             sysbox_multiplier=fake_result.sysbox_multiplier,
+            provider_discord_connected=fake_result.provider_discord_connected,
+            discord_multiplier=fake_result.discord_multiplier,
             uptime_multiplier=fake_result.uptime_multiplier,
             gpu_portion=fake_result.gpu_portion,
             total_gpu_count=fake_result.total_gpu_count,
