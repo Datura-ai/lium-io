@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -140,6 +141,7 @@ def _make_rented_data(
     gpu_splitting_config: dict[str, int] | None = None,
     spot_executor_ids: list[str] | None = None,
     new_rentals_paused_executor_ids: list[str] | None = None,
+    provider_discord_connected_executor_ids: list[str] | None = None,
 ) -> RentedExecutorsResponse:
     executors = {}
     for executor_id in rented_executor_ids or []:
@@ -155,6 +157,7 @@ def _make_rented_data(
         gpu_splitting_config=gpu_splitting_config or {},
         spot_executor_ids=spot_executor_ids or [],
         new_rentals_paused_executor_ids=new_rentals_paused_executor_ids or [],
+        provider_discord_connected_executor_ids=provider_discord_connected_executor_ids,
     )
 
 
@@ -2658,6 +2661,81 @@ async def test_rental_price_spot_excluded_from_both_pools(
     # secure H100 executors (8+8=16) but must NOT include the spot's 8 GPUs;
     # an inflated denominator (24) would silently reduce the rented executor's
     # mining incentive by 1/3 (formula: score * gpu_portion * gpu_count / total).
+    assert secure_rented.is_rented is True
+    assert secure_rented.total_gpu_count == 16
+    assert validator.miner_scores["miner_secure_rented"] > 0
+
+
+@pytest.mark.asyncio
+async def test_rental_price_missing_discord_excluded_like_spot(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+    monkeypatch,
+):
+    """A no-Discord executor after cutoff is treated like spot for incentives:
+    - it earns zero
+    - it does not dilute secure unrented bucket caps
+    - it does not inflate rented mining denominators
+    """
+    monkeypatch.setattr(settings, "DISCORD_INCENTIVE_CUTOFF", datetime.utcnow() - timedelta(days=1))
+
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_secure_unrented"),
+        create_neuron_info(uid=3, hotkey="miner_secure_rented"),
+        create_neuron_info(uid=4, hotkey="miner_no_discord"),
+    ]
+
+    secure_unrented = _job(
+        create_job_result, executor_id="exec-secure-unrented",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    secure_rented = _job(
+        create_job_result, executor_id="exec-secure-rented",
+        gpu_model="H100", gpu_count=8, is_rented=True,
+    )
+    no_discord = _job(
+        create_job_result, executor_id="exec-no-discord",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    no_discord.provider_discord_connected = False
+
+    all_job_results = {
+        "miner_secure_unrented": [secure_unrented],
+        "miner_secure_rented": [secure_rented],
+        "miner_no_discord": [no_discord],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(
+            rented_executor_ids=["exec-secure-rented"],
+            provider_discord_connected_executor_ids=[
+                "exec-secure-unrented",
+                "exec-secure-rented",
+            ],
+        )
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    assert no_discord.mining_score == 0
+    assert no_discord.eligible_for_rental_share is False
+    assert (no_discord.incentive or 0.0) == 0.0
+    assert validator.miner_scores.get("miner_no_discord", 0.0) == pytest.approx(0.0, abs=0.0001)
+
+    assert secure_unrented.eligible_for_rental_share is True
+    assert secure_unrented.total_unrented_by_gpu_type == 8
+    assert secure_unrented.unrented_cap_multiplier == pytest.approx(1.0)
+    assert (secure_unrented.incentive or 0.0) > 0.0
+
     assert secure_rented.is_rented is True
     assert secure_rented.total_gpu_count == 16
     assert validator.miner_scores["miner_secure_rented"] > 0

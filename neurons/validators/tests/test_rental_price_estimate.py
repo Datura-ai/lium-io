@@ -172,6 +172,26 @@ async def test_get_snapshot_cap_multiplier_stored(
     assert snapshot.mining.total_gpu_model_count_map == {"H100": 20}
 
 
+@pytest.mark.asyncio
+async def test_get_snapshot_excludes_spot_executor_from_mining_totals(
+    rental_config, mock_redis, mock_price_provider, monkeypatch
+):
+    """Snapshot mining totals mirror live scoring denominators for spot executors."""
+    spot_job = _make_job("exec-spot", "H100", 8, is_rented=False)
+    spot_job.is_spot = True
+    job_results = {
+        "miner_regular": [_make_job("exec-regular", "H100", 8, is_rented=False)],
+        "miner_spot": [spot_job],
+    }
+    incentive = _make_incentive(rental_config, mock_redis, mock_price_provider, job_results, monkeypatch)
+
+    await incentive.calculate_mining_scores()
+    snapshot = incentive.get_snapshot()
+
+    assert snapshot.mining.total_gpu_count == 8
+    assert snapshot.mining.total_gpu_model_count_map == {"H100": 8}
+
+
 # ── estimate_executor() — unrented path ──────────────────────────────────────
 
 @pytest.mark.asyncio

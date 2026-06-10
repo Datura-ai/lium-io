@@ -4,8 +4,6 @@ This implementation extracts the original score calculation and weight distribut
 logic to maintain backward compatibility with the existing system.
 """
 
-from datetime import datetime
-
 import bittensor
 
 from core.config import settings
@@ -38,16 +36,6 @@ class DefaultIncentive(BaseIncentive):
         self.total_mining_score = 0
         self.miner_incentives = {}
         self.mining_share = 1 - TOTAL_BURN_EMISSION
-
-    def should_exclude_for_missing_discord(self, job_result: JobResult) -> bool:
-        if datetime.utcnow() < settings.DISCORD_INCENTIVE_CUTOFF:
-            return False
-        return not job_result.provider_discord_connected
-
-    def get_discord_multiplier(self, job_result: JobResult) -> float:
-        if not self.should_exclude_for_missing_discord(job_result):
-            return 1
-        return 1 - settings.PORTION_FOR_DISCORD
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult):
         """Process a job result.
@@ -126,9 +114,6 @@ class DefaultIncentive(BaseIncentive):
             job_result.mining_score = 0
             return job_result
 
-        # Fallback for deployments using the legacy/default incentive algorithm
-        # directly. The active rental_price algorithm handles this before it
-        # calls into DefaultIncentive.
         if job_result.is_new_rentals_paused and not job_result.is_rented:
             logger.info(
                 _m(
@@ -171,9 +156,6 @@ class DefaultIncentive(BaseIncentive):
 
             job_result.sysbox_multiplier = 1 - portion
 
-        # Provider Discord connection multiplier
-        job_result.discord_multiplier = self.get_discord_multiplier(job_result)
-
         # Uptime multiplier
         if settings.SKIP_COLLATERAL_PENALTY or job_result.collateral_deposited:
             job_result.uptime_multiplier = 1
@@ -189,19 +171,16 @@ class DefaultIncentive(BaseIncentive):
         # Apply multiplier
         job_result.mining_score *= (
             job_result.sysbox_multiplier
-            * job_result.discord_multiplier
             * job_result.uptime_multiplier
         )
         log = _m(
-            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * discord_multiplier * uptime_multiplier",
+            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier",
             extra=get_extra_info(
                 {
                     "executor_id": str(job_result.executor_info.uuid),
                     "gpu_model": job_result.gpu_model,
                     "gpu_count": job_result.gpu_count,
                     "sysbox_multiplier": job_result.sysbox_multiplier,
-                    "discord_multiplier": job_result.discord_multiplier,
-                    "provider_discord_connected": job_result.provider_discord_connected,
                     "uptime_multiplier": job_result.uptime_multiplier,
                     "mining_score": job_result.mining_score,
                     "gpu_portion": job_result.gpu_portion,
