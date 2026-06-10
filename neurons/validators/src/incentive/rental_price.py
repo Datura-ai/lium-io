@@ -399,6 +399,27 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.eligible_for_rental_share = False
             return job_result
 
+        if self.should_exclude_for_missing_discord(job_result):
+            logger.info(
+                _m(
+                    "Executor excluded from both pools - provider Discord not connected",
+                    extra={
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "gpu_model": job_result.gpu_model,
+                        "gpu_count": job_result.gpu_count,
+                        "provider_discord_connected": job_result.provider_discord_connected,
+                        "discord_multiplier": 0,
+                        "reason": "provider_discord_not_connected",
+                        "score": 0,
+                        "pool": "none",
+                    },
+                )
+            )
+            job_result.mining_score = 0
+            job_result.discord_multiplier = 0
+            job_result.eligible_for_rental_share = False
+            return job_result
+
         if job_result.is_new_rentals_paused and not job_result.is_rented:
             logger.info(
                 _m(

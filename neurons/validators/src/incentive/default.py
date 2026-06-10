@@ -39,10 +39,13 @@ class DefaultIncentive(BaseIncentive):
         self.miner_incentives = {}
         self.mining_share = 1 - TOTAL_BURN_EMISSION
 
-    def get_discord_multiplier(self, job_result: JobResult) -> float:
+    def should_exclude_for_missing_discord(self, job_result: JobResult) -> bool:
         if datetime.utcnow() < settings.DISCORD_INCENTIVE_CUTOFF:
-            return 1
-        if job_result.provider_discord_connected:
+            return False
+        return not job_result.provider_discord_connected
+
+    def get_discord_multiplier(self, job_result: JobResult) -> float:
+        if not self.should_exclude_for_missing_discord(job_result):
             return 1
         return 1 - settings.PORTION_FOR_DISCORD
 

@@ -92,7 +92,7 @@ async def test_default_incentive_does_not_penalize_missing_discord_before_cutoff
 
 
 @pytest.mark.asyncio
-async def test_rental_price_incentive_sets_zero_effective_rate_without_discord_after_cutoff(monkeypatch):
+async def test_rental_price_incentive_excludes_executor_without_discord_after_cutoff(monkeypatch):
     _set_discord_cutoff(monkeypatch, active=True)
     monkeypatch.setattr(rental_price_module, "BASE_GPU_MAP", {"H100": "H100"})
     job = _make_job(provider_discord_connected=False)
@@ -101,8 +101,12 @@ async def test_rental_price_incentive_sets_zero_effective_rate_without_discord_a
     await incentive.calculate_mining_scores()
 
     assert job.discord_multiplier == 0
-    assert job.effective_rate == 0
+    assert job.eligible_for_rental_share is False
+    assert job.mining_score == 0
+    assert job.effective_rate is None
     assert job.incentive == 0
+    assert incentive.unrented_count_by_bucket == {}
+    assert incentive.total_rental_cost == 0
 
 
 @pytest.mark.asyncio
@@ -134,7 +138,7 @@ async def test_rental_price_incentive_does_not_penalize_missing_discord_before_c
 
 
 @pytest.mark.asyncio
-async def test_rental_price_incentive_mixed_discord_bucket_excludes_disconnected_cost(monkeypatch):
+async def test_rental_price_incentive_mixed_discord_bucket_excludes_disconnected_executor(monkeypatch):
     _set_discord_cutoff(monkeypatch, active=True)
     monkeypatch.setattr(rental_price_module, "BASE_GPU_MAP", {"H100": "H100"})
     connected = _make_job(
@@ -154,19 +158,20 @@ async def test_rental_price_incentive_mixed_discord_bucket_excludes_disconnected
 
     await incentive.calculate_mining_scores()
 
-    # Match sysbox behavior: disconnected supply still counts against the bucket cap,
-    # but its multiplier removes it from weighted rental cost and incentive.
-    assert incentive.unrented_count_by_bucket[("H100", 1)] == 2
-    assert incentive.cap_multiplier_by_bucket[("H100", 1)] == pytest.approx(0.5)
-    assert incentive.total_rental_cost == pytest.approx(2.0)
+    # Match spot behavior: disconnected supply is excluded from incentive pools.
+    assert incentive.unrented_count_by_bucket[("H100", 1)] == 1
+    assert incentive.cap_multiplier_by_bucket[("H100", 1)] == pytest.approx(1.0)
+    assert incentive.total_rental_cost == pytest.approx(4.0)
 
     assert connected.discord_multiplier == 1
-    assert connected.effective_rate == pytest.approx(2.0)
+    assert connected.effective_rate == pytest.approx(4.0)
     assert connected.incentive > 0
     assert incentive.miner_incentives["connected-miner"] == pytest.approx(connected.incentive)
 
     assert disconnected.discord_multiplier == 0
-    assert disconnected.effective_rate == 0
+    assert disconnected.eligible_for_rental_share is False
+    assert disconnected.mining_score == 0
+    assert disconnected.effective_rate is None
     assert disconnected.incentive == 0
     assert incentive.miner_incentives["disconnected-miner"] == 0
 
