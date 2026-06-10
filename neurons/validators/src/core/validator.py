@@ -7,6 +7,7 @@ from payload_models.payloads import MinerJobRequestPayload
 from clients.backend_client import BackendClient
 
 from core.config import settings
+from incentive.eligibility import is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
 from core.utils import _m, get_extra_info, get_logger
@@ -311,6 +312,7 @@ class Validator:
                                         and job_result.gpu_count
                                         and (job_result.score > 0 or job_result.job_score > 0)
                                         and not job_result.is_spot
+                                        and not is_missing_discord_after_cutoff(job_result)
                                         and not (
                                             job_result.is_new_rentals_paused and not job_result.is_rented
                                         )

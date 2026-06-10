@@ -128,7 +128,6 @@ class Settings(BaseSettings):
     PORTION_FOR_SYSBOX_UNRENTED: float = 1
     PORTION_FOR_SYSBOX_RENTED: float = 1
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
-    PORTION_FOR_DISCORD: float = 1
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 1, 1, 0, 0, 0)
 
     TIME_DELTA_FOR_EMISSION: float = 0.01

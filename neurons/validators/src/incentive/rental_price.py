@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from incentive.config import BASE_GPU_MAP
+from incentive.eligibility import is_missing_discord_after_cutoff
 
 if TYPE_CHECKING:
     from incentive.config import IncentiveConfig
@@ -40,7 +41,7 @@ class GpuBucketRentalState(BaseModel):
     unrented_count: int
     max_cap: int
     cap_multiplier: float
-    weighted_rate_sum: float  # sum(gpu_count * hourly_rate * sysbox_multiplier * discord_multiplier) in this bucket
+    weighted_rate_sum: float  # sum(gpu_count * hourly_rate * sysbox_multiplier) in this bucket
 
 
 class RentalMiningState(BaseModel):
@@ -88,7 +89,6 @@ class RentalPriceEstimate(BaseModel):
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
     provider_discord_connected: bool = True             # Whether provider Discord is connected for scoring logic
-    discord_multiplier: float | None = None             # Multiplier for provider Discord connection for scoring logic
     uptime_multiplier: float | None = None              # Multiplier for uptime
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
@@ -219,9 +219,8 @@ class RentalPriceIncentive(DefaultIncentive):
                 )
                 result.hourly_rate = max(result.hourly_rate, rate_for_min)
 
-            # Sysbox and Discord penalties are applied later via effective_rate, not baked into hourly_rate
+            # Sysbox penalty is applied later via effective_rate, not baked into hourly_rate
             result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
-            result.discord_multiplier = self.get_discord_multiplier(result)
 
             cap_spec = self.config.max_unrented_gpus.get(base_model, {})
             bucket = self._resolve_bucket(result, cap_spec)
@@ -240,7 +239,6 @@ class RentalPriceIncentive(DefaultIncentive):
                     + result.gpu_count
                     * result.hourly_rate
                     * result.sysbox_multiplier
-                    * result.discord_multiplier
                 )
 
     async def _on_finish_pre_process(self) -> None:
@@ -322,7 +320,6 @@ class RentalPriceIncentive(DefaultIncentive):
             result.hourly_rate
             * result.unrented_cap_multiplier
             * result.sysbox_multiplier
-            * result.discord_multiplier
         )
 
         # calculate incentive score
@@ -344,7 +341,6 @@ class RentalPriceIncentive(DefaultIncentive):
                     "sysbox_runtime": result.sysbox_runtime,
                     "sysbox_multiplier": result.sysbox_multiplier,
                     "provider_discord_connected": result.provider_discord_connected,
-                    "discord_multiplier": result.discord_multiplier,
                     "unrented_cap_multiplier": result.unrented_cap_multiplier,
                     "effective_rate": result.effective_rate,
                     "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,
@@ -399,7 +395,7 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.eligible_for_rental_share = False
             return job_result
 
-        if self.should_exclude_for_missing_discord(job_result):
+        if is_missing_discord_after_cutoff(job_result):
             logger.info(
                 _m(
                     "Executor excluded from both pools - provider Discord not connected",
@@ -408,7 +404,6 @@ class RentalPriceIncentive(DefaultIncentive):
                         "gpu_model": job_result.gpu_model,
                         "gpu_count": job_result.gpu_count,
                         "provider_discord_connected": job_result.provider_discord_connected,
-                        "discord_multiplier": 0,
                         "reason": "provider_discord_not_connected",
                         "score": 0,
                         "pool": "none",
@@ -416,7 +411,6 @@ class RentalPriceIncentive(DefaultIncentive):
                 )
             )
             job_result.mining_score = 0
-            job_result.discord_multiplier = 0
             job_result.eligible_for_rental_share = False
             return job_result
 
@@ -550,7 +544,6 @@ class RentalPriceIncentive(DefaultIncentive):
             mining_score=fake_result.mining_score,
             sysbox_multiplier=fake_result.sysbox_multiplier,
             provider_discord_connected=fake_result.provider_discord_connected,
-            discord_multiplier=fake_result.discord_multiplier,
             uptime_multiplier=fake_result.uptime_multiplier,
             gpu_portion=fake_result.gpu_portion,
             total_gpu_count=fake_result.total_gpu_count,
@@ -638,6 +631,10 @@ class RentalPriceIncentive(DefaultIncentive):
         for results in self.job_results.values():
             for result in results:
                 if not result.is_successful or not result.gpu_model:
+                    continue
+                # Keep snapshot totals aligned with live scoring denominators:
+                # executors excluded from incentive pools should not inflate estimates.
+                if result.is_spot or is_missing_discord_after_cutoff(result):
                     continue
                 total_gpu_model_count_map[result.gpu_model] = (
                     total_gpu_model_count_map.get(result.gpu_model, 0) + result.gpu_count

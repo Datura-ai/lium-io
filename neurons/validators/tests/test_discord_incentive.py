@@ -7,7 +7,6 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from core.config import settings
 from incentive import rental_price as rental_price_module
 from incentive.config import IncentiveConfig
-from incentive.default import DefaultIncentive
 from incentive.rental_price import RentalPriceIncentive
 from services.task_service import JobResult
 
@@ -54,41 +53,6 @@ def _redis_service() -> AsyncMock:
 def _set_discord_cutoff(monkeypatch, *, active: bool) -> None:
     cutoff = datetime.utcnow() - timedelta(days=1) if active else datetime.utcnow() + timedelta(days=1)
     monkeypatch.setattr(settings, "DISCORD_INCENTIVE_CUTOFF", cutoff)
-    monkeypatch.setattr(settings, "PORTION_FOR_DISCORD", 1)
-
-
-@pytest.mark.asyncio
-async def test_default_incentive_sets_zero_multiplier_without_discord_after_cutoff(monkeypatch):
-    _set_discord_cutoff(monkeypatch, active=True)
-    job = _make_job(is_rented=True, provider_discord_connected=False)
-    incentive = DefaultIncentive(
-        IncentiveConfig(algorithm="default"),
-        _redis_service(),
-        {"miner": [job]},
-        total_gpu_model_count_map={"H100": 1},
-    )
-
-    result = await incentive.calculate_executor_score(job)
-
-    assert result.discord_multiplier == 0
-    assert result.mining_score == 0
-
-
-@pytest.mark.asyncio
-async def test_default_incentive_does_not_penalize_missing_discord_before_cutoff(monkeypatch):
-    _set_discord_cutoff(monkeypatch, active=False)
-    job = _make_job(is_rented=True, provider_discord_connected=False)
-    incentive = DefaultIncentive(
-        IncentiveConfig(algorithm="default"),
-        _redis_service(),
-        {"miner": [job]},
-        total_gpu_model_count_map={"H100": 1},
-    )
-
-    result = await incentive.calculate_executor_score(job)
-
-    assert result.discord_multiplier == 1
-    assert result.mining_score == pytest.approx(0.3)
 
 
 @pytest.mark.asyncio
@@ -100,13 +64,13 @@ async def test_rental_price_incentive_excludes_executor_without_discord_after_cu
 
     await incentive.calculate_mining_scores()
 
-    assert job.discord_multiplier == 0
     assert job.eligible_for_rental_share is False
     assert job.mining_score == 0
     assert job.effective_rate is None
     assert job.incentive == 0
     assert incentive.unrented_count_by_bucket == {}
     assert incentive.total_rental_cost == 0
+    assert incentive.get_snapshot().mining.total_gpu_model_count_map == {}
 
 
 @pytest.mark.asyncio
@@ -118,7 +82,6 @@ async def test_rental_price_incentive_keeps_effective_rate_with_discord_after_cu
 
     await incentive.calculate_mining_scores()
 
-    assert job.discord_multiplier == 1
     assert job.effective_rate == pytest.approx(4.0)
     assert job.incentive > 0
 
@@ -132,7 +95,6 @@ async def test_rental_price_incentive_does_not_penalize_missing_discord_before_c
 
     await incentive.calculate_mining_scores()
 
-    assert job.discord_multiplier == 1
     assert job.effective_rate == pytest.approx(4.0)
     assert job.incentive > 0
 
@@ -162,13 +124,12 @@ async def test_rental_price_incentive_mixed_discord_bucket_excludes_disconnected
     assert incentive.unrented_count_by_bucket[("H100", 1)] == 1
     assert incentive.cap_multiplier_by_bucket[("H100", 1)] == pytest.approx(1.0)
     assert incentive.total_rental_cost == pytest.approx(4.0)
+    assert incentive.get_snapshot().mining.total_gpu_model_count_map == {"H100": 1}
 
-    assert connected.discord_multiplier == 1
     assert connected.effective_rate == pytest.approx(4.0)
     assert connected.incentive > 0
     assert incentive.miner_incentives["connected-miner"] == pytest.approx(connected.incentive)
 
-    assert disconnected.discord_multiplier == 0
     assert disconnected.eligible_for_rental_share is False
     assert disconnected.mining_score == 0
     assert disconnected.effective_rate is None
