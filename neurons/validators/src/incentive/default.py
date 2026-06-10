@@ -114,6 +114,9 @@ class DefaultIncentive(BaseIncentive):
             job_result.mining_score = 0
             return job_result
 
+        # Fallback for deployments using the legacy/default incentive algorithm
+        # directly. The active rental_price algorithm handles this before it
+        # calls into DefaultIncentive.
         if job_result.is_new_rentals_paused and not job_result.is_rented:
             logger.info(
                 _m(
@@ -169,10 +172,7 @@ class DefaultIncentive(BaseIncentive):
             )
 
         # Apply multiplier
-        job_result.mining_score *= (
-            job_result.sysbox_multiplier
-            * job_result.uptime_multiplier
-        )
+        job_result.mining_score *= job_result.sysbox_multiplier * job_result.uptime_multiplier
         log = _m(
             "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier",
             extra=get_extra_info(
