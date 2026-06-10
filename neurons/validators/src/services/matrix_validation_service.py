@@ -38,6 +38,14 @@ class DMCompVerifyWrapper:
         self._lib.getCipherText.argtypes = [c_void_p]
         self._lib.getCipherText.restype = c_char_p
 
+        # unsealResult is optional: present only on sealing-aware .so builds. It
+        # authenticates+decrypts the executor's sealed {uuid, metrics} blob using the
+        # generate-side object's key. An older .so without the symbol still loads.
+        self._has_sealed = hasattr(self._lib, "unsealResult")
+        if self._has_sealed:
+            self._lib.unsealResult.argtypes = [POINTER(c_void_p), c_char_p]
+            self._lib.unsealResult.restype = c_char_p
+
         self._lib.free.argtypes = [c_void_p]
         self._lib.free.restype = None
 
@@ -73,6 +81,20 @@ class DMCompVerifyWrapper:
             return cipher_text.decode('utf-8')
         else:
             return None
+
+    def unsealResult(self, verifier_ptr: POINTER(c_void_p), sealed_hex: str) -> str:
+        """
+        Wrap the C++ function unsealResult. Authenticates + decrypts the executor's
+        sealed blob using THIS object's generate-side key. Returns the inner JSON
+        ('{"uuid": "...", "metrics": {...}}') or "" on malformed input / auth failure.
+        """
+        if not getattr(self, "_has_sealed", False) or not sealed_hex:
+            return ""
+        result_ptr = self._lib.unsealResult(verifier_ptr, sealed_hex.encode('utf-8'))
+        if result_ptr:
+            value = c_char_p(result_ptr).value
+            return value.decode('utf-8') if value else ""
+        return ""
 
     def setDimension(self, ptr: c_void_p, m_dim_n: int, m_dim_k: int):
         self._lib.setDimension(ptr, m_dim_n, m_dim_k)
@@ -112,6 +134,7 @@ class ValidationResult:
     stdout: str = ""
     stderr: str = ""
     error_message: str = ""
+    metrics: dict | None = None
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -180,6 +203,10 @@ class ValidationService:
         default_extra: dict,
         machine_spec: dict,
     ) -> ValidationResult:
+        # Per-call verifier object: its key MUST survive the SSH round-trip so we can
+        # unseal the executor's authenticated response. A shared object would be clobbered
+        # by concurrent validations across the `await` below. Freed in `finally`.
+        gen_ptr = None
         try:
             script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
 
@@ -215,13 +242,18 @@ class ValidationService:
             verifier_params.generate()
             verifier_params.dim_k = int(self.get_max_matrix_dimensions(gpu_capacity_mb, verifier_params.dim_n))
 
-            verifier_params.cipher_text = self.encrypt_challenge(
-                verifier_params.dim_n,
-                verifier_params.dim_k,
-                verifier_params.seed,
-                machine_info,
-                verifier_params.uuid,
-            )
+            # Generate the challenge on a dedicated per-call object (mirrors the legacy
+            # encrypt_challenge flow, but its key is retained for the post-SSH unseal).
+            try:
+                gen_ptr = self.wrapper.DMCompVerify_new(10, 10)
+                self.wrapper.setDimension(gen_ptr, verifier_params.dim_n, verifier_params.dim_k)
+                self.wrapper.generateChallenge(
+                    gen_ptr, verifier_params.seed, machine_info, verifier_params.uuid
+                )
+                verifier_params.cipher_text = self.wrapper.getCipherText(gen_ptr) or ""
+            except Exception as e:
+                logger.error("Failed encrypt challenge request: %s", str(e))
+                verifier_params.cipher_text = ""
 
             log_extra = {
                 **default_extra,
@@ -284,10 +316,40 @@ class ValidationService:
                     error_message=error_msg
                 )
 
-            # Extract UUID from stdout
+            # Extract the result from stdout. Prefer the combined RESULT_JSON marker
+            # (carries uuid + TFLOPS metrics); fall back to the legacy "UUID:" line for
+            # backward compatibility with older executors. A malformed RESULT_JSON also
+            # falls back to the legacy line rather than failing the check. The library
+            # prints many debug lines, so we take the LAST RESULT_JSON match.
+            metrics = None
+            sealed_blob = ""
             try:
-                uuid_line = next((line for line in stdout.splitlines() if line.startswith("UUID:")), None)
-                uuid = uuid_line.split("UUID:")[1].strip() if uuid_line else ""
+                lines = stdout.splitlines()
+                result_json_line = next(
+                    (line for line in reversed(lines) if line.startswith("RESULT_JSON:")),
+                    None,
+                )
+                uuid = ""
+                if result_json_line is not None:
+                    try:
+                        parsed = json.loads(result_json_line[len("RESULT_JSON:"):].strip())
+                    except (ValueError, TypeError):
+                        parsed = None
+                    # Only trust a well-formed object carrying a *string* uuid. Stdout is
+                    # miner-controlled, so a crafted uuid of list/int/dict type must fall
+                    # back to the legacy UUID: line rather than erroring out the whole
+                    # check. (UUID comparison stays fail-closed regardless.)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("uuid"), str):
+                        uuid = parsed["uuid"].strip()
+                        metrics = parsed.get("metrics")
+                        # The sealed blob (when present) is authoritative; verified below.
+                        if isinstance(parsed.get("sealed"), str):
+                            sealed_blob = parsed["sealed"]
+                    else:
+                        result_json_line = None  # malformed/unusable → fall through to legacy parse
+                if result_json_line is None:
+                    uuid_line = next((line for line in lines if line.startswith("UUID:")), None)
+                    uuid = uuid_line.split("UUID:")[1].strip() if uuid_line else ""
             except Exception as e:
                 error_msg = f"Failed to extract UUID from stdout: {str(e)}"
                 logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
@@ -300,6 +362,36 @@ class ValidationService:
                     error_message=error_msg
                 )
 
+            # Anti-spoof gate: when the executor returns a sealed (authenticated-encrypted)
+            # blob, it is AUTHORITATIVE. We decrypt it with OUR generate-side key and take
+            # uuid+metrics from inside, so a miner who only edits the (untrusted) Python
+            # wrapper cannot forge or inflate the result. If a sealed blob is present but
+            # fails authentication, we REJECT — we do not fall back to the miner-controlled
+            # plaintext line. Executors that predate sealing send no blob and keep the
+            # legacy behavior, so independent validator/executor upgrades stay compatible.
+            if getattr(self.wrapper, "_has_sealed", False) and sealed_blob:
+                inner = self.wrapper.unsealResult(gen_ptr, sealed_blob)
+                inner_obj = None
+                if inner:
+                    try:
+                        inner_obj = json.loads(inner)
+                    except (ValueError, TypeError):
+                        inner_obj = None
+                if not isinstance(inner_obj, dict) or not isinstance(inner_obj.get("uuid"), str):
+                    error_msg = "Sealed result failed authentication (tampered/forged executor output)"
+                    logger.error(_m("Matrix Multiplication Verification Failed", extra=get_extra_info({**log_extra, "error": error_msg})))
+                    return ValidationResult(
+                        success=False,
+                        expected_uuid=verifier_params.uuid,
+                        returned_uuid="",
+                        stdout=stdout,
+                        stderr=stderr,
+                        error_message=error_msg,
+                    )
+                # Authenticated: these override anything in the plaintext line.
+                uuid = inner_obj["uuid"].strip()
+                metrics = inner_obj.get("metrics")
+
             try:
                 uuid_array = verifier_params.uuid.split(",")
                 if uuid in uuid_array:
@@ -309,7 +401,8 @@ class ValidationService:
                         expected_uuid=verifier_params.uuid,
                         returned_uuid=uuid,
                         stdout=stdout,
-                        stderr=stderr
+                        stderr=stderr,
+                        metrics=metrics
                     )
                 else:
                     error_msg = f"UUID mismatch: expected '{verifier_params.uuid}', got '{uuid}'"
@@ -320,7 +413,8 @@ class ValidationService:
                         returned_uuid=uuid,
                         stdout=stdout,
                         stderr=stderr,
-                        error_message=error_msg
+                        error_message=error_msg,
+                        metrics=metrics
                     )
             except Exception as e:
                 error_msg = f"Error during UUID verification: {str(e)}"
@@ -341,3 +435,10 @@ class ValidationService:
                 success=False,
                 error_message=error_msg
             )
+        finally:
+            # Always release the per-call verifier object (it held the seal key).
+            if gen_ptr is not None:
+                try:
+                    self.wrapper.free(gen_ptr)
+                except Exception:
+                    pass

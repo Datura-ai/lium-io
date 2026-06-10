@@ -72,6 +72,7 @@ class ContextState:
     gpu_uuids: Optional[str] = None
     verified_port_count: int = 0
     rented_data: RentedExecutorsResponse | None = None
+    gpu_metrics: dict | None = None
 
 
 class CheckResult(BaseModel):
