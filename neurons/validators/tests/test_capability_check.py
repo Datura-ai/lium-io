@@ -10,16 +10,25 @@ from tests.helpers import build_context_config, build_services, build_state
 
 # Mock validation service - mimics the real ValidationService interface
 class DummyValidationService:
-    def __init__(self, *, success: bool, should_raise: bool = False, error_message: str = ""):
+    def __init__(
+        self,
+        *,
+        success: bool,
+        should_raise: bool = False,
+        error_message: str = "",
+        metrics: dict | None = None,
+    ):
         """
         Args:
             success: Whether validate_gpu_model_and_process_job should return success/failure
             should_raise: Whether to raise an exception instead of returning
             error_message: The exception message if should_raise=True or error in ValidationResult
+            metrics: Optional FP32 TFLOPS metrics dict to surface on the ValidationResult
         """
         self.success = success
         self.should_raise = should_raise
         self.error_message = error_message
+        self.metrics = metrics
         # Track what parameters the check called us with
         self.called_with: dict | None = None
 
@@ -51,7 +60,8 @@ class DummyValidationService:
             returned_uuid="test-uuid-123" if self.success else "wrong-uuid",
             stdout="UUID: test-uuid-123" if self.success else "UUID: wrong-uuid",
             stderr="",
-            error_message="" if self.success else self.error_message or "Validation failed"
+            error_message="" if self.success else self.error_message or "Validation failed",
+            metrics=self.metrics,
         )
 
 
@@ -164,3 +174,35 @@ async def test_capability_check_runs_for_customer_rental_even_with_filler_mappin
     assert result.passed is True
     assert result.event.reason_code == Msg.VERIFY_OK.reason
     assert validation_service.called_with is not None
+
+
+@pytest.mark.asyncio
+async def test_capability_check_captures_metrics_into_state(context_factory):
+    """On success with metrics present, the check writes gpu_metrics into pipeline state."""
+    metrics = {"device": "NVIDIA A100", "cc": "8.0", "fp32_tflops": 51.2}
+    validation_service = DummyValidationService(success=True, metrics=metrics)
+    services = build_services(validation=validation_service)
+    state = build_state(specs={"gpu": {"count": 1}})
+    ctx = context_factory(services=services, state=state)
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFY_OK.reason
+    assert "state" in result.updates
+    assert result.updates["state"].gpu_metrics == metrics
+
+
+@pytest.mark.asyncio
+async def test_capability_check_no_metrics_leaves_state_none(context_factory):
+    """Fail-safe: success with no metrics leaves state untouched (no gpu_metrics)."""
+    validation_service = DummyValidationService(success=True, metrics=None)
+    services = build_services(validation=validation_service)
+    state = build_state(specs={"gpu": {"count": 1}})
+    ctx = context_factory(services=services, state=state)
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.VERIFY_OK.reason
+    assert "state" not in result.updates

@@ -111,6 +111,11 @@ class ResultHandler:
             "tdx_attestation_passed": context.tdx_attestation_passed,
             "is_spot": is_spot,
         }
+        # FP32 TFLOPS metrics (device-0 representative), captured by CapabilityCheck.
+        # Only added when present; absent → fail-safe (TFLOPS disabled/failed). The
+        # backend types this nested object as MachineSpecs.gpu_metrics.
+        if context.state.gpu_metrics is not None:
+            specs["gpu_metrics"] = context.state.gpu_metrics
 
         # Build and return JobResult
         return JobResult(

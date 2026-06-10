@@ -1,6 +1,14 @@
 import os
+import json
 import argparse
 from ctypes import CDLL, c_longlong, POINTER, c_int, c_void_p, c_char_p
+
+# Opt-in to the TFLOPS benchmark for THIS process only. The shared library reads
+# TFLOPS_ENABLE at solve time and runs the throughput benchmark after the challenge
+# is solved. Validator-side in-process callers of the same .so (e.g. the preflight
+# matrix_check) never set this, so they pay zero benchmark cost.
+os.environ.setdefault("TFLOPS_ENABLE", "1")
+
 
 class DMCompVerifyWrapper:
     def __init__(self, lib_name: str):
@@ -28,6 +36,21 @@ class DMCompVerifyWrapper:
 
         self._lib.getUUID.argtypes = [c_void_p]
         self._lib.getUUID.restype = c_char_p
+
+        # getMetrics is optional: an older .so without the symbol must still load.
+        self._has_metrics = hasattr(self._lib, "getMetrics")
+        if self._has_metrics:
+            self._lib.getMetrics.argtypes = [c_void_p]
+            self._lib.getMetrics.restype = c_char_p
+
+        # getSealedResult is optional too: an older .so without it must still load.
+        # When present, it returns an authenticated-encrypted {uuid, metrics} blob the
+        # validator decrypts itself, so this (miner-controlled) wrapper cannot forge or
+        # inflate the result by swapping the printed line.
+        self._has_sealed = hasattr(self._lib, "getSealedResult")
+        if self._has_sealed:
+            self._lib.getSealedResult.argtypes = [c_void_p]
+            self._lib.getSealedResult.restype = c_char_p
 
         self._lib.free.argtypes = [c_void_p]
         self._lib.free.restype = None
@@ -71,6 +94,34 @@ class DMCompVerifyWrapper:
         else:
             return None
 
+    def getMetrics(self, verifier_ptr: POINTER(c_void_p)) -> str:
+        """
+        Wrap the C++ function getMetrics. Returns the TFLOPS metrics JSON string
+        (or None if the symbol is absent / the benchmark did not run).
+        """
+        if not getattr(self, "_has_metrics", False):
+            return None
+        metrics_ptr = self._lib.getMetrics(verifier_ptr)
+        if metrics_ptr:
+            metrics = c_char_p(metrics_ptr).value
+            return metrics.decode('utf-8')
+        return None
+
+    def getSealedResult(self, verifier_ptr: POINTER(c_void_p)) -> str:
+        """
+        Wrap the C++ function getSealedResult. Returns the authenticated-encrypted
+        {uuid, metrics} blob (hex) that the validator decrypts, or None if the symbol
+        is absent / no UUID was recovered.
+        """
+        if not getattr(self, "_has_sealed", False):
+            return None
+        sealed_ptr = self._lib.getSealedResult(verifier_ptr)
+        if sealed_ptr:
+            sealed = c_char_p(sealed_ptr).value
+            sealed = sealed.decode('utf-8') if sealed else ""
+            return sealed or None
+        return None
+
     def free(self, ptr: c_void_p):
         """
         Frees memory allocated for the given pointer.
@@ -98,7 +149,25 @@ def decrypt_challenge():
 
     # Example to get the UUID
     uuid = wrapper.getUUID(verifier_ptr)
+    # Legacy line — kept byte-for-byte so older validators (which scan for a line
+    # starting with "UUID:") keep working during independent deploys.
     print("UUID: ", uuid)
+
+    # Combined result: the decrypted UUID plus best-effort TFLOPS metrics. Assembled
+    # in Python (guaranteed valid one-line JSON) behind a stable marker the validator
+    # greps for. Metrics is null when the benchmark was disabled or failed.
+    metrics_raw = wrapper.getMetrics(verifier_ptr)
+    try:
+        metrics = json.loads(metrics_raw) if metrics_raw else None
+    except (ValueError, TypeError):
+        metrics = None
+
+    # The sealed blob is the AUTHORITATIVE result: the validator decrypts it and reads
+    # uuid+metrics from inside, so this wrapper cannot forge or inflate them. The legacy
+    # uuid/metrics fields are kept ONLY for validators that predate sealing; a
+    # sealing-aware validator ignores them and trusts only the sealed blob.
+    sealed = wrapper.getSealedResult(verifier_ptr)
+    print("RESULT_JSON: " + json.dumps({"uuid": uuid, "metrics": metrics, "sealed": sealed}))
 
     # Free resources
     wrapper.free(verifier_ptr)

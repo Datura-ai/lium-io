@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..messages import CapabilityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -54,8 +56,15 @@ class CapabilityCheck:
                 Msg.VERIFY_OK,
                 ctx=ctx,
                 check_id=self.check_id,
+                what={"metrics": result.metrics},
             )
-            return CheckResult(passed=True, event=event)
+            # Carry FP32 TFLOPS metrics into pipeline state so ResultHandler can nest them
+            # in the published specs. Only on success and only when present (fail-safe:
+            # None leaves state untouched and no gpu_metrics key is ever published).
+            updates: dict = {}
+            if result.metrics is not None:
+                updates["state"] = replace(ctx.state, gpu_metrics=result.metrics)
+            return CheckResult(passed=True, event=event, updates=updates)
 
         # Build detailed failure information
         failure_details = {}
@@ -66,6 +75,7 @@ class CapabilityCheck:
                 "returned_uuid": result.returned_uuid,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
+                "metrics": result.metrics,
             }
         elif failure_reason:
             failure_details = {"error": failure_reason}

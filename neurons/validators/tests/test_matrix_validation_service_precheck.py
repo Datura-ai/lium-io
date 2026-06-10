@@ -105,3 +105,101 @@ async def test_empty_cipher_text_short_circuits_ssh(service_with_mock_wrapper):
     assert result.success is False
     assert "cipher" in result.error_message.lower()
     ssh.run.assert_not_called()
+
+
+# --- RESULT_JSON / UUID stdout parsing + metrics plumbing ------------------
+_FIXED_UUID = "11111111-1111-1111-1111-111111111111"
+
+
+async def _run_with_stdout(svc, monkeypatch, stdout):
+    """Drive the validator with a fixed expected UUID and a canned executor stdout."""
+    # Make the generated challenge UUID deterministic so we can craft a match.
+    monkeypatch.setattr(mvs.uuid4, "uuid4", lambda: _FIXED_UUID)
+    ssh = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(stdout=stdout, stderr=""))
+    )
+    return await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_result_json_parsed_with_metrics(service_with_mock_wrapper, monkeypatch):
+    """A RESULT_JSON line is preferred and its metrics land on ValidationResult."""
+    svc, _ = service_with_mock_wrapper
+    stdout = (
+        "GPU Info: {...}\n"
+        f'RESULT_JSON: {{"uuid": "{_FIXED_UUID}", "metrics": {{"fp32_tflops": 1.2, "tensor_bf16_tflops": 3.4}}}}'
+    )
+    result = await _run_with_stdout(svc, monkeypatch, stdout)
+    assert result.success is True
+    assert result.returned_uuid == _FIXED_UUID
+    assert result.metrics == {"fp32_tflops": 1.2, "tensor_bf16_tflops": 3.4}
+
+
+@pytest.mark.asyncio
+async def test_result_json_metrics_null_still_verifies(service_with_mock_wrapper, monkeypatch):
+    """metrics=null (benchmark disabled/failed) must not affect UUID verification."""
+    svc, _ = service_with_mock_wrapper
+    stdout = f'RESULT_JSON: {{"uuid": "{_FIXED_UUID}", "metrics": null}}'
+    result = await _run_with_stdout(svc, monkeypatch, stdout)
+    assert result.success is True
+    assert result.returned_uuid == _FIXED_UUID
+    assert result.metrics is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_uuid_line_fallback_sets_metrics_none(service_with_mock_wrapper, monkeypatch):
+    """An old executor that prints only `UUID:` still verifies; metrics is None."""
+    svc, _ = service_with_mock_wrapper
+    stdout = f"some debug\nUUID:  {_FIXED_UUID}"
+    result = await _run_with_stdout(svc, monkeypatch, stdout)
+    assert result.success is True
+    assert result.returned_uuid == _FIXED_UUID
+    assert result.metrics is None
+
+
+@pytest.mark.asyncio
+async def test_last_result_json_wins(service_with_mock_wrapper, monkeypatch):
+    """With library debug noise and multiple markers, the LAST RESULT_JSON wins."""
+    svc, _ = service_with_mock_wrapper
+    stdout = (
+        "debug line one\n"
+        'RESULT_JSON: {"uuid": "00000000-0000-0000-0000-000000000000", "metrics": null}\n'
+        "more debug\n"
+        f'RESULT_JSON: {{"uuid": "{_FIXED_UUID}", "metrics": {{"fp32_tflops": 9.9}}}}'
+    )
+    result = await _run_with_stdout(svc, monkeypatch, stdout)
+    assert result.success is True
+    assert result.returned_uuid == _FIXED_UUID
+    assert result.metrics == {"fp32_tflops": 9.9}
+
+
+@pytest.mark.asyncio
+async def test_malformed_result_json_falls_back_to_uuid_line(service_with_mock_wrapper, monkeypatch):
+    """A broken RESULT_JSON must fall back to the legacy UUID line, not fail."""
+    svc, _ = service_with_mock_wrapper
+    stdout = f"UUID:  {_FIXED_UUID}\nRESULT_JSON: {{not valid json"
+    result = await _run_with_stdout(svc, monkeypatch, stdout)
+    assert result.success is True
+    assert result.returned_uuid == _FIXED_UUID
+    assert result.metrics is None
+
+
+@pytest.mark.asyncio
+async def test_non_string_uuid_in_result_json_falls_back(service_with_mock_wrapper, monkeypatch):
+    """Miner-controlled stdout with a non-string uuid must NOT crash the parse; it
+    falls back to the legacy UUID: line instead of failing the check."""
+    svc, _ = service_with_mock_wrapper
+    # Valid JSON, but uuid is a list — `.strip()` on it would raise if unguarded.
+    stdout = (
+        f"UUID:  {_FIXED_UUID}\n"
+        'RESULT_JSON: {"uuid": ["not-a-string"], "metrics": {"fp32_tflops": 1.0}}'
+    )
+    result = await _run_with_stdout(svc, monkeypatch, stdout)
+    assert result.success is True
+    assert result.returned_uuid == _FIXED_UUID
+    assert result.metrics is None  # untrusted metrics from the malformed line are dropped
