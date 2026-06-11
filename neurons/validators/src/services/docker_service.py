@@ -1437,7 +1437,7 @@ class DockerService:
             )
 
         total_bytes = 0
-        for line in (inspect_result.stdout or "").splitlines():
+        for volume_name, line in zip(volume_names, (inspect_result.stdout or "").splitlines()):
             line = line.strip()
             if not line:
                 continue
@@ -1447,6 +1447,17 @@ class DockerService:
                 size_bytes = _parse_volume_size_to_bytes(size_option_raw)
             if size_bytes is not None:
                 total_bytes += size_bytes
+            else:
+                # Undercounting existing volumes inflates the reconstructed pool.
+                logger.info(
+                    _m(
+                        "vloopback_fresh_sizing_unparsable_volume_size",
+                        extra=get_extra_info({
+                            "volume_name": volume_name,
+                            "inspect_line": line,
+                        }),
+                    )
+                )
         return total_bytes
 
     async def resolve_volume_sizing(
@@ -1496,10 +1507,14 @@ class DockerService:
                 path="fresh_fallback",
             )
 
-        pool_bytes = (
+        # Clamp negative intermediates: a nearly-full disk must degrade to the
+        # 1 GB floor (or a min-size rejection), never to a negative candidate
+        # winning min().
+        pool_bytes = max(
             df_avail_bytes
             + existing_volumes_bytes
-            - _FRESH_SIZING_OVERHEAD_GB * _FRESH_SIZING_GB_BYTES
+            - _FRESH_SIZING_OVERHEAD_GB * _FRESH_SIZING_GB_BYTES,
+            0,
         )
         slice_candidates = [("pool", payload.disk_share * pool_bytes)]
         if payload.volume_limit_gb is not None:
@@ -1509,13 +1524,18 @@ class DockerService:
         slice_candidates.append(
             (
                 "df_guard",
-                (df_avail_bytes - _FRESH_SIZING_HEADROOM_GB * _FRESH_SIZING_GB_BYTES) * 1.5,
+                max(
+                    (df_avail_bytes - _FRESH_SIZING_HEADROOM_GB * _FRESH_SIZING_GB_BYTES) * 1.5,
+                    0,
+                ),
             )
         )
         capped_by, slice_bytes = min(slice_candidates, key=lambda item: item[1])
 
-        volume_limit_gb = math.floor(slice_bytes * 2 / 3 / _FRESH_SIZING_GB_BYTES)
-        storage_limit_gb = math.floor(slice_bytes / 3 / _FRESH_SIZING_GB_BYTES)
+        # -o size= requires a positive integer; floor to at least 1 GB before
+        # the min-size check so the check runs against the final value.
+        volume_limit_gb = max(math.floor(slice_bytes * 2 / 3 / _FRESH_SIZING_GB_BYTES), 1)
+        storage_limit_gb = max(math.floor(slice_bytes / 3 / _FRESH_SIZING_GB_BYTES), 1)
 
         if payload.min_volume_gb is not None and volume_limit_gb < payload.min_volume_gb:
             logger.error(
@@ -1537,10 +1557,6 @@ class DockerService:
                 f"Fresh vloopback sizing produced {volume_limit_gb}GB volume, "
                 f"below required minimum {payload.min_volume_gb}GB"
             )
-
-        # -o size= requires a positive integer; floor to at least 1 GB.
-        volume_limit_gb = max(volume_limit_gb, 1)
-        storage_limit_gb = max(storage_limit_gb, 1)
 
         logger.info(
             _m(

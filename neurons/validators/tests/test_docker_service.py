@@ -2599,3 +2599,131 @@ def test_parse_volume_size_to_bytes_handles_bytes_and_size_strings():
     assert _parse_volume_size_to_bytes("<no value>") is None
     assert _parse_volume_size_to_bytes("") is None
     assert _parse_volume_size_to_bytes(None) is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_low_free_space_clamps_to_floor(docker_service):
+    # Arrange: df_avail=5GB is below both overhead (20GB) and headroom (10GB);
+    # pool and df_guard candidates must clamp to 0, not go negative.
+    payload = _make_sizing_payload(disk_share=1.0)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=5 * _SIZING_GB)
+
+    # Act
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "fresh"
+    assert result.volume_limit_gb == 1
+    assert result.storage_limit_gb == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_low_free_space_below_min_raises(docker_service):
+    # Arrange: same nearly-full disk, but a min floor is set -> reject.
+    payload = _make_sizing_payload(disk_share=1.0, min_volume_gb=10)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=5 * _SIZING_GB)
+
+    # Act / Assert
+    with pytest.raises(VolumeMinSizeError):
+        await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+
+@pytest.mark.asyncio
+async def test_create_container_fresh_sizing_uses_effective_values(
+    docker_service,
+    monkeypatch,
+):
+    """disk_share set: effective fresh values (not payload echoes) must flow into
+    create_local_volume, the docker run --storage-opt flag, and ContainerCreated."""
+    # Arrange: df_avail=900GB, existing vloopback=300GB, share=0.5 -> pool 1180GB,
+    # slice 590GB (request cap 500*1.5=750GB does not bind) -> volume 393, storage 196.
+    def ssh_run(command, **kwargs):
+        if "docker info" in command:
+            return _make_ssh_command_result(stdout="/var/lib/docker\n")
+        if command.startswith("df "):
+            return _make_ssh_command_result(stdout=f"       Avail\n{900 * _SIZING_GB}\n")
+        if "volume ls" in command:
+            return _make_ssh_command_result(stdout="volume_other vloopback\n")
+        if "volume inspect" in command:
+            return _make_ssh_command_result(stdout=f"{300 * _SIZING_GB}|<no value>\n")
+        return _make_ssh_command_result()
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=ssh_run)
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.add_pending_pod = AsyncMock()
+    docker_service.redis_service.remove_pending_pod = AsyncMock()
+    docker_service.redis_service.add_rented_pod = AsyncMock()
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        docker_service,
+        "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], None)),
+    )
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_existing_containers", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
+    monkeypatch.setattr(
+        docker_service,
+        "wait_for_port_check_containers",
+        AsyncMock(return_value=(True, "ok")),
+    )
+    monkeypatch.setattr(docker_service, "_run_docker_create_with_port_retry", AsyncMock())
+    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=500,
+        storage_limit_gb=250,
+        disk_share=0.5,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    # Act
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    # Assert: fresh-computed volume limit reaches docker volume create
+    assert docker_service.create_local_volume.await_args.kwargs["limit"] == 393
+    # Assert: fresh-computed storage limit reaches docker run --storage-opt
+    run_command = docker_service._run_docker_create_with_port_retry.await_args.kwargs["command"]
+    assert "--storage-opt size=196g" in run_command
+    # Assert: ContainerCreated carries effective values, not payload echoes
+    assert result.volume_limit_gb == 393
+    assert result.storage_limit_gb == 196
