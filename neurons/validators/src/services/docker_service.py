@@ -1395,13 +1395,24 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         docker_root_dir: str,
     ) -> int:
-        result = await ssh_client.run(f"df -B1 --output=avail {shlex.quote(docker_root_dir)}")
+        # The validator's SSH session lands inside the miner's executor container,
+        # where DockerRootDir (a host path) does not exist. Measure through the
+        # docker daemon instead: bind-mount the host path into a helper container
+        # and run df there. Alpine's busybox df has no --output, so use POSIX -P
+        # and parse the "Available" column (4th) of the data line.
+        result = await ssh_client.run(
+            f"/usr/bin/docker run --rm -v {shlex.quote(docker_root_dir)}:/hostfs:ro "
+            f"{_VLOOPBACK_REPAIR_IMAGE} df -P -B1 /hostfs"
+        )
         if getattr(result, "exit_status", 0) != 0:
-            raise Exception(f"df failed: {getattr(result, 'stderr', '')}")
+            raise Exception(f"df via helper container failed: {getattr(result, 'stderr', '')}")
         lines = (result.stdout or "").strip().splitlines()
         if len(lines) < 2:
             raise Exception(f"Unexpected df output: {result.stdout!r}")
-        return int(lines[1].strip())
+        columns = lines[1].split()
+        if len(columns) < 4 or not columns[3].isdigit():
+            raise Exception(f"Unexpected df output: {result.stdout!r}")
+        return int(columns[3])
 
     async def _get_existing_vloopback_bytes(
         self,
