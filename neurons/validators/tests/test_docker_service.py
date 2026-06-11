@@ -1,5 +1,5 @@
 import shlex
-from unittest.mock import AsyncMock, Mock, MagicMock
+from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from uuid import uuid4, UUID
 from datetime import datetime
 
@@ -7,7 +7,11 @@ import pytest
 import pytest_asyncio
 from tenacity import Future, RetryError
 
-from services.docker_service import DockerService
+from services.docker_service import (
+    DockerService,
+    VolumeMinSizeError,
+    _parse_volume_size_to_bytes,
+)
 from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerDeleteRequest,
@@ -2410,3 +2414,188 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
         "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
         for c in FakeSSHClient.seen
     ), f"force-rm xargs missing. Seen: {FakeSSHClient.seen}"
+
+
+# ---------------------------------------------------------------------------
+# DAH-2183: validator-side fresh vloopback sizing
+# ---------------------------------------------------------------------------
+
+_SIZING_GB = 1024 ** 3
+
+
+def _make_sizing_payload(**overrides) -> ContainerCreateRequest:
+    defaults = dict(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+    )
+    defaults.update(overrides)
+    return ContainerCreateRequest(**defaults)
+
+
+def _make_sizing_ssh_client(
+    df_avail_bytes: int,
+    volume_ls_stdout: str = "",
+    volume_inspect_stdout: str = "",
+    df_error: bool = False,
+) -> Mock:
+    def run(command, **kwargs):
+        if "docker info" in command:
+            return Mock(stdout="/var/lib/docker\n", exit_status=0)
+        if command.startswith("df "):
+            if df_error:
+                raise Exception("df boom")
+            return Mock(stdout=f"       Avail\n{df_avail_bytes}\n", exit_status=0)
+        if "volume ls" in command:
+            return Mock(stdout=volume_ls_stdout, exit_status=0)
+        if "volume inspect" in command:
+            return Mock(stdout=volume_inspect_stdout, exit_status=0)
+        raise AssertionError(f"unexpected ssh command: {command}")
+
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    return ssh_client
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_legacy_passthrough(docker_service):
+    # Arrange
+    payload = _make_sizing_payload(volume_limit_gb=40, storage_limit_gb=20)
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock()
+
+    # Act
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "legacy"
+    assert result.volume_limit_gb == 40
+    assert result.storage_limit_gb == 20
+    assert result.capped_by is None
+    ssh_client.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
+    # Arrange: df_avail=900GB, existing volumes=300GB, overhead 20 -> pool 1180GB,
+    # disk_share 0.5 -> slice 590GB -> volume 393GB, storage 196GB.
+    payload = _make_sizing_payload(disk_share=0.5)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=900 * _SIZING_GB,
+        volume_ls_stdout="volume_abc vloopback:latest\nother_volume local\n",
+        volume_inspect_stdout=f"{300 * _SIZING_GB}|<no value>\n",
+    )
+
+    # Act
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "fresh"
+    assert result.capped_by == "pool"
+    assert result.volume_limit_gb == 393
+    assert result.storage_limit_gb == 196
+    assert result.df_avail_bytes == 900 * _SIZING_GB
+    assert result.existing_volumes_bytes == 300 * _SIZING_GB
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_fresh_request_cap_bound(docker_service):
+    # Arrange: pool slice would be 590GB but request cap is 100GB * 1.5 = 150GB.
+    payload = _make_sizing_payload(disk_share=0.5, volume_limit_gb=100, storage_limit_gb=50)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=900 * _SIZING_GB,
+        volume_ls_stdout="volume_abc vloopback\n",
+        volume_inspect_stdout=f"{300 * _SIZING_GB}|<no value>\n",
+    )
+
+    # Act
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "fresh"
+    assert result.capped_by == "request_cap"
+    assert result.volume_limit_gb == 100
+    assert result.storage_limit_gb == 50
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_fresh_df_guard_bound(docker_service):
+    # Arrange: df_avail=50GB, existing=1000GB, share=0.9 -> pool slice 927GB,
+    # df guard (50-10)*1.5 = 60GB wins -> volume 40GB, storage 20GB.
+    payload = _make_sizing_payload(disk_share=0.9)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=50 * _SIZING_GB,
+        volume_ls_stdout="volume_abc vloopback\n",
+        volume_inspect_stdout="<no value>|1000g\n",
+    )
+
+    # Act
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "fresh"
+    assert result.capped_by == "df_guard"
+    assert result.volume_limit_gb == 40
+    assert result.storage_limit_gb == 20
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_below_min_raises(docker_service):
+    # Arrange: df_avail=30GB, no volumes, share=0.5 -> pool 10GB, slice 5GB,
+    # volume 3GB < min_volume_gb=10.
+    payload = _make_sizing_payload(disk_share=0.5, min_volume_gb=10)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=30 * _SIZING_GB)
+
+    # Act / Assert
+    with pytest.raises(VolumeMinSizeError):
+        await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_severe_shrink_logged(docker_service):
+    # Arrange: requested 1000GB, share=1.0, df_avail=100GB, no volumes ->
+    # pool 80GB binds -> volume 53GB < 1000/2 -> severe shrink.
+    payload = _make_sizing_payload(disk_share=1.0, volume_limit_gb=1000)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=100 * _SIZING_GB)
+
+    # Act
+    with patch("services.docker_service.logger") as mock_logger:
+        result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "fresh"
+    assert result.capped_by == "pool"
+    assert result.volume_limit_gb == 53
+    warning_keys = [call.args[0].message for call in mock_logger.warning.call_args_list]
+    assert "vloopback_fresh_sizing_severe_shrink" in warning_keys
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_measurement_failure_falls_back(docker_service):
+    # Arrange
+    payload = _make_sizing_payload(disk_share=0.5, volume_limit_gb=40, storage_limit_gb=20)
+    ssh_client = _make_sizing_ssh_client(df_avail_bytes=0, df_error=True)
+
+    # Act
+    with patch("services.docker_service.logger") as mock_logger:
+        result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "fresh_fallback"
+    assert result.volume_limit_gb == 40
+    assert result.storage_limit_gb == 20
+    warning_keys = [call.args[0].message for call in mock_logger.warning.call_args_list]
+    assert "vloopback_fresh_sizing_fallback" in warning_keys
+
+
+def test_parse_volume_size_to_bytes_handles_bytes_and_size_strings():
+    # Arrange / Act / Assert
+    assert _parse_volume_size_to_bytes("20401094656") == 20401094656
+    assert _parse_volume_size_to_bytes("19g") == 19 * 1024 ** 3
+    assert _parse_volume_size_to_bytes("1t") == 1024 ** 4
+    assert _parse_volume_size_to_bytes("<no value>") is None
+    assert _parse_volume_size_to_bytes("") is None
+    assert _parse_volume_size_to_bytes(None) is None
