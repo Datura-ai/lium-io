@@ -2445,10 +2445,16 @@ def _make_sizing_ssh_client(
     def run(command, **kwargs):
         if "docker info" in command:
             return Mock(stdout="/var/lib/docker\n", exit_status=0)
-        if command.startswith("df "):
+        if "df -P -B1 /hostfs" in command:
             if df_error:
                 raise Exception("df boom")
-            return Mock(stdout=f"       Avail\n{df_avail_bytes}\n", exit_status=0)
+            return Mock(
+                stdout=(
+                    "Filesystem           1-blocks       Used Available Capacity Mounted on\n"
+                    f"/dev/vda1            1000 500 {df_avail_bytes}  80% /hostfs\n"
+                ),
+                exit_status=0,
+            )
         if "volume ls" in command:
             return Mock(stdout=volume_ls_stdout, exit_status=0)
         if "volume inspect" in command:
@@ -2458,6 +2464,69 @@ def _make_sizing_ssh_client(
     ssh_client = Mock()
     ssh_client.run = AsyncMock(side_effect=run)
     return ssh_client
+
+
+@pytest.mark.asyncio
+async def test_get_fs_available_bytes_happy_parse(docker_service):
+    # Arrange: df runs via helper container; POSIX -P output, Available = 4th column.
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(
+        return_value=Mock(
+            stdout=(
+                "Filesystem           1-blocks       Used Available Capacity Mounted on\n"
+                "/dev/vda1            103865303040 83581857792 20266668032  80% /hostfs\n"
+            ),
+            exit_status=0,
+        )
+    )
+
+    # Act
+    avail = await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
+
+    # Assert
+    assert avail == 20266668032
+    command = ssh_client.run.call_args.args[0]
+    assert command == (
+        "/usr/bin/docker run --rm -v /var/lib/docker:/hostfs:ro "
+        "docker.io/library/alpine:3.19 df -P -B1 /hostfs"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_fs_available_bytes_nonzero_exit_raises(docker_service):
+    # Arrange
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(
+        return_value=Mock(stdout="", stderr="docker: boom", exit_status=125)
+    )
+
+    # Act / Assert
+    with pytest.raises(Exception, match="docker: boom"):
+        await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
+
+
+@pytest.mark.asyncio
+async def test_get_fs_available_bytes_garbage_output_raises(docker_service):
+    # Arrange: data line lacks a numeric 4th column.
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(
+        return_value=Mock(stdout="Filesystem\ngarbage line\n", exit_status=0)
+    )
+
+    # Act / Assert
+    with pytest.raises(Exception, match="Unexpected df output"):
+        await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
+
+
+@pytest.mark.asyncio
+async def test_get_fs_available_bytes_short_output_raises(docker_service):
+    # Arrange: only the header line, no data line.
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="Filesystem\n", exit_status=0))
+
+    # Act / Assert
+    with pytest.raises(Exception, match="Unexpected df output"):
+        await docker_service._get_fs_available_bytes(ssh_client, "/var/lib/docker")
 
 
 @pytest.mark.asyncio
@@ -2640,8 +2709,13 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     def ssh_run(command, **kwargs):
         if "docker info" in command:
             return _make_ssh_command_result(stdout="/var/lib/docker\n")
-        if command.startswith("df "):
-            return _make_ssh_command_result(stdout=f"       Avail\n{900 * _SIZING_GB}\n")
+        if "df -P -B1 /hostfs" in command:
+            return _make_ssh_command_result(
+                stdout=(
+                    "Filesystem           1-blocks       Used Available Capacity Mounted on\n"
+                    f"/dev/vda1            1000 500 {900 * _SIZING_GB}  80% /hostfs\n"
+                )
+            )
         if "volume ls" in command:
             return _make_ssh_command_result(stdout="volume_other vloopback\n")
         if "volume inspect" in command:
