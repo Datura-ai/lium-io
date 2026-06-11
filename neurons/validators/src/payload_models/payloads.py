@@ -226,6 +226,15 @@ class PayloadPortMapping(BaseModel):
 
 
 class ContainerCreateRequest(ContainerBaseRequest):
+    """Container creation request from the backend.
+
+    Disk sizing contract: when ``disk_share`` is set, the validator computes
+    effective volume/storage limits from fresh on-host disk state and
+    ``volume_limit_gb``/``storage_limit_gb`` act only as upper-bound caps.
+    When ``disk_share`` is absent, ``volume_limit_gb``/``storage_limit_gb``
+    are exact sizes (legacy behavior).
+    """
+
     message_type: ContainerRequestType = ContainerRequestType.ContainerCreateRequest
     docker_image: str
     user_public_keys: list[str] = []
@@ -237,6 +246,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     local_volume: str | None = None
     volume_limit_gb: int | None = None
     storage_limit_gb: int | None = None
+    disk_share: float | None = None  # pod's share of machine disk (rented_gpus/total_gpus); None -> legacy sizing
+    min_volume_gb: int | None = None  # reject floor for fresh sizing; None -> never reject (shrink only)
     external_volume_info: ExternalVolumeInfo | None = None
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required

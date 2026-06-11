@@ -1,5 +1,7 @@
 import asyncio
+import math
 import random
+from dataclasses import dataclass
 from datetime import datetime
 import logging
 import re
@@ -102,6 +104,49 @@ _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
 _DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60 # 3 hours
+# DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
+# from on-host disk state when the backend sends disk_share.
+_FRESH_SIZING_OVERHEAD_GB = 20   # reserved for system/docker overhead when reconstructing the pool
+_FRESH_SIZING_HEADROOM_GB = 10   # min free space left on the fs after volume allocation
+_FRESH_SIZING_GB_BYTES = 1024 ** 3
+_VOLUME_SIZE_OPTION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([kmgt]?)b?", re.IGNORECASE)
+_VOLUME_SIZE_SUFFIX_MULTIPLIERS = {
+    "": 1,
+    "k": 1024,
+    "m": 1024 ** 2,
+    "g": 1024 ** 3,
+    "t": 1024 ** 4,
+}
+
+
+class VolumeMinSizeError(Exception):
+    """Fresh vloopback sizing produced a volume smaller than the requested minimum."""
+
+
+@dataclass
+class VolumeSizingResult:
+    volume_limit_gb: int | None    # -> docker volume create -o size=
+    storage_limit_gb: int | None   # -> docker run --storage-opt size=
+    path: str                      # "fresh" | "legacy" | "fresh_fallback"
+    capped_by: str | None = None   # "pool" | "request_cap" | "df_guard" (fresh path only)
+    df_avail_bytes: int | None = None
+    existing_volumes_bytes: int | None = None
+
+
+def _parse_volume_size_to_bytes(value: str | None) -> int | None:
+    """Parse a docker volume size into bytes.
+
+    Accepts raw byte counts (vloopback ``Status.size-max``) and human size
+    strings like ``19g`` / ``1t`` (vloopback ``Options.size``).
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    match = _VOLUME_SIZE_OPTION_RE.fullmatch(text)
+    if not match:
+        return None
+    number, suffix = match.groups()
+    return int(float(number) * _VOLUME_SIZE_SUFFIX_MULTIPLIERS[suffix.lower()])
 
 
 def _is_missing_docker_container_error(exc: Exception) -> bool:
@@ -1345,6 +1390,208 @@ class DockerService:
             timeout=timeout,
         )
 
+    async def _get_fs_available_bytes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_root_dir: str,
+    ) -> int:
+        result = await ssh_client.run(f"df -B1 --output=avail {shlex.quote(docker_root_dir)}")
+        if getattr(result, "exit_status", 0) != 0:
+            raise Exception(f"df failed: {getattr(result, 'stderr', '')}")
+        lines = (result.stdout or "").strip().splitlines()
+        if len(lines) < 2:
+            raise Exception(f"Unexpected df output: {result.stdout!r}")
+        return int(lines[1].strip())
+
+    async def _get_existing_vloopback_bytes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+    ) -> int:
+        list_result = await ssh_client.run(
+            '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
+        )
+        if getattr(list_result, "exit_status", 0) != 0:
+            raise Exception(
+                f"docker volume ls failed: {getattr(list_result, 'stderr', '')}"
+            )
+
+        volume_names = []
+        for line in (list_result.stdout or "").splitlines():
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) != 2:
+                continue
+            name, driver = parts
+            if _is_vloopback_driver(driver) and _is_safe_docker_volume_name(name):
+                volume_names.append(name)
+        if not volume_names:
+            return 0
+
+        names = " ".join(shlex.quote(name) for name in volume_names)
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker volume inspect {names} "
+            "--format '{{index .Status \"size-max\"}}|{{index .Options \"size\"}}'"
+        )
+        if getattr(inspect_result, "exit_status", 0) != 0:
+            raise Exception(
+                f"docker volume inspect failed: {getattr(inspect_result, 'stderr', '')}"
+            )
+
+        total_bytes = 0
+        for line in (inspect_result.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            size_max_raw, _, size_option_raw = line.partition("|")
+            size_bytes = _parse_volume_size_to_bytes(size_max_raw)
+            if size_bytes is None:
+                size_bytes = _parse_volume_size_to_bytes(size_option_raw)
+            if size_bytes is not None:
+                total_bytes += size_bytes
+        return total_bytes
+
+    async def resolve_volume_sizing(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        log_tag: str,
+        log_extra: dict,
+    ) -> VolumeSizingResult:
+        """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        Legacy contract (payload.disk_share is None): backend-sent
+        volume_limit_gb/storage_limit_gb are exact sizes and are returned
+        untouched, without any SSH calls.
+
+        Fresh contract (payload.disk_share set): measure fresh on-host disk
+        state over the existing ssh_client and compute the pod's slice;
+        backend-sent limits act only as upper-bound caps. Measurement
+        failures fall back to legacy passthrough (never break the rent);
+        a VolumeMinSizeError (effective volume below payload.min_volume_gb)
+        propagates to the caller.
+        """
+        if payload.disk_share is None:
+            return VolumeSizingResult(
+                volume_limit_gb=payload.volume_limit_gb,
+                storage_limit_gb=payload.storage_limit_gb,
+                path="legacy",
+            )
+
+        try:
+            docker_root_dir = await self.get_docker_root_dir(ssh_client)
+            df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+            existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "vloopback_fresh_sizing_fallback",
+                    extra=get_extra_info({**log_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+            return VolumeSizingResult(
+                volume_limit_gb=payload.volume_limit_gb,
+                storage_limit_gb=payload.storage_limit_gb,
+                path="fresh_fallback",
+            )
+
+        pool_bytes = (
+            df_avail_bytes
+            + existing_volumes_bytes
+            - _FRESH_SIZING_OVERHEAD_GB * _FRESH_SIZING_GB_BYTES
+        )
+        slice_candidates = [("pool", payload.disk_share * pool_bytes)]
+        if payload.volume_limit_gb is not None:
+            slice_candidates.append(
+                ("request_cap", payload.volume_limit_gb * _FRESH_SIZING_GB_BYTES * 1.5)
+            )
+        slice_candidates.append(
+            (
+                "df_guard",
+                (df_avail_bytes - _FRESH_SIZING_HEADROOM_GB * _FRESH_SIZING_GB_BYTES) * 1.5,
+            )
+        )
+        capped_by, slice_bytes = min(slice_candidates, key=lambda item: item[1])
+
+        volume_limit_gb = math.floor(slice_bytes * 2 / 3 / _FRESH_SIZING_GB_BYTES)
+        storage_limit_gb = math.floor(slice_bytes / 3 / _FRESH_SIZING_GB_BYTES)
+
+        if payload.min_volume_gb is not None and volume_limit_gb < payload.min_volume_gb:
+            logger.error(
+                _m(
+                    "vloopback_fresh_sizing_below_min",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "requested_volume_limit_gb": payload.volume_limit_gb,
+                        "min_volume_gb": payload.min_volume_gb,
+                        "computed_volume_limit_gb": volume_limit_gb,
+                        "df_avail_bytes": df_avail_bytes,
+                        "existing_volumes_bytes": existing_volumes_bytes,
+                        "disk_share": payload.disk_share,
+                        "docker_root_dir": docker_root_dir,
+                    }),
+                )
+            )
+            raise VolumeMinSizeError(
+                f"Fresh vloopback sizing produced {volume_limit_gb}GB volume, "
+                f"below required minimum {payload.min_volume_gb}GB"
+            )
+
+        # -o size= requires a positive integer; floor to at least 1 GB.
+        volume_limit_gb = max(volume_limit_gb, 1)
+        storage_limit_gb = max(storage_limit_gb, 1)
+
+        logger.info(
+            _m(
+                "vloopback_fresh_sizing_calc",
+                extra=get_extra_info({
+                    **log_extra,
+                    "disk_share": payload.disk_share,
+                    "df_avail_bytes": df_avail_bytes,
+                    "existing_volumes_bytes": existing_volumes_bytes,
+                    "overhead_gb": _FRESH_SIZING_OVERHEAD_GB,
+                    "headroom_gb": _FRESH_SIZING_HEADROOM_GB,
+                    "pool_bytes": pool_bytes,
+                    "slice_bytes": int(slice_bytes),
+                    "slice_candidates": {name: int(value) for name, value in slice_candidates},
+                    "capped_by": capped_by,
+                    "effective_volume_limit_gb": volume_limit_gb,
+                    "effective_storage_limit_gb": storage_limit_gb,
+                    "requested_volume_limit_gb": payload.volume_limit_gb,
+                    "requested_storage_limit_gb": payload.storage_limit_gb,
+                    "docker_root_dir": docker_root_dir,
+                }),
+            )
+        )
+
+        if payload.volume_limit_gb is not None and volume_limit_gb < payload.volume_limit_gb:
+            shrink_key = (
+                "vloopback_fresh_sizing_severe_shrink"
+                if volume_limit_gb < payload.volume_limit_gb / 2
+                else "vloopback_fresh_sizing_shrink"
+            )
+            logger.warning(
+                _m(
+                    shrink_key,
+                    extra=get_extra_info({
+                        **log_extra,
+                        "requested_volume_limit_gb": payload.volume_limit_gb,
+                        "effective_volume_limit_gb": volume_limit_gb,
+                        "capped_by": capped_by,
+                    }),
+                )
+            )
+
+        return VolumeSizingResult(
+            volume_limit_gb=volume_limit_gb,
+            storage_limit_gb=storage_limit_gb,
+            path="fresh",
+            capped_by=capped_by,
+            df_avail_bytes=df_avail_bytes,
+            existing_volumes_bytes=existing_volumes_bytes,
+        )
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -1637,8 +1884,23 @@ class DockerService:
                 profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
+                # Effective limits default to the backend-sent values (legacy /
+                # restart-edit path); the fresh-sizing path overrides them below.
+                effective_volume_limit_gb = payload.volume_limit_gb
+                effective_storage_limit_gb = payload.storage_limit_gb
+
                 if not local_volume:
-                    # create docker volume
+                    # resolve effective sizing, then create docker volume
+                    current_step = "volume_sizing"
+                    sizing = await self.resolve_volume_sizing(
+                        ssh_client=ssh_client,
+                        payload=payload,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
+                    effective_volume_limit_gb = sizing.volume_limit_gb
+                    effective_storage_limit_gb = sizing.storage_limit_gb
+
                     current_step = "volume_creation"
                     local_volume = f"volume_{payload.pod_id}"
                     await self.create_local_volume(
@@ -1647,7 +1909,7 @@ class DockerService:
                         log_tag=log_tag,
                         log_text=f"Creating docker volume {local_volume}",
                         log_extra=default_extra,
-                        limit=payload.volume_limit_gb,
+                        limit=effective_volume_limit_gb,
                     )
                     created_local_volume = True
 
@@ -1697,7 +1959,7 @@ class DockerService:
                     cpu_flag = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
                 memory_flag = f"--memory {payload.memory_gb}g " if payload.memory_gb else ""
                 
-                storage_flag = f"--storage-opt size={payload.storage_limit_gb}g " if payload.storage_limit_gb else ""
+                storage_flag = f"--storage-opt size={effective_storage_limit_gb}g " if effective_storage_limit_gb else ""
 
                 command = (
                     f'/usr/bin/docker run -d '
@@ -1925,8 +2187,8 @@ class DockerService:
                     restore_path=payload.restore_path,
                     jupyter_url=jupyter_url,
                     warnings=warnings,
-                    storage_limit_gb=payload.storage_limit_gb,
-                    volume_limit_gb=payload.volume_limit_gb,
+                    storage_limit_gb=effective_storage_limit_gb,
+                    volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
                 )
         except Exception as e:
