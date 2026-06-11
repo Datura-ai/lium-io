@@ -92,9 +92,11 @@ async def test_machine_info_does_not_contain_gpu_capacity_mb(
 # --- Empty cipher_text from encrypt_challenge → short-circuit before SSH ----
 @pytest.mark.asyncio
 async def test_empty_cipher_text_short_circuits_ssh(service_with_mock_wrapper):
-    """If encrypt_challenge returns "" (e.g. unexpected .so failure), no SSH."""
+    """If challenge generation yields "" (e.g. unexpected .so failure), no SSH."""
     svc, _wrapper = service_with_mock_wrapper
-    svc.encrypt_challenge = lambda *a, **kw: ""
+    # The cipher text is read straight from the native wrapper's getCipherText;
+    # an empty return models a silent .so failure and must short-circuit.
+    _wrapper.getCipherText.return_value = ""
     ssh = _ssh_client()
     result = await svc.validate_gpu_model_and_process_job(
         ssh_client=ssh,
