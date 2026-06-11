@@ -141,6 +141,29 @@ def _should_repair_stale_mountpoint(
     )
 
 
+def build_startup_command_args(startup_commands: str | None) -> str:
+    """Quote user-supplied startup_commands into a safe argv fragment.
+
+    The fragment is appended to the host-side ``docker run ... <image>`` command
+    that runs via ``/bin/sh -c`` over SSH as root on the executor. The user value
+    is split into tokens (honouring its own quoting) and each token is
+    ``shlex.quote``-d, so the host shell cannot interpret any metacharacter
+    inside it: the tokens become the container's command + args, never a host
+    command. Legitimate quoted commands such as ``bash -c "a && b"`` are
+    preserved (the ``&&`` runs inside the container); break-out attempts such as
+    a leading newline collapse to harmless container arguments. Unbalanced
+    quotes or an empty value fall back to the image default command.
+    """
+    if not startup_commands or not startup_commands.strip():
+        return ""
+    try:
+        tokens = shlex.split(startup_commands)
+    except ValueError:
+        # Unbalanced quotes etc. — don't risk a malformed/unsafe host command.
+        return ""
+    return " ".join(shlex.quote(token) for token in tokens)
+
+
 class DockerService:
     def __init__(
         self,
@@ -1583,12 +1606,8 @@ class DockerService:
                     if custom_options and custom_options.environment
                     else "-e NVIDIA_DRIVER_CAPABILITIES=all"
                 )
-                startup_commands = (
-                    f"{custom_options.startup_commands}"
-                    if custom_options
-                    and custom_options.startup_commands
-                    and custom_options.startup_commands.strip()
-                    else ""
+                startup_commands = build_startup_command_args(
+                    custom_options.startup_commands if custom_options else None
                 )
 
                 container_name = self.get_container_name(payload)
