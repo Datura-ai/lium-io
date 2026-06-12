@@ -2551,7 +2551,7 @@ async def test_resolve_volume_sizing_legacy_passthrough(docker_service):
 async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
     # Arrange: df_avail=900GB, existing volumes=300GB, overhead 20 -> pool 1180GB,
     # disk_share 0.5 -> slice 590GB -> volume 393GB, storage 196GB.
-    payload = _make_sizing_payload(disk_share=0.5)
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(
         df_avail_bytes=900 * _SIZING_GB,
         volume_ls_stdout="volume_abc vloopback:latest\nother_volume local\n",
@@ -2568,6 +2568,29 @@ async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
     assert result.storage_limit_gb == 196
     assert result.df_avail_bytes == 900 * _SIZING_GB
     assert result.existing_volumes_bytes == 300 * _SIZING_GB
+
+
+@pytest.mark.asyncio
+async def test_resolve_volume_sizing_storage_opt_unsupported_short_circuits(docker_service):
+    # Arrange: backend signals the host can't enforce --storage-opt by sending
+    # storage_limit_gb=None (mirrors calc_volume_storage_limit's (None, None)
+    # return when executor.is_storage_limit_supported is False). The validator
+    # must skip fresh re-derivation regardless of disk_share and pass the
+    # payload's limits through untouched, so create_container omits
+    # --storage-opt; otherwise dockerd rejects the run with "supported only
+    # for overlay over xfs with 'pquota'".
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=None)
+    ssh_client = Mock()
+    ssh_client.run = AsyncMock()
+
+    # Act
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    # Assert
+    assert result.path == "storage_opt_unsupported"
+    assert result.volume_limit_gb == payload.volume_limit_gb
+    assert result.storage_limit_gb is None
+    ssh_client.run.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2594,7 +2617,7 @@ async def test_resolve_volume_sizing_fresh_request_cap_bound(docker_service):
 async def test_resolve_volume_sizing_fresh_df_guard_bound(docker_service):
     # Arrange: df_avail=50GB, existing=1000GB, share=0.9 -> pool slice 927GB,
     # df guard (50-10)*1.5 = 60GB wins -> volume 40GB, storage 20GB.
-    payload = _make_sizing_payload(disk_share=0.9)
+    payload = _make_sizing_payload(disk_share=0.9, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(
         df_avail_bytes=50 * _SIZING_GB,
         volume_ls_stdout="volume_abc vloopback\n",
@@ -2615,7 +2638,7 @@ async def test_resolve_volume_sizing_fresh_df_guard_bound(docker_service):
 async def test_resolve_volume_sizing_below_min_raises(docker_service):
     # Arrange: df_avail=30GB, no volumes, share=0.5 -> pool 10GB, slice 5GB,
     # volume 3GB < min_volume_gb=10.
-    payload = _make_sizing_payload(disk_share=0.5, min_volume_gb=10)
+    payload = _make_sizing_payload(disk_share=0.5, min_volume_gb=10, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(df_avail_bytes=30 * _SIZING_GB)
 
     # Act / Assert
@@ -2627,7 +2650,7 @@ async def test_resolve_volume_sizing_below_min_raises(docker_service):
 async def test_resolve_volume_sizing_severe_shrink_logged(docker_service):
     # Arrange: requested 1000GB, share=1.0, df_avail=100GB, no volumes ->
     # pool 80GB binds -> volume 53GB < 1000/2 -> severe shrink.
-    payload = _make_sizing_payload(disk_share=1.0, volume_limit_gb=1000)
+    payload = _make_sizing_payload(disk_share=1.0, volume_limit_gb=1000, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(df_avail_bytes=100 * _SIZING_GB)
 
     # Act
@@ -2674,7 +2697,7 @@ def test_parse_volume_size_to_bytes_handles_bytes_and_size_strings():
 async def test_resolve_volume_sizing_low_free_space_clamps_to_floor(docker_service):
     # Arrange: df_avail=5GB is below both overhead (20GB) and headroom (10GB);
     # pool and df_guard candidates must clamp to 0, not go negative.
-    payload = _make_sizing_payload(disk_share=1.0)
+    payload = _make_sizing_payload(disk_share=1.0, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(df_avail_bytes=5 * _SIZING_GB)
 
     # Act
@@ -2689,7 +2712,7 @@ async def test_resolve_volume_sizing_low_free_space_clamps_to_floor(docker_servi
 @pytest.mark.asyncio
 async def test_resolve_volume_sizing_low_free_space_below_min_raises(docker_service):
     # Arrange: same nearly-full disk, but a min floor is set -> reject.
-    payload = _make_sizing_payload(disk_share=1.0, min_volume_gb=10)
+    payload = _make_sizing_payload(disk_share=1.0, min_volume_gb=10, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(df_avail_bytes=5 * _SIZING_GB)
 
     # Act / Assert
