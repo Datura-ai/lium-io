@@ -1,6 +1,7 @@
 from .banned_gpu import BannedGpuCheck
 from .capability import CapabilityCheck
 from .collateral import CollateralCheck
+from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .finalize import FinalizeCheck
 from .gpu_count import GpuCountCheck
@@ -27,6 +28,7 @@ __all__ = [
     "BannedGpuCheck",
     "CapabilityCheck",
     "CollateralCheck",
+    "CustomBuildOrphanSweepCheck",
     "DuplicateExecutorCheck",
     "FinalizeCheck",
     "GpuCountCheck",

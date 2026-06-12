@@ -410,6 +410,28 @@ class StaleContainerCleanupMessages:
     )
 
 
+class CustomBuildOrphanSweepMessages:
+    """DAH-2211 — Phase 3.4(ii) — periodic GC of `lium-build-*` image+scratch
+    orphans left behind by validator crashes / aborted releases. The happy
+    path (inline cleanup at pod release) means this sweep usually finds
+    nothing."""
+
+    SKIPPED = MessageTemplate(
+        event="Custom build orphan sweep skipped (cadence)",
+        reason="CUSTOM_BUILD_SWEEP_SKIPPED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    SWEPT = MessageTemplate(
+        event="Custom build orphan sweep complete",
+        reason="CUSTOM_BUILD_SWEEP_DONE",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+
+
 class TenantEnforcementMessages:
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
