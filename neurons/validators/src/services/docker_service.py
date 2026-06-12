@@ -1741,16 +1741,19 @@ class DockerService:
         # Executor-runner images that ship Docker CLI without the `buildx`
         # plugin emit a multi-line DEPRECATED notice on stderr when the CLI
         # falls back to the legacy builder. `_stream_process_output` flips
-        # status=False on any stderr line, so that benign warning was being
-        # misclassified as `docker_build` failure with a "buildx"-tinted err
-        # string. Filter only those four DEPRECATED lines; real build errors
-        # (RUN failures, --network=none egress denials, etc.) still reach
-        # stderr and the exit code is preserved by bash.
+        # status=False on any stderr line — including the trailing blank line
+        # that follows the notice — so a successful build was being misread as
+        # `docker_build` failure. Drop the three DEPRECATED content lines AND
+        # any whitespace-only stderr lines. Real build errors (RUN failures,
+        # network-blocked, etc.) are non-blank content and still reach stderr;
+        # exit code is preserved by bash.
         build_cmd = (
             "bash -c " + shlex.quote(
                 '/usr/bin/docker build --network=none --pull -t "$1" "$2" '
                 '2> >(grep -vE '
-                '"^(DEPRECATED:| +Install the buildx component| +https://docs.docker.com/go/buildx/)" '
+                r'"^(DEPRECATED:|[[:space:]]+Install the buildx component|'
+                r'[[:space:]]+https://docs\.docker\.com/go/buildx/|'
+                r'[[:space:]]*$)" '
                 '>&2)'
             )
             + f" _ {shlex.quote(image_tag)} {shlex.quote(scratch_dir)}"
