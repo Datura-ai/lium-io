@@ -1633,21 +1633,6 @@ class DockerService:
     def _custom_build_scratch_dir(pod_id: str) -> str:
         return f"/tmp/lium-build-{pod_id}"
 
-    @staticmethod
-    def _parse_df_kib(stdout: str) -> int | None:
-        """Parse `df --output=avail` second line (KiB). Returns None on failure."""
-        if not stdout:
-            return None
-        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-        if not lines:
-            return None
-        # Drop header if present
-        candidate = lines[-1]
-        try:
-            return int(candidate)
-        except ValueError:
-            return None
-
     async def _write_dockerfile_via_heredoc(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -1740,44 +1725,50 @@ class DockerService:
             )
             return False, "build_setup"
 
-        # 3. pre-build df check on /var/lib/docker
+        # 3. pre-build host-disk check.
+        #
+        # The validator's SSH session lands inside the miner's executor
+        # container, where the host's /var/lib/docker does not exist. Running
+        # `df` directly over SSH returns empty stdout and trips the conservative
+        # reject path (observed on staging 2026-06-12 16:15 UTC, DAH-2211).
+        # Measure through the docker daemon using the same helper-container
+        # pattern DAH-2183 introduced for `_get_fs_available_bytes` — bind-mount
+        # the real host DockerRootDir into a one-shot Alpine container and run
+        # df there. Reusing the helper avoids duplicating the busybox-df parse.
         try:
-            df_res = await ssh_client.run(
-                "/usr/bin/df --output=avail /var/lib/docker | tail -n 1", check=False
-            )
-            kib = self._parse_df_kib(df_res.stdout or "")
-            if kib is None:
-                # Conservative: if we cannot parse, treat as exhausted.
-                logger.warning(
-                    _m(
-                        "Custom build df parse failure — rejecting",
-                        extra=get_extra_info({**default_extra, "stdout": df_res.stdout}),
-                    )
-                )
-                return False, "build_disk_exhausted"
-            free_gib = kib / (1024 * 1024)
+            docker_root_dir = await self.get_docker_root_dir(ssh_client)
+            avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+            free_gib = avail_bytes / (1024**3)
             if free_gib < min_free_gib:
                 await self.stream_log(
-                    f"Insufficient free disk on /var/lib/docker: {free_gib:.1f} GiB < {min_free_gib} GiB",
+                    f"Insufficient free disk on {docker_root_dir}: {free_gib:.1f} GiB < {min_free_gib} GiB",
                     "error",
                     log_tag,
                 )
                 logger.error(
                     _m(
                         "Custom build disk exhausted",
-                        extra=get_extra_info({**default_extra, "free_gib": free_gib, "min_free_gib": min_free_gib}),
+                        extra=get_extra_info({
+                            **default_extra,
+                            "docker_root_dir": docker_root_dir,
+                            "free_gib": free_gib,
+                            "min_free_gib": min_free_gib,
+                        }),
                     )
                 )
                 return False, "build_disk_exhausted"
         except Exception as exc:
-            logger.error(
+            # df-via-helper-container can fail on legitimate executors (helper
+            # image pull blocked, weird host fs). Fail OPEN like the vloopback
+            # fresh-sizing path does — log and proceed to the build. The build
+            # itself will report any actual disk failure as a docker_build CCF.
+            logger.warning(
                 _m(
-                    "Custom build df check failed",
+                    "Custom build df check failed — proceeding without guard",
                     extra=get_extra_info({**default_extra, "error": str(exc)}),
                 ),
                 exc_info=True,
             )
-            return False, "build_setup"
 
         # 4. docker build (network=none, hard timeout)
         build_cmd = (
