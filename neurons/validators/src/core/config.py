@@ -132,9 +132,11 @@ class Settings(BaseSettings):
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that
-    # ships CUDA 13.0. Non-compliant unrented executors are fully gated (multiplier 0);
-    # currently-rented executors are exempt.
+    # ships CUDA 13.0. Before MIN_DRIVER_CUTOFF providers get a grace period (no penalty);
+    # on/after the cutoff, non-compliant unrented executors are fully gated (multiplier 0).
+    # Currently-rented executors are always exempt.
     MIN_NVIDIA_DRIVER_VERSION: str = Field(env="MIN_NVIDIA_DRIVER_VERSION", default="580.65.06")
+    MIN_DRIVER_CUTOFF: datetime = datetime(2026, 7, 15, 12, 0, 0)
 
     TIME_DELTA_FOR_EMISSION: float = 0.01
 
