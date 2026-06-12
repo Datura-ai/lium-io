@@ -1733,8 +1733,11 @@ class DockerService:
         # bucket. v1.1 follow-up: per-build cgroup disk quota.
 
         # 3. docker build (network=none, hard timeout)
+        # `--progress=plain` is BuildKit-only; force the integrated BuildKit so
+        # hosts whose daemon still defaults to the legacy builder don't reject
+        # the flag with "unknown flag: --progress".
         build_cmd = (
-            f"/usr/bin/docker build --network=none --pull --progress=plain "
+            f"DOCKER_BUILDKIT=1 /usr/bin/docker build --network=none --pull --progress=plain "
             f"-t {shlex.quote(image_tag)} {shlex.quote(scratch_dir)}"
         )
         try:
