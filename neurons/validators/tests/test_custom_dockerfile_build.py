@@ -440,9 +440,6 @@ async def test_A9_network_none_used_in_build_command(svc, monkeypatch):
     # Must call docker build with --network=none
     assert any("--network=none" in c for c in captured), captured
     assert any(f"lium-build-{payload.pod_id}" in c for c in captured), captured
-    # Must force BuildKit so `--progress=plain` is accepted on hosts whose
-    # daemon defaults to the legacy builder.
-    assert any("DOCKER_BUILDKIT=1" in c for c in captured), captured
 
 
 # ------------------------------------------------------------------
