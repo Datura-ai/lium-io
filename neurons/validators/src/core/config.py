@@ -176,6 +176,23 @@ class Settings(BaseSettings):
     # Machine Price Limit
     MACHINE_MAX_PRICE_RATE: float = Field(env="MACHINE_MAX_PRICE_RATE", default=4)
 
+    # DAH-2211 — custom-dockerfile pod build tunables (validator side).
+    # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
+    # is authoritative for the size cap but the validator double-checks it as
+    # defense-in-depth.
+    CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS", default=1200,
+        description="Hard timeout for `docker build` of a custom-dockerfile pod (seconds).",
+    )
+    CUSTOM_DOCKERFILE_MIN_FREE_DISK_GIB: int = Field(
+        env="CUSTOM_DOCKERFILE_MIN_FREE_DISK_GIB", default=20,
+        description="Reject custom-dockerfile build if /var/lib/docker has less free space (GiB).",
+    )
+    CUSTOM_DOCKERFILE_MAX_BYTES: int = Field(
+        env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,
+        description="Defense-in-depth cap on dockerfile_content size; route is authoritative.",
+    )
+
     DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 
     debug: DebugSettings = Field(default_factory=DebugSettings)

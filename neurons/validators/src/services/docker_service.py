@@ -1636,6 +1636,238 @@ class DockerService:
             existing_volumes_bytes=existing_volumes_bytes,
         )
 
+    # ------------------------------------------------------------------
+    # DAH-2211 — custom-dockerfile pod build helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _custom_build_image_tag(pod_id: str) -> str:
+        return f"lium-build-{pod_id}"
+
+    @staticmethod
+    def _custom_build_scratch_dir(pod_id: str) -> str:
+        return f"/tmp/lium-build-{pod_id}"
+
+    @staticmethod
+    def _parse_df_kib(stdout: str) -> int | None:
+        """Parse `df --output=avail` second line (KiB). Returns None on failure."""
+        if not stdout:
+            return None
+        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+        if not lines:
+            return None
+        # Drop header if present
+        candidate = lines[-1]
+        try:
+            return int(candidate)
+        except ValueError:
+            return None
+
+    async def _write_dockerfile_via_heredoc(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        scratch_dir: str,
+        dockerfile_content: str,
+    ) -> None:
+        """Write a Dockerfile to the executor without ever putting it on argv.
+
+        We pipe via stdin to `tee` so arbitrary user content (including `EOF`
+        markers, backticks, `$(...)`) cannot escape into the shell.
+        """
+        # `tee` writes stdin verbatim. shlex-quote the destination path only.
+        dest = f"{scratch_dir}/Dockerfile"
+        command = f"/usr/bin/tee {shlex.quote(dest)} > /dev/null"
+        result = await ssh_client.run(command, input=dockerfile_content, check=False)
+        if result.exit_status != 0:
+            stderr = (result.stderr or "").strip()
+            raise RuntimeError(
+                f"Failed to write Dockerfile to {dest!r}: exit={result.exit_status} stderr={stderr!r}"
+            )
+
+    async def _custom_build_image(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        log_tag: str,
+        default_extra: dict,
+    ) -> tuple[bool, str | None]:
+        """Build a custom image from `payload.dockerfile_content` on the executor.
+
+        Returns (success, failure_step). On success returns (True, None); the
+        built image tag is `_custom_build_image_tag(pod_id)`. On failure returns
+        (False, failure_step) — caller routes through the same CCF
+        `UnknownError` path used by today's pull-failure.
+        """
+        from core.config import settings
+
+        pod_id = payload.pod_id
+        scratch_dir = self._custom_build_scratch_dir(pod_id)
+        image_tag = self._custom_build_image_tag(pod_id)
+        timeout_s = int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
+        min_free_gib = int(settings.CUSTOM_DOCKERFILE_MIN_FREE_DISK_GIB)
+
+        # Defense-in-depth size cap. Route is authoritative; this is a wire-trust guard.
+        max_bytes = int(settings.CUSTOM_DOCKERFILE_MAX_BYTES)
+        content = payload.dockerfile_content or ""
+        if len(content.encode("utf-8")) > max_bytes:
+            await self.stream_log(
+                f"Dockerfile exceeds {max_bytes} byte cap", "error", log_tag
+            )
+            logger.error(
+                _m(
+                    "Custom dockerfile exceeds size cap",
+                    extra=get_extra_info({**default_extra, "size_bytes": len(content)}),
+                )
+            )
+            return False, "build_input_oversize"
+
+        # 1. mkdir scratch dir
+        await self.stream_log(
+            f"Preparing custom build scratch dir {scratch_dir}", "success", log_tag
+        )
+        mkdir_cmd = f"/usr/bin/mkdir -p {shlex.quote(scratch_dir)}"
+        try:
+            mkdir_res = await ssh_client.run(mkdir_cmd, check=False)
+            if mkdir_res.exit_status != 0:
+                raise RuntimeError(
+                    f"mkdir failed exit={mkdir_res.exit_status} stderr={(mkdir_res.stderr or '').strip()!r}"
+                )
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "Custom build mkdir failed",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+            return False, "build_setup"
+
+        # 2. write Dockerfile via stdin/tee
+        try:
+            await self._write_dockerfile_via_heredoc(ssh_client, scratch_dir, content)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "Custom build Dockerfile write failed",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+            return False, "build_setup"
+
+        # 3. pre-build df check on /var/lib/docker
+        try:
+            df_res = await ssh_client.run(
+                "/usr/bin/df --output=avail /var/lib/docker | tail -n 1", check=False
+            )
+            kib = self._parse_df_kib(df_res.stdout or "")
+            if kib is None:
+                # Conservative: if we cannot parse, treat as exhausted.
+                logger.warning(
+                    _m(
+                        "Custom build df parse failure — rejecting",
+                        extra=get_extra_info({**default_extra, "stdout": df_res.stdout}),
+                    )
+                )
+                return False, "build_disk_exhausted"
+            free_gib = kib / (1024 * 1024)
+            if free_gib < min_free_gib:
+                await self.stream_log(
+                    f"Insufficient free disk on /var/lib/docker: {free_gib:.1f} GiB < {min_free_gib} GiB",
+                    "error",
+                    log_tag,
+                )
+                logger.error(
+                    _m(
+                        "Custom build disk exhausted",
+                        extra=get_extra_info({**default_extra, "free_gib": free_gib, "min_free_gib": min_free_gib}),
+                    )
+                )
+                return False, "build_disk_exhausted"
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "Custom build df check failed",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+            return False, "build_setup"
+
+        # 4. docker build (network=none, hard timeout)
+        build_cmd = (
+            f"/usr/bin/docker build --network=none --pull --progress=plain "
+            f"-t {shlex.quote(image_tag)} {shlex.quote(scratch_dir)}"
+        )
+        try:
+            ok, err = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=build_cmd,
+                log_tag=log_tag,
+                log_text=f"Building custom image {image_tag}",
+                log_extra={**default_extra, "build_image_tag": image_tag},
+                timeout=timeout_s,
+                raise_exception=False,
+            )
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "Custom build invocation failed",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+            return False, "docker_build"
+
+        if not ok:
+            # Distinguish timeout / network-blocked vs generic build failure.
+            err_lc = (err or "").lower()
+            if "process timed out" in err_lc:
+                return False, "build_timeout"
+            # `--network=none` causes name-resolution / unreachable host messages.
+            network_markers = (
+                "could not resolve host",
+                "temporary failure in name resolution",
+                "network is unreachable",
+                "no route to host",
+                "name or service not known",
+            )
+            if any(m in err_lc for m in network_markers):
+                return False, "build_network_blocked"
+            return False, "docker_build"
+
+        return True, None
+
+    async def _cleanup_custom_build_artifacts(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        pod_id: str,
+        default_extra: dict,
+    ) -> None:
+        """Always-on inline cleanup (Phase 3.4(i)).
+
+        Removes the per-pod built image and scratch directory. Best-effort —
+        any failure is logged but never raised. Safe to call for non-custom
+        pods (no-op when the artifacts do not exist).
+        """
+        image_tag = self._custom_build_image_tag(pod_id)
+        scratch_dir = self._custom_build_scratch_dir(pod_id)
+        try:
+            await ssh_client.run(
+                f"/usr/bin/docker image rm {shlex.quote(image_tag)} 2>/dev/null || true",
+                check=False,
+            )
+            await ssh_client.run(
+                f"/usr/bin/rm -rf {shlex.quote(scratch_dir)}",
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                _m(
+                    "Custom build artifact cleanup failed (non-fatal)",
+                    extra=get_extra_info({**default_extra, "error": str(exc), "image_tag": image_tag}),
+                )
+            )
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -1682,6 +1914,37 @@ class DockerService:
 
         log_tag = "container_creation"
         current_step = "start"
+
+        # DAH-2211: a custom-build payload carries `dockerfile_content` (may be
+        # `""`/whitespace if a broken caller bypassed the route XOR). Reject
+        # empty/whitespace-only content BEFORE any SSH command runs. We treat
+        # `is_custom_build` as truthy only when the field is a non-empty string
+        # after strip().
+        dockerfile_content_raw = payload.dockerfile_content
+        is_custom_build = (
+            dockerfile_content_raw is not None
+            and dockerfile_content_raw.strip() != ""
+        )
+        if dockerfile_content_raw is not None and not is_custom_build:
+            current_step = "build_input_empty"
+            log_text = _m(
+                "Custom dockerfile pod requested with empty content",
+                extra=get_extra_info(default_extra),
+            )
+            logger.error(log_text)
+            await self.redis_service.remove_pending_pod(
+                payload.miner_hotkey, payload.executor_id, payload.pod_id
+            )
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+                failure_step=current_step,
+            )
 
         try:
             current_step = "prepare_request"
@@ -1849,20 +2112,57 @@ class DockerService:
                 profilers.append({"name": "Docker login step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
-                current_step = "docker_pull"
-                command = f"/usr/bin/docker pull {payload.docker_image}"
-                await self.execute_and_stream_logs(
-                    ssh_client=ssh_client,
-                    command=command,
-                    log_tag=log_tag,
-                    log_text=f"Pulling docker image {payload.docker_image}",
-                    log_extra=default_extra,
-                    timeout=_DOCKER_PULL_TIMEOUT_SECONDS,
-                )
+                # DAH-2211: when `dockerfile_content` is set, build the image
+                # on the executor instead of pulling. Otherwise the existing
+                # `docker pull` path runs byte-identically.
+                if is_custom_build:
+                    current_step = "docker_build"
+                    build_ok, build_failure_step = await self._custom_build_image(
+                        ssh_client=ssh_client,
+                        payload=payload,
+                        log_tag=log_tag,
+                        default_extra=default_extra,
+                    )
+                    if not build_ok:
+                        # Best-effort scratch dir cleanup; image is most likely
+                        # absent on failure but `image rm` is idempotent.
+                        await self._cleanup_custom_build_artifacts(
+                            ssh_client=ssh_client,
+                            pod_id=payload.pod_id,
+                            default_extra=default_extra,
+                        )
+                        # Raise so the existing except-Exception block in
+                        # create_container emits the CCF FailedContainerRequest
+                        # via the same path as today's pull failure.
+                        current_step = build_failure_step or "docker_build"
+                        raise Exception(
+                            f"Custom dockerfile build failed (failure_step={current_step})"
+                        )
+                    # Override docker_image so the downstream `docker run` uses
+                    # the locally built tag for this branch only.
+                    effective_image = self._custom_build_image_tag(payload.pod_id)
+                    default_extra = {**default_extra, "docker_image": effective_image}
+                    payload.docker_image = effective_image
+                    profilers.append({
+                        "name": "Custom docker build step finished",
+                        "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp,
+                    })
+                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                else:
+                    current_step = "docker_pull"
+                    command = f"/usr/bin/docker pull {payload.docker_image}"
+                    await self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=command,
+                        log_tag=log_tag,
+                        log_text=f"Pulling docker image {payload.docker_image}",
+                        log_extra=default_extra,
+                        timeout=_DOCKER_PULL_TIMEOUT_SECONDS,
+                    )
 
-                # Add profiler for docker pull
-                profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    # Add profiler for docker pull
+                    profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 port_flags = " ".join(
                     [
@@ -2115,6 +2415,13 @@ class DockerService:
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                     )
+                    # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
+                    if is_custom_build:
+                        await self._cleanup_custom_build_artifacts(
+                            ssh_client=ssh_client,
+                            pod_id=payload.pod_id,
+                            default_extra=default_extra,
+                        )
                     raise
 
                 # Add profiler for docker container creation
@@ -2204,6 +2511,13 @@ class DockerService:
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
                     )
+                    # DAH-2211: inline cleanup of custom-build artifacts on post-run failure.
+                    if is_custom_build:
+                        await self._cleanup_custom_build_artifacts(
+                            ssh_client=ssh_client,
+                            pod_id=payload.pod_id,
+                            default_extra=default_extra,
+                        )
                     raise
 
                 # Add profiler for ssh service installation
@@ -2500,6 +2814,14 @@ class DockerService:
                             ),
                         ),
                     )
+
+                # DAH-2211: always-on inline cleanup of custom-build artifacts
+                # for this pod. No-op if the pod was not a custom build.
+                await self._cleanup_custom_build_artifacts(
+                    ssh_client=ssh_client,
+                    pod_id=payload.pod_id,
+                    default_extra=default_extra,
+                )
 
                 command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)

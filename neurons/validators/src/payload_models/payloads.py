@@ -260,6 +260,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
     active_volume_names: list[str] | None = None
+    # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator
+    # builds the image from this Dockerfile on the executor host instead of pulling
+    # `docker_image`. None or "" preserves the existing pull path byte-identically.
+    dockerfile_content: str | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
