@@ -4,8 +4,6 @@ This implementation extracts the original score calculation and weight distribut
 logic to maintain backward compatibility with the existing system.
 """
 
-from datetime import UTC, datetime
-
 import bittensor
 
 from core.config import settings
@@ -28,23 +26,15 @@ def _parse_driver_version(value: str) -> tuple[int, ...] | None:
         return None
 
 
-def get_min_driver_multiplier(
-    driver_version: str,
-    is_rented: bool = False,
-    reference_time: datetime | None = None,
-) -> float:
-    """Phased minimum NVIDIA driver multiplier (mirrors the sysbox gate).
+def get_min_driver_multiplier(driver_version: str, is_rented: bool = False) -> float:
+    """Minimum NVIDIA driver multiplier — hard gate at 0 for non-compliant unrented executors.
 
     An executor whose reported driver is at least ``settings.MIN_NVIDIA_DRIVER_VERSION``
-    (compared as a dotted version tuple) is unaffected (multiplier 1.0). Otherwise a soft
-    penalty (``PORTION_FOR_MIN_DRIVER_BEFORE``) applies until ``MIN_DRIVER_CUTOFF`` and a
-    full gate (``PORTION_FOR_MIN_DRIVER_AFTER``, default 1.0 → multiplier 0.0) after it.
+    (compared as a dotted version tuple) is unaffected (multiplier 1.0). A non-compliant
+    unrented executor is fully gated (multiplier 0.0).
 
-    Currently-rented executors are exempt from the gate — an active customer must not be
-    penalised because their miner has not yet upgraded the host driver.
-
-    ``reference_time`` is normalised to naive-UTC so it can be compared with the naive
-    cutoff (same convention as ``SYSBOX_RENTED_CUTOFF``); tests may inject it.
+    Currently-rented executors are exempt — an active customer must not be penalised
+    because their miner has not yet upgraded the host driver.
 
     A missing or unparseable ``driver_version`` means the value was not reported (a real
     GPU always reports a driver string), so the gate fails open rather than penalising an
@@ -56,15 +46,7 @@ def get_min_driver_multiplier(
     required = _parse_driver_version(settings.MIN_NVIDIA_DRIVER_VERSION)
     if reported is None or required is None or reported >= required:
         return 1.0
-    now = reference_time or datetime.now(UTC)
-    if now.tzinfo is not None:
-        now = now.astimezone(UTC).replace(tzinfo=None)
-    portion = (
-        settings.PORTION_FOR_MIN_DRIVER_AFTER
-        if now >= settings.MIN_DRIVER_CUTOFF
-        else settings.PORTION_FOR_MIN_DRIVER_BEFORE
-    )
-    return 1 - portion
+    return 0.0
 
 
 class DefaultIncentive(BaseIncentive):
