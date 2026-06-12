@@ -142,12 +142,6 @@ def _patch_create_container_happy(svc, monkeypatch, ssh_client):
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     monkeypatch.setattr(svc, "finish_stream_logs", AsyncMock())
     monkeypatch.setattr(svc, "handle_stream_logs", AsyncMock())
-    # Pre-build df check (DAH-2211) reads through the docker daemon via a
-    # helper container — the validator SSH session lands inside the executor
-    # container, where the host docker root does not exist. Stub the two
-    # helpers to "plenty of free space" for happy-path tests.
-    monkeypatch.setattr(svc, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
-    monkeypatch.setattr(svc, "_get_fs_available_bytes", AsyncMock(return_value=100 * 1024**3))
 
 
 # ------------------------------------------------------------------
@@ -434,8 +428,6 @@ async def test_A9_network_none_used_in_build_command(svc, monkeypatch):
         return (True, "")
     monkeypatch.setattr(svc, "execute_and_stream_logs", _exec)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
-    monkeypatch.setattr(svc, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
-    monkeypatch.setattr(svc, "_get_fs_available_bytes", AsyncMock(return_value=100 * 1024**3))
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN curl -m 2 http://example.com\n")
     ok, step = await svc._custom_build_image(
@@ -448,71 +440,6 @@ async def test_A9_network_none_used_in_build_command(svc, monkeypatch):
     # Must call docker build with --network=none
     assert any("--network=none" in c for c in captured), captured
     assert any(f"lium-build-{payload.pod_id}" in c for c in captured), captured
-
-
-# ------------------------------------------------------------------
-# B.3 — Pre-build df rejection: < 20 GiB free → CCF, no docker build
-# ------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_B3_pre_build_df_rejection(svc, monkeypatch):
-    """Helper-container df reports below threshold → CCF, no `docker build`.
-
-    The validator's SSH session lands inside the executor container, so disk
-    measurement must go through the docker daemon (`docker run --rm -v
-    <docker_root>:/hostfs:ro alpine df -P -B1 /hostfs`). We stub the two
-    helpers used by `_custom_build_image` directly.
-    """
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_ssh_result())
-
-    five_gib_bytes = 5 * 1024**3  # 5 GiB, threshold is 20 GiB
-    monkeypatch.setattr(svc, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
-    monkeypatch.setattr(svc, "_get_fs_available_bytes", AsyncMock(return_value=five_gib_bytes))
-
-    exec_mock = AsyncMock(return_value=(True, ""))
-    monkeypatch.setattr(svc, "execute_and_stream_logs", exec_mock)
-    monkeypatch.setattr(svc, "stream_log", AsyncMock())
-
-    payload = _base_payload(dockerfile_content="FROM scratch\n")
-    ok, step = await svc._custom_build_image(
-        ssh_client=ssh_client,
-        payload=payload,
-        log_tag="t",
-        default_extra={"pod_id": payload.pod_id},
-    )
-    assert ok is False
-    assert step == "build_disk_exhausted"
-    # No docker build invocation reached execute_and_stream_logs
-    exec_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_B3_df_helper_failure_proceeds_to_build(svc, monkeypatch):
-    """When the helper-container df call raises (e.g. helper image pull blocked),
-    fail OPEN and proceed to the build. This mirrors the vloopback fresh-sizing
-    fail-open behavior so legitimate executors are never wrongly rejected."""
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_ssh_result())
-
-    monkeypatch.setattr(svc, "get_docker_root_dir", AsyncMock(side_effect=RuntimeError("no docker info")))
-    monkeypatch.setattr(svc, "_get_fs_available_bytes", AsyncMock())  # not reached
-
-    exec_mock = AsyncMock(return_value=(True, ""))
-    monkeypatch.setattr(svc, "execute_and_stream_logs", exec_mock)
-    monkeypatch.setattr(svc, "stream_log", AsyncMock())
-
-    payload = _base_payload(dockerfile_content="FROM scratch\n")
-    ok, step = await svc._custom_build_image(
-        ssh_client=ssh_client,
-        payload=payload,
-        log_tag="t",
-        default_extra={"pod_id": payload.pod_id},
-    )
-    assert ok is True
-    assert step is None
-    exec_mock.assert_called_once()
 
 
 # ------------------------------------------------------------------

@@ -1674,7 +1674,6 @@ class DockerService:
         scratch_dir = self._custom_build_scratch_dir(pod_id)
         image_tag = self._custom_build_image_tag(pod_id)
         timeout_s = int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
-        min_free_gib = int(settings.CUSTOM_DOCKERFILE_MIN_FREE_DISK_GIB)
 
         # Defense-in-depth size cap. Route is authoritative; this is a wire-trust guard.
         max_bytes = int(settings.CUSTOM_DOCKERFILE_MAX_BYTES)
@@ -1725,52 +1724,15 @@ class DockerService:
             )
             return False, "build_setup"
 
-        # 3. pre-build host-disk check.
-        #
-        # The validator's SSH session lands inside the miner's executor
-        # container, where the host's /var/lib/docker does not exist. Running
-        # `df` directly over SSH returns empty stdout and trips the conservative
-        # reject path (observed on staging 2026-06-12 16:15 UTC, DAH-2211).
-        # Measure through the docker daemon using the same helper-container
-        # pattern DAH-2183 introduced for `_get_fs_available_bytes` — bind-mount
-        # the real host DockerRootDir into a one-shot Alpine container and run
-        # df there. Reusing the helper avoids duplicating the busybox-df parse.
-        try:
-            docker_root_dir = await self.get_docker_root_dir(ssh_client)
-            avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-            free_gib = avail_bytes / (1024**3)
-            if free_gib < min_free_gib:
-                await self.stream_log(
-                    f"Insufficient free disk on {docker_root_dir}: {free_gib:.1f} GiB < {min_free_gib} GiB",
-                    "error",
-                    log_tag,
-                )
-                logger.error(
-                    _m(
-                        "Custom build disk exhausted",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "docker_root_dir": docker_root_dir,
-                            "free_gib": free_gib,
-                            "min_free_gib": min_free_gib,
-                        }),
-                    )
-                )
-                return False, "build_disk_exhausted"
-        except Exception as exc:
-            # df-via-helper-container can fail on legitimate executors (helper
-            # image pull blocked, weird host fs). Fail OPEN like the vloopback
-            # fresh-sizing path does — log and proceed to the build. The build
-            # itself will report any actual disk failure as a docker_build CCF.
-            logger.warning(
-                _m(
-                    "Custom build df check failed — proceeding without guard",
-                    extra=get_extra_info({**default_extra, "error": str(exc)}),
-                ),
-                exc_info=True,
-            )
+        # No explicit pre-build disk check — see DAH-2211 v1 decision.
+        # The 2026-06-12 staging incident (validator SSH lands inside the
+        # executor container, host /var/lib/docker invisible) showed a guard
+        # here is more likely to false-reject than to catch a real exhaustion
+        # case. Real disk failures surface from `docker build` itself as a
+        # docker_build CCF, which routes through the same accident-analysis
+        # bucket. v1.1 follow-up: per-build cgroup disk quota.
 
-        # 4. docker build (network=none, hard timeout)
+        # 3. docker build (network=none, hard timeout)
         build_cmd = (
             f"/usr/bin/docker build --network=none --pull --progress=plain "
             f"-t {shlex.quote(image_tag)} {shlex.quote(scratch_dir)}"
