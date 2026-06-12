@@ -130,6 +130,15 @@ class Settings(BaseSettings):
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
+    # Minimum NVIDIA driver requirement (phased gate, mirrors the sysbox rollout).
+    # Compared as a dotted version tuple against the executor's reported gpu.driver
+    # (e.g. "580.95.05"). 580.65.06 is the r580 floor that ships CUDA 13.0. An executor
+    # below this is penalised before MIN_DRIVER_CUTOFF and fully gated on/after it.
+    MIN_NVIDIA_DRIVER_VERSION: str = Field(env="MIN_NVIDIA_DRIVER_VERSION", default="580.65.06")
+    PORTION_FOR_MIN_DRIVER_BEFORE: float = 0.2  # soft penalty before the cutoff (1 - 0.2 = 0.8x)
+    PORTION_FOR_MIN_DRIVER_AFTER: float = 1  # full gate on/after the cutoff (1 - 1 = 0x)
+    MIN_DRIVER_CUTOFF: datetime = datetime(2026, 7, 15, 12, 0, 0)
+
     TIME_DELTA_FOR_EMISSION: float = 0.01
 
     # Read version from version.txt

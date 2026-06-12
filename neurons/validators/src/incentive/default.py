@@ -4,6 +4,8 @@ This implementation extracts the original score calculation and weight distribut
 logic to maintain backward compatibility with the existing system.
 """
 
+from datetime import UTC, datetime
+
 import bittensor
 
 from core.config import settings
@@ -13,6 +15,56 @@ from services.const import TOTAL_BURN_EMISSION
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
+
+
+def _parse_driver_version(value: str) -> tuple[int, ...] | None:
+    """Parse a dotted NVIDIA driver version (e.g. "580.95.05") into an int tuple for
+    ordering. Returns None when the value is missing or non-numeric."""
+    if not value:
+        return None
+    try:
+        return tuple(int(part) for part in str(value).strip().split("."))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_min_driver_multiplier(
+    driver_version: str,
+    is_rented: bool = False,
+    reference_time: datetime | None = None,
+) -> float:
+    """Phased minimum NVIDIA driver multiplier (mirrors the sysbox gate).
+
+    An executor whose reported driver is at least ``settings.MIN_NVIDIA_DRIVER_VERSION``
+    (compared as a dotted version tuple) is unaffected (multiplier 1.0). Otherwise a soft
+    penalty (``PORTION_FOR_MIN_DRIVER_BEFORE``) applies until ``MIN_DRIVER_CUTOFF`` and a
+    full gate (``PORTION_FOR_MIN_DRIVER_AFTER``, default 1.0 → multiplier 0.0) after it.
+
+    Currently-rented executors are exempt from the gate — an active customer must not be
+    penalised because their miner has not yet upgraded the host driver.
+
+    ``reference_time`` is normalised to naive-UTC so it can be compared with the naive
+    cutoff (same convention as ``SYSBOX_RENTED_CUTOFF``); tests may inject it.
+
+    A missing or unparseable ``driver_version`` means the value was not reported (a real
+    GPU always reports a driver string), so the gate fails open rather than penalising an
+    unknown reading.
+    """
+    if is_rented:
+        return 1.0
+    reported = _parse_driver_version(driver_version)
+    required = _parse_driver_version(settings.MIN_NVIDIA_DRIVER_VERSION)
+    if reported is None or required is None or reported >= required:
+        return 1.0
+    now = reference_time or datetime.now(UTC)
+    if now.tzinfo is not None:
+        now = now.astimezone(UTC).replace(tzinfo=None)
+    portion = (
+        settings.PORTION_FOR_MIN_DRIVER_AFTER
+        if now >= settings.MIN_DRIVER_CUTOFF
+        else settings.PORTION_FOR_MIN_DRIVER_BEFORE
+    )
+    return 1 - portion
 
 
 class DefaultIncentive(BaseIncentive):
@@ -159,6 +211,11 @@ class DefaultIncentive(BaseIncentive):
 
             job_result.sysbox_multiplier = 1 - portion
 
+        # Minimum NVIDIA driver multiplier (phased gate); rented executors are exempt.
+        job_result.driver_multiplier = get_min_driver_multiplier(
+            job_result.nvidia_driver_version, is_rented=job_result.is_rented
+        )
+
         # Uptime multiplier
         if settings.SKIP_COLLATERAL_PENALTY or job_result.collateral_deposited:
             job_result.uptime_multiplier = 1
@@ -172,15 +229,19 @@ class DefaultIncentive(BaseIncentive):
             )
 
         # Apply multiplier
-        job_result.mining_score *= job_result.sysbox_multiplier * job_result.uptime_multiplier
+        job_result.mining_score *= (
+            job_result.sysbox_multiplier * job_result.uptime_multiplier * job_result.driver_multiplier
+        )
         log = _m(
-            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier",
+            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier * driver_multiplier",
             extra=get_extra_info(
                 {
                     "executor_id": str(job_result.executor_info.uuid),
                     "gpu_model": job_result.gpu_model,
                     "gpu_count": job_result.gpu_count,
                     "sysbox_multiplier": job_result.sysbox_multiplier,
+                    "driver_multiplier": job_result.driver_multiplier,
+                    "nvidia_driver_version": job_result.nvidia_driver_version,
                     "uptime_multiplier": job_result.uptime_multiplier,
                     "mining_score": job_result.mining_score,
                     "gpu_portion": job_result.gpu_portion,
