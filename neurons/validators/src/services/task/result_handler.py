@@ -122,6 +122,10 @@ class ResultHandler:
         if context.state.gpu_metrics is not None:
             specs["gpu_metrics"] = context.state.gpu_metrics
 
+        # NVIDIA driver version string reported by NVML (e.g. "580.95.05"). Used by the
+        # minimum-driver requirement gate.
+        nvidia_driver_version = str(specs.get("gpu", {}).get("driver") or "")
+
         # Build and return JobResult
         return JobResult(
             spec=specs,
@@ -135,6 +139,7 @@ class ResultHandler:
             gpu_model=gpu_model,
             gpu_count=gpu_count,
             sysbox_runtime=context.state.sysbox_runtime,
+            nvidia_driver_version=nvidia_driver_version,
             supports_gpu_splitting=context.state.supports_gpu_splitting,
             gpu_splitting_min_count=context.state.gpu_splitting_min_count,
             ssh_pub_keys=context.ssh_pub_keys,

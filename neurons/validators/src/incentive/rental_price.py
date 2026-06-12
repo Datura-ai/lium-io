@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from incentive.config import IncentiveConfig
     from services.redis_service import RedisService
 from incentive.utils import get_hourly_rate
-from incentive.default import DefaultIncentive
+from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
 from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
 from services.task_service import JobResult
@@ -222,6 +222,9 @@ class RentalPriceIncentive(DefaultIncentive):
             # Sysbox penalty is applied later via effective_rate, not baked into hourly_rate
             result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
 
+            # Minimum NVIDIA driver penalty: applied later via effective_rate
+            result.driver_multiplier = get_min_driver_multiplier(result.nvidia_driver_version)
+
             cap_spec = self.config.max_unrented_gpus.get(base_model, {})
             bucket = self._resolve_bucket(result, cap_spec)
             max_cap = cap_spec.get(bucket, 0)
@@ -239,6 +242,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     + result.gpu_count
                     * result.hourly_rate
                     * result.sysbox_multiplier
+                    * result.driver_multiplier
                 )
 
     async def _on_finish_pre_process(self) -> None:
@@ -320,6 +324,7 @@ class RentalPriceIncentive(DefaultIncentive):
             result.hourly_rate
             * result.unrented_cap_multiplier
             * result.sysbox_multiplier
+            * result.driver_multiplier
         )
 
         # calculate incentive score
@@ -341,6 +346,8 @@ class RentalPriceIncentive(DefaultIncentive):
                     "sysbox_runtime": result.sysbox_runtime,
                     "sysbox_multiplier": result.sysbox_multiplier,
                     "provider_discord_connected": result.provider_discord_connected,
+                    "nvidia_driver_version": result.nvidia_driver_version,
+                    "driver_multiplier": result.driver_multiplier,
                     "unrented_cap_multiplier": result.unrented_cap_multiplier,
                     "effective_rate": result.effective_rate,
                     "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,
@@ -528,6 +535,8 @@ class RentalPriceIncentive(DefaultIncentive):
             gpu_splitting_min_count=params.gpu_splitting_min_count,
             collateral_deposited=params.collateral_deposited,
             sysbox_runtime=params.sysbox_runtime,
+            # Price estimates assume a compliant driver (no requirement penalty).
+            nvidia_driver_version=settings.MIN_NVIDIA_DRIVER_VERSION,
         )
 
         await self._pre_process_job_result("estimate", fake_result)

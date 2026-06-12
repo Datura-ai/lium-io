@@ -19,6 +19,7 @@ class JobResult(BaseModel):
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False
+    nvidia_driver_version: str = ""  # reported gpu.driver string, e.g. "580.95.05"
     supports_gpu_splitting: bool = False
     gpu_splitting_min_count: int | None = None
     ssh_pub_keys: list[str] | None = None
@@ -36,6 +37,7 @@ class JobResult(BaseModel):
     # Incentive relevant fields 
     mining_score: float | None = None                   # Score for mining pool for scoring logic
     sysbox_multiplier: float | None = None              # Multiplier for sysbox runtime for scoring logic
+    driver_multiplier: float | None = None              # Multiplier for the minimum NVIDIA driver requirement
     uptime_multiplier: float | None = None              # Multiplier for uptime
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
