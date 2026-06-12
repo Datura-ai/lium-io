@@ -71,7 +71,10 @@ REPOSITORIES = [
     "daturaai/ubuntu",
 ]
 
-LOG_STREAM_INTERVAL = 5  # 5 seconds
+LOG_STREAM_INTERVAL = 0.5  # 500ms — keeps build-log p95 emit→publish under AC-3's
+# 2000ms budget (DAH-2211). Was 5s; that was fine for slow `docker pull` lines
+# but build phases emit dense progress (one line per layer) and a 5s batch
+# would violate the SSE latency requirement.
 IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 
 DOCKER_VOLUME_PLUGINS = {

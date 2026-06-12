@@ -29,6 +29,7 @@ from .checks import (
     BannedGpuCheck,
     CapabilityCheck,
     CollateralCheck,
+    CustomBuildOrphanSweepCheck,
     DuplicateExecutorCheck,
     FinalizeCheck,
     GpuCountCheck,
@@ -66,6 +67,12 @@ from .score_calculator import calculate_scores
 logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
+
+# DAH-2211: singleton for per-executor cadence tracking across pipeline cycles.
+# `build_checks()` is a staticmethod called per cycle, so a fresh instance per
+# call would lose the "last swept at" timestamps. The check itself is stateless
+# wrt input data and only reads ctx, so a shared instance is safe.
+_CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
 
 
 class PipelineFactory:
@@ -237,6 +244,13 @@ class PipelineFactory:
                 # cycle; otherwise PortCountCheck (fatal) halts the pipeline before the cleanup
                 # that used to live in TenantEnforcementCheck ever runs -> executor stuck at 0.
                 StaleContainerCleanupCheck(),
+                # DAH-2211 Phase 3.4(ii): orphan sweep for `lium-build-*`
+                # image/scratch artifacts left behind by validator crashes or
+                # aborted releases. Internally throttled to once-per-6h per
+                # executor, so this is cheap to run every cycle. Singleton
+                # instance so cadence state persists across `build_checks()`
+                # calls.
+                _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 TenantEnforcementCheck(),
