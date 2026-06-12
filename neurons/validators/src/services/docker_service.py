@@ -1490,7 +1490,24 @@ class DockerService:
         failures fall back to legacy passthrough (never break the rent);
         a VolumeMinSizeError (effective volume below payload.min_volume_gb)
         propagates to the caller.
+
+        Storage-opt gating: ``payload.storage_limit_gb is None`` is the
+        backend's signal that the executor's filesystem cannot enforce
+        ``--storage-opt size=`` (e.g. overlay2 without xfs+pquota /
+        ext4+prjquota — see ``calc_volume_storage_limit`` in the backend
+        which returns ``(None, None)`` in that case). Skip the fresh
+        re-derivation entirely and pass the payload's limits through
+        untouched; otherwise the fresh path would compute a non-None
+        ``storage_limit_gb`` from ``disk_share`` and dockerd would reject
+        the run with "supported only for overlay over xfs with 'pquota'".
         """
+        if payload.storage_limit_gb is None:
+            return VolumeSizingResult(
+                volume_limit_gb=payload.volume_limit_gb,
+                storage_limit_gb=payload.storage_limit_gb,
+                path="storage_opt_unsupported",
+            )
+
         if payload.disk_share is None:
             return VolumeSizingResult(
                 volume_limit_gb=payload.volume_limit_gb,
