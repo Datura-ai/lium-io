@@ -291,7 +291,13 @@ class NvmlDigestMessages:
         severity="error",
         category="env",
         impact="Score set to 0; previous verification cleared",
-        remediation="Update to a supported NVIDIA driver version. Your current driver version is not recognized.",
+        remediation=(
+            "Do not blindly add this hash to LIB_NVIDIA_ML_DIGESTS. An unrecognized "
+            "version can mean a tampered/spoofed NVML, e.g. a Windows GeForce version "
+            "like 591.86 that has no Linux driver. Only whitelist after confirming it "
+            "is a real NVIDIA Linux release and taking the digest from a clean install, "
+            "never from the reported value."
+        ),
     )
     DIGEST_OK = MessageTemplate(
         event="NVML library digest verified",
