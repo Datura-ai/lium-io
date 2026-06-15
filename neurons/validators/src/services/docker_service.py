@@ -614,7 +614,16 @@ class DockerService:
         log_extra: dict = {},
         timeout: int = 0,
         raise_exception: bool = True,
+        on_line=None,
     ) -> tuple[bool, str]:
+        """Stream a remote command's stdout/stderr through `stream_log`.
+
+        `on_line` (DAH-2211): optional async callback `(line, phase)` invoked
+        once per stdout (phase="build") and stderr (phase="build_err") line.
+        Used by `_custom_build_image` to fan build output out to the backend's
+        `/pods/{pod_id}/build-log-chunk` ingestion endpoint so `Pod.build_log`
+        can be replayed after the build ends. No behavior change when None.
+        """
         logger.info(
             _m(
                 log_text,
@@ -633,9 +642,12 @@ class DockerService:
         try:
             async with ssh_client.create_process(command) as process:
                 if timeout != 0:
-                    status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
+                    status, error = await asyncio.wait_for(
+                        self._stream_process_output(process, log_tag, on_line=on_line),
+                        timeout=timeout,
+                    )
                 else:
-                    status, error = await self._stream_process_output(process, log_tag)
+                    status, error = await self._stream_process_output(process, log_tag, on_line=on_line)
         except asyncio.TimeoutError:
             status = False
             error = "Process timed out"
@@ -657,17 +669,30 @@ class DockerService:
 
         return status, error
 
-    async def _stream_process_output(self, process, log_tag):
+    async def _stream_process_output(self, process, log_tag, on_line=None):
         status = True
         error = ''
 
         async for line in process.stdout:
-            await self.stream_log(line.strip(), "success", log_tag)
+            line_str = line.strip()
+            await self.stream_log(line_str, "success", log_tag)
+            if on_line is not None:
+                try:
+                    await on_line(line_str, "build")
+                except Exception:
+                    # Shipper failures are best-effort; never abort the stream.
+                    logger.debug("on_line callback raised on stdout line", exc_info=True)
 
         async for line in process.stderr:
             status = False
-            error += line.strip() + "\n"
-            await self.stream_log(line.strip(), "error", log_tag)
+            line_str = line.strip()
+            error += line_str + "\n"
+            await self.stream_log(line_str, "error", log_tag)
+            if on_line is not None:
+                try:
+                    await on_line(line_str, "build_err")
+                except Exception:
+                    logger.debug("on_line callback raised on stderr line", exc_info=True)
 
         return status, error
 
@@ -1758,6 +1783,16 @@ class DockerService:
             )
             + f" _ {shlex.quote(image_tag)} {shlex.quote(scratch_dir)}"
         )
+        # DAH-2211 §3.B.2 re-readability: ship every build-log line to
+        # backend's `/pods/{pod_id}/build-log-chunk` so `Pod.build_log` is
+        # populated and replay works after the build ends. Best-effort —
+        # backend outage / signing error / HTTP 5xx are logged once and
+        # dropped; the build itself is never delayed or failed. The shipper
+        # resolves wallet+url internally and disables itself on init failure.
+        from services.build_log_shipper import BuildLogShipper
+
+        shipper = BuildLogShipper(pod_id=payload.pod_id)
+        await shipper.start()
         try:
             ok, err = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -1767,6 +1802,7 @@ class DockerService:
                 log_extra={**default_extra, "build_image_tag": image_tag},
                 timeout=timeout_s,
                 raise_exception=False,
+                on_line=shipper.append,
             )
         except Exception as exc:
             logger.error(
@@ -1777,6 +1813,8 @@ class DockerService:
                 exc_info=True,
             )
             return False, "docker_build"
+        finally:
+            await shipper.stop()
 
         if not ok:
             # Distinguish timeout / network-blocked vs generic build failure.
