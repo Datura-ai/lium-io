@@ -67,6 +67,13 @@ class TestCustomOptionsSanitization:
             "/var/log/app:/var/log/app",
         ]
 
+    def test_sanitize_volumes_preserves_plain_container_paths(self):
+        options = CustomOptions(volumes=["/workspace", "/data/models"])
+
+        result = CustomOptions.sanitize(options)
+
+        assert result.volumes == ["/workspace", "/data/models"]
+
     def test_sanitize_environment_dangerous_keys(self):
         """Test environment sanitization against dangerous keys."""
         dangerous_options = CustomOptions(

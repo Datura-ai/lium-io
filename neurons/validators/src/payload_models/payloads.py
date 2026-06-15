@@ -45,20 +45,47 @@ class CustomOptions(BaseModel):
 
     @staticmethod
     def _sanitize_volumes(volumes: list[str]) -> list[str]:
-        """Sanitize volume mounts to prevent command injection."""
+        """Sanitize volume mounts to prevent command injection.
+
+        Backend templates can send either plain container paths such as
+        "/workspace" or explicit host:container mounts. Plain paths are the
+        target path for the Lium-managed Docker volume, so dropping them makes
+        the runtime fall back to /root.
+        """
+        import re
+
         sanitized = []
         for volume in volumes:
             if not volume or not volume.strip():
                 continue
                 
             # Remove any extra flags or commands
-            clean_volume = volume.strip().split()[0]
-            
-            # Validate format: must be host_path:container_path
+            parts = volume.strip().split()
+            clean_volume = parts[0]
+            if len(parts) > 1 and ':' not in clean_volume:
+                continue
+
+            # Absolute Unix-style paths only: letters, numbers, dot, underscore,
+            # dash, and slash. This rejects spaces, shell metacharacters, Docker
+            # flags, and other mount syntax before values reach `docker run`.
+            safe_path_re = r'^/[a-zA-Z0-9._/-]+$'
+
+            # Preserve safe plain container paths like "/workspace". These are
+            # not bind mounts; they tell the validator where to mount the
+            # Lium-managed local Docker volume.
             if ':' not in clean_volume:
+                if not re.match(safe_path_re, clean_volume):
+                    continue
+                if CustomOptions._is_dangerous_path(clean_volume):
+                    continue
+                sanitized.append(clean_volume)
                 continue
                 
+            # Existing safe host:container mounts are still supported, but both
+            # sides must look like plain absolute paths.
             host_path, container_path = clean_volume.split(':', 1)
+            if not re.match(safe_path_re, host_path) or not re.match(safe_path_re, container_path):
+                continue
             
             # Basic validation - reject dangerous paths
             if CustomOptions._is_dangerous_path(host_path) or CustomOptions._is_dangerous_path(container_path):
@@ -251,6 +278,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     custom_options: CustomOptions | None = None
     debug: bool | None = None
     local_volume: str | None = None
+    local_volume_enabled: bool = True
     volume_limit_gb: int | None = None
     storage_limit_gb: int | None = None
     disk_share: float | None = None  # pod's share of machine disk (rented_gpus/total_gpus); None -> legacy sizing

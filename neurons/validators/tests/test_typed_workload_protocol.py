@@ -51,6 +51,12 @@ def test_filler_create_request_round_trips_workload_kind_and_pod_id():
     assert parsed.pod_id == filler_run_id
 
 
+def test_create_request_defaults_local_volume_enabled():
+    request = _base_create_request()
+
+    assert request.local_volume_enabled is True
+
+
 def test_container_created_response_echoes_filler_workload_kind():
     filler_run_id = str(uuid4())
     response = ContainerCreated(

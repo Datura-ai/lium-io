@@ -673,8 +673,8 @@ class DockerService:
         container_name: str,
         custom_options: CustomOptions,
         port_maps: list[tuple[int, int, int]],
-        local_volume: str,
-        local_volume_path: str,
+        local_volume: str | None,
+        local_volume_path: str | None,
         external_volume_name: str | None,
         gpu_devices,
         effective_storage_limit_gb: int | None,
@@ -687,7 +687,9 @@ class DockerService:
         }
         environment["NVIDIA_DRIVER_CAPABILITIES"] = "all"
 
-        volumes = [VolumeMount(source=local_volume, target=local_volume_path)]
+        volumes = []
+        if local_volume and local_volume_path:
+            volumes.append(VolumeMount(source=local_volume, target=local_volume_path))
         if external_volume_name:
             volumes.append(VolumeMount(source=external_volume_name, target="/mnt"))
 
@@ -2850,7 +2852,8 @@ class DockerService:
         private_key: str,
     ):
         warnings = []
-        local_volume = payload.local_volume
+        local_volume_enabled = payload.local_volume_enabled
+        local_volume = payload.local_volume if local_volume_enabled else None
         external_volume_info = payload.external_volume_info
 
         default_extra = {
@@ -2864,6 +2867,7 @@ class DockerService:
             "executor_ssh_port": executor_info.ssh_port,
             "docker_image": payload.docker_image,
             "local_volume": local_volume,
+            "local_volume_enabled": local_volume_enabled,
             "edit_pod": True if local_volume else False,
             "external_volume": external_volume_info.name if external_volume_info else None,
             "enable_jupyter": payload.enable_jupyter,
@@ -3222,8 +3226,13 @@ class DockerService:
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
                         prev_timestamp = now_ms()
 
-                # Get the container path from the first volume
-                local_volume_path = custom_options.volumes[0].split(':')[-1] if custom_options.volumes else '/root'
+                # Get the container path from the first volume. When the backend explicitly
+                # disables the Lium-managed local volume, there is no local mount target.
+                local_volume_path = (
+                    custom_options.volumes[0].split(':')[-1]
+                    if local_volume_enabled and custom_options.volumes
+                    else ("/root" if local_volume_enabled else None)
+                )
                 # DAH-2265: default-image / cached-template rentals set `ships_sshd`.
                 # Those images run their own start.sh, which starts sshd unconditionally
                 # and launches Jupyter itself. Rather than have the validator bootstrap
@@ -3285,7 +3294,7 @@ class DockerService:
                 container_name = self.get_container_name(payload)
                 created_local_volume = False
                 protected_volume_names = set(payload.active_volume_names or [])
-                if local_volume:
+                if local_volume_enabled and local_volume:
                     protected_volume_names.add(local_volume)
 
                 current_step = "container_cleanup"
@@ -3302,7 +3311,7 @@ class DockerService:
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     pod_name=container_name,
-                    clear_volume=False if local_volume else True,
+                    clear_volume=local_volume_enabled and not local_volume,
                     active_container_names=payload.active_container_names,
                     active_volume_names=payload.active_volume_names,
                 )
@@ -3319,10 +3328,10 @@ class DockerService:
 
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.
-                effective_volume_limit_gb = payload.volume_limit_gb
+                effective_volume_limit_gb = payload.volume_limit_gb if local_volume_enabled else None
                 effective_storage_limit_gb = payload.storage_limit_gb
 
-                if not local_volume:
+                if local_volume_enabled and not local_volume:
                     # resolve effective sizing, then create docker volume
                     current_step = "volume_sizing"
                     sizing = await self.resolve_volume_sizing(
@@ -3762,7 +3771,7 @@ class DockerService:
                     pod_id=payload.pod_id,
                     workload_kind=payload.workload_kind,
                     container_name=container_name,
-                    volume_name=local_volume,
+                    volume_name=local_volume or "",
                     port_maps=[
                         (docker_port, external_port) for docker_port, _, external_port in port_maps
                     ],
