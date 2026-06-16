@@ -170,6 +170,7 @@ def _build_job_results(prod_snapshot: dict) -> dict[str, list[JobResult]]:
                 supports_gpu_splitting=r.get("supports_gpu_splitting", False),
                 gpu_splitting_min_count=r.get("gpu_splitting_min_count"),
                 is_spot=r.get("is_spot", False),
+                default_job_owner=r.get("default_job_owner"),
             )
             job_results[hotkey].append(job_result)
     return job_results

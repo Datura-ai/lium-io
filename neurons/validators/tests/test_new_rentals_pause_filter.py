@@ -159,6 +159,44 @@ def test_rented_executors_response_parses_provider_discord_connected_executor_id
     assert result.provider_discord_connected_executor_ids == ["discord-executor"]
 
 
+def test_rented_executors_response_defaults_default_job_owner_by_executor():
+    """Older backend responses without default-job owners remain compatible."""
+    result = RentedExecutorsResponse.model_validate({"executors": {}})
+
+    assert result.default_job_owner_by_executor == {}
+
+
+def test_rented_executors_response_parses_default_job_owner_by_executor():
+    """Default-job owners are parsed leniently so an unknown future value cannot break the whole response."""
+    result = RentedExecutorsResponse.model_validate(
+        {
+            "executors": {},
+            "default_job_owner_by_executor": {
+                "miner-executor": "miner",
+                "lium-executor": "lium",
+                "future-executor": "partner",
+            },
+        }
+    )
+
+    assert result.default_job_owner_by_executor == {
+        "miner-executor": "miner",
+        "lium-executor": "lium",
+        "future-executor": "partner",
+    }
+
+
+def test_get_default_job_owner_returns_owner_or_none():
+    """The accessor used by ResultHandler returns the owner for a known executor, None otherwise."""
+    result = RentedExecutorsResponse(
+        executors={},
+        default_job_owner_by_executor={"miner-executor": "miner"},
+    )
+
+    assert result.get_default_job_owner("miner-executor") == "miner"
+    assert result.get_default_job_owner("unknown-executor") is None
+
+
 def test_result_handler_treats_missing_provider_discord_list_as_connected():
     """Missing backend field means unknown, so do not penalize during rollout."""
     context = SimpleNamespace(

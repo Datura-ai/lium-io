@@ -142,6 +142,7 @@ def _make_rented_data(
     spot_executor_ids: list[str] | None = None,
     new_rentals_paused_executor_ids: list[str] | None = None,
     provider_discord_connected_executor_ids: list[str] | None = None,
+    default_job_owner_by_executor: dict[str, str] | None = None,
 ) -> RentedExecutorsResponse:
     executors = {}
     for executor_id in rented_executor_ids or []:
@@ -158,6 +159,7 @@ def _make_rented_data(
         spot_executor_ids=spot_executor_ids or [],
         new_rentals_paused_executor_ids=new_rentals_paused_executor_ids or [],
         provider_discord_connected_executor_ids=provider_discord_connected_executor_ids,
+        default_job_owner_by_executor=default_job_owner_by_executor or {},
     )
 
 
@@ -2809,3 +2811,82 @@ async def test_rental_price_paused_unrented_excluded_from_incentives_but_still_v
     assert secure_rented.is_rented is True
     assert secure_rented.total_gpu_count == 16
     assert validator.miner_scores["miner_secure_rented"] > 0
+
+
+@pytest.mark.asyncio
+async def test_rental_price_miner_default_job_unrented_earns_nothing(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """An unrented executor running the MINER'S OWN default job earns nothing:
+    - it is excluded from both pools (mining + rental)
+    - it does not dilute the unrented bucket caps of legitimate executors
+    A Lium-owned default job (or no default job) keeps the unrented incentive.
+    """
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_plain"),
+        create_neuron_info(uid=3, hotkey="miner_lium_job"),
+        create_neuron_info(uid=4, hotkey="miner_own_job"),
+    ]
+
+    plain = _job(
+        create_job_result, executor_id="exec-plain",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    lium_job = _job(
+        create_job_result, executor_id="exec-lium-job",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    own_job = _job(
+        create_job_result, executor_id="exec-own-job",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    lium_job.default_job_owner = "lium"
+    own_job.default_job_owner = "miner"
+
+    all_job_results = {
+        "miner_plain": [plain],
+        "miner_lium_job": [lium_job],
+        "miner_own_job": [own_job],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(
+            default_job_owner_by_executor={
+                "exec-lium-job": "lium",
+                "exec-own-job": "miner",
+            },
+        )
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Miner's own default job -> excluded from both pools, earns nothing
+    assert own_job.default_job_owner == "miner"
+    assert own_job.mining_score == 0
+    assert own_job.eligible_for_rental_share is False
+    assert (own_job.incentive or 0.0) == 0.0
+    assert validator.miner_scores.get("miner_own_job", 0.0) == pytest.approx(0.0, abs=0.0001)
+
+    # Lium-owned default job -> still earns the unrented incentive
+    assert lium_job.default_job_owner == "lium"
+    assert lium_job.eligible_for_rental_share is True
+    assert (lium_job.incentive or 0.0) > 0.0
+
+    # No default job -> still earns the unrented incentive
+    assert plain.default_job_owner is None
+    assert plain.eligible_for_rental_share is True
+    assert (plain.incentive or 0.0) > 0.0
+
+    # The miner's own job must not dilute the legitimate unrented bucket (only plain + lium_job count)
+    assert lium_job.total_unrented_by_gpu_type == 16
+    assert plain.total_unrented_by_gpu_type == 16

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive
 from incentive.price_provider import PriceProvider
-from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
+from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION, DEFAULT_JOB_OWNER_MINER
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
@@ -423,6 +423,24 @@ class RentalPriceIncentive(DefaultIncentive):
                         "gpu_model": job_result.gpu_model,
                         "gpu_count": job_result.gpu_count,
                         "reason": "new_rentals_paused",
+                        "score": 0,
+                        "pool": "none",
+                    },
+                )
+            )
+            job_result.mining_score = 0
+            job_result.eligible_for_rental_share = False
+            return job_result
+
+        if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
+            logger.info(
+                _m(
+                    "Executor excluded from both pools - running miner's own default job",
+                    extra={
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "gpu_model": job_result.gpu_model,
+                        "gpu_count": job_result.gpu_count,
+                        "reason": "miner_default_job",
                         "score": 0,
                         "pool": "none",
                     },

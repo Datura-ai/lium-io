@@ -382,6 +382,10 @@ POD_CONTAINER_PREFIX = "pod_"
 FILLER_CONTAINER_PREFIX = "filler_"
 FILLER_CONTAINER_GRACE_MINUTES = 15
 
+# Owner of an executor's active default job, as reported by compute-app.
+# An executor running the miner's OWN default job earns no unrented incentive.
+DEFAULT_JOB_OWNER_MINER = "miner"
+
 # Container name prefixes that count as "rental-related" on an executor.
 # All producers of short-lived containers competing for the 9100-9130 port range
 # MUST be listed here so that container_cleanup and wait_for_port_check_containers
