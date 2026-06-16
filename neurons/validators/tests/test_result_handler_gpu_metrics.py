@@ -63,3 +63,94 @@ async def test_handle_result_omits_gpu_metrics_when_absent(context_factory):
     )
 
     assert "gpu_metrics" not in result.spec
+
+
+@pytest.mark.asyncio
+async def test_handle_result_defaults_inspector_outcome_to_skipped(context_factory):
+    ctx = context_factory(
+        score=1.0,
+        job_score=1.0,
+        collateral_deposited=False,
+        ssh_pub_keys=[],
+        rented=False,
+    )
+    handler = ResultHandler(redis_service=None, dry_run=True)
+
+    result = await handler.handle_result(
+        context=ctx,
+        miner_info=_miner_info(),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="ok",
+        success=True,
+    )
+
+    assert result.inspector_outcome == "SKIPPED"
+
+
+@pytest.mark.asyncio
+async def test_handle_result_publishes_inspector_event(context_factory):
+    from unittest.mock import AsyncMock
+
+    from services.redis_service import INSPECTOR_EVENT_CHANNEL
+
+    inspector_event = {
+        "executor_id": "executor-123",
+        "outcome": "CLEAN",
+        "reason_code": "INSPECTOR_CLEAN",
+        "report": {"canary_ok": True, "findings": []},
+        "when": "2026-06-17T12:00:00+00:00",
+    }
+    state = build_state(inspector_event=inspector_event)
+    ctx = context_factory(
+        state=state,
+        score=1.0,
+        job_score=1.0,
+        collateral_deposited=False,
+        ssh_pub_keys=[],
+        rented=True,
+    )
+    redis = AsyncMock()
+    handler = ResultHandler(redis_service=redis, dry_run=False)
+
+    result = await handler.handle_result(
+        context=ctx,
+        miner_info=_miner_info(),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="ok",
+        success=True,
+    )
+
+    assert result.inspector_outcome == "CLEAN"
+    redis.publish.assert_awaited_once_with(
+        INSPECTOR_EVENT_CHANNEL,
+        {**inspector_event, "miner_hotkey": "miner-hotkey"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_result_skips_inspector_event_in_dry_run(context_factory):
+    from unittest.mock import AsyncMock
+
+    state = build_state(
+        inspector_event={
+            "executor_id": "executor-123",
+            "outcome": "CLEAN",
+            "reason_code": "INSPECTOR_CLEAN",
+        }
+    )
+    ctx = context_factory(state=state, rented=True)
+    redis = AsyncMock()
+    handler = ResultHandler(redis_service=redis, dry_run=True)
+
+    await handler.handle_result(
+        context=ctx,
+        miner_info=_miner_info(),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="ok",
+        success=True,
+    )
+
+    redis.publish.assert_not_awaited()

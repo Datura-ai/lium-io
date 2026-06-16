@@ -755,6 +755,426 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
 
 
 @pytest.mark.asyncio
+async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service):
+    executor_info = ExecutorSSHInfo(
+        uuid="exec-1",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app dir",
+    )
+
+    command = docker_service._build_inspector_collector_command(
+        executor_info,
+        "start",
+    )
+
+    assert command == (
+        "/usr/bin/python3 '/root/app dir/src/inspector_executor.py' --start-collector"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inspector_lifecycle_logs_error_without_raising(docker_service, caplog):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        return_value=_make_ssh_command_result(
+            exit_status=1,
+            stderr="collector failed",
+        )
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid="exec-1",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+
+    with caplog.at_level("ERROR"):
+        await docker_service._run_inspector_collector_lifecycle(
+            ssh_client=ssh_client,
+            executor_info=executor_info,
+            action="stop",
+            default_extra={"executor_uuid": "exec-1"},
+        )
+
+    assert ssh_client.run.await_count == 1
+    assert ssh_client.run.await_args.kwargs["timeout"] == 30
+    assert any(
+        "Inspector collector stop failed" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_inspector_lifecycle_logs_success(docker_service, caplog):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    executor_info = ExecutorSSHInfo(
+        uuid="exec-1",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+
+    with caplog.at_level("INFO"):
+        await docker_service._run_inspector_collector_lifecycle(
+            ssh_client=ssh_client,
+            executor_info=executor_info,
+            action="start",
+            default_extra={"executor_uuid": "exec-1"},
+        )
+
+    assert any(
+        "Inspector collector start succeeded" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def _patch_create_container_happy_path(docker_service, monkeypatch):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.add_pending_pod = AsyncMock()
+    docker_service.redis_service.remove_pending_pod = AsyncMock()
+    docker_service.redis_service.add_rented_pod = AsyncMock()
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        docker_service,
+        "generate_portMappings",
+        AsyncMock(return_value=([(20000, 20020, 20020)], None)),
+    )
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_existing_containers", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
+    monkeypatch.setattr(
+        docker_service,
+        "wait_for_port_check_containers",
+        AsyncMock(return_value=(True, "ok")),
+    )
+    monkeypatch.setattr(docker_service, "_run_docker_create_with_port_retry", AsyncMock())
+    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
+    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
+    return ssh_client
+
+
+def _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    retry_ssh_mock.return_value = None
+    return ssh_client
+
+
+@pytest.mark.asyncio
+async def test_create_customer_rental_starts_inspector_collector(docker_service, monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
+    ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
+    lifecycle_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
+
+    pod_id = str(uuid4())
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    lifecycle_spy.assert_awaited_once()
+    assert lifecycle_spy.await_args.kwargs["action"] == "start"
+    assert lifecycle_spy.await_args.kwargs["ssh_client"] is ssh_client
+    assert lifecycle_spy.await_args.kwargs["executor_info"] == executor_info
+    assert lifecycle_spy.await_args.kwargs["default_extra"]["container_name"] == f"pod_{pod_id}"
+
+
+@pytest.mark.asyncio
+async def test_create_customer_rental_skips_inspector_collector_when_disabled(
+    docker_service,
+    monkeypatch,
+):
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", False)
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    lifecycle_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
+
+    pod_id = str(uuid4())
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    lifecycle_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_filler_skips_inspector_collector_start(docker_service, monkeypatch):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    lifecycle_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    lifecycle_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_last_customer_rental_stops_inspector_collector(
+    docker_service,
+    retry_ssh_mock,
+    monkeypatch,
+):
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
+    ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    lifecycle_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
+    docker_service.redis_service.get_rented_machine = AsyncMock(return_value=None)
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_last",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    lifecycle_spy.assert_awaited_once()
+    assert lifecycle_spy.await_args.kwargs["action"] == "stop"
+    assert lifecycle_spy.await_args.kwargs["ssh_client"] is ssh_client
+
+
+@pytest.mark.asyncio
+async def test_delete_customer_rental_keeps_collector_with_remaining_pods(
+    docker_service,
+    retry_ssh_mock,
+    monkeypatch,
+):
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    lifecycle_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
+    docker_service.redis_service.get_rented_machine = AsyncMock(
+        return_value={"containers": [{"name": "pod_still_running", "pod_id": "other"}]}
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_one",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+
+    await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    lifecycle_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_filler_skips_inspector_collector_stop(
+    docker_service,
+    retry_ssh_mock,
+    monkeypatch,
+):
+    _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
+    lifecycle_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
+    docker_service.redis_service.get_rented_machine = AsyncMock(return_value=None)
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        container_name="filler_1",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+
+    await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    lifecycle_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inspector_lifecycle_sees_remaining_rented_containers(docker_service):
+    executor_info = ExecutorSSHInfo(
+        uuid="exec-1",
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+    docker_service.redis_service.get_rented_machine = AsyncMock(
+        return_value={"containers": [{"name": "pod_still_running"}]}
+    )
+
+    assert await docker_service._has_rented_customer_containers(executor_info) is True
+
+    docker_service.redis_service.get_rented_machine = AsyncMock(return_value=None)
+
+    assert await docker_service._has_rented_customer_containers(executor_info) is False
+
+
+@pytest.mark.asyncio
 async def test_install_ssh_service_creates_bootstrap_script_inside_container(docker_service):
     """SSH bootstrap script is written directly in-container before execution."""
     ssh_client = AsyncMock()

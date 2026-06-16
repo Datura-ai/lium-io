@@ -1,6 +1,5 @@
 import asyncio
 import ctypes
-import hashlib
 import json
 import random
 import os
@@ -11,6 +10,7 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 
 from core.config import settings, FeatureFlag
 from core.utils import _m, get_extra_info
+from core.checksums import sha256_from_executor, sha256_from_path
 
 
 logger = logging.getLogger(__name__)
@@ -141,25 +141,6 @@ class VerifyXValidationService:
     def __init__(self):
         self.lib_name = "/usr/lib/libverifyx.so"
 
-    def _calculate_lib_checksum(self, lib_path: str) -> str:
-        """Calculate SHA256 checksum of the VerifyX shared library."""
-        with open(lib_path, "rb") as f:
-            return hashlib.sha256(f.read()).hexdigest()
-
-    async def _get_executor_checksum(self, shell) -> str:
-        """Get the VerifyX library checksum from executor using SCP."""
-        max_retries = 2
-        for attempt in range(1, max_retries + 1):
-            try:
-                checksums = await shell.get_checksums_over_scp(self.lib_name)
-                # Format is "md5:sha256", we need sha256
-                sha256_checksum = checksums.split(":")[1]
-                return sha256_checksum
-            except Exception:
-                if attempt < max_retries:
-                    await asyncio.sleep(1.0)
-        return ""
-
     async def validate_verifyx_and_process_job(
         self,
         shell,
@@ -169,8 +150,8 @@ class VerifyXValidationService:
     ):
         try:
             # Verify checksum before proceeding with validation
-            local_checksum = self._calculate_lib_checksum(self.lib_name)
-            executor_checksum = await self._get_executor_checksum(shell)
+            local_checksum = sha256_from_path(self.lib_name)
+            executor_checksum = await sha256_from_executor(shell, self.lib_name)
 
             if local_checksum != executor_checksum:
                 return VerifyXResponse(error="Executor using outdated VerifyX library. Run docker compose restart to update to the latest executor image")

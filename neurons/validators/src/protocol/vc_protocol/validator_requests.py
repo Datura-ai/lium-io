@@ -13,6 +13,7 @@ class RequestType(enum.Enum):
     ExecutorSpecRequest = "ExecutorSpecRequest"
     RentedMachineRequest = "RentedMachineRequest"
     LogStreamRequest = "LogStreamRequest"
+    InspectorEventRequest = "InspectorEventRequest"
     ResetVerifiedJobRequest = "ResetVerifiedJobRequest"
     DuplicateExecutorsRequest = "DuplicateExecutorsRequest"
     NormalizedScoreRequest = "NormalizedScoreRequest"
@@ -83,6 +84,23 @@ class LogStreamRequest(BaseValidatorRequest):
     executor_uuid: str
     pod_id: str
     logs: list[dict]
+
+
+class InspectorEventRequest(BaseValidatorRequest):
+    message_type: RequestType = RequestType.InspectorEventRequest
+    miner_hotkey: str
+    validator_hotkey: str
+    executor_id: str
+    job_batch_id: str
+    pod_ids: list[str]
+    outcome: str
+    reason_code: str
+    report: dict | None = None
+    error: dict | None = None
+    context: dict = pydantic.Field(default_factory=dict)
+    pipeline_id: str | None = None
+    trace_id: str | None = None
+    when: str
 
 
 class ResetVerifiedJobReason(int, enum.Enum):

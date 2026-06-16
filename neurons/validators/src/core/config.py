@@ -151,6 +151,11 @@ class Settings(BaseSettings):
 
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
+    ENABLE_INSPECTOR: bool = True
+    INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK: bool = Field(
+        env="INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK",
+        default=True,
+    )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")

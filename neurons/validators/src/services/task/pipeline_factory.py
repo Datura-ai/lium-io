@@ -19,6 +19,7 @@ from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
 from services.container_cleanup import ContainerCleanup
 from services.executor_connectivity_service import ExecutorConnectivityService
+from services.inspector_validation_service import InspectorValidationService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.redis_service import RENTAL_SUCCEED_MACHINE_SET, RedisService
@@ -38,6 +39,7 @@ from .checks import (
     GpuPowerLimitCheck,
     GpuUsageCheck,
     GpuVramPrecheck,
+    InspectorRentedCheck,
     MachineSpecScrapeCheck,
     NvmlDigestCheck,
     PortConnectivityCheck,
@@ -103,6 +105,7 @@ class PipelineFactory:
         self.redis_service = redis_service
         self.validation_service = validation_service
         self.verifyx_validation_service = verifyx_validation_service
+        self.inspector_validation_service = InspectorValidationService()
         self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
         self.backend_client = backend_client
@@ -180,6 +183,7 @@ class PipelineFactory:
                 collateral=self.collateral_contract_service,
                 validation=self.validation_service,
                 verifyx=self.verifyx_validation_service,
+                inspector=self.inspector_validation_service,
                 connectivity=self.executor_connectivity_service,
                 shell=shell,
                 score_calculator=calculate_scores,
@@ -199,6 +203,7 @@ class PipelineFactory:
                 nvml_digest_map=LIB_NVIDIA_ML_DIGESTS,
                 enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
                 verifyx_enabled=settings.ENABLE_VERIFYX,
+                inspector_enabled=settings.ENABLE_INSPECTOR,
                 port_private_key=private_key,
                 port_public_key=public_key,
                 job_batch_id=miner_info.job_batch_id,
@@ -253,6 +258,7 @@ class PipelineFactory:
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
+                InspectorRentedCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 VerifyXCheck(),

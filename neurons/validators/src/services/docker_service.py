@@ -49,6 +49,7 @@ from payload_models.payloads import (
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
+from core.config import settings
 from core.utils import _m, get_extra_info, retry_ssh_command
 from services.const import (
     FILLER_CONTAINER_PREFIX,
@@ -110,6 +111,7 @@ _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
 _DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60 # 3 hours
+_INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
 # DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
 # from on-host disk state when the backend sends disk_share.
 _FRESH_SIZING_OVERHEAD_GB = 20   # reserved for system/docker overhead when reconstructing the pool
@@ -235,6 +237,64 @@ class DockerService:
         if payload.workload_kind == WorkloadKind.FILLER:
             return f"{FILLER_CONTAINER_PREFIX}{payload.pod_id}"
         return f"{POD_CONTAINER_PREFIX}{payload.pod_id}"
+
+    @staticmethod
+    def _build_inspector_collector_command(
+        executor_info: ExecutorSSHInfo,
+        action: str,
+    ) -> str:
+        flag = {
+            "start": "--start-collector",
+            "stop": "--stop-collector",
+        }[action]
+        script = f"{executor_info.root_dir.rstrip('/')}/src/inspector_executor.py"
+        return f"{shlex.quote(executor_info.python_path)} {shlex.quote(script)} {flag}"
+
+    async def _run_inspector_collector_lifecycle(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        action: str,
+        default_extra: dict,
+    ) -> None:
+        command = self._build_inspector_collector_command(executor_info, action)
+        log_extra = {
+            **default_extra,
+            "command": command,
+            "executor_uuid": executor_info.uuid,
+            "inspector_action": action,
+        }
+        try:
+            result = await ssh_client.run(
+                command,
+                timeout=_INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS,
+            )
+            exit_status = getattr(result, "exit_status", 0)
+            stderr = getattr(result, "stderr", "") or ""
+            if exit_status != 0:
+                raise RuntimeError(f"exit_status={exit_status} stderr={stderr}")
+            logger.info(
+                _m(
+                    f"Inspector collector {action} succeeded",
+                    extra=get_extra_info(log_extra),
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                _m(
+                    f"Inspector collector {action} failed",
+                    extra=get_extra_info({**log_extra, "error": str(exc)}),
+                ),
+            )
+
+    async def _has_rented_customer_containers(
+        self,
+        executor_info: ExecutorSSHInfo,
+    ) -> bool:
+        rented_machine = await self.redis_service.get_rented_machine(executor_info)
+        return bool(rented_machine and rented_machine.get("containers"))
 
     def _ssh_bootstrap_script_path(self) -> Path:
         return Path(__file__).resolve().parent / "assets" / "sshd_bootstrap.sh"
@@ -2784,6 +2844,19 @@ class DockerService:
 
                     current_step = "finalize"
                     await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
+                    if (
+                        settings.ENABLE_INSPECTOR
+                        and payload.workload_kind != WorkloadKind.FILLER
+                    ):
+                        await self._run_inspector_collector_lifecycle(
+                            ssh_client=ssh_client,
+                            executor_info=executor_info,
+                            action="start",
+                            default_extra={
+                                **default_extra,
+                                "container_name": container_name,
+                            },
+                        )
                 except Exception:
                     await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
@@ -3163,6 +3236,21 @@ class DockerService:
                 )
 
                 await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
+                # Stop inspector only after the last customer pod leaves this executor.
+                if (
+                    settings.ENABLE_INSPECTOR
+                    and payload.workload_kind != WorkloadKind.FILLER
+                    and not await self._has_rented_customer_containers(executor_info)
+                ):
+                    await self._run_inspector_collector_lifecycle(
+                        ssh_client=ssh_client,
+                        executor_info=executor_info,
+                        action="stop",
+                        default_extra={
+                            **default_extra,
+                            "container_name": payload.container_name,
+                        },
+                    )
 
                 # Port release now handled by backend
 

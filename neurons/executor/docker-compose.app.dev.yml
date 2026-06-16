@@ -26,6 +26,7 @@ services:
       - /etc/docker/daemon.json:/etc/docker/daemon.json
       - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
     pid: host
+    privileged: true
     environment:
       - DB_URI=postgresql://postgres:password@db:5432/compute-subnet-db
       - NVIDIA_DRIVER_CAPABILITIES=all
