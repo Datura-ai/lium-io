@@ -45,10 +45,19 @@ async def test_power_limit_rejects_below_threshold(context_factory):
 
 @pytest.mark.asyncio
 async def test_power_limit_allows_exact_threshold(context_factory):
-    ctx = context_factory(state=_state(current_limit=280, default_limit=350))
+    ctx = context_factory(state=_state(current_limit=315, default_limit=350))
     result = await GpuPowerLimitCheck().run(ctx)
     assert result.passed is True
     assert result.event.reason_code == "GPU_POWER_LIMIT_OK"
+
+
+@pytest.mark.asyncio
+async def test_power_limit_rejects_between_old_and_new_floor(context_factory):
+    ctx = context_factory(state=_state(current_limit=300, default_limit=350))
+    result = await GpuPowerLimitCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.reason_code == "GPU_POWER_LIMIT_BELOW_DEFAULT"
+    assert result.updates["score"] == 0.0
 
 
 @pytest.mark.asyncio

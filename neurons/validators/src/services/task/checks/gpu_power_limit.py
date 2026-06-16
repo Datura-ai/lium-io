@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..messages import GpuPowerLimitMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
-MIN_POWER_LIMIT_RATIO = 0.8
+MIN_POWER_LIMIT_RATIO = 0.9
 
 
 def _to_float(value) -> float | None:
@@ -69,7 +69,7 @@ class GpuPowerLimitCheck:
                     "score": 0.0,
                     "job_score": 0.0,
                     "score_warning": (
-                        " WARNING: GPU power limit is below 80% of the default power limit"
+                        " WARNING: GPU power limit is below 90% of the default power limit"
                     ),
                 },
             )
