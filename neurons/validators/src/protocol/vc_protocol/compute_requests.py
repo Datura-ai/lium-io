@@ -79,6 +79,9 @@ class RentedExecutorsResponse(BaseModel):
     spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
     new_rentals_paused_executor_ids: list[str] = []  # executor_ids paused from unrented incentives
     provider_discord_connected_executor_ids: list[str] | None = None  # executor_ids whose provider has connected Discord
+    # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
+    # forward-compatibility (a future owner value must not break parsing of the whole response).
+    default_job_owner_by_executor: dict[str, str] = {}
 
     @field_validator("filler_containers_by_executor")
     @classmethod
@@ -91,6 +94,9 @@ class RentedExecutorsResponse(BaseModel):
 
     def get_filler_container(self, executor_uuid: str) -> str | None:
         return self.filler_containers_by_executor.get(str(executor_uuid))
+
+    def get_default_job_owner(self, executor_uuid: str) -> str | None:
+        return self.default_job_owner_by_executor.get(str(executor_uuid))
 
 
 class PodRentalActiveResponse(BaseModel):

@@ -107,6 +107,11 @@ class ResultHandler:
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
         )
+        default_job_owner = (
+            context.state.rented_data.get_default_job_owner(executor_info.uuid)
+            if context.state.rented_data
+            else None
+        )
         provider_discord_connected = self._get_provider_discord_connected(context)
 
         # add TDX attestation and spot tier to specs (propagated to compute-app
@@ -148,6 +153,7 @@ class ResultHandler:
             is_new_rentals_paused=is_new_rentals_paused,
             provider_discord_connected=provider_discord_connected,
             rental_created_at=self._get_rental_created_at(context),
+            default_job_owner=default_job_owner,
             tdx_attestation_passed=context.tdx_attestation_passed,
         )
 
