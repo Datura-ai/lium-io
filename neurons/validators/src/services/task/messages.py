@@ -255,7 +255,7 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 80% of the default limit "
+            "Restore the GPU power limit to at least 90% of the default limit "
             "reported by NVML."
         ),
     )
