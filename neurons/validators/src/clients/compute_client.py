@@ -53,6 +53,7 @@ from protocol.vc_protocol.validator_requests import (
     EstimateResponse,
     ExecutorSpecRequest,
     GpuEstimatesRequest,
+    InspectorEventRequest,
     LogStreamRequest,
     RentedMachineRequest,
     ResetVerifiedJobRequest,
@@ -72,6 +73,7 @@ from services.redis_service import (
     DUPLICATED_MACHINE_SET,
     EXECUTORS_UPTIME_PREFIX,
     GPU_ESTIMATES_CHANNEL,
+    INSPECTOR_EVENT_CHANNEL,
     RENTAL_SUCCEED_MACHINE_SET,
     MACHINE_SPEC_CHANNEL,
     RENTED_MACHINE_PREFIX,
@@ -264,6 +266,7 @@ class ComputeClient:
                 pubsub = await self.miner_service.redis_service.subscribe(
                     MACHINE_SPEC_CHANNEL,
                     STREAMING_LOG_CHANNEL,
+                    INSPECTOR_EVENT_CHANNEL,
                     RESET_VERIFIED_JOB_CHANNEL,
                     NORMALIZED_SCORE_CHANNEL,
                     GPU_ESTIMATES_CHANNEL,
@@ -331,6 +334,25 @@ class ComputeClient:
 
                         async with self.lock:
                             self.message_queue.append(log_stream)
+                    elif channel == INSPECTOR_EVENT_CHANNEL:
+                        inspector_event = InspectorEventRequest(
+                            validator_hotkey=validator_hotkey,
+                            miner_hotkey=data["miner_hotkey"],
+                            executor_id=data["executor_id"],
+                            job_batch_id=data["job_batch_id"],
+                            pod_ids=data["pod_ids"],
+                            outcome=data["outcome"],
+                            reason_code=data["reason_code"],
+                            report=data.get("report"),
+                            error=data.get("error"),
+                            context=data.get("context") or {},
+                            pipeline_id=data.get("pipeline_id"),
+                            trace_id=data.get("trace_id"),
+                            when=data["when"],
+                        )
+
+                        async with self.lock:
+                            self.message_queue.append(inspector_event)
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         reset_request = ResetVerifiedJobRequest(
                             miner_hotkey=data["miner_hotkey"],

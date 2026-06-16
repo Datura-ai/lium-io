@@ -41,7 +41,8 @@ RUN pdm install --prod
 COPY . .
 
 RUN mv /root/app/libdmcompverify.so /usr/lib/ \
-  && mv /root/app/libverifyx.so /usr/lib/
+  && mv /root/app/libverifyx.so /usr/lib/ \
+  && mv /root/app/libinspector.so /usr/lib/
 
 # Remove existing SSH host keys
 RUN rm -f /etc/ssh/ssh_host_*

@@ -16,6 +16,7 @@ COPY src/services /app/services
 # Copy libraries
 COPY libdmcompverify.so /usr/lib/libdmcompverify.so
 COPY libverifyx.so /usr/lib/libverifyx.so
+COPY libinspector.so /usr/lib/libinspector.so
 
 # Install Python dependencies
 RUN pip3 install --no-cache-dir \

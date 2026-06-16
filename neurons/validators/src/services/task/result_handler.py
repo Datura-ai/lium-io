@@ -8,11 +8,11 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from core.utils import _m
+from core.utils import _m, get_extra_info
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from datura.requests.miner_requests import ExecutorSSHInfo
-from services.redis_service import RedisService
+from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
 from .models import JobResult
 from .pipeline import Context
@@ -89,6 +89,12 @@ class ResultHandler:
         else:
             logger.info("DRY_RUN: Skipping Redis persistence")
 
+        if not self.dry_run and context.state.inspector_event:
+            await self._publish_inspector_event(
+                context.state.inspector_event,
+                miner_info.miner_hotkey,
+            )
+
         # Parse GPU model and count from gpu_model_count string
         gpu_model: Optional[str] = None
         gpu_count = 0
@@ -130,6 +136,11 @@ class ResultHandler:
         # NVIDIA driver version string reported by NVML (e.g. "580.95.05"). Used by the
         # minimum-driver requirement gate.
         nvidia_driver_version = str(specs.get("gpu", {}).get("driver") or "")
+        inspector_outcome = (
+            context.state.inspector_event.get("outcome")
+            if context.state.inspector_event
+            else "SKIPPED"
+        )
 
         # Build and return JobResult
         return JobResult(
@@ -155,6 +166,7 @@ class ResultHandler:
             rental_created_at=self._get_rental_created_at(context),
             default_job_owner=default_job_owner,
             tdx_attestation_passed=context.tdx_attestation_passed,
+            inspector_outcome=inspector_outcome,
         )
 
     @staticmethod
@@ -246,3 +258,28 @@ class ResultHandler:
             return ResetVerifiedJobReason(reason_value)
         except ValueError:
             return ResetVerifiedJobReason.DEFAULT
+
+    async def _publish_inspector_event(self, event: dict, miner_hotkey: str) -> None:
+        payload = {
+            **event,
+            "miner_hotkey": miner_hotkey,
+        }
+        try:
+            await self.redis_service.publish(
+                INSPECTOR_EVENT_CHANNEL,
+                payload,
+            )
+        except Exception as e:
+            logger.error(
+                _m(
+                    "Failed to publish inspector event",
+                    extra=get_extra_info(
+                        {
+                            "miner_hotkey": miner_hotkey,
+                            "executor_id": event.get("executor_id"),
+                            "error": str(e),
+                        }
+                    ),
+                ),
+                exc_info=True,
+            )

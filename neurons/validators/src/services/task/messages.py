@@ -432,6 +432,139 @@ class CustomBuildOrphanSweepMessages:
     )
 
 
+class InspectorMessages:
+    SKIPPED = MessageTemplate(
+        event="Inspector validation skipped",
+        reason="INSPECTOR_SKIPPED_NOT_RENTED",
+        severity="info",
+        category="runtime",
+        impact="No active customer rental on this executor",
+    )
+    DISABLED = MessageTemplate(
+        event="Inspector validation disabled",
+        reason="INSPECTOR_SKIPPED_DISABLED",
+        severity="info",
+        category="runtime",
+        impact="Inspector checks are disabled",
+    )
+    CLEAN = MessageTemplate(
+        event="Inspector validation clean",
+        reason="INSPECTOR_CLEAN",
+        severity="info",
+        category="runtime",
+        impact="No malicious findings reported",
+    )
+    COLLECTOR_RECENTLY_STARTED = MessageTemplate(
+        event="Inspector collector recently started",
+        reason="INSPECTOR_COLLECTOR_RECENTLY_STARTED",
+        severity="warning",
+        category="runtime",
+        impact="Collection window may be incomplete; possible evasion",
+        remediation="Review collector uptime before trusting a clean result.",
+    )
+    COLLECTOR_NOT_RUNNING = MessageTemplate(
+        event="Inspector collector not running",
+        reason="INSPECTOR_COLLECTOR_NOT_RUNNING",
+        severity="warning",
+        category="runtime",
+        impact="No collector telemetry; possible evasion",
+        remediation="Verify the collector process is running and reachable.",
+    )
+    CANARY_FAILED = MessageTemplate(
+        event="Inspector canary check failed",
+        reason="INSPECTOR_CANARY_FAILED",
+        severity="warning",
+        category="runtime",
+        impact="Canary check failed; result not trustworthy",
+        remediation="Investigate collector integrity and libinspector canary state.",
+    )
+    MALICIOUS_FINDINGS = MessageTemplate(
+        event="Inspector malicious findings detected",
+        reason="INSPECTOR_MALICIOUS_FINDINGS",
+        severity="warning",
+        category="runtime",
+        impact="Findings logged; score unchanged",
+        remediation="Review the libinspector report and tenant workload before taking action.",
+    )
+    VALIDATION_ERROR = MessageTemplate(
+        event="Inspector validation error",
+        reason="INSPECTOR_VALIDATION_ERROR",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation="Check libinspector installation and executor SSH process logs.",
+    )
+    FAILED_LIB_MISMATCH = MessageTemplate(
+        event="Inspector libinspector.so mismatch",
+        reason="INSPECTOR_FAILED_LIB_MISMATCH",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation=(
+            "The executor's libinspector.so SHA256 does not match the validator's. "
+            "Verify both sides ship the same libinspector build and restart the executor "
+            "container (docker compose restart) if it does not."
+        ),
+    )
+    FAILED_SSH_TRANSPORT = MessageTemplate(
+        event="Inspector SSH transport failed",
+        reason="INSPECTOR_FAILED_SSH_TRANSPORT",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation=(
+            "Validator could not reach the executor over SSH. Verify the executor is running "
+            "and reachable on its SSH port, and that the validator's SSH key is present in the "
+            "executor's authorized_keys."
+        ),
+    )
+    FAILED_EXECUTOR_CRASH = MessageTemplate(
+        event="Inspector executor crashed",
+        reason="INSPECTOR_FAILED_EXECUTOR_CRASH",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation=(
+            "The inspector_executor.py process exited before completing the interactive session. "
+            "Check executor container logs (docker logs <executor-container>) for tracebacks."
+        ),
+    )
+    FAILED_CIPHER_REJECTED = MessageTemplate(
+        event="Inspector cipher rejected",
+        reason="INSPECTOR_FAILED_CIPHER_REJECTED",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation=(
+            "The executor returned a response that the validator's libinspector.so rejected. "
+            "Verify the executor's libinspector.so SHA256 matches the validator's, and restart "
+            "the executor container (docker compose restart) if it does not."
+        ),
+    )
+    FAILED_TIMEOUT = MessageTemplate(
+        event="Inspector interactive command timed out",
+        reason="INSPECTOR_FAILED_TIMEOUT",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation=(
+            "The inspector_executor.py REPL did not respond within the configured timeout. "
+            "Check for host load, stuck collector startup, or OOM on the executor."
+        ),
+    )
+    FAILED_INTERACTIVE = MessageTemplate(
+        event="Inspector executor command failed",
+        reason="INSPECTOR_FAILED_INTERACTIVE",
+        severity="warning",
+        category="runtime",
+        impact="Inspector result unavailable; score unchanged",
+        remediation=(
+            "The executor REPL returned an error for a handshake, collect, or collector command. "
+            "Read executor_stderr in the validation event and inspect libinspector on the executor."
+        ),
+    )
+
+
 class TenantEnforcementMessages:
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",

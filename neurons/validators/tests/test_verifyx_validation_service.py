@@ -30,10 +30,11 @@ def _executor_info() -> SimpleNamespace:
 async def test_outer_catch_all_populates_diagnostics_and_logs(caplog):
     service = VerifyXValidationService()
 
-    # Force `_calculate_lib_checksum` to blow up so the outer except catches it — this is
+    # Force local sha256 lookup to blow up so the outer except catches it — this is
     # the exact pre-SSH failure surface the previous catch-all swallowed without a log.
-    with patch.object(
-        service, "_calculate_lib_checksum", side_effect=RuntimeError("boom")
+    with patch(
+        "neurons.validators.src.services.verifyx_validation_service.sha256_from_path",
+        side_effect=RuntimeError("boom"),
     ):
         shell = MagicMock()
         shell.get_checksums_over_scp = AsyncMock(return_value="md5:sha256")
@@ -66,14 +67,14 @@ async def test_nonzero_exit_with_nonempty_stdout_classified_as_executor_crash(ca
 
     # Skip the checksum check (equal) and the ctypes-based challenge generation. We only
     # care about the SSH capture → classification path.
-    with patch.object(service, "_calculate_lib_checksum", return_value="s"), patch.object(
-        service, "_get_executor_checksum", AsyncMock(return_value="s")
+    with patch(
+        "neurons.validators.src.services.verifyx_validation_service.sha256_from_path",
+        return_value="s",
     ), patch(
         "neurons.validators.src.services.verifyx_validation_service.VerifyXValidator"
     ) as fake_validator_cls:
         fake_validator_cls.return_value.generate_challenge.return_value = "deadbeef"
 
-        # Executor prints a partial/corrupt payload to stdout and exits non-zero.
         partial_stdout = "a" * (MIN_CIPHER_LEN + 20)
         ssh_result = SimpleNamespace(
             stdout=partial_stdout,
@@ -81,6 +82,7 @@ async def test_nonzero_exit_with_nonempty_stdout_classified_as_executor_crash(ca
             exit_status=1,
         )
         shell = MagicMock()
+        shell.get_checksums_over_scp = AsyncMock(return_value="md5:s")
         shell.ssh_client = MagicMock()
         shell.ssh_client.run = AsyncMock(return_value=ssh_result)
 

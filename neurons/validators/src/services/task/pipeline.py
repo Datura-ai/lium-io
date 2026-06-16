@@ -17,6 +17,7 @@ from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
+from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .models import ValidationEvent
@@ -29,6 +30,7 @@ class ContextServices:
     collateral: CollateralContractService
     validation: ValidationService
     verifyx: VerifyXValidationService
+    inspector: InspectorValidationService
     connectivity: ExecutorConnectivityService
     shell: InteractiveShellService
     score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
@@ -50,6 +52,7 @@ class ContextConfig:
     nvml_digest_map: Optional[dict[str, str]] = None
     enable_no_collateral: bool = False
     verifyx_enabled: bool = False
+    inspector_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
@@ -73,6 +76,7 @@ class ContextState:
     verified_port_count: int = 0
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
+    inspector_event: dict | None = None
 
 
 class CheckResult(BaseModel):
