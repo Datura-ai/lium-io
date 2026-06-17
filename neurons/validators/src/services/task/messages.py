@@ -420,6 +420,14 @@ class DuplicateExecutorMessages:
         impact="Score set to 0; verification cleared",
         remediation="Ensure every executor has a unique UUID and deregister duplicates before retrying.",
     )
+    DUPLICATE_OBSERVED = MessageTemplate(
+        event="Duplicate executor registration (observe mode)",
+        reason="EXECUTOR_DUPLICATE_OBSERVED",
+        severity="warning",
+        category="policy",
+        impact="Detected; no score impact (observe mode)",
+        remediation="Ensure every executor has a unique UUID and deregister duplicates before retrying.",
+    )
     UNIQUE = MessageTemplate(
         event="Executor registration unique",
         reason="EXECUTOR_NOT_DUPLICATE",
