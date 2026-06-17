@@ -146,6 +146,7 @@ class Settings(BaseSettings):
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
+    DUPLICATE_EXECUTOR_DRY_RUN: bool = Field(env="DUPLICATE_EXECUTOR_DRY_RUN", default=True, description="Observe mode: detect duplicate executors but don't penalize")
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'

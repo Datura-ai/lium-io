@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from core.config import settings
+from services.redis_service import DUPLICATED_MACHINE_SET
+
 from ..messages import DuplicateExecutorMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
-DUPLICATED_MACHINE_SET = "duplicated_machine:set"
 
 class DuplicateExecutorCheck:
     """Ensure a miner is not registering the same executor UUID multiple times.
@@ -23,14 +25,24 @@ class DuplicateExecutorCheck:
         )
 
         if is_duplicate:
+            what = {
+                "executor_uuid": ctx.executor.uuid,
+                "miner_hotkey": ctx.miner_hotkey,
+            }
+            if settings.DUPLICATE_EXECUTOR_DRY_RUN:
+                event = render_message(
+                    Msg.DUPLICATE_OBSERVED,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what=what,
+                )
+                return CheckResult(passed=True, event=event)
+
             event = render_message(
                 Msg.DUPLICATE,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={
-                    "executor_uuid": ctx.executor.uuid,
-                    "miner_hotkey": ctx.miner_hotkey,
-                },
+                what=what,
             )
             return CheckResult(
                 passed=False,
