@@ -208,6 +208,8 @@ def test_A1_dockerfile_field_omitted_when_none():
     # `str | None` — null when not set, which is what backend serializers can
     # safely drop or include.
     assert data["dockerfile_content"] is None
+    # DAH-1524: the new optional flag follows the same convention (null by default).
+    assert data["ships_sshd"] is None
 
 
 # ------------------------------------------------------------------
@@ -285,7 +287,16 @@ async def test_A2_build_success_overrides_docker_image_tag(svc, monkeypatch):
 async def test_A2_image_pull_path_unchanged_when_dockerfile_none(svc, monkeypatch):
     """Default branch is byte-identical: pull command emitted, no build helper invoked."""
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_ssh_result())
+
+    # DAH-1524: the pull is now guarded by a `docker image inspect` probe. Make
+    # the probe report the image as ABSENT (exit !=0) so the pull still runs,
+    # which is what this test asserts. All other ssh commands succeed (exit 0).
+    def _ssh_run_side(cmd, *args, **kwargs):
+        if "image inspect" in cmd:
+            return _ssh_result(exit_status=1)
+        return _ssh_result()
+
+    ssh_client.run = AsyncMock(side_effect=_ssh_run_side)
     _patch_create_container_happy(svc, monkeypatch, ssh_client)
 
     build_mock = AsyncMock(return_value=(True, None))
