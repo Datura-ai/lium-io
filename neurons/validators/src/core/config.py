@@ -196,6 +196,36 @@ class Settings(BaseSettings):
         env="CUSTOM_DOCKERFILE_MAX_BYTES", default=65_536,
         description="Defense-in-depth cap on dockerfile_content size; route is authoritative.",
     )
+    # DAH-2211 — internet-enabled custom builds run inside a throwaway sysbox
+    # Docker-in-Docker container (NOT on the host daemon) so the build can
+    # `--network` out for deps while a build-time escape stays confined to an
+    # unprivileged-on-host (user-namespaced) container. Egress is firewalled
+    # host-side to block cloud metadata + RFC1918. See the DAH-2211 build flow.
+    CUSTOM_DOCKERFILE_DIND_IMAGE: str = Field(
+        env="CUSTOM_DOCKERFILE_DIND_IMAGE", default="daturaai/dind:0.0.1",
+        description="Sysbox DinD image used to build custom-dockerfile pods in isolation.",
+    )
+    CUSTOM_DOCKERFILE_DIND_CPUS: str = Field(
+        env="CUSTOM_DOCKERFILE_DIND_CPUS", default="4",
+        description="--cpus limit for the throwaway DinD build container.",
+    )
+    CUSTOM_DOCKERFILE_DIND_MEMORY: str = Field(
+        env="CUSTOM_DOCKERFILE_DIND_MEMORY", default="8g",
+        description="--memory limit for the throwaway DinD build container.",
+    )
+    CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
+        env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60,
+        description="Max seconds to wait for the inner DinD dockerd to become ready.",
+    )
+    CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS: str = Field(
+        env="CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS",
+        default="169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+        description=(
+            "Comma-separated CIDRs the custom build must NOT reach (cloud metadata + "
+            "RFC1918). Enforced host-side in the DOCKER-USER chain, scoped to the DinD "
+            "container IP. Build still has full public-internet egress."
+        ),
+    )
 
     DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 

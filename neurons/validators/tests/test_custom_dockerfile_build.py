@@ -1,16 +1,19 @@
 """DAH-2211 — validator-owned subset of §3.A and §3.B tests for
 custom-dockerfile pod deployment.
 
-Covers (from the plan):
+Covers (from the plan + DAH-2211 isolated-build flow):
 - A.1 Golden-snapshot regression — image-pull JSON byte-identical
 - A.2 Build success path
 - A.4 Build failure (bad RUN)
-- A.5 Unreachable base image
+- A.5 Unreachable base image (network ON → generic docker_build)
 - A.6 Hard timeout
-- A.9 `--network=none` enforced during build
+- A.9 Build runs in a sysbox DinD container WITH network (no --network=none)
 - A.11 Empty dockerfile_content guard (validator-level, no SSH issued)
+- A.12 sysbox-runc unavailable → build_sysbox_unavailable (never builds)
+- A.13 egress firewall failure → build_egress_setup (never builds)
+- A.14 DinD container always torn down (finally)
+- A.15 image export (save|load) failure → build_export
 - B.1 SSE latency p95 ≤ 2000 ms (stubbed redis consumer)
-- B.3 Pre-build `df` rejection
 """
 
 from __future__ import annotations
@@ -77,6 +80,63 @@ def _ssh_result(exit_status: int = 0, stdout: str = "", stderr: str = ""):
     r.stdout = stdout
     r.stderr = stderr
     return r
+
+
+def _make_dind_ssh(
+    *,
+    sysbox: bool = True,
+    dind_start_exit: int = 0,
+    ready_exit: int = 0,
+    dind_ip: str = "172.20.0.2",
+):
+    """An `ssh.run` router emulating the DAH-2211 DinD build control commands.
+
+    Routes by command substring: sysbox preflight, DinD `run -d`, the
+    readiness `docker exec ... docker info` probe, IP inspect, and everything
+    else (Dockerfile write, teardown) → exit 0. The build / egress / export
+    steps go through `execute_and_stream_logs`, not `ssh.run`.
+    """
+    calls: list[str] = []
+
+    async def _run(cmd, **kw):
+        calls.append(cmd)
+        if "info --format" in cmd and "Runtimes" in cmd:
+            runtimes = '{"runc":{"path":"runc"}'
+            if sysbox:
+                runtimes += ',"sysbox-runc":{"path":"/usr/bin/sysbox-runc"}'
+            runtimes += "}"
+            return _ssh_result(stdout=runtimes)
+        if "run -d --runtime=sysbox-runc" in cmd:
+            return _ssh_result(exit_status=dind_start_exit, stdout="dind-cid")
+        if "docker exec" in cmd and cmd.rstrip().endswith("docker info"):
+            return _ssh_result(exit_status=ready_exit)
+        if "docker inspect -f" in cmd:
+            return _ssh_result(stdout=dind_ip)
+        return _ssh_result(exit_status=0)
+
+    ssh = AsyncMock()
+    ssh.run = _run
+    ssh.calls = calls
+    return ssh
+
+
+def _make_esl(*, egress=(True, ""), build=(True, ""), export=(True, "")):
+    """Stub `execute_and_stream_logs`, routing by the step it serves."""
+    seen: list[str] = []
+
+    async def _esl(**kwargs):
+        cmd = kwargs.get("command", "")
+        seen.append(cmd)
+        if "--network=host" in cmd:  # egress firewall helper
+            return egress
+        if "docker save" in cmd:  # export (save | load)
+            return export
+        if "docker build" in cmd:  # the build itself
+            return build
+        return (True, "")
+
+    _esl.seen = seen
+    return _esl
 
 
 def _base_payload(*, dockerfile_content: str | None = None, docker_image: str = "daturaai/pytorch:test") -> ContainerCreateRequest:
@@ -339,30 +399,22 @@ async def test_A4_build_failure_returns_ccf_unknown_error(svc, monkeypatch):
 
 
 # ------------------------------------------------------------------
-# A.5 — Unreachable base classifies identically (UnknownError) with
-#       distinguishing failure_step
+# A.5 — Unreachable base image. Network is ON now, so a resolve failure is a
+#       genuine build error (no dedicated network-blocked step).
 # ------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_A5_unreachable_base_image_ccf_classification(svc, monkeypatch):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_ssh_result())
+    ssh_client = _make_dind_ssh()
     _patch_create_container_happy(svc, monkeypatch, ssh_client)
-
-    # _custom_build_image internally classifies via the docker build stderr
-    # markers. Here we route through the real subroutine to assert the
-    # classification logic by stubbing execute_and_stream_logs to return a
-    # registry-resolution failure.
     monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
-    # df returns plenty of space
-    async def _ssh_run(cmd, **kw):
-        return _ssh_result(stdout=str(1024 * 1024 * 100))
-    ssh_client.run = _ssh_run
 
-    async def _exec_emulate_pull_failure(**kwargs):
-        return (False, "ERROR: failed to pull image: could not resolve host gcr.io")
-    monkeypatch.setattr(svc, "execute_and_stream_logs", _exec_emulate_pull_failure)
+    # Egress applies fine; the build step fails resolving an unreachable base.
+    monkeypatch.setattr(
+        svc, "execute_and_stream_logs",
+        _make_esl(build=(False, "ERROR: failed to solve: could not resolve host gcr.io")),
+    )
 
     payload = _base_payload(dockerfile_content="FROM gcr.io/this-does-not-exist:latest\n")
     result = await svc.create_container(
@@ -374,8 +426,8 @@ async def test_A5_unreachable_base_image_ccf_classification(svc, monkeypatch):
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_code == FailedContainerErrorCodes.UnknownError
-    # Network resolution failures classify as `build_network_blocked`.
-    assert result.failure_step == "build_network_blocked"
+    # With network enabled there is no special network-blocked step anymore.
+    assert result.failure_step == "docker_build"
 
 
 # ------------------------------------------------------------------
@@ -385,16 +437,14 @@ async def test_A5_unreachable_base_image_ccf_classification(svc, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_A6_build_hard_timeout(svc, monkeypatch):
-    ssh_client = AsyncMock()
-    # df: plenty of space
-    async def _ssh_run(cmd, **kw):
-        return _ssh_result(stdout=str(1024 * 1024 * 100))
-    ssh_client.run = _ssh_run
+    ssh_client = _make_dind_ssh()
     _patch_create_container_happy(svc, monkeypatch, ssh_client)
 
-    async def _exec_timeout(**kwargs):
-        return (False, "Process timed out")
-    monkeypatch.setattr(svc, "execute_and_stream_logs", _exec_timeout)
+    # Egress applies fine; the build step times out.
+    monkeypatch.setattr(
+        svc, "execute_and_stream_logs",
+        _make_esl(build=(False, "Process timed out")),
+    )
     monkeypatch.setattr(svc, "_cleanup_custom_build_artifacts", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM scratch\nRUN sleep 99999\n")
@@ -411,22 +461,18 @@ async def test_A6_build_hard_timeout(svc, monkeypatch):
 
 
 # ------------------------------------------------------------------
-# A.9 — `--network=none` enforced during build
+# A.9 — Build runs inside a sysbox DinD container WITH network (no
+#       --network=none), then the image is exported to the host.
 # ------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_A9_network_none_used_in_build_command(svc, monkeypatch):
-    """The docker build command emitted by `_custom_build_image` carries
-    `--network=none`, so `RUN curl ...` can't egress at build time."""
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_ssh_result())
-
-    captured: list[str] = []
-    async def _exec(**kwargs):
-        captured.append(kwargs.get("command", ""))
-        return (True, "")
-    monkeypatch.setattr(svc, "execute_and_stream_logs", _exec)
+async def test_A9_build_runs_in_sysbox_dind_with_network(svc, monkeypatch):
+    """`_custom_build_image` launches a sysbox DinD container, builds inside it
+    WITHOUT `--network=none`, firewalls egress, and exports the image."""
+    ssh_client = _make_dind_ssh()
+    esl = _make_esl()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
 
     payload = _base_payload(dockerfile_content="FROM alpine\nRUN curl -m 2 http://example.com\n")
@@ -437,9 +483,121 @@ async def test_A9_network_none_used_in_build_command(svc, monkeypatch):
         default_extra={"pod_id": payload.pod_id},
     )
     assert ok is True and step is None
-    # Must call docker build with --network=none
-    assert any("--network=none" in c for c in captured), captured
-    assert any(f"lium-build-{payload.pod_id}" in c for c in captured), captured
+
+    all_run = "\n".join(ssh_client.calls)
+    all_esl = "\n".join(esl.seen)
+    # DinD launched under sysbox-runc with the per-pod name.
+    assert "run -d --runtime=sysbox-runc" in all_run
+    assert f"lium-dind-build-{payload.pod_id}" in all_run
+    # Build happens inside the DinD container and NEVER with --network=none.
+    assert any("docker build" in c for c in esl.seen)
+    assert "--network=none" not in all_esl
+    # Egress firewall applied + image exported (save | load) onto the host.
+    assert any("--network=host" in c and "DOCKER-USER" in c for c in esl.seen)
+    assert any("docker save" in c and "docker load" in c for c in esl.seen)
+    assert any(f"lium-build-{payload.pod_id}" in c for c in esl.seen)
+
+
+# ------------------------------------------------------------------
+# A.12 — sysbox-runc unavailable → build_sysbox_unavailable, NO build attempted
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_A12_sysbox_unavailable_aborts_before_build(svc, monkeypatch):
+    ssh_client = _make_dind_ssh(sysbox=False)
+    esl = _make_esl()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert ok is False
+    assert step == "build_sysbox_unavailable"
+    # Never started a DinD container, never built (no runc fallback).
+    assert not any("run -d --runtime=sysbox-runc" in c for c in ssh_client.calls)
+    assert not any("docker build" in c for c in esl.seen)
+
+
+# ------------------------------------------------------------------
+# A.13 — egress firewall failure → build_egress_setup, NO build attempted
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_A13_egress_failure_aborts_before_build(svc, monkeypatch):
+    ssh_client = _make_dind_ssh()
+    esl = _make_esl(egress=(False, "DOCKER-USER chain not found"))
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert ok is False
+    assert step == "build_egress_setup"
+    # The build must NOT run when egress filtering can't be guaranteed.
+    assert not any("docker build" in c for c in esl.seen)
+    # But the DinD container is still torn down.
+    assert any(f"docker rm -f" in c and f"lium-dind-build-{payload.pod_id}" in c
+               for c in ssh_client.calls)
+
+
+# ------------------------------------------------------------------
+# A.14 — DinD container is always torn down (finally), even on success
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_A14_dind_container_always_torn_down(svc, monkeypatch):
+    ssh_client = _make_dind_ssh()
+    monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl())
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert ok is True and step is None
+    assert any(
+        "docker rm -f" in c and f"lium-dind-build-{payload.pod_id}" in c
+        for c in ssh_client.calls
+    ), ssh_client.calls
+
+
+# ------------------------------------------------------------------
+# A.15 — image export (save | load) failure → build_export
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_A15_export_failure_classifies_build_export(svc, monkeypatch):
+    ssh_client = _make_dind_ssh()
+    esl = _make_esl(export=(False, "Error: no space left on device"))
+    monkeypatch.setattr(svc, "execute_and_stream_logs", esl)
+    monkeypatch.setattr(svc, "stream_log", AsyncMock())
+
+    payload = _base_payload(dockerfile_content="FROM alpine\nRUN echo hi\n")
+    ok, step = await svc._custom_build_image(
+        ssh_client=ssh_client,
+        payload=payload,
+        log_tag="t",
+        default_extra={"pod_id": payload.pod_id},
+    )
+    assert ok is False
+    assert step == "build_export"
 
 
 # ------------------------------------------------------------------

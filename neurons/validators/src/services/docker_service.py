@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import math
 import random
 from dataclasses import dataclass
@@ -1650,26 +1651,101 @@ class DockerService:
     def _custom_build_scratch_dir(pod_id: str) -> str:
         return f"/tmp/lium-build-{pod_id}"
 
-    async def _write_dockerfile_via_heredoc(
+    @staticmethod
+    def _dind_container_name(pod_id: str) -> str:
+        return f"lium-dind-build-{pod_id}"
+
+    # Build context written inside the throwaway DinD container.
+    _DIND_BUILD_CONTEXT = "/build"
+
+    async def _write_dockerfile_into_dind(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-        scratch_dir: str,
+        dind_name: str,
         dockerfile_content: str,
     ) -> None:
-        """Write a Dockerfile to the executor without ever putting it on argv.
+        """Write the Dockerfile *inside* the DinD container without argv exposure.
 
-        We pipe via stdin to `tee` so arbitrary user content (including `EOF`
-        markers, backticks, `$(...)`) cannot escape into the shell.
+        Streams user content via stdin into `cat` (through `docker exec -i`) so
+        arbitrary content (`EOF` markers, backticks, `$(...)`) cannot escape into
+        the shell. Only the controlled container name reaches argv.
         """
-        # `tee` writes stdin verbatim. shlex-quote the destination path only.
-        dest = f"{scratch_dir}/Dockerfile"
-        command = f"/usr/bin/tee {shlex.quote(dest)} > /dev/null"
+        ctx = self._DIND_BUILD_CONTEXT
+        inner = f"mkdir -p {ctx} && cat > {ctx}/Dockerfile"
+        command = (
+            f"/usr/bin/docker exec -i {shlex.quote(dind_name)} "
+            f"sh -c {shlex.quote(inner)}"
+        )
         result = await ssh_client.run(command, input=dockerfile_content, check=False)
         if result.exit_status != 0:
             stderr = (result.stderr or "").strip()
             raise RuntimeError(
-                f"Failed to write Dockerfile to {dest!r}: exit={result.exit_status} stderr={stderr!r}"
+                f"Failed to write Dockerfile into {dind_name!r}: "
+                f"exit={result.exit_status} stderr={stderr!r}"
             )
+
+    @staticmethod
+    def _parse_egress_block_cidrs(raw: str) -> list[str]:
+        """Validate the configured egress-block CIDRs into shell-safe strings.
+
+        Invalid entries are dropped with a warning. 169.254.0.0/16 (cloud
+        metadata) is always included so a misconfiguration can never silently
+        re-expose the credential-theft vector.
+        """
+        cidrs: list[str] = []
+        for part in (raw or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                cidrs.append(str(ipaddress.ip_network(part, strict=False)))
+            except ValueError:
+                logger.warning(
+                    _m(
+                        "Ignoring invalid CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS entry",
+                        extra=get_extra_info({"entry": part}),
+                    )
+                )
+        metadata = "169.254.0.0/16"
+        if metadata not in cidrs:
+            cidrs.insert(0, metadata)
+        return cidrs
+
+    @staticmethod
+    def _egress_filter_script(dind_ip: str, cidrs: list[str], apply: bool) -> str:
+        """Backend-agnostic iptables script for the host DOCKER-USER chain.
+
+        Runs inside a `--network=host --cap-add=NET_ADMIN` helper container so it
+        edits the *host* netns regardless of where the validator SSH lands. The
+        fleet is mixed nft/legacy, so we pick whichever backend actually owns the
+        DOCKER-USER chain. Rules are scoped to the DinD container's source IP so
+        DinD-internal docker networking (172.x bridges) is never affected.
+
+        `dind_ip` and `cidrs` are pre-validated via `ipaddress`, so they are
+        shell-safe to interpolate.
+        """
+        lines = [
+            "IPT=iptables-nft",
+            "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
+        ]
+        if apply:
+            # No DOCKER-USER chain => egress filtering cannot be guaranteed. Fail
+            # loudly so the caller aborts rather than running the build open.
+            lines.append(
+                '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || '
+                '{ echo "DOCKER-USER chain not found" >&2; exit 3; }'
+            )
+            for c in cidrs:
+                lines.append(
+                    f"$IPT -C DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || "
+                    f"$IPT -I DOCKER-USER -s {dind_ip} -d {c} -j DROP"
+                )
+        else:
+            for c in cidrs:
+                lines.append(
+                    f"$IPT -D DOCKER-USER -s {dind_ip} -d {c} -j DROP 2>/dev/null || true"
+                )
+        return "; ".join(lines)
 
     async def _custom_build_image(
         self,
@@ -1688,9 +1764,13 @@ class DockerService:
         from core.config import settings
 
         pod_id = payload.pod_id
-        scratch_dir = self._custom_build_scratch_dir(pod_id)
         image_tag = self._custom_build_image_tag(pod_id)
+        dind_name = self._dind_container_name(pod_id)
+        ctx = self._DIND_BUILD_CONTEXT
         timeout_s = int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
+        ready_timeout_s = int(settings.CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS)
+        dind_image = settings.CUSTOM_DOCKERFILE_DIND_IMAGE
+        cidrs = self._parse_egress_block_cidrs(settings.CUSTOM_DOCKERFILE_EGRESS_BLOCK_CIDRS)
 
         # Defense-in-depth size cap. Route is authoritative; this is a wire-trust guard.
         max_bytes = int(settings.CUSTOM_DOCKERFILE_MAX_BYTES)
@@ -1707,112 +1787,265 @@ class DockerService:
             )
             return False, "build_input_oversize"
 
-        # 1. mkdir scratch dir
-        await self.stream_log(
-            f"Preparing custom build scratch dir {scratch_dir}", "success", log_tag
-        )
-        mkdir_cmd = f"/usr/bin/mkdir -p {shlex.quote(scratch_dir)}"
+        # 1. Preflight: sysbox-runc MUST be available. Never fall back to runc —
+        #    a silent fallback would run an internet-enabled build on the host
+        #    daemon with no user-namespace containment, defeating the design.
         try:
-            mkdir_res = await ssh_client.run(mkdir_cmd, check=False)
-            if mkdir_res.exit_status != 0:
-                raise RuntimeError(
-                    f"mkdir failed exit={mkdir_res.exit_status} stderr={(mkdir_res.stderr or '').strip()!r}"
+            info = await ssh_client.run(
+                "/usr/bin/docker info --format '{{json .Runtimes}}'", check=False
+            )
+            if info.exit_status != 0 or "sysbox-runc" not in (info.stdout or ""):
+                await self.stream_log(
+                    "sysbox-runc runtime unavailable on executor", "error", log_tag
                 )
+                logger.error(
+                    _m(
+                        "Custom build aborted: sysbox-runc unavailable",
+                        extra=get_extra_info(
+                            {**default_extra, "runtimes": (info.stdout or "").strip()}
+                        ),
+                    )
+                )
+                return False, "build_sysbox_unavailable"
         except Exception as exc:
             logger.error(
                 _m(
-                    "Custom build mkdir failed",
+                    "Custom build sysbox preflight failed",
                     extra=get_extra_info({**default_extra, "error": str(exc)}),
                 ),
                 exc_info=True,
             )
-            return False, "build_setup"
+            return False, "build_sysbox_unavailable"
 
-        # 2. write Dockerfile via stdin/tee
+        dind_ip: str | None = None
+        egress_applied = False
         try:
-            await self._write_dockerfile_via_heredoc(ssh_client, scratch_dir, content)
-        except Exception as exc:
-            logger.error(
-                _m(
-                    "Custom build Dockerfile write failed",
-                    extra=get_extra_info({**default_extra, "error": str(exc)}),
-                ),
-                exc_info=True,
+            # 2. Launch the throwaway DinD build container under sysbox-runc.
+            await self.stream_log(
+                f"Starting isolated build container {dind_name}", "success", log_tag
             )
-            return False, "build_setup"
-
-        # No explicit pre-build disk check — see DAH-2211 v1 decision.
-        # The 2026-06-12 staging incident (validator SSH lands inside the
-        # executor container, host /var/lib/docker invisible) showed a guard
-        # here is more likely to false-reject than to catch a real exhaustion
-        # case. Real disk failures surface from `docker build` itself as a
-        # docker_build CCF, which routes through the same accident-analysis
-        # bucket. v1.1 follow-up: per-build cgroup disk quota.
-
-        # 3. docker build (network=none, hard timeout)
-        # Use whatever builder the daemon defaults to: legacy hosts reject
-        # `--progress=plain` (BuildKit-only), and BuildKit hosts without the
-        # `buildx` plugin reject `DOCKER_BUILDKIT=1`. Letting Docker decide is
-        # the only setting that works across the heterogeneous executor fleet.
-        #
-        # Executor-runner images that ship Docker CLI without the `buildx`
-        # plugin emit a multi-line DEPRECATED notice on stderr when the CLI
-        # falls back to the legacy builder. `_stream_process_output` flips
-        # status=False on any stderr line — including the trailing blank line
-        # that follows the notice — so a successful build was being misread as
-        # `docker_build` failure. Drop the three DEPRECATED content lines AND
-        # any whitespace-only stderr lines. Real build errors (RUN failures,
-        # network-blocked, etc.) are non-blank content and still reach stderr;
-        # exit code is preserved by bash.
-        build_cmd = (
-            "bash -c " + shlex.quote(
-                '/usr/bin/docker build --network=none --pull -t "$1" "$2" '
-                '2> >(grep -vE '
-                r'"^(DEPRECATED:|[[:space:]]+Install the buildx component|'
-                r'[[:space:]]+https://docs\.docker\.com/go/buildx/|'
-                r'[[:space:]]*$)" '
-                '>&2)'
+            run_dind = (
+                f"/usr/bin/docker run -d --runtime=sysbox-runc "
+                f"--name {shlex.quote(dind_name)} "
+                f"--cpus={shlex.quote(str(settings.CUSTOM_DOCKERFILE_DIND_CPUS))} "
+                f"--memory={shlex.quote(str(settings.CUSTOM_DOCKERFILE_DIND_MEMORY))} "
+                f"{shlex.quote(dind_image)}"
             )
-            + f" _ {shlex.quote(image_tag)} {shlex.quote(scratch_dir)}"
-        )
-        try:
+            start_res = await ssh_client.run(run_dind, check=False)
+            if start_res.exit_status != 0:
+                logger.error(
+                    _m(
+                        "Custom build DinD start failed",
+                        extra=get_extra_info(
+                            {**default_extra, "stderr": (start_res.stderr or "").strip()}
+                        ),
+                    )
+                )
+                return False, "build_dind_start"
+
+            # 3. Wait for the inner dockerd to accept connections.
+            ready = False
+            for _ in range(max(1, ready_timeout_s)):
+                probe = await ssh_client.run(
+                    f"/usr/bin/docker exec {shlex.quote(dind_name)} docker info",
+                    check=False,
+                )
+                if probe.exit_status == 0:
+                    ready = True
+                    break
+                await asyncio.sleep(1)
+            if not ready:
+                logger.error(
+                    _m(
+                        "Custom build DinD dockerd not ready",
+                        extra=get_extra_info(
+                            {**default_extra, "ready_timeout_s": ready_timeout_s}
+                        ),
+                    )
+                )
+                return False, "build_dind_unready"
+
+            # 4. Resolve the DinD container IP and firewall its egress host-side
+            #    (block cloud metadata + RFC1918; full public internet stays open).
+            ip_res = await ssh_client.run(
+                "/usr/bin/docker inspect -f "
+                "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
+                f"{shlex.quote(dind_name)}",
+                check=False,
+            )
+            raw_ip = (ip_res.stdout or "").strip()
+            try:
+                dind_ip = str(ipaddress.ip_address(raw_ip))
+            except ValueError:
+                logger.error(
+                    _m(
+                        "Custom build could not resolve DinD container IP",
+                        extra=get_extra_info({**default_extra, "raw_ip": raw_ip}),
+                    )
+                )
+                return False, "build_egress_setup"
+
+            apply_script = self._egress_filter_script(dind_ip, cidrs, apply=True)
+            egress_cmd = (
+                f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
+                f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
+                f"-c {shlex.quote(apply_script)}"
+            )
             ok, err = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
-                command=build_cmd,
+                command=egress_cmd,
                 log_tag=log_tag,
-                log_text=f"Building custom image {image_tag}",
+                log_text="Applying build egress firewall",
+                log_extra={**default_extra, "dind_ip": dind_ip},
+                raise_exception=False,
+            )
+            if not ok:
+                # Cannot guarantee egress filtering -> never run the build open.
+                logger.error(
+                    _m(
+                        "Custom build egress firewall failed",
+                        extra=get_extra_info({**default_extra, "error": err}),
+                    )
+                )
+                return False, "build_egress_setup"
+            egress_applied = True
+
+            # 5. Write the Dockerfile into the DinD container (stdin, not argv).
+            await self.stream_log(
+                f"Preparing build context in {dind_name}", "success", log_tag
+            )
+            try:
+                await self._write_dockerfile_into_dind(ssh_client, dind_name, content)
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "Custom build Dockerfile write failed",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    ),
+                    exc_info=True,
+                )
+                return False, "build_setup"
+
+            # 6. Build INSIDE the DinD container WITH network enabled (no
+            #    --network=none). BuildKit streams progress to stderr and
+            #    `execute_and_stream_logs` treats any stderr as failure, so we
+            #    redirect build output to stdout (streamed as success logs) and
+            #    emit to stderr ONLY on non-zero exit — the streamer's signal.
+            inner_build = (
+                f"docker build --progress=plain --pull "
+                f"-t {shlex.quote(image_tag)} {shlex.quote(ctx)} 2>&1; "
+                f"rc=$?; [ $rc -ne 0 ] && echo BUILD_FAILED_RC=$rc >&2; exit $rc"
+            )
+            build_cmd = (
+                f"/usr/bin/docker exec {shlex.quote(dind_name)} "
+                f"sh -c {shlex.quote(inner_build)}"
+            )
+            try:
+                ok, err = await self.execute_and_stream_logs(
+                    ssh_client=ssh_client,
+                    command=build_cmd,
+                    log_tag=log_tag,
+                    log_text=f"Building custom image {image_tag}",
+                    log_extra={**default_extra, "build_image_tag": image_tag},
+                    timeout=timeout_s,
+                    raise_exception=False,
+                )
+            except Exception as exc:
+                logger.error(
+                    _m(
+                        "Custom build invocation failed",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    ),
+                    exc_info=True,
+                )
+                return False, "docker_build"
+            if not ok:
+                if "process timed out" in (err or "").lower():
+                    return False, "build_timeout"
+                return False, "docker_build"
+
+            # 7. Export the image from DinD and load it onto the host daemon so
+            #    the rental `docker run` (host-side) can use it.
+            await self.stream_log(
+                f"Loading built image {image_tag} onto host", "success", log_tag
+            )
+            export_cmd = (
+                f"/usr/bin/docker exec {shlex.quote(dind_name)} "
+                f"docker save {shlex.quote(image_tag)} | /usr/bin/docker load"
+            )
+            ok, err = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=export_cmd,
+                log_tag=log_tag,
+                log_text=f"Exporting custom image {image_tag}",
                 log_extra={**default_extra, "build_image_tag": image_tag},
                 timeout=timeout_s,
                 raise_exception=False,
             )
-        except Exception as exc:
-            logger.error(
+            if not ok:
+                if "process timed out" in (err or "").lower():
+                    return False, "build_timeout"
+                return False, "build_export"
+
+            return True, None
+        finally:
+            # Always tear down the throwaway container + its egress rules. The
+            # host-loaded image is removed later by _cleanup_custom_build_artifacts.
+            await self._teardown_dind_build(
+                ssh_client=ssh_client,
+                dind_name=dind_name,
+                dind_image=dind_image,
+                dind_ip=dind_ip if egress_applied else None,
+                cidrs=cidrs,
+                default_extra=default_extra,
+            )
+
+    async def _teardown_dind_build(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        dind_name: str,
+        dind_image: str,
+        dind_ip: str | None,
+        cidrs: list[str],
+        default_extra: dict,
+    ) -> None:
+        """Best-effort teardown of the throwaway DinD container + its egress rules.
+
+        Always called from `_custom_build_image`'s finally. Failures are logged,
+        never raised — the rental flow must not break on cleanup.
+        """
+        if dind_ip:
+            try:
+                remove_script = self._egress_filter_script(dind_ip, cidrs, apply=False)
+                await ssh_client.run(
+                    f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN "
+                    f"--entrypoint /bin/sh {shlex.quote(dind_image)} "
+                    f"-c {shlex.quote(remove_script)}",
+                    check=False,
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                logger.warning(
+                    _m(
+                        "Custom build egress rule teardown failed (non-fatal)",
+                        extra=get_extra_info(
+                            {**default_extra, "error": str(exc), "dind_ip": dind_ip}
+                        ),
+                    )
+                )
+        try:
+            await ssh_client.run(
+                f"/usr/bin/docker rm -f {shlex.quote(dind_name)} 2>/dev/null || true",
+                check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
                 _m(
-                    "Custom build invocation failed",
-                    extra=get_extra_info({**default_extra, "error": str(exc)}),
-                ),
-                exc_info=True,
+                    "Custom build DinD container teardown failed (non-fatal)",
+                    extra=get_extra_info(
+                        {**default_extra, "error": str(exc), "dind_name": dind_name}
+                    ),
+                )
             )
-            return False, "docker_build"
-
-        if not ok:
-            # Distinguish timeout / network-blocked vs generic build failure.
-            err_lc = (err or "").lower()
-            if "process timed out" in err_lc:
-                return False, "build_timeout"
-            # `--network=none` causes name-resolution / unreachable host messages.
-            network_markers = (
-                "could not resolve host",
-                "temporary failure in name resolution",
-                "network is unreachable",
-                "no route to host",
-                "name or service not known",
-            )
-            if any(m in err_lc for m in network_markers):
-                return False, "build_network_blocked"
-            return False, "docker_build"
-
-        return True, None
 
     async def _cleanup_custom_build_artifacts(
         self,

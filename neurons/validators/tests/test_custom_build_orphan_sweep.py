@@ -72,6 +72,34 @@ async def test_sweep_removes_orphan_image_and_scratch():
 
 
 @pytest.mark.asyncio
+async def test_sweep_removes_orphan_dind_container():
+    """DAH-2211: a leftover `lium-dind-build-*` container (validator crashed
+    mid-build) is force-removed unless its pod is still active."""
+    check = CustomBuildOrphanSweepCheck(interval_seconds=0)
+
+    ssh = AsyncMock()
+    calls: list[str] = []
+
+    async def _run(cmd, **kw):
+        calls.append(cmd)
+        if "docker ps -a" in cmd:
+            return _result(
+                stdout="lium-dind-build-POD-DEAD\nlium-dind-build-POD-ALIVE\n"
+            )
+        return _result()
+
+    ssh.run = _run
+    ctx = _make_ctx(executor_uuid="exec-1", active_pod_ids={"POD-ALIVE"}, ssh=ssh)
+
+    result = await check.run(ctx)
+    assert result.passed is True
+
+    dind_rm_calls = [c for c in calls if "docker rm -f lium-dind-build-" in c]
+    assert any("lium-dind-build-POD-DEAD" in c for c in dind_rm_calls)
+    assert not any("lium-dind-build-POD-ALIVE" in c for c in dind_rm_calls)
+
+
+@pytest.mark.asyncio
 async def test_sweep_respects_cadence():
     """Second invocation within the cadence window must NOT re-list / remove."""
     check = CustomBuildOrphanSweepCheck(interval_seconds=6 * 60 * 60)
