@@ -249,11 +249,11 @@ class DockerService:
         """Run `docker run` with same-command retry on known Docker races.
 
         DAH-1991: backend-spawned `health_check_*` probes (TTL ~30s) can land
-        on a port we already accepted into `port_maps` during the 20-60s gap
-        inside `create_container` (driven by `docker pull`,
-        `clean_existing_containers(sleep=10)`, and volume creation). Wait
-        through the probe's natural lifetime by retrying the same command on
-        a 90s budget. Non-port-allocated errors propagate immediately.
+        on a port we already accepted into `port_maps` during the gap inside
+        `create_container` (driven by `docker pull` and volume creation; the
+        former 10s `clean_existing_containers` sleep was removed in DAH-1524).
+        Wait through the probe's natural lifetime by retrying the same command
+        on a 90s budget. Non-port-allocated errors propagate immediately.
 
         DAH-2018: Docker reserves the container name during command parse,
         before port-bind. A port-bind failure therefore leaves a Created-state
@@ -875,8 +875,11 @@ class DockerService:
         command = f'/usr/bin/docker ps -a --format "{{{{.Names}}}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
-            # wait until the docker connection check is finished.
-            await asyncio.sleep(sleep)
+            # Optional pre-GC delay (default 0). DAH-1524 removed the 10s
+            # deploy-path sleep; the port-race it hedged is now covered by
+            # wait_for_port_check_containers + the 90s docker-run retry budget.
+            if sleep:
+                await asyncio.sleep(sleep)
 
             active_set = set(active_container_names) if active_container_names else set()
             active_volume_set = set(active_volume_names) if active_volume_names else set()
@@ -2226,11 +2229,19 @@ class DockerService:
                     protected_volume_names.add(local_volume)
 
                 current_step = "container_cleanup"
+                # DAH-1524: the GC below (force-removing stale pod_/filler_
+                # containers + their volumes that aren't in active_*) stays on the
+                # deploy path — it frees ports/volumes the new pod needs. The former
+                # `sleep=10` here was a vestigial hedge against the port-allocation
+                # race; that race is now handled by explicit, bounded mechanisms
+                # (force_remove_health_checks at the probe spawn site,
+                # wait_for_port_check_containers just before `docker run`, and the
+                # 90s _run_docker_create_with_port_retry budget), so we no longer
+                # block the critical path for ~10s. (sleep defaults to 0.)
                 await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     pod_name=container_name,
-                    sleep=10,
                     clear_volume=False if local_volume else True,
                     active_container_names=payload.active_container_names,
                     active_volume_names=payload.active_volume_names,
