@@ -416,3 +416,25 @@ def test_payload_without_ships_sshd_deserializes():
     )
     req = ContainerCreateRequest(**legacy)
     assert req.ships_sshd is None
+
+
+# ------------------------------------------------------------------
+# DAH-1524 — cleanup step no longer blocks the critical path on a 10s sleep
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deploy_cleanup_runs_without_blocking_sleep(svc, monkeypatch):
+    """The container-cleanup GC still runs on the deploy path, but the former
+    `sleep=10` is gone: create_container must NOT request a blocking sleep
+    (defaults to 0), so the cleanup no longer adds ~10s to the critical path.
+    The GC itself (clean_existing_containers) is still invoked."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    result = await _run(svc, _payload())
+
+    assert isinstance(result, ContainerCreated)
+    svc.clean_existing_containers.assert_awaited_once()
+    sleep_arg = svc.clean_existing_containers.await_args.kwargs.get("sleep", 0)
+    assert sleep_arg == 0, f"deploy path must not request a blocking sleep, got sleep={sleep_arg}"
