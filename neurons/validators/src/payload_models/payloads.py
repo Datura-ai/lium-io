@@ -264,6 +264,20 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" preserves the existing pull path byte-identically.
     dockerfile_content: str | None = None
+    # DAH-1524 (cached-template deploy): when truthy, the validator skips the
+    # ENTIRE post-creation sshd bootstrap (install_open_ssh_server_and_start_ssh_service
+    # -> sshd_bootstrap.sh). That bootstrap normally provides FOUR guarantees, ALL of
+    # which are surrendered when this flag is set:
+    #   (a) starts the sshd daemon                 (sshd_bootstrap.sh:110-117, main 166)
+    #   (b) generates host keys via `ssh-keygen -A` (sshd_bootstrap.sh:106)
+    #   (c) hardens config: PasswordAuthentication/KbdInteractive/ChallengeResponse no
+    #                                              (sshd_bootstrap.sh:89-99)
+    #   (d) installs a 30s self-heal restart watchdog (sshd_bootstrap.sh:119-156)
+    # Setting ships_sshd=True ASSERTS the image itself provides all four; the validator
+    # then only re-ensures ~/.ssh for key injection. None/False (default) preserves
+    # today's always-bootstrap behavior. Populated by lium-io-backend in a follow-up;
+    # ships inert here (no producer sets it yet).
+    ships_sshd: bool | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):

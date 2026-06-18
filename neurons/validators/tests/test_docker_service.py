@@ -1368,7 +1368,16 @@ async def test_create_container_uses_keepalives_and_docker_pull_timeout(
     import services.docker_service as docker_service_module
 
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+
+    # DAH-1524: the pull is now preceded by a `docker image inspect` probe.
+    # Report the image as ABSENT (exit !=0) so the pull this test asserts on
+    # still runs; all other ssh commands succeed.
+    def _ssh_run_side(cmd, *args, **kwargs):
+        if "image inspect" in cmd:
+            return _make_ssh_command_result(exit_status=1)
+        return _make_ssh_command_result()
+
+    ssh_client.run = AsyncMock(side_effect=_ssh_run_side)
     connect_mock = Mock(return_value=DummySSHConnectionManager(ssh_client))
     monkeypatch.setattr("services.docker_service.asyncssh.connect", connect_mock)
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
@@ -1451,7 +1460,16 @@ async def test_create_container_reports_docker_pull_failure_step(
     monkeypatch,
 ):
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+
+    # DAH-1524: report the image as ABSENT so the pull runs and the
+    # execute_and_stream_logs failure below is attributed to the docker_pull
+    # step (the inspect probe precedes the pull).
+    def _ssh_run_side(cmd, *args, **kwargs):
+        if "image inspect" in cmd:
+            return _make_ssh_command_result(exit_status=1)
+        return _make_ssh_command_result()
+
+    ssh_client.run = AsyncMock(side_effect=_ssh_run_side)
     monkeypatch.setattr(
         "services.docker_service.asyncssh.connect",
         Mock(return_value=DummySSHConnectionManager(ssh_client)),

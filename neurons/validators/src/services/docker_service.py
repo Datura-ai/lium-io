@@ -2359,20 +2359,61 @@ class DockerService:
                     })
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
                 else:
-                    current_step = "docker_pull"
-                    command = f"/usr/bin/docker pull {payload.docker_image}"
-                    await self.execute_and_stream_logs(
-                        ssh_client=ssh_client,
-                        command=command,
-                        log_tag=log_tag,
-                        log_text=f"Pulling docker image {payload.docker_image}",
-                        log_extra=default_extra,
-                        timeout=_DOCKER_PULL_TIMEOUT_SECONDS,
+                    # DAH-1524: skip the pull when the image is already present
+                    # locally (the executor pre-pulls cached templates). Probe with
+                    # `docker image inspect` (check=False so an absent image yields a
+                    # non-zero exit instead of a raised ProcessError). Fail-open:
+                    # ONLY exit 0 counts as present; anything else (including a probe
+                    # error) falls through to the pull, so the worst case is
+                    # identical to today (we pulled an image we didn't strictly need).
+                    current_step = "docker_image_inspect"
+                    image_present = False
+                    inspect_cmd = (
+                        f"/usr/bin/docker image inspect {payload.docker_image} "
+                        f">/dev/null 2>&1"
                     )
+                    try:
+                        inspect_result = await ssh_client.run(inspect_cmd, check=False)
+                        image_present = inspect_result.exit_status == 0
+                    except Exception as exc:
+                        image_present = False
+                        logger.warning(
+                            _m(
+                                "docker image inspect probe failed; falling back to pull",
+                                extra=get_extra_info({**default_extra, "error": str(exc)}),
+                            )
+                        )
 
-                    # Add profiler for docker pull
-                    profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    current_step = "docker_pull"
+                    if image_present:
+                        logger.info(
+                            _m(
+                                "Skipping docker pull; image already present locally",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
+                        # Keep the existing step name so before/after Loki queries
+                        # match; the ~0ms duration + "skipped" flag mark the skip.
+                        profilers.append({
+                            "name": "Docker pull step finished",
+                            "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp,
+                            "skipped": True,
+                        })
+                        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    else:
+                        command = f"/usr/bin/docker pull {payload.docker_image}"
+                        await self.execute_and_stream_logs(
+                            ssh_client=ssh_client,
+                            command=command,
+                            log_tag=log_tag,
+                            log_text=f"Pulling docker image {payload.docker_image}",
+                            log_extra=default_extra,
+                            timeout=_DOCKER_PULL_TIMEOUT_SECONDS,
+                        )
+
+                        # Add profiler for docker pull
+                        profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 port_flags = " ".join(
                     [
@@ -2658,12 +2699,35 @@ class DockerService:
                 # else:
                 try:
                     current_step = "ssh_bootstrap"
-                    await self.install_open_ssh_server_and_start_ssh_service(
-                        ssh_client=ssh_client,
-                        container_name=container_name,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                    )
+                    if payload.ships_sshd:
+                        # DAH-1524: the image asserts it ships+starts sshd (and
+                        # provides host keys, password-auth hardening, and a restart
+                        # supervisor — see ContainerCreateRequest.ships_sshd). Skip
+                        # the whole bootstrap.
+                        logger.info(
+                            _m(
+                                "Skipping SSH-server install; template ships sshd",
+                                extra=get_extra_info({**default_extra, "container_name": container_name}),
+                            )
+                        )
+                        # The bootstrap normally creates ~/.ssh (sshd_bootstrap.sh
+                        # prepare_sshd_runtime). The key-injection loop below has no
+                        # guard, so ensure the dir exists when we skip the install.
+                        # Home-resolution assumption: `docker run` carries no --user,
+                        # so `~` here, sshd_bootstrap.sh's /root/.ssh, and the key loop
+                        # all resolve to the same default-exec-user home.
+                        await ssh_client.run(
+                            f"/usr/bin/docker exec {container_name} "
+                            f"sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'",
+                            check=False,
+                        )
+                    else:
+                        await self.install_open_ssh_server_and_start_ssh_service(
+                            ssh_client=ssh_client,
+                            container_name=container_name,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
 
                     jupyter_url = None
                     if payload.enable_jupyter and jupyter_port_map:
@@ -2739,6 +2803,38 @@ class DockerService:
                         payload.executor_id,
                         payload.pod_id,
                     )
+
+                # DAH-1524: one structured, Loki-queryable summary of the deploy
+                # profile. Reuses the `profilers` list. Skipped steps appear at
+                # ~0ms (with "skipped": true) so before/after is visible. Success
+                # path only (per spec). Uses .get() so the mixed-shape list — the
+                # first entry can be timestamp-only with no "duration" key — never
+                # raises a KeyError into the outer except.
+                profile_steps = [
+                    {
+                        "name": p.get("name"),
+                        "duration_ms": p.get("duration"),
+                        "skipped": p.get("skipped", False),
+                    }
+                    for p in profilers
+                ]
+                # Sum of every step's duration. When the backend sends
+                # `payload.timestamp`, the backend->subnet queue/transit leg is
+                # captured inside the "Started in subnet" step (now - timestamp),
+                # so this total is end-to-end; otherwise it is subnet-internal time.
+                # The "Requested from backend" anchor has no "duration" and is excluded.
+                total_duration_ms = sum(p.get("duration", 0) or 0 for p in profilers)
+                logger.info(
+                    _m(
+                        "Deployment profile summary",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": container_name,
+                            "profile_steps": profile_steps,
+                            "total_duration_ms": total_duration_ms,
+                        }),
+                    )
+                )
 
                 return ContainerCreated(
                     miner_hotkey=payload.miner_hotkey,
