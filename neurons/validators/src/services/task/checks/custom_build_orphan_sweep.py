@@ -42,6 +42,11 @@ SWEEP_INTERVAL_SECONDS = 6 * 60 * 60
 # ``docker_service._custom_build_image_tag`` / ``_custom_build_scratch_dir``.
 BUILD_IMAGE_PREFIX = "lium-build-"
 BUILD_SCRATCH_PREFIX = "/tmp/lium-build-"
+# DAH-2211 — internet-enabled builds run in a throwaway sysbox DinD container
+# named ``lium-dind-build-{pod_id}`` (see ``docker_service._dind_container_name``).
+# Inline teardown removes it; this sweep mops up the validator-crashed-mid-build
+# leftover so a stale container does not pin CPU/mem/disk on the executor host.
+BUILD_DIND_PREFIX = "lium-dind-build-"
 
 
 class CustomBuildOrphanSweepCheck:
@@ -122,6 +127,42 @@ class CustomBuildOrphanSweepCheck:
             orphans.append(path)
         return orphans
 
+    async def _list_orphan_dind_containers(self, ssh, active_pod_ids: set[str]) -> list[str]:
+        """Return `lium-dind-build-*` container names whose pod_id is not active."""
+        cmd = (
+            f'/usr/bin/docker ps -a --filter "name={BUILD_DIND_PREFIX}" '
+            f'--format "{{{{.Names}}}}" 2>/dev/null || true'
+        )
+        try:
+            result = await ssh.run(cmd, check=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Custom build orphan sweep: docker ps failed: %s", exc)
+            return []
+        orphans: list[str] = []
+        for raw in (result.stdout or "").splitlines():
+            name = raw.strip()
+            if not name.startswith(BUILD_DIND_PREFIX):
+                continue
+            pod_id = name[len(BUILD_DIND_PREFIX):]
+            if not pod_id or pod_id in active_pod_ids:
+                continue
+            orphans.append(name)
+        return orphans
+
+    async def _remove_dind_container(self, ssh, name: str) -> bool:
+        # Defensive — only act on names matching our prefix.
+        if not name.startswith(BUILD_DIND_PREFIX):
+            return False
+        cmd = f'/usr/bin/docker rm -f {name} 2>/dev/null || true'
+        try:
+            await ssh.run(cmd, check=False)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Custom build orphan sweep: dind rm failed (%s): %s", name, exc
+            )
+            return False
+
     async def _remove_image(self, ssh, image_ref: str) -> bool:
         cmd = f'/usr/bin/docker image rm {image_ref} 2>/dev/null || true'
         try:
@@ -162,9 +203,10 @@ class CustomBuildOrphanSweepCheck:
 
         active_pod_ids = self._active_pod_ids(ctx)
         try:
-            orphan_images, orphan_scratch = await asyncio.gather(
+            orphan_images, orphan_scratch, orphan_dind = await asyncio.gather(
                 self._list_orphan_images(ctx.ssh, active_pod_ids),
                 self._list_orphan_scratch_dirs(ctx.ssh, active_pod_ids),
+                self._list_orphan_dind_containers(ctx.ssh, active_pod_ids),
             )
         except Exception as exc:  # noqa: BLE001 — non-fatal
             logger.warning(
@@ -177,18 +219,27 @@ class CustomBuildOrphanSweepCheck:
                 Msg.SWEPT,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"removed_image_count": 0, "removed_scratch_count": 0, "error": str(exc)},
+                what={
+                    "removed_image_count": 0,
+                    "removed_scratch_count": 0,
+                    "removed_dind_count": 0,
+                    "error": str(exc),
+                },
             )
             return CheckResult(passed=True, event=event)
 
         removed_images = 0
         removed_scratch = 0
+        removed_dind = 0
         for image_ref in orphan_images:
             if await self._remove_image(ctx.ssh, image_ref):
                 removed_images += 1
         for path in orphan_scratch:
             if await self._remove_scratch(ctx.ssh, path):
                 removed_scratch += 1
+        for name in orphan_dind:
+            if await self._remove_dind_container(ctx.ssh, name):
+                removed_dind += 1
 
         # Only update cadence timestamp on a successful run end-to-end; this way
         # a transient SSH failure (which we logged above and turned into an
@@ -202,8 +253,10 @@ class CustomBuildOrphanSweepCheck:
             what={
                 "removed_image_count": removed_images,
                 "removed_scratch_count": removed_scratch,
+                "removed_dind_count": removed_dind,
                 "removed_images": orphan_images,
                 "removed_scratch_paths": orphan_scratch,
+                "removed_dind_containers": orphan_dind,
                 "active_pod_ids": sorted(active_pod_ids),
             },
         )
