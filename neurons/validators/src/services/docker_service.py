@@ -2519,6 +2519,12 @@ class DockerService:
                     )
                     created_local_volume = True
 
+                    # DAH-1524: profile local volume sizing + creation on its own;
+                    # otherwise this SSH-bound time hides inside the broad
+                    # "container creation" bucket and looks like `docker run`.
+                    profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
 
                 if external_volume_info:
@@ -2555,6 +2561,12 @@ class DockerService:
                 # nvidia hook program; HostConfig.Devices is reapplied by Docker).
                 current_step = "gpu_flags"
                 gpu_flags = await build_gpu_flags(ssh_client, payload.gpu_uuids) + " "
+
+                # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
+                # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it
+                # apart from the docker run so a slow probe doesn't read as a slow run.
+                profilers.append({"name": "GPU device probe step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # CPU and memory restriction flags
                 # --cpus flag isn't working inside cvm. skip to use it when tdx_quote is present
@@ -2617,6 +2629,11 @@ class DockerService:
                     )
                 )
 
+                # DAH-1524: the pre-run wait can block on live backend health_check_*
+                # probes (up to retry_delay); keep it out of the docker-run measurement.
+                profilers.append({"name": "Port-check wait step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+
                 try:
                     current_step = "docker_run"
                     await self._run_docker_create_with_port_retry(
@@ -2630,6 +2647,12 @@ class DockerService:
                     )
 
                     logger.info(f"Container creation step finished")
+
+                    # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
+                    # --gpus prestart hook, +sysbox/storage-opt) from the post-run
+                    # running-state poll below.
+                    profilers.append({"name": "Docker run step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                     # check if the container is running correctly
                     current_step = "container_health_check"
@@ -2686,8 +2709,8 @@ class DockerService:
                         )
                     raise
 
-                # Add profiler for docker container creation
-                profilers.append({"name": "Docker container creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                # Add profiler for the post-run container running-state poll
+                profilers.append({"name": "Container running check step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 logger.info(
