@@ -114,6 +114,23 @@ async def test_nvml_digest_check_allows_driver_595_71_05(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_nvml_digest_check_allows_driver_580_167_08(context_factory):
+    specs = {
+        "gpu": {"driver": "580.167.08"},
+        "md5_checksums": {
+            "libnvidia_ml": "fa0c084327835d0369e5307a1ba3a882:c7eac74626efce631035360d6a5d1f9d72b02d81739ab0adbf0521f6c6a0f10a",
+        },
+    }
+    ctx = context_factory(state=build_state(specs=specs))
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.DIGEST_OK.reason
+    assert "clear_verified_job_info" not in result.updates
+
+
+@pytest.mark.asyncio
 async def test_nvml_digest_check_allows_driver_610_43_02(context_factory):
     specs = {
         "gpu": {"driver": "610.43.02"},
