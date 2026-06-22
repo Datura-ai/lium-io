@@ -42,6 +42,8 @@ from payload_models.payloads import (
     CustomOptions,
     ContainerWarningCode,
     PayloadPortMapping,
+    ProfilerStep,
+    ProfilerStepName,
     WorkloadKind,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
@@ -1878,11 +1880,11 @@ class DockerService:
         # Deploy container profiler
         profilers = []
         if payload.timestamp:
-            profilers.append({"name": "Requested from backend", "timestamp": payload.timestamp})
+            profilers.append(ProfilerStep(name=ProfilerStepName.REQUESTED_FROM_BACKEND, timestamp=payload.timestamp))
             prev_timestamp = payload.timestamp
         else:
             prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
-        profilers.append({"name": "Started in subnet", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+        profilers.append(ProfilerStep(name=ProfilerStepName.STARTED_IN_SUBNET, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
         prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
         logger.info(
@@ -1944,7 +1946,7 @@ class DockerService:
             )
 
             # Add profiler for port mappings generation
-            profilers.append({"name": "Port mappings generated", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+            profilers.append(ProfilerStep(name=ProfilerStepName.PORT_MAPPINGS_GENERATED, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
             prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
             if not port_maps:
@@ -2055,7 +2057,7 @@ class DockerService:
                 keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
             ) as ssh_client:
                 # Add profiler for ssh connection
-                profilers.append({"name": "SSH connection established", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                profilers.append(ProfilerStep(name=ProfilerStepName.SSH_CONNECTION_ESTABLISHED, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # set real-time logging
@@ -2089,7 +2091,7 @@ class DockerService:
                     )
 
                 # Add profiler for docker login
-                profilers.append({"name": "Docker login step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_LOGIN, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # DAH-2211: when `dockerfile_content` is set, build the image
@@ -2123,10 +2125,7 @@ class DockerService:
                     effective_image = self._custom_build_image_tag(payload.pod_id)
                     default_extra = {**default_extra, "docker_image": effective_image}
                     payload.docker_image = effective_image
-                    profilers.append({
-                        "name": "Custom docker build step finished",
-                        "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp,
-                    })
+                    profilers.append(ProfilerStep(name=ProfilerStepName.CUSTOM_DOCKER_BUILD, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
                 else:
                     # DAH-1524: skip the pull when the image is already present
@@ -2164,11 +2163,7 @@ class DockerService:
                         )
                         # Keep the existing step name so before/after Loki queries
                         # match; the ~0ms duration + "skipped" flag mark the skip.
-                        profilers.append({
-                            "name": "Docker pull step finished",
-                            "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp,
-                            "skipped": True,
-                        })
+                        profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_PULL, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp, skipped=True))
                         prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
                     else:
                         command = f"/usr/bin/docker pull {payload.docker_image}"
@@ -2182,7 +2177,7 @@ class DockerService:
                         )
 
                         # Add profiler for docker pull
-                        profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_PULL, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                         prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 port_flags = " ".join(
@@ -2254,7 +2249,7 @@ class DockerService:
                 )
 
                 # Add profiler for docker volume creation
-                profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                profilers.append(ProfilerStep(name=ProfilerStepName.CONTAINER_CLEANING, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # Effective limits default to the backend-sent values (legacy /
@@ -2289,7 +2284,7 @@ class DockerService:
                     # DAH-1524: profile local volume sizing + creation on its own;
                     # otherwise this SSH-bound time hides inside the broad
                     # "container creation" bucket and looks like `docker run`.
-                    profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_VOLUME_CREATION, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
@@ -2304,7 +2299,7 @@ class DockerService:
                     )
                     if success:
                         # Add profiler for docker volume creation
-                        profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_VOLUME_CREATION, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                         prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
                         # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
                         payload.is_sysbox = False
@@ -2312,7 +2307,7 @@ class DockerService:
                         volume_flag += f" -v {external_volume_info.name}:/mnt"
                     else:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
-                        profilers.append({"name": "Docker volume creation step failed", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
 
                 # Network permission flags (permission to create a network interface inside the container)
@@ -2332,7 +2327,7 @@ class DockerService:
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it
                 # apart from the docker run so a slow probe doesn't read as a slow run.
-                profilers.append({"name": "GPU device probe step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                profilers.append(ProfilerStep(name=ProfilerStepName.GPU_DEVICE_PROBE, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 # CPU and memory restriction flags
@@ -2398,7 +2393,7 @@ class DockerService:
 
                 # DAH-1524: the pre-run wait can block on live backend health_check_*
                 # probes (up to retry_delay); keep it out of the docker-run measurement.
-                profilers.append({"name": "Port-check wait step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                profilers.append(ProfilerStep(name=ProfilerStepName.PORT_CHECK_WAIT, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 try:
@@ -2418,7 +2413,7 @@ class DockerService:
                     # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
                     # --gpus prestart hook, +sysbox/storage-opt) from the post-run
                     # running-state poll below.
-                    profilers.append({"name": "Docker run step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_RUN, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                     # check if the container is running correctly
@@ -2477,7 +2472,7 @@ class DockerService:
                     raise
 
                 # Add profiler for the post-run container running-state poll
-                profilers.append({"name": "Container running check step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                profilers.append(ProfilerStep(name=ProfilerStepName.CONTAINER_RUNNING_CHECK, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                 prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                 logger.info(
@@ -2547,7 +2542,7 @@ class DockerService:
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
                     # Add profiler for ssh service installation
-                    profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    profilers.append(ProfilerStep(name=ProfilerStepName.SSH_SERVICE_INSTALLATION, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                     # add rest of public keys
@@ -2571,7 +2566,7 @@ class DockerService:
                                     print(f"Failed to set environment variable {k}: {e}")
 
                     # Add profiler for adding public keys
-                    profilers.append({"name": "Adding public keys step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                    profilers.append(ProfilerStep(name=ProfilerStepName.ADDING_PUBLIC_KEYS, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
                     prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
 
                     await self.finish_stream_logs()
@@ -2596,7 +2591,7 @@ class DockerService:
                     raise
 
                 # Add profiler for ssh service installation
-                profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                profilers.append(ProfilerStep(name=ProfilerStepName.FINISHED_IN_SUBNET, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
 
                 if payload.workload_kind == WorkloadKind.FILLER:
                     await self.redis_service.remove_pending_pod(
@@ -2606,16 +2601,16 @@ class DockerService:
                     )
 
                 # DAH-1524: one structured, Loki-queryable summary of the deploy
-                # profile. Reuses the `profilers` list. Skipped steps appear at
-                # ~0ms (with "skipped": true) so before/after is visible. Success
-                # path only (per spec). Uses .get() so the mixed-shape list — the
-                # first entry can be timestamp-only with no "duration" key — never
-                # raises a KeyError into the outer except.
+                # profile. Reuses the `profilers` list (now typed `ProfilerStep`s).
+                # Skipped steps appear at ~0ms (with "skipped": true) so before/after
+                # is visible. Success path only (per spec). The anchor step has
+                # `duration is None`, so it surfaces as `duration_ms: null` and is
+                # excluded from the total.
                 profile_steps = [
                     {
-                        "name": p.get("name"),
-                        "duration_ms": p.get("duration"),
-                        "skipped": p.get("skipped", False),
+                        "name": p.name.value,
+                        "duration_ms": p.duration,
+                        "skipped": p.skipped,
                     }
                     for p in profilers
                 ]
@@ -2623,8 +2618,8 @@ class DockerService:
                 # `payload.timestamp`, the backend->subnet queue/transit leg is
                 # captured inside the "Started in subnet" step (now - timestamp),
                 # so this total is end-to-end; otherwise it is subnet-internal time.
-                # The "Requested from backend" anchor has no "duration" and is excluded.
-                total_duration_ms = sum(p.get("duration", 0) or 0 for p in profilers)
+                # The "Requested from backend" anchor has no duration and is excluded.
+                total_duration_ms = sum(p.duration or 0 for p in profilers)
                 logger.info(
                     _m(
                         "Deployment profile summary",
