@@ -62,7 +62,19 @@ from services.redis_service import (
     RedisService,
 )
 from services.attestation_service import AttestationService, AttestationError
-from services.nvidia_devices import build_gpu_flags
+from services.nvidia_devices import build_gpu_docker_config_for_executor
+from services.rental_docker_sdk import (
+    ContainerExecSpec,
+    ContainerRunSpec,
+    DeviceMount,
+    PortBinding,
+    RentalDockerSdkClient,
+    RentalDockerSdkClientFactory,
+    VolumeMount,
+    build_authorized_keys_exec_spec,
+    build_container_command_argv,
+    build_environment_exec_spec,
+)
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -223,10 +235,14 @@ class DockerService:
         ssh_service: Annotated[SSHService, Depends(SSHService)],
         redis_service: Annotated[RedisService, Depends(RedisService)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
+        rental_docker_client_factory: RentalDockerSdkClientFactory | None = None,
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
         self.attestation_service = attestation_service
+        self.rental_docker_client_factory = (
+            rental_docker_client_factory or RentalDockerSdkClientFactory()
+        )
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
         self.log_task: asyncio.Task | None = None
@@ -387,6 +403,157 @@ class DockerService:
                     continue
 
                 raise
+
+    async def _run_rental_docker_create_with_port_retry(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        ssh_client: asyncssh.SSHClientConnection,
+        run_spec: ContainerRunSpec,
+        container_name: str,
+        default_extra: dict,
+        local_volume: str | None = None,
+    ) -> None:
+        deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
+        attempt = 0
+        vloopback_mount_repair_attempted = False
+        while True:
+            try:
+                await docker_client.run_container(run_spec)
+                return
+            except Exception as exc:
+                if _should_repair_stale_mountpoint(
+                    exc,
+                    local_volume,
+                    vloopback_mount_repair_attempted,
+                ):
+                    vloopback_mount_repair_attempted = True
+                    if await self.repair_stale_vloopback_mountpoint(
+                        ssh_client,
+                        local_volume,
+                        default_extra,
+                    ):
+                        logger.info(
+                            _m(
+                                "VLOOPBACK_STALE_MOUNTPOINT_RETRY",
+                                extra=get_extra_info(
+                                    {**default_extra, "local_volume": local_volume}
+                                ),
+                            )
+                        )
+                        continue
+
+                port_allocation_phrase = next(
+                    (phrase for phrase in _PORT_ALLOCATED_PHRASES if phrase in str(exc)),
+                    None,
+                )
+                port_retry_deadline_expired = time.monotonic() >= deadline
+                port_retry_needed = bool(port_allocation_phrase) and not port_retry_deadline_expired
+                if port_retry_needed:
+                    attempt += 1
+                    logger.info(
+                        _m(
+                            "PORT_ALREADY_ALLOCATED_RETRY",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "attempt": attempt,
+                                "remaining_sec": int(deadline - time.monotonic()),
+                                "sleep_seconds": _PORT_ALLOCATED_RETRY_SLEEP_SEC,
+                                "port_allocation_phrase": port_allocation_phrase,
+                            }),
+                        )
+                    )
+                    await asyncio.sleep(_PORT_ALLOCATED_RETRY_SLEEP_SEC)
+                    await self._remove_failed_rental_container_for_retry(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        default_extra=default_extra,
+                        warning_event="PORT_RETRY_STALE_RM_FAILED",
+                    )
+                    continue
+
+                raise
+
+    async def _remove_failed_rental_container_for_retry(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        container_name: str,
+        default_extra: dict,
+        warning_event: str,
+    ) -> None:
+        try:
+            await docker_client.remove_container(
+                container_name=container_name,
+                force=True,
+                remove_volumes=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as rm_exc:
+            logger.warning(
+                _m(
+                    warning_event,
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": container_name,
+                        "rm_error": str(rm_exc),
+                    }),
+                )
+            )
+
+    def _build_rental_container_run_spec(
+        self,
+        *,
+        payload: ContainerCreateRequest,
+        container_name: str,
+        custom_options: CustomOptions,
+        port_maps: list[tuple[int, int, int]],
+        local_volume: str,
+        local_volume_path: str,
+        external_volume_name: str | None,
+        gpu_devices,
+        effective_storage_limit_gb: int | None,
+        cpu_count: int | None,
+    ) -> ContainerRunSpec:
+        environment = {
+            key: str(value)
+            for key, value in (custom_options.environment or {}).items()
+            if key and value and key.strip() and str(value).strip()
+        }
+        environment["NVIDIA_DRIVER_CAPABILITIES"] = "all"
+
+        volumes = [VolumeMount(source=local_volume, target=local_volume_path)]
+        if external_volume_name:
+            volumes.append(VolumeMount(source=external_volume_name, target="/mnt"))
+
+        devices = (
+            DeviceMount(path_on_host="/dev/net/tun", path_in_container="/dev/net/tun"),
+            *gpu_devices.device_mounts,
+        )
+
+        return ContainerRunSpec(
+            image=payload.docker_image,
+            name=container_name,
+            command=build_container_command_argv(custom_options.startup_commands),
+            environment=environment,
+            ports=tuple(
+                PortBinding(container_port=docker_port, host_port=internal_port)
+                for docker_port, internal_port, _ in port_maps
+            ),
+            volumes=tuple(volumes),
+            restart_policy="unless-stopped",
+            runtime="sysbox-runc" if payload.is_sysbox else None,
+            cap_add=("NET_ADMIN",),
+            sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
+            devices=devices,
+            device_requests=gpu_devices.device_requests,
+            cpu_count=cpu_count,
+            memory_gb=payload.memory_gb,
+            storage_limit_gb=effective_storage_limit_gb,
+            shm_size=custom_options.shm_size,
+            entrypoint=custom_options.entrypoint,
+        )
 
     async def _remove_failed_container_for_retry(
         self,
@@ -1224,6 +1391,209 @@ class DockerService:
             )
 
         return success
+
+    async def install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+        self,
+        docker_client: RentalDockerSdkClient,
+        *,
+        container_name: str,
+        log_tag: str,
+        log_extra: dict,
+    ) -> bool:
+        local_script_path = self._ssh_bootstrap_script_path()
+        container_path = IN_CONTAINER_SSH_BOOTSTRAP_PATH
+
+        try:
+            script_content = local_script_path.read_text()
+        except Exception as exc:
+            await self.stream_log("Failed to read SSH bootstrap script", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to read SSH bootstrap script",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "local_script_path": str(local_script_path),
+                        "error": str(exc),
+                    }),
+                ),
+                exc_info=True,
+            )
+            return False
+
+        create_spec = ContainerExecSpec(
+            container_name=container_name,
+            argv=(
+                "sh",
+                "-c",
+                f"cat > {shlex.quote(container_path)} "
+                f"&& chmod +x {shlex.quote(container_path)}",
+            ),
+            stdin=script_content,
+        )
+        run_spec = ContainerExecSpec(
+            container_name=container_name,
+            argv=("sh", container_path),
+        )
+
+        try:
+            create_result = await docker_client.exec_in_container(create_spec)
+        except Exception as exc:
+            await self.stream_log(
+                "Failed to create SSH bootstrap script in container",
+                "error",
+                log_tag,
+            )
+            logger.warning(
+                _m(
+                    "Failed to create SSH bootstrap script in container",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "container_path": container_path,
+                        "error": str(exc),
+                    }),
+                ),
+                exc_info=True,
+            )
+            return False
+
+        if create_result.exit_status != 0:
+            await self.stream_log(
+                "Failed to create SSH bootstrap script in container",
+                "error",
+                log_tag,
+            )
+            logger.warning(
+                _m(
+                    "Failed to create SSH bootstrap script in container",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "container_path": container_path,
+                        "exit_status": create_result.exit_status,
+                        "stdout": create_result.stdout,
+                        "stderr": create_result.stderr,
+                    }),
+                )
+            )
+            return False
+
+        run_result = await docker_client.exec_in_container(run_spec)
+        if run_result.exit_status != 0:
+            await self.stream_log(
+                run_result.stderr or run_result.stdout or "SSH bootstrap script failed",
+                "error",
+                log_tag,
+            )
+            logger.warning(
+                _m(
+                    "SSH bootstrap script finished with errors",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "exit_status": run_result.exit_status,
+                        "stdout": run_result.stdout,
+                        "stderr": run_result.stderr,
+                    }),
+                )
+            )
+            return False
+
+        return True
+
+    async def add_ssh_public_keys_with_rental_docker(
+        self,
+        docker_client: RentalDockerSdkClient,
+        *,
+        container_name: str,
+        public_keys: list[str] | tuple[str, ...],
+        log_tag: str,
+        log_extra: dict,
+    ) -> None:
+        exec_spec = build_authorized_keys_exec_spec(
+            container_name=container_name,
+            public_keys=public_keys,
+        )
+        result = await docker_client.exec_in_container(exec_spec)
+        if result.exit_status != 0:
+            await self.stream_log(
+                result.stderr or result.stdout or "Failed to add SSH public keys",
+                "error",
+                log_tag,
+            )
+            logger.warning(
+                _m(
+                    "Failed to add SSH public keys",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "exit_status": result.exit_status,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }),
+                )
+            )
+            raise Exception(
+                "Failed to add SSH public keys: "
+                f"exit_status={result.exit_status}; "
+                f"stderr={result.stderr}; stdout={result.stdout}"
+            )
+
+    async def add_environment_variables_with_rental_docker(
+        self,
+        docker_client: RentalDockerSdkClient,
+        *,
+        container_name: str,
+        environment: dict[str, str] | None,
+        log_tag: str,
+        log_extra: dict,
+    ) -> bool:
+        exec_spec = build_environment_exec_spec(
+            container_name=container_name,
+            environment=environment,
+        )
+        if exec_spec is None:
+            return True
+
+        try:
+            result = await docker_client.exec_in_container(exec_spec)
+        except Exception as exc:
+            await self.stream_log("Failed to set environment variables", "error", log_tag)
+            logger.warning(
+                _m(
+                    "Failed to set environment variables",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "error": str(exc),
+                    }),
+                ),
+                exc_info=True,
+            )
+            return False
+
+        if result.exit_status != 0:
+            await self.stream_log(
+                result.stderr or result.stdout or "Failed to set environment variables",
+                "error",
+                log_tag,
+            )
+            logger.warning(
+                _m(
+                    "Failed to set environment variables",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "exit_status": result.exit_status,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }),
+                )
+            )
+            return False
+
+        return True
 
     async def create_s3fs_volume(
         self,
@@ -2352,15 +2722,21 @@ class DockerService:
                 )
 
             current_step = "ssh_connect"
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=executor_info.ssh_port,
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=known_hosts_policy,
-                keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
-                keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
-            ) as ssh_client:
+            async with (
+                asyncssh.connect(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=known_hosts_policy,
+                    keepalive_interval=_CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC,
+                    keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
+                ) as ssh_client,
+                self.rental_docker_client_factory.connect(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                ) as docker_client,
+            ):
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
                 prev_timestamp = now_ms()
@@ -2383,25 +2759,27 @@ class DockerService:
                 # )
                 if payload.docker_username and payload.docker_password:
                     current_step = "docker_login"
-                    command = self._build_docker_login_command(
-                        payload.docker_username, payload.docker_password
-                    )
-                    await self.execute_and_stream_logs(
-                        ssh_client=ssh_client,
-                        command=command,
-                        log_tag=log_tag,
-                        log_text=f"Logging in to Docker registry as {payload.docker_image}",
-                        log_extra=default_extra,
-                        raise_exception=False
-                    )
+                    try:
+                        await docker_client.login(
+                            username=payload.docker_username,
+                            password=payload.docker_password,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            _m(
+                                "Docker registry login failed",
+                                extra=get_extra_info({**default_extra, "error": str(exc)}),
+                            ),
+                            exc_info=True,
+                        )
 
                 # Add profiler for docker login
                 profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_LOGIN, prev_timestamp))
                 prev_timestamp = now_ms()
 
-                # DAH-2211: when `dockerfile_content` is set, build the image
-                # on the executor instead of pulling. Otherwise the existing
-                # `docker pull` path runs byte-identically.
+                # When `dockerfile_content` is set, build the image on the executor
+                # instead of pulling. Otherwise pull the requested image through the
+                # rental Docker SDK client.
                 if is_custom_build:
                     current_step = "docker_build"
                     build_ok, build_failure_step = await self._custom_build_image(
@@ -2433,95 +2811,20 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.CUSTOM_DOCKER_BUILD, prev_timestamp))
                     prev_timestamp = now_ms()
                 else:
-                    # DAH-1524: skip the pull when the image is already present
-                    # locally (the executor pre-pulls cached templates). Probe with
-                    # `docker image inspect` (check=False so an absent image yields a
-                    # non-zero exit instead of a raised ProcessError). Fail-open:
-                    # ONLY exit 0 counts as present; anything else (including a probe
-                    # error) falls through to the pull, so the worst case is
-                    # identical to today (we pulled an image we didn't strictly need).
-                    current_step = "docker_image_inspect"
-                    image_present = False
-                    inspect_cmd = (
-                        f"/usr/bin/docker image inspect {payload.docker_image} "
-                        f">/dev/null 2>&1"
-                    )
-                    try:
-                        inspect_result = await ssh_client.run(inspect_cmd, check=False)
-                        image_present = inspect_result.exit_status == 0
-                    except Exception as exc:
-                        image_present = False
-                        logger.warning(
-                            _m(
-                                "docker image inspect probe failed; falling back to pull",
-                                extra=get_extra_info({**default_extra, "error": str(exc)}),
-                            )
-                        )
-
                     current_step = "docker_pull"
-                    if image_present:
-                        logger.info(
-                            _m(
-                                "Skipping docker pull; image already present locally",
-                                extra=get_extra_info(default_extra),
-                            )
-                        )
-                        # Keep the existing step name so before/after Loki queries
-                        # match; the ~0ms duration + "skipped" flag mark the skip.
-                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp, skipped=True))
-                        prev_timestamp = now_ms()
-                    else:
-                        command = f"/usr/bin/docker pull {payload.docker_image}"
-                        await self.execute_and_stream_logs(
-                            ssh_client=ssh_client,
-                            command=command,
-                            log_tag=log_tag,
-                            log_text=f"Pulling docker image {payload.docker_image}",
-                            log_extra=default_extra,
-                            timeout=_DOCKER_PULL_TIMEOUT_SECONDS,
-                        )
+                    await self.stream_log(
+                        f"Pulling docker image {payload.docker_image}",
+                        "success",
+                        log_tag,
+                    )
+                    await docker_client.pull(image=payload.docker_image)
 
-                        # Add profiler for docker pull
-                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
-                        prev_timestamp = now_ms()
-
-                port_flags = " ".join(
-                    [
-                        f"-p {internal_port}:{docker_port}"
-                        for docker_port, internal_port, _ in port_maps
-                    ]
-                )
+                    # Add profiler for docker pull
+                    profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
+                    prev_timestamp = now_ms()
 
                 # Get the container path from the first volume
                 local_volume_path = custom_options.volumes[0].split(':')[-1] if custom_options.volumes else '/root'
-                entrypoint_flag = (
-                    f"--entrypoint {custom_options.entrypoint}"
-                    if custom_options
-                    and custom_options.entrypoint
-                    and custom_options.entrypoint.strip()
-                    else ""
-                )
-                shm_size_flag = (
-                    f"--shm-size {custom_options.shm_size}"
-                    if custom_options and custom_options.shm_size
-                    else ""
-                )
-                env_flags = (
-                    " ".join(
-                        [
-                            f"-e '{key}={value}'"
-                            for key, value in custom_options.environment.items()
-                            if key and value and key.strip() and value.strip()
-                        ]
-                        + ["-e NVIDIA_DRIVER_CAPABILITIES=all"]
-                    )
-                    if custom_options and custom_options.environment
-                    else "-e NVIDIA_DRIVER_CAPABILITIES=all"
-                )
-                startup_commands = build_startup_command_args(
-                    custom_options.startup_commands if custom_options else None
-                )
-
                 container_name = self.get_container_name(payload)
                 created_local_volume = False
                 protected_volume_names = set(payload.active_volume_names or [])
@@ -2601,8 +2904,7 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
                     prev_timestamp = now_ms()
 
-                volume_flag = f"-v {local_volume}:{local_volume_path}"
-
+                external_volume_name = None
                 if external_volume_info:
                     current_step = "external_volume_creation"
                     success, msg = await self.create_s3fs_volume(
@@ -2618,25 +2920,21 @@ class DockerService:
                         # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
                         payload.is_sysbox = False
 
-                        volume_flag += f" -v {external_volume_info.name}:/mnt"
+                        external_volume_name = external_volume_info.name
                     else:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, prev_timestamp))
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
 
-                # Network permission flags (permission to create a network interface inside the container)
-                net_perm_flags = (
-                    "--cap-add=NET_ADMIN "
-                    "--sysctl net.ipv4.conf.all.src_valid_mark=1 "
-                    "--device /dev/net/tun "
-                )
-
-                # GPU flags. --gpus injects userspace libs (libnvidia-ml.so, nvidia-smi);
+                # GPU options. --gpus injects userspace libs (libnvidia-ml.so, nvidia-smi);
                 # explicit --device entries persist the device cgroup across systemd
                 # daemon-reload (cgroup v2 + systemd cgroup driver wipe the transient
                 # nvidia hook program; HostConfig.Devices is reapplied by Docker).
                 current_step = "gpu_flags"
-                gpu_flags = await build_gpu_flags(ssh_client, payload.gpu_uuids) + " "
+                gpu_config = await build_gpu_docker_config_for_executor(
+                    ssh_client,
+                    payload.gpu_uuids,
+                )
 
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it
@@ -2647,35 +2945,26 @@ class DockerService:
                 # CPU and memory restriction flags
                 # --cpus flag isn't working inside cvm. skip to use it when tdx_quote is present
                 # TODO: remove this when cvm is fixed
-                if executor_info.tdx_quote: 
-                    cpu_flag = ""
-                else:
-                    cpu_flag = f"--cpus {payload.cpu_count} " if payload.cpu_count else ""
-                memory_flag = f"--memory {payload.memory_gb}g " if payload.memory_gb else ""
-                
-                storage_flag = f"--storage-opt size={effective_storage_limit_gb}g " if effective_storage_limit_gb else ""
-
-                command = (
-                    f'/usr/bin/docker run -d '
-                    f'{"--runtime=sysbox-runc " if payload.is_sysbox else ""}'
-                    f'{net_perm_flags} '  # Network permission flags
-                    f'{port_flags} '
-                    f'{volume_flag} '
-                    f'{entrypoint_flag} '
-                    f'{env_flags} '
-                    f'{shm_size_flag} '
-                    f'{gpu_flags} '  # GPU restriction flags
-                    f'{cpu_flag} '  # CPU restriction flags
-                    f'{memory_flag} '  # Memory restriction flags
-                    f'{storage_flag} '  # Storage restriction flags
-                    f'--restart unless-stopped '
-                    f'--name {container_name} '
-                    f'{payload.docker_image} '
-                    f'{startup_commands}'
+                cpu_count = None if executor_info.tdx_quote else payload.cpu_count
+                run_spec = self._build_rental_container_run_spec(
+                    payload=payload,
+                    container_name=container_name,
+                    custom_options=custom_options,
+                    port_maps=port_maps,
+                    local_volume=local_volume,
+                    local_volume_path=local_volume_path,
+                    external_volume_name=external_volume_name,
+                    gpu_devices=gpu_config,
+                    effective_storage_limit_gb=effective_storage_limit_gb,
+                    cpu_count=cpu_count,
                 )
 
-                timeout = 120
-                logger.info(f"Running command: {command} with timeout={timeout}")
+                logger.info(
+                    _m(
+                        "Creating docker container with SDK",
+                        extra=get_extra_info({**default_extra, "container_name": container_name}),
+                    )
+                )
 
                 # DAH-2018: re-check for backend health_check_* / validator
                 # port-test containers immediately before `docker run`. The
@@ -2712,13 +3001,12 @@ class DockerService:
 
                 try:
                     current_step = "docker_run"
-                    await self._run_docker_create_with_port_retry(
+                    await self._run_rental_docker_create_with_port_retry(
+                        docker_client=docker_client,
                         ssh_client=ssh_client,
-                        command=command,
+                        run_spec=run_spec,
                         container_name=container_name,
-                        log_tag=log_tag,
                         default_extra=default_extra,
-                        timeout=timeout,
                         local_volume=local_volume,
                     )
 
@@ -2755,13 +3043,19 @@ class DockerService:
                         log_extra = get_extra_info({
                             **default_extra,
                             "container_name": container_name,
-                            "gpu_flags": gpu_flags,
+                            "gpu_device_mounts": [
+                                device.path_on_host for device in gpu_config.device_mounts
+                            ],
+                            "gpu_device_request_ids": [
+                                list(device_request.device_ids)
+                                for device_request in gpu_config.device_requests
+                            ],
                             "failure_reason": failure_reason[:2000],
                         })
                         if nvidia_signal:
                             logger.error(_m(
                                 "docker run failed with NVIDIA-device-related error — "
-                                "possible regression from build_gpu_flags --device flag set",
+                                "possible regression from GPU device configuration",
                                 extra=log_extra,
                             ))
                         else:
@@ -2807,9 +3101,8 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-
-                    ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service(
-                        ssh_client=ssh_client,
+                    ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+                        docker_client=docker_client,
                         container_name=container_name,
                         log_tag=log_tag,
                         log_extra=default_extra,
@@ -2839,23 +3132,23 @@ class DockerService:
 
                     # add rest of public keys
                     current_step = "add_public_keys"
-                    for public_key in payload.user_public_keys:
-                        command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
-                        await ssh_client.run(command)
+                    await self.add_ssh_public_keys_with_rental_docker(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        public_keys=payload.user_public_keys,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
 
                     # add environment variables
                     current_step = "set_environment"
-                    if custom_options and custom_options.environment:
-                        for k, v in custom_options.environment.items():
-                            if k and v and k.strip() and str(v).strip():
-                                env_line = f"{k}={v}"
-                                # Execute each variable addition separately for better error handling
-                                script = f'printf "%s\\n" {shlex.quote(env_line)} >> /etc/environment'
-                                command = f"/usr/bin/docker exec {container_name} sh -c {shlex.quote(script)}"
-                                try:
-                                    await ssh_client.run(command)
-                                except Exception as e:
-                                    print(f"Failed to set environment variable {k}: {e}")
+                    await self.add_environment_variables_with_rental_docker(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        environment=custom_options.environment if custom_options else None,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
 
                     # Add profiler for adding public keys
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
@@ -3016,11 +3309,9 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
-        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            known_hosts_policy = await self._prepare_known_hosts_policy(
+            await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
@@ -3041,23 +3332,42 @@ class DockerService:
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
-        async with asyncssh.connect(
-            host=executor_info.address,
-            port=executor_info.ssh_port,
-            username=executor_info.ssh_username,
-            client_keys=[pkey],
-            known_hosts=known_hosts_policy,
-        ) as ssh_client:
-            await ssh_client.run(f"/usr/bin/docker stop {payload.container_name}")
-
-            logger.info(
-                _m(
-                    "Stopped Docker Container",
-                    extra=get_extra_info(
-                        {**default_extra, "container_name": payload.container_name}
-                    ),
+        try:
+            async with self.rental_docker_client_factory.connect(
+                executor_info=executor_info,
+                private_key=private_key,
+            ) as docker_client:
+                await docker_client.stop(container_name=payload.container_name)
+        except Exception as exc:
+            log_text = _m(
+                "Failed stop_container",
+                extra=get_extra_info(
+                    {
+                        **default_extra,
+                        "container_name": payload.container_name,
+                        "error": str(exc),
+                    }
                 ),
             )
+            logger.error(log_text, exc_info=True)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerStopFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+        logger.info(
+            _m(
+                "Stopped Docker Container",
+                extra=get_extra_info(
+                    {**default_extra, "container_name": payload.container_name}
+                ),
+            ),
+        )
 
     async def start_container(
         self,
@@ -3083,11 +3393,9 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
-        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            known_hosts_policy = await self._prepare_known_hosts_policy(
+            await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
@@ -3108,36 +3416,55 @@ class DockerService:
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
-        async with asyncssh.connect(
-            host=executor_info.address,
-            port=executor_info.ssh_port,
-            username=executor_info.ssh_username,
-            client_keys=[pkey],
-            known_hosts=known_hosts_policy,
-        ) as ssh_client:
-            await ssh_client.run(f"/usr/bin/docker start {payload.container_name}")
-            ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service(
-                ssh_client=ssh_client,
-                container_name=payload.container_name,
-                log_tag=f"start_container_{payload.pod_id}",
-                log_extra=default_extra,
-            )
-            if not ssh_bootstrap_ok:
-                logger.warning(
+        try:
+            async with self.rental_docker_client_factory.connect(
+                executor_info=executor_info,
+                private_key=private_key,
+            ) as docker_client:
+                await docker_client.start(container_name=payload.container_name)
+                ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+                    docker_client=docker_client,
+                    container_name=payload.container_name,
+                    log_tag=f"start_container_{payload.pod_id}",
+                    log_extra=default_extra,
+                )
+                if not ssh_bootstrap_ok:
+                    logger.warning(
+                        _m(
+                            "Docker container started but SSH bootstrap did not complete cleanly",
+                            extra=get_extra_info(
+                                {**default_extra, "container_name": payload.container_name}
+                            ),
+                        )
+                    )
+                logger.info(
                     _m(
-                        "Docker container started but SSH bootstrap did not complete cleanly",
+                        "Started Docker Container",
                         extra=get_extra_info(
                             {**default_extra, "container_name": payload.container_name}
                         ),
-                    )
-                )
-            logger.info(
-                _m(
-                    "Started Docker Container",
-                    extra=get_extra_info(
-                        {**default_extra, "container_name": payload.container_name}
                     ),
+                )
+        except Exception as exc:
+            log_text = _m(
+                "Failed start_container",
+                extra=get_extra_info(
+                    {
+                        **default_extra,
+                        "container_name": payload.container_name,
+                        "error": str(exc),
+                    }
                 ),
+            )
+            logger.error(log_text, exc_info=True)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerStartFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
             )
 
     async def delete_container(
@@ -3192,17 +3519,26 @@ class DockerService:
             )
 
         try:
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=executor_info.ssh_port,
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=known_hosts_policy,
-            ) as ssh_client:
+            async with (
+                asyncssh.connect(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=known_hosts_policy,
+                ) as ssh_client,
+                self.rental_docker_client_factory.connect(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                ) as docker_client,
+            ):
                 # await ssh_client.run(f"docker stop {payload.container_name}")
-                command = f"/usr/bin/docker rm -fv {payload.container_name}"
                 try:
-                    await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+                    await docker_client.remove_container(
+                        container_name=payload.container_name,
+                        force=True,
+                        remove_volumes=True,
+                    )
                 except Exception as exc:
                     if (
                         payload.workload_kind != WorkloadKind.FILLER
@@ -3568,7 +3904,6 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
         known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
@@ -3594,37 +3929,38 @@ class DockerService:
             )
 
         try:
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=executor_info.ssh_port,
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=known_hosts_policy,
-            ) as ssh_client:
-                if not payload.user_public_keys:
-                    log_text = _m(
-                        "ssh key Add error: no public key",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "container_name": payload.container_name,
-                            "error": "No public keys",
-                        }),
-                    )
-                    logger.error(log_text)
+            if not payload.user_public_keys:
+                log_text = _m(
+                    "ssh key Add error: no public key",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": payload.container_name,
+                        "error": "No public keys",
+                    }),
+                )
+                logger.error(log_text)
 
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        pod_id=payload.pod_id,
-                        workload_kind=payload.workload_kind,
-                        msg=str(log_text),
-                        error_type=FailedContainerErrorTypes.AddSSkeyFailed,
-                        error_code=FailedContainerErrorCodes.NoSshKeys,
-                    )
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
+                    msg=str(log_text),
+                    error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                    error_code=FailedContainerErrorCodes.NoSshKeys,
+                )
 
-                for public_key in payload.user_public_keys:
-                    command = f"/usr/bin/docker exec -i {payload.container_name} sh -c 'echo \"{public_key}\" >> ~/.ssh/authorized_keys'"
-                    await retry_ssh_command(ssh_client, command, "add_ssh_key", 3, 5)
+            async with self.rental_docker_client_factory.connect(
+                executor_info=executor_info,
+                private_key=private_key,
+            ) as docker_client:
+                await self.add_ssh_public_keys_with_rental_docker(
+                    docker_client=docker_client,
+                    container_name=payload.container_name,
+                    public_keys=payload.user_public_keys,
+                    log_tag=f"add_ssh_key_{payload.pod_id}",
+                    log_extra=default_extra,
+                )
 
                 logger.info(
                     _m(
