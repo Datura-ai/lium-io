@@ -1,4 +1,5 @@
 import enum
+from datetime import datetime
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
@@ -414,6 +415,11 @@ class ProfilerStepName(str, enum.Enum):
     FINISHED_IN_SUBNET = "Finished in subnet."
 
 
+def now_ms() -> int:
+    """Current wall-clock time as integer milliseconds (the deploy-profiling clock)."""
+    return int(datetime.utcnow().timestamp() * 1000)
+
+
 class ProfilerStep(BaseModel):
     """One step in a deploy profile (DAH-1524).
 
@@ -430,6 +436,17 @@ class ProfilerStep(BaseModel):
     duration: int | None = None
     timestamp: int | None = None
     skipped: bool = False
+
+    @classmethod
+    def since(
+        cls, name: ProfilerStepName, prev_ms: int, *, skipped: bool = False
+    ) -> "ProfilerStep":
+        """Build a step whose ``duration`` is the time elapsed since ``prev_ms`` (ms).
+
+        Collapses the repeated ``ProfilerStep(name=..., duration=now_ms() -
+        prev_timestamp)`` at every deploy step into one readable call.
+        """
+        return cls(name=name, duration=now_ms() - prev_ms, skipped=skipped)
 
     @model_serializer
     def _serialize(self) -> dict:
