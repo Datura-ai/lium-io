@@ -190,6 +190,12 @@ def _is_safe_docker_volume_name(volume_name: str) -> bool:
     return bool(_DOCKER_VOLUME_NAME_RE.fullmatch(volume_name))
 
 
+def _quote_safe_docker_volume_name(volume_name: str, *, field_name: str) -> str:
+    if not _is_safe_docker_volume_name(volume_name):
+        raise ValueError(f"Unsafe Docker volume name for {field_name}: {volume_name!r}")
+    return shlex.quote(volume_name)
+
+
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
@@ -970,8 +976,9 @@ class DockerService:
     ):
         """Check if the container is running"""
         start_time = time.time()
+        name_filter = shlex.quote(f"name={container_name}")
         while time.time() - start_time < timeout:
-            result = await ssh_client.run(f"/usr/bin/docker ps -q -f name={container_name}")
+            result = await ssh_client.run(f"/usr/bin/docker ps -q --filter {name_filter}")
             if result.stdout.strip():
                 return True
             await asyncio.sleep(1)
@@ -1020,14 +1027,16 @@ class DockerService:
         """
         container_prefix = f"container_{miner_hotkey}_"
         health_check_prefix = "health_check_"
+        container_filter = shlex.quote(f"name=^{container_prefix}")
+        health_check_filter = shlex.quote(f"name=^{health_check_prefix}")
 
         async def _run_checks(client: asyncssh.SSHClientConnection) -> tuple[bool, str]:
             for attempt in range(max_retries + 1):
                 # docker ps OR-s multiple --filter name= flags
                 command = (
                     '/usr/bin/docker ps --format "{{.Names}}" '
-                    f'--filter "name=^{container_prefix}" '
-                    f'--filter "name=^{health_check_prefix}"'
+                    f"--filter {container_filter} "
+                    f"--filter {health_check_filter}"
                 )
                 result = await client.run(command)
 
@@ -1055,10 +1064,10 @@ class DockerService:
 
                     # Force remove containers matching either prefix.
                     remove_cmd = (
-                        "docker ps -q "
-                        f"--filter 'name=^{container_prefix}' "
-                        f"--filter 'name=^{health_check_prefix}' "
-                        "| xargs -r docker rm -f"
+                        "/usr/bin/docker ps -q "
+                        f"--filter {container_filter} "
+                        f"--filter {health_check_filter} "
+                        "| xargs -r /usr/bin/docker rm -f"
                     )
                     await client.run(remove_cmd)
 
@@ -1790,6 +1799,10 @@ class DockerService:
         sparse: bool = False,
     ):
         requested_timeout = timeout
+        local_volume_quoted = _quote_safe_docker_volume_name(
+            local_volume,
+            field_name="local_volume",
+        )
         if limit:
             # install loopback plugin
             loopback_plugin_name = "vloopback"
@@ -1797,7 +1810,12 @@ class DockerService:
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
             logger.info(_m(f"Docker data root: {docker_root_dir}", extra=get_extra_info(log_extra)))
 
-            command = f'/usr/bin/docker plugin install ashald/docker-volume-loopback --alias {loopback_plugin_name} --grant-all-permissions DATA_DIR="{docker_root_dir}/loopback"'
+            loopback_plugin_arg = shlex.quote(loopback_plugin_name)
+            data_dir_arg = shlex.quote(f"DATA_DIR={docker_root_dir}/loopback")
+            command = (
+                "/usr/bin/docker plugin install ashald/docker-volume-loopback "
+                f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
+            )
             await ssh_client.run(command)
 
             # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
@@ -1807,13 +1825,14 @@ class DockerService:
             # leaves its unwritten space free in df AND still counts its declared size in
             # resolve_volume_sizing(), double-counting the pool and overcommitting host disk.
             sparse_opt = " -o sparse=true" if sparse else ""
+            size_arg = shlex.quote(f"size={limit}g")
             command = (
-                f'/usr/bin/docker volume create -d {loopback_plugin_name} '
-                f'{local_volume} -o size={limit}g{sparse_opt}'
+                f"/usr/bin/docker volume create -d {loopback_plugin_arg} "
+                f"{local_volume_quoted} -o {size_arg}{sparse_opt}"
             )
         else:
             loopback_plugin_name = None
-            command = f"/usr/bin/docker volume create {local_volume}"
+            command = f"/usr/bin/docker volume create {local_volume_quoted}"
 
         timeout = self._get_local_volume_create_timeout(limit, timeout)
         volume_log_extra = {
@@ -3026,11 +3045,12 @@ class DockerService:
                         # failures; logs --tail covers entrypoint failures.
                         failure_reason = ""
                         try:
+                            container_name_quoted = shlex.quote(container_name)
                             inspect = await ssh_client.run(
-                                f"/usr/bin/docker inspect -f '{{{{.State.Error}}}}' {container_name}"
+                                f"/usr/bin/docker inspect -f '{{{{.State.Error}}}}' {container_name_quoted}"
                             )
                             logs_tail = await ssh_client.run(
-                                f"/usr/bin/docker logs --tail 50 {container_name} 2>&1 || true"
+                                f"/usr/bin/docker logs --tail 50 {container_name_quoted} 2>&1 || true"
                             )
                             failure_reason = (inspect.stdout or "") + "\n" + (logs_tail.stdout or "")
                         except Exception:
@@ -3492,6 +3512,39 @@ class DockerService:
             ),
         )
 
+        try:
+            local_volume_quoted = (
+                _quote_safe_docker_volume_name(
+                    payload.local_volume,
+                    field_name="local_volume",
+                )
+                if payload.local_volume
+                else None
+            )
+            external_volume_quoted = (
+                _quote_safe_docker_volume_name(
+                    payload.external_volume,
+                    field_name="external_volume",
+                )
+                if payload.external_volume
+                else None
+            )
+        except ValueError as exc:
+            log_text = _m(
+                "Invalid Docker volume name",
+                extra=get_extra_info({**default_extra, "error": str(exc)}),
+            )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
@@ -3569,12 +3622,12 @@ class DockerService:
                 command = f"/usr/bin/docker image prune -f"
                 await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
 
-                if payload.local_volume:
-                    command = f"/usr/bin/docker volume rm {payload.local_volume}"
+                if local_volume_quoted:
+                    command = f"/usr/bin/docker volume rm {local_volume_quoted}"
                     await ssh_client.run(command)
 
-                if payload.external_volume:
-                    command = f"/usr/bin/docker volume rm {payload.external_volume}"
+                if external_volume_quoted:
+                    command = f"/usr/bin/docker volume rm {external_volume_quoted}"
                     await ssh_client.run(command)
                     await self.disable_s3fs_volume_plugin(ssh_client)
 
