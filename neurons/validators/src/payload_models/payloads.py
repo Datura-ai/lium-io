@@ -2,7 +2,7 @@ import enum
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_serializer
 
 
 class CustomOptions(BaseModel):
@@ -387,12 +387,68 @@ class ContainerBaseResponse(BaseValidatorResponse):
     pod_id: str
     workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
 
+class ProfilerStepName(str, enum.Enum):
+    """Stable identifiers for each deploy-profiling step (DAH-1524).
+
+    The string *values* double as Loki query keys and are consumed by
+    lium-io-backend, so they must not be changed without coordinating both.
+    Adding a new deploy step means adding a member here.
+    """
+
+    REQUESTED_FROM_BACKEND = "Requested from backend"
+    STARTED_IN_SUBNET = "Started in subnet"
+    PORT_MAPPINGS_GENERATED = "Port mappings generated"
+    SSH_CONNECTION_ESTABLISHED = "SSH connection established"
+    DOCKER_LOGIN = "Docker login step finished"
+    CUSTOM_DOCKER_BUILD = "Custom docker build step finished"
+    DOCKER_PULL = "Docker pull step finished"
+    CONTAINER_CLEANING = "Container cleaning step finished"
+    DOCKER_VOLUME_CREATION = "Docker volume creation step finished"
+    DOCKER_VOLUME_CREATION_FAILED = "Docker volume creation step failed"
+    GPU_DEVICE_PROBE = "GPU device probe step finished"
+    PORT_CHECK_WAIT = "Port-check wait step finished"
+    DOCKER_RUN = "Docker run step finished"
+    CONTAINER_RUNNING_CHECK = "Container running check step finished"
+    SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
+    ADDING_PUBLIC_KEYS = "Adding public keys step finished"
+    FINISHED_IN_SUBNET = "Finished in subnet."
+
+
+class ProfilerStep(BaseModel):
+    """One step in a deploy profile (DAH-1524).
+
+    Typed replacement for the former free-form ``dict``. The anchor step
+    carries ``timestamp`` (no ``duration``); every other step carries a
+    ``duration`` in ms; ``skipped`` marks a short-circuited step.
+
+    ``_serialize`` reproduces the historical wire shape exactly — it emits
+    only the keys that were present before this became a model — so
+    lium-io-backend keeps receiving byte-identical JSON.
+    """
+
+    name: ProfilerStepName
+    duration: int | None = None
+    timestamp: int | None = None
+    skipped: bool = False
+
+    @model_serializer
+    def _serialize(self) -> dict:
+        data: dict = {"name": self.name.value}
+        if self.timestamp is not None:
+            data["timestamp"] = self.timestamp
+        if self.duration is not None:
+            data["duration"] = self.duration
+        if self.skipped:
+            data["skipped"] = self.skipped
+        return data
+
+
 class ContainerCreated(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerCreated
     container_name: str
     volume_name: str
     port_maps: list[tuple[int, int]]
-    profilers: list[dict] = []
+    profilers: list[ProfilerStep] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
     jupyter_url: str | None = None

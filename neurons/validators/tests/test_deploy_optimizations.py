@@ -18,12 +18,15 @@ from uuid import uuid4
 
 import pytest
 import services.docker_service as ds_module
+from pydantic import ValidationError
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
     FailedContainerRequest,
     PayloadPortMapping,
+    ProfilerStep,
+    ProfilerStepName,
 )
 from services.docker_service import DockerService
 
@@ -187,8 +190,8 @@ async def test_pull_skipped_when_image_present(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     assert _pull_commands(svc) == [], "docker pull must NOT be issued when image is present"
-    pull_step = next(p for p in result.profilers if p["name"] == "Docker pull step finished")
-    assert pull_step.get("skipped") is True
+    pull_step = next(p for p in result.profilers if p.name == ProfilerStepName.DOCKER_PULL)
+    assert pull_step.skipped is True
 
 
 @pytest.mark.asyncio
@@ -200,8 +203,8 @@ async def test_pull_runs_when_image_absent(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     assert any("/usr/bin/docker pull daturaai/pytorch:1.2.3" in c for c in _pull_commands(svc))
-    pull_step = next(p for p in result.profilers if p["name"] == "Docker pull step finished")
-    assert not pull_step.get("skipped")
+    pull_step = next(p for p in result.profilers if p.name == ProfilerStepName.DOCKER_PULL)
+    assert not pull_step.skipped
 
 
 @pytest.mark.asyncio
@@ -366,9 +369,9 @@ async def test_summary_marks_skipped_steps(svc, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_summary_survives_timestamp_only_first_entry(svc, monkeypatch):
-    """With payload.timestamp set, the first profiler entry has no `duration`
-    key. The .get()-based builder must not raise and must exclude it from the
-    total."""
+    """With payload.timestamp set, the first profiler step has `duration is
+    None` (timestamp-only anchor). The summary builder must not raise and must
+    exclude it from the total."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
     mock_logger = Mock()
@@ -438,3 +441,71 @@ async def test_deploy_cleanup_runs_without_blocking_sleep(svc, monkeypatch):
     svc.clean_existing_containers.assert_awaited_once()
     sleep_arg = svc.clean_existing_containers.await_args.kwargs.get("sleep", 0)
     assert sleep_arg == 0, f"deploy path must not request a blocking sleep, got sleep={sleep_arg}"
+
+
+# ------------------------------------------------------------------
+# DAH-1524 — ProfilerStep schema: typed `name` enum + wire-shape preservation
+# ------------------------------------------------------------------
+
+
+def test_profiler_step_rejects_unknown_name():
+    """`name` is constrained to the ProfilerStepName enum."""
+    with pytest.raises(ValidationError):
+        ProfilerStep(name="not a real step", duration=5)
+
+
+def test_profiler_step_serializes_to_historical_wire_shape():
+    """The typed model must serialize to exactly the keys we emitted before it
+    became a model — no `null`/`false` keys may leak — so lium-io-backend keeps
+    parsing byte-identical JSON."""
+    duration_step = ProfilerStep(name=ProfilerStepName.STARTED_IN_SUBNET, duration=508)
+    assert duration_step.model_dump() == {"name": "Started in subnet", "duration": 508}
+    # A non-skipped, non-anchor step carries neither `skipped` nor `timestamp`.
+    assert "skipped" not in duration_step.model_dump()
+    assert "timestamp" not in duration_step.model_dump()
+
+    anchor = ProfilerStep(
+        name=ProfilerStepName.REQUESTED_FROM_BACKEND, timestamp=1_700_000_000_000
+    )
+    assert anchor.model_dump() == {
+        "name": "Requested from backend",
+        "timestamp": 1_700_000_000_000,
+    }
+
+    skipped = ProfilerStep(name=ProfilerStepName.DOCKER_PULL, duration=127, skipped=True)
+    assert skipped.model_dump() == {
+        "name": "Docker pull step finished",
+        "duration": 127,
+        "skipped": True,
+    }
+
+
+def test_container_created_profilers_round_trip():
+    """ContainerCreated with typed profilers serializes and re-parses cleanly —
+    the validator round-trips responses through JSON."""
+    response = ContainerCreated(
+        miner_hotkey="miner",
+        executor_id="00000000-0000-0000-0000-000000000001",
+        pod_id="00000000-0000-0000-0000-0000000000aa",
+        container_name="c",
+        volume_name="v",
+        port_maps=[],
+        profilers=[
+            ProfilerStep(
+                name=ProfilerStepName.REQUESTED_FROM_BACKEND, timestamp=1_700_000_000_000
+            ),
+            ProfilerStep(name=ProfilerStepName.STARTED_IN_SUBNET, duration=508),
+            ProfilerStep(name=ProfilerStepName.DOCKER_PULL, duration=127, skipped=True),
+        ],
+    )
+
+    parsed = ContainerCreated.model_validate_json(response.model_dump_json())
+
+    assert [p.name for p in parsed.profilers] == [
+        ProfilerStepName.REQUESTED_FROM_BACKEND,
+        ProfilerStepName.STARTED_IN_SUBNET,
+        ProfilerStepName.DOCKER_PULL,
+    ]
+    assert parsed.profilers[0].timestamp == 1_700_000_000_000
+    assert parsed.profilers[0].duration is None
+    assert parsed.profilers[2].skipped is True
