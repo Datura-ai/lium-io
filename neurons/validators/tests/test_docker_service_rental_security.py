@@ -1,3 +1,4 @@
+import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -9,6 +10,7 @@ from payload_models.payloads import (
     AddSshPublicKeyRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
+    FailedContainerRequest,
     ContainerStartRequest,
     ContainerStopRequest,
     CustomOptions,
@@ -28,6 +30,8 @@ HOSTILE_PUBLIC_KEY = (
 )
 HOSTILE_STARTUP_COMMAND = "\n\nsh /tmp/startup-marker.sh"
 HOSTILE_CONTAINER_NAME = "pod_name; echo CONTAINER_MARKER; $(echo name)"
+HOSTILE_VOLUME_NAME = "volume_bad; echo VOLUME_MARKER; $(echo volume)"
+HOSTILE_MINER_HOTKEY = "miner; echo HOTKEY_MARKER; $(echo hotkey)"
 
 
 class DummySSHConnectionManager:
@@ -42,12 +46,19 @@ class DummySSHConnectionManager:
 
 
 class RecordingSSHClient:
-    def __init__(self):
+    def __init__(self, *, stdout: str = "", stderr: str = "", exit_status: int = 0):
         self.commands = []
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_status = exit_status
 
     async def run(self, command, *args, **kwargs):
         self.commands.append(command)
-        return SimpleNamespace(stdout="", stderr="", exit_status=0)
+        return SimpleNamespace(
+            stdout=self.stdout,
+            stderr=self.stderr,
+            exit_status=self.exit_status,
+        )
 
 
 class RecordingRentalDockerClient:
@@ -277,6 +288,12 @@ def _assert_markers_not_in_host_shell(commands, markers):
     assert not hits, "user-controlled marker appeared in host shell command text"
 
 
+def _assert_shell_arg_is_single_token(command: str, expected_arg: str):
+    words = shlex.split(command)
+    assert expected_arg in words
+    assert words.count(expected_arg) == 1
+
+
 @pytest.mark.asyncio
 async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
     docker_service,
@@ -428,3 +445,99 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
             "remove_volumes": True,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "volume_kwargs",
+    [
+        {"local_volume": HOSTILE_VOLUME_NAME},
+        {"external_volume": HOSTILE_VOLUME_NAME},
+    ],
+)
+@pytest.mark.asyncio
+async def test_delete_container_rejects_unsafe_volume_names_before_shell(
+    docker_service,
+    executor_info,
+    keypair,
+    volume_kwargs,
+):
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner-hotkey",
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_valid",
+        **volume_kwargs,
+    )
+
+    result = await docker_service.delete_container(
+        payload,
+        executor_info,
+        keypair,
+        "encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert docker_service.rental_docker_client_factory.connect_calls == []
+
+
+@pytest.mark.asyncio
+async def test_check_container_running_quotes_hostile_container_name_filter(
+    docker_service,
+):
+    ssh_client = RecordingSSHClient(stdout="container-id\n")
+
+    assert await docker_service.check_container_running(
+        ssh_client,
+        HOSTILE_CONTAINER_NAME,
+    )
+
+    assert len(ssh_client.commands) == 1
+    _assert_shell_arg_is_single_token(
+        ssh_client.commands[0],
+        f"name={HOSTILE_CONTAINER_NAME}",
+    )
+    assert "echo" not in shlex.split(ssh_client.commands[0])
+
+
+@pytest.mark.asyncio
+async def test_port_check_filters_quote_hostile_miner_hotkey(
+    docker_service,
+):
+    ssh_client = RecordingSSHClient()
+
+    result = await docker_service.wait_for_port_check_containers(
+        executor_info=Mock(),
+        miner_hotkey=HOSTILE_MINER_HOTKEY,
+        keypair=Mock(),
+        private_key="unused",
+        max_retries=0,
+        retry_delay=0,
+        ssh_client=ssh_client,
+    )
+
+    assert result == (True, "No port check containers found")
+    assert len(ssh_client.commands) == 1
+    _assert_shell_arg_is_single_token(
+        ssh_client.commands[0],
+        f"name=^container_{HOSTILE_MINER_HOTKEY}_",
+    )
+    assert "echo" not in shlex.split(ssh_client.commands[0])
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_rejects_unsafe_volume_name_before_shell(
+    docker_service,
+):
+    ssh_client = RecordingSSHClient()
+
+    with pytest.raises(ValueError):
+        await docker_service.create_local_volume(
+            ssh_client=ssh_client,
+            local_volume=HOSTILE_VOLUME_NAME,
+            log_tag="test",
+            log_text="Creating volume",
+            log_extra={},
+        )
+
+    assert ssh_client.commands == []
