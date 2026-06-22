@@ -122,6 +122,21 @@ _VOLUME_SIZE_SUFFIX_MULTIPLIERS = {
 }
 
 
+def _now_ms() -> int:
+    return int(datetime.utcnow().timestamp() * 1000)
+
+
+def _append_profiler(
+    profilers: list[dict],
+    name: str,
+    prev_timestamp: int,
+    **extra: Any,
+) -> int:
+    now = _now_ms()
+    profilers.append({"name": name, "duration": now - prev_timestamp, **extra})
+    return now
+
+
 class VolumeMinSizeError(Exception):
     """Fresh vloopback sizing produced a volume smaller than the requested minimum."""
 
@@ -871,12 +886,13 @@ class DockerService:
         clear_volume: bool = True,
         active_container_names: list[str] | None = None,
         active_volume_names: list[str] | None = None,
-    ):
+    ) -> bool:
         command = f'/usr/bin/docker ps -a --format "{{{{.Names}}}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
             # wait until the docker connection check is finished.
             await asyncio.sleep(sleep)
+            slept = sleep > 0
 
             active_set = set(active_container_names) if active_container_names else set()
             active_volume_set = set(active_volume_names) if active_volume_names else set()
@@ -893,7 +909,7 @@ class DockerService:
                 stale_containers.append(name)
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
-                return
+                return slept
 
             logger.info(
                 _m(
@@ -924,6 +940,8 @@ class DockerService:
                     volumes = " ".join(shlex.quote(volume) for volume in volumes_to_remove)
                     command = f'/usr/bin/docker volume rm {volumes} 2>/dev/null || true'
                     await retry_ssh_command(ssh_client, command, 'clean_existing_containers')
+            return slept
+        return False
 
     async def clean_stale_vloopback_volumes(
         self,
@@ -1878,9 +1896,8 @@ class DockerService:
             profilers.append({"name": "Requested from backend", "timestamp": payload.timestamp})
             prev_timestamp = payload.timestamp
         else:
-            prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
-        profilers.append({"name": "Started in subnet", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+            prev_timestamp = _now_ms()
+        prev_timestamp = _append_profiler(profilers, "Started in subnet", prev_timestamp)
 
         logger.info(
             _m(
@@ -1941,8 +1958,7 @@ class DockerService:
             )
 
             # Add profiler for port mappings generation
-            profilers.append({"name": "Port mappings generated", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-            prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+            prev_timestamp = _append_profiler(profilers, "Port mappings generated", prev_timestamp)
 
             if not port_maps:
                 log_text = _m(
@@ -2041,6 +2057,8 @@ class DockerService:
                     failure_step=current_step,
                 )
 
+            prev_timestamp = _append_profiler(profilers, "Attestation step finished", prev_timestamp)
+
             current_step = "ssh_connect"
             async with asyncssh.connect(
                 host=executor_info.address,
@@ -2052,8 +2070,7 @@ class DockerService:
                 keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
             ) as ssh_client:
                 # Add profiler for ssh connection
-                profilers.append({"name": "SSH connection established", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                prev_timestamp = _append_profiler(profilers, "SSH connection established", prev_timestamp)
 
                 # set real-time logging
                 self.log_task = asyncio.create_task(
@@ -2086,8 +2103,7 @@ class DockerService:
                     )
 
                 # Add profiler for docker login
-                profilers.append({"name": "Docker login step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                prev_timestamp = _append_profiler(profilers, "Docker login step finished", prev_timestamp)
 
                 # DAH-2211: when `dockerfile_content` is set, build the image
                 # on the executor instead of pulling. Otherwise the existing
@@ -2120,13 +2136,16 @@ class DockerService:
                     effective_image = self._custom_build_image_tag(payload.pod_id)
                     default_extra = {**default_extra, "docker_image": effective_image}
                     payload.docker_image = effective_image
-                    profilers.append({
-                        "name": "Custom docker build step finished",
-                        "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp,
-                    })
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    prev_timestamp = _append_profiler(
+                        profilers,
+                        "Custom docker build step finished",
+                        prev_timestamp,
+                    )
                 else:
                     current_step = "docker_pull"
+                    inspect_cmd = f"/usr/bin/docker image inspect {shlex.quote(payload.docker_image)} >/dev/null 2>&1"
+                    inspect_result = await ssh_client.run(inspect_cmd, check=False)
+                    docker_pull_result = "local_hit" if inspect_result.exit_status == 0 else "downloaded"
                     command = f"/usr/bin/docker pull {payload.docker_image}"
                     await self.execute_and_stream_logs(
                         ssh_client=ssh_client,
@@ -2138,8 +2157,12 @@ class DockerService:
                     )
 
                     # Add profiler for docker pull
-                    profilers.append({"name": "Docker pull step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    prev_timestamp = _append_profiler(
+                        profilers,
+                        "Docker pull step finished",
+                        prev_timestamp,
+                        docker_pull_result=docker_pull_result,
+                    )
 
                 port_flags = " ".join(
                     [
@@ -2185,7 +2208,7 @@ class DockerService:
                     protected_volume_names.add(local_volume)
 
                 current_step = "container_cleanup"
-                await self.clean_existing_containers(
+                cleanup_sleep_happened = await self.clean_existing_containers(
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     pod_name=container_name,
@@ -2202,8 +2225,13 @@ class DockerService:
                 )
 
                 # Add profiler for docker volume creation
-                profilers.append({"name": "Container cleaning step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                prev_timestamp = _append_profiler(
+                    profilers,
+                    "Container cleaning step finished",
+                    prev_timestamp,
+                    cleanup_sleep_happened=cleanup_sleep_happened,
+                )
+                legacy_container_creation_started_at = prev_timestamp
 
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.
@@ -2233,6 +2261,11 @@ class DockerService:
                         limit=effective_volume_limit_gb,
                     )
                     created_local_volume = True
+                    prev_timestamp = _append_profiler(
+                        profilers,
+                        "Local volume setup step finished",
+                        prev_timestamp,
+                    )
 
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
 
@@ -2246,15 +2279,22 @@ class DockerService:
                     )
                     if success:
                         # Add profiler for docker volume creation
-                        profilers.append({"name": "Docker volume creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                        prev_timestamp = _append_profiler(
+                            profilers,
+                            "Docker volume creation step finished",
+                            prev_timestamp,
+                        )
                         # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
                         payload.is_sysbox = False
 
                         volume_flag += f" -v {external_volume_info.name}:/mnt"
                     else:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
-                        profilers.append({"name": "Docker volume creation step failed", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                        prev_timestamp = _append_profiler(
+                            profilers,
+                            "Docker volume creation step failed",
+                            prev_timestamp,
+                        )
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
 
                 # Network permission flags (permission to create a network interface inside the container)
@@ -2270,6 +2310,11 @@ class DockerService:
                 # nvidia hook program; HostConfig.Devices is reapplied by Docker).
                 current_step = "gpu_flags"
                 gpu_flags = await build_gpu_flags(ssh_client, payload.gpu_uuids) + " "
+                prev_timestamp = _append_profiler(
+                    profilers,
+                    "GPU flags step finished",
+                    prev_timestamp,
+                )
 
                 # CPU and memory restriction flags
                 # --cpus flag isn't working inside cvm. skip to use it when tdx_quote is present
@@ -2331,6 +2376,13 @@ class DockerService:
                         extra=get_extra_info({**default_extra, "ok": wait_ok}),
                     )
                 )
+                port_check_wait_happened = wait_msg.startswith("Port check containers")
+                prev_timestamp = _append_profiler(
+                    profilers,
+                    "Port check wait step finished",
+                    prev_timestamp,
+                    port_check_wait_happened=port_check_wait_happened,
+                )
 
                 try:
                     current_step = "docker_run"
@@ -2345,6 +2397,11 @@ class DockerService:
                     )
 
                     logger.info(f"Container creation step finished")
+                    prev_timestamp = _append_profiler(
+                        profilers,
+                        "Docker run step finished",
+                        prev_timestamp,
+                    )
 
                     # check if the container is running correctly
                     current_step = "container_health_check"
@@ -2384,6 +2441,11 @@ class DockerService:
                             logger.error(_m("docker run failed", extra=log_extra))
 
                         raise Exception("Run docker run command but container is not running")
+                    prev_timestamp = _append_profiler(
+                        profilers,
+                        "Container running check step finished",
+                        prev_timestamp,
+                    )
                 except Exception:
                     await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
@@ -2402,8 +2464,10 @@ class DockerService:
                     raise
 
                 # Add profiler for docker container creation
-                profilers.append({"name": "Docker container creation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                profilers.append({
+                    "name": "Docker container creation step finished",
+                    "duration": _now_ms() - legacy_container_creation_started_at,
+                })
 
                 logger.info(
                     _m(
@@ -2449,8 +2513,11 @@ class DockerService:
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
                     # Add profiler for ssh service installation
-                    profilers.append({"name": "SSH service installation step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    prev_timestamp = _append_profiler(
+                        profilers,
+                        "SSH service installation step finished",
+                        prev_timestamp,
+                    )
 
                     # add rest of public keys
                     current_step = "add_public_keys"
@@ -2473,8 +2540,11 @@ class DockerService:
                                     print(f"Failed to set environment variable {k}: {e}")
 
                     # Add profiler for adding public keys
-                    profilers.append({"name": "Adding public keys step finished", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    prev_timestamp = _append_profiler(
+                        profilers,
+                        "Adding public keys step finished",
+                        prev_timestamp,
+                    )
 
                     await self.finish_stream_logs()
 
@@ -2498,7 +2568,7 @@ class DockerService:
                     raise
 
                 # Add profiler for ssh service installation
-                profilers.append({"name": "Finished in subnet.", "duration": int(datetime.utcnow().timestamp() * 1000) - prev_timestamp})
+                _append_profiler(profilers, "Finished in subnet.", prev_timestamp)
 
                 if payload.workload_kind == WorkloadKind.FILLER:
                     await self.redis_service.remove_pending_pod(
