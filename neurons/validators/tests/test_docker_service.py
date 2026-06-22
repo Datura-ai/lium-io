@@ -12,15 +12,96 @@ from services.docker_service import (
     VolumeMinSizeError,
     _parse_volume_size_to_bytes,
 )
+from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
 from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerDeleteRequest,
     ContainerDeleted,
     ContainerStartRequest,
+    ContainerStopRequest,
+    FailedContainerRequest,
     PayloadPortMapping,
     WorkloadKind,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
+
+
+class _FakeRentalDockerClient:
+    def __init__(self):
+        self.login_calls = []
+        self.pulled_images = []
+        self.run_specs = []
+        self.exec_specs = []
+        self.started_containers = []
+        self.stopped_containers = []
+        self.removed_containers = []
+        self.pull_error = None
+        self.run_error = None
+        self.start_error = None
+        self.stop_error = None
+        self.remove_error = None
+
+    async def login(self, *, username: str, password: str) -> None:
+        self.login_calls.append({"username": username, "password": password})
+
+    async def pull(self, *, image: str) -> None:
+        self.pulled_images.append(image)
+        if self.pull_error is not None:
+            raise self.pull_error
+
+    async def run_container(self, spec) -> None:
+        self.run_specs.append(spec)
+        if self.run_error is not None:
+            raise self.run_error
+
+    async def exec_in_container(self, spec) -> ContainerExecResult:
+        self.exec_specs.append(spec)
+        return ContainerExecResult(exit_status=0)
+
+    async def start(self, *, container_name: str) -> None:
+        self.started_containers.append(container_name)
+        if self.start_error is not None:
+            raise self.start_error
+
+    async def stop(self, *, container_name: str) -> None:
+        self.stopped_containers.append(container_name)
+        if self.stop_error is not None:
+            raise self.stop_error
+
+    async def remove_container(
+        self,
+        *,
+        container_name: str,
+        force: bool = True,
+        remove_volumes: bool = True,
+    ) -> None:
+        self.removed_containers.append(
+            {
+                "container_name": container_name,
+                "force": force,
+                "remove_volumes": remove_volumes,
+            }
+        )
+        if self.remove_error is not None:
+            raise self.remove_error
+
+
+class _FakeRentalDockerFactory:
+    def __init__(self):
+        self.client = _FakeRentalDockerClient()
+        self.connect_calls = []
+
+    def connect(self, *, executor_info: ExecutorSSHInfo, private_key: str):
+        self.connect_calls.append(
+            {"executor_info": executor_info, "private_key": private_key}
+        )
+        return self
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return None
 
 
 def create_mock_port_dict(
@@ -64,7 +145,8 @@ async def docker_service(mock_dependencies):
     service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
-        attestation_service=attestation_service
+        attestation_service=attestation_service,
+        rental_docker_client_factory=_FakeRentalDockerFactory(),
     )
     return service
 
@@ -714,10 +796,10 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
-    retry_ssh_mock.side_effect = [
-        _make_retry_error(Exception("Error response from daemon: No such container: filler_missing")),
-        None,
-    ]
+    docker_service.rental_docker_client_factory.client.remove_error = Exception(
+        "Error response from daemon: No such container: filler_missing"
+    )
+    retry_ssh_mock.return_value = None
 
     payload = ContainerDeleteRequest(
         miner_hotkey="miner",
@@ -747,7 +829,14 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
 
     assert isinstance(result, ContainerDeleted)
     assert result.pod_id == payload.pod_id
-    assert retry_ssh_mock.await_count == 2
+    assert docker_service.rental_docker_client_factory.client.removed_containers == [
+        {
+            "container_name": payload.container_name,
+            "force": True,
+            "remove_volumes": True,
+        }
+    ]
+    assert retry_ssh_mock.await_count == 1
     docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
         executor_info,
         payload.container_name,
@@ -1248,18 +1337,13 @@ def test_ssh_bootstrap_script_uses_single_watchdog_with_30_second_sleep(docker_s
 
 @pytest.mark.asyncio
 async def test_start_container_restarts_ssh_after_docker_start(docker_service, monkeypatch):
-    """start_container reruns the SSH bootstrap helper after docker start."""
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock()
-    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
-    monkeypatch.setattr(
-        "services.docker_service.asyncssh.connect",
-        Mock(return_value=DummySSHConnectionManager(ssh_client)),
-    )
+    """start_container reruns the SSH bootstrap helper after SDK docker start."""
 
     docker_service.ssh_service.decrypt_payload.return_value = "private-key"
     docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
-    docker_service.install_open_ssh_server_and_start_ssh_service = AsyncMock(return_value=True)
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = (
+        AsyncMock(return_value=True)
+    )
 
     payload = ContainerStartRequest(
         miner_hotkey="miner-hotkey",
@@ -1282,9 +1366,11 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
 
     await docker_service.start_container(payload, executor_info, keypair, "encrypted-private-key")
 
-    ssh_client.run.assert_awaited_once_with("/usr/bin/docker start pod_test")
-    docker_service.install_open_ssh_server_and_start_ssh_service.assert_awaited_once_with(
-        ssh_client=ssh_client,
+    assert docker_service.rental_docker_client_factory.client.started_containers == [
+        "pod_test"
+    ]
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once_with(
+        docker_client=docker_service.rental_docker_client_factory.client,
         container_name="pod_test",
         log_tag="start_container_pod-id",
         log_extra={
@@ -1301,17 +1387,11 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
 @pytest.mark.asyncio
 async def test_start_container_logs_ssh_bootstrap_failure_and_keeps_starting(docker_service, monkeypatch):
     """A failed SSH bootstrap does not interrupt docker start."""
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock()
-    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
-    monkeypatch.setattr(
-        "services.docker_service.asyncssh.connect",
-        Mock(return_value=DummySSHConnectionManager(ssh_client)),
-    )
-
     docker_service.ssh_service.decrypt_payload.return_value = "private-key"
     docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
-    docker_service.install_open_ssh_server_and_start_ssh_service = AsyncMock(return_value=False)
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = (
+        AsyncMock(return_value=False)
+    )
 
     payload = ContainerStartRequest(
         miner_hotkey="miner-hotkey",
@@ -1336,9 +1416,101 @@ async def test_start_container_logs_ssh_bootstrap_failure_and_keeps_starting(doc
 
     await docker_service.start_container(payload, executor_info, keypair, "encrypted-private-key")
 
-    ssh_client.run.assert_awaited_once_with("/usr/bin/docker start pod_test")
-    docker_service.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+    assert docker_service.rental_docker_client_factory.client.started_containers == [
+        "pod_test"
+    ]
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
     assert logger_mock.called
+
+
+@pytest.mark.asyncio
+async def test_start_container_sdk_failure_returns_failed_request_without_shell_fallback(
+    docker_service,
+    monkeypatch,
+):
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.rental_docker_client_factory.client.start_error = Exception(
+        "SDK start failed"
+    )
+    connect_mock = Mock(side_effect=AssertionError("asyncssh fallback is not allowed"))
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", connect_mock)
+
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+
+    result = await docker_service.start_container(
+        payload,
+        executor_info,
+        Mock(ss58_address="validator-hotkey"),
+        "encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert connect_mock.call_count == 0
+    assert docker_service.rental_docker_client_factory.client.started_containers == [
+        "pod_test"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stop_container_sdk_failure_returns_failed_request_without_shell_fallback(
+    docker_service,
+    monkeypatch,
+):
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.rental_docker_client_factory.client.stop_error = Exception(
+        "SDK stop failed"
+    )
+    connect_mock = Mock(side_effect=AssertionError("asyncssh fallback is not allowed"))
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", connect_mock)
+
+    payload = ContainerStopRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+
+    result = await docker_service.stop_container(
+        payload,
+        executor_info,
+        Mock(ss58_address="validator-hotkey"),
+        "encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert connect_mock.call_count == 0
+    assert docker_service.rental_docker_client_factory.client.stopped_containers == [
+        "pod_test"
+    ]
 
 
 @pytest.mark.asyncio
@@ -1625,7 +1797,10 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.add_pending_pod = AsyncMock()
@@ -1646,9 +1821,7 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
         "wait_for_port_check_containers",
         AsyncMock(return_value=(True, "ok")),
     )
-    monkeypatch.setattr(docker_service, "_run_docker_create_with_port_retry", AsyncMock())
     monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
-    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
     monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
     monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
@@ -1693,9 +1866,11 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
     assert docker_service.clean_stale_vloopback_volumes.await_args.kwargs[
         "skip_volume_names"
     ] == set()
-    assert docker_service._run_docker_create_with_port_retry.await_args.kwargs[
-        "local_volume"
-    ] == f"volume_{payload.pod_id}"
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
+    assert any(
+        volume.source == f"volume_{payload.pod_id}"
+        for volume in run_spec.volumes
+    )
 
 
 @pytest.mark.asyncio
@@ -1710,7 +1885,10 @@ async def test_create_container_clears_pending_pod_after_successful_filler_creat
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.add_pending_pod = AsyncMock()
@@ -1731,9 +1909,7 @@ async def test_create_container_clears_pending_pod_after_successful_filler_creat
         "wait_for_port_check_containers",
         AsyncMock(return_value=(True, "ok")),
     )
-    monkeypatch.setattr(docker_service, "_run_docker_create_with_port_retry", AsyncMock())
     monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
-    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
     monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
     monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
@@ -1781,12 +1957,10 @@ async def test_create_container_clears_pending_pod_after_successful_filler_creat
 
 
 @pytest.mark.asyncio
-async def test_create_container_uses_keepalives_and_docker_pull_timeout(
+async def test_create_container_uses_keepalives_and_sdk_pull(
     docker_service,
     monkeypatch,
 ):
-    import services.docker_service as docker_service_module
-
     ssh_client = AsyncMock()
 
     # DAH-1524: the pull is now preceded by a `docker image inspect` probe.
@@ -1801,7 +1975,10 @@ async def test_create_container_uses_keepalives_and_docker_pull_timeout(
     connect_mock = Mock(return_value=DummySSHConnectionManager(ssh_client))
     monkeypatch.setattr("services.docker_service.asyncssh.connect", connect_mock)
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.add_pending_pod = AsyncMock()
@@ -1813,8 +1990,7 @@ async def test_create_container_uses_keepalives_and_docker_pull_timeout(
         "generate_portMappings",
         AsyncMock(return_value=([(22, 20001, 20001)], None)),
     )
-    execute_mock = AsyncMock(return_value=(True, ""))
-    monkeypatch.setattr(docker_service, "execute_and_stream_logs", execute_mock)
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
     monkeypatch.setattr(docker_service, "clean_existing_containers", AsyncMock())
     monkeypatch.setattr(docker_service, "clean_stale_vloopback_volumes", AsyncMock())
     monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
@@ -1823,9 +1999,7 @@ async def test_create_container_uses_keepalives_and_docker_pull_timeout(
         "wait_for_port_check_containers",
         AsyncMock(return_value=(True, "ok")),
     )
-    monkeypatch.setattr(docker_service, "_run_docker_create_with_port_retry", AsyncMock())
     monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
-    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
     monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
     monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
@@ -1866,12 +2040,9 @@ async def test_create_container_uses_keepalives_and_docker_pull_timeout(
     assert connect_mock.call_args.kwargs["keepalive_interval"] == 30
     assert connect_mock.call_args.kwargs["keepalive_count_max"] == 4
 
-    pull_calls = [
-        call for call in execute_mock.await_args_list
-        if call.kwargs["command"] == f"/usr/bin/docker pull {payload.docker_image}"
+    assert docker_service.rental_docker_client_factory.client.pulled_images == [
+        payload.docker_image
     ]
-    assert len(pull_calls) == 1
-    assert pull_calls[0].kwargs["timeout"] == docker_service_module._DOCKER_PULL_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio
@@ -1899,17 +2070,16 @@ async def test_create_container_reports_docker_pull_failure_step(
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.add_pending_pod = AsyncMock()
     docker_service.redis_service.remove_pending_pod = AsyncMock()
+    docker_service.rental_docker_client_factory.client.pull_error = Exception(
+        "[Errno 104] Connection reset by peer"
+    )
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(
         docker_service,
         "generate_portMappings",
         AsyncMock(return_value=([(22, 20001, 20001)], None)),
     )
-    monkeypatch.setattr(
-        docker_service,
-        "execute_and_stream_logs",
-        AsyncMock(side_effect=Exception("[Errno 104] Connection reset by peer")),
-    )
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock())
     monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
     monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
 
@@ -3267,7 +3437,10 @@ async def test_create_container_fresh_sizing_uses_effective_values(
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.add_pending_pod = AsyncMock()
@@ -3288,9 +3461,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
         "wait_for_port_check_containers",
         AsyncMock(return_value=(True, "ok")),
     )
-    monkeypatch.setattr(docker_service, "_run_docker_create_with_port_retry", AsyncMock())
     monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
-    monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
     monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
     monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
@@ -3333,9 +3504,9 @@ async def test_create_container_fresh_sizing_uses_effective_values(
 
     # Assert: fresh-computed volume limit reaches docker volume create
     assert docker_service.create_local_volume.await_args.kwargs["limit"] == 393
-    # Assert: fresh-computed storage limit reaches docker run --storage-opt
-    run_command = docker_service._run_docker_create_with_port_retry.await_args.kwargs["command"]
-    assert "--storage-opt size=196g" in run_command
+    # Assert: fresh-computed storage limit reaches Docker SDK host config data
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
+    assert run_spec.storage_limit_gb == 196
     # Assert: ContainerCreated carries effective values, not payload echoes
     assert result.volume_limit_gb == 393
     assert result.storage_limit_gb == 196

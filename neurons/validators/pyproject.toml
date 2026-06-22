@@ -32,6 +32,7 @@ dependencies = [
     "tenacity>=9.1.2",
     "uvicorn>=0.35.0",
     "asyncpg>=0.30.0",
+    "docker[ssh]>=7.1.0",
 ]
 requires-python = "<3.13,>=3.11"
 readme = "README.md"
