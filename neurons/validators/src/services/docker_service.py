@@ -2,7 +2,6 @@ import asyncio
 import math
 import random
 from dataclasses import dataclass
-from datetime import datetime
 import logging
 import re
 import time
@@ -45,6 +44,7 @@ from payload_models.payloads import (
     ProfilerStep,
     ProfilerStepName,
     WorkloadKind,
+    now_ms,
 )
 from protocol.vc_protocol.compute_requests import RentedMachine
 
@@ -1883,9 +1883,9 @@ class DockerService:
             profilers.append(ProfilerStep(name=ProfilerStepName.REQUESTED_FROM_BACKEND, timestamp=payload.timestamp))
             prev_timestamp = payload.timestamp
         else:
-            prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
-        profilers.append(ProfilerStep(name=ProfilerStepName.STARTED_IN_SUBNET, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+            prev_timestamp = now_ms()
+        profilers.append(ProfilerStep.since(ProfilerStepName.STARTED_IN_SUBNET, prev_timestamp))
+        prev_timestamp = now_ms()
 
         logger.info(
             _m(
@@ -1946,8 +1946,8 @@ class DockerService:
             )
 
             # Add profiler for port mappings generation
-            profilers.append(ProfilerStep(name=ProfilerStepName.PORT_MAPPINGS_GENERATED, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-            prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+            profilers.append(ProfilerStep.since(ProfilerStepName.PORT_MAPPINGS_GENERATED, prev_timestamp))
+            prev_timestamp = now_ms()
 
             if not port_maps:
                 log_text = _m(
@@ -2057,8 +2057,8 @@ class DockerService:
                 keepalive_count_max=_CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX,
             ) as ssh_client:
                 # Add profiler for ssh connection
-                profilers.append(ProfilerStep(name=ProfilerStepName.SSH_CONNECTION_ESTABLISHED, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
+                prev_timestamp = now_ms()
 
                 # set real-time logging
                 self.log_task = asyncio.create_task(
@@ -2091,8 +2091,8 @@ class DockerService:
                     )
 
                 # Add profiler for docker login
-                profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_LOGIN, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_LOGIN, prev_timestamp))
+                prev_timestamp = now_ms()
 
                 # DAH-2211: when `dockerfile_content` is set, build the image
                 # on the executor instead of pulling. Otherwise the existing
@@ -2125,8 +2125,8 @@ class DockerService:
                     effective_image = self._custom_build_image_tag(payload.pod_id)
                     default_extra = {**default_extra, "docker_image": effective_image}
                     payload.docker_image = effective_image
-                    profilers.append(ProfilerStep(name=ProfilerStepName.CUSTOM_DOCKER_BUILD, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    profilers.append(ProfilerStep.since(ProfilerStepName.CUSTOM_DOCKER_BUILD, prev_timestamp))
+                    prev_timestamp = now_ms()
                 else:
                     # DAH-1524: skip the pull when the image is already present
                     # locally (the executor pre-pulls cached templates). Probe with
@@ -2163,8 +2163,8 @@ class DockerService:
                         )
                         # Keep the existing step name so before/after Loki queries
                         # match; the ~0ms duration + "skipped" flag mark the skip.
-                        profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_PULL, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp, skipped=True))
-                        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp, skipped=True))
+                        prev_timestamp = now_ms()
                     else:
                         command = f"/usr/bin/docker pull {payload.docker_image}"
                         await self.execute_and_stream_logs(
@@ -2177,8 +2177,8 @@ class DockerService:
                         )
 
                         # Add profiler for docker pull
-                        profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_PULL, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
+                        prev_timestamp = now_ms()
 
                 port_flags = " ".join(
                     [
@@ -2249,8 +2249,8 @@ class DockerService:
                 )
 
                 # Add profiler for docker volume creation
-                profilers.append(ProfilerStep(name=ProfilerStepName.CONTAINER_CLEANING, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, prev_timestamp))
+                prev_timestamp = now_ms()
 
                 # Effective limits default to the backend-sent values (legacy /
                 # restart-edit path); the fresh-sizing path overrides them below.
@@ -2284,8 +2284,8 @@ class DockerService:
                     # DAH-1524: profile local volume sizing + creation on its own;
                     # otherwise this SSH-bound time hides inside the broad
                     # "container creation" bucket and looks like `docker run`.
-                    profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_VOLUME_CREATION, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
+                    prev_timestamp = now_ms()
 
                 volume_flag = f"-v {local_volume}:{local_volume_path}"
 
@@ -2299,15 +2299,15 @@ class DockerService:
                     )
                     if success:
                         # Add profiler for docker volume creation
-                        profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_VOLUME_CREATION, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                        prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
+                        prev_timestamp = now_ms()
                         # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
                         payload.is_sysbox = False
 
                         volume_flag += f" -v {external_volume_info.name}:/mnt"
                     else:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
-                        profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
+                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, prev_timestamp))
                         await self.stream_log("S3 volume setup failed", "error", log_tag)
 
                 # Network permission flags (permission to create a network interface inside the container)
@@ -2327,8 +2327,8 @@ class DockerService:
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it
                 # apart from the docker run so a slow probe doesn't read as a slow run.
-                profilers.append(ProfilerStep(name=ProfilerStepName.GPU_DEVICE_PROBE, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                profilers.append(ProfilerStep.since(ProfilerStepName.GPU_DEVICE_PROBE, prev_timestamp))
+                prev_timestamp = now_ms()
 
                 # CPU and memory restriction flags
                 # --cpus flag isn't working inside cvm. skip to use it when tdx_quote is present
@@ -2393,8 +2393,8 @@ class DockerService:
 
                 # DAH-1524: the pre-run wait can block on live backend health_check_*
                 # probes (up to retry_delay); keep it out of the docker-run measurement.
-                profilers.append(ProfilerStep(name=ProfilerStepName.PORT_CHECK_WAIT, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                profilers.append(ProfilerStep.since(ProfilerStepName.PORT_CHECK_WAIT, prev_timestamp))
+                prev_timestamp = now_ms()
 
                 try:
                     current_step = "docker_run"
@@ -2413,8 +2413,8 @@ class DockerService:
                     # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
                     # --gpus prestart hook, +sysbox/storage-opt) from the post-run
                     # running-state poll below.
-                    profilers.append(ProfilerStep(name=ProfilerStepName.DOCKER_RUN, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_RUN, prev_timestamp))
+                    prev_timestamp = now_ms()
 
                     # check if the container is running correctly
                     current_step = "container_health_check"
@@ -2472,8 +2472,8 @@ class DockerService:
                     raise
 
                 # Add profiler for the post-run container running-state poll
-                profilers.append(ProfilerStep(name=ProfilerStepName.CONTAINER_RUNNING_CHECK, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_RUNNING_CHECK, prev_timestamp))
+                prev_timestamp = now_ms()
 
                 logger.info(
                     _m(
@@ -2542,8 +2542,8 @@ class DockerService:
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
                     # Add profiler for ssh service installation
-                    profilers.append(ProfilerStep(name=ProfilerStepName.SSH_SERVICE_INSTALLATION, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    profilers.append(ProfilerStep.since(ProfilerStepName.SSH_SERVICE_INSTALLATION, prev_timestamp))
+                    prev_timestamp = now_ms()
 
                     # add rest of public keys
                     current_step = "add_public_keys"
@@ -2566,8 +2566,8 @@ class DockerService:
                                     print(f"Failed to set environment variable {k}: {e}")
 
                     # Add profiler for adding public keys
-                    profilers.append(ProfilerStep(name=ProfilerStepName.ADDING_PUBLIC_KEYS, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
-                    prev_timestamp = int(datetime.utcnow().timestamp() * 1000)
+                    profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
+                    prev_timestamp = now_ms()
 
                     await self.finish_stream_logs()
 
@@ -2591,7 +2591,7 @@ class DockerService:
                     raise
 
                 # Add profiler for ssh service installation
-                profilers.append(ProfilerStep(name=ProfilerStepName.FINISHED_IN_SUBNET, duration=int(datetime.utcnow().timestamp() * 1000) - prev_timestamp))
+                profilers.append(ProfilerStep.since(ProfilerStepName.FINISHED_IN_SUBNET, prev_timestamp))
 
                 if payload.workload_kind == WorkloadKind.FILLER:
                     await self.redis_service.remove_pending_pod(

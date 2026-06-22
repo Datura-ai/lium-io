@@ -27,6 +27,7 @@ from payload_models.payloads import (
     PayloadPortMapping,
     ProfilerStep,
     ProfilerStepName,
+    now_ms,
 )
 from services.docker_service import DockerService
 
@@ -452,6 +453,23 @@ def test_profiler_step_rejects_unknown_name():
     """`name` is constrained to the ProfilerStepName enum."""
     with pytest.raises(ValidationError):
         ProfilerStep(name="not a real step", duration=5)
+
+
+def test_profiler_step_since_builds_duration_step():
+    """`since()` is the factory used at every deploy step: it fills `duration`
+    from the elapsed time and carries the `skipped` flag, leaving `timestamp`
+    unset (so the wire shape stays name+duration[, skipped])."""
+    start = now_ms()
+    step = ProfilerStep.since(ProfilerStepName.DOCKER_RUN, start)
+    assert step.name is ProfilerStepName.DOCKER_RUN
+    assert step.duration is not None and step.duration >= 0
+    assert step.timestamp is None
+    assert step.skipped is False
+    assert set(step.model_dump()) == {"name", "duration"}
+
+    skipped = ProfilerStep.since(ProfilerStepName.DOCKER_PULL, start, skipped=True)
+    assert skipped.skipped is True
+    assert set(skipped.model_dump()) == {"name", "duration", "skipped"}
 
 
 def test_profiler_step_serializes_to_historical_wire_shape():
