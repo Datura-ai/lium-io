@@ -74,6 +74,7 @@ from services.rental_docker_sdk import (
     build_authorized_keys_exec_spec,
     build_container_command_argv,
     build_environment_exec_spec,
+    build_remove_authorized_keys_exec_spec,
 )
 from services.ssh_service import SSHService
 
@@ -1545,6 +1546,44 @@ class DockerService:
             )
             raise Exception(
                 "Failed to add SSH public keys: "
+                f"exit_status={result.exit_status}; "
+                f"stderr={result.stderr}; stdout={result.stdout}"
+            )
+
+    async def remove_ssh_public_keys_with_rental_docker(
+        self,
+        docker_client: RentalDockerSdkClient,
+        *,
+        container_name: str,
+        public_keys: list[str] | tuple[str, ...],
+        log_tag: str,
+        log_extra: dict,
+    ) -> None:
+        exec_spec = build_remove_authorized_keys_exec_spec(
+            container_name=container_name,
+            public_keys=public_keys,
+        )
+        result = await docker_client.exec_in_container(exec_spec)
+        if result.exit_status != 0:
+            await self.stream_log(
+                result.stderr or result.stdout or "Failed to remove SSH public keys",
+                "error",
+                log_tag,
+            )
+            logger.warning(
+                _m(
+                    "Failed to remove SSH public keys",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "exit_status": result.exit_status,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }),
+                )
+            )
+            raise Exception(
+                "Failed to remove SSH public keys: "
                 f"exit_status={result.exit_status}; "
                 f"stderr={result.stderr}; stdout={result.stdout}"
             )
@@ -3513,22 +3552,16 @@ class DockerService:
         )
 
         try:
-            local_volume_quoted = (
+            if payload.local_volume:
                 _quote_safe_docker_volume_name(
                     payload.local_volume,
                     field_name="local_volume",
                 )
-                if payload.local_volume
-                else None
-            )
-            external_volume_quoted = (
+            if payload.external_volume:
                 _quote_safe_docker_volume_name(
                     payload.external_volume,
                     field_name="external_volume",
                 )
-                if payload.external_volume
-                else None
-            )
         except ValueError as exc:
             log_text = _m(
                 "Invalid Docker volume name",
@@ -3619,16 +3652,13 @@ class DockerService:
                     default_extra=default_extra,
                 )
 
-                command = f"/usr/bin/docker image prune -f"
-                await retry_ssh_command(ssh_client, command, "delete_container", 3, 5)
+                await docker_client.prune_images()
 
-                if local_volume_quoted:
-                    command = f"/usr/bin/docker volume rm {local_volume_quoted}"
-                    await ssh_client.run(command)
+                if payload.local_volume:
+                    await docker_client.remove_volume(volume_name=payload.local_volume)
 
-                if external_volume_quoted:
-                    command = f"/usr/bin/docker volume rm {external_volume_quoted}"
-                    await ssh_client.run(command)
+                if payload.external_volume:
+                    await docker_client.remove_volume(volume_name=payload.external_volume)
                     await self.disable_s3fs_volume_plugin(ssh_client)
 
                 logger.info(
@@ -3826,11 +3856,9 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
-        pkey = asyncssh.import_private_key(private_key)
 
-        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            known_hosts_policy = await self._prepare_known_hosts_policy(
+            await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
@@ -3852,50 +3880,38 @@ class DockerService:
             )
 
         try:
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=executor_info.ssh_port,
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=known_hosts_policy,
-            ) as ssh_client:
-                if not payload.user_public_keys:
-                    log_text = _m(
-                        "ssh key Remove error: no public key",
-                        extra=get_extra_info({
-                            **default_extra,
-                            "container_name": payload.container_name,
-                            "error": "No public keys",
-                        }),
-                    )
-                    logger.error(log_text)
+            if not payload.user_public_keys:
+                log_text = _m(
+                    "ssh key Remove error: no public key",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": payload.container_name,
+                        "error": "No public keys",
+                    }),
+                )
+                logger.error(log_text)
 
-                    return FailedContainerRequest(
-                        miner_hotkey=payload.miner_hotkey,
-                        executor_id=payload.executor_id,
-                        pod_id=payload.pod_id,
-                        workload_kind=payload.workload_kind,
-                        msg=str(log_text),
-                        error_type=FailedContainerErrorTypes.AddSSkeyFailed,
-                        error_code=FailedContainerErrorCodes.NoSshKeys,
-                    )
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
+                    msg=str(log_text),
+                    error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                    error_code=FailedContainerErrorCodes.NoSshKeys,
+                )
 
-                # Remove each public key from authorized_keys
-                for pubkey in payload.user_public_keys:
-                    # Remove the public key from authorized_keys
-                    # Properly escape slashes and pluses in pubkey for sed
-                    # Use Python's shlex.quote to safely quote the pubkey for shell usage
-                    import shlex
-
-                    # Remove the public key from authorized_keys by matching the exact line
-                    # This approach is safer and more reliable than trying to escape characters for sed
-                    quoted_pubkey = shlex.quote(pubkey)
-                    remove_cmd = (
-                        f"/usr/bin/docker exec -i {payload.container_name} "
-                        f"sh -c \"grep -vxF {quoted_pubkey} /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp && "
-                        f"mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys\""
-                    )
-                    await ssh_client.run(remove_cmd)
+            async with self.rental_docker_client_factory.connect(
+                executor_info=executor_info,
+                private_key=private_key,
+            ) as docker_client:
+                await self.remove_ssh_public_keys_with_rental_docker(
+                    docker_client=docker_client,
+                    container_name=payload.container_name,
+                    public_keys=payload.user_public_keys,
+                    log_tag=f"remove_ssh_keys_{payload.pod_id}",
+                    log_extra=default_extra,
+                )
 
                 logger.info(
                     _m(

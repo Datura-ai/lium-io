@@ -13,12 +13,13 @@ from services.rental_docker_sdk import (
     ContainerRunSpec,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
+    build_remove_authorized_keys_exec_spec,
 )
 
 
 TARGET_IMAGE = "alpine:3.20"
 HOSTILE_ENV_VALUE = "value'; echo SHOULD_NOT_RUN; $(echo nope)"
-HOSTILE_PUBLIC_KEY = 'ssh-ed25519 AAAA user"; echo KEY_MARKER; $(echo nope)\n'
+HOSTILE_PUBLIC_KEY = 'ssh-ed25519 AAAA user"; echo KEY_MARKER; $(echo nope)'
 
 
 requires_local_docker = pytest.mark.skipif(
@@ -46,6 +47,7 @@ class RentalLifecycleResult:
     env_value_preserved: bool
     stdin_marker_echoed: bool
     public_key_write_succeeded: bool
+    public_key_remove_succeeded: bool
     stopped: bool
     restarted: bool
     removed: bool
@@ -67,6 +69,7 @@ async def test_local_docker_sdk_rental_smoke(local_docker_api_client):
         assert result.env_value_preserved
         assert result.stdin_marker_echoed
         assert result.public_key_write_succeeded
+        assert result.public_key_remove_succeeded
         assert result.stopped
         assert result.restarted
         assert result.removed
@@ -101,6 +104,7 @@ async def test_local_docker_sdk_factory_over_ssh(
             assert result.env_value_preserved
             assert result.stdin_marker_echoed
             assert result.public_key_write_succeeded
+            assert result.public_key_remove_succeeded
             assert result.stopped
             assert result.restarted
             assert result.removed
@@ -229,10 +233,31 @@ async def _run_rental_lifecycle(
                 "-c",
                 "mkdir -p /root/.ssh && cat >> /root/.ssh/authorized_keys",
             ),
-            stdin=HOSTILE_PUBLIC_KEY,
+            stdin=f"{HOSTILE_PUBLIC_KEY}\n",
         )
     )
     public_key_write_succeeded = key_result.exit_status == 0
+
+    remove_key_result = await rental_client.exec_in_container(
+        build_remove_authorized_keys_exec_spec(
+            container_name=container_name,
+            public_keys=[HOSTILE_PUBLIC_KEY],
+        )
+    )
+    verify_key_removed_result = await rental_client.exec_in_container(
+        ContainerExecSpec(
+            container_name=container_name,
+            argv=(
+                "sh",
+                "-c",
+                "if grep -q KEY_MARKER /root/.ssh/authorized_keys; then exit 1; fi",
+            ),
+        )
+    )
+    public_key_remove_succeeded = (
+        remove_key_result.exit_status == 0
+        and verify_key_removed_result.exit_status == 0
+    )
 
     await rental_client.stop(container_name=container_name)
     stopped = (
@@ -261,6 +286,7 @@ async def _run_rental_lifecycle(
         env_value_preserved=env_value_preserved,
         stdin_marker_echoed=stdin_marker_echoed,
         public_key_write_succeeded=public_key_write_succeeded,
+        public_key_remove_succeeded=public_key_remove_succeeded,
         stopped=stopped,
         restarted=restarted,
         removed=removed,

@@ -35,6 +35,8 @@ class _FakeRentalDockerClient:
         self.started_containers = []
         self.stopped_containers = []
         self.removed_containers = []
+        self.removed_volumes = []
+        self.pruned_images = 0
         self.pull_error = None
         self.run_error = None
         self.start_error = None
@@ -84,6 +86,14 @@ class _FakeRentalDockerClient:
         )
         if self.remove_error is not None:
             raise self.remove_error
+
+    async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
+        self.removed_volumes.append(
+            {"volume_name": volume_name, "force": force}
+        )
+
+    async def prune_images(self) -> None:
+        self.pruned_images += 1
 
 
 class _FakeRentalDockerFactory:
@@ -782,7 +792,6 @@ def _make_retry_error(exc: Exception) -> RetryError:
 @pytest.mark.asyncio
 async def test_delete_filler_container_treats_missing_container_as_deleted(
     docker_service,
-    retry_ssh_mock,
     monkeypatch,
 ):
     ssh_client = AsyncMock()
@@ -799,7 +808,6 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
     docker_service.rental_docker_client_factory.client.remove_error = Exception(
         "Error response from daemon: No such container: filler_missing"
     )
-    retry_ssh_mock.return_value = None
 
     payload = ContainerDeleteRequest(
         miner_hotkey="miner",
@@ -836,7 +844,10 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
             "remove_volumes": True,
         }
     ]
-    assert retry_ssh_mock.await_count == 1
+    assert docker_service.rental_docker_client_factory.client.pruned_images == 1
+    assert docker_service.rental_docker_client_factory.client.removed_volumes == [
+        {"volume_name": payload.local_volume, "force": False}
+    ]
     docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
         executor_info,
         payload.container_name,

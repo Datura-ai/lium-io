@@ -159,6 +159,20 @@ class RentalDockerSdkClient:
             v=remove_volumes,
         )
 
+    async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
+        await self._call_api(
+            volume_name,
+            operation_label="remove volume",
+            api_method=self._api_client.remove_volume,
+            force=force,
+        )
+
+    async def prune_images(self) -> None:
+        await self._call_api(
+            operation_label="prune images",
+            api_method=self._api_client.prune_images,
+        )
+
     async def aclose(self) -> None:
         close = getattr(self._api_client, "close", None)
         if close is not None:
@@ -350,6 +364,36 @@ def build_authorized_keys_exec_spec(
             f"mkdir -p {shlex.quote(target_path.rsplit('/', 1)[0])} "
             f"&& cat >> {shlex.quote(target_path)}",
         ),
+        stdin=key_data,
+    )
+
+
+def build_remove_authorized_keys_exec_spec(
+    *,
+    container_name: str,
+    public_keys: list[str] | tuple[str, ...],
+    target_path: str = "/root/.ssh/authorized_keys",
+) -> ContainerExecSpec:
+    import shlex
+
+    key_data = "".join(f"{public_key}\n" for public_key in public_keys)
+    quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
+    quoted_path = shlex.quote(target_path)
+    script = (
+        "set -e; "
+        f"mkdir -p {quoted_dir} && "
+        f"touch {quoted_path} && "
+        "keys=$(mktemp) && filtered=$(mktemp) && "
+        "trap 'rm -f \"$keys\" \"$filtered\"' EXIT && "
+        "cat > \"$keys\" && "
+        f"if grep -vxF -f \"$keys\" {quoted_path} > \"$filtered\"; then "
+        ":; else status=$?; "
+        "[ \"$status\" -eq 1 ] || exit \"$status\"; fi; "
+        f"cat \"$filtered\" > {quoted_path}"
+    )
+    return ContainerExecSpec(
+        container_name=container_name,
+        argv=("sh", "-c", script),
         stdin=key_data,
     )
 

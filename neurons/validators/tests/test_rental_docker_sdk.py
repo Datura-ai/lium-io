@@ -17,6 +17,7 @@ from services.rental_docker_sdk import (
     VolumeMount,
     build_authorized_keys_exec_spec,
     build_environment_exec_spec,
+    build_remove_authorized_keys_exec_spec,
 )
 
 
@@ -28,6 +29,8 @@ class FakeApiClient:
         self.exec_created = []
         self.exec_started = []
         self.exec_inspected = []
+        self.pruned_images = False
+        self.removed_volumes = []
         self.closed = False
 
     def create_host_config(self, **kwargs):
@@ -52,6 +55,13 @@ class FakeApiClient:
     def exec_inspect(self, exec_id):
         self.exec_inspected.append(exec_id)
         return {"ExitCode": 0}
+
+    def prune_images(self):
+        self.pruned_images = True
+        return {"ImagesDeleted": []}
+
+    def remove_volume(self, volume_name, **kwargs):
+        self.removed_volumes.append((volume_name, kwargs))
 
     def close(self):
         self.closed = True
@@ -145,6 +155,10 @@ def test_stdin_exec_spec_builders_keep_values_out_of_argv():
         container_name="pod_key",
         public_keys=[public_key],
     )
+    remove_key_spec = build_remove_authorized_keys_exec_spec(
+        container_name="pod_key",
+        public_keys=[public_key],
+    )
     env_spec = build_environment_exec_spec(
         container_name="pod_env",
         environment={
@@ -156,11 +170,27 @@ def test_stdin_exec_spec_builders_keep_values_out_of_argv():
     assert key_spec is not None
     assert public_key not in " ".join(key_spec.argv)
     assert key_spec.stdin == f"{public_key}\n"
+    assert remove_key_spec is not None
+    assert public_key not in " ".join(remove_key_spec.argv)
+    assert remove_key_spec.stdin == f"{public_key}\n"
+    assert "grep -vxF -f" in " ".join(remove_key_spec.argv)
     assert env_spec is not None
     assert "ENV_MARKER" not in " ".join(env_spec.argv)
     assert "ENV_NEWLINE_MARKER" not in " ".join(env_spec.argv)
     assert "HOSTILE_ENV=value'; echo ENV_MARKER; $(echo env)\n" in env_spec.stdin
     assert "MULTILINE_ENV=line1\nENV_NEWLINE_MARKER\n" in env_spec.stdin
+
+
+@pytest.mark.asyncio
+async def test_delete_helpers_call_sdk_volume_and_prune_apis():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    await client.prune_images()
+    await client.remove_volume(volume_name="volume_test", force=True)
+
+    assert api_client.pruned_images is True
+    assert api_client.removed_volumes == [("volume_test", {"force": True})]
 
 
 @pytest.mark.asyncio
