@@ -33,6 +33,18 @@ class Settings(BaseSettings):
 
     DB_URI: str = Field(env="DB_URI")
 
+    # Compute-app (backend) base URL used to look up the default "cache template"
+    # docker image for this host's GPU. Defaults to the same backend the
+    # validators use; set to an empty value to disable the on-boot cache pre-pull.
+    COMPUTE_REST_API_URL: Optional[str] = Field(
+        env="COMPUTE_REST_API_URL", default="https://lium.io/api"
+    )
+    # How often (seconds) the executor re-checks the template's remote digest and
+    # re-pulls when it has changed. Defaults to 15 minutes.
+    CACHE_TEMPLATE_REFRESH_SECONDS: int = Field(
+        env="CACHE_TEMPLATE_REFRESH_SECONDS", default=15 * 60
+    )
+
     ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
     TDX_QUOTE_TIMEOUT: int = Field(env="TDX_QUOTE_TIMEOUT", default=60)
     SSH_HOST_KEY_PATH: str = Field(env="SSH_HOST_KEY_PATH", default="/etc/ssh/ssh_host_ed25519_key.pub")

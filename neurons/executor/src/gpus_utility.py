@@ -7,6 +7,8 @@ import click
 import pynvml
 import psutil
 
+from services.pull_lock import cache_pull_lock
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -196,6 +198,7 @@ async def manage_docker_images(
                         await asyncio.sleep(first_interval)
                         continue
                     
+                    had_error = False
                     for data in docker_images_data:
                         docker_image = data['docker_image']
                         docker_image_tag = data['docker_image_tag']
@@ -249,19 +252,28 @@ async def manage_docker_images(
                             await asyncio.sleep(first_interval)
                             continue
 
-                        # Pull the image
-                        pull_result = subprocess.run(
-                            ['docker', 'pull', template],
-                            capture_output=True,
-                            text=True
-                        )
-                        
+                        # Pull the image (guarded so we don't pull the same image
+                        # concurrently with the executor's on-boot cache pre-pull).
+                        with cache_pull_lock() as acquired:
+                            if not acquired:
+                                logger.info(
+                                    f"Another puller holds the lock; skipping {template} this cycle"
+                                )
+                                continue
+                            pull_result = subprocess.run(
+                                ['docker', 'pull', template],
+                                capture_output=True,
+                                text=True
+                            )
+
                         if pull_result.returncode == 0:
                             logger.info(f"Successfully pulled {template}")
-                            await asyncio.sleep(success_interval)
                         else:
                             logger.error(f"Failed to pull {template}: {pull_result.stderr}")
-                            await asyncio.sleep(first_interval)
+                            had_error = True
+
+                    # Sleep once per full sweep: retry sooner if anything failed.
+                    await asyncio.sleep(first_interval if had_error else success_interval)
 
             except aiohttp.ClientError as e:
                 logger.error(f"Network error: {e}")
