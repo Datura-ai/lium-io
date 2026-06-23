@@ -115,13 +115,16 @@ async def _ensure_template(client: "docker.DockerClient", data: dict) -> None:
 
     image_ref = f"{docker_image}:{docker_image_tag}"
 
-    # Compare remote vs local digest; skip the pull when already up to date.
-    remote = await _remote_digest(client, image_ref)
+    # Only query the registry for the digest when the image is already cached;
+    # on a first pull there is nothing to compare against, so skip the call and
+    # avoid a needless registry manifest request (counts against pull limits).
     local = await _local_digests(client, image_ref)
+    remote: str | None = None
     if local:
-        # Image is already cached. Re-pull only if we can confirm the remote
-        # digest changed. If the remote digest is unreadable (rate limit / auth),
-        # keep the cached copy rather than re-pulling every cycle.
+        remote = await _remote_digest(client, image_ref)
+        # Re-pull only if we can confirm the remote digest changed. If the remote
+        # digest is unreadable (rate limit / auth), keep the cached copy rather
+        # than re-pulling every cycle.
         if remote is None:
             logger.info(f"{image_ref} cached; remote digest unreadable, keeping local copy")
             return
@@ -164,14 +167,7 @@ async def run_cache_template_prefetch() -> None:
 
     refresh_interval = settings.CACHE_TEMPLATE_REFRESH_SECONDS
     error_interval = min(ERROR_INTERVAL_SECONDS, refresh_interval)
-
-    gpu_model, driver_version = _get_gpu_info()
     url = f"{base_url.rstrip('/')}{DEFAULT_DOCKER_IMAGE_PATH}"
-    params = {"gpu_model": gpu_model, "driver_version": driver_version}
-    logger.info(
-        f"Starting cache template pre-pull for gpu_model={gpu_model} "
-        f"driver_version={driver_version} (refresh every {refresh_interval}s)"
-    )
 
     try:
         client = docker.from_env()
@@ -179,9 +175,28 @@ async def run_cache_template_prefetch() -> None:
         logger.error(f"Cannot connect to docker; cache pre-pull disabled: {e}")
         return
 
+    logger.info(f"Cache template pre-pull starting (refresh every {refresh_interval}s)")
+
+    gpu_model = "unknown"
+    driver_version = "unknown"
     async with aiohttp.ClientSession() as session:
         while True:
             try:
+                # Resolve GPU info off-thread, and keep retrying while it is still
+                # unknown: at early boot the NVIDIA driver may not be ready yet,
+                # and caching "unknown" once would wedge the loop forever.
+                if gpu_model == "unknown":
+                    gpu_model, driver_version = await asyncio.to_thread(_get_gpu_info)
+                    if gpu_model == "unknown":
+                        logger.warning("GPU not detected yet; retrying cache pre-pull shortly")
+                        await asyncio.sleep(error_interval)
+                        continue
+                    logger.info(
+                        f"Cache pre-pull resolved gpu_model={gpu_model} "
+                        f"driver_version={driver_version}"
+                    )
+
+                params = {"gpu_model": gpu_model, "driver_version": driver_version}
                 templates = await _fetch_templates(session, url, params)
                 if not templates:
                     await asyncio.sleep(error_interval)
