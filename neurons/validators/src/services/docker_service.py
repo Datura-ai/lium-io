@@ -2733,7 +2733,7 @@ class DockerService:
                         log_tag=log_tag,
                         log_extra=default_extra,
                     )
-                    if not ssh_bootstrap_ok:
+                    if payload.ships_sshd and not ssh_bootstrap_ok:
                         raise RuntimeError("SSH bootstrap failed")
 
                     jupyter_url = None
