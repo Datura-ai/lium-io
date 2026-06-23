@@ -2717,46 +2717,24 @@ class DockerService:
 
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
-                # skip installing ssh service for daturaai images
-                # if payload.docker_image.startswith("daturaai/"):
-                #     logger.info(
-                #         _m(
-                #             "Skipping checking install and start ssh service for daturaai images",
-                #             extra=get_extra_info({**default_extra, "container_name": container_name}),
-                #         ),
-                #     )
-                # else:
                 try:
                     current_step = "ssh_bootstrap"
                     if payload.ships_sshd:
-                        # DAH-1524: the image asserts it ships+starts sshd (and
-                        # provides host keys, password-auth hardening, and a restart
-                        # supervisor — see ContainerCreateRequest.ships_sshd). Skip
-                        # the whole bootstrap.
                         logger.info(
                             _m(
-                                "Skipping SSH-server install; template ships sshd",
+                                "Running SSH bootstrap for template that ships sshd",
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-                        # The bootstrap normally creates ~/.ssh (sshd_bootstrap.sh
-                        # prepare_sshd_runtime). The key-injection loop below has no
-                        # guard, so ensure the dir exists when we skip the install.
-                        # Home-resolution assumption: `docker run` carries no --user,
-                        # so `~` here, sshd_bootstrap.sh's /root/.ssh, and the key loop
-                        # all resolve to the same default-exec-user home.
-                        await ssh_client.run(
-                            f"/usr/bin/docker exec {container_name} "
-                            f"sh -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'",
-                            check=False,
-                        )
-                    else:
-                        await self.install_open_ssh_server_and_start_ssh_service(
-                            ssh_client=ssh_client,
-                            container_name=container_name,
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                        )
+
+                    ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service(
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
+                    if not ssh_bootstrap_ok:
+                        raise RuntimeError("SSH bootstrap failed")
 
                     jupyter_url = None
                     if payload.enable_jupyter and jupyter_port_map:

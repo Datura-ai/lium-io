@@ -3,9 +3,9 @@
 Covers (from the plan's Test Plan):
 - Pull-skip (#1): skip when image present, pull when absent, fail-open on probe
   error, and `check=False` on the inspect probe.
-- sshd-skip (#2): skip the bootstrap when `ships_sshd` is truthy (with the
-  ~/.ssh guard + key injection still running), install on the default/False
-  path. Includes the DEFAULT-PATH REGRESSION GUARD.
+- SSH bootstrap (#2): run the idempotent bootstrap for every rental path,
+  including templates that set `ships_sshd`. Includes the DEFAULT-PATH
+  REGRESSION GUARD.
 - Profile summary log (#3): emitted once on success, survives the mixed-shape
   profilers list, and NOT emitted on the failure path.
 - Backward compat: payloads omitting `ships_sshd` deserialize with None.
@@ -148,7 +148,11 @@ def _patch_happy(svc, monkeypatch, ssh_client):
     )
     monkeypatch.setattr(svc, "_run_docker_create_with_port_retry", AsyncMock())
     monkeypatch.setattr(svc, "check_container_running", AsyncMock(return_value=True))
-    monkeypatch.setattr(svc, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
+    monkeypatch.setattr(
+        svc,
+        "install_open_ssh_server_and_start_ssh_service",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(svc, "run_jupyter", AsyncMock())
     monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
@@ -235,22 +239,32 @@ async def test_inspect_probe_uses_check_false(svc, monkeypatch):
 
 
 # ------------------------------------------------------------------
-# #2 — sshd-skip
+# #2 — SSH bootstrap
 # ------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_ships_sshd_true_skips_install(svc, monkeypatch):
+async def test_ships_sshd_true_still_runs_bootstrap(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
 
     result = await _run(svc, _payload(ships_sshd=True))
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service.assert_not_awaited()
-    assert any("mkdir -p ~/.ssh" in c for c in _ssh_run_cmds(ssh_client)), (
-        "the ~/.ssh guard exec must run on the skip path"
-    )
+    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ships_sshd_true_fails_create_when_bootstrap_fails(svc, monkeypatch):
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    svc.install_open_ssh_server_and_start_ssh_service.return_value = False
+
+    result = await _run(svc, _payload(ships_sshd=True))
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "ssh_bootstrap"
+    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -273,9 +287,6 @@ async def test_default_ships_sshd_none_runs_full_bootstrap(svc, monkeypatch):
 
     assert isinstance(result, ContainerCreated)
     svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
-    assert not any("mkdir -p ~/.ssh" in c for c in _ssh_run_cmds(ssh_client)), (
-        "the skip-path ~/.ssh guard must NOT run on the default install path"
-    )
 
 
 @pytest.mark.asyncio
@@ -302,12 +313,12 @@ async def test_ships_sshd_true_with_jupyter(svc, monkeypatch):
     result = await _run(svc, _payload(ships_sshd=True, enable_jupyter=True))
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service.assert_not_awaited()
+    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
     svc.run_jupyter.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_key_injection_runs_on_sshd_skip(svc, monkeypatch):
+async def test_key_injection_runs_after_shipped_sshd_bootstrap(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
 
