@@ -301,6 +301,18 @@ async def test_ships_sshd_false_runs_install(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ships_sshd_false_preserves_lenient_bootstrap_failure(svc, monkeypatch):
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    svc.install_open_ssh_server_and_start_ssh_service.return_value = False
+
+    result = await _run(svc, _payload(ships_sshd=False))
+
+    assert isinstance(result, ContainerCreated)
+    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_ships_sshd_true_with_jupyter(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
