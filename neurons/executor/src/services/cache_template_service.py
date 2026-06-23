@@ -179,7 +179,10 @@ async def run_cache_template_prefetch() -> None:
 
     gpu_model = "unknown"
     driver_version = "unknown"
-    async with aiohttp.ClientSession() as session:
+    # Bound every backend request so a hung server cannot wedge the prefetch loop;
+    # timeouts surface as exceptions and route through the existing error backoff.
+    session_timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=session_timeout) as session:
         while True:
             try:
                 # Resolve GPU info off-thread, and keep retrying while it is still
