@@ -1,3 +1,5 @@
+import json
+import logging
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -306,6 +308,23 @@ def _assert_shell_arg_is_single_token(command: str, expected_arg: str):
     assert words.count(expected_arg) == 1
 
 
+def _sdk_log_extras(caplog):
+    return [
+        record.msg.extra
+        for record in caplog.records
+        if getattr(record.msg, "extra", {}).get("docker_access") == "sdk"
+    ]
+
+
+def _sdk_log_extra(caplog, *, operation: str, status: str):
+    return next(
+        extra
+        for extra in _sdk_log_extras(caplog)
+        if extra["docker_operation"] == operation
+        and extra["operation_status"] == status
+    )
+
+
 @pytest.mark.asyncio
 async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
     docker_service,
@@ -362,6 +381,113 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
     assert len(env_specs) == 1
     assert env_specs[0].argv == ("sh", "-c", "cat >> /etc/environment")
     assert "ENV_NEWLINE_MARKER" in env_specs[0].stdin
+
+
+@pytest.mark.asyncio
+async def test_create_container_emits_secret_safe_sdk_operation_logs(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+    caplog,
+):
+    ssh_client = RecordingSSHClient()
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    payload = _base_create_payload(docker_image=HOSTILE_IMAGE)
+
+    with caplog.at_level(logging.INFO, logger="services.rental_docker_observability"):
+        await docker_service.create_container(
+            payload=payload,
+            executor_info=executor_info,
+            keypair=keypair,
+            private_key="encrypted-private-key",
+        )
+
+    sdk_extras = _sdk_log_extras(caplog)
+    succeeded_operations = {
+        extra["docker_operation"]
+        for extra in sdk_extras
+        if extra["operation_status"] == "succeeded"
+    }
+
+    assert {
+        "login",
+        "pull",
+        "run_container",
+        "exec_create_ssh_bootstrap_script",
+        "exec_run_ssh_bootstrap_script",
+        "exec_add_authorized_keys",
+        "exec_append_environment",
+    }.issubset(succeeded_operations)
+
+    run_extra = _sdk_log_extra(
+        caplog,
+        operation="run_container",
+        status="succeeded",
+    )
+    assert run_extra["host_shell_command"] is False
+    assert run_extra["container_name"] == "pod_00000000-0000-0000-0000-0000000000aa"
+    assert run_extra["pod_id"] == payload.pod_id
+    assert run_extra["image"] == HOSTILE_IMAGE
+    assert run_extra["command_argv"] == ["sh", "/tmp/Jtd7.sh"]
+    assert sorted(run_extra["environment_keys"]) == [
+        "APP_MODE",
+        "HOSTILE_ENV",
+        "MULTILINE_ENV",
+        "NVIDIA_DRIVER_CAPABILITIES",
+    ]
+
+    add_key_extra = _sdk_log_extra(
+        caplog,
+        operation="exec_add_authorized_keys",
+        status="succeeded",
+    )
+    assert add_key_extra["stdin_bytes"] == len(f"{HOSTILE_PUBLIC_KEY}\n".encode())
+    assert add_key_extra["stdout_len"] == 0
+    assert add_key_extra["stderr_len"] == 0
+
+    serialized = json.dumps(sdk_extras, default=str)
+    assert HOSTILE_PASSWORD not in serialized
+    assert HOSTILE_PUBLIC_KEY not in serialized
+    assert HOSTILE_ENV_VALUE not in serialized
+
+
+class NonZeroExecRentalDockerClient:
+    async def exec_in_container(self, spec) -> ContainerExecResult:
+        return ContainerExecResult(
+            exit_status=7,
+            stdout="stdout details",
+            stderr="stderr details",
+        )
+
+
+@pytest.mark.asyncio
+async def test_sdk_exec_logs_exit_status_stdout_and_stderr_lengths(
+    docker_service,
+    caplog,
+):
+    with caplog.at_level(logging.WARNING, logger="services.rental_docker_observability"):
+        ok = await docker_service.add_environment_variables_with_rental_docker(
+            docker_client=NonZeroExecRentalDockerClient(),
+            container_name="pod_logs",
+            environment={"APP_MODE": "prod"},
+            log_tag="test",
+            log_extra={"pod_id": "pod-id", "miner_hotkey": "miner-hotkey"},
+        )
+
+    assert ok is False
+    failed_extra = _sdk_log_extra(
+        caplog,
+        operation="exec_append_environment",
+        status="failed",
+    )
+    assert failed_extra["host_shell_command"] is False
+    assert failed_extra["container_name"] == "pod_logs"
+    assert failed_extra["exit_status"] == 7
+    assert failed_extra["stdout"] == "stdout details"
+    assert failed_extra["stderr"] == "stderr details"
+    assert failed_extra["stdout_len"] == len("stdout details")
+    assert failed_extra["stderr_len"] == len("stderr details")
 
 
 @pytest.mark.asyncio
