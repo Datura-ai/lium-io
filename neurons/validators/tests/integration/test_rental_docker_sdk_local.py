@@ -236,7 +236,20 @@ async def _run_rental_lifecycle(
             stdin=f"{HOSTILE_PUBLIC_KEY}\n",
         )
     )
-    public_key_write_succeeded = key_result.exit_status == 0
+    verify_key_added_result = await rental_client.exec_in_container(
+        ContainerExecSpec(
+            container_name=container_name,
+            argv=(
+                "sh",
+                "-c",
+                "grep -q KEY_MARKER /root/.ssh/authorized_keys",
+            ),
+        )
+    )
+    public_key_write_succeeded = (
+        key_result.exit_status == 0
+        and verify_key_added_result.exit_status == 0
+    )
 
     remove_key_result = await rental_client.exec_in_container(
         build_remove_authorized_keys_exec_spec(
