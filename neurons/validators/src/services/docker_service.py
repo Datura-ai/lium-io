@@ -63,6 +63,11 @@ from services.redis_service import (
 )
 from services.attestation_service import AttestationService, AttestationError
 from services.nvidia_devices import build_gpu_docker_config_for_executor
+from services.rental_docker_observability import (
+    exec_logged_rental_docker_sdk_operation,
+    rental_run_spec_log_fields,
+    run_logged_rental_docker_sdk_operation,
+)
 from services.rental_docker_sdk import (
     ContainerExecSpec,
     ContainerRunSpec,
@@ -426,7 +431,13 @@ class DockerService:
         vloopback_mount_repair_attempted = False
         while True:
             try:
-                await docker_client.run_container(run_spec)
+                await run_logged_rental_docker_sdk_operation(
+                    operation="run_container",
+                    log_extra=default_extra,
+                    call=lambda: docker_client.run_container(run_spec),
+                    attempt=attempt + 1,
+                    **rental_run_spec_log_fields(run_spec),
+                )
                 return
             except Exception as exc:
                 if _should_repair_stale_mountpoint(
@@ -490,7 +501,14 @@ class DockerService:
         warning_event: str,
     ) -> None:
         try:
-            await docker_client.remove_container(
+            await run_logged_rental_docker_sdk_operation(
+                operation="remove_failed_container_for_retry",
+                log_extra=default_extra,
+                call=lambda: docker_client.remove_container(
+                    container_name=container_name,
+                    force=True,
+                    remove_volumes=False,
+                ),
                 container_name=container_name,
                 force=True,
                 remove_volumes=False,
@@ -1440,7 +1458,12 @@ class DockerService:
         )
 
         try:
-            create_result = await docker_client.exec_in_container(create_spec)
+            create_result = await exec_logged_rental_docker_sdk_operation(
+                docker_client=docker_client,
+                operation="exec_create_ssh_bootstrap_script",
+                exec_spec=create_spec,
+                log_extra=log_extra,
+            )
         except Exception as exc:
             await self.stream_log(
                 "Failed to create SSH bootstrap script in container",
@@ -1482,7 +1505,12 @@ class DockerService:
             )
             return False
 
-        run_result = await docker_client.exec_in_container(run_spec)
+        run_result = await exec_logged_rental_docker_sdk_operation(
+            docker_client=docker_client,
+            operation="exec_run_ssh_bootstrap_script",
+            exec_spec=run_spec,
+            log_extra=log_extra,
+        )
         if run_result.exit_status != 0:
             await self.stream_log(
                 run_result.stderr or run_result.stdout or "SSH bootstrap script failed",
@@ -1518,7 +1546,12 @@ class DockerService:
             container_name=container_name,
             public_keys=public_keys,
         )
-        result = await docker_client.exec_in_container(exec_spec)
+        result = await exec_logged_rental_docker_sdk_operation(
+            docker_client=docker_client,
+            operation="exec_add_authorized_keys",
+            exec_spec=exec_spec,
+            log_extra=log_extra,
+        )
         if result.exit_status != 0:
             await self.stream_log(
                 result.stderr or result.stdout or "Failed to add SSH public keys",
@@ -1556,7 +1589,12 @@ class DockerService:
             container_name=container_name,
             public_keys=public_keys,
         )
-        result = await docker_client.exec_in_container(exec_spec)
+        result = await exec_logged_rental_docker_sdk_operation(
+            docker_client=docker_client,
+            operation="exec_remove_authorized_keys",
+            exec_spec=exec_spec,
+            log_extra=log_extra,
+        )
         if result.exit_status != 0:
             await self.stream_log(
                 result.stderr or result.stdout or "Failed to remove SSH public keys",
@@ -1598,7 +1636,12 @@ class DockerService:
             return True
 
         try:
-            result = await docker_client.exec_in_container(exec_spec)
+            result = await exec_logged_rental_docker_sdk_operation(
+                docker_client=docker_client,
+                operation="exec_append_environment",
+                exec_spec=exec_spec,
+                log_extra=log_extra,
+            )
         except Exception as exc:
             await self.stream_log("Failed to set environment variables", "error", log_tag)
             logger.warning(
@@ -2811,9 +2854,15 @@ class DockerService:
                 if payload.docker_username and payload.docker_password:
                     current_step = "docker_login"
                     try:
-                        await docker_client.login(
-                            username=payload.docker_username,
-                            password=payload.docker_password,
+                        await run_logged_rental_docker_sdk_operation(
+                            operation="login",
+                            log_extra=default_extra,
+                            call=lambda: docker_client.login(
+                                username=payload.docker_username,
+                                password=payload.docker_password,
+                            ),
+                            username_present=True,
+                            username_len=len(payload.docker_username),
                         )
                     except Exception as exc:
                         logger.warning(
@@ -2868,7 +2917,12 @@ class DockerService:
                         "success",
                         log_tag,
                     )
-                    await docker_client.pull(image=payload.docker_image)
+                    await run_logged_rental_docker_sdk_operation(
+                        operation="pull",
+                        log_extra=default_extra,
+                        call=lambda: docker_client.pull(image=payload.docker_image),
+                        image=payload.docker_image,
+                    )
 
                     # Add profiler for docker pull
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
@@ -3389,7 +3443,12 @@ class DockerService:
                 executor_info=executor_info,
                 private_key=private_key,
             ) as docker_client:
-                await docker_client.stop(container_name=payload.container_name)
+                await run_logged_rental_docker_sdk_operation(
+                    operation="stop_container",
+                    log_extra=default_extra,
+                    call=lambda: docker_client.stop(container_name=payload.container_name),
+                    container_name=payload.container_name,
+                )
         except Exception as exc:
             log_text = _m(
                 "Failed stop_container",
@@ -3473,7 +3532,12 @@ class DockerService:
                 executor_info=executor_info,
                 private_key=private_key,
             ) as docker_client:
-                await docker_client.start(container_name=payload.container_name)
+                await run_logged_rental_docker_sdk_operation(
+                    operation="start_container",
+                    log_extra=default_extra,
+                    call=lambda: docker_client.start(container_name=payload.container_name),
+                    container_name=payload.container_name,
+                )
                 ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                     docker_client=docker_client,
                     container_name=payload.container_name,
@@ -3612,7 +3676,14 @@ class DockerService:
                 ) as docker_client,
             ):
                 try:
-                    await docker_client.remove_container(
+                    await run_logged_rental_docker_sdk_operation(
+                        operation="remove_container",
+                        log_extra=default_extra,
+                        call=lambda: docker_client.remove_container(
+                            container_name=payload.container_name,
+                            force=True,
+                            remove_volumes=True,
+                        ),
                         container_name=payload.container_name,
                         force=True,
                         remove_volumes=True,
@@ -3644,13 +3715,33 @@ class DockerService:
                     default_extra=default_extra,
                 )
 
-                await docker_client.prune_images()
+                await run_logged_rental_docker_sdk_operation(
+                    operation="prune_images",
+                    log_extra=default_extra,
+                    call=docker_client.prune_images,
+                )
 
                 if payload.local_volume:
-                    await docker_client.remove_volume(volume_name=payload.local_volume)
+                    await run_logged_rental_docker_sdk_operation(
+                        operation="remove_volume",
+                        log_extra=default_extra,
+                        call=lambda: docker_client.remove_volume(
+                            volume_name=payload.local_volume
+                        ),
+                        volume_name=payload.local_volume,
+                        volume_role="local",
+                    )
 
                 if payload.external_volume:
-                    await docker_client.remove_volume(volume_name=payload.external_volume)
+                    await run_logged_rental_docker_sdk_operation(
+                        operation="remove_volume",
+                        log_extra=default_extra,
+                        call=lambda: docker_client.remove_volume(
+                            volume_name=payload.external_volume
+                        ),
+                        volume_name=payload.external_volume,
+                        volume_role="external",
+                    )
                     await self.disable_s3fs_volume_plugin(ssh_client)
 
                 logger.info(

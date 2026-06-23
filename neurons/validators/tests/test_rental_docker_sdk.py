@@ -1,4 +1,7 @@
 import os
+import socket
+import struct
+import threading
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -76,6 +79,43 @@ class FakeApiClient:
 
     def close(self):
         self.closed = True
+
+
+class SocketExecApiClient(FakeApiClient):
+    def __init__(self):
+        super().__init__()
+        self.stdin_received = b""
+        self.server_thread = None
+
+    def exec_start(self, exec_id, **kwargs):
+        if kwargs != {"socket": True}:
+            return super().exec_start(exec_id, **kwargs)
+
+        self.exec_started.append((exec_id, kwargs))
+        client_socket, server_socket = socket.socketpair()
+
+        def serve_exec_socket():
+            try:
+                chunks = []
+                while True:
+                    chunk = server_socket.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                self.stdin_received = b"".join(chunks)
+
+                for stream, payload in (
+                    (1, b"socket-stdout"),
+                    (2, b"socket-stderr"),
+                ):
+                    header = struct.pack(">BxxxL", stream, len(payload))
+                    server_socket.sendall(header + payload)
+            finally:
+                server_socket.close()
+
+        self.server_thread = threading.Thread(target=serve_exec_socket)
+        self.server_thread.start()
+        return client_socket
 
 
 @pytest.mark.asyncio
@@ -194,6 +234,36 @@ async def test_exec_in_container_passes_argv_and_environment_as_data():
         }
     ]
     assert api_client.exec_started == [("exec-id", {"demux": True})]
+
+
+@pytest.mark.asyncio
+async def test_exec_in_container_with_stdin_demuxes_socket_stdout_and_stderr():
+    api_client = SocketExecApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    result = await client.exec_in_container(
+        ContainerExecSpec(
+            container_name="pod_exec",
+            argv=("sh", "-c", "cat > /tmp/file"),
+            stdin="stdin payload\n",
+        )
+    )
+    api_client.server_thread.join(timeout=1)
+
+    assert api_client.server_thread.is_alive() is False
+    assert api_client.stdin_received == b"stdin payload\n"
+    assert result.exit_status == 0
+    assert result.stdout == "socket-stdout"
+    assert result.stderr == "socket-stderr"
+    assert api_client.exec_created == [
+        {
+            "container": "pod_exec",
+            "cmd": ["sh", "-c", "cat > /tmp/file"],
+            "stdin": True,
+            "environment": None,
+        }
+    ]
+    assert api_client.exec_started == [("exec-id", {"socket": True})]
 
 
 def test_stdin_exec_spec_builders_keep_values_out_of_argv():
