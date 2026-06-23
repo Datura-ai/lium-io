@@ -379,6 +379,9 @@ def build_remove_authorized_keys_exec_spec(
     key_data = "".join(f"{public_key}\n" for public_key in public_keys)
     quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
     quoted_path = shlex.quote(target_path)
+    # This shell runs inside the target container. Public keys are supplied via
+    # stdin and matched from a temp file, so key contents are never interpolated
+    # into host-side Docker shell text or into this argv.
     script = (
         "set -e; "
         f"mkdir -p {quoted_dir} && "
