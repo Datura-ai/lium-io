@@ -835,13 +835,6 @@ class DockerService:
 
         return available_ports, pod_mapping
 
-    @staticmethod
-    def _build_docker_login_command(username: str, password: str) -> str:
-        return (
-            f"echo {shlex.quote(password)} | "
-            f"/usr/bin/docker login --username {shlex.quote(username)} --password-stdin"
-        )
-
     async def execute_and_stream_logs(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -3618,7 +3611,6 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
-                # await ssh_client.run(f"docker stop {payload.container_name}")
                 try:
                     await docker_client.remove_container(
                         container_name=payload.container_name,
@@ -4120,79 +4112,6 @@ class DockerService:
                     print(f"Error retrieving data for {repo}: {e}")
 
         return all_digests
-
-    async def setup_ssh_access(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        container_name: str,
-        ip_address: str,
-        username: str = "root",
-        port_maps: list[tuple[int, int]] = None,
-    ) -> tuple[bool, str, str]:
-        """Generate an SSH key pair, add the public key to the Docker container, and check SSH connection."""
-
-        my_key = "my_key"
-        private_key, public_key = self.ssh_service.generate_ssh_key(my_key)
-
-        public_key = public_key.decode("utf-8")
-        private_key = private_key.decode("utf-8")
-
-        private_key = self.ssh_service.decrypt_payload(my_key, private_key)
-        pkey = asyncssh.import_private_key(private_key)
-
-        await asyncio.sleep(5)
-
-        command = f"/usr/bin/docker exec {container_name} sh -c 'echo \"{public_key}\" >> /root/.ssh/authorized_keys'"
-
-        result = await ssh_client.run(command)
-        if result.exit_status != 0:
-            log_text = "Error creating docker connection"
-            log_status = "error"
-            logger.error(log_text)
-
-            return False, log_text, log_status
-
-        port = 0
-        for internal, external in port_maps:
-            if internal == 22:
-                port = external
-        # Check SSH connection
-        try:
-            async with asyncssh.connect(
-                host=ip_address,
-                port=port,
-                username=username,
-                client_keys=[pkey],
-                known_hosts=None,
-            ):
-                log_status = "info"
-                log_text = "SSH connection successful!"
-                logger.info(
-                    _m(
-                        log_text,
-                        extra={
-                            "container_name": container_name,
-                            "ip_address": ip_address,
-                            "port_maps": port_maps,
-                        },
-                    )
-                )
-                return True, log_text, log_status
-        except Exception as e:
-            log_text = "SSH connection failed"
-            log_status = "error"
-            logger.error(
-                _m(
-                    log_text,
-                    extra={
-                        "container_name": container_name,
-                        "ip_address": ip_address,
-                        "port_maps": port_maps,
-                        "error": str(e),
-                    },
-                )
-            )
-            return False, log_text, log_status
 
     def _get_preferred_ports(self, initial_port_count: int | None) -> list[int]:
         """Calculate preferred ports based on initial_port_count.
