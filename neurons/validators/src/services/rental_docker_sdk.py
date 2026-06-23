@@ -114,6 +114,17 @@ class RentalDockerSdkClient:
             api_method=self._api_client.pull,
         )
 
+    async def image_exists(self, *, image: str) -> bool:
+        try:
+            await asyncio.to_thread(self._api_client.inspect_image, image)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return False
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect image failed", exc)
+            ) from exc
+        return True
+
     async def run_container(self, spec: ContainerRunSpec) -> None:
         try:
             await asyncio.to_thread(self._run_container_sync, spec)
@@ -592,6 +603,13 @@ def _decode_output_part(value) -> str:
     if isinstance(value, bytes):
         return value.decode(errors="replace")
     return str(value)
+
+
+def _is_docker_not_found_error(exc: Exception) -> bool:
+    if exc.__class__.__name__ in {"ImageNotFound", "NotFound"}:
+        return True
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 404
 
 
 def _build_docker_ssh_base_url(executor_info: ExecutorSSHInfo) -> str:

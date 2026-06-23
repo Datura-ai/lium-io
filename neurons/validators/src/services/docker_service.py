@@ -2911,22 +2911,57 @@ class DockerService:
                     profilers.append(ProfilerStep.since(ProfilerStepName.CUSTOM_DOCKER_BUILD, prev_timestamp))
                     prev_timestamp = now_ms()
                 else:
-                    current_step = "docker_pull"
-                    await self.stream_log(
-                        f"Pulling docker image {payload.docker_image}",
-                        "success",
-                        log_tag,
-                    )
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="pull",
-                        log_extra=default_extra,
-                        call=lambda: docker_client.pull(image=payload.docker_image),
-                        image=payload.docker_image,
-                    )
+                    current_step = "docker_image_inspect"
+                    image_present = False
+                    try:
+                        image_present = await run_logged_rental_docker_sdk_operation(
+                            operation="inspect_image",
+                            log_extra=default_extra,
+                            call=lambda: docker_client.image_exists(
+                                image=payload.docker_image
+                            ),
+                            image=payload.docker_image,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            _m(
+                                "Docker SDK image inspect probe failed; falling back to pull",
+                                extra=get_extra_info({**default_extra, "error": str(exc)}),
+                            )
+                        )
 
-                    # Add profiler for docker pull
-                    profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
-                    prev_timestamp = now_ms()
+                    current_step = "docker_pull"
+                    if image_present:
+                        logger.info(
+                            _m(
+                                "Skipping docker pull; image already present locally",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
+                        profilers.append(
+                            ProfilerStep.since(
+                                ProfilerStepName.DOCKER_PULL,
+                                prev_timestamp,
+                                skipped=True,
+                            )
+                        )
+                        prev_timestamp = now_ms()
+                    else:
+                        await self.stream_log(
+                            f"Pulling docker image {payload.docker_image}",
+                            "success",
+                            log_tag,
+                        )
+                        await run_logged_rental_docker_sdk_operation(
+                            operation="pull",
+                            log_extra=default_extra,
+                            call=lambda: docker_client.pull(image=payload.docker_image),
+                            image=payload.docker_image,
+                        )
+
+                        # Add profiler for docker pull
+                        profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
+                        prev_timestamp = now_ms()
 
                 # Get the container path from the first volume
                 local_volume_path = custom_options.volumes[0].split(':')[-1] if custom_options.volumes else '/root'
