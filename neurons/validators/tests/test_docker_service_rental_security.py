@@ -68,6 +68,8 @@ class RecordingSSHClient:
 class RecordingRentalDockerClient:
     def __init__(self):
         self.login_calls = []
+        self.inspected_images = []
+        self.existing_images = set()
         self.pulled_images = []
         self.run_specs = []
         self.exec_specs = []
@@ -79,6 +81,10 @@ class RecordingRentalDockerClient:
 
     async def login(self, *, username: str, password: str) -> None:
         self.login_calls.append({"username": username, "password": password})
+
+    async def image_exists(self, *, image: str) -> bool:
+        self.inspected_images.append(image)
+        return image in self.existing_images
 
     async def pull(self, *, image: str) -> None:
         self.pulled_images.append(image)

