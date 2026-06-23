@@ -136,7 +136,7 @@ class Settings(BaseSettings):
     # on/after the cutoff, non-compliant unrented executors are fully gated (multiplier 0).
     # Currently-rented executors are always exempt.
     MIN_NVIDIA_DRIVER_VERSION: str = Field(env="MIN_NVIDIA_DRIVER_VERSION", default="580.65.06")
-    MIN_DRIVER_CUTOFF: datetime = datetime(2026, 6, 24, 12, 0, 0)
+    MIN_DRIVER_CUTOFF: datetime = datetime(2026, 6, 30, 12, 0, 0)
 
     TIME_DELTA_FOR_EMISSION: float = 0.01
 
