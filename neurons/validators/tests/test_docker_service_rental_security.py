@@ -15,6 +15,7 @@ from payload_models.payloads import (
     ContainerStopRequest,
     CustomOptions,
     PayloadPortMapping,
+    RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
 from services.docker_service import DockerService
@@ -70,6 +71,8 @@ class RecordingRentalDockerClient:
         self.started_containers = []
         self.stopped_containers = []
         self.removed_containers = []
+        self.removed_volumes = []
+        self.pruned_images = 0
 
     async def login(self, *, username: str, password: str) -> None:
         self.login_calls.append({"username": username, "password": password})
@@ -104,6 +107,14 @@ class RecordingRentalDockerClient:
                 "remove_volumes": remove_volumes,
             }
         )
+
+    async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
+        self.removed_volumes.append(
+            {"volume_name": volume_name, "force": force}
+        )
+
+    async def prune_images(self) -> None:
+        self.pruned_images += 1
 
 
 class RecordingRentalDockerFactory:
@@ -383,6 +394,43 @@ async def test_add_ssh_key_writes_public_keys_as_stdin_data(
 
 
 @pytest.mark.asyncio
+async def test_remove_ssh_key_writes_public_keys_as_stdin_data(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    _patch_common(monkeypatch, docker_service, ssh_client)
+    payload = RemoveSshPublicKeysRequest(
+        miner_hotkey="miner-hotkey",
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name=HOSTILE_CONTAINER_NAME,
+        user_public_keys=[HOSTILE_PUBLIC_KEY],
+    )
+
+    await docker_service.remove_ssh_keys(
+        payload,
+        executor_info,
+        keypair,
+        "encrypted-private-key",
+    )
+
+    docker_client = docker_service.rental_docker_client_factory.client
+    assert len(docker_client.exec_specs) == 1
+    spec = docker_client.exec_specs[0]
+    _assert_markers_not_in_host_shell(
+        ssh_client.commands,
+        ["CONTAINER_MARKER", "KEY_MARKER"],
+    )
+    assert spec.container_name == HOSTILE_CONTAINER_NAME
+    assert HOSTILE_PUBLIC_KEY not in " ".join(spec.argv)
+    assert spec.stdin == f"{HOSTILE_PUBLIC_KEY}\n"
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_operations_pass_container_names_as_sdk_data(
     docker_service,
     executor_info,
@@ -444,6 +492,10 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
             "force": True,
             "remove_volumes": True,
         }
+    ]
+    assert docker_client.pruned_images == 1
+    assert docker_client.removed_volumes == [
+        {"volume_name": "volume_lifecycle", "force": False}
     ]
 
 
