@@ -16,6 +16,7 @@ dependencies = [
     "databases>=0.9.0",
     "datura @ file:///${PROJECT_ROOT}/../../datura",
     "fastapi>=0.110.3",
+    "lium-core>=0.1.1",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
     "python-json-logger>=3.3.0",

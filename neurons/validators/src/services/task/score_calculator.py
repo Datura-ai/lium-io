@@ -6,8 +6,7 @@ based on collateral status, rental state, and contract versions.
 
 from typing import Tuple
 
-from core.config import settings
-from services.const import MACHINE_PRICES
+from core.config import settings, shared_client
 from services.task.pipeline import Context
 
 
@@ -40,11 +39,12 @@ def calculate_scores(
     actual_score = 1.0
 
     # Machine price check
-    base_price = MACHINE_PRICES.get(gpu_model, 0)
-    if price_per_gpu and price_per_gpu > base_price * settings.MACHINE_MAX_PRICE_RATE:
+    base_price = shared_client.config.machine_prices.get(gpu_model, 0)
+    max_price_rate = shared_client.config.machine_max_price_rate
+    if price_per_gpu and price_per_gpu > base_price * max_price_rate:
         actual_score = 0.0
         warning_messages.append(
-            f"GPU price exceeds the limit. limit: {base_price * settings.MACHINE_MAX_PRICE_RATE}, actual: {price_per_gpu}"
+            f"GPU price exceeds the limit. limit: {base_price * max_price_rate}, actual: {price_per_gpu}"
         )
 
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
