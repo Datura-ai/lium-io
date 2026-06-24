@@ -67,6 +67,24 @@ class RentalLifecycleResult:
 
 @requires_local_docker
 @pytest.mark.asyncio
+async def test_local_docker_sdk_create_and_remove_volume(local_docker_api_client):
+    client = RentalDockerSdkClient(local_docker_api_client)
+    volume_name = _container_name("lium-rental-sdk-volume")
+
+    try:
+        await client.create_volume(volume_name=volume_name)
+        inspect = local_docker_api_client.inspect_volume(volume_name)
+        assert inspect["Name"] == volume_name
+
+        await client.remove_volume(volume_name=volume_name, force=True)
+        assert not _volume_exists(local_docker_api_client, volume_name)
+    finally:
+        _remove_volume_if_present(local_docker_api_client, volume_name)
+        await client.aclose()
+
+
+@requires_local_docker
+@pytest.mark.asyncio
 async def test_local_docker_sdk_rental_smoke(local_docker_api_client):
     client = RentalDockerSdkClient(local_docker_api_client)
     container_name = _container_name("lium-rental-sdk-smoke")
@@ -506,6 +524,23 @@ def _remove_container_if_present(api_client, container_name: str) -> None:
         api_client.remove_container(container_name, force=True, v=True)
     except Exception:
         pass
+
+
+def _remove_volume_if_present(api_client, volume_name: str) -> None:
+    try:
+        api_client.remove_volume(volume_name, force=True)
+    except Exception:
+        pass
+
+
+def _volume_exists(api_client, volume_name: str) -> bool:
+    import docker
+
+    try:
+        api_client.inspect_volume(volume_name)
+        return True
+    except docker.errors.NotFound:
+        return False
 
 
 def _wait_for_ssh_port(container):

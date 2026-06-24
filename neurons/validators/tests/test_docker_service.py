@@ -36,6 +36,7 @@ class _FakeRentalDockerClient:
         self.started_containers = []
         self.stopped_containers = []
         self.removed_containers = []
+        self.created_volumes = []
         self.removed_volumes = []
         self.pruned_images = 0
         self.pull_error = None
@@ -91,6 +92,23 @@ class _FakeRentalDockerClient:
         )
         if self.remove_error is not None:
             raise self.remove_error
+
+    async def create_volume(
+        self,
+        *,
+        volume_name: str,
+        driver: str | None = None,
+        driver_opts: dict[str, str] | None = None,
+        timeout: int | None = None,
+    ) -> None:
+        self.created_volumes.append(
+            {
+                "volume_name": volume_name,
+                "driver": driver,
+                "driver_opts": driver_opts,
+                "timeout": timeout,
+            }
+        )
 
     async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
         self.removed_volumes.append(
@@ -2183,11 +2201,13 @@ async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
 ):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
-    execute = AsyncMock()
-    monkeypatch.setattr(docker_service, "execute_and_stream_logs", execute)
+    stream_log = AsyncMock()
+    monkeypatch.setattr(docker_service, "stream_log", stream_log)
+    docker_client = _FakeRentalDockerClient()
 
     await docker_service.create_local_volume(
         ssh_client=ssh_client,
+        docker_client=docker_client,
         local_volume="volume_test",
         log_tag="tag",
         log_text="Creating docker volume volume_test",
@@ -2196,17 +2216,15 @@ async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
         timeout=10,
     )
 
-    execute.assert_awaited_once()
-    assert execute.await_args.kwargs["timeout"] == 133
-    assert execute.await_args.kwargs["log_extra"] == {
-        "local_volume": "volume_test",
-        "volume_limit_gb": 1024,
-        "requested_timeout_seconds": 10,
-        "effective_timeout_seconds": 133,
-        "timeout_scaled": True,
-        "loopback_plugin": "vloopback",
-        "sparse": False,
-    }
+    stream_log.assert_awaited_once_with("Creating docker volume volume_test", "success", "tag")
+    assert docker_client.created_volumes == [
+        {
+            "volume_name": "volume_test",
+            "driver": "vloopback",
+            "driver_opts": {"size": "1024g"},
+            "timeout": 133,
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -3460,7 +3478,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
         private_key="encrypted",
     )
 
-    # Assert: fresh-computed volume limit reaches docker volume create
+    # Assert: fresh-computed volume limit reaches local volume creation
     assert docker_service.create_local_volume.await_args.kwargs["limit"] == 393
     # Assert: fresh-computed storage limit reaches Docker SDK host config data
     run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]

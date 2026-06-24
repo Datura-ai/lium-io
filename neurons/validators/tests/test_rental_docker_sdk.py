@@ -44,7 +44,9 @@ class FakeApiClient:
         self.exec_started = []
         self.exec_inspected = []
         self.pruned_images = False
+        self.created_volumes = []
         self.removed_volumes = []
+        self.timeout = 60
         self.closed = False
 
     def create_host_config(self, **kwargs):
@@ -84,6 +86,10 @@ class FakeApiClient:
     def prune_images(self):
         self.pruned_images = True
         return {"ImagesDeleted": []}
+
+    def create_volume(self, **kwargs):
+        self.created_volumes.append({**kwargs, "client_timeout": self.timeout})
+        return {"Name": kwargs.get("name")}
 
     def remove_volume(self, volume_name, **kwargs):
         self.removed_volumes.append((volume_name, kwargs))
@@ -341,9 +347,24 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
 
+    await client.create_volume(
+        volume_name="volume_test",
+        driver="vloopback",
+        driver_opts={"size": "23g"},
+        timeout=133,
+    )
     await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
 
+    assert api_client.created_volumes == [
+        {
+            "name": "volume_test",
+            "driver": "vloopback",
+            "driver_opts": {"size": "23g"},
+            "client_timeout": 133,
+        }
+    ]
+    assert api_client.timeout == 60
     assert api_client.pruned_images is True
     assert api_client.removed_volumes == [("volume_test", {"force": True})]
 
