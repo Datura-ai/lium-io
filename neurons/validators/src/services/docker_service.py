@@ -1417,6 +1417,7 @@ class DockerService:
         log_extra: dict,
         limit: int | None = None,
         timeout: int = 10,
+        sparse: bool = False,
     ):
         requested_timeout = timeout
         if limit:
@@ -1429,7 +1430,17 @@ class DockerService:
             command = f'/usr/bin/docker plugin install ashald/docker-volume-loopback --alias {loopback_plugin_name} --grant-all-permissions DATA_DIR="{docker_root_dir}/loopback"'
             await ssh_client.run(command)
 
-            command = f'/usr/bin/docker volume create -d {loopback_plugin_name} {local_volume} -o size={limit}g'
+            # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
+            # by default (creation time scales with size). `sparse=true` writes a sparse
+            # file (creation ~flat) while still capping the volume at `size`. Gated to
+            # full-node rentals only — see the caller — because a sparse partial volume
+            # leaves its unwritten space free in df AND still counts its declared size in
+            # resolve_volume_sizing(), double-counting the pool and overcommitting host disk.
+            sparse_opt = " -o sparse=true" if sparse else ""
+            command = (
+                f'/usr/bin/docker volume create -d {loopback_plugin_name} '
+                f'{local_volume} -o size={limit}g{sparse_opt}'
+            )
         else:
             loopback_plugin_name = None
             command = f"/usr/bin/docker volume create {local_volume}"
@@ -1443,6 +1454,7 @@ class DockerService:
             "effective_timeout_seconds": timeout,
             "timeout_scaled": timeout != requested_timeout,
             "loopback_plugin": loopback_plugin_name,
+            "sparse": bool(sparse and limit),
         }
         logger.info(
             _m(
@@ -2564,6 +2576,14 @@ class DockerService:
 
                     current_step = "volume_creation"
                     local_volume = f"volume_{payload.pod_id}"
+                    # DAH-2265 Plan 3: only full-node rentals (disk_share >= 1.0) get a
+                    # sparse loopback volume. A full-node pod is sole-tenant, so there is
+                    # nothing to overcommit against; partial (< 1.0) and legacy (None)
+                    # rentals must stay preallocated to keep the DAH-2183 fresh-sizing
+                    # math (df_avail + existing declared sizes) balanced.
+                    full_node_rental = (
+                        payload.disk_share is not None and payload.disk_share >= 1.0
+                    )
                     await self.create_local_volume(
                         ssh_client=ssh_client,
                         local_volume=local_volume,
@@ -2571,6 +2591,7 @@ class DockerService:
                         log_text=f"Creating docker volume {local_volume}",
                         log_extra=default_extra,
                         limit=effective_volume_limit_gb,
+                        sparse=full_node_rental,
                     )
                     created_local_volume = True
 

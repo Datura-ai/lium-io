@@ -2077,7 +2077,84 @@ async def test_create_local_volume_uses_scaled_timeout_for_large_limited_volume(
         "effective_timeout_seconds": 133,
         "timeout_scaled": True,
         "loopback_plugin": "vloopback",
+        "sparse": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# DAH-2265 Plan 3: sparse vloopback volume creation, gated to full-node rentals.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_sparse_true_appends_sparse_flag(
+    docker_service,
+    monkeypatch,
+):
+    """sparse=True (full-node rental) → `-o sparse=true` appended after the size cap."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
+    execute = AsyncMock()
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", execute)
+
+    await docker_service.create_local_volume(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        log_tag="tag",
+        log_text="Creating docker volume volume_test",
+        log_extra={},
+        limit=200,
+        sparse=True,
+    )
+
+    command = execute.await_args.kwargs["command"]
+    assert command == (
+        "/usr/bin/docker volume create -d vloopback volume_test "
+        "-o size=200g -o sparse=true"
+    )
+    assert execute.await_args.kwargs["log_extra"]["sparse"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_local_volume_sparse_false_keeps_preallocation(
+    docker_service,
+    monkeypatch,
+):
+    """sparse=False (partial / legacy rental) → no sparse flag; size cap unchanged."""
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
+    execute = AsyncMock()
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", execute)
+
+    await docker_service.create_local_volume(
+        ssh_client=ssh_client,
+        local_volume="volume_test",
+        log_tag="tag",
+        log_text="Creating docker volume volume_test",
+        log_extra={},
+        limit=200,
+    )
+
+    command = execute.await_args.kwargs["command"]
+    assert command == "/usr/bin/docker volume create -d vloopback volume_test -o size=200g"
+    assert "sparse" not in command
+    assert execute.await_args.kwargs["log_extra"]["sparse"] is False
+
+
+@pytest.mark.parametrize(
+    "disk_share, expected_sparse",
+    [
+        (1.0, True),    # exact full-node
+        (1.5, True),    # >1.0 (defensive) still full-node
+        (0.5, False),   # partial
+        (0.99, False),  # just-under partial
+        (None, False),  # legacy / unknown
+    ],
+)
+def test_full_node_sparse_gate(disk_share, expected_sparse):
+    """The call-site gate: sparse iff disk_share is not None and >= 1.0 (DAH-2265 Plan 3)."""
+    full_node_rental = disk_share is not None and disk_share >= 1.0
+    assert full_node_rental is expected_sparse
 
 
 # ---------------------------------------------------------------------------
