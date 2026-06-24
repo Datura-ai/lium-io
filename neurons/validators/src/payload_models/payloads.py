@@ -3,7 +3,7 @@ from datetime import datetime
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import BaseModel, field_validator, model_serializer
+from pydantic import BaseModel, Field, field_validator, model_serializer
 
 
 class CustomOptions(BaseModel):
@@ -252,7 +252,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     external_volume_info: ExternalVolumeInfo | None = None
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
-    docker_password: str | None = None  # when edit pod, docker_password is required
+    # when edit pod, docker_password is required
+    docker_password: str | None = Field(default=None, repr=False)
     timestamp: int | None = None
     backup_log_id: str | None = None
     restore_path: str | None = None

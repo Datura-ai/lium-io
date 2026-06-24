@@ -401,7 +401,7 @@ async def test_create_container_emits_secret_safe_sdk_operation_logs(
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
     payload = _base_create_payload(docker_image=HOSTILE_IMAGE)
 
-    with caplog.at_level(logging.INFO, logger="services.rental_docker_observability"):
+    with caplog.at_level(logging.INFO):
         await docker_service.create_container(
             payload=payload,
             executor_info=executor_info,
@@ -456,6 +456,18 @@ async def test_create_container_emits_secret_safe_sdk_operation_logs(
     assert HOSTILE_PASSWORD not in serialized
     assert HOSTILE_PUBLIC_KEY not in serialized
     assert HOSTILE_ENV_VALUE not in serialized
+
+    all_log_content = json.dumps(
+        {
+            "messages": [record.getMessage() for record in caplog.records],
+            "extras": [
+                getattr(record.msg, "extra", {})
+                for record in caplog.records
+            ],
+        },
+        default=str,
+    )
+    assert HOSTILE_PASSWORD not in all_log_content
 
 
 class NonZeroExecRentalDockerClient:
