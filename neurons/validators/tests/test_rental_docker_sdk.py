@@ -15,6 +15,7 @@ from services.rental_docker_sdk import (
     GpuDeviceRequest,
     PortBinding,
     RentalDockerConnectionError,
+    RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
@@ -135,6 +136,31 @@ class SocketExecApiClient(FakeApiClient):
         return client_socket
 
 
+class PullApiClient(FakeApiClient):
+    def __init__(self):
+        super().__init__()
+        self.post_calls = []
+        self.pull_events = [{"status": "Pull complete"}]
+        self.raise_for_status_called = False
+        self.stream_decode = None
+        self._auth_configs = None
+
+    def _url(self, path):
+        return f"http://docker.test{path}"
+
+    def _post(self, *args, **kwargs):
+        response = object()
+        self.post_calls.append({"args": args, "kwargs": kwargs, "response": response})
+        return response
+
+    def _raise_for_status(self, response):
+        self.raise_for_status_called = True
+
+    def _stream_helper(self, response, *, decode=False):
+        self.stream_decode = decode
+        return self.pull_events
+
+
 class ImageNotFound(Exception):
     pass
 
@@ -173,6 +199,37 @@ async def test_login_preserves_legitimate_password_metacharacters(password):
     await client.login(username="registry-user", password=password)
 
     assert api_client.login_calls[0]["password"] == password
+
+
+@pytest.mark.asyncio
+async def test_pull_overrides_docker_sdk_unbounded_timeout():
+    api_client = PullApiClient()
+    client = RentalDockerSdkClient(api_client, pull_timeout_seconds=123)
+
+    await client.pull(image="registry.example/app:tag")
+
+    assert api_client.post_calls[0]["args"] == ("http://docker.test/images/create",)
+    assert api_client.post_calls[0]["kwargs"]["params"] == {
+        "tag": "tag",
+        "fromImage": "registry.example/app",
+    }
+    assert api_client.post_calls[0]["kwargs"]["headers"] == {}
+    assert api_client.post_calls[0]["kwargs"]["stream"] is True
+    assert api_client.post_calls[0]["kwargs"]["timeout"] == 123
+    assert api_client.raise_for_status_called is True
+    assert api_client.stream_decode is True
+
+
+@pytest.mark.asyncio
+async def test_pull_stream_error_is_reported_as_sdk_operation_failure():
+    api_client = PullApiClient()
+    api_client.pull_events = [
+        {"errorDetail": {"message": "manifest unavailable"}},
+    ]
+    client = RentalDockerSdkClient(api_client, pull_timeout_seconds=123)
+
+    with pytest.raises(RentalDockerOperationError, match="manifest unavailable"):
+        await client.pull(image="registry.example/missing:tag")
 
 
 @pytest.mark.asyncio
