@@ -17,6 +17,17 @@ os.environ.setdefault("BITTENSOR_WALLET_HOTKEY_NAME", "test-hotkey")
 os.environ.setdefault("SQLALCHEMY_DATABASE_URI", "sqlite:///:memory:")
 os.environ.setdefault("ASYNC_SQLALCHEMY_DATABASE_URI", "sqlite+aiosqlite:///:memory:")
 
+# Prevent network calls during module-level SharedConfigClient instantiation.
+# core/config.py creates `shared_client = SharedConfigClient(...)` at import time, which
+# otherwise performs a blocking HTTP fetch against the live API. Forcing _fetch to return
+# None keeps the offline fallback (DEFAULT_SHARED_CONFIG) so unit tests stay hermetic.
+# This patch must run before test collection.
+_shared_config_patcher = patch(
+    "lium_core.shared_config.client.SharedConfigClient._fetch",
+    return_value=None,
+)
+_shared_config_patcher.start()
+
 from helpers import make_context
 
 # Prevent wallet KeyFileError during module-level PriceProvider() instantiation in rental_price.py.

@@ -11,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 if TYPE_CHECKING:
     from bittensor import Wallet
 
+from lium_core.shared_config import SharedConfigClient
 from incentive.config import IncentiveConfig
 
 
@@ -180,9 +181,6 @@ class Settings(BaseSettings):
 
     # Use REST API instead of WebSocket for miner communication
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
-    
-    # Machine Price Limit
-    MACHINE_MAX_PRICE_RATE: float = Field(env="MACHINE_MAX_PRICE_RATE", default=4)
 
     # DAH-2211 — custom-dockerfile pod build tunables (validator side).
     # These mirror the spec keys `features.custom_dockerfile_pod.*`; the route
@@ -309,3 +307,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+shared_client = SharedConfigClient(
+    api_url=f"{settings.COMPUTE_REST_API_URL}/v1/shared-config"
+)

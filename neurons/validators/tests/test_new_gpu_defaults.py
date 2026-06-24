@@ -1,5 +1,5 @@
 from incentive.config import BASE_GPU_MAP, IncentiveConfig
-from services.const import GPU_MODEL_RATES, MACHINE_PRICES, REQUIRED_DEPOSIT_AMOUNT
+from services.const import GPU_MODEL_RATES
 
 NEW_GPU_MODELS = {
     "NVIDIA GeForce GTX 1060": "GTX 1060",
@@ -60,8 +60,6 @@ NEW_GPU_MODELS = {
 
 def test_new_gpu_models_are_supported_with_zero_default_portion():
     for model in NEW_GPU_MODELS:
-        assert model in MACHINE_PRICES
-        assert model in REQUIRED_DEPOSIT_AMOUNT
         assert model in GPU_MODEL_RATES
         assert GPU_MODEL_RATES[model] == 0.0
 
