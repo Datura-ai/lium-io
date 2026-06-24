@@ -74,6 +74,7 @@ from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     DeviceMount,
     PortBinding,
+    RentalDockerConnectionError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
@@ -81,6 +82,7 @@ from services.rental_docker_sdk import (
     build_container_command_argv,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
+    require_rental_docker_ssh_host_key,
 )
 from services.ssh_service import SSHService
 
@@ -135,6 +137,18 @@ _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
 _DOCKER_PULL_TIMEOUT_SECONDS = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
 _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
+
+
+def _missing_rental_docker_host_key_log_text(
+    default_extra: dict[str, Any],
+    exc: RentalDockerConnectionError,
+):
+    return _m(
+        "Missing executor SSH host key for rental Docker SDK operation",
+        extra=get_extra_info({**default_extra, **HOST_KEY_REQUIRED_EXTRA, "error": str(exc)}),
+    )
+
+
 # DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
 # from on-host disk state when the backend sends disk_share.
 _FRESH_SIZING_OVERHEAD_GB = 20   # reserved for system/docker overhead when reconstructing the pool
@@ -2833,6 +2847,10 @@ class DockerService:
                     failure_step=current_step,
                 )
 
+            current_step = "docker_sdk_ssh_host_key"
+            # Keep this immediately before the guard; the broad except uses it as failure_step.
+            require_rental_docker_ssh_host_key(executor_info)
+
             current_step = "ssh_connect"
             async with (
                 asyncssh.connect(
@@ -3426,13 +3444,19 @@ class DockerService:
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
             # Port release now handled by backend
+            failure_msg = str(log_text)
+            if (
+                current_step == "docker_sdk_ssh_host_key"
+                and isinstance(e, RentalDockerConnectionError)
+            ):
+                failure_msg = f"{failure_msg}: {e}"
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=str(log_text),
+                msg=failure_msg,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
                 failure_step=current_step,
@@ -3483,6 +3507,21 @@ class DockerService:
                 "Attestation failed",
                 extra=get_extra_info({**default_extra, "error": str(exc)}),
             )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerStopFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+        try:
+            require_rental_docker_ssh_host_key(executor_info)
+        except RentalDockerConnectionError as exc:
+            log_text = _missing_rental_docker_host_key_log_text(default_extra, exc)
             logger.error(log_text)
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -3572,6 +3611,21 @@ class DockerService:
                 "Attestation failed",
                 extra=get_extra_info({**default_extra, "error": str(exc)}),
             )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerStartFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+        try:
+            require_rental_docker_ssh_host_key(executor_info)
+        except RentalDockerConnectionError as exc:
+            log_text = _missing_rental_docker_host_key_log_text(default_extra, exc)
             logger.error(log_text)
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -3706,6 +3760,21 @@ class DockerService:
                 "Attestation failed",
                 extra=get_extra_info({**default_extra, "error": str(exc)}),
             )
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
+
+        try:
+            require_rental_docker_ssh_host_key(executor_info)
+        except RentalDockerConnectionError as exc:
+            log_text = _missing_rental_docker_host_key_log_text(default_extra, exc)
             logger.error(log_text)
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -4018,28 +4087,43 @@ class DockerService:
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
+        if not payload.user_public_keys:
+            log_text = _m(
+                "ssh key Remove error: no public key",
+                extra=get_extra_info({
+                    **default_extra,
+                    "container_name": payload.container_name,
+                    "error": "No public keys",
+                }),
+            )
+            logger.error(log_text)
+
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                error_code=FailedContainerErrorCodes.NoSshKeys,
+            )
+
         try:
-            if not payload.user_public_keys:
-                log_text = _m(
-                    "ssh key Remove error: no public key",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "container_name": payload.container_name,
-                        "error": "No public keys",
-                    }),
-                )
-                logger.error(log_text)
+            require_rental_docker_ssh_host_key(executor_info)
+        except RentalDockerConnectionError as exc:
+            log_text = _missing_rental_docker_host_key_log_text(default_extra, exc)
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
 
-                return FailedContainerRequest(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    pod_id=payload.pod_id,
-                    workload_kind=payload.workload_kind,
-                    msg=str(log_text),
-                    error_type=FailedContainerErrorTypes.AddSSkeyFailed,
-                    error_code=FailedContainerErrorCodes.NoSshKeys,
-                )
-
+        try:
             async with self.rental_docker_client_factory.connect(
                 executor_info=executor_info,
                 private_key=private_key,
@@ -4136,28 +4220,43 @@ class DockerService:
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
+        if not payload.user_public_keys:
+            log_text = _m(
+                "ssh key Add error: no public key",
+                extra=get_extra_info({
+                    **default_extra,
+                    "container_name": payload.container_name,
+                    "error": "No public keys",
+                }),
+            )
+            logger.error(log_text)
+
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                error_code=FailedContainerErrorCodes.NoSshKeys,
+            )
+
         try:
-            if not payload.user_public_keys:
-                log_text = _m(
-                    "ssh key Add error: no public key",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "container_name": payload.container_name,
-                        "error": "No public keys",
-                    }),
-                )
-                logger.error(log_text)
+            require_rental_docker_ssh_host_key(executor_info)
+        except RentalDockerConnectionError as exc:
+            log_text = _missing_rental_docker_host_key_log_text(default_extra, exc)
+            logger.error(log_text)
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+            )
 
-                return FailedContainerRequest(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    pod_id=payload.pod_id,
-                    workload_kind=payload.workload_kind,
-                    msg=str(log_text),
-                    error_type=FailedContainerErrorTypes.AddSSkeyFailed,
-                    error_code=FailedContainerErrorCodes.NoSshKeys,
-                )
-
+        try:
             async with self.rental_docker_client_factory.connect(
                 executor_info=executor_info,
                 private_key=private_key,

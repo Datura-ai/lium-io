@@ -22,6 +22,7 @@ from services.rental_docker_sdk import (
     build_authorized_keys_exec_spec,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
+    require_rental_docker_ssh_host_key,
 )
 
 
@@ -494,3 +495,34 @@ async def test_factory_fails_closed_without_executor_host_key():
             pass
 
     api_client_factory.assert_not_called()
+
+
+def test_require_rental_docker_ssh_host_key_rejects_blank_key():
+    executor_info = ExecutorSSHInfo(
+        uuid="executor-id",
+        address="127.0.0.1",
+        port=8000,
+        ssh_username="root",
+        ssh_port=2222,
+        python_path="/usr/bin/python",
+        root_dir="/root",
+        ssh_host_key="   ",
+    )
+
+    with pytest.raises(RentalDockerConnectionError, match="missing ssh_host_key"):
+        require_rental_docker_ssh_host_key(executor_info)
+
+
+def test_require_rental_docker_ssh_host_key_strips_present_key():
+    executor_info = ExecutorSSHInfo(
+        uuid="executor-id",
+        address="127.0.0.1",
+        port=8000,
+        ssh_username="root",
+        ssh_port=2222,
+        python_path="/usr/bin/python",
+        root_dir="/root",
+        ssh_host_key="  ssh-ed25519 AAAATESTKEY  ",
+    )
+
+    assert require_rental_docker_ssh_host_key(executor_info) == "ssh-ed25519 AAAATESTKEY"

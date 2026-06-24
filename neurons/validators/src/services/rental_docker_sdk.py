@@ -25,6 +25,18 @@ class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
 
+def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
+    """Return the host key required by rental Docker SDK SSH connections."""
+    # ExecutorSSHInfo keeps this optional for non-connectable placeholder/error
+    # records; the rental Docker SDK path requires it to build known_hosts.
+    host_key = executor_info.ssh_host_key.strip() if executor_info.ssh_host_key else ""
+    if not host_key:
+        raise RentalDockerConnectionError(
+            "Executor is missing ssh_host_key; rental Docker operations require the executor SSH host public key"
+        )
+    return host_key
+
+
 @dataclass(slots=True)
 class PortBinding:
     container_port: int
@@ -346,10 +358,7 @@ class RentalDockerSdkClientFactory:
         executor_info: ExecutorSSHInfo,
         private_key: str,
     ) -> AsyncIterator[RentalDockerSdkClient]:
-        if not executor_info.ssh_host_key or not executor_info.ssh_host_key.strip():
-            raise RentalDockerConnectionError(
-                "Executor SSH host key is required for Docker SDK SSH access"
-            )
+        host_key = require_rental_docker_ssh_host_key(executor_info)
 
         with tempfile.TemporaryDirectory(prefix="lium-rental-docker-ssh-") as temp_dir:
             ssh_home = Path(temp_dir)
@@ -365,7 +374,7 @@ class RentalDockerSdkClientFactory:
                 _build_known_hosts_text(
                     host=executor_info.address,
                     port=executor_info.ssh_port,
-                    host_key=executor_info.ssh_host_key,
+                    host_key=host_key,
                 )
             )
             known_hosts_path.chmod(0o600)
