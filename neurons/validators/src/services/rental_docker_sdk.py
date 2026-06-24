@@ -170,6 +170,27 @@ class RentalDockerSdkClient:
             v=remove_volumes,
         )
 
+    async def create_volume(
+        self,
+        *,
+        volume_name: str,
+        driver: str | None = None,
+        driver_opts: dict[str, str] | None = None,
+        timeout: int | None = None,
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self._create_volume_sync,
+                volume_name=volume_name,
+                driver=driver,
+                driver_opts=driver_opts,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK create volume failed", exc)
+            ) from exc
+
     async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
         await self._call_api(
             volume_name,
@@ -213,6 +234,31 @@ class RentalDockerSdkClient:
             host_config=host_config,
         )
         self._api_client.start(spec.name)
+
+    def _create_volume_sync(
+        self,
+        *,
+        volume_name: str,
+        driver: str | None,
+        driver_opts: dict[str, str] | None,
+        timeout: int | None,
+    ) -> None:
+        original_timeout = getattr(self._api_client, "timeout", None)
+        should_override_timeout = timeout is not None and hasattr(
+            self._api_client,
+            "timeout",
+        )
+        if should_override_timeout:
+            self._api_client.timeout = None if timeout == 0 else timeout
+        try:
+            self._api_client.create_volume(
+                name=volume_name,
+                driver=driver,
+                driver_opts=driver_opts,
+            )
+        finally:
+            if should_override_timeout:
+                self._api_client.timeout = original_timeout
 
     def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
         stdin_data = _encode_exec_stdin(spec.stdin)

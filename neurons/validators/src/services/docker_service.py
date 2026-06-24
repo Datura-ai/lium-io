@@ -1865,6 +1865,7 @@ class DockerService:
     async def create_local_volume(
         self,
         ssh_client: asyncssh.SSHClientConnection,
+        docker_client: RentalDockerSdkClient,
         local_volume: str,
         log_tag: str,
         log_text: str,
@@ -1874,7 +1875,7 @@ class DockerService:
         sparse: bool = False,
     ):
         requested_timeout = timeout
-        local_volume_quoted = _quote_safe_docker_volume_name(
+        _quote_safe_docker_volume_name(
             local_volume,
             field_name="local_volume",
         )
@@ -1891,6 +1892,9 @@ class DockerService:
                 "/usr/bin/docker plugin install ashald/docker-volume-loopback "
                 f"--alias {loopback_plugin_arg} --grant-all-permissions {data_dir_arg}"
             )
+            # TODO: migrate Docker plugin management if/when plugin setup becomes
+            # part of the SDK migration scope. The user-controlled volume name is
+            # not used in this shell command; volume creation below is SDK-backed.
             await ssh_client.run(command)
 
             # DAH-2265 Plan 3: the loopback plugin preallocates the whole backing file
@@ -1899,15 +1903,14 @@ class DockerService:
             # full-node rentals only — see the caller — because a sparse partial volume
             # leaves its unwritten space free in df AND still counts its declared size in
             # resolve_volume_sizing(), double-counting the pool and overcommitting host disk.
-            sparse_opt = " -o sparse=true" if sparse else ""
-            size_arg = shlex.quote(f"size={limit}g")
-            command = (
-                f"/usr/bin/docker volume create -d {loopback_plugin_arg} "
-                f"{local_volume_quoted} -o {size_arg}{sparse_opt}"
-            )
+            volume_driver = loopback_plugin_name
+            volume_driver_opts = {"size": f"{limit}g"}
+            if sparse:
+                volume_driver_opts["sparse"] = "true"
         else:
             loopback_plugin_name = None
-            command = f"/usr/bin/docker volume create {local_volume_quoted}"
+            volume_driver = None
+            volume_driver_opts = None
 
         timeout = self._get_local_volume_create_timeout(limit, timeout)
         volume_log_extra = {
@@ -1926,13 +1929,20 @@ class DockerService:
                 extra=get_extra_info(volume_log_extra),
             )
         )
-        await self.execute_and_stream_logs(
-            ssh_client=ssh_client,
-            command=command,
-            log_tag=log_tag,
-            log_text=log_text,
+        await self.stream_log(log_text, "success", log_tag)
+        await run_logged_rental_docker_sdk_operation(
+            operation="create_volume",
             log_extra=volume_log_extra,
-            timeout=timeout,
+            call=lambda: docker_client.create_volume(
+                volume_name=local_volume,
+                driver=volume_driver,
+                driver_opts=volume_driver_opts,
+                timeout=timeout,
+            ),
+            volume_name=local_volume,
+            volume_driver=volume_driver,
+            volume_driver_opts=volume_driver_opts,
+            timeout_seconds=timeout,
         )
 
     async def _get_fs_available_bytes(
@@ -3029,6 +3039,7 @@ class DockerService:
                     )
                     await self.create_local_volume(
                         ssh_client=ssh_client,
+                        docker_client=docker_client,
                         local_volume=local_volume,
                         log_tag=log_tag,
                         log_text=f"Creating docker volume {local_volume}",

@@ -76,6 +76,7 @@ class RecordingRentalDockerClient:
         self.started_containers = []
         self.stopped_containers = []
         self.removed_containers = []
+        self.created_volumes = []
         self.removed_volumes = []
         self.pruned_images = 0
 
@@ -114,6 +115,23 @@ class RecordingRentalDockerClient:
                 "container_name": container_name,
                 "force": force,
                 "remove_volumes": remove_volumes,
+            }
+        )
+
+    async def create_volume(
+        self,
+        *,
+        volume_name: str,
+        driver: str | None = None,
+        driver_opts: dict[str, str] | None = None,
+        timeout: int | None = None,
+    ) -> None:
+        self.created_volumes.append(
+            {
+                "volume_name": volume_name,
+                "driver": driver,
+                "driver_opts": driver_opts,
+                "timeout": timeout,
             }
         )
 
@@ -734,10 +752,12 @@ async def test_create_local_volume_rejects_unsafe_volume_name_before_shell(
     docker_service,
 ):
     ssh_client = RecordingSSHClient()
+    docker_client = RecordingRentalDockerClient()
 
     with pytest.raises(ValueError):
         await docker_service.create_local_volume(
             ssh_client=ssh_client,
+            docker_client=docker_client,
             local_volume=HOSTILE_VOLUME_NAME,
             log_tag="test",
             log_text="Creating volume",
@@ -745,3 +765,4 @@ async def test_create_local_volume_rejects_unsafe_volume_name_before_shell(
         )
 
     assert ssh_client.commands == []
+    assert docker_client.created_volumes == []
