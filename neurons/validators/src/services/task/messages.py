@@ -916,3 +916,66 @@ class FinalizeMessages:
         category="runtime",
         impact="Proceed",
     )
+
+
+class CachedTemplateMessages:
+    """DAH-2265 Plan 2 — advisory cached-template verification.
+
+    Confirms whether the executor has the recommended default image pre-pulled so
+    DOCKER_PULL is a no-op for default-template rentals. Purely observational: every
+    template is severity="info" and the check never fails the pipeline or changes score.
+    """
+
+    CACHED = MessageTemplate(
+        event="Recommended default image is cached on executor",
+        reason="RECOMMENDED_IMAGE_CACHED",
+        severity="info",
+        category="runtime",
+        impact="None — default-template DOCKER_PULL will be a no-op",
+    )
+    NOT_CACHED = MessageTemplate(
+        event="Recommended default image not cached on executor",
+        reason="RECOMMENDED_IMAGE_NOT_CACHED",
+        severity="info",
+        category="runtime",
+        impact=(
+            "None (advisory) — default-template rentals will pay a docker pull "
+            "until the executor pre-pull catches up"
+        ),
+        remediation=(
+            "Executor cache pre-pull keeps the recommended image warm; "
+            "verify cache_template_service is running on the host."
+        ),
+    )
+    SKIPPED = MessageTemplate(
+        event="Cached-template verification skipped",
+        reason="RECOMMENDED_IMAGE_CHECK_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="None — could not determine the recommended image this cycle",
+    )
+    DIGEST_MATCH = MessageTemplate(
+        event="Recommended image digest matches the published manifest",
+        reason="RECOMMENDED_IMAGE_DIGEST_MATCH",
+        severity="info",
+        category="runtime",
+        impact="None — node holds current content under this tag",
+    )
+    DIGEST_MISMATCH = MessageTemplate(
+        event="Recommended image digest differs from the published manifest",
+        reason="RECOMMENDED_IMAGE_DIGEST_MISMATCH",
+        severity="info",
+        category="runtime",
+        impact="None (advisory) — node serves STALE content under an unchanged tag",
+        remediation=(
+            "Provider should re-pull repo:tag to fetch the latest content; "
+            "the executor cache pre-pull may be broken or disabled."
+        ),
+    )
+    DIGEST_SKIPPED = MessageTemplate(
+        event="Recommended image digest check skipped",
+        reason="RECOMMENDED_IMAGE_DIGEST_SKIPPED",
+        severity="info",
+        category="runtime",
+        impact="None — digest unknown this cycle (no backend digest / unreadable RepoDigests)",
+    )

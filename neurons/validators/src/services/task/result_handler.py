@@ -133,6 +133,21 @@ class ResultHandler:
         if context.state.gpu_metrics is not None:
             specs["gpu_metrics"] = context.state.gpu_metrics
 
+        # DAH-2265 Plan 2: advisory cached-template signal — whether this executor has the
+        # recommended default image pre-pulled (so DOCKER_PULL is a no-op for default-template
+        # rentals). Captured by CachedTemplateVerificationCheck. Only published when measured
+        # (None → skipped/fail-open, key omitted). Rides executor.specs like gpu_metrics; no
+        # scoring impact.
+        if context.state.recommended_image_cached is not None:
+            specs["recommended_image_cached"] = context.state.recommended_image_cached
+
+        # DAH-2265 digest: advisory digest-match for the recommended image. False = the node
+        # holds STALE content under an unchanged tag (re-pull needed). Only published when
+        # compared (None → not cached / no backend digest / unreadable, key omitted). Rides
+        # executor.specs like recommended_image_cached; no scoring impact.
+        if context.state.recommended_image_digest_match is not None:
+            specs["recommended_image_digest_match"] = context.state.recommended_image_digest_match
+
         # NVIDIA driver version string reported by NVML (e.g. "580.95.05"). Used by the
         # minimum-driver requirement gate.
         nvidia_driver_version = str(specs.get("gpu", {}).get("driver") or "")

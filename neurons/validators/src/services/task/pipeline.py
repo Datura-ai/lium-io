@@ -77,6 +77,15 @@ class ContextState:
     rented_data: RentedExecutorsResponse | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None
+    # DAH-2265 Plan 2: advisory result of the cached-template verification check.
+    # True/False once measured; None = not measured this cycle (skipped/fail-open).
+    # ResultHandler publishes it into executor.specs when not None.
+    recommended_image_cached: bool | None = None
+    # DAH-2265 digest: advisory digest-match for the recommended image. True = local
+    # RepoDigest matches the backend's published manifest digest; False = differs (node
+    # serves STALE content under an unchanged tag); None = not compared this cycle
+    # (not cached / no backend digest / unreadable RepoDigest — strict fail-open).
+    recommended_image_digest_match: bool | None = None
 
 
 class CheckResult(BaseModel):

@@ -28,6 +28,7 @@ from services.verifyx_validation_service import VerifyXValidationService
 
 from .checks import (
     BannedGpuCheck,
+    CachedTemplateVerificationCheck,
     CapabilityCheck,
     CollateralCheck,
     CustomBuildOrphanSweepCheck,
@@ -264,6 +265,11 @@ class PipelineFactory:
                 VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),
+                # DAH-2265 Plan 2: advisory, non-fatal — observes whether the executor has
+                # the recommended default image pre-pulled (DOCKER_PULL no-op). Runs here,
+                # after specs/gpu_model/driver are populated and the GPU is validated, on the
+                # idle valid-executor population. No scoring impact; fails open on any error.
+                CachedTemplateVerificationCheck(),
                 RentalVerificationCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),

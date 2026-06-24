@@ -1,4 +1,5 @@
 from .banned_gpu import BannedGpuCheck
+from .cached_template_verification import CachedTemplateVerificationCheck
 from .capability import CapabilityCheck
 from .collateral import CollateralCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
@@ -27,6 +28,7 @@ from .verifyx import VerifyXCheck
 
 __all__ = [
     "BannedGpuCheck",
+    "CachedTemplateVerificationCheck",
     "CapabilityCheck",
     "CollateralCheck",
     "CustomBuildOrphanSweepCheck",

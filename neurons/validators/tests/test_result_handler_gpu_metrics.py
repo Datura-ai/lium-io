@@ -154,3 +154,59 @@ async def test_handle_result_skips_inspector_event_in_dry_run(context_factory):
     )
 
     redis.publish.assert_not_awaited()
+
+
+# DAH-2265 Plan 2: advisory recommended_image_cached signal rides executor.specs.
+
+
+def _context_cached(context_factory, *, recommended_image_cached):
+    state = build_state(
+        specs={"gpu": {"count": 1}},
+        recommended_image_cached=recommended_image_cached,
+    )
+    return context_factory(
+        state=state,
+        tdx_attestation_passed=False,
+        score=1.0,
+        job_score=1.0,
+        collateral_deposited=False,
+        ssh_pub_keys=[],
+        rented=False,
+    )
+
+
+@pytest.mark.parametrize("cached", [True, False])
+@pytest.mark.asyncio
+async def test_handle_result_publishes_recommended_image_cached(context_factory, cached):
+    """When measured (True/False), the published spec carries recommended_image_cached."""
+    ctx = _context_cached(context_factory, recommended_image_cached=cached)
+    handler = ResultHandler(redis_service=None, dry_run=True)
+
+    result = await handler.handle_result(
+        context=ctx,
+        miner_info=_miner_info(),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="ok",
+        success=True,
+    )
+
+    assert result.spec["recommended_image_cached"] is cached
+
+
+@pytest.mark.asyncio
+async def test_handle_result_omits_recommended_image_cached_when_not_measured(context_factory):
+    """Fail-safe: None (skipped/fail-open) → no recommended_image_cached key published."""
+    ctx = _context_cached(context_factory, recommended_image_cached=None)
+    handler = ResultHandler(redis_service=None, dry_run=True)
+
+    result = await handler.handle_result(
+        context=ctx,
+        miner_info=_miner_info(),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="ok",
+        success=True,
+    )
+
+    assert "recommended_image_cached" not in result.spec

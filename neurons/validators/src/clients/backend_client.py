@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from typing import Any, ClassVar, TypeVar
+from urllib.parse import urlencode
 
 import aiohttp
 import bittensor
@@ -13,6 +14,8 @@ from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import (
+    DefaultDockerImage,
+    DefaultDockerImagesResponse,
     ExecutorHealthCheckResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
@@ -206,6 +209,25 @@ class BackendClient:
             RentedExecutorsResponse,
             timeout=30,
         )
+
+    async def get_default_docker_image(
+        self, gpu_model: str, driver_version: str
+    ) -> list[DefaultDockerImage] | None:
+        """Fetch the recommended/default template image(s) for a GPU + driver combo.
+
+        Hits the same public `/executors/default-docker-image` endpoint the executor
+        cache pre-pull consumes (DAH-2265 Plan 2). Advisory caller: no retry (must not
+        block the validation pipeline), unsigned (mirrors the executor), and `get()`
+        already returns None on any error / non-200 / bad JSON, so this fails open.
+        """
+        query = urlencode({"gpu_model": gpu_model, "driver_version": driver_version})
+        response = await self.get(
+            f"/executors/default-docker-image?{query}",
+            DefaultDockerImagesResponse,
+            add_signature=False,
+            timeout=15,
+        )
+        return response.root if response is not None else None
 
     async def get_pod_rental_active(self, pod_id: str) -> PodRentalActiveResponse | None:
         """Fetch whether the backend still considers a pod rental active."""
