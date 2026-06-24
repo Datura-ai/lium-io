@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, RootModel, field_validator
 
 from services.const import FILLER_CONTAINER_PREFIX
 
@@ -120,3 +120,28 @@ class ExecutorHealthCheckResponse(BaseModel):
     error: str | None = None
     details: dict | None = None
     reason_code: str | None = None
+
+
+class DefaultDockerImage(BaseModel, extra="allow"):
+    """One recommended/default template image for a GPU + driver combo.
+
+    Mirrors a single item from the backend `/executors/default-docker-image`
+    response (the same endpoint the executor cache pre-pull consumes). Parsed
+    leniently so new backend fields never break validation.
+    """
+    docker_image: str
+    docker_image_tag: str
+    docker_image_size: int | None = None
+    # DAH-2265: bare manifest-list digest ("sha256:…") the backend says is current for this
+    # image. None when the backend has no recorded digest. Compared against the executor's
+    # local RepoDigest to flag stale content cached under an unchanged tag.
+    docker_image_digest: str | None = None
+
+    @property
+    def image_ref(self) -> str:
+        return f"{self.docker_image}:{self.docker_image_tag}"
+
+
+class DefaultDockerImagesResponse(RootModel[list[DefaultDockerImage]]):
+    """The backend returns a bare JSON list; wrap it so `BackendClient.get()`
+    (which validates with a single model) can parse it."""
