@@ -6,13 +6,14 @@ import socket as socket_module
 import tempfile
 import threading
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 
+DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
 _DOCKER_SDK_SSH_HOME_LOCK = threading.Lock()
 
 
@@ -95,8 +96,14 @@ class ContainerExecResult:
 
 
 class RentalDockerSdkClient:
-    def __init__(self, api_client):
+    def __init__(
+        self,
+        api_client,
+        *,
+        pull_timeout_seconds: int | float | None = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
+    ):
         self._api_client = api_client
+        self._pull_timeout_seconds = pull_timeout_seconds
 
     async def login(self, *, username: str, password: str) -> None:
         await self._call_api(
@@ -108,11 +115,26 @@ class RentalDockerSdkClient:
         )
 
     async def pull(self, *, image: str) -> None:
-        await self._call_api(
-            image,
-            operation_label="pull",
-            api_method=self._api_client.pull,
-        )
+        timeout_seconds = self._normalized_pull_timeout_seconds()
+        try:
+            pull_call = asyncio.to_thread(self._pull_sync, image)
+            if timeout_seconds is not None:
+                await asyncio.wait_for(
+                    pull_call,
+                    timeout=timeout_seconds,
+                )
+            else:
+                await pull_call
+        except asyncio.TimeoutError as exc:
+            with suppress(Exception):
+                await self.aclose()
+            raise RentalDockerOperationError(
+                f"Docker SDK pull timed out after {timeout_seconds} seconds"
+            ) from exc
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK pull failed", exc)
+            ) from exc
 
     async def image_exists(self, *, image: str) -> bool:
         try:
@@ -260,6 +282,32 @@ class RentalDockerSdkClient:
             if should_override_timeout:
                 self._api_client.timeout = original_timeout
 
+    def _pull_sync(self, image: str) -> None:
+        # docker.APIClient.pull() hardcodes timeout=None for /images/create.
+        # Call the same endpoint directly so rental image pulls keep the
+        # create_container timeout cap instead of waiting forever.
+        from docker import auth, utils
+
+        repository, image_tag = utils.parse_repository_tag(image)
+        tag = image_tag or "latest"
+        registry, _ = auth.resolve_repository_name(repository)
+        response = self._api_client._post(
+            self._api_client._url("/images/create"),
+            params={"tag": tag, "fromImage": repository},
+            headers=_build_pull_headers(self._api_client, registry),
+            stream=True,
+            timeout=self._normalized_pull_timeout_seconds(),
+        )
+        self._api_client._raise_for_status(response)
+
+        for event in self._api_client._stream_helper(response, decode=True) or ():
+            _raise_pull_event_error(event)
+
+    def _normalized_pull_timeout_seconds(self) -> int | float | None:
+        if self._pull_timeout_seconds is None or self._pull_timeout_seconds <= 0:
+            return None
+        return self._pull_timeout_seconds
+
     def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
         stdin_data = _encode_exec_stdin(spec.stdin)
         exec_create_result = self._api_client.exec_create(
@@ -289,6 +337,7 @@ class RentalDockerSdkClient:
 class RentalDockerSdkClientFactory:
     api_client_factory: Callable[..., object] | None = None
     timeout: int = 60
+    pull_timeout_seconds: int = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
 
     @asynccontextmanager
     async def connect(
@@ -349,7 +398,10 @@ class RentalDockerSdkClientFactory:
                     _wrap_error_message("Docker SDK client construction failed", exc)
                 ) from exc
 
-            client = RentalDockerSdkClient(api_client)
+            client = RentalDockerSdkClient(
+                api_client,
+                pull_timeout_seconds=self.pull_timeout_seconds,
+            )
             try:
                 yield client
             finally:
@@ -649,6 +701,33 @@ def _decode_output_part(value) -> str:
     if isinstance(value, bytes):
         return value.decode(errors="replace")
     return str(value)
+
+
+def _build_pull_headers(api_client, registry: str) -> dict[str, str]:
+    auth_configs = getattr(api_client, "_auth_configs", None)
+    if not auth_configs or getattr(auth_configs, "is_empty", True):
+        return {}
+
+    from docker import auth
+
+    header = auth.get_config_header(api_client, registry)
+    return {"X-Registry-Auth": header} if header else {}
+
+
+def _raise_pull_event_error(event) -> None:
+    if not isinstance(event, dict):
+        return
+
+    message = event.get("error")
+    error_detail = event.get("errorDetail")
+    if not message and isinstance(error_detail, dict):
+        message = error_detail.get("message")
+    if not message:
+        return
+
+    from docker.errors import APIError
+
+    raise APIError("Docker image pull failed", explanation=str(message))
 
 
 def _is_docker_not_found_error(exc: Exception) -> bool:

@@ -14,6 +14,7 @@ from services.docker_service import (
 from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
 from payload_models.payloads import (
     ContainerCreateRequest,
+    CustomOptions,
     ContainerDeleteRequest,
     ContainerDeleted,
     ContainerStartRequest,
@@ -2151,6 +2152,106 @@ async def test_create_container_reports_docker_pull_failure_step(
     )
 
     assert result.failure_step == "docker_pull"
+    docker_service.redis_service.remove_pending_pod.assert_awaited_once_with(
+        payload.miner_hotkey,
+        payload.executor_id,
+        payload.pod_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_container_reports_set_environment_failure_step(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.add_pending_pod = AsyncMock()
+    docker_service.redis_service.remove_pending_pod = AsyncMock()
+    docker_service.redis_service.add_rented_pod = AsyncMock()
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        docker_service,
+        "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], None)),
+    )
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_existing_containers", AsyncMock())
+    monkeypatch.setattr(docker_service, "clean_stale_vloopback_volumes", AsyncMock())
+    monkeypatch.setattr(docker_service, "create_local_volume", AsyncMock())
+    monkeypatch.setattr(
+        docker_service,
+        "wait_for_port_check_containers",
+        AsyncMock(return_value=(True, "ok")),
+    )
+    monkeypatch.setattr(docker_service, "check_container_running", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        docker_service,
+        "install_open_ssh_server_and_start_ssh_service_with_rental_docker",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        docker_service,
+        "add_ssh_public_keys_with_rental_docker",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        docker_service,
+        "add_environment_variables_with_rental_docker",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
+    monkeypatch.setattr(docker_service, "handle_stream_logs", AsyncMock())
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        custom_options=CustomOptions(environment={"APP_MODE": "prod"}),
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "set_environment"
+    docker_service.redis_service.add_rented_pod.assert_not_awaited()
     docker_service.redis_service.remove_pending_pod.assert_awaited_once_with(
         payload.miner_hotkey,
         payload.executor_id,

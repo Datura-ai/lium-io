@@ -71,6 +71,7 @@ from services.rental_docker_observability import (
 from services.rental_docker_sdk import (
     ContainerExecSpec,
     ContainerRunSpec,
+    DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     DeviceMount,
     PortBinding,
     RentalDockerSdkClient,
@@ -124,11 +125,15 @@ _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
 _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
+HOST_KEY_REQUIRED_EXTRA = {
+    "ssh_host_key_missing": True,
+    "docker_sdk_host_key_required": True,
+}
 # Keep the rental create_container SSH session alive while long docker pulls
 # are quiet. With 30s/4, AsyncSSH declares a dead peer after about 2 minutes.
 _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
-_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60 # 3 hours
+_DOCKER_PULL_TIMEOUT_SECONDS = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
 _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
 # DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
 # from on-host disk state when the backend sends disk_share.
@@ -253,7 +258,10 @@ class DockerService:
         self.redis_service = redis_service
         self.attestation_service = attestation_service
         self.rental_docker_client_factory = (
-            rental_docker_client_factory or RentalDockerSdkClientFactory()
+            rental_docker_client_factory
+            or RentalDockerSdkClientFactory(
+                pull_timeout_seconds=_DOCKER_PULL_TIMEOUT_SECONDS,
+            )
         )
         self.lock = asyncio.Lock()
         self.logs_queue: list[dict] = []
@@ -3294,13 +3302,15 @@ class DockerService:
 
                     # add environment variables
                     current_step = "set_environment"
-                    await self.add_environment_variables_with_rental_docker(
+                    environment_ok = await self.add_environment_variables_with_rental_docker(
                         docker_client=docker_client,
                         container_name=container_name,
                         environment=custom_options.environment if custom_options else None,
                         log_tag=log_tag,
                         log_extra=default_extra,
                     )
+                    if not environment_ok:
+                        raise RuntimeError("Failed to set environment variables")
 
                     # Add profiler for adding public keys
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
