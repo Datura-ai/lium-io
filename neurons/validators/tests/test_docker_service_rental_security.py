@@ -189,6 +189,7 @@ def executor_info():
         ssh_port=2200,
         python_path="/usr/bin/python3",
         root_dir="/root/app",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
     )
 
 

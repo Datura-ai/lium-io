@@ -13,17 +13,35 @@ from services.docker_service import (
 )
 from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
 from payload_models.payloads import (
+    AddSshPublicKeyRequest,
     ContainerCreateRequest,
     CustomOptions,
     ContainerDeleteRequest,
     ContainerDeleted,
     ContainerStartRequest,
     ContainerStopRequest,
+    FailedContainerErrorTypes,
     FailedContainerRequest,
     PayloadPortMapping,
+    RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
+
+
+FAKE_SSH_HOST_KEY = "ssh-ed25519 AAAATESTKEY"
+
+
+def _executor_without_host_key(executor_id: str) -> ExecutorSSHInfo:
+    return ExecutorSSHInfo(
+        uuid=executor_id,
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
 
 
 class _FakeRentalDockerClient:
@@ -849,6 +867,7 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
     keypair = Mock(ss58_address="validator-hotkey")
 
@@ -1396,6 +1415,7 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
         ssh_port=2200,
         python_path="/usr/bin/python3",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
     keypair = Mock(ss58_address="validator-hotkey")
 
@@ -1444,6 +1464,7 @@ async def test_start_container_logs_ssh_bootstrap_failure_and_keeps_starting(doc
         ssh_port=2200,
         python_path="/usr/bin/python3",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
     keypair = Mock(ss58_address="validator-hotkey")
     logger_mock = Mock()
@@ -1487,6 +1508,7 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
         ssh_port=2200,
         python_path="/usr/bin/python3",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     result = await docker_service.start_container(
@@ -1532,6 +1554,7 @@ async def test_stop_container_sdk_failure_returns_failed_request_without_shell_f
         ssh_port=2200,
         python_path="/usr/bin/python3",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     result = await docker_service.stop_container(
@@ -1546,6 +1569,158 @@ async def test_stop_container_sdk_failure_returns_failed_request_without_shell_f
     assert docker_service.rental_docker_client_factory.client.stopped_containers == [
         "pod_test"
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "payload", "error_type"),
+    [
+        (
+            "stop_container",
+            ContainerStopRequest(
+                miner_hotkey="miner-hotkey",
+                miner_address="127.0.0.1",
+                miner_port=8000,
+                executor_id=str(uuid4()),
+                pod_id="pod-id",
+                container_name="pod_test",
+            ),
+            FailedContainerErrorTypes.ContainerStopFailed,
+        ),
+        (
+            "start_container",
+            ContainerStartRequest(
+                miner_hotkey="miner-hotkey",
+                miner_address="127.0.0.1",
+                miner_port=8000,
+                executor_id=str(uuid4()),
+                pod_id="pod-id",
+                container_name="pod_test",
+            ),
+            FailedContainerErrorTypes.ContainerStartFailed,
+        ),
+        (
+            "delete_container",
+            ContainerDeleteRequest(
+                miner_hotkey="miner-hotkey",
+                miner_address="127.0.0.1",
+                miner_port=8000,
+                executor_id=str(uuid4()),
+                pod_id="pod-id",
+                container_name="pod_test",
+            ),
+            FailedContainerErrorTypes.ContainerDeletionFailed,
+        ),
+        (
+            "add_ssh_key",
+            AddSshPublicKeyRequest(
+                miner_hotkey="miner-hotkey",
+                miner_address="127.0.0.1",
+                miner_port=8000,
+                executor_id=str(uuid4()),
+                pod_id="pod-id",
+                container_name="pod_test",
+                user_public_keys=["ssh-ed25519 test-key"],
+            ),
+            FailedContainerErrorTypes.AddSSkeyFailed,
+        ),
+        (
+            "remove_ssh_keys",
+            RemoveSshPublicKeysRequest(
+                miner_hotkey="miner-hotkey",
+                miner_address="127.0.0.1",
+                miner_port=8000,
+                executor_id=str(uuid4()),
+                pod_id="pod-id",
+                container_name="pod_test",
+                user_public_keys=["ssh-ed25519 test-key"],
+            ),
+            FailedContainerErrorTypes.AddSSkeyFailed,
+        ),
+    ],
+)
+async def test_sdk_lifecycle_missing_host_key_returns_typed_failure_without_sdk_connect(
+    docker_service,
+    monkeypatch,
+    method_name,
+    payload,
+    error_type,
+):
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    connect_mock = Mock(side_effect=AssertionError("asyncssh connect is not expected"))
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", connect_mock)
+
+    result = await getattr(docker_service, method_name)(
+        payload,
+        _executor_without_host_key(payload.executor_id),
+        Mock(ss58_address="validator-hotkey"),
+        "encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == error_type
+    assert "Missing executor SSH host key" in result.msg
+    assert docker_service.rental_docker_client_factory.connect_calls == []
+    assert connect_mock.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_create_container_missing_host_key_reports_sdk_host_key_failure_step(
+    docker_service,
+    monkeypatch,
+):
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service.redis_service.add_pending_pod = AsyncMock()
+    docker_service.redis_service.remove_pending_pod = AsyncMock()
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        docker_service,
+        "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], None)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    connect_mock = Mock(side_effect=AssertionError("asyncssh connect is not expected"))
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", connect_mock)
+    monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        docker_image="daturaai/pytorch:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_without_host_key(payload.executor_id),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerCreationFailed
+    assert result.failure_step == "docker_sdk_ssh_host_key"
+    assert "missing ssh_host_key" in result.msg
+    docker_service.finish_stream_logs.assert_awaited_once()
+    docker_service.redis_service.remove_pending_pod.assert_awaited_once_with(
+        payload.miner_hotkey,
+        payload.executor_id,
+        payload.pod_id,
+    )
+    assert docker_service.rental_docker_client_factory.connect_calls == []
+    assert connect_mock.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -1885,6 +2060,7 @@ async def test_create_container_cleans_stale_vloopback_when_active_volumes_missi
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
     keypair = Mock(ss58_address="validator-hotkey")
 
@@ -1974,6 +2150,7 @@ async def test_create_container_clears_pending_pod_after_successful_filler_creat
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
     keypair = Mock(ss58_address="validator-hotkey")
 
@@ -2063,6 +2240,7 @@ async def test_create_container_uses_keepalives_and_sdk_pull(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     await docker_service.create_container(
@@ -2142,6 +2320,7 @@ async def test_create_container_reports_docker_pull_failure_step(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     result = await docker_service.create_container(
@@ -2240,6 +2419,7 @@ async def test_create_container_reports_set_environment_failure_step(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     result = await docker_service.create_container(
@@ -3568,6 +3748,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
     keypair = Mock(ss58_address="validator-hotkey")
 

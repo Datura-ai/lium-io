@@ -153,6 +153,7 @@ def _executor_info(payload: ContainerCreateRequest) -> ExecutorSSHInfo:
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
     )
 
 
