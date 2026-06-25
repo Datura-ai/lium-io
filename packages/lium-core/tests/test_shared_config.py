@@ -63,6 +63,17 @@ def test_default_shared_config_has_all_fields() -> None:
     assert DEFAULT_SHARED_CONFIG.require_storage_limit_supported is False
 
 
+def test_machine_prices_p90_defaults_to_empty() -> None:
+    # backward-compatible: constructing without the new field yields an empty dict
+    assert DEFAULT_SHARED_CONFIG.machine_prices_p90 == {}
+
+
+def test_machine_prices_p90_accepts_values_and_serializes() -> None:
+    config = DEFAULT_SHARED_CONFIG.model_copy(update={"machine_prices_p90": {"NVIDIA H100 PCIe": 1.6}})
+    assert config.machine_prices_p90 == {"NVIDIA H100 PCIe": 1.6}
+    assert config.model_dump()["machine_prices_p90"] == {"NVIDIA H100 PCIe": 1.6}
+
+
 def test_shared_config_serializes_to_json() -> None:
     data = DEFAULT_SHARED_CONFIG.model_dump()
     assert isinstance(data, dict)
