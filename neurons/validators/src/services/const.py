@@ -109,7 +109,11 @@ BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy
 VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 
-TOTAL_BURN_EMISSION = 0.91
+# Emission split between the rented "mining" pool and the unrented + burn pool.
+# TOTAL_BURN_EMISSION caps the unrented-rental + burn pool; the remainder
+# (1 - TOTAL_BURN_EMISSION) is the rented mining pool. Raising the rented pool
+# from 0.09 to 0.13 (DAH-2273) lowers this cap from 0.91 to 0.87.
+TOTAL_BURN_EMISSION = 0.87
 BURNER_EMISSION = 0.01
 
 # Rental Price Incentive Constants

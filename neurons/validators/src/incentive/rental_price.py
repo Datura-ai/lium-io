@@ -265,7 +265,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
         rental_share_raw = await self._calculate_rental_share(self.total_rental_cost)
 
-        # Ensure rental_share doesn't exceed 0.91 (cap at burn emission)
+        # Ensure rental_share doesn't exceed TOTAL_BURN_EMISSION (0.87, cap at burn emission)
         rental_share_capped = rental_share_raw > TOTAL_BURN_EMISSION
         self.rental_share = min(rental_share_raw, TOTAL_BURN_EMISSION)
 
@@ -599,7 +599,7 @@ class RentalPriceIncentive(DefaultIncentive):
             total_rental_cost: Total rental cost in USD per hour
 
         Returns:
-            Rental emission share (0 to 0.91)
+            Rental emission share (0 to 0.87)
         """
         # If seeded from a snapshot, epoch_subnet_emission is already correct — skip price fetch.
         if self._seed_snapshot is not None:
