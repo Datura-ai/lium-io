@@ -275,7 +275,7 @@ class DefaultIncentive(BaseIncentive):
         # Calculate burn scores using BurnService
         cycle_scores = self.burn_service.calculate_burn_scores(
             miners=miners,
-            burn_share=self.burn_share,  # Fixed at 0.91 for default incentive
+            burn_share=self.burn_share,  # Fixed at TOTAL_BURN_EMISSION (0.87) for default incentive
             last_mechanism_step_block=last_mechanism_step_block,
         )
         for miner in miners:

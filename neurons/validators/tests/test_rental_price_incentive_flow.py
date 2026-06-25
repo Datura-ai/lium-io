@@ -501,7 +501,7 @@ async def test_rental_price_scenario_all_unrented(
         alpha_rate=ALPHA_RATE,
     )
 
-    assert splits["mining_share"] == pytest.approx(0.09)
+    assert splits["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION)
     assert sum(validator.miner_scores.values()) == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
 
     for hotkey in ["miner_a", "miner_b", "miner_c"]:
@@ -554,7 +554,7 @@ async def test_rental_price_scenario_zero_unrented(
 
     assert splits["rental_share"] == 0.0
     assert splits["burn_share"] == pytest.approx(TOTAL_BURN_EMISSION, abs=0.0001)
-    assert splits["mining_share"] == pytest.approx(0.09, abs=0.0001)
+    assert splits["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION, abs=0.0001)
     mock_price_provider.get_tao_price.assert_not_called()
     mock_price_provider.get_alpha_rate.assert_not_called()
 
@@ -1333,7 +1333,12 @@ async def test_rental_price_edge_single_miner_dominance(
                     # Default algorithm logs for rented executors
                     assert_log_contains_keys(result.full_log_text, ["mining_score", "total_mining_score"])
 
-    assert validator.miner_scores["miner_a"] > validator.miner_scores["miner_b"] + validator.miner_scores["miner_c"]
+    # The single miner controlling vast unrented capacity dominates each rented
+    # peer individually. (It no longer necessarily out-earns the rented miners
+    # combined: DAH-2273 raised the rented mining pool from 0.09 to 0.13, so two
+    # rented peers can now sum above one capped unrented miner.)
+    assert validator.miner_scores["miner_a"] > validator.miner_scores["miner_b"]
+    assert validator.miner_scores["miner_a"] > validator.miner_scores["miner_c"]
     assert validator.miner_scores["miner_b"] == pytest.approx(
         validator.miner_scores["miner_c"], abs=0.0001
     )
