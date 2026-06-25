@@ -38,6 +38,7 @@ class FakeShell:
 class FakeValidator:
     def __init__(self, *_args, **_kwargs) -> None:
         self.session_closed = False
+        created_validators.append(self)
 
     def start_session(self) -> None:
         pass
@@ -78,10 +79,15 @@ class FakeStdin:
 
 
 class FakeStdout:
-    def __init__(self, lines: list[str]) -> None:
+    def __init__(self, lines: list[str], *, delay_first: float = 0) -> None:
         self.lines = lines
+        self.delay_first = delay_first
+        self._delayed = False
 
     async def readline(self) -> str:
+        if self.delay_first and not self._delayed:
+            self._delayed = True
+            await asyncio.sleep(self.delay_first)
         return self.lines.pop(0)
 
 
@@ -130,8 +136,12 @@ class FakeSSH:
         return self.process
 
 
+created_validators: list[FakeValidator] = []
+
+
 @pytest.fixture(autouse=True)
 def fake_validator(monkeypatch):
+    created_validators.clear()
     monkeypatch.setattr(
         "neurons.validators.src.services.inspector_validation_service.InspectorValidator",
         FakeValidator,
@@ -170,7 +180,8 @@ async def test_validate_rented_executor_uses_interactive_json_protocol():
         {"cmd": "quit"},
     ]
     assert ssh.process.waited is True
-    assert service._validator.session_closed is True
+    assert len(created_validators) == 1
+    assert created_validators[0].session_closed is True
 
 
 @pytest.mark.asyncio
@@ -317,20 +328,36 @@ async def test_validate_rented_executor_classifies_ssh_transport_error():
 
 
 @pytest.mark.asyncio
-async def test_inspector_validator_reused_across_validations():
+async def test_validate_rented_executor_concurrent_uses_separate_validators():
     service = InspectorValidationService()
-    validator_obj = service._validator
     shell = FakeShell()
-    executor = SimpleNamespace(
-        uuid="exec-1",
+    executor_a = SimpleNamespace(
+        uuid="exec-a",
         python_path="/usr/bin/python3",
         root_dir="/root/app",
     )
+    executor_b = SimpleNamespace(
+        uuid="exec-b",
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+    )
+    ssh_a = FakeSSH()
+    ssh_b = FakeSSH()
+    ssh_a.process.stdout = FakeStdout(_interactive_stdout(), delay_first=0.05)
+    ssh_b.process.stdout = FakeStdout(_interactive_stdout(), delay_first=0.05)
 
-    await service.validate_rented_executor(shell, FakeSSH(), executor, {})
-    await service.validate_rented_executor(shell, FakeSSH(), executor, {})
+    result_a, result_b = await asyncio.gather(
+        service.validate_rented_executor(shell, ssh_a, executor_a, {}),
+        service.validate_rented_executor(shell, ssh_b, executor_b, {}),
+    )
 
-    assert service._validator is validator_obj
+    assert result_a.error is None
+    assert result_b.error is None
+    assert result_a.report is not None
+    assert result_b.report is not None
+    assert len(created_validators) == 2
+    assert created_validators[0] is not created_validators[1]
+    assert all(v.session_closed for v in created_validators)
 
 
 @pytest.mark.asyncio

@@ -118,7 +118,6 @@ class InspectorValidationService:
         self.command_timeout = command_timeout
         self.stderr_capture_timeout = stderr_capture_timeout
         self.stderr_capture_max_bytes = stderr_capture_max_bytes
-        self._validator = InspectorValidator(lib_path)
 
     async def validate_rented_executor(
         self,
@@ -130,6 +129,7 @@ class InspectorValidationService:
         from services.task.messages import InspectorMessages as Msg
 
         process = None
+        validator = None
         command = self._interactive_command(executor)
         diagnostics: dict[str, Any] = {
             "command": command,
@@ -154,7 +154,8 @@ class InspectorValidationService:
                     default_extra=default_extra,
                 )
 
-            self._validator.start_session()
+            validator = InspectorValidator(self.lib_path)
+            validator.start_session()
             process = await ssh.create_process(command)
 
             if settings.INSPECTOR_ENSURE_COLLECTOR_ON_RENTED_CHECK:
@@ -163,19 +164,19 @@ class InspectorValidationService:
                 except Exception as exc:
                     diagnostics["collector_ensure_error"] = str(exc)
 
-            open_json = self._validator.handshake_start()
+            open_json = validator.handshake_start()
             handshake_reply = await self._send_message(
                 process,
                 {"cmd": "handshake-reply", "open_json": open_json},
             )
-            self._validator.handshake_finish(handshake_reply)
+            validator.handshake_finish(handshake_reply)
 
-            request_cipher = self._validator.generate()
+            request_cipher = validator.generate()
             response_cipher = await self._send_message(
                 process,
                 {"cmd": "execute", "request_cipher": request_cipher},
             )
-            report = self._validator.verify(response_cipher)
+            report = validator.verify(response_cipher)
             return InspectorValidationResponse(
                 report=self._normalize_report(report),
                 diagnostics=diagnostics,
@@ -189,7 +190,8 @@ class InspectorValidationService:
                 default_extra=default_extra,
             )
         finally:
-            self._validator.close_session()
+            if validator is not None:
+                validator.close_session()
             if process is not None:
                 await self._close_process(process)
 
