@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import bittensor
 from pydantic import BaseModel, Field
 
-from core.config import settings
+from core.config import settings, shared_client
 from core.utils import _m, get_extra_info, get_logger
 from incentive.config import BASE_GPU_MAP
 from incentive.eligibility import is_missing_discord_after_cutoff
@@ -31,6 +31,11 @@ from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMI
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
+
+# DAH-2250 — unrented incentive soft price limit (section 3 of the market-pricing
+# proposal). An unrented executor whose price_per_gpu exceeds the market p90 times
+# this multiplier forfeits the unrented rental incentive but stays active.
+SOFT_LIMIT_PRICE_RATE = 1.1
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -169,6 +174,40 @@ class RentalPriceIncentive(DefaultIncentive):
     def get_base_model_for_gpu(self, gpu_model: str) -> str:
         base_model = BASE_GPU_MAP[gpu_model]
         return base_model
+
+    def _is_over_soft_price_limit(self, result: JobResult) -> bool:
+        # miner price_per_gpu above the market p90 ceiling (p90 * SOFT_LIMIT_PRICE_RATE)
+        price_per_gpu = result.executor_info.price_per_gpu
+        if not price_per_gpu:
+            return False
+        # machine_prices_p90 is partial: GPUs without market data keep full incentive
+        p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
+        if not p90:
+            return False
+        return price_per_gpu > p90 * SOFT_LIMIT_PRICE_RATE
+
+    def _log_soft_price_limit(self, result: JobResult) -> None:
+        # structured log for every unrented executor over the p90 soft ceiling
+        enforced = settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT
+        p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
+        logger.info(
+            _m(
+                "Unrented executor over market p90 soft price limit"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "price_per_gpu": result.executor_info.price_per_gpu,
+                    "machine_price_p90": p90,
+                    "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
+                    "soft_limit_threshold": p90 * SOFT_LIMIT_PRICE_RATE if p90 else None,
+                    "enforced": enforced,
+                    "reason": "price_above_market_p90_soft_limit",
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
 
     @staticmethod
     def _resolve_bucket(result: JobResult, cap_spec: dict[int, int]) -> int:
@@ -459,11 +498,21 @@ class RentalPriceIncentive(DefaultIncentive):
 
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
         base_model = self.get_base_model_for_gpu(job_result.gpu_model)
-        job_result.eligible_for_rental_share = (
+        eligible_for_rental_share = (
             not job_result.is_rented
             and (base_model in self.config.rental_incentive_gpu_types)
             and (job_result.score > 0 or job_result.job_score > 0)
         )
+
+        # DAH-2250 soft price limit: an otherwise-eligible unrented executor priced
+        # above the market p90 ceiling forfeits the unrented incentive (node stays
+        # active). While the flag is off we only log the would-be exclusion (shadow).
+        if eligible_for_rental_share and self._is_over_soft_price_limit(job_result):
+            self._log_soft_price_limit(job_result)
+            if settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT:
+                eligible_for_rental_share = False
+
+        job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
             logger.info(
                 _m(
