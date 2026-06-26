@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import bittensor
 from pydantic import BaseModel, Field
 
-from core.config import settings, shared_client
+from core.config import get_total_burn_emission, settings, shared_client
 from core.utils import _m, get_extra_info, get_logger
 from incentive.config import BASE_GPU_MAP
 from incentive.eligibility import is_missing_discord_after_cutoff
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
-from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION, DEFAULT_JOB_OWNER_MINER
+from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, DEFAULT_JOB_OWNER_MINER
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
@@ -304,9 +304,10 @@ class RentalPriceIncentive(DefaultIncentive):
 
         rental_share_raw = await self._calculate_rental_share(self.total_rental_cost)
 
-        # Ensure rental_share doesn't exceed TOTAL_BURN_EMISSION (0.87, cap at burn emission)
-        rental_share_capped = rental_share_raw > TOTAL_BURN_EMISSION
-        self.rental_share = min(rental_share_raw, TOTAL_BURN_EMISSION)
+        # Cap rental_share at the burn-emission share (sourced from shared config, DAH-2274)
+        total_burn_emission = get_total_burn_emission()
+        rental_share_capped = rental_share_raw > total_burn_emission
+        self.rental_share = min(rental_share_raw, total_burn_emission)
 
         if rental_share_capped:
             logger.warning(
@@ -315,14 +316,14 @@ class RentalPriceIncentive(DefaultIncentive):
                     extra={
                         "rental_share_raw": rental_share_raw,
                         "rental_share_capped": self.rental_share,
-                        "max_cap": TOTAL_BURN_EMISSION,
-                        "hint": f"Rental share would have been {rental_share_raw:.4f} but capped at {TOTAL_BURN_EMISSION}",
+                        "max_cap": total_burn_emission,
+                        "hint": f"Rental share would have been {rental_share_raw:.4f} but capped at {total_burn_emission}",
                     },
                 )
             )
 
         # Calculate emission splits
-        self.burn_share = TOTAL_BURN_EMISSION - self.rental_share
+        self.burn_share = total_burn_emission - self.rental_share
         logger.info(
             _m(
                 "Final emission splits calculated",

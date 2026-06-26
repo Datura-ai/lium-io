@@ -8,10 +8,9 @@ from datetime import UTC, datetime
 
 import bittensor
 
-from core.config import settings
+from core.config import get_total_burn_emission, settings
 from core.utils import _m, get_extra_info, get_logger
 from incentive.base import BaseIncentive
-from services.const import TOTAL_BURN_EMISSION
 from services.task_service import JobResult
 
 logger = get_logger(__name__)
@@ -74,7 +73,7 @@ class DefaultIncentive(BaseIncentive):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.burn_share = TOTAL_BURN_EMISSION
+        self.burn_share = get_total_burn_emission()
 
         # Metrics
         self.total_executors = 0
@@ -84,7 +83,7 @@ class DefaultIncentive(BaseIncentive):
         # Incentive states
         self.total_mining_score = 0
         self.miner_incentives = {}
-        self.mining_share = 1 - TOTAL_BURN_EMISSION
+        self.mining_share = 1 - self.burn_share
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult):
         """Process a job result.
@@ -275,7 +274,7 @@ class DefaultIncentive(BaseIncentive):
         # Calculate burn scores using BurnService
         cycle_scores = self.burn_service.calculate_burn_scores(
             miners=miners,
-            burn_share=self.burn_share,  # Fixed at TOTAL_BURN_EMISSION (0.87) for default incentive
+            burn_share=self.burn_share,  # burn-emission share sourced from shared config (DAH-2274)
             last_mechanism_step_block=last_mechanism_step_block,
         )
         for miner in miners:
