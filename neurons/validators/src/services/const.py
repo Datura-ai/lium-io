@@ -1,3 +1,5 @@
+from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
+
 MIN_JOB_TAKEN_TIME = 20
 
 GPU_MODEL_RATES = {
@@ -110,10 +112,12 @@ BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become 
 VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 
 # Emission split between the rented "mining" pool and the unrented + burn pool.
-# TOTAL_BURN_EMISSION caps the unrented-rental + burn pool; the remainder
-# (1 - TOTAL_BURN_EMISSION) is the rented mining pool. Raising the rented pool
-# from 0.09 to 0.13 (DAH-2273) lowers this cap from 0.91 to 0.87.
-TOTAL_BURN_EMISSION = 0.87
+# The LIVE value is sourced from shared config at runtime via
+# core.config.get_total_burn_emission() (DAH-2274). This constant is only the
+# offline fallback and mirrors the packaged lium-core default, so the value has a
+# single definition rather than an independent copy. (1 - TOTAL_BURN_EMISSION) is
+# the rented mining pool.
+TOTAL_BURN_EMISSION = DEFAULT_SHARED_CONFIG.total_burn_emission
 BURNER_EMISSION = 0.01
 
 # Rental Price Incentive Constants

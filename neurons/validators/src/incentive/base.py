@@ -12,7 +12,6 @@ from incentive.utils import log_for_monitoring
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.redis_service import RedisService
 from services.task_service import JobResult
-from services.const import TOTAL_BURN_EMISSION
 
 
 class BaseIncentive(ABC):

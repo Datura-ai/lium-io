@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 if TYPE_CHECKING:
     from bittensor import Wallet
 
-from lium_core.shared_config import SharedConfigClient
+from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 from incentive.config import IncentiveConfig
 
 
@@ -315,3 +315,29 @@ settings = Settings()
 shared_client = SharedConfigClient(
     api_url=f"{settings.COMPUTE_REST_API_URL}/v1/shared-config"
 )
+
+
+def get_total_burn_emission() -> float:
+    """Burn-emission share, sourced live from shared config (DAH-2274).
+
+    The value is served by the backend ``/v1/shared-config`` endpoint — the single
+    source of truth — and fetched here via ``shared_client``. Because it feeds
+    on-chain weights directly, the served value is clamped to ``[0, 1]`` and falls
+    back to the packaged lium-core default (``DEFAULT_SHARED_CONFIG.total_burn_emission``)
+    when it is missing or out of range, so a misconfigured or stale endpoint cannot
+    push a garbage burn share into weights.
+    """
+    fallback = DEFAULT_SHARED_CONFIG.total_burn_emission
+    value = getattr(shared_client.config, "total_burn_emission", None)
+    if not isinstance(value, int | float) or not (0.0 <= float(value) <= 1.0):
+        # Lazy import avoids a circular dependency (core.utils imports settings).
+        from core.utils import _m, get_logger
+
+        get_logger(__name__).warning(
+            _m(
+                "Invalid total_burn_emission from shared config; using fallback",
+                extra={"served_value": value, "fallback": fallback},
+            )
+        )
+        return fallback
+    return float(value)
