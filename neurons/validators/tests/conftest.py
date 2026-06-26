@@ -6,9 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from datura.requests.miner_requests import ExecutorSSHInfo
+from lium_core.shared_config import DEFAULT_SHARED_CONFIG
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
+
+from services.const import TOTAL_BURN_EMISSION
 
 # Settings is instantiated during test collection through app imports. These
 # defaults keep unit tests self-contained without requiring a local validator env.
@@ -19,12 +22,16 @@ os.environ.setdefault("ASYNC_SQLALCHEMY_DATABASE_URI", "sqlite+aiosqlite:///:mem
 
 # Prevent network calls during module-level SharedConfigClient instantiation.
 # core/config.py creates `shared_client = SharedConfigClient(...)` at import time, which
-# otherwise performs a blocking HTTP fetch against the live API. Forcing _fetch to return
-# None keeps the offline fallback (DEFAULT_SHARED_CONFIG) so unit tests stay hermetic.
-# This patch must run before test collection.
+# otherwise performs a blocking HTTP fetch against the live API. We make _fetch return a
+# hermetic config pinned to the production burn value (TOTAL_BURN_EMISSION) so tests
+# exercise production behaviour, not the lium-core offline fallback (intentionally left
+# stale at the old value). This patch must run before test collection.
+_TEST_SHARED_CONFIG = DEFAULT_SHARED_CONFIG.model_copy(
+    update={"total_burn_emission": TOTAL_BURN_EMISSION}
+)
 _shared_config_patcher = patch(
     "lium_core.shared_config.client.SharedConfigClient._fetch",
-    return_value=None,
+    return_value=_TEST_SHARED_CONFIG,
 )
 _shared_config_patcher.start()
 

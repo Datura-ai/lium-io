@@ -1,5 +1,3 @@
-from lium_core.shared_config.defaults import DEFAULT_SHARED_CONFIG
-
 MIN_JOB_TAKEN_TIME = 20
 
 GPU_MODEL_RATES = {
@@ -113,11 +111,11 @@ VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 
 # Emission split between the rented "mining" pool and the unrented + burn pool.
 # The LIVE value is sourced from shared config at runtime via
-# core.config.get_total_burn_emission() (DAH-2274). This constant is only the
-# offline fallback and mirrors the packaged lium-core default, so the value has a
-# single definition rather than an independent copy. (1 - TOTAL_BURN_EMISSION) is
-# the rented mining pool.
-TOTAL_BURN_EMISSION = DEFAULT_SHARED_CONFIG.total_burn_emission
+# core.config.get_total_burn_emission() (DAH-2274) — the backend is the source of
+# truth. This constant is the validator's expected production value: it is what the
+# tests assert against and what the test harness serves (see tests/conftest.py).
+# (1 - TOTAL_BURN_EMISSION) is the rented mining pool.
+TOTAL_BURN_EMISSION = 0.87
 BURNER_EMISSION = 0.01
 
 # Rental Price Incentive Constants

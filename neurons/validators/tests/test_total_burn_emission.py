@@ -32,7 +32,8 @@ def test_out_of_range_value_falls_back_to_default(monkeypatch, value):
 
 
 def test_default_offline_config_is_in_range(monkeypatch):
-    # The conftest patches _fetch -> None, so the live config is the offline default.
+    # Explicitly pin the packaged lium-core default (the offline fallback) and confirm
+    # get_total_burn_emission() returns it unchanged and in range.
     monkeypatch.setattr(shared_client, "_config", DEFAULT_SHARED_CONFIG)
     assert get_total_burn_emission() == pytest.approx(FALLBACK)
     assert 0.0 <= get_total_burn_emission() <= 1.0
