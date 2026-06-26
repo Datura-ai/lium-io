@@ -1,8 +1,8 @@
 from time import time
 
+from core.config import get_total_burn_emission
 from core.utils import get_logger, _m
 from incentive.config import BASE_GPU_MAP, DefaultPrice
-from services.const import TOTAL_BURN_EMISSION
 from services.task import JobResult
 
 
@@ -55,7 +55,7 @@ def log_for_monitoring(
             None,
         )
         rental_share = first_with_rental.rental_share if first_with_rental else 0
-        burn_share = first_with_rental.burn_share if first_with_rental else float(TOTAL_BURN_EMISSION)
+        burn_share = first_with_rental.burn_share if first_with_rental else float(get_total_burn_emission())
         total_rental_cost = first_with_rental.total_rental_cost if first_with_rental else 0
 
         # Bucket-keyed map uses tuple keys; serialize as "{base}_{bucket}" for Loki unwrap compatibility.

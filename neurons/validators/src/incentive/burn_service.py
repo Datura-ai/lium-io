@@ -9,9 +9,9 @@ from collections import Counter
 
 import bittensor
 
-from core.config import settings
+from core.config import get_total_burn_emission, settings
 from core.utils import _m, get_logger
-from services.const import BURNER_EMISSION, TOTAL_BURN_EMISSION
+from services.const import BURNER_EMISSION
 
 logger = get_logger(__name__)
 
@@ -66,7 +66,7 @@ class BurnService:
                     "burn_logic": "new" if settings.ENABLE_NEW_BURN_LOGIC else "old",
                     "num_burners": num_burners,
                     "burn_share": burn_share,
-                    "total_burn_emission_const": TOTAL_BURN_EMISSION,
+                    "total_burn_emission": get_total_burn_emission(),
                     "total_distributed": total_distributed,
                     "burner_hotkeys": list(burn_scores.keys()),
                     "validation": f"distributed={total_distributed:.6f}, expected={burn_share:.6f}",
@@ -166,9 +166,10 @@ class BurnService:
         other_burners = [uid for uid in burners if uid != main_burner]
 
         # Calculate scores proportional to burn_share
-        # Scale the original BURNER_EMISSION by the ratio of burn_share to TOTAL_BURN_EMISSION
-        # This maintains the same distribution pattern but with dynamic burn_share
-        burn_ratio = burn_share / TOTAL_BURN_EMISSION if TOTAL_BURN_EMISSION > 0 else 1
+        # Scale the original BURNER_EMISSION by the ratio of burn_share to the total burn
+        # emission. This maintains the same distribution pattern but with dynamic burn_share.
+        total_burn_emission = get_total_burn_emission()
+        burn_ratio = burn_share / total_burn_emission if total_burn_emission > 0 else 1
         scaled_burner_emission = BURNER_EMISSION * burn_ratio
 
         # Main burner gets: burn_share - (num_other_burners * scaled_burner_emission)
@@ -250,14 +251,14 @@ class BurnService:
         """Get the total burn emission share.
 
         Returns:
-            float: Total portion of emission allocated to burning (0.87)
+            float: Total portion of emission allocated to burning (from shared config)
         """
-        return TOTAL_BURN_EMISSION
+        return get_total_burn_emission()
 
     def get_mining_share(self) -> float:
         """Get the total mining emission share.
 
         Returns:
-            float: Total portion of emission allocated to mining (0.13)
+            float: Total portion of emission allocated to mining (from shared config)
         """
-        return 1 - TOTAL_BURN_EMISSION
+        return 1 - get_total_burn_emission()
