@@ -165,7 +165,7 @@ class Settings(BaseSettings):
     # whose price_per_gpu exceeds market p90 * SOFT_LIMIT_PRICE_RATE loses the unrented
     # rental incentive while staying active. When False, the breach is only logged
     # (shadow mode) so prod impact can be observed before enforcing.
-    ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)
+    ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=True)
 
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
