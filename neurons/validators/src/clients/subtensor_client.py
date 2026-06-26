@@ -661,5 +661,13 @@ class SubtensorClient:
         return cls._subtensor
 
     def get_alpha_rate(self) -> float:
-        price = self.subtensor.get_subnet_price(netuid=self.netuid)
-        return price.tao
+        # `subtensor.get_subnet_price()` reads the `Swap.AlphaSqrtPrice` storage item,
+        # which the finney runtime removed when the `Swap` pallet was migrated to a new
+        # AMM — querying it now raises `Storage function "Swap.AlphaSqrtPrice" not found`.
+        # `subtensor.subnet()` is resilient: it attempts `get_subnet_price()` and, on that
+        # failure, falls back to the `tao_in / alpha_in` reserve ratio, yielding the same
+        # alpha price in TAO. This keeps the query working without a bittensor SDK upgrade.
+        subnet = self.subtensor.subnet(netuid=self.netuid)
+        if subnet is None or subnet.price is None:
+            raise RuntimeError(f"No subnet price available for netuid {self.netuid}")
+        return subnet.price.tao
