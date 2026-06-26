@@ -107,6 +107,15 @@ def test_is_over_soft_price_limit_no_price(monkeypatch):
     assert over is False
 
 
+def test_enforcement_defaults_to_shadow_mode():
+    # Arrange / Act — rollout contract: first deploy must be shadow-only, so the
+    # flag default (not the env-resolved value) must stay False.
+    default = type(settings).model_fields["ENABLE_UNRENTED_SOFT_PRICE_LIMIT"].default
+
+    # Assert
+    assert default is False
+
+
 @pytest.mark.asyncio
 async def test_shadow_mode_keeps_rental_eligibility(monkeypatch):
     # Arrange — over the limit but flag off → shadow only
