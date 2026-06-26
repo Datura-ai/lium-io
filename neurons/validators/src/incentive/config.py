@@ -115,22 +115,21 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
 # Price of 0 means the (gpu_model, gpu_count) combo is not eligible for rental incentive.
 # Resolution order: specific GPU name > "*"; specific count > "*".
 D = DEFAULT_PRICE
-D12 = DefaultPrice(1.2)
 GPU_COUNT_CUSTOM_PRICES: dict[str, dict[str, float | DefaultPrice]] = {
     "*": {"*": 0, "1": D, "8": D},
     # B200
-    "NVIDIA B200": {"*": 0, "1": D12, "8": D12},
+    "NVIDIA B200": {"*": 0, "1": D, "8": D},
     # H100
-    "NVIDIA H100 80GB HBM3": {"*": 0, "1": D12, "8": D12},
-    "NVIDIA H100 NVL": {"*": 0, "1": D12, "8": D12},
-    "NVIDIA H100 PCIe": {"*": 0, "1": D12, "8": D12},
+    "NVIDIA H100 80GB HBM3": {"*": 0, "1": D, "8": D},
+    "NVIDIA H100 NVL": {"*": 0, "1": D, "8": D},
+    "NVIDIA H100 PCIe": {"*": 0, "1": D, "8": D},
     # A100
-    "NVIDIA A100 80GB PCIe": {"*": 0, "1": D12, "8": D12},
-    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": D12, "8": D12},
+    "NVIDIA A100 80GB PCIe": {"*": 0, "1": D, "8": D},
+    "NVIDIA A100-SXM4-80GB": {"*": 0, "1": D, "8": D},
     # RTX A6000
-    "NVIDIA RTX A6000": {"*": 0, "1": D12, "8": D12},
+    "NVIDIA RTX A6000": {"*": 0, "1": D, "8": D},
     # RTX PRO 6000
-    "RTX PRO 6000": {"*": 0, "1": D12, "8": D12},
+    "RTX PRO 6000": {"*": 0, "1": D, "8": D},
 }
 
 
