@@ -318,26 +318,25 @@ shared_client = SharedConfigClient(
 
 
 def get_total_burn_emission() -> float:
-    """Burn-emission share, sourced live from shared config (DAH-2274).
+    """Burn-emission share from shared config, guarded for on-chain use (DAH-2274).
 
-    The value is served by the backend ``/v1/shared-config`` endpoint — the single
-    source of truth — and fetched here via ``shared_client``. Because it feeds
-    on-chain weights directly, the served value is clamped to ``[0, 1]`` and falls
-    back to the packaged lium-core default (``DEFAULT_SHARED_CONFIG.total_burn_emission``)
-    when it is missing or out of range, so a misconfigured or stale endpoint cannot
-    push a garbage burn share into weights.
+    ``SharedConfigClient`` already falls back to the packaged lium-core default when
+    the backend is unreachable, so ``shared_client.config.total_burn_emission`` is
+    always a valid float. The only extra guard is rejecting a structurally valid but
+    out-of-range served value (e.g. an operator typo) before it reaches on-chain
+    weights, falling back to the lium-core default.
     """
-    fallback = DEFAULT_SHARED_CONFIG.total_burn_emission
-    value = getattr(shared_client.config, "total_burn_emission", None)
-    if not isinstance(value, int | float) or not (0.0 <= float(value) <= 1.0):
-        # Lazy import avoids a circular dependency (core.utils imports settings).
-        from core.utils import _m, get_logger
+    value = shared_client.config.total_burn_emission
+    if 0.0 <= value <= 1.0:
+        return value
 
-        get_logger(__name__).warning(
-            _m(
-                "Invalid total_burn_emission from shared config; using fallback",
-                extra={"served_value": value, "fallback": fallback},
-            )
+    # Lazy import avoids a circular dependency (core.utils imports settings).
+    from core.utils import _m, get_logger
+
+    get_logger(__name__).warning(
+        _m(
+            "total_burn_emission out of range; using lium-core default",
+            extra={"served_value": value, "fallback": DEFAULT_SHARED_CONFIG.total_burn_emission},
         )
-        return fallback
-    return float(value)
+    )
+    return DEFAULT_SHARED_CONFIG.total_burn_emission
