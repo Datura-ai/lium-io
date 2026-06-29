@@ -222,7 +222,7 @@ def test_apply_asyncssh_log_level_off(monkeypatch):
     """Flag off -> asyncssh logger WARNING, debug level not raised."""
     from core import utils
 
-    monkeypatch.setattr(utils.settings.debug, "SSH_DEBUG_LOGGING", False)
+    monkeypatch.setattr(utils.settings, "SSH_DEBUG_LOGGING", False)
     set_debug = MagicMock()
     monkeypatch.setattr(utils.asyncssh, "set_debug_level", set_debug)
 
@@ -238,7 +238,7 @@ def test_apply_asyncssh_log_level_on(monkeypatch):
     """Flag on -> asyncssh logger DEBUG, debug level 2 (handshake, no packet dumps)."""
     from core import utils
 
-    monkeypatch.setattr(utils.settings.debug, "SSH_DEBUG_LOGGING", True)
+    monkeypatch.setattr(utils.settings, "SSH_DEBUG_LOGGING", True)
     set_debug = MagicMock()
     monkeypatch.setattr(utils.asyncssh, "set_debug_level", set_debug)
 

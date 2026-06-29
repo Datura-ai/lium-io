@@ -32,7 +32,7 @@ Reading the split: a large ``tcp_connect_ms`` (with an IP host, so no DNS) →
 network path / host uplink; a large ``ssh_handshake_ms`` → remote sshd slow to
 emit its banner / KEX; a large value across *all* hosts in the same window →
 validator-side (event-loop) rather than remote. For a finer banner-vs-KEX
-split, enable ``DEBUG_SSH_DEBUG_LOGGING`` (see ``core.utils``).
+split, enable ``SSH_DEBUG_LOGGING`` (see ``core.utils``).
 
 Only the *notification* callbacks (all return ``None``) are overridden; the
 credential/host-key request callbacks are left to the base ``SSHClient`` so auth
