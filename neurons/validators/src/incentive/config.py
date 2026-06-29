@@ -31,24 +31,27 @@ DEFAULT_PRICE = DefaultPrice()
 # An empty dict `{}` means the base model is known but not eligible for rental
 # subsidy (no buckets → no subsidy path).
 #
-# Families migrated to per-count caps use `{1: 1, 8: 8}` — one single-GPU budget
-# and one full-chassis (8×) budget, matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
+# The cap is expressed in GPUs (the per-bucket sum of executor `gpu_count`), so a
+# bucket cap equals `machines × gpus_per_machine`. Eligible families use
+# `{1: 10, 8: 64}` — 10 single-GPU machines (10 GPUs) and 8 full chassis (8×8 = 64
+# GPUs), matching `GPU_COUNT_CUSTOM_PRICES` eligibility.
 MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
-    "B300": {1: 1},
-    "B200": {1: 4, 8: 8},
-    "H200": {1: 4, 8: 16},
-    "H100": {1: 4, 8: 16},
-    "RTX 4090": {1: 4, 8: 16},
-    "A100": {1: 4, 8: 8},
-    "RTX A6000": {1: 2, 8: 8},
-    "RTX 3090": {1: 4, 8: 16},
+    "B300": {1: 10, 8: 64},
+    "B200": {1: 10, 8: 64},
+    "H200": {1: 10, 8: 64},
+    "H100": {1: 10, 8: 64},
+    "RTX 4090": {1: 10, 8: 64},
+    "A100": {1: 10, 8: 64},
+    "RTX A6000": {1: 10, 8: 64},
+    "RTX 3090": {1: 10, 8: 64},
     "H800": {},
-    "RTX 5090": {1: 4, 8: 16},
+    "RTX 5090": {1: 10, 8: 64},
     "RTX 4000 Ada Generation": {},
-    "RTX 6000 Ada Generation": {},
-    "RTX PRO 6000": {1: 2, 8: 8},
+    "RTX 6000 Ada Generation": {1: 10, 8: 64},
+    "RTX PRO 6000": {1: 10, 8: 64},
     "L4": {},
-    "L40S": {},
+    "L40S": {1: 10, 8: 64},
+    "L40": {1: 10, 8: 64},
     "RTX 2000 Ada Generation": {},
     "RTX A5000": {},
     "RTX A4500": {},
