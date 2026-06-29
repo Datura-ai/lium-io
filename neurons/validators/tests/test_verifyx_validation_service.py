@@ -82,6 +82,7 @@ async def test_nonzero_exit_with_nonempty_stdout_classified_as_executor_crash(ca
             exit_status=1,
         )
         shell = MagicMock()
+        shell.get_sha256_checksum_by_path = AsyncMock(return_value="s")
         shell.get_checksums_over_scp = AsyncMock(return_value="md5:s")
         shell.ssh_client = MagicMock()
         shell.ssh_client.run = AsyncMock(return_value=ssh_result)

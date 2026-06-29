@@ -41,23 +41,29 @@ class InspectorExecutorExitError(Exception):
 
 
 class InspectorValidator:
-    def __init__(self, lib_path: str) -> None:
-        self.lib = ctypes.CDLL(lib_path)
-        self._bind_signatures()
+    def __init__(self, lib: ctypes.CDLL) -> None:
+        self.lib = lib
         self.session = None
 
-    def _bind_signatures(self) -> None:
-        self.lib.session_new.restype = ctypes.c_void_p
-        self.lib.session_handshake_start.argtypes = [ctypes.c_void_p]
-        self.lib.session_handshake_start.restype = ctypes.POINTER(ctypes.c_char)
-        self.lib.session_handshake_finish.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        self.lib.session_handshake_finish.restype = ctypes.c_int
-        self.lib.inspector_generate.argtypes = [ctypes.c_void_p]
-        self.lib.inspector_generate.restype = ctypes.POINTER(ctypes.c_char)
-        self.lib.inspector_verify.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        self.lib.inspector_verify.restype = ctypes.POINTER(ctypes.c_char)
-        self.lib.session_del.argtypes = [ctypes.c_void_p]
-        self.lib.str_del.argtypes = [ctypes.POINTER(ctypes.c_char)]
+    @classmethod
+    def load_library(cls, lib_path: str) -> ctypes.CDLL:
+        lib = ctypes.CDLL(lib_path)
+        cls._bind_signatures(lib)
+        return lib
+
+    @staticmethod
+    def _bind_signatures(lib: ctypes.CDLL) -> None:
+        lib.session_new.restype = ctypes.c_void_p
+        lib.session_handshake_start.argtypes = [ctypes.c_void_p]
+        lib.session_handshake_start.restype = ctypes.POINTER(ctypes.c_char)
+        lib.session_handshake_finish.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.session_handshake_finish.restype = ctypes.c_int
+        lib.inspector_generate.argtypes = [ctypes.c_void_p]
+        lib.inspector_generate.restype = ctypes.POINTER(ctypes.c_char)
+        lib.inspector_verify.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        lib.inspector_verify.restype = ctypes.POINTER(ctypes.c_char)
+        lib.session_del.argtypes = [ctypes.c_void_p]
+        lib.str_del.argtypes = [ctypes.POINTER(ctypes.c_char)]
 
     def start_session(self) -> None:
         self.session = self.lib.session_new()
@@ -118,6 +124,8 @@ class InspectorValidationService:
         self.command_timeout = command_timeout
         self.stderr_capture_timeout = stderr_capture_timeout
         self.stderr_capture_max_bytes = stderr_capture_max_bytes
+        self.local_checksum = sha256_from_path(self.lib_path)
+        self.inspector_lib = InspectorValidator.load_library(self.lib_path)
 
     async def validate_rented_executor(
         self,
@@ -137,9 +145,8 @@ class InspectorValidationService:
         }
 
         try:
-            local_checksum = sha256_from_path(self.lib_path)
             executor_checksum = await sha256_from_executor(shell, self.lib_path)
-            if local_checksum != executor_checksum:
+            if self.local_checksum != executor_checksum:
                 return self._failure_response(
                     error=(
                         "Executor using outdated libinspector library. "
@@ -148,13 +155,13 @@ class InspectorValidationService:
                     message=Msg.FAILED_LIB_MISMATCH,
                     diagnostics={
                         **diagnostics,
-                        "local_sha256": local_checksum,
+                        "local_sha256": self.local_checksum,
                         "executor_sha256": executor_checksum or None,
                     },
                     default_extra=default_extra,
                 )
 
-            validator = InspectorValidator(self.lib_path)
+            validator = InspectorValidator(self.inspector_lib)
             validator.start_session()
             process = await ssh.create_process(command)
 
