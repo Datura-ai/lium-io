@@ -12,8 +12,8 @@ def sha256_from_path(file_path: str) -> str:
 async def sha256_from_executor(shell, file_path: str, *, max_retries: int = 2) -> str:
     for attempt in range(1, max_retries + 1):
         try:
-            checksums = await shell.get_checksums_over_scp(file_path)
-            return checksums.split(":")[1]
+            checksum = await shell.get_sha256_checksum_by_path(file_path)
+            return checksum.strip()
         except Exception:
             if attempt < max_retries:
                 await asyncio.sleep(1.0)

@@ -2,7 +2,7 @@ import gc
 import pexpect
 import tempfile
 import os
-import re
+import shlex
 import asyncssh
 import asyncio
 import logging
@@ -203,6 +203,25 @@ class InteractiveShellService:
     async def get_checksums_over_scp(self, file_path: str):
         file_content = await self.read_file_content_over_scp(file_path)
         return f"{self.get_md5_checksum_from_file_content(file_content)}:{self.get_sha256_checksum_from_file_content(file_content)}"
+
+    async def get_sha256_checksum_by_path(self, file_path: str) -> str:
+        result = await self.ssh_client.run(
+            f"sha256sum {shlex.quote(file_path)}",
+            check=False,
+        )
+        if result.exit_status != 0:
+            return ""
+
+        output = result.stdout or ""
+        parts = output.split(maxsplit=1)
+        if not parts:
+            return ""
+
+        digest = parts[0]
+        if len(digest) != 64:
+            return ""
+
+        return digest
 
     # async def get_checksums_by_path(self, file_path: str):
     #     md5_output = await self.exec_shell_command(f'md5sum {file_path}')
