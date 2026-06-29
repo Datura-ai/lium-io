@@ -16,12 +16,17 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopRequest,
     CustomOptions,
+    ExternalVolumeInfo,
     PayloadPortMapping,
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
 from services.docker_service import DockerService
-from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
+from services.rental_docker_sdk import (
+    ContainerExecResult,
+    RentalDockerOperationError,
+    build_gpu_docker_config,
+)
 
 
 HOSTILE_USERNAME = "user'; rm -rf / #"
@@ -79,6 +84,7 @@ class RecordingRentalDockerClient:
         self.created_volumes = []
         self.removed_volumes = []
         self.pruned_images = 0
+        self.run_container_error = None
 
     async def login(self, *, username: str, password: str) -> None:
         self.login_calls.append({"username": username, "password": password})
@@ -92,6 +98,8 @@ class RecordingRentalDockerClient:
 
     async def run_container(self, spec) -> None:
         self.run_specs.append(spec)
+        if self.run_container_error is not None:
+            raise self.run_container_error
 
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
@@ -406,6 +414,74 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
     assert len(env_specs) == 1
     assert env_specs[0].argv == ("sh", "-c", "cat >> /etc/environment")
     assert "ENV_NEWLINE_MARKER" in env_specs[0].stdin
+
+
+@pytest.mark.asyncio
+async def test_create_container_disables_sysbox_runtime_for_s3fs_external_volume(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    payload = _base_create_payload(
+        is_sysbox=True,
+        external_volume_info=ExternalVolumeInfo(
+            name="celium-volume-safe",
+            plugin="s3fs",
+            iam_user_access_key="access-key",
+            iam_user_secret_key="secret-key",
+        ),
+    )
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
+    assert run_spec.runtime is None
+    assert any(
+        volume.source == "celium-volume-safe" and volume.target == "/mnt"
+        for volume in run_spec.volumes
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_container_streams_sdk_run_error_details(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    docker_service.rental_docker_client_factory.client.run_container_error = (
+        RentalDockerOperationError(
+            "Docker SDK run container failed: VolumeDriver.Mount: "
+            "error mounting celium-volume-test: Software caused connection abort; "
+            "fstype should be s3fs"
+        )
+    )
+    payload = _base_create_payload()
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_run"
+    streamed_messages = [
+        call.args[0] for call in docker_service.stream_log.await_args_list
+    ]
+    assert any("VolumeDriver.Mount" in message for message in streamed_messages)
+    assert any("fstype should be s3fs" in message for message in streamed_messages)
 
 
 @pytest.mark.asyncio
