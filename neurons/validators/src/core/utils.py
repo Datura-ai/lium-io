@@ -128,6 +128,23 @@ def get_extra_info(extra: dict) -> dict:
     return extra_info
 
 
+def _apply_asyncssh_log_level(asyncssh_logger: logging.Logger | None = None) -> int:
+    """Set the asyncssh logger level from the ``DEBUG_SSH_DEBUG_LOGGING`` flag.
+
+    DAH-2272: defaults to WARNING (asyncssh is quiet); when the flag is on, raise
+    it to DEBUG and request debug level 2 (full handshake, no packet dumps — 3
+    can leak the private key) so the banner / key-exchange / auth phases are
+    logged per connection.
+    """
+    level = logging.DEBUG if settings.debug.SSH_DEBUG_LOGGING else logging.WARNING
+    lg = asyncssh_logger or logging.getLogger("asyncssh")
+    lg.setLevel(level)
+    if settings.debug.SSH_DEBUG_LOGGING:
+        # Level 2 = full debug logging; level 3 would dump packets (key material).
+        asyncssh.set_debug_level(2)
+    return level
+
+
 def configure_logs_of_other_modules():
     # Configure root logger with JSON formatter
     root_logger = logging.getLogger()
@@ -155,7 +172,7 @@ def configure_logs_of_other_modules():
             return True
 
     asyncssh_logger = logging.getLogger("asyncssh")
-    asyncssh_logger.setLevel(logging.WARNING)
+    _apply_asyncssh_log_level(asyncssh_logger)
 
     # Add the filter to the logger
     asyncssh_logger.addFilter(ContextFilter())
@@ -187,7 +204,8 @@ def get_logger(name: str):
                 "propagate": False,
             },
             "asyncssh": {
-                "level": "WARNING",
+                # DAH-2272: DEBUG when DEBUG_SSH_DEBUG_LOGGING is set, else quiet.
+                "level": "DEBUG" if settings.debug.SSH_DEBUG_LOGGING else "WARNING",
                 "propagate": True,
             },
         },
