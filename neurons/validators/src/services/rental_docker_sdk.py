@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import socket as socket_module
 import tempfile
 import threading
@@ -14,7 +13,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 
 DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
-_DOCKER_SDK_SSH_HOME_LOCK = threading.Lock()
+_DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
 
 
 class RentalDockerConnectionError(RuntimeError):
@@ -380,27 +379,12 @@ class RentalDockerSdkClientFactory:
             known_hosts_path.chmod(0o600)
             _validate_paramiko_known_hosts(known_hosts_path)
 
-            config_path = ssh_dir / "config"
-            config_path.write_text(
-                "\n".join(
-                    [
-                        f"Host {executor_info.address}",
-                        f"    HostName {executor_info.address}",
-                        f"    Port {executor_info.ssh_port}",
-                        f"    User {executor_info.ssh_username}",
-                        f"    IdentityFile {key_path}",
-                        "    IdentitiesOnly yes",
-                        "",
-                    ]
-                )
-            )
-            config_path.chmod(0o600)
-
             try:
                 api_client = await asyncio.to_thread(
                     self._create_api_client,
                     _build_docker_ssh_base_url(executor_info),
-                    ssh_home,
+                    key_path,
+                    known_hosts_path,
                 )
             except Exception as exc:
                 raise RentalDockerConnectionError(
@@ -416,22 +400,27 @@ class RentalDockerSdkClientFactory:
             finally:
                 await client.aclose()
 
-    def _create_api_client(self, base_url: str, ssh_home: Path):
-        with _DOCKER_SDK_SSH_HOME_LOCK:
-            original_home = os.environ.get("HOME")
-            os.environ["HOME"] = str(ssh_home)
-            try:
-                factory = self.api_client_factory or _default_docker_api_client_factory
-                return factory(
+    def _create_api_client(
+        self,
+        base_url: str,
+        key_path: Path,
+        known_hosts_path: Path,
+    ):
+        with _DOCKER_SDK_SSH_ADAPTER_LOCK:
+            if self.api_client_factory is not None:
+                return self.api_client_factory(
                     base_url=base_url,
                     timeout=self.timeout,
                     use_ssh_client=False,
                 )
-            finally:
-                if original_home is None:
-                    os.environ.pop("HOME", None)
-                else:
-                    os.environ["HOME"] = original_home
+
+            return _default_docker_api_client_factory(
+                base_url=base_url,
+                timeout=self.timeout,
+                use_ssh_client=False,
+                key_path=key_path,
+                known_hosts_path=known_hosts_path,
+            )
 
 
 def build_container_command_argv(startup_commands: str | None) -> tuple[str, ...]:
@@ -541,7 +530,72 @@ def build_environment_exec_spec(
 def _default_docker_api_client_factory(**kwargs):
     import docker
 
+    key_path = kwargs.pop("key_path", None)
+    known_hosts_path = kwargs.pop("known_hosts_path", None)
+    if key_path is not None and known_hosts_path is not None:
+        return _create_docker_api_client_with_rental_ssh_adapter(
+            docker_module=docker,
+            key_path=key_path,
+            known_hosts_path=known_hosts_path,
+            **kwargs,
+        )
+
     return docker.APIClient(**kwargs)
+
+
+def _create_docker_api_client_with_rental_ssh_adapter(
+    *,
+    docker_module,
+    key_path: Path,
+    known_hosts_path: Path,
+    **kwargs,
+):
+    import docker.api.client as docker_api_client
+
+    # docker-py normally discovers SSH identity/known_hosts via ~/.ssh. Patch
+    # its adapter only during construction so this rental client uses our
+    # operation-scoped files without mutating process-global HOME.
+    original_adapter = docker_api_client.SSHHTTPAdapter
+    docker_api_client.SSHHTTPAdapter = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    try:
+        return docker_module.APIClient(**kwargs)
+    finally:
+        docker_api_client.SSHHTTPAdapter = original_adapter
+
+
+def _build_rental_ssh_http_adapter_class(
+    *,
+    key_path: Path,
+    known_hosts_path: Path,
+):
+    from docker.transport.sshconn import SSHHTTPAdapter
+
+    class RentalSSHHTTPAdapter(SSHHTTPAdapter):
+        def _create_paramiko_client(self, base_url):
+            import logging
+            import urllib.parse
+
+            import paramiko
+
+            logging.getLogger("paramiko").setLevel(logging.WARNING)
+            parsed_base_url = urllib.parse.urlparse(base_url)
+            self.ssh_client = paramiko.SSHClient()
+            self.ssh_params = {
+                "hostname": parsed_base_url.hostname,
+                "port": parsed_base_url.port,
+                "username": parsed_base_url.username,
+                "key_filename": str(key_path),
+                "look_for_keys": False,
+                "allow_agent": False,
+            }
+            self.ssh_client.load_host_keys(str(known_hosts_path))
+            self.ssh_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+    RentalSSHHTTPAdapter.__name__ = "RentalSSHHTTPAdapter"
+    return RentalSSHHTTPAdapter
 
 
 def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
