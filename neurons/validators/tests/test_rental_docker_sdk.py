@@ -23,6 +23,7 @@ from services.rental_docker_sdk import (
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
+    _build_rental_ssh_http_adapter_class,
 )
 
 
@@ -428,22 +429,26 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
 
 
 @pytest.mark.asyncio
-async def test_factory_restores_home_and_closes_client(monkeypatch):
-    original_home = os.environ.get("HOME")
+async def test_factory_does_not_mutate_home_and_closes_client(monkeypatch):
+    original_home = "/validator/home"
+    monkeypatch.setenv("HOME", original_home)
     created = {}
     api_client = FakeApiClient()
 
     def api_client_factory(**kwargs):
-        ssh_home = Path(os.environ["HOME"])
         created["kwargs"] = kwargs
-        created["ssh_home"] = ssh_home
-        created["key_mode"] = (ssh_home / ".ssh" / "id_executor").stat().st_mode & 0o777
-        created["known_hosts"] = (ssh_home / ".ssh" / "known_hosts").read_text()
+        created["observed_home"] = os.environ.get("HOME")
         return api_client
+
+    def validate_known_hosts(known_hosts_path):
+        created["key_mode"] = (
+            known_hosts_path.parent / "id_executor"
+        ).stat().st_mode & 0o777
+        created["known_hosts"] = known_hosts_path.read_text()
 
     monkeypatch.setattr(
         "services.rental_docker_sdk._validate_paramiko_known_hosts",
-        Mock(),
+        validate_known_hosts,
     )
     factory = RentalDockerSdkClientFactory(api_client_factory=api_client_factory)
     executor_info = ExecutorSSHInfo(
@@ -466,6 +471,7 @@ async def test_factory_restores_home_and_closes_client(monkeypatch):
     assert created["kwargs"]["base_url"] == "ssh://root@127.0.0.1:2222"
     assert created["kwargs"]["use_ssh_client"] is False
     assert "PRIVATE KEY" not in str(created["kwargs"])
+    assert created["observed_home"] == original_home
     assert created["key_mode"] == 0o600
     assert "[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY" in created["known_hosts"]
     assert os.environ.get("HOME") == original_home
@@ -526,3 +532,48 @@ def test_require_rental_docker_ssh_host_key_strips_present_key():
     )
 
     assert require_rental_docker_ssh_host_key(executor_info) == "ssh-ed25519 AAAATESTKEY"
+
+
+def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_path):
+    import paramiko
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY\n")
+    calls = {}
+
+    class FakeSSHClient:
+        def load_host_keys(self, path):
+            calls["host_keys_path"] = path
+
+        def load_system_host_keys(self):
+            raise AssertionError("system host keys should not be loaded")
+
+        def set_missing_host_key_policy(self, policy):
+            calls["policy"] = policy
+
+    class FakeRejectPolicy:
+        pass
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+    monkeypatch.setattr(paramiko, "RejectPolicy", FakeRejectPolicy)
+
+    adapter_class = _build_rental_ssh_http_adapter_class(
+        key_path=key_path,
+        known_hosts_path=known_hosts_path,
+    )
+    adapter = adapter_class.__new__(adapter_class)
+
+    adapter._create_paramiko_client("ssh://root@127.0.0.1:2222")
+
+    assert adapter.ssh_params == {
+        "hostname": "127.0.0.1",
+        "port": 2222,
+        "username": "root",
+        "key_filename": str(key_path),
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    assert calls["host_keys_path"] == str(known_hosts_path)
+    assert isinstance(calls["policy"], FakeRejectPolicy)
