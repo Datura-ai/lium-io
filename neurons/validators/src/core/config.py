@@ -81,14 +81,6 @@ class DebugSettings(BaseSettings):
 
     SKIP_STORAGE_CHECK: bool = Field(default=False, description="Skip storage check")
 
-    # DAH-2272: raise the asyncssh logger to DEBUG (debug level 2) so the SSH
-    # handshake (banner / key exchange / auth) is logged per connection. Off by
-    # default — it is verbose; enable per-deploy to break down a slow connect
-    # below the tcp/login split that ssh_connect_timing already emits.
-    SSH_DEBUG_LOGGING: bool = Field(
-        default=False, description="Enable verbose asyncssh SSH handshake debug logging"
-    )
-
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -168,6 +160,14 @@ class Settings(BaseSettings):
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
+
+    # DAH-2272: raise the asyncssh logger to DEBUG (debug level 2) so the SSH
+    # handshake (banner / key exchange / auth) is logged per connection. Off by
+    # default — verbose; flip on briefly in staging/prod to deep-dive a slow
+    # connect below the always-on ssh_connect_phase_timing split. Lives on the
+    # main settings (not DebugSettings, which is local-dev only) so it is
+    # configurable where the real slow connects happen.
+    SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=False, description="Enable verbose asyncssh SSH handshake debug logging")
 
     # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
     # whose price_per_gpu exceeds market p90 * SOFT_LIMIT_PRICE_RATE loses the unrented
