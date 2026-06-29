@@ -1,13 +1,21 @@
-"""DAH-2265 Plan 2 — CachedTemplateVerificationCheck (advisory, non-fatal).
+"""DAH-2265 — CachedTemplateVerificationCheck.
 
 Verifies the executor has the recommended default image pre-pulled, publishing the
-result to executor.specs (via pipeline state) and a structured event. It must never
-fail the pipeline or change score, and must fail open on every uncertainty.
+result to executor.specs (via pipeline state) and a structured event. Before
+``settings.CACHED_TEMPLATE_CUTOFF`` it is advisory (never fails / changes score); on/after
+the cutoff the two bad signals (not cached, stale digest) fail verification. It must fail
+open on every uncertainty regardless of the cutoff.
+
+An autouse fixture pins the cutoff to the future by default so the advisory-mode assertions
+are wall-clock-independent; cutoff-enforcement tests opt in with ``_set_cutoff(active=True)``.
 """
 
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+
+from core.config import settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
 )
@@ -52,8 +60,23 @@ def _ssh(exit_status=0, stdout="", raises=False):
     return ssh
 
 
-def test_check_is_non_fatal():
-    assert CachedTemplateVerificationCheck.fatal is False
+@pytest.fixture(autouse=True)
+def _advisory_by_default(monkeypatch):
+    # Pin every test to BEFORE the cutoff (advisory mode) so assertions are independent of the
+    # wall clock. Cutoff-enforcement tests opt in with _set_cutoff(active=True).
+    monkeypatch.setattr(
+        settings, "CACHED_TEMPLATE_CUTOFF", datetime.utcnow() + timedelta(days=365)
+    )
+
+
+def _set_cutoff(monkeypatch, *, active: bool) -> None:
+    cutoff = datetime.utcnow() - timedelta(days=1) if active else datetime.utcnow() + timedelta(days=1)
+    monkeypatch.setattr(settings, "CACHED_TEMPLATE_CUTOFF", cutoff)
+
+
+def test_check_is_fatal():
+    # DAH-2265: the check is fatal-capable; run() only returns passed=False after the cutoff.
+    assert CachedTemplateVerificationCheck.fatal is True
 
 
 @pytest.mark.asyncio
@@ -296,3 +319,127 @@ async def test_digest_fails_open_on_unparseable_stdout(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.DIGEST_SKIPPED.reason
     assert result.updates["state"].recommended_image_digest_match is None
+
+
+# --- DAH-2265 cutoff enforcement (critical on/after the cutoff) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_not_cached_fails_after_cutoff(context_factory, monkeypatch):
+    # Image not pre-pulled + after cutoff → fatal fail. The reason rides the event (and thus
+    # log_text → provider), the cached signal is still published to specs.
+    _set_cutoff(monkeypatch, active=True)
+    ctx = context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE])),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh(exit_status=1),
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.NOT_CACHED.reason
+    assert result.event.severity == "error"
+    assert result.updates["state"].recommended_image_cached is False
+
+
+@pytest.mark.asyncio
+async def test_digest_mismatch_fails_after_cutoff(context_factory, monkeypatch):
+    # Stale content under the same tag + after cutoff → fatal fail.
+    _set_cutoff(monkeypatch, active=True)
+    ctx = context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh(exit_status=0, stdout=_LOCAL_MISMATCH),
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
+    assert result.event.severity == "error"
+    assert result.updates["state"].recommended_image_cached is True
+    assert result.updates["state"].recommended_image_digest_match is False
+
+
+@pytest.mark.asyncio
+async def test_cached_passes_after_cutoff(context_factory, monkeypatch):
+    # Pre-pulled, no backend digest to compare → CACHED, never a fatal fail.
+    _set_cutoff(monkeypatch, active=True)
+    ctx = context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE])),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh(exit_status=0),
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.CACHED.reason
+
+
+@pytest.mark.asyncio
+async def test_digest_match_passes_after_cutoff(context_factory, monkeypatch):
+    _set_cutoff(monkeypatch, active=True)
+    ctx = context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh(exit_status=0, stdout=_LOCAL_MATCH),
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.DIGEST_MATCH.reason
+
+
+@pytest.mark.asyncio
+async def test_uncertainty_fails_open_after_cutoff(context_factory, monkeypatch):
+    # No recommended image from backend → SKIPPED, stays advisory even after the cutoff.
+    _set_cutoff(monkeypatch, active=True)
+    ssh = _ssh()
+    ctx = context_factory(
+        services=build_services(backend=_backend(images=None)),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=ssh,
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SKIPPED.reason
+    ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_digest_skipped_passes_after_cutoff(context_factory, monkeypatch):
+    # Cached but RepoDigest unreadable for this repo → DIGEST_SKIPPED, never a fatal fail.
+    _set_cutoff(monkeypatch, active=True)
+    ctx = context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh(exit_status=0, stdout="[]"),
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.DIGEST_SKIPPED.reason
+
+
+@pytest.mark.asyncio
+async def test_not_cached_stays_advisory_before_cutoff(context_factory, monkeypatch):
+    # Same bad signal as the fatal test, but before the cutoff → advisory pass, info severity.
+    _set_cutoff(monkeypatch, active=False)
+    ctx = context_factory(
+        services=build_services(backend=_backend(images=[_IMAGE])),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=_ssh(exit_status=1),
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.NOT_CACHED.reason
+    assert result.event.severity != "error"
+    assert result.updates["state"].recommended_image_cached is False
