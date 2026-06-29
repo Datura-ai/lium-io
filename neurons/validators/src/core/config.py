@@ -81,6 +81,14 @@ class DebugSettings(BaseSettings):
 
     SKIP_STORAGE_CHECK: bool = Field(default=False, description="Skip storage check")
 
+    # DAH-2272: raise the asyncssh logger to DEBUG (debug level 2) so the SSH
+    # handshake (banner / key exchange / auth) is logged per connection. Off by
+    # default — it is verbose; enable per-deploy to break down a slow connect
+    # below the tcp/login split that ssh_connect_timing already emits.
+    SSH_DEBUG_LOGGING: bool = Field(
+        default=False, description="Enable verbose asyncssh SSH handshake debug logging"
+    )
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

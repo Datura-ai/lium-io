@@ -51,6 +51,7 @@ from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.config import settings
 from core.utils import _m, get_extra_info, retry_ssh_command
+from services.ssh_connect_timing import connect_with_phase_timing
 from services.const import (
     FILLER_CONTAINER_PREFIX,
     POD_CONTAINER_PREFIX,
@@ -1138,7 +1139,15 @@ class DockerService:
         decrypted_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(decrypted_key)
         try:
-            async with asyncssh.connect(
+            # DAH-2272: this early port-check connect is the one whose stall got
+            # absorbed into "Started in subnet"; phase-time it so a future stall
+            # is attributable to network (TCP) vs. remote sshd (login).
+            async with connect_with_phase_timing(
+                log_extra={
+                    "miner_hotkey": miner_hotkey,
+                    "executor_ip_address": executor_info.address,
+                    "context": "wait_for_port_check_containers",
+                },
                 host=executor_info.address,
                 port=executor_info.ssh_port,
                 username=executor_info.ssh_username,
@@ -2868,8 +2877,12 @@ class DockerService:
             require_rental_docker_ssh_host_key(executor_info)
 
             current_step = "ssh_connect"
+            # DAH-2272: connect_with_phase_timing logs the TCP-vs-SSH-login
+            # split for this connect (host/network vs. remote sshd) without
+            # changing how the connection is established.
             async with (
-                asyncssh.connect(
+                connect_with_phase_timing(
+                    log_extra=default_extra,
                     host=executor_info.address,
                     port=executor_info.ssh_port,
                     username=executor_info.ssh_username,
