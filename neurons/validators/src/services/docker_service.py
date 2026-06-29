@@ -3194,6 +3194,7 @@ class DockerService:
 
                 try:
                     current_step = "docker_run"
+                    await self.stream_log("Creating docker container", "success", log_tag)
                     await self._run_rental_docker_create_with_port_retry(
                         docker_client=docker_client,
                         ssh_client=ssh_client,

@@ -480,6 +480,7 @@ async def test_create_container_streams_sdk_run_error_details(
     streamed_messages = [
         call.args[0] for call in docker_service.stream_log.await_args_list
     ]
+    assert "Creating docker container" in streamed_messages
     assert any("VolumeDriver.Mount" in message for message in streamed_messages)
     assert any("fstype should be s3fs" in message for message in streamed_messages)
 
