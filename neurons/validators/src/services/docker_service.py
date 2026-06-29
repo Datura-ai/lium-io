@@ -447,6 +447,7 @@ class DockerService:
         container_name: str,
         default_extra: dict,
         local_volume: str | None = None,
+        log_tag: str = "container_creation",
     ) -> None:
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
@@ -512,6 +513,21 @@ class DockerService:
                     )
                     continue
 
+                error_text = str(exc)
+                logger.error(
+                    _m(
+                        "Docker SDK run container failed",
+                        extra=get_extra_info(
+                            {
+                                **default_extra,
+                                "container_name": container_name,
+                                "error": error_text,
+                            }
+                        ),
+                    ),
+                    exc_info=True,
+                )
+                await self.stream_log(error_text, "error", log_tag)
                 raise
 
     async def _remove_failed_rental_container_for_retry(
@@ -3185,6 +3201,7 @@ class DockerService:
                         container_name=container_name,
                         default_extra=default_extra,
                         local_volume=local_volume,
+                        log_tag=log_tag,
                     )
 
                     logger.info(f"Container creation step finished")
