@@ -990,7 +990,10 @@ def _patch_create_container_happy_path(docker_service, monkeypatch):
         Mock(return_value=DummySSHConnectionManager(ssh_client)),
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.add_pending_pod = AsyncMock()
@@ -1068,6 +1071,7 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     await docker_service.create_container(
@@ -1120,6 +1124,7 @@ async def test_create_customer_rental_skips_inspector_collector_when_disabled(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     await docker_service.create_container(
@@ -1163,6 +1168,7 @@ async def test_create_filler_skips_inspector_collector_start(docker_service, mon
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     await docker_service.create_container(
@@ -1202,6 +1208,7 @@ async def test_delete_last_customer_rental_stops_inspector_collector(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     result = await docker_service.delete_container(
@@ -1245,6 +1252,7 @@ async def test_delete_customer_rental_keeps_collector_with_remaining_pods(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     await docker_service.delete_container(
@@ -1283,6 +1291,7 @@ async def test_delete_filler_skips_inspector_collector_stop(
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
     await docker_service.delete_container(
@@ -2521,11 +2530,13 @@ async def test_create_local_volume_sparse_true_appends_sparse_flag(
     """sparse=True (full-node rental) → `-o sparse=true` appended after the size cap."""
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
-    execute = AsyncMock()
-    monkeypatch.setattr(docker_service, "execute_and_stream_logs", execute)
+    stream_log = AsyncMock()
+    monkeypatch.setattr(docker_service, "stream_log", stream_log)
+    docker_client = _FakeRentalDockerClient()
 
     await docker_service.create_local_volume(
         ssh_client=ssh_client,
+        docker_client=docker_client,
         local_volume="volume_test",
         log_tag="tag",
         log_text="Creating docker volume volume_test",
@@ -2534,12 +2545,15 @@ async def test_create_local_volume_sparse_true_appends_sparse_flag(
         sparse=True,
     )
 
-    command = execute.await_args.kwargs["command"]
-    assert command == (
-        "/usr/bin/docker volume create -d vloopback volume_test "
-        "-o size=200g -o sparse=true"
-    )
-    assert execute.await_args.kwargs["log_extra"]["sparse"] is True
+    stream_log.assert_awaited_once_with("Creating docker volume volume_test", "success", "tag")
+    assert docker_client.created_volumes == [
+        {
+            "volume_name": "volume_test",
+            "driver": "vloopback",
+            "driver_opts": {"size": "200g", "sparse": "true"},
+            "timeout": 50,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -2550,11 +2564,13 @@ async def test_create_local_volume_sparse_false_keeps_preallocation(
     """sparse=False (partial / legacy rental) → no sparse flag; size cap unchanged."""
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=Mock(stdout="/var/lib/docker\n"))
-    execute = AsyncMock()
-    monkeypatch.setattr(docker_service, "execute_and_stream_logs", execute)
+    stream_log = AsyncMock()
+    monkeypatch.setattr(docker_service, "stream_log", stream_log)
+    docker_client = _FakeRentalDockerClient()
 
     await docker_service.create_local_volume(
         ssh_client=ssh_client,
+        docker_client=docker_client,
         local_volume="volume_test",
         log_tag="tag",
         log_text="Creating docker volume volume_test",
@@ -2562,10 +2578,15 @@ async def test_create_local_volume_sparse_false_keeps_preallocation(
         limit=200,
     )
 
-    command = execute.await_args.kwargs["command"]
-    assert command == "/usr/bin/docker volume create -d vloopback volume_test -o size=200g"
-    assert "sparse" not in command
-    assert execute.await_args.kwargs["log_extra"]["sparse"] is False
+    stream_log.assert_awaited_once_with("Creating docker volume volume_test", "success", "tag")
+    assert docker_client.created_volumes == [
+        {
+            "volume_name": "volume_test",
+            "driver": "vloopback",
+            "driver_opts": {"size": "200g"},
+            "timeout": 50,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
