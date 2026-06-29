@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import shlex
 from dataclasses import replace
+from datetime import datetime
+
+from core.config import settings
 
 from ..messages import CachedTemplateMessages as Msg
 from ..messages import render_message
@@ -28,25 +31,31 @@ def _repo_digest(stdout: str | None, repo: str) -> str | None:
 
 
 class CachedTemplateVerificationCheck:
-    """Advisory: verify the executor has the recommended default image pre-pulled.
+    """Verify the executor has the recommended default image pre-pulled (DAH-2265).
 
-    DAH-2265 Plan 2. The executor cache pre-pull (``cache_template_service.py``) keeps the
-    recommended default template image warm, and the rental-time DAH-1524 pull-skip turns
-    DOCKER_PULL into a no-op when the image is already present. This check *observes*
-    whether that pre-pull actually happened: it resolves the recommended image from the
+    The executor cache pre-pull (``cache_template_service.py``) keeps the recommended default
+    template image warm, and the rental-time DAH-1524 pull-skip turns DOCKER_PULL into a no-op
+    when the image is already present. This check resolves the recommended image from the
     backend (the same ``/executors/default-docker-image`` endpoint the executor uses) and
     probes ``docker image inspect`` on the executor.
 
-    Strictly advisory — non-fatal, never halts, never changes score. It only:
-      * emits a structured event (logged by the pipeline sink), and
-      * publishes ``recommended_image_cached`` into ``executor.specs`` via pipeline state.
+    Two-phase by ``settings.CACHED_TEMPLATE_CUTOFF``:
+      * Before the cutoff — advisory only: emits a structured event and publishes
+        ``recommended_image_cached`` / ``recommended_image_digest_match`` into
+        ``executor.specs`` via pipeline state. Never changes score.
+      * On/after the cutoff — critical (``fatal``): the two bad signals (image not pre-pulled,
+        or stale content under an unchanged tag) return ``passed=False`` so the pipeline halts
+        early, the executor scores 0, and the failure reason reaches the provider via
+        ``log_text``. This check sits after ``TenantEnforcementCheck`` (the rented
+        short-circuit), so it only ever gates *unrented* executors — an active customer rental
+        is never failed by it.
 
-    It fails open on every uncertainty (unknown GPU/driver, backend unreachable, empty
-    recommendation, SSH error) by recording a skip and leaving state untouched.
+    Fails open on every uncertainty (unknown GPU/driver, backend unreachable, empty
+    recommendation, SSH error) by recording a skip and leaving score untouched.
     """
 
     check_id = "executor.validate.cached_template"
-    fatal = False
+    fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
         gpu_model = ctx.state.gpu_model
@@ -138,10 +147,25 @@ class CachedTemplateVerificationCheck:
             # Cached, but the backend published no digest to compare against.
             template = Msg.CACHED
 
+        # DAH-2265: on/after the cutoff this check turns critical. The two "bad" signals —
+        # image not pre-pulled (NOT_CACHED) or stale content under an unchanged tag
+        # (DIGEST_MISMATCH) — fail verification early, so the executor scores 0 and the reason
+        # reaches the provider via log_text (the pipeline surfaces the last event). Before the
+        # cutoff (and on every fail-open None path above) the check stays advisory: passed=True,
+        # score untouched. The cached/digest signals are published to specs either way.
+        after_cutoff = datetime.utcnow() >= settings.CACHED_TEMPLATE_CUTOFF
+        should_fail = after_cutoff and template in (Msg.NOT_CACHED, Msg.DIGEST_MISMATCH)
+
         event = render_message(
             template,
             ctx=ctx,
             check_id=self.check_id,
+            severity="error" if should_fail else None,
+            impact=(
+                "Score set to 0 — recommended default image must be pre-pulled and current"
+                if should_fail
+                else None
+            ),
             what={
                 "recommended_image": image_ref,
                 "cached": cached,
@@ -150,10 +174,11 @@ class CachedTemplateVerificationCheck:
                 "local_digest": local_digest,
                 "gpu_model": gpu_model,
                 "driver_version": driver_version,
+                "after_cutoff": after_cutoff,
             },
         )
         return CheckResult(
-            passed=True,
+            passed=not should_fail,
             event=event,
             updates={
                 "state": replace(

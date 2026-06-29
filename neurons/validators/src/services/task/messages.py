@@ -944,11 +944,14 @@ class FinalizeMessages:
 
 
 class CachedTemplateMessages:
-    """DAH-2265 Plan 2 — advisory cached-template verification.
+    """DAH-2265 — cached-template verification.
 
     Confirms whether the executor has the recommended default image pre-pulled so
-    DOCKER_PULL is a no-op for default-template rentals. Purely observational: every
-    template is severity="info" and the check never fails the pipeline or changes score.
+    DOCKER_PULL is a no-op for default-template rentals. Templates carry severity="info"
+    (advisory) by default; before ``settings.CACHED_TEMPLATE_CUTOFF`` the check is purely
+    observational. On/after the cutoff the check renders the two bad signals (NOT_CACHED,
+    DIGEST_MISMATCH) with a severity="error" override and fails verification — see
+    ``CachedTemplateVerificationCheck``.
     """
 
     CACHED = MessageTemplate(

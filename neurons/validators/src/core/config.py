@@ -133,6 +133,14 @@ class Settings(BaseSettings):
     REQUIRE_SYSBOX_FOR_UNRENTED: bool = Field(env="REQUIRE_SYSBOX_FOR_UNRENTED", default=True)
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
+    # DAH-2265: cached-template requirement. Before the cutoff the CachedTemplateVerificationCheck
+    # is purely advisory (publishes recommended_image_cached / recommended_image_digest_match to
+    # executor.specs, never changes score). On/after the cutoff that check turns critical: an
+    # unrented executor that has not pre-pulled the recommended default image, or holds stale
+    # content under the same tag, fails verification early (score 0, reason surfaced to the
+    # provider). Fails open: an unmeasured signal (None) is never penalised.
+    CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 15, 12, 0, 0)
+
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that
     # ships CUDA 13.0. Before MIN_DRIVER_CUTOFF providers get a grace period (no penalty);
