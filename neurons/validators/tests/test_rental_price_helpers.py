@@ -1,5 +1,6 @@
 from core.config import settings
-from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
+from constants import TOTAL_BURN_EMISSION
+from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO
 
 
 BASE_JOB_SCORE = 1.0

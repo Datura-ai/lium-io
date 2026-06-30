@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from services.const import TOTAL_BURN_EMISSION
+from constants import TOTAL_BURN_EMISSION
 
 # Settings is instantiated during test collection through app imports. These
 # defaults keep unit tests self-contained without requiring a local validator env.

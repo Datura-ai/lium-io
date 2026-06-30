@@ -15,7 +15,8 @@ from incentive.rental_price import (
     RentalPriceSnapshot,
     precompute_all_estimates,
 )
-from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
+from constants import TOTAL_BURN_EMISSION
+from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO
 from services.task_service import JobResult
 
 pytest_plugins = ["fixtures.incentive_fixtures"]

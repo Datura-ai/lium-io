@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from services.const import TOTAL_BURN_EMISSION
+from constants import TOTAL_BURN_EMISSION
 
 BASE_JOB_SCORE = 1.0
 BURNER_COUNT = 2

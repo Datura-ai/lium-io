@@ -38,7 +38,7 @@ class BurnService:
         Args:
             miners: List of all miner neuron information
             burn_share: Dynamic burn emission share to distribute (e.g., 0.87 for default,
-                       or TOTAL_BURN_EMISSION - rental_share for rental price incentive)
+                       or total burn emission - rental_share for rental price incentive)
             last_mechanism_step_block: Block number for randomization (old logic only)
 
         Returns:

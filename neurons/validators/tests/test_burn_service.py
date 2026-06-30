@@ -1,7 +1,7 @@
 import pytest
 
+from constants import TOTAL_BURN_EMISSION
 from incentive.burn_service import BurnService
-from services.const import TOTAL_BURN_EMISSION
 
 pytest_plugins = ["fixtures.incentive_fixtures"]
 
