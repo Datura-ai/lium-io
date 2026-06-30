@@ -168,6 +168,9 @@ class Settings(BaseSettings):
     # SSH_DEBUG_LOGGING=false (env) to silence it without a deploy. Lives on the
     # main settings (not DebugSettings, which is local-dev only) so it is
     # configurable in staging/prod where the real slow connects happen.
+    # TODO(DAH-2272): flip default back to False once the slow-connect
+    # investigation is closed — debug-level handshake logging shouldn't ship on
+    # by default long-term.
     SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=True, description="Enable verbose asyncssh SSH handshake debug logging")
 
     # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
