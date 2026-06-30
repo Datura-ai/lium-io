@@ -109,13 +109,10 @@ BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy
 VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 
-# Emission split between the rented "mining" pool and the unrented + burn pool.
-# The LIVE value is sourced from shared config at runtime via
-# core.config.get_total_burn_emission() (DAH-2274) — the backend is the source of
-# truth. This constant is the validator's expected production value: it is what the
-# tests assert against and what the test harness serves (see tests/conftest.py).
-# (1 - TOTAL_BURN_EMISSION) is the rented mining pool.
-TOTAL_BURN_EMISSION = 0.87
+# Emission split between the rented "mining" pool and the unrented + burn pool is
+# sourced from shared config at runtime via core.config.get_total_burn_emission()
+# (DAH-2274) — the backend is the source of truth. The expected production value
+# used by the test suite lives in tests/constants.py.
 BURNER_EMISSION = 0.01
 
 # Rental Price Incentive Constants

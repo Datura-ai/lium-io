@@ -8,7 +8,8 @@ from incentive import rental_price as rental_price_module
 from incentive.config import DEFAULT_PRICE, IncentiveConfig
 from incentive.factory import IncentiveFactory
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
-from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO, TOTAL_BURN_EMISSION
+from constants import TOTAL_BURN_EMISSION
+from services.const import TEMPO, SECONDS_PER_BLOCK, FIXED_RATIO
 from tests.helpers import (
     assert_executor_has_log,
     assert_incentive_log_present,

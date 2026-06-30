@@ -134,8 +134,8 @@ class BaseIncentive(ABC):
 
         Returns:
             dict[str, float]: Weights with burning applied for each miner.
-                - Burners receive high scores (proportional to TOTAL_BURN_EMISSION)
-                - Regular miners receive low scores (proportional to 1 - TOTAL_BURN_EMISSION)
+                - Burners receive high scores (proportional to the burn emission share)
+                - Regular miners receive low scores (proportional to 1 - burn emission share)
                 These weights are accumulated across cycles in validator.miner_scores
         """
         pass
