@@ -232,7 +232,11 @@ RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 TDX_WHITELIST = {
     "OS_IMAGE_HASH": set(
         [
+            # dstack-nvidia 0.5.5 — upstream download.dstack.org build
             "9b69bb1698bacbb6985409a2c272bcb892e09cdcea63d5399c6768b67d3ff677",
+            # DAH-2311 — dstack-nvidia 0.5.5 rebuilt with NVIDIA driver 595.71.05
+            # (private-ml-sdk git_revision 0a1dcf7, prod/non-dev image)
+            "dbfde5432af2762da24d2ee3f39dcb7fdb676064fce1891edab3f6d924e8dc3d",
         ]
     ),
     "COMPOSE_HASH": { # compose file hash will be vary depending on the environment (depends on lium-watchtower)
