@@ -242,8 +242,6 @@ class PipelineFactory:
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
                 BannedGpuCheck(),
-                # DAH-2313: require sysbox before an unrented executor is allowed on the network.
-                SysboxRequiredCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
@@ -262,6 +260,10 @@ class PipelineFactory:
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
+                # DAH-2313: require sysbox before an unrented executor is allowed on the network.
+                # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
+                # the authoritative probe result used for scoring (not the earlier scrape hint).
+                SysboxRequiredCheck(),
                 InspectorRentedCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
@@ -306,13 +308,15 @@ class PipelineFactory:
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
                 BannedGpuCheck(),
-                # DAH-2313: require sysbox before an unrented executor is allowed on the network.
-                SysboxRequiredCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
                 PortConnectivityCheck(),
                 PortCountCheck(),
+                # DAH-2313: require sysbox before an unrented executor is allowed on the network.
+                # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
+                # the authoritative probe result used for scoring (not the earlier scrape hint).
+                SysboxRequiredCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
                 # VerifyXCheck(),
