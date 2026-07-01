@@ -9,11 +9,9 @@ import uuid
 from typing import cast
 
 import bittensor
+from clients.backend_client import BackendClient
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
-
-from clients.backend_client import BackendClient
-from core.config import settings
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
@@ -23,8 +21,10 @@ from services.inspector_validation_service import InspectorValidationService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.redis_service import RENTAL_SUCCEED_MACHINE_SET, RedisService
-from services.ssh_service import SSHService
 from services.verifyx_validation_service import VerifyXValidationService
+
+from core.config import settings
+from services.ssh_service import SSHService
 
 from .checks import (
     BannedGpuCheck,
@@ -50,6 +50,7 @@ from .checks import (
     SpecChangeCheck,
     StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
+    SysboxRequiredCheck,
     TdxHostCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
@@ -241,6 +242,8 @@ class PipelineFactory:
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
                 BannedGpuCheck(),
+                # DAH-2313: require sysbox before an unrented executor is allowed on the network.
+                SysboxRequiredCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
                 # Reap orphaned (non-rented) rental containers BEFORE the port checks.
@@ -303,6 +306,8 @@ class PipelineFactory:
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
                 BannedGpuCheck(),
+                # DAH-2313: require sysbox before an unrented executor is allowed on the network.
+                SysboxRequiredCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
                 # StaleContainerCleanupCheck(),  # SKIP: removes containers on the executor
