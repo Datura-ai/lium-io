@@ -11,8 +11,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 if TYPE_CHECKING:
     from bittensor import Wallet
 
-from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 from incentive.config import IncentiveConfig
+from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 
 
 class FeatureFlag(str, Enum):
@@ -129,6 +129,8 @@ class Settings(BaseSettings):
     PORTION_FOR_SYSBOX_UNRENTED: float = 1
     PORTION_FOR_SYSBOX_RENTED: float = 1
     SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
+    # DAH-2313: reject unrented executors without sysbox so they never appear on the network.
+    REQUIRE_SYSBOX_FOR_UNRENTED: bool = Field(env="REQUIRE_SYSBOX_FOR_UNRENTED", default=True)
     DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the

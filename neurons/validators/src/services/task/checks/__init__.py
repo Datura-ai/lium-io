@@ -22,6 +22,7 @@ from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
 from .stale_container_cleanup import StaleContainerCleanupCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
+from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
 from .verifyx import VerifyXCheck
@@ -51,6 +52,7 @@ __all__ = [
     "ScoreCheck",
     "StaleContainerCleanupCheck",
     "StartGPUMonitorCheck",
+    "SysboxRequiredCheck",
     "SpecChangeCheck",
     "UploadFilesCheck",
     "VerifyXCheck",

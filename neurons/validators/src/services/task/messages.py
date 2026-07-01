@@ -364,6 +364,31 @@ class BannedGpuMessages:
     )
 
 
+class SysboxRequiredMessages:
+    SYSBOX_MISSING = MessageTemplate(
+        event="Sysbox required for unrented executor",
+        reason="SYSBOX_REQUIRED_MISSING",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0; verification cleared; executor kept off the network",
+        remediation="Install the sysbox runtime; unrented machines without sysbox are not allowed on the network.",
+    )
+    SYSBOX_OK = MessageTemplate(
+        event="Sysbox requirement satisfied",
+        reason="SYSBOX_REQUIRED_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    DISABLED = MessageTemplate(
+        event="Sysbox requirement disabled",
+        reason="SYSBOX_REQUIRED_DISABLED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class DuplicateExecutorMessages:
     DUPLICATE = MessageTemplate(
         event="Duplicate executor registration",
