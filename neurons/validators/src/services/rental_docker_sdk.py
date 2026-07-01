@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket as socket_module
 import tempfile
 import threading
@@ -13,7 +14,9 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 
 DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
+_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
 _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 class RentalDockerConnectionError(RuntimeError):
@@ -167,12 +170,41 @@ class RentalDockerSdkClient:
             ) from exc
 
     async def exec_in_container(self, spec: ContainerExecSpec) -> ContainerExecResult:
-        try:
-            return await asyncio.to_thread(self._exec_in_container_sync, spec)
-        except Exception as exc:
-            raise RentalDockerOperationError(
-                _wrap_error_message("Docker SDK exec failed", exc)
-            ) from exc
+        last_restart_error: Exception | None = None
+        for attempt in range(len(_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                return await asyncio.to_thread(self._exec_in_container_sync, spec)
+            except Exception as exc:
+                if not _is_docker_container_restarting_error(exc):
+                    raise RentalDockerOperationError(
+                        _wrap_error_message("Docker SDK exec failed", exc)
+                    ) from exc
+
+                last_restart_error = exc
+                if attempt >= len(_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS):
+                    # Retry budget exhausted; preserve the last Docker restart
+                    # conflict below so callers get the original daemon detail.
+                    break
+
+                delay_seconds = _DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS[attempt]
+                logger.warning(
+                    "Docker SDK exec hit transient restarting container state; retrying",
+                    extra={
+                        "container_name": spec.container_name,
+                        "attempt": attempt + 1,
+                        "retry_delay_seconds": delay_seconds,
+                        "error": str(exc),
+                    },
+                )
+                await self._wait_for_container_exec_ready(
+                    spec.container_name,
+                    timeout_seconds=delay_seconds,
+                )
+
+        assert last_restart_error is not None
+        raise RentalDockerOperationError(
+            _wrap_error_message("Docker SDK exec failed", last_restart_error)
+        ) from last_restart_error
 
     async def start(self, *, container_name: str) -> None:
         await self._call_api(
@@ -250,6 +282,45 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError(
                 _wrap_error_message(f"Docker SDK {operation_label} failed", exc)
             ) from exc
+
+    async def _wait_for_container_exec_ready(
+        self,
+        container_name: str,
+        *,
+        timeout_seconds: int | float,
+    ) -> None:
+        if timeout_seconds <= 0:
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            if await asyncio.to_thread(
+                self._is_container_running_and_not_restarting,
+                container_name,
+            ):
+                return
+
+            remaining_seconds = deadline - loop.time()
+            if remaining_seconds <= 0:
+                return
+
+            await asyncio.sleep(min(0.5, remaining_seconds))
+
+    def _is_container_running_and_not_restarting(self, container_name: str) -> bool:
+        inspect_container = getattr(self._api_client, "inspect_container", None)
+        if inspect_container is None:
+            return False
+
+        try:
+            inspect_result = inspect_container(container_name)
+        except Exception:
+            return False
+
+        state = inspect_result.get("State") if isinstance(inspect_result, dict) else None
+        if not isinstance(state, dict):
+            return False
+        return bool(state.get("Running")) and not bool(state.get("Restarting"))
 
     def _run_container_sync(self, spec: ContainerRunSpec) -> None:
         host_config = self._api_client.create_host_config(
@@ -798,6 +869,19 @@ def _is_docker_not_found_error(exc: Exception) -> bool:
         return True
     response = getattr(exc, "response", None)
     return getattr(response, "status_code", None) == 404
+
+
+def _is_docker_container_restarting_error(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    message = str(exc).lower()
+    is_restart_conflict = (
+        "is restarting" in message
+        and "wait until the container is running" in message
+    )
+    if status_code is not None:
+        return status_code == 409 and is_restart_conflict
+    return "409" in message and "conflict" in message and is_restart_conflict
 
 
 def _build_docker_ssh_base_url(executor_info: ExecutorSSHInfo) -> str:

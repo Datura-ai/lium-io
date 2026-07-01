@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from docker.errors import APIError
 
+import services.rental_docker_sdk as rental_docker_sdk
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.rental_docker_sdk import (
     ContainerExecSpec,
@@ -46,6 +48,7 @@ class FakeApiClient:
         self.exec_created = []
         self.exec_started = []
         self.exec_inspected = []
+        self.containers_inspected = []
         self.pruned_images = False
         self.created_volumes = []
         self.removed_volumes = []
@@ -86,6 +89,10 @@ class FakeApiClient:
         self.exec_inspected.append(exec_id)
         return {"ExitCode": 0}
 
+    def inspect_container(self, container_name):
+        self.containers_inspected.append(container_name)
+        return {"State": {"Running": True, "Restarting": False}}
+
     def prune_images(self):
         self.pruned_images = True
         return {"ImagesDeleted": []}
@@ -99,6 +106,58 @@ class FakeApiClient:
 
     def close(self):
         self.closed = True
+
+
+def _container_restarting_error() -> APIError:
+    return APIError(
+        '409 Client Error for http+docker://ssh/v1.52/containers/pod_exec/exec: '
+        'Conflict ("Container abc123 is restarting, wait until the container is running")'
+    )
+
+
+def _other_conflict_error() -> APIError:
+    return APIError(
+        '409 Client Error for http+docker://ssh/v1.52/containers/pod_exec/exec: '
+        'Conflict ("container name is already in use")'
+    )
+
+
+class RestartingExecCreateApiClient(FakeApiClient):
+    def __init__(self):
+        super().__init__()
+        self.remaining_restarts = 1
+
+    def exec_create(self, **kwargs):
+        self.exec_created.append(kwargs)
+        if self.remaining_restarts:
+            self.remaining_restarts -= 1
+            raise _container_restarting_error()
+        return {"Id": "exec-id"}
+
+
+class RestartingExecStartApiClient(FakeApiClient):
+    def __init__(self):
+        super().__init__()
+        self.remaining_restarts = 1
+        self.next_exec_id = 0
+
+    def exec_create(self, **kwargs):
+        self.exec_created.append(kwargs)
+        self.next_exec_id += 1
+        return {"Id": f"exec-id-{self.next_exec_id}"}
+
+    def exec_start(self, exec_id, **kwargs):
+        self.exec_started.append((exec_id, kwargs))
+        if self.remaining_restarts:
+            self.remaining_restarts -= 1
+            raise _container_restarting_error()
+        return (b"stdout", b"stderr")
+
+
+class OtherConflictExecCreateApiClient(FakeApiClient):
+    def exec_create(self, **kwargs):
+        self.exec_created.append(kwargs)
+        raise _other_conflict_error()
 
 
 class SocketExecApiClient(FakeApiClient):
@@ -365,6 +424,128 @@ async def test_exec_in_container_with_stdin_demuxes_socket_stdout_and_stderr():
         }
     ]
     assert api_client.exec_started == [("exec-id", {"socket": True})]
+
+
+@pytest.mark.asyncio
+async def test_exec_in_container_retries_transient_container_restarting_on_exec_create(monkeypatch):
+    monkeypatch.setattr(
+        rental_docker_sdk,
+        "_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS",
+        (0,),
+    )
+    api_client = RestartingExecCreateApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    result = await client.exec_in_container(
+        ContainerExecSpec(
+            container_name="pod_exec",
+            argv=("sh", "-c", "cat /tmp/file"),
+        )
+    )
+
+    assert result.exit_status == 0
+    assert result.stdout == "stdout"
+    assert len(api_client.exec_created) == 2
+    assert api_client.exec_started == [("exec-id", {"demux": True})]
+
+
+@pytest.mark.asyncio
+async def test_exec_in_container_waits_for_container_ready_after_restart(monkeypatch):
+    monkeypatch.setattr(
+        rental_docker_sdk,
+        "_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS",
+        (5,),
+    )
+    api_client = RestartingExecCreateApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    result = await client.exec_in_container(
+        ContainerExecSpec(
+            container_name="pod_exec",
+            argv=("sh", "-c", "cat /tmp/file"),
+        )
+    )
+
+    assert result.exit_status == 0
+    assert api_client.containers_inspected == ["pod_exec"]
+    assert len(api_client.exec_created) == 2
+
+
+@pytest.mark.asyncio
+async def test_exec_in_container_retries_transient_container_restarting_on_exec_start(monkeypatch):
+    monkeypatch.setattr(
+        rental_docker_sdk,
+        "_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS",
+        (0,),
+    )
+    api_client = RestartingExecStartApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    result = await client.exec_in_container(
+        ContainerExecSpec(
+            container_name="pod_exec",
+            argv=("sh", "-c", "cat /tmp/file"),
+        )
+    )
+
+    assert result.exit_status == 0
+    assert result.stdout == "stdout"
+    assert len(api_client.exec_created) == 2
+    assert api_client.exec_started == [
+        ("exec-id-1", {"demux": True}),
+        ("exec-id-2", {"demux": True}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exec_in_container_keeps_original_restart_conflict_after_retry_budget(monkeypatch):
+    monkeypatch.setattr(
+        rental_docker_sdk,
+        "_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS",
+        (0, 0),
+    )
+    api_client = RestartingExecCreateApiClient()
+    api_client.remaining_restarts = 10
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(
+        RentalDockerOperationError,
+        match="Container abc123 is restarting, wait until the container is running",
+    ):
+        await client.exec_in_container(
+            ContainerExecSpec(
+                container_name="pod_exec",
+                argv=("sh", "-c", "cat /tmp/file"),
+            )
+        )
+
+    assert len(api_client.exec_created) == 3
+    assert api_client.exec_started == []
+
+
+@pytest.mark.asyncio
+async def test_exec_in_container_does_not_retry_other_conflicts(monkeypatch):
+    monkeypatch.setattr(
+        rental_docker_sdk,
+        "_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS",
+        (0, 0),
+    )
+    api_client = OtherConflictExecCreateApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(
+        RentalDockerOperationError,
+        match="container name is already in use",
+    ):
+        await client.exec_in_container(
+            ContainerExecSpec(
+                container_name="pod_exec",
+                argv=("sh", "-c", "cat /tmp/file"),
+            )
+        )
+
+    assert len(api_client.exec_created) == 1
+    assert api_client.containers_inspected == []
 
 
 def test_stdin_exec_spec_builders_keep_values_out_of_argv():
