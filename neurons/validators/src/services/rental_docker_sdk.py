@@ -15,7 +15,9 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 
 DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS = 3 * 60 * 60
-_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
+_DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
+_DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
+_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
 _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
@@ -110,6 +112,13 @@ class ContainerExecResult:
     stderr: str = ""
 
 
+@dataclass(slots=True)
+class _ContainerExecReadiness:
+    ready: bool
+    terminal: bool
+    detail: str
+
+
 class RentalDockerSdkClient:
     def __init__(
         self,
@@ -172,8 +181,13 @@ class RentalDockerSdkClient:
 
     async def exec_in_container(self, spec: ContainerExecSpec) -> ContainerExecResult:
         last_restart_error: Exception | None = None
-        for attempt in range(len(_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS) + 1):
+        for attempt in range(len(_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS) + 1):
             retry_result: ContainerExecResult | None = None
+            # A container can pass start/running checks while still moving through
+            # transient restart/runtime states where exec is rejected or runc cannot
+            # enter its namespaces/cgroups. Inspect first, then keep a narrow retry
+            # for the remaining inspect-vs-exec race.
+            await self._wait_for_container_exec_ready(spec.container_name)
             try:
                 result = await asyncio.to_thread(self._exec_in_container_sync, spec)
             except Exception as exc:
@@ -207,10 +221,8 @@ class RentalDockerSdkClient:
                 attempt=attempt + 1,
                 delay_seconds=delay_seconds,
             )
-            await self._wait_for_container_exec_ready(
-                spec.container_name,
-                timeout_seconds=delay_seconds,
-            )
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
 
         assert last_restart_error is not None
         raise RentalDockerOperationError(
@@ -298,40 +310,76 @@ class RentalDockerSdkClient:
         self,
         container_name: str,
         *,
-        timeout_seconds: int | float,
+        timeout_seconds: int | float | None = None,
     ) -> None:
-        if timeout_seconds <= 0:
-            return
+        if timeout_seconds is None:
+            timeout_seconds = _DOCKER_EXEC_READY_TIMEOUT_SECONDS
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
         while True:
-            if await asyncio.to_thread(
-                self._is_container_running_and_not_restarting,
+            readiness = await asyncio.to_thread(
+                self._inspect_container_exec_readiness,
                 container_name,
-            ):
+            )
+            if readiness.ready:
                 return
+            if readiness.terminal:
+                raise RentalDockerOperationError(
+                    f"Docker container is not ready for exec: {readiness.detail}"
+                )
 
             remaining_seconds = deadline - loop.time()
             if remaining_seconds <= 0:
-                return
+                raise RentalDockerOperationError(
+                    "Docker container did not become ready for exec "
+                    f"after {timeout_seconds} seconds: {readiness.detail}"
+                )
 
-            await asyncio.sleep(min(0.5, remaining_seconds))
+            await asyncio.sleep(
+                min(_DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS, remaining_seconds)
+            )
 
-    def _is_container_running_and_not_restarting(self, container_name: str) -> bool:
+    def _inspect_container_exec_readiness(
+        self,
+        container_name: str,
+    ) -> _ContainerExecReadiness:
         inspect_container = getattr(self._api_client, "inspect_container", None)
         if inspect_container is None:
-            return False
+            raise RentalDockerOperationError(
+                "Docker SDK inspect container is unavailable"
+            )
 
         try:
             inspect_result = inspect_container(container_name)
-        except Exception:
-            return False
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
 
         state = inspect_result.get("State") if isinstance(inspect_result, dict) else None
         if not isinstance(state, dict):
-            return False
-        return bool(state.get("Running")) and not bool(state.get("Restarting"))
+            return _ContainerExecReadiness(
+                ready=False,
+                terminal=False,
+                detail="Docker inspect did not include container State",
+            )
+
+        running = bool(state.get("Running"))
+        restarting = bool(state.get("Restarting"))
+        paused = bool(state.get("Paused"))
+        dead = bool(state.get("Dead"))
+        ready = running and not restarting and not paused and not dead
+        terminal = paused or dead or (
+            not running
+            and not restarting
+            and str(state.get("Status") or "").lower() != "created"
+        )
+        return _ContainerExecReadiness(
+            ready=ready,
+            terminal=terminal,
+            detail=_format_container_state_detail(state),
+        )
 
     def _run_container_sync(self, spec: ContainerRunSpec) -> None:
         host_config = self._api_client.create_host_config(
@@ -920,10 +968,23 @@ def _format_exec_result_failure(result: ContainerExecResult) -> str:
     )
 
 
+def _format_container_state_detail(state: dict) -> str:
+    fields = {
+        "status": state.get("Status"),
+        "running": state.get("Running"),
+        "restarting": state.get("Restarting"),
+        "paused": state.get("Paused"),
+        "dead": state.get("Dead"),
+        "exit_code": state.get("ExitCode"),
+        "error": state.get("Error"),
+    }
+    return " ".join(f"{key}={value!r}" for key, value in fields.items())
+
+
 def _retry_delay_for_exec_attempt(attempt: int) -> int | float | None:
-    if attempt >= len(_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS):
+    if attempt >= len(_DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS):
         return None
-    return _DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS[attempt]
+    return _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS[attempt]
 
 
 def _log_transient_exec_retry(
