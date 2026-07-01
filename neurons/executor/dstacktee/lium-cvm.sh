@@ -14,7 +14,9 @@ NC='\033[0m' # No Color
 
 # Configuration
 OS_IMAGE_NAME=${OS:-dstack-nvidia-0.5.5}
-OS_IMAGE_URL="https://download.dstack.org/os-images/$OS_IMAGE_NAME.tar.gz"
+# DAH-2311: serve the Lium-built image (NVIDIA driver 595.71.05) from the private-ml-sdk
+# release; override OS_IMAGE_URL to point elsewhere (e.g. staging mirror).
+OS_IMAGE_URL="${OS_IMAGE_URL:-https://github.com/Datura-ai/private-ml-sdk/releases/download/v0.5.5/$OS_IMAGE_NAME.tar.gz}"
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEY_PROVIDER_DIR="$THIS_DIR/key-provider"
 SCRIPTS_DIR="$THIS_DIR/scripts"
