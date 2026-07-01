@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 
@@ -172,34 +173,44 @@ class RentalDockerSdkClient:
     async def exec_in_container(self, spec: ContainerExecSpec) -> ContainerExecResult:
         last_restart_error: Exception | None = None
         for attempt in range(len(_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS) + 1):
+            retry_result: ContainerExecResult | None = None
             try:
-                return await asyncio.to_thread(self._exec_in_container_sync, spec)
+                result = await asyncio.to_thread(self._exec_in_container_sync, spec)
             except Exception as exc:
                 if not _is_docker_container_restarting_error(exc):
                     raise RentalDockerOperationError(
                         _wrap_error_message("Docker SDK exec failed", exc)
                     ) from exc
-
                 last_restart_error = exc
-                if attempt >= len(_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS):
-                    # Retry budget exhausted; preserve the last Docker restart
-                    # conflict below so callers get the original daemon detail.
-                    break
+                retry_reason = "container_restarting"
+                retry_error = str(exc)
+            else:
+                if not _is_transient_oci_exec_result(result):
+                    return result
+                retry_result = result
+                retry_reason = "oci_runtime_exec_transient"
+                retry_error = _format_exec_result_failure(result)
 
-                delay_seconds = _DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS[attempt]
-                logger.warning(
-                    "Docker SDK exec hit transient restarting container state; retrying",
-                    extra={
-                        "container_name": spec.container_name,
-                        "attempt": attempt + 1,
-                        "retry_delay_seconds": delay_seconds,
-                        "error": str(exc),
-                    },
-                )
-                await self._wait_for_container_exec_ready(
-                    spec.container_name,
-                    timeout_seconds=delay_seconds,
-                )
+            delay_seconds = _retry_delay_for_exec_attempt(attempt)
+            if delay_seconds is None:
+                # Nonzero exec results keep the existing caller behavior after
+                # retry budget is exhausted. Exception-based failures have no
+                # result, so preserve the original Docker daemon detail below.
+                if retry_result is not None:
+                    return retry_result
+                break
+
+            _log_transient_exec_retry(
+                spec=spec,
+                retry_reason=retry_reason,
+                retry_error=retry_error,
+                attempt=attempt + 1,
+                delay_seconds=delay_seconds,
+            )
+            await self._wait_for_container_exec_ready(
+                spec.container_name,
+                timeout_seconds=delay_seconds,
+            )
 
         assert last_restart_error is not None
         raise RentalDockerOperationError(
@@ -882,6 +893,61 @@ def _is_docker_container_restarting_error(exc: Exception) -> bool:
     if status_code is not None:
         return status_code == 409 and is_restart_conflict
     return "409" in message and "conflict" in message and is_restart_conflict
+
+
+def _is_transient_oci_exec_result(result: ContainerExecResult) -> bool:
+    if result.exit_status == 0:
+        return False
+
+    message = f"{result.stdout}\n{result.stderr}".lower()
+    if "oci runtime exec failed" not in message:
+        return False
+
+    return any(
+        transient_marker in message
+        for transient_marker in (
+            "executing setns process caused",
+            "cgroup.procs",
+            "init.scope (deleted)",
+        )
+    )
+
+
+def _format_exec_result_failure(result: ContainerExecResult) -> str:
+    return (
+        f"exit_status={result.exit_status}; "
+        f"stderr={result.stderr}; stdout={result.stdout}"
+    )
+
+
+def _retry_delay_for_exec_attempt(attempt: int) -> int | float | None:
+    if attempt >= len(_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS):
+        return None
+    return _DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS[attempt]
+
+
+def _log_transient_exec_retry(
+    *,
+    spec: ContainerExecSpec,
+    retry_reason: str,
+    retry_error: str,
+    attempt: int,
+    delay_seconds: int | float,
+) -> None:
+    logger.warning(
+        _m(
+            "Docker SDK exec hit transient container state; retrying",
+            extra=get_extra_info(
+                {
+                    "container_name": spec.container_name,
+                    "attempt": attempt,
+                    "retry_delay_seconds": delay_seconds,
+                    "retry_reason": retry_reason,
+                    "error": retry_error,
+                }
+            ),
+        )
+    )
 
 
 def _build_docker_ssh_base_url(executor_info: ExecutorSSHInfo) -> str:
