@@ -3188,6 +3188,32 @@ class DockerService:
 
                 # Get the container path from the first volume
                 local_volume_path = custom_options.volumes[0].split(':')[-1] if custom_options.volumes else '/root'
+                # DAH-2265: default-image / cached-template rentals set `ships_sshd`.
+                # Those images run their own start.sh, which starts sshd
+                # unconditionally and launches Jupyter when ENABLE_JUPYTER is set. So
+                # rather than have the validator bootstrap sshd and run run_jupyter
+                # post-create (see below), we let the image do it: forward
+                # ENABLE_JUPYTER (+ a validator-chosen token and the mapped port) as
+                # container env vars. These MUST be present at `docker run` time —
+                # start.sh (the image entrypoint) reads them once at container startup,
+                # so a post-create /etc/environment write would be too late. They are
+                # injected into custom_options.environment here so _build_rental_container_run_spec
+                # carries them into the run spec (create-time env), not the post-create
+                # add_environment_variables step.
+                image_managed_jupyter = bool(
+                    payload.ships_sshd and payload.enable_jupyter and jupyter_port_map
+                )
+                image_jupyter_token = (
+                    secrets.token_hex(16) if image_managed_jupyter else None
+                )
+                if image_managed_jupyter:
+                    custom_options.environment = {
+                        **(custom_options.environment or {}),
+                        "ENABLE_JUPYTER": "true",
+                        "JUPYTER_TOKEN": image_jupyter_token,
+                        "JUPYTER_PORT": str(jupyter_port_map[0]),
+                    }
+
                 container_name = self.get_container_name(payload)
                 created_local_volume = False
                 protected_volume_names = set(payload.active_volume_names or [])
@@ -3512,35 +3538,47 @@ class DockerService:
 
                     current_step = "ssh_bootstrap"
                     if payload.ships_sshd:
+                        # DAH-2265: the default image / cached template ships and
+                        # starts sshd itself (its start.sh runs `service ssh start`
+                        # unconditionally). Skip the validator's sshd bootstrap
+                        # entirely. The public-key injection above already created
+                        # ~/.ssh (mkdir -p /root/.ssh in the authorized_keys exec spec),
+                        # so the skip path needs nothing further here.
                         logger.info(
                             _m(
-                                "Running SSH bootstrap for template that ships sshd",
+                                "Skipping SSH-server bootstrap; template ships sshd",
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-                    ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
-                        docker_client=docker_client,
-                        container_name=container_name,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                    )
-                    if payload.ships_sshd and not ssh_bootstrap_ok:
-                        raise RuntimeError("SSH bootstrap failed")
+                    else:
+                        await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+                            docker_client=docker_client,
+                            container_name=container_name,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
 
                     jupyter_url = None
                     if payload.enable_jupyter and jupyter_port_map:
                         current_step = "jupyter_setup"
-                        jupyter_token = secrets.token_hex(16)
-                        await self.run_jupyter(
-                            ssh_client=ssh_client,
-                            container_name=container_name,
-                            jupyter_token=jupyter_token,
-                            jupyter_port=jupyter_port_map[0],
-                            log_tag=log_tag,
-                            log_extra=default_extra,
-                            local_volume=local_volume,
-                            local_volume_path=local_volume_path,
-                        )
+                        if image_managed_jupyter:
+                            # DAH-2265: the image's start.sh already launched Jupyter
+                            # from the ENABLE_JUPYTER / JUPYTER_TOKEN / JUPYTER_PORT env
+                            # vars forwarded at `docker run` above. Don't run
+                            # run_jupyter; just build the URL from the token we chose.
+                            jupyter_token = image_jupyter_token
+                        else:
+                            jupyter_token = secrets.token_hex(16)
+                            await self.run_jupyter(
+                                ssh_client=ssh_client,
+                                container_name=container_name,
+                                jupyter_token=jupyter_token,
+                                jupyter_port=jupyter_port_map[0],
+                                log_tag=log_tag,
+                                log_extra=default_extra,
+                                local_volume=local_volume,
+                                local_volume_path=local_volume_path,
+                            )
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
                     # Add profiler for ssh service installation (covers key

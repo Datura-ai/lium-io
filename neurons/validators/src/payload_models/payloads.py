@@ -272,18 +272,26 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" keeps the normal image-pull path.
     dockerfile_content: str | None = None
-    # DAH-1524 introduced this flag ("skip the bootstrap for cached templates");
-    # its semantics have since changed TWICE — do not trust older comments:
-    #   - 2345af85 reverted the skip: the sshd bootstrap ALWAYS runs, because a
-    #     renter's custom startup_commands replaces the image CMD, so the image
-    #     alone can never be trusted to bring sshd up.
-    #   - DAH-2341 made the bootstrap converge with a self-starting image
-    #     instead of racing it (grace-wait, adopt a running sshd, no keygen
-    #     when adopted; see sshd_bootstrap.sh header).
-    # Today ships_sshd=True (set by lium-io-backend for cached recommended
-    # images) means exactly one thing: a bootstrap failure is FATAL to the
-    # deploy (RuntimeError -> FailedContainerRequest). None/False keeps
-    # bootstrap failures lenient (logged, deploy continues).
+    # DAH-1524 / DAH-2265 (default-image / cached-template deploy): set truthy by the
+    # backend when the user selects the default Docker image or default cache template.
+    # Such images run their own start.sh, so the validator skips work the image already
+    # does:
+    #   * SSH: skip the ENTIRE post-creation sshd bootstrap
+    #     (install_open_ssh_server_and_start_ssh_service -> sshd_bootstrap.sh), which
+    #     otherwise provides FOUR guarantees, ALL surrendered when this flag is set —
+    #     the image ASSERTS it provides them itself:
+    #       (a) starts the sshd daemon                 (sshd_bootstrap.sh:110-117, main 166)
+    #       (b) generates host keys via `ssh-keygen -A` (sshd_bootstrap.sh:106)
+    #       (c) hardens config: PasswordAuthentication/KbdInteractive/ChallengeResponse no
+    #                                                  (sshd_bootstrap.sh:89-99)
+    #       (d) installs a 30s self-heal restart watchdog (sshd_bootstrap.sh:119-156)
+    #     The validator then only re-ensures ~/.ssh for key injection.
+    #   * Jupyter: skip the validator's run_jupyter path. Instead, when `enable_jupyter`
+    #     is also set, the validator forwards ENABLE_JUPYTER (+ a validator-chosen
+    #     JUPYTER_TOKEN and JUPYTER_PORT) as `docker run -e` env vars so the image's
+    #     start.sh launches Jupyter itself.
+    # None/False (default) preserves the always-bootstrap + run_jupyter behavior.
+    # Populated by lium-io-backend in a follow-up; ships inert here (no producer sets it yet).
     ships_sshd: bool | None = None
     # DAH-2356: per-GPU power caps for the Lium PEARL default-job (FILLER) container. Applied
     # host-side via `nvidia-smi -pl` (clamped to the GPU's live min/max) before the filler starts;

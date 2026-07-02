@@ -3,9 +3,12 @@
 Covers (from the plan's Test Plan):
 - Pull-skip (#1): skip when image present, pull when absent, fail-open on probe
   error, and `check=False` on the inspect probe.
-- SSH bootstrap (#2): run the idempotent bootstrap for every rental path,
-  including templates that set `ships_sshd`. Includes the DEFAULT-PATH
-  REGRESSION GUARD.
+- SSH bootstrap (#2): run the idempotent bootstrap for the default rental path
+  (`ships_sshd` None/False), and SKIP it for templates that set `ships_sshd`
+  (DAH-2265) — the image ships+starts sshd itself, so the validator only
+  re-ensures ~/.ssh for key injection. Includes the DEFAULT-PATH REGRESSION
+  GUARD. When `ships_sshd` is set with `enable_jupyter`, the validator forwards
+  ENABLE_JUPYTER as a docker-run env var instead of running run_jupyter.
 - Profile summary log (#3): emitted once on success, survives the mixed-shape
   profilers list, and NOT emitted on the failure path.
 - Backward compat: payloads omitting `ships_sshd` deserialize with None.
@@ -237,6 +240,12 @@ def _ssh_run_cmds(ssh_client):
     return [c.args[0] for c in ssh_client.run.await_args_list if c.args]
 
 
+def _created_run_spec(svc):
+    """The ContainerRunSpec handed to _run_rental_docker_create_with_port_retry
+    (carries the create-time `docker run` environment)."""
+    return svc._run_rental_docker_create_with_port_retry.await_args.kwargs["run_spec"]
+
+
 # ------------------------------------------------------------------
 # #1 — pull-skip
 # ------------------------------------------------------------------
@@ -300,27 +309,21 @@ async def test_inspect_probe_uses_sdk_data_not_host_shell(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ships_sshd_true_still_runs_bootstrap(svc, monkeypatch):
+async def test_ships_sshd_true_skips_bootstrap(svc, monkeypatch):
+    """DAH-2265: templates that ship sshd must NOT run the validator bootstrap.
+
+    The image's start.sh starts sshd itself; the validator only re-ensures
+    ~/.ssh so key injection can write authorized_keys.
+    """
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
 
     result = await _run(svc, _payload(ships_sshd=True))
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_ships_sshd_true_fails_create_when_bootstrap_fails(svc, monkeypatch):
-    ssh_client = _ssh_client(inspect_exit=0)
-    _patch_happy(svc, monkeypatch, ssh_client)
-    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.return_value = False
-
-    result = await _run(svc, _payload(ships_sshd=True))
-
-    assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "ssh_bootstrap"
-    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+    # The image ships & starts sshd itself, so the validator bootstrap is skipped.
+    # (~/.ssh is created by the authorized_keys injection that runs just before.)
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -369,7 +372,10 @@ async def test_ships_sshd_false_preserves_lenient_bootstrap_failure(svc, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_ships_sshd_true_with_jupyter(svc, monkeypatch):
+async def test_ships_sshd_true_forwards_jupyter_env_instead_of_run_jupyter(svc, monkeypatch):
+    """DAH-2265: ships_sshd + enable_jupyter → forward ENABLE_JUPYTER as a
+    docker-run env var and let the image launch Jupyter, rather than running
+    the validator's run_jupyter path."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
     # Provide a jupyter port map so the jupyter branch fires.
@@ -381,35 +387,56 @@ async def test_ships_sshd_true_with_jupyter(svc, monkeypatch):
     result = await _run(svc, _payload(ships_sshd=True, enable_jupyter=True))
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
-    svc.run_jupyter.assert_awaited_once()
+    # Neither the validator sshd bootstrap nor run_jupyter should run.
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_not_awaited()
+    svc.run_jupyter.assert_not_awaited()
+
+    # ENABLE_JUPYTER (+ token + port) is forwarded as create-time container env so
+    # the image's start.sh launches Jupyter itself (it reads them once at startup).
+    env = _created_run_spec(svc).environment
+    assert env.get("ENABLE_JUPYTER") == "true"
+    assert env.get("JUPYTER_PORT") == "8888"
+    token = env.get("JUPYTER_TOKEN")
+    assert token
+
+    # The returned URL uses the same token the validator forwarded to the image.
+    assert result.jupyter_url == f"http://127.0.0.1:30888/lab?token={token}"
 
 
 @pytest.mark.asyncio
-async def test_key_injection_runs_before_sshd_bootstrap(svc, monkeypatch):
-    """DAH-2341: keys are plain data (mkdir + append) with no dependency on a
-    running sshd, and the bootstrap may spend a grace period waiting for an
-    image-provided sshd — whichever sshd comes up first must already find the
-    customer's keys in place."""
+async def test_ships_sshd_none_with_jupyter_uses_run_jupyter(svc, monkeypatch):
+    """Regression guard: the default path (ships_sshd None) still runs the
+    validator's run_jupyter and does NOT forward ENABLE_JUPYTER."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-
-    exec_texts_at_bootstrap: list[str] = []
-
-    async def _snapshot_then_succeed(*args, **kwargs):
-        exec_texts_at_bootstrap.extend(
-            " ".join(spec.argv) for spec in _docker_client(svc).exec_specs
-        )
-        return True
-
-    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.side_effect = (
-        _snapshot_then_succeed
+    monkeypatch.setattr(
+        svc, "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], (8888, 30888))),
     )
+
+    result = await _run(svc, _payload(enable_jupyter=True))
+
+    assert isinstance(result, ContainerCreated)
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+    svc.run_jupyter.assert_awaited_once()
+    assert "ENABLE_JUPYTER" not in _created_run_spec(svc).environment
+
+
+@pytest.mark.asyncio
+async def test_key_injection_runs_when_template_ships_sshd(svc, monkeypatch):
+    """DAH-2265: even when the validator skips the sshd bootstrap (ships_sshd),
+    the customer's public keys are still injected so the image-started sshd finds
+    authorized_keys in place."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
 
     keys = ["ssh-ed25519 key-one", "ssh-ed25519 key-two"]
     result = await _run(svc, _payload(ships_sshd=True, user_public_keys=keys))
 
     assert isinstance(result, ContainerCreated)
+    # Bootstrap is skipped on the ships_sshd path...
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_not_awaited()
+    # ...but key injection (which also `mkdir -p /root/.ssh`) still ran exactly once.
     authorized = [
         spec
         for spec in _docker_client(svc).exec_specs
@@ -418,9 +445,6 @@ async def test_key_injection_runs_before_sshd_bootstrap(svc, monkeypatch):
     assert len(authorized) == 1
     assert "key-one" in authorized[0].stdin
     assert "key-two" in authorized[0].stdin
-    assert any("authorized_keys" in text for text in exec_texts_at_bootstrap), (
-        "public keys must already be injected when the sshd bootstrap starts"
-    )
 
 
 # ------------------------------------------------------------------
