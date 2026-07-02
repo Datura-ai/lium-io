@@ -93,13 +93,16 @@ class RentalVerificationCheck:
         container_port = verified_ports[0]
 
         try:
-            # Call backend API to verify executor health
+            # Call backend API to verify executor health. Pass the rental hint: when this validator
+            # already sees an active customer rental, the backend skips the container-creating check
+            # instead of disturbing the tenant (it still re-checks the DB itself when this is False).
             response = await backend_client.check_executor_health(
                 miner_address=ctx.miner_address,
                 miner_port=ctx.miner_port,
                 miner_hotkey=miner_hotkey,
                 container_port=container_port,
                 executor_id=executor.uuid,
+                rental_in_progress=has_customer_rental,
             )
 
             # Handle API failure (None response) - fail this executor
