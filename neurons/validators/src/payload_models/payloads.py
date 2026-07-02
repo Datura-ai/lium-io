@@ -3,7 +3,7 @@ from datetime import datetime
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import BaseModel, Field, field_validator, model_serializer
+from pydantic import BaseModel, field_validator, model_serializer
 
 
 class CustomOptions(BaseModel):
@@ -252,8 +252,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     external_volume_info: ExternalVolumeInfo | None = None
     is_sysbox: bool | None = None
     docker_username: str | None = None  # when edit pod, docker_username is required
-    # when edit pod, docker_password is required
-    docker_password: str | None = Field(default=None, repr=False)
+    docker_password: str | None = None  # when edit pod, docker_password is required
     timestamp: int | None = None
     backup_log_id: str | None = None
     restore_path: str | None = None
@@ -264,7 +263,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     active_volume_names: list[str] | None = None
     # DAH-2211 (custom-dockerfile pod): when present and non-empty the validator
     # builds the image from this Dockerfile on the executor host instead of pulling
-    # `docker_image`. None or "" keeps the normal image-pull path.
+    # `docker_image`. None or "" preserves the existing pull path byte-identically.
     dockerfile_content: str | None = None
     # DAH-1524 (cached-template deploy): when truthy, the validator skips the
     # ENTIRE post-creation sshd bootstrap (install_open_ssh_server_and_start_ssh_service
