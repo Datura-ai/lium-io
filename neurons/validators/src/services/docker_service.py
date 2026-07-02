@@ -50,6 +50,7 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.config import settings
+from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info, retry_ssh_command
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.const import (
@@ -113,6 +114,14 @@ DOCKER_VOLUME_PLUGINS = {
 _PORT_ALLOCATED_PHRASES = ("port is already allocated", "address already in use", "failed to bind host port")
 _PORT_ALLOCATED_RETRY_BUDGET_SEC = 90
 _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
+
+# DAH-2272: wall-clock time budgets for wait_for_port_check_containers, replacing
+# the old flat max_retries/retry_delay sleep loop so the worst case is bounded
+# and deterministic instead of absorbing 60-120s into "Started in subnet".
+# Public (not underscore-prefixed) because miner_service.py imports these.
+PORT_CHECK_POLL_INTERVAL_SEC = 1.5
+PORT_CHECK_EARLY_BUDGET_SEC = 18.0
+PORT_CHECK_LATE_BUDGET_SEC = 20.0
 _VLOOPBACK_MOUNT_ERROR_PHRASES = (
     "VolumeDriver.Mount",
     "cannot create mount point dir",
@@ -1060,8 +1069,9 @@ class DockerService:
         miner_hotkey: str,
         keypair: bittensor.Keypair,
         private_key: str,
-        max_retries: int = 2,
-        retry_delay: int = 60,
+        *,
+        budget_sec: float = PORT_CHECK_LATE_BUDGET_SEC,
+        poll_interval_sec: float = PORT_CHECK_POLL_INTERVAL_SEC,
         ssh_client: asyncssh.SSHClientConnection | None = None,
     ) -> tuple[bool, str]:
         """Wait for port check containers to finish before creating rental containers.
@@ -1077,6 +1087,13 @@ class DockerService:
         second connect — the late re-check inside ``create_container`` runs
         right before ``docker run`` and reuses the existing session.
 
+        DAH-2272: bounded by a wall-clock time budget (``time.monotonic()``
+        deadline) instead of a flat max_retries/retry_delay sleep loop, so the
+        worst case is deterministic and small instead of absorbing 60-120s
+        into "Started in subnet". Keyword-only params are deliberate: they
+        force every call site to surface via TypeError and get migrated
+        rather than silently keeping stale positional args.
+
         Args:
             executor_info: Executor SSH connection info (ignored when
                 ``ssh_client`` is provided).
@@ -1085,15 +1102,17 @@ class DockerService:
                 ``ssh_client`` is provided).
             private_key: Encrypted SSH private key (ignored when ``ssh_client``
                 is provided).
-            max_retries: Maximum number of times to check (default 2)
-            retry_delay: Seconds to wait between checks (default 60)
+            budget_sec: Wall-clock seconds to keep polling before force-removing
+                lingering containers (default PORT_CHECK_LATE_BUDGET_SEC).
+            poll_interval_sec: Seconds to sleep between polls (default
+                PORT_CHECK_POLL_INTERVAL_SEC).
             ssh_client: Optional pre-opened SSH session to reuse.
 
         Returns:
             Tuple of (success: bool, message: str)
             - (True, "No port check containers found") - Can proceed immediately
-            - (True, "Port check containers cleared after X attempts") - Waited and cleared
-            - (False, "Port check containers still exist after max retries") - Failed to clear
+            - (True, "Port check containers cleared after X.Xs") - Waited and cleared
+            - (True, "Port check containers forcefully removed after budget expiry") - Force-removed
         """
         container_prefix = f"container_{miner_hotkey}_"
         health_check_prefix = "health_check_"
@@ -1101,7 +1120,10 @@ class DockerService:
         health_check_filter = shlex.quote(f"name=^{health_check_prefix}")
 
         async def _run_checks(client: asyncssh.SSHClientConnection) -> tuple[bool, str]:
-            for attempt in range(max_retries + 1):
+            start = time.monotonic()
+            deadline = start + budget_sec
+            first_iteration = True
+            while True:
                 # docker ps OR-s multiple --filter name= flags
                 command = (
                     '/usr/bin/docker ps --format "{{.Names}}" '
@@ -1111,25 +1133,63 @@ class DockerService:
                 result = await client.run(command)
 
                 if not result.stdout or not result.stdout.strip():
-                    if attempt == 0:
+                    elapsed = time.monotonic() - start
+                    logger.info(
+                        _m(
+                            "port_check_wait_cleared",
+                            extra=get_extra_info({
+                                "miner_hotkey": miner_hotkey,
+                                "context": "wait_for_port_check_containers",
+                                "wait_ms": int(elapsed * 1000),
+                                "budget_sec": budget_sec,
+                            }),
+                        )
+                    )
+                    if first_iteration:
                         return True, "No port check containers found"
-                    else:
-                        return True, f"Port check containers cleared after {attempt} attempt(s)"
+                    return True, f"Port check containers cleared after {elapsed:.1f}s"
 
-                # Found port check containers
+                # Found port check containers still present.
                 container_names = result.stdout.strip()
 
-                if attempt < max_retries:
-                    logger.info(
-                        f"Port check containers exist ({container_names}), "
-                        f"waiting {retry_delay}s (attempt {attempt + 1}/{max_retries + 1})"
-                    )
-                    await asyncio.sleep(retry_delay)
-                else:
-                    # Max retries reached, containers still exist - force cleanup
+                if time.monotonic() >= deadline:
+                    # Budget exhausted — force-remove. Filter UNCHANGED (MOD #1):
+                    # targets BOTH container_{hotkey}_* AND health_check_* exactly
+                    # as before; do NOT narrow this to hotkey-only (see DAH-2272 ADR).
+                    names = [n for n in container_names.strip().split("\n") if n]
+
+                    container_ages_sec: dict[str, int | None] = {}
+                    for name in names:
+                        try:
+                            created = await client.run(DockerCommand.inspect_created_timestamp(name))
+                            if created.exit_status == 0 and created.stdout.strip():
+                                # Advisory telemetry only (feeds a future,
+                                # human-reviewed PR-2 filter-narrowing decision) —
+                                # deliberately use the validator's LOCAL clock
+                                # instead of a second SSH round-trip to the
+                                # remote host's clock, to avoid doubling the
+                                # SSH cost per lingering container. Clock skew
+                                # is an accepted tradeoff for this field.
+                                container_ages_sec[name] = int(
+                                    time.time() - int(created.stdout.strip())
+                                )
+                            else:
+                                container_ages_sec[name] = None
+                        except Exception:
+                            container_ages_sec[name] = None
+
                     logger.warning(
-                        f"Port check containers still running after {max_retries} retries, "
-                        f"forcing cleanup: {container_names}"
+                        _m(
+                            "port_check_wait_force_removed",
+                            extra=get_extra_info({
+                                "miner_hotkey": miner_hotkey,
+                                "context": "wait_for_port_check_containers",
+                                "budget_sec": budget_sec,
+                                "elapsed_sec": time.monotonic() - start,
+                                "container_names": names,
+                                "container_age_sec": container_ages_sec,
+                            }),
+                        )
                     )
 
                     # Force remove containers matching either prefix.
@@ -1142,10 +1202,10 @@ class DockerService:
                     await client.run(remove_cmd)
 
                     logger.info("Forced removal of stale port check containers completed")
-                    return True, f"Port check containers forcefully removed after {max_retries} retries"
+                    return True, "Port check containers forcefully removed after budget expiry"
 
-            # Should never reach here, but just in case
-            return False, "Unexpected error in wait_for_port_check_containers"
+                first_iteration = False
+                await asyncio.sleep(poll_interval_sec)
 
         if ssh_client is not None:
             try:
@@ -3208,8 +3268,8 @@ class DockerService:
                     miner_hotkey=payload.miner_hotkey,
                     keypair=keypair,
                     private_key=private_key,
-                    max_retries=1,
-                    retry_delay=30,
+                    budget_sec=PORT_CHECK_LATE_BUDGET_SEC,
+                    poll_interval_sec=PORT_CHECK_POLL_INTERVAL_SEC,
                     ssh_client=ssh_client,
                 )
                 logger.info(
