@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 from docker.errors import APIError
+from docker.types import ContainerConfig
 
 import services.rental_docker_sdk as rental_docker_sdk
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -448,6 +449,39 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
     assert api_client.host_config_kwargs["mem_limit"] == "8g"
     assert api_client.host_config_kwargs["storage_opt"] == {"size": "20g"}
     assert api_client.started == ["pod_test"]
+
+
+@pytest.mark.asyncio
+async def test_run_container_exposes_ports_without_duplicate_protocol_suffix():
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    await client.run_container(
+        ContainerRunSpec(
+            image="registry.example/app:tag",
+            name="pod_test",
+            ports=(
+                PortBinding(container_port=22, host_port=30022),
+                PortBinding(container_port=40000, host_port=30040),
+            ),
+        )
+    )
+
+    container_config = ContainerConfig(
+        version="1.52",
+        image=api_client.created_container["image"],
+        command=api_client.created_container["command"],
+        ports=api_client.created_container["ports"],
+    )
+
+    assert container_config["ExposedPorts"] == {
+        "22/tcp": {},
+        "40000/tcp": {},
+    }
+    assert api_client.host_config_kwargs["port_bindings"] == {
+        "22/tcp": 30022,
+        "40000/tcp": 30040,
+    }
 
 
 @pytest.mark.asyncio
