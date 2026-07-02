@@ -1158,25 +1158,47 @@ class DockerService:
                     # as before; do NOT narrow this to hotkey-only (see DAH-2272 ADR).
                     names = [n for n in container_names.strip().split("\n") if n]
 
-                    container_ages_sec: dict[str, int | None] = {}
-                    for name in names:
-                        try:
-                            created = await client.run(DockerCommand.inspect_created_timestamp(name))
+                    # Advisory telemetry only (feeds a future, human-reviewed
+                    # PR-2 filter-narrowing decision) — deliberately use the
+                    # validator's LOCAL clock instead of a second SSH
+                    # round-trip to the remote host's clock, to avoid doubling
+                    # the SSH cost per lingering container. Clock skew is an
+                    # accepted tradeoff for this field; the result is clamped
+                    # to 0 as a floor so skew can't produce a confusing
+                    # negative value.
+                    #
+                    # Fan the per-container `docker inspect` calls out
+                    # CONCURRENTLY (rather than serially) so this stays
+                    # bounded on the rental-creation hot path even when
+                    # several containers are lingering, and cap the whole
+                    # fan-out with an outer timeout so a hung remote inspect
+                    # can't stall the force-remove path indefinitely.
+                    container_ages_sec: dict[str, int | None] = dict.fromkeys(names)
+                    try:
+                        inspect_results = await asyncio.wait_for(
+                            asyncio.gather(
+                                *[
+                                    client.run(DockerCommand.inspect_created_timestamp(name))
+                                    for name in names
+                                ],
+                                return_exceptions=True,
+                            ),
+                            timeout=5,
+                        )
+                        for name, created in zip(names, inspect_results, strict=True):
+                            if isinstance(created, BaseException):
+                                container_ages_sec[name] = None
+                                continue
                             if created.exit_status == 0 and created.stdout.strip():
-                                # Advisory telemetry only (feeds a future,
-                                # human-reviewed PR-2 filter-narrowing decision) —
-                                # deliberately use the validator's LOCAL clock
-                                # instead of a second SSH round-trip to the
-                                # remote host's clock, to avoid doubling the
-                                # SSH cost per lingering container. Clock skew
-                                # is an accepted tradeoff for this field.
-                                container_ages_sec[name] = int(
-                                    time.time() - int(created.stdout.strip())
+                                container_ages_sec[name] = max(
+                                    0, int(time.time() - int(created.stdout.strip()))
                                 )
                             else:
                                 container_ages_sec[name] = None
-                        except Exception:
-                            container_ages_sec[name] = None
+                    except TimeoutError:
+                        # Outer cap fired — whichever containers didn't get a
+                        # response in time stay None rather than blocking.
+                        pass
 
                     logger.warning(
                         _m(
@@ -3280,7 +3302,7 @@ class DockerService:
                 )
 
                 # DAH-1524: the pre-run wait can block on live backend health_check_*
-                # probes (up to retry_delay); keep it out of the docker-run measurement.
+                # probes (up to budget_sec); keep it out of the docker-run measurement.
                 profilers.append(ProfilerStep.since(ProfilerStepName.PORT_CHECK_WAIT, prev_timestamp))
                 prev_timestamp = now_ms()
 

@@ -3659,14 +3659,12 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
     detect the lingering health_check_* container and force-remove it
     before the rental's docker run.
     """
-    calls = {"n": 0}
 
     class FakeSSHClient:
         seen: list[str] = []
 
         async def run(self_inner, cmd):
             FakeSSHClient.seen.append(cmd)
-            calls["n"] += 1
             # Every docker ps reports an HC still alive (so the loop polls
             # once, then the deadline trips and it force-cleans).
             if "docker ps --format" in cmd:
@@ -3877,6 +3875,105 @@ async def test_wait_for_port_check_force_remove_emits_container_age_sec(docker_s
     age = container_age_sec.get("health_check_1777635787")
     assert isinstance(age, int), f"expected numeric container_age_sec, got: {age}"
     assert age == 5000
+
+
+@pytest.mark.asyncio
+async def test_wait_for_port_check_force_remove_ages_fetched_concurrently(docker_service):
+    """With 2+ lingering containers, each `docker inspect` is issued
+    concurrently (not serially) and each container gets its own
+    container_age_sec — or None if its inspect call fails."""
+
+    names = [
+        "health_check_1777635787",
+        "container_5TestMiner_9101",
+        "container_5TestMiner_9102",
+    ]
+
+    class FakeSSHClient:
+        seen: list[str] = []
+        inspect_calls: list[str] = []
+
+        async def run(self_inner, cmd):
+            FakeSSHClient.seen.append(cmd)
+            if "docker ps --format" in cmd:
+                return MagicMock(stdout="\n".join(names) + "\n", stderr="", exit_status=0)
+            if "docker inspect" in cmd:
+                FakeSSHClient.inspect_calls.append(cmd)
+                # First two containers resolve to distinct ages; the third
+                # fails (non-zero exit) so it must fall back to None without
+                # blocking the other two.
+                if names[0] in cmd:
+                    return MagicMock(stdout="1000000000\n", stderr="", exit_status=0)
+                if names[1] in cmd:
+                    return MagicMock(stdout="1000002000\n", stderr="", exit_status=0)
+                return MagicMock(stdout="", stderr="", exit_status=1)
+            # The xargs force-rm command.
+            return MagicMock(stdout="", stderr="", exit_status=0)
+
+    async def instant_sleep(_):
+        return None
+
+    import services.docker_service as svc_mod
+    real_sleep = svc_mod.asyncio.sleep
+    real_monotonic = svc_mod.time.monotonic
+    real_time = svc_mod.time.time
+
+    monotonic_calls = {"n": 0}
+    start = 2_000_000.0
+
+    def fake_monotonic():
+        monotonic_calls["n"] += 1
+        if monotonic_calls["n"] == 1:
+            return start
+        return start + 1000.0
+
+    svc_mod.asyncio.sleep = instant_sleep
+    svc_mod.time.monotonic = fake_monotonic
+    svc_mod.time.time = lambda: 1000005000.0
+
+    caplog_records = []
+    import logging as _logging
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            caplog_records.append(record)
+
+    handler = _Capture()
+    svc_mod.logger.addHandler(handler)
+    try:
+        ok, msg = await docker_service.wait_for_port_check_containers(
+            executor_info=MagicMock(),
+            miner_hotkey="5TestMiner",
+            keypair=MagicMock(),
+            private_key="ignored",
+            budget_sec=20.0,
+            poll_interval_sec=1.5,
+            ssh_client=FakeSSHClient(),
+        )
+    finally:
+        svc_mod.asyncio.sleep = real_sleep
+        svc_mod.time.monotonic = real_monotonic
+        svc_mod.time.time = real_time
+        svc_mod.logger.removeHandler(handler)
+
+    assert ok is True
+    assert "forcefully removed" in msg
+    # One inspect round-trip issued for each of the 3 lingering containers.
+    assert len(FakeSSHClient.inspect_calls) == 3
+
+    force_remove_events = [
+        r for r in caplog_records if "port_check_wait_force_removed" in r.getMessage()
+    ]
+    assert force_remove_events, "expected a port_check_wait_force_removed log event"
+    extra = force_remove_events[0].msg.extra
+    container_age_sec = extra.get("container_age_sec")
+    assert container_age_sec is not None, f"container_age_sec missing from log extra: {extra}"
+
+    # Each container gets its own independently-computed age.
+    assert container_age_sec[names[0]] == 5000
+    assert container_age_sec[names[1]] == 3000
+    # The failed inspect must not block the other two — falls back to None.
+    assert container_age_sec[names[2]] is None
 
 
 @pytest.mark.asyncio

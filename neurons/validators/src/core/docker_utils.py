@@ -1,3 +1,5 @@
+import shlex
+
 from services.const import DOCKER_DIND_IMAGE
 
 
@@ -75,7 +77,7 @@ class DockerCommand:
     def inspect_created_timestamp(container_id: str) -> str:
         """Build docker inspect command to get creation timestamp in seconds."""
         return (
-            f"/usr/bin/docker inspect {container_id} "
+            f"/usr/bin/docker inspect {shlex.quote(container_id)} "
             "--format '{{json .Created}}' | "
             "xargs -I {} date -d {} +%s"
         )
