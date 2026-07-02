@@ -1,13 +1,15 @@
-"""DAH-2272: early-caller port-check behavior in MinerService._handle_container.
+"""DAH-2272: MinerService._handle_container create-request path.
 
 No existing test drove MinerService._handle_container before this; the harness
-below mocks every boundary MinerService._handle_container crosses (bittensor
-wallet, REST submit, redis renting_in_progress, ssh decrypt) so the
-`wait_for_port_check_containers` call at miner_service.py:~1749 actually
-executes. DAH-2272 removed the wait/poll loop (the rental now force-removes any
-lingering probe immediately), so these tests pin the surrounding control flow
-rather than a timing event: on success the create proceeds; if the step ever
-reports failure the container request fails cleanly without attempting a create.
+below mocks every boundary it crosses (bittensor wallet, REST submit, redis
+renting_in_progress, ssh decrypt) so the create branch actually executes.
+
+DAH-2272 removed the pre-flag port-check force-remove that used to live here —
+probe removal now happens entirely inside create_container, AFTER the
+pending-pod flag is set, so a probe the rental kills is covered by
+PortConnectivityCheck's renting_in_progress tolerate. This test therefore pins
+that a ContainerCreateRequest is delegated to create_container and that
+miner_service no longer makes an early wait_for_port_check_containers call.
 """
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -18,7 +20,6 @@ from datura.requests.miner_requests import AcceptSSHKeyRequest, ExecutorSSHInfo
 from payload_models.payloads import (
     ContainerCreateRequest,
     CustomOptions,
-    FailedContainerRequest,
     PayloadPortMapping,
 )
 from services.miner_service import MinerService
@@ -80,8 +81,7 @@ def miner_service(mocker):
 
 def _wire_common_mocks(mocker, miner_service, executor_id: str):
     """Patch every boundary between MinerService._handle_container's entry and
-    the wait_for_port_check_containers call, so only that call's outcome varies
-    between the success and failure test cases."""
+    the create_container call, so the create branch is reached deterministically."""
     my_key = Mock(ss58_address="validator-hotkey")
     my_key.sign.return_value = b"\x01\x02\x03"
     my_key.get_hotkey = Mock(return_value=my_key)
@@ -106,8 +106,10 @@ def _wire_common_mocks(mocker, miner_service, executor_id: str):
 
 
 @pytest.mark.asyncio
-async def test_early_call_site_proceeds_on_success(mocker, miner_service):
-    """When the port-check force-remove reports success, container creation proceeds."""
+async def test_create_request_delegates_to_create_container(mocker, miner_service):
+    """A ContainerCreateRequest is delegated to create_container, and
+    miner_service itself no longer calls wait_for_port_check_containers
+    (removal moved into create_container, after the pending-pod flag)."""
     executor_id = str(uuid4())
     payload = _make_create_payload(executor_id)
     _wire_common_mocks(mocker, miner_service, executor_id)
@@ -123,29 +125,8 @@ async def test_early_call_site_proceeds_on_success(mocker, miner_service):
 
     await miner_service._handle_container(payload)
 
-    wait_mock.assert_awaited_once()
     create_mock.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_early_call_site_fails_container_when_step_reports_failure(mocker, miner_service):
-    """Defensive: if the port-check step ever reports failure, the container
-    request fails cleanly and no create is attempted. (Post-DAH-2272 the step
-    always succeeds, so this pins the guard, not a live code path.)"""
-    executor_id = str(uuid4())
-    payload = _make_create_payload(executor_id)
-    _wire_common_mocks(mocker, miner_service, executor_id)
-
-    mocker.patch(
-        "services.miner_service.DockerService.wait_for_port_check_containers",
-        AsyncMock(return_value=(False, "Port check containers still present")),
-    )
-    create_mock = mocker.patch(
-        "services.miner_service.DockerService.create_container",
-        AsyncMock(return_value=Mock()),
-    )
-
-    result = await miner_service._handle_container(payload)
-
-    assert isinstance(result, FailedContainerRequest)
-    create_mock.assert_not_awaited()
+    # First positional arg to create_container is the create payload.
+    assert create_mock.call_args.args[0] is payload
+    # No pre-flag port-check removal in miner_service anymore.
+    wait_mock.assert_not_awaited()
