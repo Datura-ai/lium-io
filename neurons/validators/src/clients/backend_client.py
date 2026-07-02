@@ -244,6 +244,7 @@ class BackendClient:
         miner_hotkey: str,
         container_port: int,
         executor_id: str | None = None,
+        rental_in_progress: bool = False,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -253,6 +254,9 @@ class BackendClient:
             miner_hotkey: Miner hotkey (SS58 address)
             container_port: Container port to check
             executor_id: Executor ID (optional)
+            rental_in_progress: True if this validator already sees an active customer rental for the
+                executor. Lets the backend skip the container-creating check immediately; the backend
+                still re-checks the DB itself when this is False.
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -265,6 +269,7 @@ class BackendClient:
             "miner_port": miner_port,
             "miner_hotkey": miner_hotkey,
             "container_port": container_port,
+            "rental_in_progress": rental_in_progress,
         }
 
         if executor_id:

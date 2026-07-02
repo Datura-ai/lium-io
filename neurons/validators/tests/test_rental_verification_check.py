@@ -5,7 +5,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     ExecutorHealthCheckResponse,
 )
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
@@ -25,6 +25,7 @@ class DummyBackendClient:
         miner_hotkey: str,
         container_port: int,
         executor_id: str | None = None,
+        rental_in_progress: bool = False,
     ):
         self.called_with = {
             "miner_address": miner_address,
@@ -32,6 +33,7 @@ class DummyBackendClient:
             "miner_hotkey": miner_hotkey,
             "container_port": container_port,
             "executor_id": executor_id,
+            "rental_in_progress": rental_in_progress,
         }
         return self.response
 
@@ -129,6 +131,7 @@ async def test_rental_verification_success():
         "miner_hotkey": "miner-hotkey",
         "container_port": 8080,  # First verified port
         "executor_id": "executor-123",
+        "rental_in_progress": False,  # no customer rental in this state
     }
 
 
@@ -426,3 +429,58 @@ async def test_rental_verification_skips_filler_only_executor():
     assert result.passed is True
     assert result.event.reason_code == Msg.SKIPPED.reason
     assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_sends_flag_when_customer_rental():
+    """When this validator already sees a customer rental, it flags the backend to skip the check."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={"skipped": True})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(
+        specs={"verified_ports": [8080]},
+        rented_data=RentedExecutorsResponse(
+            executors={
+                "executor-123": RentedExecutor(
+                    miner_hotkey="miner-hotkey",
+                    executor_ip_address="127.0.0.1",
+                    executor_ip_port="8000",
+                    pods=[RentedPod(pod_id="pod-1", container_name="c1")],
+                )
+            }
+        ),
+    )
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert backend_client.called_with is not None
+    assert backend_client.called_with["rental_in_progress"] is True
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_flag_false_when_no_customer_rental():
+    """No customer rental → the flag is False and the backend still runs its own DB check."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert backend_client.called_with["rental_in_progress"] is False
