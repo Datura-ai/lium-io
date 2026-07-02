@@ -35,6 +35,7 @@ from payload_models.payloads import (
     PayloadPortMapping,
 )
 from services.docker_service import DockerService
+from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
 
 # ------------------------------------------------------------------
 # Shared fixtures / helpers
@@ -60,7 +61,81 @@ async def svc(deps):
         ssh_service=ssh_service,
         redis_service=redis_service,
         attestation_service=attestation_service,
+        rental_docker_client_factory=_FakeRentalDockerFactory(),
     )
+
+
+class _FakeRentalDockerClient:
+    def __init__(self):
+        self.login_calls = []
+        self.pulled_images = []
+        self.run_specs = []
+        self.exec_specs = []
+        self.created_volumes = []
+        self.removed_volumes = []
+        self.pruned_images = 0
+        self.pull_error = None
+        self.run_error = None
+
+    async def login(self, *, username: str, password: str) -> None:
+        self.login_calls.append({"username": username, "password": password})
+
+    async def pull(self, *, image: str) -> None:
+        self.pulled_images.append(image)
+        if self.pull_error is not None:
+            raise self.pull_error
+
+    async def run_container(self, spec) -> None:
+        self.run_specs.append(spec)
+        if self.run_error is not None:
+            raise self.run_error
+
+    async def exec_in_container(self, spec) -> ContainerExecResult:
+        self.exec_specs.append(spec)
+        return ContainerExecResult(exit_status=0)
+
+    async def create_volume(
+        self,
+        *,
+        volume_name: str,
+        driver: str | None = None,
+        driver_opts: dict[str, str] | None = None,
+        timeout: int | None = None,
+    ) -> None:
+        self.created_volumes.append(
+            {
+                "volume_name": volume_name,
+                "driver": driver,
+                "driver_opts": driver_opts,
+                "timeout": timeout,
+            }
+        )
+
+    async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
+        self.removed_volumes.append(
+            {"volume_name": volume_name, "force": force}
+        )
+
+    async def prune_images(self) -> None:
+        self.pruned_images += 1
+
+
+class _FakeRentalDockerFactory:
+    def __init__(self):
+        self.client = _FakeRentalDockerClient()
+        self.connect_calls = []
+
+    def connect(self, *, executor_info: ExecutorSSHInfo, private_key: str):
+        self.connect_calls.append(
+            {"executor_info": executor_info, "private_key": private_key}
+        )
+        return self
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return None
 
 
 class _ConnCtx:
@@ -168,6 +243,7 @@ def _executor_info_for(payload: ContainerCreateRequest) -> ExecutorSSHInfo:
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
     )
 
 
@@ -179,7 +255,10 @@ def _patch_create_container_happy(svc, monkeypatch, ssh_client):
         Mock(return_value=_ConnCtx(ssh_client)),
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
     svc.ssh_service.decrypt_payload = Mock(return_value="private-key")
     svc.redis_service.add_pending_pod = AsyncMock()
     svc.redis_service.remove_pending_pod = AsyncMock()
@@ -196,9 +275,12 @@ def _patch_create_container_happy(svc, monkeypatch, ssh_client):
         svc, "wait_for_port_check_containers",
         AsyncMock(return_value=(True, "ok")),
     )
-    monkeypatch.setattr(svc, "_run_docker_create_with_port_retry", AsyncMock())
     monkeypatch.setattr(svc, "check_container_running", AsyncMock(return_value=True))
-    monkeypatch.setattr(svc, "install_open_ssh_server_and_start_ssh_service", AsyncMock())
+    monkeypatch.setattr(
+        svc,
+        "install_open_ssh_server_and_start_ssh_service_with_rental_docker",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
     monkeypatch.setattr(svc, "finish_stream_logs", AsyncMock())
     monkeypatch.setattr(svc, "handle_stream_logs", AsyncMock())
@@ -335,17 +417,13 @@ async def test_A2_build_success_overrides_docker_image_tag(svc, monkeypatch):
     # docker_image was replaced with lium-build-{pod_id}
     assert payload.docker_image == f"lium-build-{payload.pod_id}"
 
-    # The docker run command (captured via _run_docker_create_with_port_retry)
-    # must reference the built tag.
-    run_call = svc._run_docker_create_with_port_retry.await_args
-    assert run_call is not None
-    cmd = run_call.kwargs.get("command", "")
-    assert f"lium-build-{payload.pod_id}" in cmd
+    run_spec = svc.rental_docker_client_factory.client.run_specs[-1]
+    assert run_spec.image == f"lium-build-{payload.pod_id}"
 
 
 @pytest.mark.asyncio
 async def test_A2_image_pull_path_unchanged_when_dockerfile_none(svc, monkeypatch):
-    """Default branch is byte-identical: pull command emitted, no build helper invoked."""
+    """Default branch still pulls the requested image and skips custom build."""
     ssh_client = AsyncMock()
 
     # DAH-1524: the pull is now guarded by a `docker image inspect` probe. Make
@@ -362,11 +440,7 @@ async def test_A2_image_pull_path_unchanged_when_dockerfile_none(svc, monkeypatc
     build_mock = AsyncMock(return_value=(True, None))
     monkeypatch.setattr(svc, "_custom_build_image", build_mock)
 
-    captured_cmds: list[str] = []
-    async def _capture_exec(**kwargs):
-        captured_cmds.append(kwargs.get("command", ""))
-        return (True, "")
-    monkeypatch.setattr(svc, "execute_and_stream_logs", _capture_exec)
+    monkeypatch.setattr(svc, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
 
     payload = _base_payload(dockerfile_content=None, docker_image="daturaai/pytorch:1.2.3")
     await svc.create_container(
@@ -377,7 +451,9 @@ async def test_A2_image_pull_path_unchanged_when_dockerfile_none(svc, monkeypatc
     )
 
     build_mock.assert_not_awaited()
-    assert any("/usr/bin/docker pull daturaai/pytorch:1.2.3" in c for c in captured_cmds), captured_cmds
+    assert svc.rental_docker_client_factory.client.pulled_images == [
+        "daturaai/pytorch:1.2.3"
+    ]
 
 
 # ------------------------------------------------------------------

@@ -39,6 +39,8 @@ from collections.abc import Sequence
 
 import asyncssh
 
+from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
+
 logger = logging.getLogger(__name__)
 
 _PROC_GPU_INFO_CMD = (
@@ -73,6 +75,18 @@ async def build_gpu_flags(
     at WARNING). The pod will still be created in the legacy path; it just
     won't survive `systemctl daemon-reload` on the executor host.
     """
+    gpu_config = await build_gpu_docker_config_for_executor(ssh_client, gpu_uuids)
+    device_flags = _device_flags(
+        tuple(device.path_on_host for device in gpu_config.device_mounts)
+    )
+    return " ".join(flag for flag in (_gpus_flag(gpu_uuids), device_flags) if flag)
+
+
+async def build_gpu_docker_config_for_executor(
+    ssh_client: asyncssh.SSHClientConnection,
+    gpu_uuids: Sequence[str] | None,
+) -> GpuDockerConfig:
+    """Resolve structured GPU Docker options for SDK container creation."""
     try:
         if gpu_uuids:
             per_gpu, host_total = await _query_gpu_nodes_for_uuids(ssh_client, gpu_uuids)
@@ -87,8 +101,7 @@ async def build_gpu_flags(
         # We don't sell MIG slices today, but stripping caps under partial rental
         # closes the leak before that ever ships.
         shared = await _query_shared_nodes(ssh_client, include_caps=not is_partial_rental)
-        device_flags = _device_flags((*per_gpu, *shared))
-        return " ".join(flag for flag in (_gpus_flag(gpu_uuids), device_flags) if flag)
+        return build_gpu_docker_config(gpu_uuids, device_nodes=(*per_gpu, *shared))
     except Exception:
         logger.warning(
             "nvidia_devices: probe failed, falling back to legacy --gpus only "
@@ -96,7 +109,7 @@ async def build_gpu_flags(
             exc_info=True,
             extra={"gpu_uuids": list(gpu_uuids) if gpu_uuids else None},
         )
-        return _gpus_flag(gpu_uuids)
+        return build_gpu_docker_config(gpu_uuids)
 
 
 def _gpus_flag(gpu_uuids: Sequence[str] | None) -> str:
