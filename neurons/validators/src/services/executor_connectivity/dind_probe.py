@@ -57,7 +57,13 @@ class DindVerifier:
             # Test SSH
             pkey = asyncssh.import_private_key(private_key)
             async with asyncssh.connect(
-                host=host, port=port.external, username="root", client_keys=[pkey], known_hosts=None
+                host=host,
+                port=port.external,
+                username="root",
+                client_keys=[pkey],
+                known_hosts=None,
+                connect_timeout=12,
+                login_timeout=12,
             ) as ssh:
                 logger.info(_m("DinD SSH connected", extra=get_extra_info(log_ctx)))
 
@@ -68,10 +74,21 @@ class DindVerifier:
                     # registry round-trip. If the bundled load failed for any reason the local
                     # image is absent and docker falls back to a Docker Hub pull, matching the
                     # previous behaviour.
-                    result = await ssh.run("docker run --rm hello-world")
-                    sysbox_ok = result.exit_status == 0
+                    try:
+                        result = await asyncio.wait_for(
+                            ssh.run("docker run --rm hello-world"), timeout=30
+                        )
+                        sysbox_ok = result.exit_status == 0
+                        error_msg = (
+                            result.stderr.strip()
+                            if not sysbox_ok and result.stderr and isinstance(result.stderr, str)
+                            else "unknown error"
+                        )
+                    except asyncio.TimeoutError:
+                        sysbox_ok = False
+                        error_msg = "sysbox check timed out after 30s"
+
                     if not sysbox_ok:
-                        error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                         logger.warning(
                             _m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg}))
                         )

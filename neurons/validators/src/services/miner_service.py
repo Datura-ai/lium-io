@@ -51,6 +51,7 @@ from payload_models.payloads import (
     JupyterServerInstalled,
     JupyterInstallationFailed,
     WorkloadKind,
+    now_ms,
 )
 from tenacity import RetryError
 
@@ -58,7 +59,11 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService
+from services.docker_service import (
+    DockerService,
+    PORT_CHECK_EARLY_BUDGET_SEC,
+    PORT_CHECK_POLL_INTERVAL_SEC,
+)
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from services.task_service import TaskService, JobResult
@@ -1737,13 +1742,27 @@ class MinerService:
                 result = None
                 if isinstance(payload, ContainerCreateRequest):
                     # Check for port check containers and wait if found
+                    # DAH-2272: standalone timing event (additive — the existing
+                    # success/failure logs below stay unchanged) so a future
+                    # stall on this early wait is attributable via wait_ms.
+                    _pc_start = now_ms()
                     success, message = await docker_service.wait_for_port_check_containers(
                         executor,
                         payload.miner_hotkey,
                         my_key,
                         private_key.decode("utf-8"),
-                        max_retries=2,
-                        retry_delay=60
+                        budget_sec=PORT_CHECK_EARLY_BUDGET_SEC,
+                        poll_interval_sec=PORT_CHECK_POLL_INTERVAL_SEC,
+                    )
+                    logger.info(
+                        _m(
+                            "port_check_wait_early_timing",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "wait_ms": now_ms() - _pc_start,
+                                "ok": success,
+                            }),
+                        )
                     )
 
                     if not success:
