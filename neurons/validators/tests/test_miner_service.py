@@ -1,13 +1,14 @@
-"""DAH-2272: early-caller port_check_wait_early_timing coverage.
+"""DAH-2272: early-caller port-check behavior in MinerService._handle_container.
 
-No existing test drove MinerService._handle_container before this; the
-harness below mocks every boundary MinerService._handle_container crosses
-(bittensor wallet, REST submit, redis renting_in_progress, ssh decrypt) so
-the `wait_for_port_check_containers` call at miner_service.py:~1749 actually
-executes and the additive `port_check_wait_early_timing` event can be
-asserted on both success and failure.
+No existing test drove MinerService._handle_container before this; the harness
+below mocks every boundary MinerService._handle_container crosses (bittensor
+wallet, REST submit, redis renting_in_progress, ssh decrypt) so the
+`wait_for_port_check_containers` call at miner_service.py:~1749 actually
+executes. DAH-2272 removed the wait/poll loop (the rental now force-removes any
+lingering probe immediately), so these tests pin the surrounding control flow
+rather than a timing event: on success the create proceeds; if the step ever
+reports failure the container request fails cleanly without attempting a create.
 """
-import logging
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -104,49 +105,33 @@ def _wire_common_mocks(mocker, miner_service, executor_id: str):
     return my_key
 
 
-def _collect_log_records():
-    records = []
-
-    class _Capture(logging.Handler):
-        def emit(self, record):
-            records.append(record)
-
-    handler = _Capture()
-    logging.getLogger("services.miner_service").addHandler(handler)
-    return records, handler
-
-
 @pytest.mark.asyncio
-async def test_early_call_site_logs_timing_on_success(mocker, miner_service):
+async def test_early_call_site_proceeds_on_success(mocker, miner_service):
+    """When the port-check force-remove reports success, container creation proceeds."""
     executor_id = str(uuid4())
     payload = _make_create_payload(executor_id)
     _wire_common_mocks(mocker, miner_service, executor_id)
 
-    mocker.patch(
+    wait_mock = mocker.patch(
         "services.miner_service.DockerService.wait_for_port_check_containers",
         AsyncMock(return_value=(True, "No port check containers found")),
     )
-    mocker.patch(
+    create_mock = mocker.patch(
         "services.miner_service.DockerService.create_container",
         AsyncMock(return_value=Mock()),
     )
 
-    records, handler = _collect_log_records()
-    try:
-        await miner_service._handle_container(payload)
-    finally:
-        logging.getLogger("services.miner_service").removeHandler(handler)
+    await miner_service._handle_container(payload)
 
-    timing_events = [r for r in records if "port_check_wait_early_timing" in r.getMessage()]
-    assert timing_events, "expected a port_check_wait_early_timing log event on success"
-    extra = timing_events[0].msg.extra
-    assert isinstance(extra.get("wait_ms"), int)
-    assert extra.get("wait_ms") >= 0
-    assert extra.get("ok") is True
+    wait_mock.assert_awaited_once()
+    create_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_early_call_site_logs_timing_on_failure(mocker, miner_service):
+async def test_early_call_site_fails_container_when_step_reports_failure(mocker, miner_service):
+    """Defensive: if the port-check step ever reports failure, the container
+    request fails cleanly and no create is attempted. (Post-DAH-2272 the step
+    always succeeds, so this pins the guard, not a live code path.)"""
     executor_id = str(uuid4())
     payload = _make_create_payload(executor_id)
     _wire_common_mocks(mocker, miner_service, executor_id)
@@ -155,20 +140,12 @@ async def test_early_call_site_logs_timing_on_failure(mocker, miner_service):
         "services.miner_service.DockerService.wait_for_port_check_containers",
         AsyncMock(return_value=(False, "Port check containers still present")),
     )
+    create_mock = mocker.patch(
+        "services.miner_service.DockerService.create_container",
+        AsyncMock(return_value=Mock()),
+    )
 
-    records, handler = _collect_log_records()
-    try:
-        result = await miner_service._handle_container(payload)
-    finally:
-        logging.getLogger("services.miner_service").removeHandler(handler)
+    result = await miner_service._handle_container(payload)
 
-    timing_events = [r for r in records if "port_check_wait_early_timing" in r.getMessage()]
-    assert timing_events, "expected a port_check_wait_early_timing log event on failure"
-    extra = timing_events[0].msg.extra
-    assert isinstance(extra.get("wait_ms"), int)
-    assert extra.get("wait_ms") >= 0
-    assert extra.get("ok") is False
-
-    # The pre-existing failure-path behavior (container error response) must
-    # be unchanged — this event is additive, not a replacement.
     assert isinstance(result, FailedContainerRequest)
+    create_mock.assert_not_awaited()

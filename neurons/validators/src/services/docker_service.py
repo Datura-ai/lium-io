@@ -50,7 +50,6 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.config import settings
-from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info, retry_ssh_command
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.const import (
@@ -115,13 +114,6 @@ _PORT_ALLOCATED_PHRASES = ("port is already allocated", "address already in use"
 _PORT_ALLOCATED_RETRY_BUDGET_SEC = 90
 _PORT_ALLOCATED_RETRY_SLEEP_SEC = 5
 
-# DAH-2272: wall-clock time budgets for wait_for_port_check_containers, replacing
-# the old flat max_retries/retry_delay sleep loop so the worst case is bounded
-# and deterministic instead of absorbing 60-120s into "Started in subnet".
-# Public (not underscore-prefixed) because miner_service.py imports these.
-PORT_CHECK_POLL_INTERVAL_SEC = 1.5
-PORT_CHECK_EARLY_BUDGET_SEC = 18.0
-PORT_CHECK_LATE_BUDGET_SEC = 20.0
 _VLOOPBACK_MOUNT_ERROR_PHRASES = (
     "VolumeDriver.Mount",
     "cannot create mount point dir",
@@ -1070,11 +1062,9 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
         *,
-        budget_sec: float = PORT_CHECK_LATE_BUDGET_SEC,
-        poll_interval_sec: float = PORT_CHECK_POLL_INTERVAL_SEC,
         ssh_client: asyncssh.SSHClientConnection | None = None,
     ) -> tuple[bool, str]:
-        """Wait for port check containers to finish before creating rental containers.
+        """Force-remove lingering port-check / probe containers before a rental.
 
         Matches two prefix patterns:
         - 'container_{miner_hotkey}_*' — validator DinD/port-check probes (hotkey-scoped,
@@ -1082,37 +1072,39 @@ class DockerService:
         - 'health_check_*' — backend executor_health_check probes (hotkey-agnostic,
           backend creates these without a hotkey segment — see DAH-1991)
 
-        DAH-2018: when the caller already holds an open SSH connection, pass it
-        in via ``ssh_client`` to avoid the cost (and TOCTOU widening) of a
-        second connect — the late re-check inside ``create_container`` runs
-        right before ``docker run`` and reuses the existing session.
+        DAH-2272: rentals take priority over background verification. Rather than
+        WAITING for a lingering probe to clear (the old max_retries/retry_delay
+        sleep loop, which absorbed 60-120s into "Started in subnet"), any match is
+        force-removed IMMEDIATELY so the rental never blocks on a probe. Safe
+        because:
+        - A DinD probe killed mid-flight is tolerated on the verification side:
+          ``PortConnectivityCheck`` treats a sysbox downgrade during
+          ``renting_in_progress`` as inconclusive and keeps the last known value,
+          so the miner is not penalised and the next verification cycle
+          re-measures.
+        - Any residual port-bind race is caught downstream by the 90s
+          "port is already allocated" docker-create retry.
 
-        DAH-2272: bounded by a wall-clock time budget (``time.monotonic()``
-        deadline) instead of a flat max_retries/retry_delay sleep loop, so the
-        worst case is deterministic and small instead of absorbing 60-120s
-        into "Started in subnet". Keyword-only params are deliberate: they
-        force every call site to surface via TypeError and get migrated
-        rather than silently keeping stale positional args.
+        DAH-2018: when the caller already holds an open SSH connection, pass it in
+        via ``ssh_client`` to reuse the session (avoids a second connect and a
+        wider TOCTOU gap); the late re-check inside ``create_container`` runs
+        right before ``docker run``.
 
         Args:
             executor_info: Executor SSH connection info (ignored when
                 ``ssh_client`` is provided).
-            miner_hotkey: The miner's hotkey to check containers for
+            miner_hotkey: The miner's hotkey used to scope the container_* filter.
             keypair: Bittensor keypair for decrypting private key (ignored when
                 ``ssh_client`` is provided).
             private_key: Encrypted SSH private key (ignored when ``ssh_client``
                 is provided).
-            budget_sec: Wall-clock seconds to keep polling before force-removing
-                lingering containers (default PORT_CHECK_LATE_BUDGET_SEC).
-            poll_interval_sec: Seconds to sleep between polls (default
-                PORT_CHECK_POLL_INTERVAL_SEC).
             ssh_client: Optional pre-opened SSH session to reuse.
 
         Returns:
-            Tuple of (success: bool, message: str)
-            - (True, "No port check containers found") - Can proceed immediately
-            - (True, "Port check containers cleared after X.Xs") - Waited and cleared
-            - (True, "Port check containers forcefully removed after budget expiry") - Force-removed
+            Tuple of (success: bool, message: str). Always succeeds — removal is
+            best-effort and the rental proceeds regardless:
+            - (True, "No port check containers found")
+            - (True, "Port check containers forcefully removed")
         """
         container_prefix = f"container_{miner_hotkey}_"
         health_check_prefix = "health_check_"
@@ -1120,114 +1112,46 @@ class DockerService:
         health_check_filter = shlex.quote(f"name=^{health_check_prefix}")
 
         async def _run_checks(client: asyncssh.SSHClientConnection) -> tuple[bool, str]:
-            start = time.monotonic()
-            deadline = start + budget_sec
-            first_iteration = True
-            while True:
-                # docker ps OR-s multiple --filter name= flags
-                command = (
-                    '/usr/bin/docker ps --format "{{.Names}}" '
-                    f"--filter {container_filter} "
-                    f"--filter {health_check_filter}"
+            # docker ps OR-s multiple --filter name= flags
+            command = (
+                '/usr/bin/docker ps --format "{{.Names}}" '
+                f"--filter {container_filter} "
+                f"--filter {health_check_filter}"
+            )
+            result = await client.run(command)
+
+            if not result.stdout or not result.stdout.strip():
+                return True, "No port check containers found"
+
+            # Found lingering probe container(s). Force-remove IMMEDIATELY and let
+            # the rental proceed — the customer-facing create request must not wait
+            # on a verification/health-check probe (DAH-2272). Filter UNCHANGED:
+            # targets BOTH container_{hotkey}_* AND health_check_*; do NOT narrow
+            # to hotkey-only — the old retry loop could never clear a foreign
+            # health_check_*, so removal is the only path that frees the port
+            # (see DAH-2272 ADR).
+            names = [n for n in result.stdout.strip().split("\n") if n]
+            logger.warning(
+                _m(
+                    "port_check_force_removed",
+                    extra=get_extra_info({
+                        "miner_hotkey": miner_hotkey,
+                        "context": "wait_for_port_check_containers",
+                        "container_names": names,
+                    }),
                 )
-                result = await client.run(command)
+            )
 
-                if not result.stdout or not result.stdout.strip():
-                    elapsed = time.monotonic() - start
-                    logger.info(
-                        _m(
-                            "port_check_wait_cleared",
-                            extra=get_extra_info({
-                                "miner_hotkey": miner_hotkey,
-                                "context": "wait_for_port_check_containers",
-                                "wait_ms": int(elapsed * 1000),
-                                "budget_sec": budget_sec,
-                            }),
-                        )
-                    )
-                    if first_iteration:
-                        return True, "No port check containers found"
-                    return True, f"Port check containers cleared after {elapsed:.1f}s"
+            remove_cmd = (
+                "/usr/bin/docker ps -q "
+                f"--filter {container_filter} "
+                f"--filter {health_check_filter} "
+                "| xargs -r /usr/bin/docker rm -f"
+            )
+            await client.run(remove_cmd)
 
-                # Found port check containers still present.
-                container_names = result.stdout.strip()
-
-                if time.monotonic() >= deadline:
-                    # Budget exhausted — force-remove. Filter UNCHANGED (MOD #1):
-                    # targets BOTH container_{hotkey}_* AND health_check_* exactly
-                    # as before; do NOT narrow this to hotkey-only (see DAH-2272 ADR).
-                    names = [n for n in container_names.strip().split("\n") if n]
-
-                    # Advisory telemetry only (feeds a future, human-reviewed
-                    # PR-2 filter-narrowing decision) — deliberately use the
-                    # validator's LOCAL clock instead of a second SSH
-                    # round-trip to the remote host's clock, to avoid doubling
-                    # the SSH cost per lingering container. Clock skew is an
-                    # accepted tradeoff for this field; the result is clamped
-                    # to 0 as a floor so skew can't produce a confusing
-                    # negative value.
-                    #
-                    # Fan the per-container `docker inspect` calls out
-                    # CONCURRENTLY (rather than serially) so this stays
-                    # bounded on the rental-creation hot path even when
-                    # several containers are lingering, and cap the whole
-                    # fan-out with an outer timeout so a hung remote inspect
-                    # can't stall the force-remove path indefinitely.
-                    container_ages_sec: dict[str, int | None] = dict.fromkeys(names)
-                    try:
-                        inspect_results = await asyncio.wait_for(
-                            asyncio.gather(
-                                *[
-                                    client.run(DockerCommand.inspect_created_timestamp(name))
-                                    for name in names
-                                ],
-                                return_exceptions=True,
-                            ),
-                            timeout=5,
-                        )
-                        for name, created in zip(names, inspect_results, strict=True):
-                            if isinstance(created, BaseException):
-                                container_ages_sec[name] = None
-                                continue
-                            if created.exit_status == 0 and created.stdout.strip():
-                                container_ages_sec[name] = max(
-                                    0, int(time.time() - int(created.stdout.strip()))
-                                )
-                            else:
-                                container_ages_sec[name] = None
-                    except TimeoutError:
-                        # Outer cap fired — whichever containers didn't get a
-                        # response in time stay None rather than blocking.
-                        pass
-
-                    logger.warning(
-                        _m(
-                            "port_check_wait_force_removed",
-                            extra=get_extra_info({
-                                "miner_hotkey": miner_hotkey,
-                                "context": "wait_for_port_check_containers",
-                                "budget_sec": budget_sec,
-                                "elapsed_sec": time.monotonic() - start,
-                                "container_names": names,
-                                "container_age_sec": container_ages_sec,
-                            }),
-                        )
-                    )
-
-                    # Force remove containers matching either prefix.
-                    remove_cmd = (
-                        "/usr/bin/docker ps -q "
-                        f"--filter {container_filter} "
-                        f"--filter {health_check_filter} "
-                        "| xargs -r /usr/bin/docker rm -f"
-                    )
-                    await client.run(remove_cmd)
-
-                    logger.info("Forced removal of stale port check containers completed")
-                    return True, "Port check containers forcefully removed after budget expiry"
-
-                first_iteration = False
-                await asyncio.sleep(poll_interval_sec)
+            logger.info("Forced removal of stale port check containers completed")
+            return True, "Port check containers forcefully removed"
 
         if ssh_client is not None:
             try:
@@ -3273,25 +3197,22 @@ class DockerService:
                     )
                 )
 
-                # DAH-2018: re-check for backend health_check_* / validator
-                # port-test containers immediately before `docker run`. The
-                # early check in miner_service runs before the image pull, but
-                # the backend's RentalVerificationCheck can spin up a
-                # health_check container during the pull window and grab a
-                # host port from the same verified-port pool the rental
-                # allocated. Reuse the open ssh_client so we don't pay the
-                # cost of a second connect (and don't widen the TOCTOU gap).
-                # Tighter budget than the early call: by this point HC should
-                # be near completion, and the port-allocated retry loop +
-                # `docker rm -f` are the backstop for any residual race.
+                # DAH-2018/DAH-2272: force-remove any backend health_check_* /
+                # validator port-test container immediately before `docker run`.
+                # The early check in miner_service runs before the image pull, but
+                # the backend's RentalVerificationCheck can spin up a health_check
+                # container during the pull window and grab a host port from the
+                # same verified-port pool the rental allocated. Reuse the open
+                # ssh_client so we don't pay for a second connect (and don't widen
+                # the TOCTOU gap). No wait — the rental takes priority; the
+                # port-allocated retry loop + `docker rm -f` are the backstop for
+                # any residual race.
                 current_step = "port_check_wait"
                 wait_ok, wait_msg = await self.wait_for_port_check_containers(
                     executor_info=executor_info,
                     miner_hotkey=payload.miner_hotkey,
                     keypair=keypair,
                     private_key=private_key,
-                    budget_sec=PORT_CHECK_LATE_BUDGET_SEC,
-                    poll_interval_sec=PORT_CHECK_POLL_INTERVAL_SEC,
                     ssh_client=ssh_client,
                 )
                 logger.info(
@@ -3301,8 +3222,9 @@ class DockerService:
                     )
                 )
 
-                # DAH-1524: the pre-run wait can block on live backend health_check_*
-                # probes (up to budget_sec); keep it out of the docker-run measurement.
+                # DAH-1524/DAH-2272: keep the pre-run port-check step out of the
+                # docker-run measurement. It no longer blocks (force-remove only),
+                # but the SSH round-trip is still not docker-run time.
                 profilers.append(ProfilerStep.since(ProfilerStepName.PORT_CHECK_WAIT, prev_timestamp))
                 prev_timestamp = now_ms()
 
