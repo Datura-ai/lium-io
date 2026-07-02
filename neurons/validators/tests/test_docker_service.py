@@ -3051,7 +3051,6 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
             miner_hotkey="5TestMiner",
             keypair=keypair_mock,
             private_key="encrypted-private-key",
-            budget_sec=0.0,
         )
 
     assert ok is True
@@ -3116,7 +3115,6 @@ async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
             miner_hotkey="5OurHotkey",
             keypair=keypair_mock,
             private_key="x",
-            budget_sec=0.0,
         )
 
     assert ok is True
@@ -3303,7 +3301,6 @@ async def test_wait_for_port_check_reuses_provided_ssh_client(docker_service):
             miner_hotkey="5TestMiner",
             keypair=MagicMock(),
             private_key="ignored",
-            budget_sec=0.0,
             ssh_client=ssh_client,
         )
 
@@ -3328,10 +3325,10 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
     """If a health_check_* probe is still up at the late re-check, force-clean it.
 
     Reproduces the May-1 incident: backend HC bound the same host port the
-    rental allocated, image pull (~3min) elapsed, and the early wait result
-    was stale by `docker run` time. The late call (budget_sec=20.0) must
-    detect the lingering health_check_* container and force-remove it
-    before the rental's docker run.
+    rental allocated, image pull (~3min) elapsed, and the early check result
+    was stale by `docker run` time. DAH-2272: the late call must force-remove
+    the lingering health_check_* container IMMEDIATELY (no wait) before the
+    rental's docker run.
     """
 
     class FakeSSHClient:
@@ -3339,8 +3336,6 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
 
         async def run(self_inner, cmd):
             FakeSSHClient.seen.append(cmd)
-            # Every docker ps reports an HC still alive (so the loop polls
-            # once, then the deadline trips and it force-cleans).
             if "docker ps --format" in cmd:
                 return MagicMock(
                     stdout="health_check_1777635787\n",
@@ -3349,44 +3344,13 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
             # The xargs force-rm command — return success.
             return MagicMock(stdout="", stderr="", exit_status=0)
 
-    async def instant_sleep(_):
-        return None
-
-    # DAH-2272: the wait loop now checks a time.monotonic() deadline instead
-    # of counting attempts, so patching asyncio.sleep alone would busy-spin
-    # for ~20 real seconds (monotonic still advances with real wall-clock).
-    # Stub monotonic to return `start` for the deadline computation AND the
-    # first deadline check (so one poll iteration actually executes), then a
-    # past-deadline value from the second check onward — this exercises the
-    # present -> sleep -> recheck path once before the force-remove branch,
-    # rather than tripping the deadline on iteration 0.
-    start = 1_000_000.0
-    monotonic_calls = {"n": 0}
-
-    def fake_monotonic():
-        monotonic_calls["n"] += 1
-        if monotonic_calls["n"] <= 2:
-            return start
-        return start + 1000.0  # far past any budget_sec
-
-    import services.docker_service as svc_mod
-    real_sleep = svc_mod.asyncio.sleep
-    real_monotonic = svc_mod.time.monotonic
-    svc_mod.asyncio.sleep = instant_sleep
-    svc_mod.time.monotonic = fake_monotonic
-    try:
-        ok, msg = await docker_service.wait_for_port_check_containers(
-            executor_info=MagicMock(),
-            miner_hotkey="5TestMiner",
-            keypair=MagicMock(),
-            private_key="ignored",
-            budget_sec=20.0,
-            poll_interval_sec=1.5,
-            ssh_client=FakeSSHClient(),
-        )
-    finally:
-        svc_mod.asyncio.sleep = real_sleep
-        svc_mod.time.monotonic = real_monotonic
+    ok, msg = await docker_service.wait_for_port_check_containers(
+        executor_info=MagicMock(),
+        miner_hotkey="5TestMiner",
+        keypair=MagicMock(),
+        private_key="ignored",
+        ssh_client=FakeSSHClient(),
+    )
 
     assert ok is True
     assert "forcefully removed" in msg
@@ -3395,266 +3359,20 @@ async def test_wait_for_port_check_late_call_force_cleans_stale_health_check(
         "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
         for c in FakeSSHClient.seen
     ), f"force-rm xargs missing. Seen: {FakeSSHClient.seen}"
-    # One poll iteration must have actually executed (2 docker-ps checks +
-    # 1 force-rm), not a deadline-trip on iteration 0.
+    # Exactly one docker-ps check — no polling loop.
     ps_checks = [c for c in FakeSSHClient.seen if "docker ps --format" in c]
-    assert len(ps_checks) == 2, f"expected 2 docker ps polls, saw: {ps_checks}"
+    assert len(ps_checks) == 1, f"expected 1 docker ps check, saw: {ps_checks}"
 
 
 # ---------------------------------------------------------------------------
-# DAH-2272: time-budget poll loop replacing max_retries/retry_delay.
+# DAH-2272: rentals never wait — a lingering probe is force-removed on sight.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_wait_for_port_check_time_budget_polls_then_clears(docker_service):
-    """Container present on the first poll, gone on the second -> cleared
-    without ever reaching the force-remove branch."""
-    calls = {"n": 0}
-
-    class FakeSSHClient:
-        seen: list[str] = []
-
-        async def run(self_inner, cmd):
-            FakeSSHClient.seen.append(cmd)
-            calls["n"] += 1
-            if "docker ps --format" in cmd:
-                # First poll: still present. Second poll: cleared.
-                if calls["n"] == 1:
-                    return MagicMock(stdout="health_check_123\n", stderr="", exit_status=0)
-                return MagicMock(stdout="", stderr="", exit_status=0)
-            return MagicMock(stdout="", stderr="", exit_status=0)
-
-    async def instant_sleep(_):
-        return None
-
-    import services.docker_service as svc_mod
-    real_sleep = svc_mod.asyncio.sleep
-    real_monotonic = svc_mod.time.monotonic
-    svc_mod.asyncio.sleep = instant_sleep
-    # Keep the clock well within budget for both checks.
-    svc_mod.time.monotonic = lambda: 500_000.0
-    try:
-        ok, msg = await docker_service.wait_for_port_check_containers(
-            executor_info=MagicMock(),
-            miner_hotkey="5TestMiner",
-            keypair=MagicMock(),
-            private_key="ignored",
-            budget_sec=20.0,
-            poll_interval_sec=1.5,
-            ssh_client=FakeSSHClient(),
-        )
-    finally:
-        svc_mod.asyncio.sleep = real_sleep
-        svc_mod.time.monotonic = real_monotonic
-
-    assert ok is True
-    assert "cleared after" in msg
-    # No force-remove should have been issued.
-    assert not any("docker rm -f" in c for c in FakeSSHClient.seen)
-    ps_checks = [c for c in FakeSSHClient.seen if "docker ps --format" in c]
-    assert len(ps_checks) == 2, f"expected 2 docker ps polls, saw: {ps_checks}"
-
-
-@pytest.mark.asyncio
-async def test_wait_for_port_check_force_remove_emits_container_age_sec(docker_service):
-    """At budget expiry, force-remove targets BOTH prefixes and the structured
-    event carries a numeric container_age_sec per lingering container."""
-    class FakeSSHClient:
-        seen: list[str] = []
-        inspect_calls: list[str] = []
-
-        async def run(self_inner, cmd):
-            FakeSSHClient.seen.append(cmd)
-            if "docker ps --format" in cmd:
-                return MagicMock(
-                    stdout="health_check_1777635787\n", stderr="", exit_status=0
-                )
-            if "docker inspect" in cmd:
-                FakeSSHClient.inspect_calls.append(cmd)
-                # Fixed epoch far in the past so the age is a stable positive int.
-                return MagicMock(stdout="1000000000\n", stderr="", exit_status=0)
-            # The xargs force-rm command.
-            return MagicMock(stdout="", stderr="", exit_status=0)
-
-    async def instant_sleep(_):
-        return None
-
-    import services.docker_service as svc_mod
-    real_sleep = svc_mod.asyncio.sleep
-    real_monotonic = svc_mod.time.monotonic
-    real_time = svc_mod.time.time
-
-    monotonic_calls = {"n": 0}
-    start = 2_000_000.0
-
-    def fake_monotonic():
-        monotonic_calls["n"] += 1
-        # First call is `start`; every subsequent call is past the deadline
-        # so the very first poll already trips force-remove.
-        if monotonic_calls["n"] == 1:
-            return start
-        return start + 1000.0
-
-    svc_mod.asyncio.sleep = instant_sleep
-    svc_mod.time.monotonic = fake_monotonic
-    svc_mod.time.time = lambda: 1000005000.0  # 5000s after the fixed "created" epoch
-
-    caplog_records = []
-    import logging as _logging
-
-    class _Capture(_logging.Handler):
-        def emit(self, record):
-            caplog_records.append(record)
-
-    handler = _Capture()
-    svc_mod.logger.addHandler(handler)
-    try:
-        ok, msg = await docker_service.wait_for_port_check_containers(
-            executor_info=MagicMock(),
-            miner_hotkey="5TestMiner",
-            keypair=MagicMock(),
-            private_key="ignored",
-            budget_sec=20.0,
-            poll_interval_sec=1.5,
-            ssh_client=FakeSSHClient(),
-        )
-    finally:
-        svc_mod.asyncio.sleep = real_sleep
-        svc_mod.time.monotonic = real_monotonic
-        svc_mod.time.time = real_time
-        svc_mod.logger.removeHandler(handler)
-
-    assert ok is True
-    assert "forcefully removed" in msg
-    # Force-rm targets BOTH prefixes — MOD #1, unchanged.
-    assert any(
-        "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
-        for c in FakeSSHClient.seen
-    ), f"force-rm xargs missing. Seen: {FakeSSHClient.seen}"
-    # One inspect round-trip for the lingering container.
-    assert len(FakeSSHClient.inspect_calls) == 1
-    assert "health_check_1777635787" in FakeSSHClient.inspect_calls[0]
-
-    # The structured force-remove log event must carry a numeric
-    # container_age_sec keyed by container name. logger.info(_m(msg, extra=...))
-    # stores a _StructuredMessage on record.msg; `.extra` holds the dict.
-    force_remove_events = [
-        r for r in caplog_records if "port_check_wait_force_removed" in r.getMessage()
-    ]
-    assert force_remove_events, "expected a port_check_wait_force_removed log event"
-    extra = force_remove_events[0].msg.extra
-    container_age_sec = extra.get("container_age_sec")
-    assert container_age_sec is not None, f"container_age_sec missing from log extra: {extra}"
-    age = container_age_sec.get("health_check_1777635787")
-    assert isinstance(age, int), f"expected numeric container_age_sec, got: {age}"
-    assert age == 5000
-
-
-@pytest.mark.asyncio
-async def test_wait_for_port_check_force_remove_ages_fetched_concurrently(docker_service):
-    """With 2+ lingering containers, each `docker inspect` is issued
-    concurrently (not serially) and each container gets its own
-    container_age_sec — or None if its inspect call fails."""
-
-    names = [
-        "health_check_1777635787",
-        "container_5TestMiner_9101",
-        "container_5TestMiner_9102",
-    ]
-
-    class FakeSSHClient:
-        seen: list[str] = []
-        inspect_calls: list[str] = []
-
-        async def run(self_inner, cmd):
-            FakeSSHClient.seen.append(cmd)
-            if "docker ps --format" in cmd:
-                return MagicMock(stdout="\n".join(names) + "\n", stderr="", exit_status=0)
-            if "docker inspect" in cmd:
-                FakeSSHClient.inspect_calls.append(cmd)
-                # First two containers resolve to distinct ages; the third
-                # fails (non-zero exit) so it must fall back to None without
-                # blocking the other two.
-                if names[0] in cmd:
-                    return MagicMock(stdout="1000000000\n", stderr="", exit_status=0)
-                if names[1] in cmd:
-                    return MagicMock(stdout="1000002000\n", stderr="", exit_status=0)
-                return MagicMock(stdout="", stderr="", exit_status=1)
-            # The xargs force-rm command.
-            return MagicMock(stdout="", stderr="", exit_status=0)
-
-    async def instant_sleep(_):
-        return None
-
-    import services.docker_service as svc_mod
-    real_sleep = svc_mod.asyncio.sleep
-    real_monotonic = svc_mod.time.monotonic
-    real_time = svc_mod.time.time
-
-    monotonic_calls = {"n": 0}
-    start = 2_000_000.0
-
-    def fake_monotonic():
-        monotonic_calls["n"] += 1
-        if monotonic_calls["n"] == 1:
-            return start
-        return start + 1000.0
-
-    svc_mod.asyncio.sleep = instant_sleep
-    svc_mod.time.monotonic = fake_monotonic
-    svc_mod.time.time = lambda: 1000005000.0
-
-    caplog_records = []
-    import logging as _logging
-
-    class _Capture(_logging.Handler):
-        def emit(self, record):
-            caplog_records.append(record)
-
-    handler = _Capture()
-    svc_mod.logger.addHandler(handler)
-    try:
-        ok, msg = await docker_service.wait_for_port_check_containers(
-            executor_info=MagicMock(),
-            miner_hotkey="5TestMiner",
-            keypair=MagicMock(),
-            private_key="ignored",
-            budget_sec=20.0,
-            poll_interval_sec=1.5,
-            ssh_client=FakeSSHClient(),
-        )
-    finally:
-        svc_mod.asyncio.sleep = real_sleep
-        svc_mod.time.monotonic = real_monotonic
-        svc_mod.time.time = real_time
-        svc_mod.logger.removeHandler(handler)
-
-    assert ok is True
-    assert "forcefully removed" in msg
-    # One inspect round-trip issued for each of the 3 lingering containers.
-    assert len(FakeSSHClient.inspect_calls) == 3
-
-    force_remove_events = [
-        r for r in caplog_records if "port_check_wait_force_removed" in r.getMessage()
-    ]
-    assert force_remove_events, "expected a port_check_wait_force_removed log event"
-    extra = force_remove_events[0].msg.extra
-    container_age_sec = extra.get("container_age_sec")
-    assert container_age_sec is not None, f"container_age_sec missing from log extra: {extra}"
-
-    # Each container gets its own independently-computed age.
-    assert container_age_sec[names[0]] == 5000
-    assert container_age_sec[names[1]] == 3000
-    # The failed inspect must not block the other two — falls back to None.
-    assert container_age_sec[names[2]] is None
-
-
-@pytest.mark.asyncio
-async def test_wait_for_port_check_budget_zero_forces_immediately_when_present(docker_service):
-    """budget_sec=0.0 with a container present on the first check must
-    force-remove immediately, with NO sleep — pins the old max_retries set
-    to zero present-branch semantic."""
+async def test_wait_for_port_check_forces_immediately_when_present(docker_service):
+    """A probe present on the first (only) check is force-removed immediately,
+    with NO sleep and exactly one docker-ps — the rental never waits (DAH-2272)."""
     class FakeSSHClient:
         seen: list[str] = []
 
@@ -3662,8 +3380,6 @@ async def test_wait_for_port_check_budget_zero_forces_immediately_when_present(d
             FakeSSHClient.seen.append(cmd)
             if "docker ps --format" in cmd:
                 return MagicMock(stdout="container_5TestMiner_9101\n", stderr="", exit_status=0)
-            if "docker inspect" in cmd:
-                return MagicMock(stdout="", stderr="", exit_status=1)
             return MagicMock(stdout="", stderr="", exit_status=0)
 
     sleep_calls = {"n": 0}
@@ -3680,8 +3396,6 @@ async def test_wait_for_port_check_budget_zero_forces_immediately_when_present(d
             miner_hotkey="5TestMiner",
             keypair=MagicMock(),
             private_key="ignored",
-            budget_sec=0.0,
-            poll_interval_sec=1.5,
             ssh_client=FakeSSHClient(),
         )
     finally:
@@ -3689,9 +3403,10 @@ async def test_wait_for_port_check_budget_zero_forces_immediately_when_present(d
 
     assert ok is True
     assert "forcefully removed" in msg
-    assert sleep_calls["n"] == 0, "budget_sec=0.0 with a container present must not sleep"
+    assert sleep_calls["n"] == 0, "the rental path must never sleep waiting on a probe"
     ps_checks = [c for c in FakeSSHClient.seen if "docker ps --format" in c]
-    assert len(ps_checks) == 1, f"expected exactly 1 docker ps poll, saw: {ps_checks}"
+    assert len(ps_checks) == 1, f"expected exactly 1 docker ps check, saw: {ps_checks}"
+    # Force-rm targets BOTH prefixes.
     assert any(
         "docker rm -f" in c and "health_check_" in c and "container_5TestMiner_" in c
         for c in FakeSSHClient.seen

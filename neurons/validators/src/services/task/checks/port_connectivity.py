@@ -59,6 +59,27 @@ class PortConnectivityCheck:
             verified_port_count=verified_port_count,
         )
 
+        # DAH-2272 (tolerate): a customer rental force-removes port-check / DinD
+        # probe containers the instant a ContainerCreateRequest lands (see
+        # DockerService.wait_for_port_check_containers). That race can flip
+        # sysbox_runtime to False for this cycle even though the executor is
+        # fine. Don't record a rental-induced sysbox downgrade — keep the last
+        # known value and let the next verification cycle re-measure. Mirrors
+        # the rented-executor sysbox fallback in ExecutorConnectivityService.
+        sysbox_downgraded = ctx.state.sysbox_runtime and not result.sysbox_runtime
+        if sysbox_downgraded and await ctx.services.redis.renting_in_progress(
+            ctx.miner_hotkey, ctx.executor.uuid
+        ):
+            extra_info["sysbox_downgrade_tolerated"] = True
+            updated_state = replace(
+                updated_state,
+                specs={
+                    **updated_state.specs,
+                    "sysbox_runtime": ctx.state.sysbox_runtime,
+                },
+                sysbox_runtime=ctx.state.sysbox_runtime,
+            )
+
         total = len(result.successful_ports) + len(result.failed_ports)
         pct = (len(result.successful_ports) / total * 100) if total > 0 else 0
         dind_status = "ok" if result.dind_ok else "failed"

@@ -184,3 +184,65 @@ async def test_port_connectivity_check(
                 assert result.updates["state"].verified_port_count == 100
             else:
                 assert result.updates["state"].verified_port_count == 0
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_tolerates_sysbox_downgrade_during_renting(context_factory):
+    """DAH-2272 (tolerate): a rental force-removes the DinD probe mid-flight,
+    flipping the probe's sysbox result to False. When renting_in_progress, the
+    check must NOT record the downgrade — it preserves the last known sysbox
+    value and flags the tolerated downgrade so the miner isn't penalised."""
+    redis_service = DummyRedis(renting_in_progress=True)
+    backend_service = DummyBackendService()
+    # Ports verify OK (status "ok"), but the probe reports sysbox False because
+    # its DinD container was force-removed by the concurrent rental.
+    connectivity_service = DummyConnectivityService(
+        success=True,
+        sysbox_runtime=False,
+        verified_port_count=100,
+    )
+    services = build_services(
+        redis=redis_service,
+        backend=backend_service,
+        connectivity=connectivity_service,
+    )
+    config = build_context_config(job_batch_id="batch-123")
+    # Prior known-good sysbox value.
+    state = build_state(sysbox_runtime=True)
+    ctx = context_factory(services=services, config=config, state=state, rented=False)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    # Prior sysbox value preserved despite the probe reporting False.
+    assert result.updates["state"].sysbox_runtime is True
+    assert result.updates["state"].specs["sysbox_runtime"] is True
+    assert result.updates["default_extra"].get("sysbox_downgrade_tolerated") is True
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_records_sysbox_downgrade_when_not_renting(context_factory):
+    """Control for the tolerate path: the same sysbox downgrade IS recorded
+    (not tolerated) when no rental is in progress."""
+    redis_service = DummyRedis(renting_in_progress=False)
+    backend_service = DummyBackendService()
+    connectivity_service = DummyConnectivityService(
+        success=True,
+        sysbox_runtime=False,
+        verified_port_count=100,
+    )
+    services = build_services(
+        redis=redis_service,
+        backend=backend_service,
+        connectivity=connectivity_service,
+    )
+    config = build_context_config(job_batch_id="batch-123")
+    state = build_state(sysbox_runtime=True)
+    ctx = context_factory(services=services, config=config, state=state, rented=False)
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    # Downgrade recorded — nothing to tolerate without a rental in progress.
+    assert result.updates["state"].sysbox_runtime is False
+    assert result.updates["default_extra"].get("sysbox_downgrade_tolerated") is None
