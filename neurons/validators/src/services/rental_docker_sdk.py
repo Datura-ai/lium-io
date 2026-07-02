@@ -750,8 +750,8 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
     return {key: value for key, value in kwargs.items() if value is not None}
 
 
-def _container_ports(ports: tuple[PortBinding, ...]) -> list[str]:
-    return [_port_key(port) for port in ports]
+def _container_ports(ports: tuple[PortBinding, ...]) -> list[tuple[int, str]]:
+    return [(port.container_port, port.protocol) for port in ports]
 
 
 def _port_bindings(ports: tuple[PortBinding, ...]) -> dict[str, int]:
