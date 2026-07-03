@@ -157,3 +157,33 @@ async def test_enforced_under_threshold_keeps_eligibility(monkeypatch):
 
     # Assert
     assert result.eligible_for_rental_share is True
+
+
+@pytest.mark.asyncio
+async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
+    # DAH-2327: the zero-incentive reason must reach the customer-facing incentive
+    # log (JobResult.incentive_logs -> "Incentive Scores Calculation Logs") with the
+    # numbers and the price to set. Threshold = 2.0 * 1.1 = 2.2.
+    _set_p90(monkeypatch, {H200: 2.0})
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", True)
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(2.3))
+
+    log = "\n".join(result.incentive_logs)
+    assert "soft price limit" in log
+    assert "2.3" in log        # miner's price
+    assert "2.2" in log        # ceiling / price to set
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_does_not_append_incentive_log(monkeypatch):
+    # Flag off — payout unchanged, so no zero-incentive reason should be logged.
+    _set_p90(monkeypatch, {H200: 2.0})
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_SOFT_PRICE_LIMIT", False)
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(2.3))
+
+    log = "\n".join(result.incentive_logs)
+    assert "soft price limit" not in log

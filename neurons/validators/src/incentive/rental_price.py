@@ -209,6 +209,31 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
+    def _append_soft_price_limit_incentive_log(self, result: JobResult) -> None:
+        # DAH-2327: surface the zero-incentive reason in the customer-facing incentive
+        # log (JobResult.incentive_logs -> "Incentive Scores Calculation Logs"), the exact
+        # block the miner reads, at the moment the soft price limit zeros the payout.
+        p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
+        soft_limit = round(p90 * SOFT_LIMIT_PRICE_RATE, 4)
+        result.incentive_logs.append(
+            _m(
+                f"Unrented incentive set to 0: price ${result.executor_info.price_per_gpu}/GPU/h "
+                f"exceeds the market soft price limit ${soft_limit} (p90 ${p90} x "
+                f"{SOFT_LIMIT_PRICE_RATE}). Lower the price to ${soft_limit} or below to receive "
+                f"the unrented incentive.",
+                extra=get_extra_info({
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "price_per_gpu": result.executor_info.price_per_gpu,
+                    "machine_price_p90": p90,
+                    "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
+                    "soft_limit_threshold": soft_limit,
+                    "reason": "price_above_market_p90_soft_limit",
+                }),
+            ).to_full_string()
+        )
+
     @staticmethod
     def _resolve_bucket(result: JobResult, cap_spec: dict[int, int]) -> int:
         """Pick the gpu_count bucket the executor is rated against.
@@ -512,6 +537,7 @@ class RentalPriceIncentive(DefaultIncentive):
             self._log_soft_price_limit(job_result)
             if settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT:
                 eligible_for_rental_share = False
+                self._append_soft_price_limit_incentive_log(job_result)
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
