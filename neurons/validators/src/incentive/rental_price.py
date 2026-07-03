@@ -268,7 +268,7 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         return None
 
-    def _append_zero_incentive_reason(
+    def _log_zero_incentive_to_miner(
         self, result: JobResult, reason: str, message: str, extra: dict[str, Any] | None = None
     ) -> None:
         # DAH-2327: surface every reason a validated executor earns 0 subnet incentive in the
@@ -284,26 +284,6 @@ class RentalPriceIncentive(DefaultIncentive):
         if extra:
             info.update(extra)
         result.incentive_logs.append(_m(message, extra=get_extra_info(info)).to_full_string())
-
-    def _append_soft_price_limit_incentive_log(self, result: JobResult) -> None:
-        p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
-        soft_limit = round(p90 * SOFT_LIMIT_PRICE_RATE, 4)
-        self._append_zero_incentive_reason(
-            result,
-            reason="price_above_market_p90_soft_limit",
-            message=(
-                f"No unrented incentive: your price ${result.executor_info.price_per_gpu}/GPU/h is "
-                f"above the market soft price limit ${soft_limit} (90th-percentile market rate "
-                f"${p90} x {SOFT_LIMIT_PRICE_RATE}). Lower the price to ${soft_limit} or below to "
-                f"earn the unrented incentive."
-            ),
-            extra={
-                "price_per_gpu": result.executor_info.price_per_gpu,
-                "machine_price_p90": p90,
-                "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
-                "soft_limit_threshold": soft_limit,
-            },
-        )
 
     @staticmethod
     def _resolve_bucket(result: JobResult, cap_spec: dict[int, int]) -> int:
@@ -502,7 +482,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # bucket has no unrented capacity (cap multiplier -> 0 -> effective rate -> 0). Tell
         # the miner, otherwise the "calculated successfully" line above shows 0 with no reason.
         if result.unrented_cap_multiplier == 0:
-            self._append_zero_incentive_reason(
+            self._log_zero_incentive_to_miner(
                 result,
                 reason="no_unrented_capacity_for_gpu_count",
                 message=(
@@ -543,7 +523,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # Hard exclusions: reasons a validated executor earns 0 from BOTH pools.
         # One evaluator so the internal log, the customer-facing incentive log, and the
         # scoring decision all read from the same source and cannot drift (DAH-2327).
-        exclusion = self._reason_excluded_from_both_pools(job_result)
+        exclusion: ZeroIncentiveReason | None = self._reason_excluded_from_both_pools(job_result)
         if exclusion is not None:
             logger.info(
                 _m(
@@ -561,7 +541,7 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
-            self._append_zero_incentive_reason(
+            self._log_zero_incentive_to_miner(
                 job_result,
                 reason=exclusion.reason,
                 message=exclusion.message_for_miner,
@@ -583,7 +563,24 @@ class RentalPriceIncentive(DefaultIncentive):
             self._log_soft_price_limit(job_result)
             if settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT:
                 eligible_for_rental_share = False
-                self._append_soft_price_limit_incentive_log(job_result)
+                p90 = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
+                soft_limit = round(p90 * SOFT_LIMIT_PRICE_RATE, 4)
+                self._log_zero_incentive_to_miner(
+                    job_result,
+                    reason="price_above_market_p90_soft_limit",
+                    message=(
+                        f"No unrented incentive: your price ${job_result.executor_info.price_per_gpu}"
+                        f"/GPU/h is above the market soft price limit ${soft_limit} (90th-percentile "
+                        f"market rate ${p90} x {SOFT_LIMIT_PRICE_RATE}). Lower the price to ${soft_limit} "
+                        f"or below to earn the unrented incentive."
+                    ),
+                    extra={
+                        "price_per_gpu": job_result.executor_info.price_per_gpu,
+                        "machine_price_p90": p90,
+                        "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
+                        "soft_limit_threshold": soft_limit,
+                    },
+                )
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
@@ -617,7 +614,7 @@ class RentalPriceIncentive(DefaultIncentive):
             if base_model not in self.config.rental_incentive_gpu_types and (
                 job_result.score > 0 or job_result.job_score > 0
             ):
-                self._append_zero_incentive_reason(
+                self._log_zero_incentive_to_miner(
                     job_result,
                     reason="gpu_model_not_eligible_for_unrented_incentive",
                     message=(
