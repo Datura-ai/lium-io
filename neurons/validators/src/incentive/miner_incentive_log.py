@@ -1,4 +1,4 @@
-"""Every reason a validated executor earns 0 subnet incentive — the single catalog.
+"""Everything a miner sees in their "Incentive Scores Calculation Logs" — one catalog.
 
 WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
   - Mining pool   — for RENTED executors. Paid by a mining score (GPU model/count
@@ -11,18 +11,25 @@ HOW A NODE PICKS A POOL:
   idle AND model in program AND price ok AND capacity? -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
-THE REASONS A VALIDATED NODE EARNS 0 (what this catalog holds):
-  Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
-    spot_tier, provider_discord_not_connected, new_rentals_paused, miner_default_job
-  Group B — idle but does not qualify for the unrented pool:
-    gpu_model_not_in_unrented_program (earns only when rented),
-    price_over_soft_limit (priced above the market ceiling -> lower price),
-    no_unrented_capacity (no cap left for that GPU-count tier this cycle)
+WHAT THIS CATALOG HOLDS (the miner-facing log block, JobResult.incentive_logs,
+delivered via MACHINE_SPEC_CHANNEL):
 
-The scoring code (rental_price.py) detects each condition where its data naturally
-lives (some per-executor upfront, some only after cohort aggregation) and calls the
-matching builder below, then `reason.write_to_miner_log(result)`. Open THIS file to
-see the full list of what a miner can be told and exactly how each message reads.
+1. ZERO-INCENTIVE REASONS — why a validated node earns 0:
+   Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
+     spot_tier, provider_discord_not_connected, new_rentals_paused, miner_default_job
+   Group B — idle but does not qualify for the unrented pool:
+     gpu_model_not_in_unrented_program (earns only when rented),
+     price_over_soft_limit (priced above the market ceiling -> lower price),
+     no_unrented_capacity (no cap left for that GPU-count tier this cycle)
+
+2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
+     mining_score_calculated, mining_incentive_calculated,
+     rental_incentive_calculated, mining_score_missing (internal-error case)
+
+The scoring code (rental_price.py / default.py) detects each condition where its
+data naturally lives (some per-executor upfront, some only after cohort aggregation)
+and calls the matching builder below, then `.write_to_miner_log(result)`. Open THIS
+file to see everything a miner can be told and exactly how each message reads.
 """
 
 from __future__ import annotations
@@ -163,5 +170,111 @@ def no_unrented_capacity(
             "max_cap": max_cap,
             "unrented_cap_multiplier": cap_multiplier,
             "total_rental_cost": total_rental_cost,
+        },
+    )
+
+
+# ── Calculation reports: the per-cycle lines every scored node gets ───────────
+
+class MinerLogLine(BaseModel):
+    """One fully-built line for the miner-facing incentive log."""
+
+    message: str
+    fields: dict[str, Any] = Field(default_factory=dict)
+
+    def as_internal_log(self):
+        """The same line as an `_m` object, for mirroring into the internal logger."""
+        return _m(self.message, extra=get_extra_info(self.fields))
+
+    def write_to_miner_log(self, result: JobResult) -> None:
+        result.incentive_logs.append(self.as_internal_log().to_full_string())
+
+
+def mining_score_calculated(result: JobResult, is_rented_after_cutoff: bool) -> MinerLogLine:
+    return MinerLogLine(
+        message=(
+            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count "
+            "/ total_gpu_count * sysbox_multiplier * uptime_multiplier * driver_multiplier"
+        ),
+        fields={
+            "executor_id": str(result.executor_info.uuid),
+            "gpu_model": result.gpu_model,
+            "gpu_count": result.gpu_count,
+            "sysbox_multiplier": result.sysbox_multiplier,
+            "driver_multiplier": result.driver_multiplier,
+            "nvidia_driver_version": result.nvidia_driver_version,
+            "uptime_multiplier": result.uptime_multiplier,
+            "mining_score": result.mining_score,
+            "gpu_portion": result.gpu_portion,
+            "total_gpu_count": result.total_gpu_count,
+            "rental_created": result.rental_created_at,
+            "is_rented_after_cutoff": is_rented_after_cutoff,
+        },
+    )
+
+
+def mining_incentive_calculated(
+    hotkey: str, result: JobResult, total_mining_score: float, mining_share: float
+) -> MinerLogLine:
+    return MinerLogLine(
+        message=(
+            "Incentive score is calculated successfully. Formula: mining_share * mining_score "
+            "/ total_mining_score"
+        ),
+        fields={
+            "hotkey": hotkey,
+            "executor_id": str(result.executor_info.uuid),
+            "mining_score": result.mining_score,
+            "total_mining_score": total_mining_score,
+            "mining_share": mining_share,
+            "gpu_model": result.gpu_model,
+            "gpu_count": result.gpu_count,
+            "incentive": result.incentive,
+        },
+    )
+
+
+def rental_incentive_calculated(hotkey: str, result: JobResult, bucket: int) -> MinerLogLine:
+    return MinerLogLine(
+        message=(
+            "Rental price incentive for executor is calculated successfully. Formula: "
+            "rental_share * gpu_count * effective_rate / total_rental_cost"
+        ),
+        fields={
+            "hotkey": hotkey,
+            "executor_id": str(result.executor_info.uuid),
+            "gpu_model": result.gpu_model,
+            "gpu_count": result.gpu_count,
+            "hourly_rate": result.hourly_rate,
+            "sysbox_runtime": result.sysbox_runtime,
+            "sysbox_multiplier": result.sysbox_multiplier,
+            "provider_discord_connected": result.provider_discord_connected,
+            "nvidia_driver_version": result.nvidia_driver_version,
+            "driver_multiplier": result.driver_multiplier,
+            "unrented_cap_multiplier": result.unrented_cap_multiplier,
+            "effective_rate": result.effective_rate,
+            "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,
+            "count_bucket": bucket,
+            "max_cap": result.max_cap,
+            "cap_dilution_applied": result.cap_dilution_applied,
+            "rental_share": result.rental_share,
+            "burn_share": result.burn_share,
+            "incentive": result.incentive,
+            "total_rental_cost": result.total_rental_cost,
+        },
+    )
+
+
+def mining_score_missing(hotkey: str, result: JobResult) -> MinerLogLine:
+    # Internal-error case: scoring finished without a mining score. Should not happen.
+    return MinerLogLine(
+        message="Mining score is not set for job result. This should not happen.",
+        fields={
+            "hotkey": hotkey,
+            "executor_id": str(result.executor_info.uuid),
+            "score": result.score,
+            "job_score": result.job_score,
+            "gpu_model": result.gpu_model,
+            "gpu_count": result.gpu_count,
         },
     )
