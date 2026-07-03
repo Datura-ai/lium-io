@@ -269,7 +269,7 @@ class RentalPriceIncentive(DefaultIncentive):
         return None
 
     def _append_zero_incentive_reason(
-        self, result: JobResult, reason: str, message: str, extra: dict | None = None
+        self, result: JobResult, reason: str, message: str, extra: dict[str, Any] | None = None
     ) -> None:
         # DAH-2327: surface every reason a validated executor earns 0 subnet incentive in the
         # customer-facing incentive log (JobResult.incentive_logs -> "Incentive Scores
@@ -497,6 +497,26 @@ class RentalPriceIncentive(DefaultIncentive):
                 }),
             ).to_full_string()
         )
+
+        # DAH-2327: an eligible unrented executor still finalizes at 0 when its gpu-count
+        # bucket has no unrented capacity (cap multiplier -> 0 -> effective rate -> 0). Tell
+        # the miner, otherwise the "calculated successfully" line above shows 0 with no reason.
+        if result.unrented_cap_multiplier == 0:
+            self._append_zero_incentive_reason(
+                result,
+                reason="no_unrented_capacity_for_gpu_count",
+                message=(
+                    f"No unrented incentive: there is currently no unrented-incentive capacity "
+                    f"for {result.gpu_count}x {result.gpu_model} (its GPU-count tier has no cap "
+                    f"this cycle). Rent this executor out to earn."
+                ),
+                extra={
+                    "count_bucket": bucket,
+                    "max_cap": result.max_cap,
+                    "unrented_cap_multiplier": result.unrented_cap_multiplier,
+                    "total_rental_cost": result.total_rental_cost,
+                },
+            )
 
         # aggregate miner incentives
         self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive

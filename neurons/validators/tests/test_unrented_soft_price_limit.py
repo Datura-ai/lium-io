@@ -251,6 +251,27 @@ async def test_unrented_non_incentive_model_appends_reason():
     assert "RTX 5080" in log
 
 
+@pytest.mark.asyncio
+async def test_eligible_zero_capacity_bucket_appends_reason():
+    # An eligible unrented GPU whose gpu-count bucket has no cap: the cap multiplier and
+    # effective rate collapse to 0, so incentive is 0 despite eligibility. Explain why.
+    incentive = _build_incentive()
+    job = _make_job(1.0)  # H200, unrented, eligible
+    job.eligible_for_rental_share = True
+    job.hourly_rate = 5.0
+    job.sysbox_multiplier = 1.0
+    job.driver_multiplier = 1.0
+    job.count_bucket = 1
+    job.max_cap = 0  # no unrented capacity for this bucket -> cap multiplier 0
+
+    await incentive._post_process_job_result("miner_hotkey", job)
+
+    assert job.incentive == 0
+    log = "\n".join(job.incentive_logs)
+    assert "no_unrented_capacity_for_gpu_count" in log
+    assert "H200" in log
+
+
 def test_evaluate_hard_exclusion_returns_first_match_and_none():
     # The evaluator is the single source of truth: first matching reason wins,
     # None for a clean executor.
