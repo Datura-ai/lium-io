@@ -593,12 +593,15 @@ def build_authorized_keys_exec_spec(
     import shlex
 
     key_data = "".join(f"{public_key}\n" for public_key in public_keys)
+    # chmod up front: key injection now runs before the sshd bootstrap's own
+    # `chmod 700` (DAH-2341), and sshd may come up in between.
+    quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
     return ContainerExecSpec(
         container_name=container_name,
         argv=(
             "sh",
             "-c",
-            f"mkdir -p {shlex.quote(target_path.rsplit('/', 1)[0])} "
+            f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} "
             f"&& cat >> {shlex.quote(target_path)}",
         ),
         stdin=key_data,

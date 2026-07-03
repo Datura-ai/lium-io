@@ -266,19 +266,18 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # builds the image from this Dockerfile on the executor host instead of pulling
     # `docker_image`. None or "" keeps the normal image-pull path.
     dockerfile_content: str | None = None
-    # DAH-1524 (cached-template deploy): when truthy, the validator skips the
-    # ENTIRE post-creation sshd bootstrap (install_open_ssh_server_and_start_ssh_service
-    # -> sshd_bootstrap.sh). That bootstrap normally provides FOUR guarantees, ALL of
-    # which are surrendered when this flag is set:
-    #   (a) starts the sshd daemon                 (sshd_bootstrap.sh:110-117, main 166)
-    #   (b) generates host keys via `ssh-keygen -A` (sshd_bootstrap.sh:106)
-    #   (c) hardens config: PasswordAuthentication/KbdInteractive/ChallengeResponse no
-    #                                              (sshd_bootstrap.sh:89-99)
-    #   (d) installs a 30s self-heal restart watchdog (sshd_bootstrap.sh:119-156)
-    # Setting ships_sshd=True ASSERTS the image itself provides all four; the validator
-    # then only re-ensures ~/.ssh for key injection. None/False (default) preserves
-    # today's always-bootstrap behavior. Populated by lium-io-backend in a follow-up;
-    # ships inert here (no producer sets it yet).
+    # DAH-1524 introduced this flag ("skip the bootstrap for cached templates");
+    # its semantics have since changed TWICE — do not trust older comments:
+    #   - 2345af85 reverted the skip: the sshd bootstrap ALWAYS runs, because a
+    #     renter's custom startup_commands replaces the image CMD, so the image
+    #     alone can never be trusted to bring sshd up.
+    #   - DAH-2341 made the bootstrap converge with a self-starting image
+    #     instead of racing it (grace-wait, adopt a running sshd, no keygen
+    #     when adopted; see sshd_bootstrap.sh header).
+    # Today ships_sshd=True (set by lium-io-backend for cached recommended
+    # images) means exactly one thing: a bootstrap failure is FATAL to the
+    # deploy (RuntimeError -> FailedContainerRequest). None/False keeps
+    # bootstrap failures lenient (logged, deploy continues).
     ships_sshd: bool | None = None
 
 

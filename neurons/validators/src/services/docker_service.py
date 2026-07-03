@@ -3302,6 +3302,20 @@ class DockerService:
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
                 try:
+                    # DAH-2341: inject the customer's public keys before the sshd
+                    # bootstrap. The keys are plain data (mkdir + append) with no
+                    # dependency on a running sshd, and the bootstrap may now spend
+                    # a grace period waiting for an image-provided sshd — whichever
+                    # sshd comes up first must already find the keys in place.
+                    current_step = "add_public_keys"
+                    await self.add_ssh_public_keys_with_rental_docker(
+                        docker_client=docker_client,
+                        container_name=container_name,
+                        public_keys=payload.user_public_keys,
+                        log_tag=log_tag,
+                        log_extra=default_extra,
+                    )
+
                     current_step = "ssh_bootstrap"
                     if payload.ships_sshd:
                         logger.info(
@@ -3335,19 +3349,10 @@ class DockerService:
                         )
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
-                    # Add profiler for ssh service installation
+                    # Add profiler for ssh service installation (covers key
+                    # injection + bootstrap + jupyter since the running check)
                     profilers.append(ProfilerStep.since(ProfilerStepName.SSH_SERVICE_INSTALLATION, prev_timestamp))
                     prev_timestamp = now_ms()
-
-                    # add rest of public keys
-                    current_step = "add_public_keys"
-                    await self.add_ssh_public_keys_with_rental_docker(
-                        docker_client=docker_client,
-                        container_name=container_name,
-                        public_keys=payload.user_public_keys,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                    )
 
                     # add environment variables
                     current_step = "set_environment"
@@ -3361,7 +3366,8 @@ class DockerService:
                     if not environment_ok:
                         raise RuntimeError("Failed to set environment variables")
 
-                    # Add profiler for adding public keys
+                    # Historical name — key injection moved before the bootstrap
+                    # (DAH-2341), so this step now times the environment setup.
                     profilers.append(ProfilerStep.since(ProfilerStepName.ADDING_PUBLIC_KEYS, prev_timestamp))
                     prev_timestamp = now_ms()
 
