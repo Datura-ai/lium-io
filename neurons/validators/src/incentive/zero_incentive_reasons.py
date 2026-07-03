@@ -1,23 +1,40 @@
 """Every reason a validated executor earns 0 subnet incentive — the single catalog.
 
+WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
+  - Mining pool   — for RENTED executors. Paid by a mining score (GPU model/count
+                    times sysbox / driver / uptime multipliers).
+  - Unrented pool — for IDLE executors of an eligible GPU model. Paid as if the GPU
+                    were rented, based on its rental market value (rental-share).
+
+HOW A NODE PICKS A POOL:
+  rented?                                              -> mining pool (always earns)
+  idle AND model in program AND price ok AND capacity? -> unrented pool (earns)
+  otherwise                                            -> 0 incentive (reason below)
+
+THE REASONS A VALIDATED NODE EARNS 0 (what this catalog holds):
+  Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
+    spot_tier, provider_discord_not_connected, new_rentals_paused, miner_default_job
+  Group B — idle but does not qualify for the unrented pool:
+    gpu_model_not_in_unrented_program (earns only when rented),
+    price_over_soft_limit (priced above the market ceiling -> lower price),
+    no_unrented_capacity (no cap left for that GPU-count tier this cycle)
+
 The scoring code (rental_price.py) detects each condition where its data naturally
 lives (some per-executor upfront, some only after cohort aggregation) and calls the
-matching builder below. Open THIS file to see the full list of what a miner can be
-told and exactly how each message reads — no need to trace the scoring flow.
-
-Each builder returns a `ZeroIncentiveReason` carrying:
-  - the machine-readable `reason` code (also used by internal Loki dashboards),
-  - `message_for_miner`: the plain-English line shown in the miner's incentive log,
-  - `miner_log_fields`: structured fields attached to that miner-facing log,
-  - `internal_log_message` / `internal_log_fields`: the separate internal observability
-    log emitted for the "excluded from both pools" reasons (None for the rest).
+matching builder below, then `reason.write_to_miner_log(result)`. Open THIS file to
+see the full list of what a miner can be told and exactly how each message reads.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
+
+from core.utils import _m, get_extra_info
+
+if TYPE_CHECKING:
+    from services.task_service import JobResult
 
 
 class ZeroIncentiveReason(BaseModel):
@@ -29,8 +46,26 @@ class ZeroIncentiveReason(BaseModel):
     internal_log_message: str | None = None                        # set only for both-pools exclusions
     internal_log_fields: dict[str, Any] = Field(default_factory=dict)
 
+    def write_to_miner_log(self, result: JobResult) -> None:
+        """Append this reason to the executor's customer-facing incentive log.
 
-# ── Excluded from BOTH pools (mining + unrented) — earns nothing at all ───────
+        Lands in JobResult.incentive_logs -> the "Incentive Scores Calculation Logs"
+        block delivered to the miner via MACHINE_SPEC_CHANNEL (DAH-2327).
+        """
+        info = {
+            "executor_id": str(result.executor_info.uuid),
+            "gpu_model": result.gpu_model,
+            "gpu_count": result.gpu_count,
+            "reason": self.reason,
+            "incentive": 0.0,
+            **self.miner_log_fields,
+        }
+        result.incentive_logs.append(
+            _m(self.message_for_miner, extra=get_extra_info(info)).to_full_string()
+        )
+
+
+# ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─────
 
 def spot_tier() -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
@@ -77,7 +112,7 @@ def miner_default_job() -> ZeroIncentiveReason:
     )
 
 
-# ── Unrented-pool-only reasons — earns only when rented / repriced ────────────
+# ── Group B: idle but not qualified for the unrented pool ─────────────────────
 
 def gpu_model_not_in_unrented_program(gpu_model: str) -> ZeroIncentiveReason:
     return ZeroIncentiveReason(

@@ -228,22 +228,6 @@ class RentalPriceIncentive(DefaultIncentive):
             return reasons.miner_default_job()
         return None
 
-    def _log_zero_incentive_to_miner(self, result: JobResult, reason: ZeroIncentiveReason) -> None:
-        # DAH-2327: surface the reason (from the zero_incentive_reasons catalog) in the
-        # customer-facing incentive log (JobResult.incentive_logs -> "Incentive Scores
-        # Calculation Logs"), the exact block the miner reads.
-        info = {
-            "executor_id": str(result.executor_info.uuid),
-            "gpu_model": result.gpu_model,
-            "gpu_count": result.gpu_count,
-            "reason": reason.reason,
-            "incentive": 0.0,
-            **reason.miner_log_fields,
-        }
-        result.incentive_logs.append(
-            _m(reason.message_for_miner, extra=get_extra_info(info)).to_full_string()
-        )
-
     @staticmethod
     def _resolve_bucket(result: JobResult, cap_spec: dict[int, int]) -> int:
         """Pick the gpu_count bucket the executor is rated against.
@@ -441,17 +425,14 @@ class RentalPriceIncentive(DefaultIncentive):
         # bucket has no unrented capacity (cap multiplier -> 0 -> effective rate -> 0). Tell
         # the miner, otherwise the "calculated successfully" line above shows 0 with no reason.
         if result.unrented_cap_multiplier == 0:
-            self._log_zero_incentive_to_miner(
-                result,
-                reasons.no_unrented_capacity(
-                    gpu_count=result.gpu_count,
-                    gpu_model=result.gpu_model,
-                    count_bucket=bucket,
-                    max_cap=result.max_cap,
-                    cap_multiplier=result.unrented_cap_multiplier,
-                    total_rental_cost=result.total_rental_cost,
-                ),
-            )
+            reasons.no_unrented_capacity(
+                gpu_count=result.gpu_count,
+                gpu_model=result.gpu_model,
+                count_bucket=bucket,
+                max_cap=result.max_cap,
+                cap_multiplier=result.unrented_cap_multiplier,
+                total_rental_cost=result.total_rental_cost,
+            ).write_to_miner_log(result)
 
         # aggregate miner incentives
         self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
@@ -496,7 +477,7 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
-            self._log_zero_incentive_to_miner(job_result, exclusion)
+            exclusion.write_to_miner_log(job_result)
             return job_result
 
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
@@ -515,12 +496,9 @@ class RentalPriceIncentive(DefaultIncentive):
             if settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT:
                 eligible_for_rental_share = False
                 p90 = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
-                self._log_zero_incentive_to_miner(
-                    job_result,
-                    reasons.price_over_soft_limit(
-                        job_result.executor_info.price_per_gpu, p90, SOFT_LIMIT_PRICE_RATE
-                    ),
-                )
+                reasons.price_over_soft_limit(
+                    job_result.executor_info.price_per_gpu, p90, SOFT_LIMIT_PRICE_RATE
+                ).write_to_miner_log(job_result)
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
@@ -554,9 +532,9 @@ class RentalPriceIncentive(DefaultIncentive):
             if base_model not in self.config.rental_incentive_gpu_types and (
                 job_result.score > 0 or job_result.job_score > 0
             ):
-                self._log_zero_incentive_to_miner(
-                    job_result, reasons.gpu_model_not_in_unrented_program(job_result.gpu_model)
-                )
+                reasons.gpu_model_not_in_unrented_program(
+                    job_result.gpu_model
+                ).write_to_miner_log(job_result)
             return job_result
 
         # For rented or non-eligible GPUs, use parent's default scoring logic
