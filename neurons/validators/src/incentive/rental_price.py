@@ -209,29 +209,41 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
+    def _append_zero_incentive_reason(
+        self, result: JobResult, reason: str, message: str, extra: dict | None = None
+    ) -> None:
+        # DAH-2327: surface every reason a validated executor earns 0 subnet incentive in the
+        # customer-facing incentive log (JobResult.incentive_logs -> "Incentive Scores
+        # Calculation Logs"), the exact block the miner reads.
+        info = {
+            "executor_id": str(result.executor_info.uuid),
+            "gpu_model": result.gpu_model,
+            "gpu_count": result.gpu_count,
+            "reason": reason,
+            "incentive": 0.0,
+        }
+        if extra:
+            info.update(extra)
+        result.incentive_logs.append(_m(message, extra=get_extra_info(info)).to_full_string())
+
     def _append_soft_price_limit_incentive_log(self, result: JobResult) -> None:
-        # DAH-2327: surface the zero-incentive reason in the customer-facing incentive
-        # log (JobResult.incentive_logs -> "Incentive Scores Calculation Logs"), the exact
-        # block the miner reads, at the moment the soft price limit zeros the payout.
         p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
         soft_limit = round(p90 * SOFT_LIMIT_PRICE_RATE, 4)
-        result.incentive_logs.append(
-            _m(
+        self._append_zero_incentive_reason(
+            result,
+            reason="price_above_market_p90_soft_limit",
+            message=(
                 f"Unrented incentive set to 0: price ${result.executor_info.price_per_gpu}/GPU/h "
                 f"exceeds the market soft price limit ${soft_limit} (p90 ${p90} x "
                 f"{SOFT_LIMIT_PRICE_RATE}). Lower the price to ${soft_limit} or below to receive "
-                f"the unrented incentive.",
-                extra=get_extra_info({
-                    "executor_id": str(result.executor_info.uuid),
-                    "gpu_model": result.gpu_model,
-                    "gpu_count": result.gpu_count,
-                    "price_per_gpu": result.executor_info.price_per_gpu,
-                    "machine_price_p90": p90,
-                    "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
-                    "soft_limit_threshold": soft_limit,
-                    "reason": "price_above_market_p90_soft_limit",
-                }),
-            ).to_full_string()
+                f"the unrented incentive."
+            ),
+            extra={
+                "price_per_gpu": result.executor_info.price_per_gpu,
+                "machine_price_p90": p90,
+                "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
+                "soft_limit_threshold": soft_limit,
+            },
         )
 
     @staticmethod
@@ -465,6 +477,14 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
+            self._append_zero_incentive_reason(
+                job_result,
+                reason="spot_tier",
+                message=(
+                    "No subnet incentive: this executor is on the spot tier, which is "
+                    "excluded from both the mining and unrented incentive pools."
+                ),
+            )
             return job_result
 
         if is_missing_discord_after_cutoff(job_result):
@@ -484,6 +504,14 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
+            self._append_zero_incentive_reason(
+                job_result,
+                reason="provider_discord_not_connected",
+                message=(
+                    "No subnet incentive: provider Discord is not connected. Connect your "
+                    "provider Discord to this executor to become eligible for incentive."
+                ),
+            )
             return job_result
 
         if job_result.is_new_rentals_paused and not job_result.is_rented:
@@ -502,6 +530,14 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
+            self._append_zero_incentive_reason(
+                job_result,
+                reason="new_rentals_paused",
+                message=(
+                    "No subnet incentive: this executor is paused for new rentals, which "
+                    "excludes it from both incentive pools. Resume new rentals to become eligible."
+                ),
+            )
             return job_result
 
         if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
@@ -520,6 +556,14 @@ class RentalPriceIncentive(DefaultIncentive):
             )
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
+            self._append_zero_incentive_reason(
+                job_result,
+                reason="miner_default_job",
+                message=(
+                    "No subnet incentive: this executor is running the miner's own default job "
+                    "instead of a Lium job, which is excluded from both incentive pools."
+                ),
+            )
             return job_result
 
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
