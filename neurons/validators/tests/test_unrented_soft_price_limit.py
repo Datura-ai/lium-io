@@ -272,13 +272,13 @@ async def test_eligible_zero_capacity_bucket_appends_reason():
     assert "H200" in log
 
 
-def test_evaluate_hard_exclusion_returns_first_match_and_none():
+def test_reason_excluded_from_both_pools_returns_first_match_and_none():
     # The evaluator is the single source of truth: first matching reason wins,
     # None for a clean executor.
     incentive = _build_incentive()
 
-    assert incentive._evaluate_hard_exclusion(_make_job(1.0)) is None
-    assert incentive._evaluate_hard_exclusion(_make_job(1.0, is_spot=True)).reason == "spot_tier"
+    assert incentive._reason_excluded_from_both_pools(_make_job(1.0)) is None
+    assert incentive._reason_excluded_from_both_pools(_make_job(1.0, is_spot=True)).reason == "spot_tier"
     # spot precedes discord when both apply — order is preserved
     both = _make_job(1.0, is_spot=True, provider_discord_connected=False)
-    assert incentive._evaluate_hard_exclusion(both).reason == "spot_tier"
+    assert incentive._reason_excluded_from_both_pools(both).reason == "spot_tier"
