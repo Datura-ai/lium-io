@@ -1715,7 +1715,8 @@ def test_ssh_bootstrap_script_uses_single_watchdog_with_30_second_sleep(docker_s
     """The watchdog loop is single-instance and checks sshd every 30 seconds."""
     script = docker_service._ssh_bootstrap_script_path().read_text()
 
-    assert 'WATCHDOG_PIDFILE="/run/sshd-watchdog.pid"' in script
+    assert 'WATCHDOG_PIDFILE="$RUN_DIR/sshd-watchdog.pid"' in script
+    assert 'RUN_DIR="${LIUM_RUN_DIR:-/run}"' in script
     assert 'WATCHDOG_LOG="/tmp/sshd-watchdog.log"' in script
     assert 'SLEEP_SECONDS=30' in script
     assert 'kill -0 "$watchdog_pid"' in script

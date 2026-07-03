@@ -386,9 +386,25 @@ async def test_ships_sshd_true_with_jupyter(svc, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_key_injection_runs_after_shipped_sshd_bootstrap(svc, monkeypatch):
+async def test_key_injection_runs_before_sshd_bootstrap(svc, monkeypatch):
+    """DAH-2341: keys are plain data (mkdir + append) with no dependency on a
+    running sshd, and the bootstrap may spend a grace period waiting for an
+    image-provided sshd — whichever sshd comes up first must already find the
+    customer's keys in place."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
+
+    exec_texts_at_bootstrap: list[str] = []
+
+    async def _snapshot_then_succeed(*args, **kwargs):
+        exec_texts_at_bootstrap.extend(
+            " ".join(spec.argv) for spec in _docker_client(svc).exec_specs
+        )
+        return True
+
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.side_effect = (
+        _snapshot_then_succeed
+    )
 
     keys = ["ssh-ed25519 key-one", "ssh-ed25519 key-two"]
     result = await _run(svc, _payload(ships_sshd=True, user_public_keys=keys))
@@ -402,6 +418,9 @@ async def test_key_injection_runs_after_shipped_sshd_bootstrap(svc, monkeypatch)
     assert len(authorized) == 1
     assert "key-one" in authorized[0].stdin
     assert "key-two" in authorized[0].stdin
+    assert any("authorized_keys" in text for text in exec_texts_at_bootstrap), (
+        "public keys must already be injected when the sshd bootstrap starts"
+    )
 
 
 # ------------------------------------------------------------------
