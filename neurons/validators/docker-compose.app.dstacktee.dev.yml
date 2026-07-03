@@ -24,11 +24,14 @@ services:
       - redis_data:/data
 
   dstack-verifier:
-    image: dstacktee/dstack-verifier@sha256:3f36162ca8dd2d4207601a6302881de6b497e610eb44050bb0874776fc8ded07
+    # DAH-2338: verifier 0.5.11 — dcap-qvl 0.3.10 (CVE-2026-22696) + dstack-mr support
+    # for dstack 0.5.11 OS images; still verifies the legacy 0.5.5 images.
+    image: dstacktee/dstack-verifier@sha256:06a20b777e59196c7f54b0cd02ffe567df6d05ae39a0b2fea9cb0642fb23c1fd
     restart: unless-stopped
     environment:
-      # DAH-2311: fetch the Lium-built OS image measurements (NVIDIA 595.71.05) from the
-      # private-ml-sdk release. {OS_IMAGE_HASH} is substituted by the verifier, not compose.
+      # Measurement bundles are hash-named (mr_<os_image_hash>.tar.gz), so this one URL
+      # template serves both the legacy 0.5.5 image and the upstream 0.5.11 image.
+      # {OS_IMAGE_HASH} is substituted by the verifier, not compose.
       - DSTACK_VERIFIER_IMAGE_DOWNLOAD_URL=https://github.com/Datura-ai/private-ml-sdk/releases/download/v0.5.5/mr_{OS_IMAGE_HASH}.tar.gz
 
   validator:
