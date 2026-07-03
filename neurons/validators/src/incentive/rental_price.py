@@ -395,9 +395,10 @@ class RentalPriceIncentive(DefaultIncentive):
         # update incentive logs
         miner_log.rental_incentive_calculated(hotkey, result, bucket).write_to_miner_log(result)
 
-        # DAH-2327: an eligible unrented executor still finalizes at 0 when its gpu-count
-        # bucket has no unrented capacity (cap multiplier -> 0 -> effective rate -> 0). Tell
-        # the miner, otherwise the "calculated successfully" line above shows 0 with no reason.
+        # DAH-2327: an eligible unrented executor still finalizes at 0 when any factor of
+        # effective_rate collapses to 0 (no bucket capacity, driver below minimum, no
+        # sysbox). Tell the miner which one, otherwise the "calculated successfully" line
+        # above shows incentive 0 with no reason.
         if result.unrented_cap_multiplier == 0:
             miner_log.no_payout_because_no_unrented_capacity_for_gpu_count(
                 gpu_count=result.gpu_count,
@@ -406,6 +407,14 @@ class RentalPriceIncentive(DefaultIncentive):
                 max_cap=result.max_cap,
                 cap_multiplier=result.unrented_cap_multiplier,
                 total_rental_cost=result.total_rental_cost,
+            ).write_to_miner_log(result)
+        elif result.driver_multiplier == 0:
+            miner_log.no_payout_because_nvidia_driver_below_minimum(
+                result.nvidia_driver_version, result.driver_multiplier
+            ).write_to_miner_log(result)
+        elif result.sysbox_multiplier == 0:
+            miner_log.no_payout_because_sysbox_not_enabled(
+                result.sysbox_runtime
             ).write_to_miner_log(result)
 
         # aggregate miner incentives
