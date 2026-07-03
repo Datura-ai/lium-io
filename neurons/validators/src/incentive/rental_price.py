@@ -17,11 +17,11 @@ import bittensor
 from pydantic import BaseModel, Field
 
 from core.config import get_total_burn_emission, settings, shared_client
-from core.utils import _m, get_extra_info, get_logger
-from incentive import zero_incentive_reasons as reasons
+from core.utils import _m, get_logger
+from incentive import miner_incentive_log as miner_log
 from incentive.config import BASE_GPU_MAP
 from incentive.eligibility import is_missing_discord_after_cutoff
-from incentive.zero_incentive_reasons import ZeroIncentiveReason
+from incentive.miner_incentive_log import ZeroIncentiveReason
 
 if TYPE_CHECKING:
     from incentive.config import IncentiveConfig
@@ -219,13 +219,13 @@ class RentalPriceIncentive(DefaultIncentive):
         gated later by the rental-pool-only soft price limit).
         """
         if job_result.is_spot:
-            return reasons.spot_tier()
+            return miner_log.spot_tier()
         if is_missing_discord_after_cutoff(job_result):
-            return reasons.provider_discord_not_connected(job_result.provider_discord_connected)
+            return miner_log.provider_discord_not_connected(job_result.provider_discord_connected)
         if job_result.is_new_rentals_paused and not job_result.is_rented:
-            return reasons.new_rentals_paused()
+            return miner_log.new_rentals_paused()
         if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
-            return reasons.miner_default_job()
+            return miner_log.miner_default_job()
         return None
 
     @staticmethod
@@ -393,39 +393,13 @@ class RentalPriceIncentive(DefaultIncentive):
         )
 
         # update incentive logs
-        result.incentive_logs.append(
-            _m(
-                "Rental price incentive for executor is calculated successfully. Formula: rental_share * gpu_count * effective_rate / total_rental_cost",
-                extra=get_extra_info({
-                    "hotkey": hotkey,
-                    "executor_id": str(result.executor_info.uuid),
-                    "gpu_model": result.gpu_model,
-                    "gpu_count": result.gpu_count,
-                    "hourly_rate": result.hourly_rate,
-                    "sysbox_runtime": result.sysbox_runtime,
-                    "sysbox_multiplier": result.sysbox_multiplier,
-                    "provider_discord_connected": result.provider_discord_connected,
-                    "nvidia_driver_version": result.nvidia_driver_version,
-                    "driver_multiplier": result.driver_multiplier,
-                    "unrented_cap_multiplier": result.unrented_cap_multiplier,
-                    "effective_rate": result.effective_rate,
-                    "total_unrented_by_gpu_type": result.total_unrented_by_gpu_type,
-                    "count_bucket": bucket,
-                    "max_cap": result.max_cap,
-                    "cap_dilution_applied": result.cap_dilution_applied,
-                    "rental_share": result.rental_share,
-                    "burn_share": result.burn_share,
-                    "incentive": result.incentive,
-                    "total_rental_cost": result.total_rental_cost,
-                }),
-            ).to_full_string()
-        )
+        miner_log.rental_incentive_calculated(hotkey, result, bucket).write_to_miner_log(result)
 
         # DAH-2327: an eligible unrented executor still finalizes at 0 when its gpu-count
         # bucket has no unrented capacity (cap multiplier -> 0 -> effective rate -> 0). Tell
         # the miner, otherwise the "calculated successfully" line above shows 0 with no reason.
         if result.unrented_cap_multiplier == 0:
-            reasons.no_unrented_capacity(
+            miner_log.no_unrented_capacity(
                 gpu_count=result.gpu_count,
                 gpu_model=result.gpu_model,
                 count_bucket=bucket,
@@ -496,7 +470,7 @@ class RentalPriceIncentive(DefaultIncentive):
             if settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT:
                 eligible_for_rental_share = False
                 p90 = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
-                reasons.price_over_soft_limit(
+                miner_log.price_over_soft_limit(
                     job_result.executor_info.price_per_gpu, p90, SOFT_LIMIT_PRICE_RATE
                 ).write_to_miner_log(job_result)
 
@@ -532,7 +506,7 @@ class RentalPriceIncentive(DefaultIncentive):
             if base_model not in self.config.rental_incentive_gpu_types and (
                 job_result.score > 0 or job_result.job_score > 0
             ):
-                reasons.gpu_model_not_in_unrented_program(
+                miner_log.gpu_model_not_in_unrented_program(
                     job_result.gpu_model
                 ).write_to_miner_log(job_result)
             return job_result

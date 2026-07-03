@@ -10,6 +10,7 @@ import bittensor
 
 from core.config import get_total_burn_emission, settings
 from core.utils import _m, get_extra_info, get_logger
+from incentive import miner_incentive_log as miner_log
 from incentive.base import BaseIncentive
 from services.task_service import JobResult
 
@@ -107,38 +108,14 @@ class DefaultIncentive(BaseIncentive):
             result: Job execution result to process
         """
         if result.mining_score is None:
-            result.incentive_logs.append(
-                _m(
-                    "Mining score is not set for job result. This should not happen.",
-                    extra=get_extra_info({
-                        "hotkey": hotkey,
-                        "executor_id": str(result.executor_info.uuid),
-                        "score": result.score,
-                        "job_score": result.job_score,
-                        "gpu_model": result.gpu_model,
-                        "gpu_count": result.gpu_count,
-                    }),
-                ).to_full_string()
-            )
+            miner_log.mining_score_missing(hotkey, result).write_to_miner_log(result)
             return result
 
         result.incentive = (self.mining_share * result.mining_score / self.total_mining_score) if self.total_mining_score > 0 else 0.0
         self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
-        result.incentive_logs.append(
-            _m(
-                "Incentive score is calculated successfully. Formula: mining_share * mining_score / total_mining_score",
-                extra=get_extra_info({
-                    "hotkey": hotkey,
-                    "executor_id": str(result.executor_info.uuid),
-                    "mining_score": result.mining_score,
-                    "total_mining_score": self.total_mining_score,
-                    "mining_share": self.mining_share,
-                    "gpu_model": result.gpu_model,
-                    "gpu_count": result.gpu_count,
-                    "incentive": result.incentive,
-                }),
-            ).to_full_string()
-        )
+        miner_log.mining_incentive_calculated(
+            hotkey, result, self.total_mining_score, self.mining_share
+        ).write_to_miner_log(result)
         return result
 
     async def calculate_executor_score(
@@ -228,29 +205,9 @@ class DefaultIncentive(BaseIncentive):
         job_result.mining_score *= (
             job_result.sysbox_multiplier * job_result.uptime_multiplier * job_result.driver_multiplier
         )
-        log = _m(
-            "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier * driver_multiplier",
-            extra=get_extra_info(
-                {
-                    "executor_id": str(job_result.executor_info.uuid),
-                    "gpu_model": job_result.gpu_model,
-                    "gpu_count": job_result.gpu_count,
-                    "sysbox_multiplier": job_result.sysbox_multiplier,
-                    "driver_multiplier": job_result.driver_multiplier,
-                    "nvidia_driver_version": job_result.nvidia_driver_version,
-                    "uptime_multiplier": job_result.uptime_multiplier,
-                    "mining_score": job_result.mining_score,
-                    "gpu_portion": job_result.gpu_portion,
-                    "total_gpu_count": job_result.total_gpu_count,
-                    "rental_created": job_result.rental_created_at,
-                    "is_rented_after_cutoff": is_rented_after_cutoff,
-                }
-            ),
-        )
-        job_result.incentive_logs.append(
-            log.to_full_string()
-        )
-        logger.info(log)
+        line = miner_log.mining_score_calculated(job_result, is_rented_after_cutoff)
+        line.write_to_miner_log(job_result)
+        logger.info(line.as_internal_log())
         return job_result
 
     async def calculate_final_weights(
