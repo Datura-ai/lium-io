@@ -234,8 +234,8 @@ class RentalPriceIncentive(DefaultIncentive):
                 reason="spot_tier",
                 log_event="Executor excluded from both pools - spot tier",
                 customer_message=(
-                    "No subnet incentive: this executor is on the spot tier, which is "
-                    "excluded from both the mining and unrented incentive pools."
+                    "No subnet incentive: this executor is on the spot tier, and spot-tier "
+                    "executors do not earn subnet incentive."
                 ),
             )
         if is_missing_discord_after_cutoff(job_result):
@@ -244,7 +244,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 log_event="Executor excluded from both pools - provider Discord not connected",
                 customer_message=(
                     "No subnet incentive: provider Discord is not connected. Connect your "
-                    "provider Discord to this executor to become eligible for incentive."
+                    "provider Discord for this executor to start earning incentive."
                 ),
                 log_extra={"provider_discord_connected": job_result.provider_discord_connected},
             )
@@ -253,8 +253,8 @@ class RentalPriceIncentive(DefaultIncentive):
                 reason="new_rentals_paused",
                 log_event="Executor excluded from both pools - paused for new rentals",
                 customer_message=(
-                    "No subnet incentive: this executor is paused for new rentals, which "
-                    "excludes it from both incentive pools. Resume new rentals to become eligible."
+                    "No subnet incentive: this executor is paused for new rentals and earns "
+                    "nothing while paused. Resume new rentals to start earning again."
                 ),
             )
         if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
@@ -262,8 +262,8 @@ class RentalPriceIncentive(DefaultIncentive):
                 reason="miner_default_job",
                 log_event="Executor excluded from both pools - running miner's own default job",
                 customer_message=(
-                    "No subnet incentive: this executor is running the miner's own default job "
-                    "instead of a Lium job, which is excluded from both incentive pools."
+                    "No subnet incentive: this executor is running your own default job instead "
+                    "of a Lium job, and executors on your own job do not earn subnet incentive."
                 ),
             )
         return None
@@ -292,10 +292,10 @@ class RentalPriceIncentive(DefaultIncentive):
             result,
             reason="price_above_market_p90_soft_limit",
             message=(
-                f"Unrented incentive set to 0: price ${result.executor_info.price_per_gpu}/GPU/h "
-                f"exceeds the market soft price limit ${soft_limit} (p90 ${p90} x "
-                f"{SOFT_LIMIT_PRICE_RATE}). Lower the price to ${soft_limit} or below to receive "
-                f"the unrented incentive."
+                f"No unrented incentive: your price ${result.executor_info.price_per_gpu}/GPU/h is "
+                f"above the market soft price limit ${soft_limit} (90th-percentile market rate "
+                f"${p90} x {SOFT_LIMIT_PRICE_RATE}). Lower the price to ${soft_limit} or below to "
+                f"earn the unrented incentive."
             ),
             extra={
                 "price_per_gpu": result.executor_info.price_per_gpu,
