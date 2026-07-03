@@ -587,21 +587,28 @@ class RentalPriceIncentive(DefaultIncentive):
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
+            # NOT a penalty: an unrented executor of an eligible GPU model is intentionally
+            # taken out of the mining pool and paid from the unrented rental-share pool
+            # instead (its incentive is computed later in _post_process_job_result). A
+            # mining_score of 0 here is expected and does not mean the executor earns 0.
             logger.info(
                 _m(
-                    "Executor excluded from mining pool - unrented eligible GPU",
+                    "Unrented eligible GPU routed to the rental-share pool "
+                    "(earns there; not scored in the mining pool, so mining_score=0 is expected)",
                     extra={
                         "executor_id": str(job_result.executor_info.uuid),
                         "gpu_model": job_result.gpu_model,
                         "gpu_count": job_result.gpu_count,
                         "reason": "unrented_and_eligible",
+                        "mining_score": 0,
+                        "earns_in_pool": "rental_share",
                         "score": 0,
                         "pool": "rental_only",
                     },
                 )
             )
             job_result.mining_score = 0
-            return job_result # Exclude from mining pool
+            return job_result  # earns via rental-share pool, not mining
 
         if not job_result.is_rented:
             job_result.mining_score = 0
