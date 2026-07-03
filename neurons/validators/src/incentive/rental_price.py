@@ -11,7 +11,7 @@ rental subsidy. See `incentive/config.py:MAX_UNRENTED_GPUS_BY_TYPE`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import bittensor
 from pydantic import BaseModel, Field
@@ -112,6 +112,19 @@ class RentalPriceEstimate(BaseModel):
     total_rental_cost: float | None = None              # Total rental cost for the executor in this cycle for scoring logic
 
 
+class IncentiveDecision(BaseModel):
+    """Why a validated executor is excluded from BOTH incentive pools (earns 0).
+
+    Single source of truth shared by the internal observability log, the
+    customer-facing incentive log, and the scoring exit (DAH-2327).
+    """
+
+    reason: str                     # machine-readable code, e.g. "spot_tier"
+    log_event: str                  # internal logger.info event string
+    customer_message: str           # customer-facing incentive_logs message
+    log_extra: dict[str, Any] = {}  # extra fields for the internal structured log
+
+
 class RentalPriceIncentive(DefaultIncentive):
     """Rental price incentive algorithm.
 
@@ -208,6 +221,52 @@ class RentalPriceIncentive(DefaultIncentive):
                 },
             )
         )
+
+    def _evaluate_hard_exclusion(self, job_result: JobResult) -> IncentiveDecision | None:
+        """First reason (if any) the executor is excluded from BOTH incentive pools.
+
+        Order matters: the first matching rule wins, mirroring the original sequential
+        checks. Returns None when no hard exclusion applies (executor may still be
+        gated later by the rental-pool-only soft price limit).
+        """
+        if job_result.is_spot:
+            return IncentiveDecision(
+                reason="spot_tier",
+                log_event="Executor excluded from both pools - spot tier",
+                customer_message=(
+                    "No subnet incentive: this executor is on the spot tier, which is "
+                    "excluded from both the mining and unrented incentive pools."
+                ),
+            )
+        if is_missing_discord_after_cutoff(job_result):
+            return IncentiveDecision(
+                reason="provider_discord_not_connected",
+                log_event="Executor excluded from both pools - provider Discord not connected",
+                customer_message=(
+                    "No subnet incentive: provider Discord is not connected. Connect your "
+                    "provider Discord to this executor to become eligible for incentive."
+                ),
+                log_extra={"provider_discord_connected": job_result.provider_discord_connected},
+            )
+        if job_result.is_new_rentals_paused and not job_result.is_rented:
+            return IncentiveDecision(
+                reason="new_rentals_paused",
+                log_event="Executor excluded from both pools - paused for new rentals",
+                customer_message=(
+                    "No subnet incentive: this executor is paused for new rentals, which "
+                    "excludes it from both incentive pools. Resume new rentals to become eligible."
+                ),
+            )
+        if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
+            return IncentiveDecision(
+                reason="miner_default_job",
+                log_event="Executor excluded from both pools - running miner's own default job",
+                customer_message=(
+                    "No subnet incentive: this executor is running the miner's own default job "
+                    "instead of a Lium job, which is excluded from both incentive pools."
+                ),
+            )
+        return None
 
     def _append_zero_incentive_reason(
         self, result: JobResult, reason: str, message: str, extra: dict | None = None
@@ -461,17 +520,22 @@ class RentalPriceIncentive(DefaultIncentive):
         Returns:
             Calculated score (0 for unrented eligible GPUs, normal score otherwise)
         """
-        if job_result.is_spot:
+        # Hard exclusions: reasons a validated executor earns 0 from BOTH pools.
+        # One evaluator so the internal log, the customer-facing incentive log, and the
+        # scoring decision all read from the same source and cannot drift (DAH-2327).
+        hard_exclusion = self._evaluate_hard_exclusion(job_result)
+        if hard_exclusion is not None:
             logger.info(
                 _m(
-                    "Executor excluded from both pools - spot tier",
+                    hard_exclusion.log_event,
                     extra={
                         "executor_id": str(job_result.executor_info.uuid),
                         "gpu_model": job_result.gpu_model,
                         "gpu_count": job_result.gpu_count,
-                        "reason": "spot_tier",
+                        "reason": hard_exclusion.reason,
                         "score": 0,
                         "pool": "none",
+                        **hard_exclusion.log_extra,
                     },
                 )
             )
@@ -479,90 +543,8 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.eligible_for_rental_share = False
             self._append_zero_incentive_reason(
                 job_result,
-                reason="spot_tier",
-                message=(
-                    "No subnet incentive: this executor is on the spot tier, which is "
-                    "excluded from both the mining and unrented incentive pools."
-                ),
-            )
-            return job_result
-
-        if is_missing_discord_after_cutoff(job_result):
-            logger.info(
-                _m(
-                    "Executor excluded from both pools - provider Discord not connected",
-                    extra={
-                        "executor_id": str(job_result.executor_info.uuid),
-                        "gpu_model": job_result.gpu_model,
-                        "gpu_count": job_result.gpu_count,
-                        "provider_discord_connected": job_result.provider_discord_connected,
-                        "reason": "provider_discord_not_connected",
-                        "score": 0,
-                        "pool": "none",
-                    },
-                )
-            )
-            job_result.mining_score = 0
-            job_result.eligible_for_rental_share = False
-            self._append_zero_incentive_reason(
-                job_result,
-                reason="provider_discord_not_connected",
-                message=(
-                    "No subnet incentive: provider Discord is not connected. Connect your "
-                    "provider Discord to this executor to become eligible for incentive."
-                ),
-            )
-            return job_result
-
-        if job_result.is_new_rentals_paused and not job_result.is_rented:
-            logger.info(
-                _m(
-                    "Executor excluded from both pools - paused for new rentals",
-                    extra={
-                        "executor_id": str(job_result.executor_info.uuid),
-                        "gpu_model": job_result.gpu_model,
-                        "gpu_count": job_result.gpu_count,
-                        "reason": "new_rentals_paused",
-                        "score": 0,
-                        "pool": "none",
-                    },
-                )
-            )
-            job_result.mining_score = 0
-            job_result.eligible_for_rental_share = False
-            self._append_zero_incentive_reason(
-                job_result,
-                reason="new_rentals_paused",
-                message=(
-                    "No subnet incentive: this executor is paused for new rentals, which "
-                    "excludes it from both incentive pools. Resume new rentals to become eligible."
-                ),
-            )
-            return job_result
-
-        if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
-            logger.info(
-                _m(
-                    "Executor excluded from both pools - running miner's own default job",
-                    extra={
-                        "executor_id": str(job_result.executor_info.uuid),
-                        "gpu_model": job_result.gpu_model,
-                        "gpu_count": job_result.gpu_count,
-                        "reason": "miner_default_job",
-                        "score": 0,
-                        "pool": "none",
-                    },
-                )
-            )
-            job_result.mining_score = 0
-            job_result.eligible_for_rental_share = False
-            self._append_zero_incentive_reason(
-                job_result,
-                reason="miner_default_job",
-                message=(
-                    "No subnet incentive: this executor is running the miner's own default job "
-                    "instead of a Lium job, which is excluded from both incentive pools."
-                ),
+                reason=hard_exclusion.reason,
+                message=hard_exclusion.customer_message,
             )
             return job_result
 

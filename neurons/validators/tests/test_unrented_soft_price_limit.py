@@ -263,3 +263,15 @@ async def test_eligible_executor_has_no_zero_incentive_reason(monkeypatch):
     log = "\n".join(result.incentive_logs)
     assert "set to 0" not in log
     assert "No subnet incentive" not in log
+
+
+def test_evaluate_hard_exclusion_returns_first_match_and_none():
+    # The evaluator is the single source of truth: first matching reason wins,
+    # None for a clean executor.
+    incentive = _build_incentive()
+
+    assert incentive._evaluate_hard_exclusion(_make_job(1.0)) is None
+    assert incentive._evaluate_hard_exclusion(_make_job(1.0, is_spot=True)).reason == "spot_tier"
+    # spot precedes discord when both apply — order is preserved
+    both = _make_job(1.0, is_spot=True, provider_discord_connected=False)
+    assert incentive._evaluate_hard_exclusion(both).reason == "spot_tier"
