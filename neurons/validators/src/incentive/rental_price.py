@@ -122,7 +122,7 @@ class IncentiveDecision(BaseModel):
     reason: str                     # machine-readable code, e.g. "spot_tier"
     log_event: str                  # internal logger.info event string
     customer_message: str           # customer-facing incentive_logs message
-    log_extra: dict[str, Any] = {}  # extra fields for the internal structured log
+    log_extra: dict[str, Any] = Field(default_factory=dict)  # extra fields for the internal structured log
 
 
 class RentalPriceIncentive(DefaultIncentive):
