@@ -14,14 +14,14 @@ HOW A NODE PICKS A POOL:
 WHAT THIS CATALOG HOLDS (the miner-facing log block, JobResult.incentive_logs,
 delivered via MACHINE_SPEC_CHANNEL):
 
-1. ZERO-INCENTIVE REASONS — why a validated node earns 0:
+1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
+   because <reason>" in the miner's log (`no_payout_because_*` builders):
    Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
-     executor_on_spot_tier, provider_discord_not_connected,
-     executor_paused_for_new_rentals, running_miners_own_default_job
+     spot tier, Discord not connected, paused for new rentals, running own default job
    Group B — idle but does not qualify for the unrented pool:
-     gpu_model_not_in_unrented_program (earns only when rented),
-     executor_price_above_market_soft_limit (miner's asking price over the ceiling -> lower it),
-     no_unrented_capacity_for_gpu_count (no cap left for that GPU-count tier this cycle)
+     GPU model not in the unrented program (earns only when rented),
+     price above the market soft limit (lower the price to earn),
+     no unrented capacity for that GPU-count tier this cycle
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
@@ -75,7 +75,7 @@ class ZeroIncentiveReason(BaseModel):
 
 # ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─────
 
-def executor_on_spot_tier() -> ZeroIncentiveReason:
+def no_payout_because_spot_tier() -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
         reason="spot_tier",
         message_for_miner=(
@@ -86,7 +86,7 @@ def executor_on_spot_tier() -> ZeroIncentiveReason:
     )
 
 
-def provider_discord_not_connected(is_connected: bool) -> ZeroIncentiveReason:
+def no_payout_because_discord_not_connected(is_connected: bool) -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
         reason="provider_discord_not_connected",
         message_for_miner=(
@@ -98,7 +98,7 @@ def provider_discord_not_connected(is_connected: bool) -> ZeroIncentiveReason:
     )
 
 
-def executor_paused_for_new_rentals() -> ZeroIncentiveReason:
+def no_payout_because_paused_for_new_rentals() -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
         reason="new_rentals_paused",
         message_for_miner=(
@@ -109,7 +109,7 @@ def executor_paused_for_new_rentals() -> ZeroIncentiveReason:
     )
 
 
-def running_miners_own_default_job() -> ZeroIncentiveReason:
+def no_payout_because_running_own_default_job() -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
         reason="miner_default_job",
         message_for_miner=(
@@ -122,7 +122,7 @@ def running_miners_own_default_job() -> ZeroIncentiveReason:
 
 # ── Group B: idle but not qualified for the unrented pool ─────────────────────
 
-def gpu_model_not_in_unrented_program(gpu_model: str) -> ZeroIncentiveReason:
+def no_payout_because_gpu_model_not_in_unrented_program(gpu_model: str) -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
         reason="gpu_model_not_eligible_for_unrented_incentive",
         message_for_miner=(
@@ -133,7 +133,7 @@ def gpu_model_not_in_unrented_program(gpu_model: str) -> ZeroIncentiveReason:
     )
 
 
-def executor_price_above_market_soft_limit(price_per_gpu: float, market_p90: float, rate: float) -> ZeroIncentiveReason:
+def no_payout_because_price_above_market_soft_limit(price_per_gpu: float, market_p90: float, rate: float) -> ZeroIncentiveReason:
     soft_limit = round(market_p90 * rate, 4)
     return ZeroIncentiveReason(
         reason="price_above_market_p90_soft_limit",
@@ -151,7 +151,7 @@ def executor_price_above_market_soft_limit(price_per_gpu: float, market_p90: flo
     )
 
 
-def no_unrented_capacity_for_gpu_count(
+def no_payout_because_no_unrented_capacity_for_gpu_count(
     gpu_count: int,
     gpu_model: str,
     count_bucket: int | None,

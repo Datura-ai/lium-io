@@ -219,13 +219,13 @@ class RentalPriceIncentive(DefaultIncentive):
         gated later by the rental-pool-only soft price limit).
         """
         if job_result.is_spot:
-            return miner_log.executor_on_spot_tier()
+            return miner_log.no_payout_because_spot_tier()
         if is_missing_discord_after_cutoff(job_result):
-            return miner_log.provider_discord_not_connected(job_result.provider_discord_connected)
+            return miner_log.no_payout_because_discord_not_connected(job_result.provider_discord_connected)
         if job_result.is_new_rentals_paused and not job_result.is_rented:
-            return miner_log.executor_paused_for_new_rentals()
+            return miner_log.no_payout_because_paused_for_new_rentals()
         if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
-            return miner_log.running_miners_own_default_job()
+            return miner_log.no_payout_because_running_own_default_job()
         return None
 
     @staticmethod
@@ -399,7 +399,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # bucket has no unrented capacity (cap multiplier -> 0 -> effective rate -> 0). Tell
         # the miner, otherwise the "calculated successfully" line above shows 0 with no reason.
         if result.unrented_cap_multiplier == 0:
-            miner_log.no_unrented_capacity_for_gpu_count(
+            miner_log.no_payout_because_no_unrented_capacity_for_gpu_count(
                 gpu_count=result.gpu_count,
                 gpu_model=result.gpu_model,
                 count_bucket=bucket,
@@ -470,7 +470,7 @@ class RentalPriceIncentive(DefaultIncentive):
             if settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT:
                 eligible_for_rental_share = False
                 p90 = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
-                miner_log.executor_price_above_market_soft_limit(
+                miner_log.no_payout_because_price_above_market_soft_limit(
                     job_result.executor_info.price_per_gpu, p90, SOFT_LIMIT_PRICE_RATE
                 ).write_to_miner_log(job_result)
 
@@ -506,7 +506,7 @@ class RentalPriceIncentive(DefaultIncentive):
             if base_model not in self.config.rental_incentive_gpu_types and (
                 job_result.score > 0 or job_result.job_score > 0
             ):
-                miner_log.gpu_model_not_in_unrented_program(
+                miner_log.no_payout_because_gpu_model_not_in_unrented_program(
                     job_result.gpu_model
                 ).write_to_miner_log(job_result)
             return job_result
