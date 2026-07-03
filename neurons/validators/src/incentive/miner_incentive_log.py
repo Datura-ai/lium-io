@@ -16,11 +16,12 @@ delivered via MACHINE_SPEC_CHANNEL):
 
 1. ZERO-INCENTIVE REASONS — why a validated node earns 0:
    Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
-     spot_tier, provider_discord_not_connected, new_rentals_paused, miner_default_job
+     executor_on_spot_tier, provider_discord_not_connected,
+     executor_paused_for_new_rentals, running_miners_own_default_job
    Group B — idle but does not qualify for the unrented pool:
      gpu_model_not_in_unrented_program (earns only when rented),
-     price_over_soft_limit (priced above the market ceiling -> lower price),
-     no_unrented_capacity (no cap left for that GPU-count tier this cycle)
+     executor_price_above_market_soft_limit (miner's asking price over the ceiling -> lower it),
+     no_unrented_capacity_for_gpu_count (no cap left for that GPU-count tier this cycle)
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
@@ -74,7 +75,7 @@ class ZeroIncentiveReason(BaseModel):
 
 # ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─────
 
-def spot_tier() -> ZeroIncentiveReason:
+def executor_on_spot_tier() -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
         reason="spot_tier",
         message_for_miner=(
@@ -97,7 +98,7 @@ def provider_discord_not_connected(is_connected: bool) -> ZeroIncentiveReason:
     )
 
 
-def new_rentals_paused() -> ZeroIncentiveReason:
+def executor_paused_for_new_rentals() -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
         reason="new_rentals_paused",
         message_for_miner=(
@@ -108,7 +109,7 @@ def new_rentals_paused() -> ZeroIncentiveReason:
     )
 
 
-def miner_default_job() -> ZeroIncentiveReason:
+def running_miners_own_default_job() -> ZeroIncentiveReason:
     return ZeroIncentiveReason(
         reason="miner_default_job",
         message_for_miner=(
@@ -132,7 +133,7 @@ def gpu_model_not_in_unrented_program(gpu_model: str) -> ZeroIncentiveReason:
     )
 
 
-def price_over_soft_limit(price_per_gpu: float, market_p90: float, rate: float) -> ZeroIncentiveReason:
+def executor_price_above_market_soft_limit(price_per_gpu: float, market_p90: float, rate: float) -> ZeroIncentiveReason:
     soft_limit = round(market_p90 * rate, 4)
     return ZeroIncentiveReason(
         reason="price_above_market_p90_soft_limit",
@@ -150,7 +151,7 @@ def price_over_soft_limit(price_per_gpu: float, market_p90: float, rate: float) 
     )
 
 
-def no_unrented_capacity(
+def no_unrented_capacity_for_gpu_count(
     gpu_count: int,
     gpu_model: str,
     count_bucket: int | None,
