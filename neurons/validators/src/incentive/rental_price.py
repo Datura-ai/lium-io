@@ -112,7 +112,7 @@ class RentalPriceEstimate(BaseModel):
     total_rental_cost: float | None = None              # Total rental cost for the executor in this cycle for scoring logic
 
 
-class IncentiveDecision(BaseModel):
+class ZeroIncentiveReason(BaseModel):
     """Why a validated executor is excluded from BOTH incentive pools (earns 0).
 
     Single source of truth shared by the internal observability log, the
@@ -120,9 +120,9 @@ class IncentiveDecision(BaseModel):
     """
 
     reason: str                     # machine-readable code, e.g. "spot_tier"
-    log_event: str                  # internal logger.info event string
-    customer_message: str           # customer-facing incentive_logs message
-    log_extra: dict[str, Any] = Field(default_factory=dict)  # extra fields for the internal structured log
+    internal_log_message: str
+    message_for_miner: str
+    internal_log_fields: dict[str, Any] = Field(default_factory=dict)
 
 
 class RentalPriceIncentive(DefaultIncentive):
@@ -222,7 +222,7 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _evaluate_hard_exclusion(self, job_result: JobResult) -> IncentiveDecision | None:
+    def _reason_excluded_from_both_pools(self, job_result: JobResult) -> ZeroIncentiveReason | None:
         """First reason (if any) the executor is excluded from BOTH incentive pools.
 
         Order matters: the first matching rule wins, mirroring the original sequential
@@ -230,38 +230,38 @@ class RentalPriceIncentive(DefaultIncentive):
         gated later by the rental-pool-only soft price limit).
         """
         if job_result.is_spot:
-            return IncentiveDecision(
+            return ZeroIncentiveReason(
                 reason="spot_tier",
-                log_event="Executor excluded from both pools - spot tier",
-                customer_message=(
+                internal_log_message="Executor excluded from both pools - spot tier",
+                message_for_miner=(
                     "No subnet incentive: this executor is on the spot tier, and spot-tier "
                     "executors do not earn subnet incentive."
                 ),
             )
         if is_missing_discord_after_cutoff(job_result):
-            return IncentiveDecision(
+            return ZeroIncentiveReason(
                 reason="provider_discord_not_connected",
-                log_event="Executor excluded from both pools - provider Discord not connected",
-                customer_message=(
+                internal_log_message="Executor excluded from both pools - provider Discord not connected",
+                message_for_miner=(
                     "No subnet incentive: provider Discord is not connected. Connect your "
                     "provider Discord for this executor to start earning incentive."
                 ),
-                log_extra={"provider_discord_connected": job_result.provider_discord_connected},
+                internal_log_fields={"provider_discord_connected": job_result.provider_discord_connected},
             )
         if job_result.is_new_rentals_paused and not job_result.is_rented:
-            return IncentiveDecision(
+            return ZeroIncentiveReason(
                 reason="new_rentals_paused",
-                log_event="Executor excluded from both pools - paused for new rentals",
-                customer_message=(
+                internal_log_message="Executor excluded from both pools - paused for new rentals",
+                message_for_miner=(
                     "No subnet incentive: this executor is paused for new rentals and earns "
                     "nothing while paused. Resume new rentals to start earning again."
                 ),
             )
         if job_result.default_job_owner == DEFAULT_JOB_OWNER_MINER and not job_result.is_rented:
-            return IncentiveDecision(
+            return ZeroIncentiveReason(
                 reason="miner_default_job",
-                log_event="Executor excluded from both pools - running miner's own default job",
-                customer_message=(
+                internal_log_message="Executor excluded from both pools - running miner's own default job",
+                message_for_miner=(
                     "No subnet incentive: this executor is running your own default job instead "
                     "of a Lium job, and executors on your own job do not earn subnet incentive."
                 ),
@@ -543,19 +543,19 @@ class RentalPriceIncentive(DefaultIncentive):
         # Hard exclusions: reasons a validated executor earns 0 from BOTH pools.
         # One evaluator so the internal log, the customer-facing incentive log, and the
         # scoring decision all read from the same source and cannot drift (DAH-2327).
-        hard_exclusion = self._evaluate_hard_exclusion(job_result)
-        if hard_exclusion is not None:
+        exclusion = self._reason_excluded_from_both_pools(job_result)
+        if exclusion is not None:
             logger.info(
                 _m(
-                    hard_exclusion.log_event,
+                    exclusion.internal_log_message,
                     extra={
                         "executor_id": str(job_result.executor_info.uuid),
                         "gpu_model": job_result.gpu_model,
                         "gpu_count": job_result.gpu_count,
-                        "reason": hard_exclusion.reason,
+                        "reason": exclusion.reason,
                         "score": 0,
                         "pool": "none",
-                        **hard_exclusion.log_extra,
+                        **exclusion.internal_log_fields,
                     },
                 )
             )
@@ -563,8 +563,8 @@ class RentalPriceIncentive(DefaultIncentive):
             job_result.eligible_for_rental_share = False
             self._append_zero_incentive_reason(
                 job_result,
-                reason=hard_exclusion.reason,
-                message=hard_exclusion.customer_message,
+                reason=exclusion.reason,
+                message=exclusion.message_for_miner,
             )
             return job_result
 
