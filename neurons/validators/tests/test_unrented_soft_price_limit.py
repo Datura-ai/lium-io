@@ -200,55 +200,25 @@ async def test_shadow_mode_does_not_append_incentive_log(monkeypatch):
 # ── DAH-2327: every zero-incentive exit surfaces its reason to the miner ──────
 
 
+@pytest.mark.parametrize(
+    "job_kwargs, expected_fragments",
+    [
+        ({"is_spot": True}, ["spot", "spot_tier"]),
+        ({"provider_discord_connected": False}, ["Discord", "provider_discord_not_connected"]),
+        ({"is_new_rentals_paused": True}, ["paused", "new_rentals_paused"]),
+        ({"default_job_owner": "miner"}, ["default job", "miner_default_job"]),
+    ],
+)
 @pytest.mark.asyncio
-async def test_spot_appends_customer_facing_incentive_log():
+async def test_hard_exclusion_appends_customer_facing_incentive_log(job_kwargs, expected_fragments):
     incentive = _build_incentive()
 
-    result = await incentive.calculate_executor_score(_make_job(1.0, is_spot=True))
+    result = await incentive.calculate_executor_score(_make_job(1.0, **job_kwargs))
 
-    assert result.incentive == 0.0 or result.mining_score == 0
-    log = "\n".join(result.incentive_logs)
-    assert "spot" in log.lower()
-    assert "spot_tier" in log
-
-
-@pytest.mark.asyncio
-async def test_discord_not_connected_appends_customer_facing_incentive_log():
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(
-        _make_job(1.0, provider_discord_connected=False)
-    )
-
-    log = "\n".join(result.incentive_logs)
-    assert "Discord" in log
-    assert "provider_discord_not_connected" in log
-
-
-@pytest.mark.asyncio
-async def test_new_rentals_paused_appends_customer_facing_incentive_log():
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(
-        _make_job(1.0, is_new_rentals_paused=True)
-    )
-
-    log = "\n".join(result.incentive_logs)
-    assert "paused" in log.lower()
-    assert "new_rentals_paused" in log
-
-
-@pytest.mark.asyncio
-async def test_miner_default_job_appends_customer_facing_incentive_log():
-    incentive = _build_incentive()
-
-    result = await incentive.calculate_executor_score(
-        _make_job(1.0, default_job_owner="miner")
-    )
-
-    log = "\n".join(result.incentive_logs)
-    assert "default job" in log.lower()
-    assert "miner_default_job" in log
+    assert result.mining_score == 0
+    log = "\n".join(result.incentive_logs).lower()
+    for fragment in expected_fragments:
+        assert fragment.lower() in log
 
 
 @pytest.mark.asyncio
