@@ -585,6 +585,20 @@ class RentalPriceIncentive(DefaultIncentive):
 
         if not job_result.is_rented:
             job_result.mining_score = 0
+            # A validated idle executor whose GPU model is not in the unrented incentive
+            # program earns nothing while unrented (only rented usage earns). Tell the miner.
+            if base_model not in self.config.rental_incentive_gpu_types and (
+                job_result.score > 0 or job_result.job_score > 0
+            ):
+                self._append_zero_incentive_reason(
+                    job_result,
+                    reason="gpu_model_not_eligible_for_unrented_incentive",
+                    message=(
+                        f"No subnet incentive while idle: GPU model {job_result.gpu_model} is not "
+                        "part of the unrented (idle-node) incentive program, so this executor earns "
+                        "nothing unless rented. Rent it out to earn."
+                    ),
+                )
             return job_result
 
         # For rented or non-eligible GPUs, use parent's default scoring logic
