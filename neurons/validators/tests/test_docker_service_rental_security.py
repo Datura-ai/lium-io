@@ -811,8 +811,6 @@ async def test_port_check_filters_quote_hostile_miner_hotkey(
         miner_hotkey=HOSTILE_MINER_HOTKEY,
         keypair=Mock(),
         private_key="unused",
-        max_retries=0,
-        retry_delay=0,
         ssh_client=ssh_client,
     )
 
