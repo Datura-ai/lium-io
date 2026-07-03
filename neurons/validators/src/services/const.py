@@ -238,6 +238,9 @@ TDX_WHITELIST = {
             # DAH-2311 — dstack-nvidia 0.5.5 rebuilt with NVIDIA driver 595.71.05
             # (private-ml-sdk git_revision 0a1dcf7, prod/non-dev image)
             "dbfde5432af2762da24d2ee3f39dcb7fdb676064fce1891edab3f6d924e8dc3d",
+            # DAH-2338 — official upstream dstack-nvidia 0.5.11 (meta-dstack v0.5.11
+            # release, git_revision ce04e924, NVIDIA driver 595.58.03, prod/non-dev image)
+            "a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02",
         ]
     ),
     "COMPOSE_HASH": { # compose file hash will be vary depending on the environment (depends on lium-watchtower)

@@ -13,10 +13,11 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-OS_IMAGE_NAME=${OS:-dstack-nvidia-0.5.5}
-# DAH-2311: serve the Lium-built image (NVIDIA driver 595.71.05) from the private-ml-sdk
-# release; override OS_IMAGE_URL to point elsewhere (e.g. staging mirror).
-OS_IMAGE_URL="${OS_IMAGE_URL:-https://github.com/Datura-ai/private-ml-sdk/releases/download/v0.5.5/$OS_IMAGE_NAME.tar.gz}"
+OS_IMAGE_NAME=${OS:-dstack-nvidia-0.5.11}
+# DAH-2338: default to the official upstream image (NVIDIA driver 595.58.03 = R595 TRD1,
+# sysbox baked in). To run the legacy Lium-built 0.5.5 image, set OS=dstack-nvidia-0.5.5
+# and OS_IMAGE_URL to the private-ml-sdk v0.5.5 release asset.
+OS_IMAGE_URL="${OS_IMAGE_URL:-https://github.com/Dstack-TEE/meta-dstack/releases/download/v0.5.11/$OS_IMAGE_NAME.tar.gz}"
 THIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEY_PROVIDER_DIR="$THIS_DIR/key-provider"
 SCRIPTS_DIR="$THIS_DIR/scripts"
