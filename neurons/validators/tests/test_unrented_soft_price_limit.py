@@ -272,6 +272,53 @@ async def test_eligible_zero_capacity_bucket_appends_reason():
     assert "H200" in log
 
 
+@pytest.mark.asyncio
+async def test_eligible_driver_below_minimum_appends_reason():
+    # Live staging case (2026-07-03): driver_multiplier=0 zeroes effective_rate, so an
+    # eligible unrented executor earns 0 with no explanation. Explain why.
+    incentive = _build_incentive()
+    job = _make_job(1.0)
+    job.eligible_for_rental_share = True
+    job.hourly_rate = 5.0
+    job.sysbox_multiplier = 1.0
+    job.driver_multiplier = 0.0  # NVIDIA driver below the network minimum
+    job.nvidia_driver_version = "570.195.03"
+    job.count_bucket = 1
+    job.max_cap = 10
+    incentive.cap_multiplier_by_bucket[("H200", 1)] = 1.0  # bucket has capacity
+
+    await incentive._post_process_job_result("miner_hotkey", job)
+
+    assert job.incentive == 0
+    log = "\n".join(job.incentive_logs)
+    assert "nvidia_driver_below_minimum" in log
+    assert "570.195.03" in log
+    assert "driver" in log.lower()
+
+
+@pytest.mark.asyncio
+async def test_eligible_no_sysbox_appends_reason():
+    # sysbox_multiplier=0 (no sysbox runtime, full unrented penalty) also zeroes the
+    # effective rate -> incentive 0. Explain why.
+    incentive = _build_incentive()
+    job = _make_job(1.0)
+    job.eligible_for_rental_share = True
+    job.hourly_rate = 5.0
+    job.sysbox_multiplier = 0.0
+    job.sysbox_runtime = False
+    job.driver_multiplier = 1.0
+    job.count_bucket = 1
+    job.max_cap = 10
+    incentive.cap_multiplier_by_bucket[("H200", 1)] = 1.0  # bucket has capacity
+
+    await incentive._post_process_job_result("miner_hotkey", job)
+
+    assert job.incentive == 0
+    log = "\n".join(job.incentive_logs)
+    assert "sysbox_not_enabled" in log
+    assert "sysbox" in log.lower()
+
+
 def test_reason_excluded_from_both_pools_returns_first_match_and_none():
     # The evaluator is the single source of truth: first matching reason wins,
     # None for a clean executor.

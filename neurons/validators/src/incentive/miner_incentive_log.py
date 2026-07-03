@@ -279,3 +279,31 @@ def mining_score_missing(hotkey: str, result: JobResult) -> MinerLogLine:
             "gpu_count": result.gpu_count,
         },
     )
+
+
+def no_payout_because_nvidia_driver_below_minimum(
+    nvidia_driver_version: str, driver_multiplier: float | None
+) -> ZeroIncentiveReason:
+    return ZeroIncentiveReason(
+        reason="nvidia_driver_below_minimum",
+        message_for_miner=(
+            f"No unrented incentive: NVIDIA driver {nvidia_driver_version} is below the "
+            "minimum version required by the network. Upgrade the NVIDIA driver on this "
+            "executor to earn the unrented incentive."
+        ),
+        miner_log_fields={
+            "nvidia_driver_version": nvidia_driver_version,
+            "driver_multiplier": driver_multiplier,
+        },
+    )
+
+
+def no_payout_because_sysbox_not_enabled(sysbox_runtime: bool) -> ZeroIncentiveReason:
+    return ZeroIncentiveReason(
+        reason="sysbox_not_enabled",
+        message_for_miner=(
+            "No unrented incentive: this executor does not run the sysbox runtime, which is "
+            "required for unrented incentive. Enable sysbox on this executor to earn."
+        ),
+        miner_log_fields={"sysbox_runtime": sysbox_runtime},
+    )
