@@ -71,6 +71,13 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     job_batch_id: str
     collateral_deposited: bool
     ssh_pub_keys: list[str] | None = None
+    # CVM attestation provenance (minimal-G5: the connector must not drop these).
+    # Optional so the backend, which ignores unknown fields until it adopts them,
+    # stays compatible in both directions.
+    tee_type: str | None = None
+    attestation_digest: str | None = None
+    tdx_attestation_passed: bool | None = None
+    gpu_attestation_passed: bool | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

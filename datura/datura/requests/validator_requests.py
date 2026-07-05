@@ -55,6 +55,24 @@ class AuthenticateRequest(BaseValidatorRequest):
         return self.payload.blob_for_signing()
 
 
+def ssh_pubkey_signing_blob(public_key: str, nonce: str | None = None) -> str:
+    """Canonical message the validator signs over an SSH public key.
+
+    CRITICAL: This is the single source of truth for the validator_signature
+    format shared by the validator (signer), the miner (relay), and the
+    executor (verifier). Any change breaks signature compatibility fleet-wide.
+
+    Without a nonce the blob is the bare public key string — the format
+    deployed executors already verify. With an attestation nonce the nonce is
+    folded into the signed message so it cannot be stripped or swapped in
+    transit while keeping a valid signature (a stripped nonce downgrades the
+    verification to the legacy blob, which no longer matches the signature).
+    """
+    if not nonce:
+        return public_key
+    return f"{public_key}\nnonce:{nonce}"
+
+
 class SSHPubKeySubmitRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.SSHPubKeySubmitRequest
     public_key: bytes
@@ -62,6 +80,11 @@ class SSHPubKeySubmitRequest(BaseValidatorRequest):
     executor_id: Optional[str] = None
     is_rental_request: bool = False
     miner_hotkey: str
+    # Attestation challenge (hex-encoded 32 bytes), minted by the validator per
+    # attestation event. Relayed by the miner to each executor, which folds it
+    # into TDX report_data[32:64] and the GPU evidence nonce. Optional for
+    # backward compatibility with executors that predate the nonce channel.
+    nonce: str | None = None
 
 
 class SSHPubKeyRemoveRequest(BaseValidatorRequest):

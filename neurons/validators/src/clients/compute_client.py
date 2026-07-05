@@ -319,6 +319,10 @@ class ComputeClient:
                             price_per_gpu=data["price_per_gpu"],
                             collateral_deposited=data["collateral_deposited"],
                             ssh_pub_keys=data["ssh_pub_keys"],
+                            tee_type=data.get("tee_type"),
+                            attestation_digest=data.get("attestation_digest"),
+                            tdx_attestation_passed=data.get("tdx_attestation_passed"),
+                            gpu_attestation_passed=data.get("gpu_attestation_passed"),
                         )
 
                         async with self.lock:

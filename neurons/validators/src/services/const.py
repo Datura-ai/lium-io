@@ -243,21 +243,21 @@ TDX_WHITELIST = {
             "a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02",
         ]
     ),
-    "COMPOSE_HASH": { # compose file hash will be vary depending on the environment (depends on lium-watchtower)
-        "PROD": set(
-            [
-                "a77f05d55bdb6c8fe86f2cd76271192a0b95617f198da4700d92c20d8798d4ee",
-            ]
-        ),
-        "STAGE": set(
-            [
-                "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11",
-            ]
-        ),
-        "LOCAL": set( 
-            [
-                "2d655bf8eca15eaec6cc5800acae99eaeb21fc3dafcfcf594139c827596a7828",
-            ]
-        ),
+    # Compose-file hashes vary per environment. G2: each approved hash carries a
+    # monotonically increasing release version — append-only, next release gets the
+    # next integer. Acceptance requires version >= settings.TDX_MINIMUM_COMPOSE_VERSION
+    # ("at/above the floor", newest-wins) so a known-bad release is retired by raising
+    # the floor instead of aging out of a rolling window. Membership checks
+    # (`hash in TDX_WHITELIST["COMPOSE_HASH"][env]`) keep working on the dict keys.
+    "COMPOSE_HASH": {
+        "PROD": {
+            "a77f05d55bdb6c8fe86f2cd76271192a0b95617f198da4700d92c20d8798d4ee": 1,
+        },
+        "STAGE": {
+            "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11": 1,
+        },
+        "LOCAL": {
+            "2d655bf8eca15eaec6cc5800acae99eaeb21fc3dafcfcf594139c827596a7828": 1,
+        },
     }
 }

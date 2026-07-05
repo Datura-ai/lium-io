@@ -128,6 +128,9 @@ class Context(BaseModel):
     log_text: str | None = None
     success: bool = False
     tdx_attestation_passed: bool = False
+    # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
+    # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
+    gpu_attestation_passed: bool | None = None
 
 
 class Check(Protocol):

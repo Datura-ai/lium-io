@@ -34,6 +34,8 @@ class JobResult(BaseModel):
     attestation_digest: str | None = None
     tee_type: str | None = None
     tdx_attestation_passed: bool = False
+    # G1 — NVIDIA CC GPU attestation outcome (None = not performed)
+    gpu_attestation_passed: bool | None = None
 
     inspector_outcome: str = "SKIPPED"
 

@@ -113,6 +113,7 @@ async def submit_ssh_pubkey(
             request.public_key,
             request.validator_signature,
             request.executor_id,
+            nonce=request.nonce,
         )
         
         if request.is_rental_request and len(executors) == 1:

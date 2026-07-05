@@ -239,13 +239,16 @@ class ExecutorService:
         return result
 
     async def send_pubkey_to_executor(
-        self, executor: Executor, pubkey: str, validator_signature: str
+        self, executor: Executor, pubkey: str, validator_signature: str,
+        nonce: str | None = None,
     ) -> ExecutorSSHInfo | None:
         """TODO: Send API request to executor with pubkey
 
         Args:
             executor (Executor): Executor instance that register validator hotkey
             pubkey (str): SSH public key from validator
+            nonce (Optional[str]): Validator attestation challenge, relayed
+                verbatim (it is covered by validator_signature)
 
         Return:
             response (ExecutorSSHInfo | None): Executor SSH connection info.
@@ -259,6 +262,8 @@ class ExecutorService:
             "data_to_sign": pubkey,
             "signature": f"0x{keypair.sign(pubkey).hex()}"
         }
+        if nonce is not None:
+            payload["nonce"] = nonce
         
         base_log_extra = {
             "executor_id": str(executor.uuid),
@@ -365,12 +370,15 @@ class ExecutorService:
         pubkey: bytes,
         validator_signature: str,
         executor_id: Optional[str] = None,
+        nonce: str | None = None,
     ):
         """Register pubkeys to executors for given validator.
 
         Args:
             validator_hotkey (str): Validator hotkey
             pubkey (bytes): SSH pubkey from validator.
+            nonce (Optional[str]): Validator attestation challenge, relayed to
+                each executor untouched (covered by validator_signature).
 
         Return:
             List[dict/object]: Executors SSH connection infos that accepted validator pubkey.
@@ -378,7 +386,9 @@ class ExecutorService:
         executors = await self.get_executors_for_validator(validator_hotkey, miner_hotkey, executor_id)
         tasks = [
             asyncio.create_task(
-                self.send_pubkey_to_executor(executor, pubkey.decode("utf-8"), validator_signature),
+                self.send_pubkey_to_executor(
+                    executor, pubkey.decode("utf-8"), validator_signature, nonce=nonce
+                ),
                 name=f"{executor}.send_pubkey_to_executor",
             )
             for executor in executors

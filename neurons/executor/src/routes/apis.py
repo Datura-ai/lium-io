@@ -10,12 +10,13 @@ from typing import Annotated, Optional
 
 import bittensor
 import docker
+from datura.requests.validator_requests import ssh_pubkey_signing_blob
 from fastapi import APIRouter, Depends, Query, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from services.miner_service import MinerService
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_system_metrics, get_container_metrics
-from core.config import VALIDATOR_HOTKEY_SS58
+from core.config import VALIDATOR_HOTKEY_SS58, settings
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod
 from payloads.backend import ContainerUtilizationPayload
@@ -157,11 +158,22 @@ def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
         raise HTTPException(status_code=400, detail="Public key mismatch")
 
 
-def _validate_validator_signature(payload: UploadSShKeyPayload) -> None:
-    """Require a valid validator signature over the SSH public key."""
+def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: bool = False) -> None:
+    """Require a valid validator signature over the SSH public key.
+
+    When the request carries an attestation nonce the signature must cover
+    public_key AND nonce (datura.ssh_pubkey_signing_blob) — stripping or swapping
+    the nonce invalidates the signature. Legacy requests without a nonce keep
+    the bare-public-key format. `require_nonce` is the G3 enforcement phase:
+    attestation-relevant requests without a nonce are rejected outright.
+    """
+    if require_nonce and not payload.nonce:
+        logger.warning("Rejecting SSH-key upload without an attestation nonce (enforcement on)")
+        raise HTTPException(status_code=401, detail="Attestation nonce required")
     try:
         keypair = bittensor.Keypair(ss58_address=VALIDATOR_HOTKEY_SS58)
-        if not keypair.verify(payload.public_key, payload.validator_signature):
+        signed_blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce)
+        if not keypair.verify(signed_blob, payload.validator_signature):
             raise HTTPException(status_code=401, detail="Invalid validator signature")
         logger.info("Validator signature verification successful")
     except HTTPException:
@@ -178,7 +190,9 @@ async def upload_ssh_key(
     logger.info("upload_ssh_key route entered")
     _validate_ssh_key_consistency(payload)
     logger.info("upload_ssh_key SSH key consistency validated")
-    _validate_validator_signature(payload)
+    # The nonce requirement applies only to uploads (the attestation-bearing
+    # request); removals never carry a nonce.
+    _validate_validator_signature(payload, require_nonce=settings.REQUIRE_ATTESTATION_NONCE)
     logger.info("upload_ssh_key validator signature validated")
     logger.info("upload_ssh_key service call started")
     response = await miner_service.upload_ssh_key(payload)

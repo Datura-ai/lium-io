@@ -10,7 +10,7 @@ from clients.backend_client import BackendClient
 from core.config import settings
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from services.attestation_service import AttestationService, AttestationError
+from services.attestation_service import AttestationError, AttestationNonce, AttestationService
 from services.collateral_contract_service import CollateralContractService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
@@ -62,11 +62,13 @@ class TaskService:
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
+        attestation_nonce: AttestationNonce | None = None,
     ):
         """New pipeline-based validation task implementation."""
         attestation_digest = None
         tee_type = None
         attestation_passed = False
+        gpu_attestation_passed = None
 
         try:
             # Decrypt private key
@@ -74,10 +76,17 @@ class TaskService:
 
             # Prepare attestation host policy before SSH connection
             try:
-                known_hosts_policy, attestation_digest, tee_type = await self.attestation_service.prepare_host_policy(
+                host_policy = await self.attestation_service.prepare_host_policy(
                     executor_info,
+                    nonce=attestation_nonce,
                 )
-                attestation_passed = attestation_digest is not None
+                known_hosts_policy = host_policy.known_hosts
+                attestation_digest = host_policy.attestation_digest
+                tee_type = host_policy.tee_type
+                gpu_attestation_passed = host_policy.gpu_attestation_passed
+                # G1 invariant: a verified-bad GPU can never surface as passed
+                # (HostPolicyResult.attestation_passed requires tdx ∧ gpu-not-False).
+                attestation_passed = host_policy.attestation_passed
             except AttestationError as exc:
                 log_text = _m(
                     "Attestation failed",
@@ -109,6 +118,7 @@ class TaskService:
                     encrypted_files=encrypted_files,
                     rented_data=rented_data,
                     tdx_attestation_passed=attestation_passed,
+                    gpu_attestation_passed=gpu_attestation_passed,
                 )
 
                 # Build and run validation pipeline
@@ -138,6 +148,7 @@ class TaskService:
                 )
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
+                result.gpu_attestation_passed = gpu_attestation_passed
                 return result
 
         except Exception as e:
@@ -169,6 +180,7 @@ class TaskService:
                 sysbox_runtime=False,
                 attestation_digest=attestation_digest,
                 tee_type=tee_type,
+                gpu_attestation_passed=gpu_attestation_passed,
             )
 
 

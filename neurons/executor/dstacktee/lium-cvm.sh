@@ -432,6 +432,31 @@ new_cvm() {
     # Ensure VMs directory exists
     mkdir -p "$VMS_DIR"
 
+    # G2 (CVM attestation) — stamp the pinned executor-runner digest into the
+    # measured compose BEFORE dstack.py measures it into compose_hash. The
+    # resolved copy (not the template) is what gets attested, so the runner
+    # release is inside the trust boundary the validator whitelists.
+    if grep -q '${EXECUTOR_RUNNER_IMAGE_DIGEST}' "$compose_file"; then
+        if [ -z "$EXECUTOR_RUNNER_IMAGE_DIGEST" ]; then
+            log_error "EXECUTOR_RUNNER_IMAGE_DIGEST is not set (required to pin the measured executor-runner)"
+            log_info "Set it in $env_file to the approved runner release, e.g."
+            log_info "  EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:<digest>"
+            return 1
+        fi
+        case "$EXECUTOR_RUNNER_IMAGE_DIGEST" in
+        sha256:*) ;;
+        *)
+            log_error "EXECUTOR_RUNNER_IMAGE_DIGEST must start with 'sha256:' (got: $EXECUTOR_RUNNER_IMAGE_DIGEST)"
+            return 1
+            ;;
+        esac
+        local resolved_compose="$VMS_DIR/$cvm_name-docker-compose.yml"
+        EXECUTOR_RUNNER_IMAGE_DIGEST="$EXECUTOR_RUNNER_IMAGE_DIGEST" \
+            envsubst '${EXECUTOR_RUNNER_IMAGE_DIGEST}' <"$compose_file" >"$resolved_compose"
+        log_info "Pinned executor-runner digest into measured compose: $EXECUTOR_RUNNER_IMAGE_DIGEST"
+        compose_file="$resolved_compose"
+    fi
+
     # Build the command
     python3 $SCRIPTS_DIR/dstack.py new "$compose_file" \
         --init-script "$INIT_SCRIPT" \

@@ -158,6 +158,7 @@ class ValidatorConsumer(BaseConsumer):
                     msg.public_key,
                     msg.validator_signature,
                     msg.executor_id,
+                    nonce=msg.nonce,
                 )
                 if msg.is_rental_request and len(executors) == 1:
                     await self.invoke_rental_request_hook(

@@ -49,5 +49,19 @@ class Settings(BaseSettings):
     TDX_QUOTE_TIMEOUT: int = Field(env="TDX_QUOTE_TIMEOUT", default=60)
     SSH_HOST_KEY_PATH: str = Field(env="SSH_HOST_KEY_PATH", default="/etc/ssh/ssh_host_ed25519_key.pub")
 
+    # G1 phase-0 — NVIDIA CC GPU evidence emission. Collected ONLY when this flag
+    # is on AND the executor runs inside a dstack CVM (socket below exists): in
+    # host-mode pynvml would attest a non-CC bare-metal GPU, which must never be
+    # emitted as confidential-compute evidence (topology guard).
+    ENABLE_GPU_ATTESTATION: bool = Field(env="ENABLE_GPU_ATTESTATION", default=False)
+    # NVIDIA attestation SDK arch tag routing the evidence at NRAS ("HOPPER", "BLACKWELL").
+    GPU_ATTESTATION_ARCH: str = Field(env="GPU_ATTESTATION_ARCH", default="HOPPER")
+    # dstack guest marker; also what the dstack SDK talks to for TDX quotes.
+    DSTACK_SOCKET_PATH: str = Field(env="DSTACK_SOCKET_PATH", default="/var/run/dstack.sock")
+    # G3 enforcement phase: reject SSH-key uploads without a validator attestation
+    # nonce. Leave off until the validator fleet mints nonces (migration order:
+    # executors accept optional nonce first, then validators send, then this).
+    REQUIRE_ATTESTATION_NONCE: bool = Field(env="REQUIRE_ATTESTATION_NONCE", default=False)
+
 
 settings = Settings()

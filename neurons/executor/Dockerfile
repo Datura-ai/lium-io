@@ -38,6 +38,16 @@ COPY --from=datura . /datura
 
 RUN pdm install --prod
 
+# G1 phase-0 (DAH-2338) — NVIDIA confidential-compute GPU attestation stack.
+# Deliberately OUTSIDE the pdm lock: the nv-ppcie-verifier dependency tree is
+# heavy and fragile, so it lives in its own opt-in layer for CVM runner builds
+# only. The single pin pulls nv_attestation_sdk, the local GPU verifier
+# (cc_admin) and pynvml transitively — same pin as the private-ml-sdk reference.
+ARG INSTALL_GPU_ATTESTATION=false
+RUN if [ "$INSTALL_GPU_ATTESTATION" = "true" ]; then \
+      pdm run pip install nv-ppcie-verifier==1.5.0; \
+    fi
+
 COPY . .
 
 RUN mv /root/app/libdmcompverify.so /usr/lib/ \

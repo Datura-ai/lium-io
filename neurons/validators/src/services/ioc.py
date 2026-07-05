@@ -40,7 +40,7 @@ async def initiate_services():
     ioc["ValidationService"] = ValidationService()
     ioc["VerifyXValidationService"] = VerifyXValidationService()
     ioc["CollateralContractService"] = CollateralContractService()
-    ioc["AttestationService"] = AttestationService()
+    ioc["AttestationService"] = AttestationService(redis_service=ioc["RedisService"])
     port_tester = PortTester()
     runner = ContainerRunner()
     ioc["ExecutorConnectivityService"] = ExecutorConnectivityService(
