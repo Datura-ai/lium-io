@@ -66,7 +66,7 @@ class Validator:
         self.validation_service = ValidationService()
         self.verifyx_validation_service = VerifyXValidationService()
         self.collateral_contract_service = CollateralContractService()
-        self.attestation_service = AttestationService()
+        self.attestation_service = AttestationService(redis_service=self.redis_service)
 
         # Backend client for API requests
         keypair = settings.get_bittensor_wallet().get_hotkey()

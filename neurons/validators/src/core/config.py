@@ -204,6 +204,66 @@ class Settings(BaseSettings):
     TDX_VERIFIER_URL: str | None = Field(env="TDX_VERIFIER_URL", default=None)
     ENABLE_ATTESTATION_WHITELIST: bool = Field(env="ENABLE_ATTESTATION_WHITELIST", default=False)
 
+    # G4 — TCB/advisory enforcement (CVM attestation gap remediation).
+    # Off = warn-only telemetry: violations are logged with structured reasons but do
+    # not reject the quote. On = fail closed with AttestationError naming the value.
+    # Also gates the minimal-G5 hooks: fail-closed on an omitted quote from a
+    # previously-attested (CVM-ratcheted) executor, and the CVM score gate.
+    ENABLE_TCB_ENFORCEMENT: bool = Field(env="ENABLE_TCB_ENFORCEMENT", default=False)
+    # Comma-separated allowlists. TCB statuses other than these reject (when enforced);
+    # advisory IDs (e.g. INTEL-SA-XXXXX) not listed here reject (when enforced).
+    TDX_ALLOWED_TCB_STATUSES: str = Field(env="TDX_ALLOWED_TCB_STATUSES", default="UpToDate")
+    TDX_ALLOWED_ADVISORY_IDS: str = Field(env="TDX_ALLOWED_ADVISORY_IDS", default="")
+
+    # G3 — freshness/anti-replay nonce channel. When enabled the validator mints a
+    # 32-byte challenge per attestation event, folds it into the signed SSH-key
+    # request, and requires the executor to echo it in TDX report_data[32:64].
+    ENABLE_ATTESTATION_NONCE: bool = Field(env="ENABLE_ATTESTATION_NONCE", default=False)
+    # A nonce-bound attestation event is required at most once per this interval per
+    # miner (freshness = "bounded, provably recent", not "every wave") — GPU evidence
+    # collection is too expensive to force fleet-wide every cycle.
+    TDX_REATTEST_INTERVAL_SECONDS: int = Field(env="TDX_REATTEST_INTERVAL_SECONDS", default=3600)
+    # Issued nonce validity window; a quote echoing an older nonce is stale.
+    ATTESTATION_NONCE_TTL_SECONDS: int = Field(env="ATTESTATION_NONCE_TTL_SECONDS", default=600)
+
+    # G1 — NVIDIA GPU confidential-compute attestation (validator-side verification).
+    # Off = observe-only: nvidia_payload, when present, is verified and logged but
+    # never affects the outcome. On = a CVM executor (verified TDX quote) must supply
+    # GPU evidence bound to the issued nonce; any failure raises AttestationError.
+    ENABLE_GPU_ATTESTATION_ENFORCEMENT: bool = Field(
+        env="ENABLE_GPU_ATTESTATION_ENFORCEMENT", default=False
+    )
+    # Hosted NRAS endpoint (interim verification locus; a local nv-verifier removes
+    # this outbound SPOF before fleet enforcement — see remediation plan CD4).
+    NVIDIA_NRAS_URL: str = Field(
+        env="NVIDIA_NRAS_URL", default="https://nras.attestation.nvidia.com/v3/attest/gpu"
+    )
+    # Optional comma-separated allowlist of NRAS `hwmodel` claims (e.g. "GH100 A01 GSP BROM").
+    # Empty = no hwmodel constraint. Substring-prefix match per entry.
+    GPU_ATTESTATION_ALLOWED_HWMODELS: str = Field(env="GPU_ATTESTATION_ALLOWED_HWMODELS", default="")
+
+    # N3 — rental host-key policy. Off preserves today's behavior (a non-attestation
+    # error while building the policy falls back to unpinned SSH). On = fail closed:
+    # no host-key policy ⇒ no rental SSH.
+    ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED: bool = Field(
+        env="ENABLE_RENTAL_HOSTKEY_FAIL_CLOSED", default=False
+    )
+
+    # G2 — monotonic version floor for the measured compose (runner) releases.
+    # Whitelisted compose hashes carry a version; hashes below the floor are rejected
+    # ("≥ approved version", newest-wins — never a rolling window). 0 accepts every
+    # whitelisted hash (today's behavior).
+    TDX_MINIMUM_COMPOSE_VERSION: int = Field(env="TDX_MINIMUM_COMPOSE_VERSION", default=0)
+
+    def get_allowed_tcb_statuses(self) -> set[str]:
+        return {s.strip() for s in self.TDX_ALLOWED_TCB_STATUSES.split(",") if s.strip()}
+
+    def get_allowed_advisory_ids(self) -> set[str]:
+        return {s.strip() for s in self.TDX_ALLOWED_ADVISORY_IDS.split(",") if s.strip()}
+
+    def get_allowed_gpu_hwmodels(self) -> set[str]:
+        return {s.strip() for s in self.GPU_ATTESTATION_ALLOWED_HWMODELS.split(",") if s.strip()}
+
     # Use REST API instead of WebSocket for miner communication
     USE_REST_API: bool = Field(env="USE_REST_API", default=False)
 

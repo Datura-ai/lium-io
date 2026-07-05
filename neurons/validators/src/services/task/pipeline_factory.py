@@ -127,6 +127,7 @@ class PipelineFactory:
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
         tdx_attestation_passed: bool = False,
+        gpu_attestation_passed: bool | None = None,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -139,6 +140,7 @@ class PipelineFactory:
             public_key: Public key for SSH
             encrypted_files: Encrypted validation files
             tdx_attestation_passed: Whether TDX attestation passed
+            gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
 
         Returns:
             Configured Context ready for pipeline execution
@@ -216,6 +218,7 @@ class PipelineFactory:
             ),
             is_rental_succeed=is_rental_succeed,
             tdx_attestation_passed=tdx_attestation_passed,
+            gpu_attestation_passed=gpu_attestation_passed,
         )
 
     @staticmethod

@@ -25,6 +25,7 @@ from datura.requests.validator_requests import (
     SSHPubKeySubmitRequest,
     GetPodLogsRequest,
     AuthenticationPayload,
+    ssh_pubkey_signing_blob,
 )
 from fastapi import Depends
 from clients.validator_portal_api import ValidatorPortalAPI
@@ -164,9 +165,20 @@ class MinerService:
     def _normalize_public_key(public_key: bytes | str) -> str:
         return public_key.decode("utf-8") if isinstance(public_key, bytes) else public_key
 
-    def _sign_validator_pubkey(self, keypair: bittensor.Keypair, public_key: bytes | str) -> str:
+    def _sign_validator_pubkey(
+        self,
+        keypair: bittensor.Keypair,
+        public_key: bytes | str,
+        nonce: str | None = None,
+    ) -> str:
+        """Sign the canonical SSH-pubkey blob (see datura.ssh_pubkey_signing_blob).
+
+        Without a nonce this is the legacy signature over the bare public key.
+        When an attestation nonce rides the request it MUST be passed here so it
+        is covered by the signature — otherwise the executor rejects the request.
+        """
         pubkey = self._normalize_public_key(public_key)
-        return f"0x{keypair.sign(pubkey).hex()}"
+        return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce)).hex()}"
 
     async def request_job_to_miner(
         self,
@@ -222,12 +234,20 @@ class MinerService:
                 # generate ssh key and send it to miner
                 private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
+                # G3 — attestation event: when due, mint a challenge that executors
+                # must echo in TDX report_data[32:64] / GPU evidence. The nonce is
+                # covered by validator_signature so it cannot be stripped or swapped.
+                attestation_nonce = await self.attestation_service.maybe_issue_nonce(
+                    payload.miner_hotkey
+                )
+                nonce_hex = attestation_nonce.value_hex if attestation_nonce else None
 
                 await miner_client.send_model(
                     SSHPubKeySubmitRequest(
                         public_key=public_key,
-                        validator_signature=self._sign_validator_pubkey(my_key, public_key),
+                        validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
                         miner_hotkey=payload.miner_hotkey, # include miner's hotkey in the request
+                        nonce=nonce_hex,
                     )
                 )
 
@@ -283,6 +303,7 @@ class MinerService:
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
                                     rented_data=rented_data,
+                                    attestation_nonce=attestation_nonce,
                                 ),
                                 timeout=settings.JOB_TIME_OUT - 120
                             )
@@ -487,6 +508,7 @@ class MinerService:
                         "attestation_digest": result.attestation_digest,
                         "tee_type": result.tee_type,
                         "tdx_attestation_passed": result.tdx_attestation_passed,
+                        "gpu_attestation_passed": result.gpu_attestation_passed,
                     },
                 )
             except Exception as e:
@@ -1446,12 +1468,19 @@ class MinerService:
             
             # Generate SSH key
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
-            
+
+            # G3 — attestation event (REST path); see the WebSocket path for details.
+            attestation_nonce = await self.attestation_service.maybe_issue_nonce(
+                payload.miner_hotkey
+            )
+            nonce_hex = attestation_nonce.value_hex if attestation_nonce else None
+
             # Prepare request
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
-                validator_signature=self._sign_validator_pubkey(my_key, public_key),
+                validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
                 miner_hotkey=payload.miner_hotkey,
+                nonce=nonce_hex,
             )
             
             # Make REST API call
@@ -1506,6 +1535,7 @@ class MinerService:
                                 public_key=public_key.decode("utf-8"),
                                 encrypted_files=encrypted_files,
                                 rented_data=rented_data,
+                                attestation_nonce=attestation_nonce,
                             ),
                             timeout=settings.JOB_TIME_OUT - 120
                         )

@@ -77,5 +77,10 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
         tdx_quote=quote_json,
     )
 
-    policy, digest, _ = await service.prepare_host_policy(executor_info)
-    assert policy is not None
+    host_policy = await service.prepare_host_policy(executor_info)
+    assert host_policy.known_hosts is not None
+    assert host_policy.attestation_digest is not None
+    assert host_policy.tee_type == "dstack/tdx"
+    # No GPU evidence supplied and enforcement off → not performed, still passed.
+    assert host_policy.gpu_attestation_passed is None
+    assert host_policy.attestation_passed is True

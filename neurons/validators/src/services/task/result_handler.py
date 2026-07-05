@@ -127,6 +127,11 @@ class ResultHandler:
             "tdx_attestation_passed": context.tdx_attestation_passed,
             "is_spot": is_spot,
         }
+        # G1 — NVIDIA CC GPU attestation outcome. Only added when a verification
+        # was actually performed (None → key omitted), mirroring gpu_metrics.
+        # Rides executor.specs to the backend like tdx_attestation_passed.
+        if context.gpu_attestation_passed is not None:
+            specs["gpu_attestation_passed"] = context.gpu_attestation_passed
         # FP32 TFLOPS metrics (device-0 representative), captured by CapabilityCheck.
         # Only added when present; absent → fail-safe (TFLOPS disabled/failed). The
         # backend types this nested object as MachineSpecs.gpu_metrics.
@@ -181,6 +186,7 @@ class ResultHandler:
             rental_created_at=self._get_rental_created_at(context),
             default_job_owner=default_job_owner,
             tdx_attestation_passed=context.tdx_attestation_passed,
+            gpu_attestation_passed=context.gpu_attestation_passed,
             inspector_outcome=inspector_outcome,
         )
 

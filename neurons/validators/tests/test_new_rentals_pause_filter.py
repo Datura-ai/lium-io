@@ -98,6 +98,9 @@ def _miner_service() -> MinerService:
     service.task_service = MagicMock()
     service.redis_service = MagicMock()
     service.attestation_service = MagicMock()
+    # request_job_to_miner awaits this before submitting the SSH key (G3);
+    # None = no attestation event, the legacy path.
+    service.attestation_service.maybe_issue_nonce = AsyncMock(return_value=None)
     return service
 
 

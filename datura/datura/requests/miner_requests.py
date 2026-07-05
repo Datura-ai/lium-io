@@ -52,6 +52,10 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     price_per_gpu: float | None = None
     ssh_host_key: str | None = None
     tdx_quote: str | None = None
+    # NVIDIA confidential-compute GPU evidence, JSON-encoded
+    # {"nonce": <hex>, "arch": <str>, "evidence_list": [...]} — collected in-CVM
+    # only and bound to the same nonce as the TDX quote when one was issued.
+    nvidia_payload: str | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):
