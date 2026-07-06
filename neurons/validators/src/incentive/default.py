@@ -108,16 +108,16 @@ class DefaultIncentive(BaseIncentive):
             result: Job execution result to process
         """
         if result.mining_score is None:
-            result.incentive_logs.append(miner_log.mining_score_missing(hotkey, result).to_log_line())
+            error_report = miner_log.mining_score_missing(hotkey, result)
+            result.incentive_logs.append(error_report.to_log_line())
             return result
 
         result.incentive = (self.mining_share * result.mining_score / self.total_mining_score) if self.total_mining_score > 0 else 0.0
         self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
-        result.incentive_logs.append(
-            miner_log.mining_incentive_calculated(
-                hotkey, result, self.total_mining_score, self.mining_share
-            ).to_log_line()
+        report = miner_log.mining_incentive_calculated(
+            hotkey, result, self.total_mining_score, self.mining_share
         )
+        result.incentive_logs.append(report.to_log_line())
         return result
 
     async def calculate_executor_score(
