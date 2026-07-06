@@ -63,6 +63,8 @@ class _FakeRentalDockerClient:
         self.start_error = None
         self.stop_error = None
         self.remove_error = None
+        self.remove_volume_error = None
+        self.prune_images_error = None
 
     async def login(self, *, username: str, password: str) -> None:
         self.login_calls.append({"username": username, "password": password})
@@ -133,9 +135,13 @@ class _FakeRentalDockerClient:
         self.removed_volumes.append(
             {"volume_name": volume_name, "force": force}
         )
+        if self.remove_volume_error is not None:
+            raise self.remove_volume_error
 
     async def prune_images(self) -> None:
         self.pruned_images += 1
+        if self.prune_images_error is not None:
+            raise self.prune_images_error
 
 
 class _FakeRentalDockerFactory:
@@ -1007,6 +1013,213 @@ async def test_delete_container_failure_msg_includes_underlying_error(
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
     assert "500 Server Error: daemon exploded" in result.msg
+
+
+def _delete_container_executor_info(executor_id: str) -> ExecutorSSHInfo:
+    return ExecutorSSHInfo(
+        uuid=executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_volume_read_timeout_still_deleted(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.rental_docker_client_factory.client.remove_volume_error = Exception(
+        "Docker SDK remove volume failed: HTTPConnectionPool: Read timed out (read timeout=60)"
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_slow_volume",
+        local_volume="volume_slow",
+    )
+    executor_info = _delete_container_executor_info(payload.executor_id)
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    # container was removed; the volume timeout must not fail the undeploy
+    assert docker_service.rental_docker_client_factory.client.removed_containers == [
+        {
+            "container_name": payload.container_name,
+            "force": True,
+            "remove_volumes": True,
+        }
+    ]
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info,
+        payload.container_name,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_missing_volume_still_deleted(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.rental_docker_client_factory.client.remove_volume_error = Exception(
+        "Docker SDK remove volume failed: 404 Client Error: Not Found "
+        '("No such volume: volume_gone")'
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_retry",
+        local_volume="volume_gone",
+    )
+    executor_info = _delete_container_executor_info(payload.executor_id)
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info,
+        payload.container_name,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_prune_images_failure_still_deleted(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.rental_docker_client_factory.client.prune_images_error = Exception(
+        "Docker SDK prune images failed: 500 Server Error"
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_prune_fail",
+        local_volume="volume_ok",
+    )
+    executor_info = _delete_container_executor_info(payload.executor_id)
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    # prune ran (and raised); the local volume is still removed afterwards
+    assert docker_service.rental_docker_client_factory.client.pruned_images == 1
+    assert docker_service.rental_docker_client_factory.client.removed_volumes == [
+        {"volume_name": payload.local_volume, "force": False}
+    ]
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info,
+        payload.container_name,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_remove_container_error_fails_undeploy(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.rental_docker_client_factory.client.remove_error = Exception(
+        "Docker SDK remove container failed: 500 Server Error: daemon exploded"
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_stuck",
+        local_volume="volume_stuck",
+    )
+    executor_info = _delete_container_executor_info(payload.executor_id)
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
+    assert "500 Server Error: daemon exploded" in result.msg
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
 
 
 @pytest.mark.asyncio
