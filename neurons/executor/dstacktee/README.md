@@ -5,10 +5,12 @@ Run compute subnet executors inside Intel TDX confidential VMs with hardware att
 ## Prerequisites
 
 - Intel CPU with TDX and SGX support
-- Ubuntu 22.04+ with KVM enabled
+- Kernel with KVM TDX (Canonical intel kernel or mainline ≥ 6.16) and the boot parameters from [docs/host-setup.md](docs/host-setup.md)
 - Docker and Docker Compose
-- QEMU with TDX support
+- The dstack QEMU 9.2.1 build — **required for attestation to pass**; one-time install, see [docs/host-setup.md](docs/host-setup.md)
 - SGX devices: `/dev/sgx_enclave` and `/dev/sgx_provision`
+
+First-time host? Follow [docs/host-setup.md](docs/host-setup.md) end to end — it covers BIOS, kernel parameters, the QEMU build, and the key provider; the steps below assume a prepared host.
 
 ## Quick Start
 
@@ -97,6 +99,9 @@ RENTING_PORT_RANGE="19001,19002,19003"
 # Identity
 MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here
 ENABLE_TDX_ATTESTATION=true
+
+# Measured executor-runner release (from the release notes) — required
+EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
 
 # Resources
 CVM_VCPUS=16
