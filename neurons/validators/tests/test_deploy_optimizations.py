@@ -30,6 +30,7 @@ from payload_models.payloads import (
     now_ms,
 )
 from services.docker_service import DockerService
+from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
 
 # ------------------------------------------------------------------
 # Fixtures / helpers
@@ -65,19 +66,61 @@ def _ssh_result(exit_status: int = 0, stdout: str = "", stderr: str = ""):
 
 
 def _ssh_client(*, inspect_exit: int = 0, inspect_raises: bool = False):
-    """AsyncMock ssh connection whose `run` answers the image-inspect probe
-    deterministically and returns exit 0 for everything else."""
+    """AsyncMock ssh connection plus SDK image-probe controls.
+
+    The image presence probe moved from host-side `docker image inspect` to
+    Docker SDK data calls; keep the old test inputs so the test intent stays
+    readable while `_patch_happy` maps them onto the fake SDK client.
+    """
     client = AsyncMock()
+    client.image_exists_result = inspect_exit == 0
+    client.image_exists_error = RuntimeError("probe boom") if inspect_raises else None
 
     def _side(cmd, *args, **kwargs):
-        if "image inspect" in cmd:
-            if inspect_raises:
-                raise RuntimeError("probe boom")
-            return _ssh_result(exit_status=inspect_exit)
         return _ssh_result(exit_status=0)
 
     client.run = AsyncMock(side_effect=_side)
     return client
+
+
+class _FakeRentalDockerClient:
+    def __init__(self, *, image_exists_result: bool, image_exists_error=None):
+        self.image_exists_result = image_exists_result
+        self.image_exists_error = image_exists_error
+        self.image_exists_calls = []
+        self.pulled_images = []
+        self.run_specs = []
+        self.exec_specs = []
+
+    async def image_exists(self, *, image: str) -> bool:
+        self.image_exists_calls.append(image)
+        if self.image_exists_error is not None:
+            raise self.image_exists_error
+        return self.image_exists_result
+
+    async def pull(self, *, image: str) -> None:
+        self.pulled_images.append(image)
+
+    async def run_container(self, spec) -> None:
+        self.run_specs.append(spec)
+
+    async def exec_in_container(self, spec) -> ContainerExecResult:
+        self.exec_specs.append(spec)
+        return ContainerExecResult(exit_status=0)
+
+
+class _FakeRentalDockerFactory:
+    def __init__(self, client):
+        self.client = client
+
+    def connect(self, *, executor_info: ExecutorSSHInfo, private_key: str):
+        return self
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, *exc):
+        return None
 
 
 def _payload(**over) -> ContainerCreateRequest:
@@ -110,18 +153,27 @@ def _executor_info(payload: ContainerCreateRequest) -> ExecutorSSHInfo:
         ssh_port=2200,
         python_path="/usr/bin/python",
         root_dir="/root/app",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
     )
 
 
 def _patch_happy(svc, monkeypatch, ssh_client):
     """Stub the whole deploy flow so only the new branch logic is exercised and
     create_container reaches a real ContainerCreated."""
+    docker_client = _FakeRentalDockerClient(
+        image_exists_result=ssh_client.image_exists_result,
+        image_exists_error=ssh_client.image_exists_error,
+    )
+    svc.rental_docker_client_factory = _FakeRentalDockerFactory(docker_client)
     monkeypatch.setattr(
         "services.docker_service.asyncssh.connect",
         Mock(return_value=_ConnCtx(ssh_client)),
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
-    monkeypatch.setattr("services.docker_service.build_gpu_flags", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "services.docker_service.build_gpu_docker_config_for_executor",
+        AsyncMock(return_value=build_gpu_docker_config(["GPU-test"])),
+    )
     svc.ssh_service.decrypt_payload = Mock(return_value="private-key")
     svc.redis_service.add_pending_pod = AsyncMock()
     svc.redis_service.remove_pending_pod = AsyncMock()
@@ -146,11 +198,11 @@ def _patch_happy(svc, monkeypatch, ssh_client):
         svc, "wait_for_port_check_containers",
         AsyncMock(return_value=(True, "ok")),
     )
-    monkeypatch.setattr(svc, "_run_docker_create_with_port_retry", AsyncMock())
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock())
     monkeypatch.setattr(svc, "check_container_running", AsyncMock(return_value=True))
     monkeypatch.setattr(
         svc,
-        "install_open_ssh_server_and_start_ssh_service",
+        "install_open_ssh_server_and_start_ssh_service_with_rental_docker",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(svc, "run_jupyter", AsyncMock())
@@ -169,12 +221,16 @@ async def _run(svc, payload):
     )
 
 
-def _pull_commands(svc):
-    return [
-        c.kwargs.get("command", "")
-        for c in svc.execute_and_stream_logs.await_args_list
-        if "docker pull" in c.kwargs.get("command", "")
-    ]
+def _docker_client(svc):
+    return svc.rental_docker_client_factory.client
+
+
+def _pulled_images(svc):
+    return _docker_client(svc).pulled_images
+
+
+def _exec_argv_texts(svc):
+    return [" ".join(spec.argv) for spec in _docker_client(svc).exec_specs]
 
 
 def _ssh_run_cmds(ssh_client):
@@ -194,7 +250,7 @@ async def test_pull_skipped_when_image_present(svc, monkeypatch):
     result = await _run(svc, _payload())
 
     assert isinstance(result, ContainerCreated)
-    assert _pull_commands(svc) == [], "docker pull must NOT be issued when image is present"
+    assert _pulled_images(svc) == [], "docker pull must NOT be issued when image is present"
     pull_step = next(p for p in result.profilers if p.name == ProfilerStepName.DOCKER_PULL)
     assert pull_step.skipped is True
 
@@ -207,7 +263,7 @@ async def test_pull_runs_when_image_absent(svc, monkeypatch):
     result = await _run(svc, _payload(docker_image="daturaai/pytorch:1.2.3"))
 
     assert isinstance(result, ContainerCreated)
-    assert any("/usr/bin/docker pull daturaai/pytorch:1.2.3" in c for c in _pull_commands(svc))
+    assert _pulled_images(svc) == ["daturaai/pytorch:1.2.3"]
     pull_step = next(p for p in result.profilers if p.name == ProfilerStepName.DOCKER_PULL)
     assert not pull_step.skipped
 
@@ -221,21 +277,21 @@ async def test_probe_error_falls_through_to_pull(svc, monkeypatch):
     result = await _run(svc, _payload(docker_image="daturaai/pytorch:9.9.9"))
 
     assert isinstance(result, ContainerCreated)
-    assert any("/usr/bin/docker pull daturaai/pytorch:9.9.9" in c for c in _pull_commands(svc))
+    assert _pulled_images(svc) == ["daturaai/pytorch:9.9.9"]
 
 
 @pytest.mark.asyncio
-async def test_inspect_probe_uses_check_false(svc, monkeypatch):
+async def test_inspect_probe_uses_sdk_data_not_host_shell(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
 
-    await _run(svc, _payload())
+    payload = _payload()
+    await _run(svc, payload)
 
-    inspect_calls = [
-        c for c in ssh_client.run.await_args_list if c.args and "image inspect" in c.args[0]
-    ]
-    assert inspect_calls, "expected a docker image inspect probe"
-    assert all(c.kwargs.get("check") is False for c in inspect_calls)
+    assert _docker_client(svc).image_exists_calls == [payload.docker_image]
+    assert not any(
+        "image inspect" in command for command in _ssh_run_cmds(ssh_client)
+    )
 
 
 # ------------------------------------------------------------------
@@ -251,20 +307,20 @@ async def test_ships_sshd_true_still_runs_bootstrap(svc, monkeypatch):
     result = await _run(svc, _payload(ships_sshd=True))
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_ships_sshd_true_fails_create_when_bootstrap_fails(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    svc.install_open_ssh_server_and_start_ssh_service.return_value = False
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.return_value = False
 
     result = await _run(svc, _payload(ships_sshd=True))
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "ssh_bootstrap"
-    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -286,7 +342,7 @@ async def test_default_ships_sshd_none_runs_full_bootstrap(svc, monkeypatch):
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -297,19 +353,19 @@ async def test_ships_sshd_false_runs_install(svc, monkeypatch):
     result = await _run(svc, _payload(ships_sshd=False))
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_ships_sshd_false_preserves_lenient_bootstrap_failure(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    svc.install_open_ssh_server_and_start_ssh_service.return_value = False
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.return_value = False
 
     result = await _run(svc, _payload(ships_sshd=False))
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -325,7 +381,7 @@ async def test_ships_sshd_true_with_jupyter(svc, monkeypatch):
     result = await _run(svc, _payload(ships_sshd=True, enable_jupyter=True))
 
     assert isinstance(result, ContainerCreated)
-    svc.install_open_ssh_server_and_start_ssh_service.assert_awaited_once()
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
     svc.run_jupyter.assert_awaited_once()
 
 
@@ -338,10 +394,14 @@ async def test_key_injection_runs_after_shipped_sshd_bootstrap(svc, monkeypatch)
     result = await _run(svc, _payload(ships_sshd=True, user_public_keys=keys))
 
     assert isinstance(result, ContainerCreated)
-    authorized = [c for c in _ssh_run_cmds(ssh_client) if "authorized_keys" in c]
-    assert len(authorized) == len(keys)
-    assert any("key-one" in c for c in authorized)
-    assert any("key-two" in c for c in authorized)
+    authorized = [
+        spec
+        for spec in _docker_client(svc).exec_specs
+        if "authorized_keys" in " ".join(spec.argv)
+    ]
+    assert len(authorized) == 1
+    assert "key-one" in authorized[0].stdin
+    assert "key-two" in authorized[0].stdin
 
 
 # ------------------------------------------------------------------
@@ -415,7 +475,7 @@ async def test_summary_not_emitted_on_failure(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=1)
     _patch_happy(svc, monkeypatch, ssh_client)
     monkeypatch.setattr(
-        svc, "_run_docker_create_with_port_retry",
+        svc, "_run_rental_docker_create_with_port_retry",
         AsyncMock(side_effect=RuntimeError("docker run failed")),
     )
     mock_logger = Mock()
