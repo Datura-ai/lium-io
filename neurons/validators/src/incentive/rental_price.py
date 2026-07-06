@@ -392,7 +392,7 @@ class RentalPriceIncentive(DefaultIncentive):
         )
 
         # update incentive logs
-        report = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
+        report: MinerLogLine = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
         result.incentive_logs.append(report.to_log_line())
 
         # DAH-2327: an eligible unrented executor still finalizes at 0 when any factor of
@@ -400,13 +400,13 @@ class RentalPriceIncentive(DefaultIncentive):
         # sysbox). Tell the miner which one, otherwise the "calculated successfully" line
         # above shows incentive 0 with no reason.
         if result.unrented_cap_multiplier == 0:
-            reason = MinerLogLine.no_payout_because_no_unrented_capacity_for_gpu_count(result, bucket)
+            reason: MinerLogLine = MinerLogLine.no_payout_because_no_unrented_capacity_for_gpu_count(result, bucket)
             result.incentive_logs.append(reason.to_log_line())
         elif result.driver_multiplier == 0:
-            reason = MinerLogLine.no_payout_because_nvidia_driver_below_minimum(result)
+            reason: MinerLogLine = MinerLogLine.no_payout_because_nvidia_driver_below_minimum(result)
             result.incentive_logs.append(reason.to_log_line())
         elif result.sysbox_multiplier == 0:
-            reason = MinerLogLine.no_payout_because_sysbox_not_enabled(result)
+            reason: MinerLogLine = MinerLogLine.no_payout_because_sysbox_not_enabled(result)
             result.incentive_logs.append(reason.to_log_line())
 
         # aggregate miner incentives
@@ -470,8 +470,8 @@ class RentalPriceIncentive(DefaultIncentive):
             self._log_soft_price_limit(job_result)
             if settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT:
                 eligible_for_rental_share = False
-                p90 = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
-                reason = MinerLogLine.no_payout_because_price_above_market_soft_limit(
+                p90: float | None = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
+                reason: MinerLogLine = MinerLogLine.no_payout_because_price_above_market_soft_limit(
                     job_result, p90, SOFT_LIMIT_PRICE_RATE
                 )
                 job_result.incentive_logs.append(reason.to_log_line())
@@ -508,7 +508,7 @@ class RentalPriceIncentive(DefaultIncentive):
             if base_model not in self.config.rental_incentive_gpu_types and (
                 job_result.score > 0 or job_result.job_score > 0
             ):
-                reason = MinerLogLine.no_payout_because_gpu_model_not_in_unrented_program(job_result)
+                reason: MinerLogLine = MinerLogLine.no_payout_because_gpu_model_not_in_unrented_program(job_result)
                 job_result.incentive_logs.append(reason.to_log_line())
             return job_result
 

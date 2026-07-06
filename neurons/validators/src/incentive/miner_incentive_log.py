@@ -73,7 +73,7 @@ class MinerLogLine(BaseModel):
     Built ONLY via the named constructors below (the catalog). The constructor bakes
     every field in; rendering takes no arguments:
 
-        line = MinerLogLine.no_payout_because_spot_tier(result)
+        line: MinerLogLine = MinerLogLine.no_payout_because_spot_tier(result)
         result.incentive_logs.append(line.to_log_line())
     """
 
@@ -101,7 +101,7 @@ class MinerLogLine(BaseModel):
         internal_fields: dict[str, Any] | None = None,
     ) -> MinerLogLine:
         """Shared shape of every zero-incentive reason: executor identity + reason + incentive 0."""
-        fields = {
+        fields: dict[str, Any] = {
             "executor_id": str(result.executor_info.uuid),
             "gpu_model": result.gpu_model,
             "gpu_count": result.gpu_count,
@@ -186,8 +186,8 @@ class MinerLogLine(BaseModel):
     def no_payout_because_price_above_market_soft_limit(
         result: JobResult, market_p90: float, rate: float
     ) -> MinerLogLine:
-        price_per_gpu = result.executor_info.price_per_gpu
-        soft_limit = round(market_p90 * rate, 4)
+        price_per_gpu: float | None = result.executor_info.price_per_gpu
+        soft_limit: float = round(market_p90 * rate, 4)
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
