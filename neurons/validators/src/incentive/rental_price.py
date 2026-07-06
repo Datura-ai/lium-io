@@ -245,7 +245,7 @@ class RentalPriceIncentive(DefaultIncentive):
     def _bucket_key_str(base_model: str, bucket: int) -> str:
         return f"{base_model}·{bucket}"
 
-    async def _pre_process_job_result(self, hotkey: str, result: JobResult):
+    async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:
         """Aggregate per-`(base_model, bucket)` metrics for the rental-share
         algorithm. Bucket resolution is symmetric with the rate-resolution path
         so split-capable executors land in the bucket of their
@@ -353,7 +353,7 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    async def _post_process_job_result(self, hotkey: str, result: JobResult):
+    async def _post_process_job_result(self, hotkey: str, result: JobResult) -> JobResult | None:
         """Process a job result.
 
         Calculate incentive score for the executor.
