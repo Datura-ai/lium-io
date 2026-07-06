@@ -3,6 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 FROM gramineproject/gramine:v1.5@sha256:615849089db84477f03cd13209c08eaf6b6a3a68b4df733e097db56781935589
 
+# The base image's CA store is too old to trust download.01.org's current
+# Sectigo cert; upgrade ca-certificates from the Ubuntu repos first.
+RUN apt-get update 2>/dev/null || true
+RUN apt-get install -y --only-upgrade ca-certificates && update-ca-certificates
+
 RUN apt-get update && apt-get install -y \
     git=1:2.25.1-1ubuntu3.14 \
     build-essential=12.8ubuntu1.1 \
