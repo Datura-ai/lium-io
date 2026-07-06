@@ -29,8 +29,8 @@ delivered via MACHINE_SPEC_CHANNEL):
 
 The scoring code (rental_price.py / default.py) detects each condition where its
 data naturally lives (some per-executor upfront, some only after cohort aggregation)
-and calls the matching builder below, then `.write_to_miner_log(result)`. Open THIS
-file to see everything a miner can be told and exactly how each message reads.
+and appends the matching builder's `.to_log_line(...)` to result.incentive_logs. Open
+THIS file to see everything a miner can be told and exactly how each message reads.
 """
 
 from __future__ import annotations
@@ -54,11 +54,12 @@ class ZeroIncentiveReason(BaseModel):
     internal_log_message: str | None = None                        # set only for both-pools exclusions
     internal_log_fields: dict[str, Any] = Field(default_factory=dict)
 
-    def write_to_miner_log(self, result: JobResult) -> None:
-        """Append this reason to the executor's customer-facing incentive log.
+    def to_log_line(self, result: JobResult) -> str:
+        """Render this reason as one line for the customer-facing incentive log.
 
-        Lands in JobResult.incentive_logs -> the "Incentive Scores Calculation Logs"
-        block delivered to the miner via MACHINE_SPEC_CHANNEL (DAH-2327).
+        The caller appends the returned string to JobResult.incentive_logs (the
+        "Incentive Scores Calculation Logs" block delivered to the miner via
+        MACHINE_SPEC_CHANNEL, DAH-2327).
         """
         info = {
             "executor_id": str(result.executor_info.uuid),
@@ -68,9 +69,7 @@ class ZeroIncentiveReason(BaseModel):
             "incentive": 0.0,
             **self.miner_log_fields,
         }
-        result.incentive_logs.append(
-            _m(self.message_for_miner, extra=get_extra_info(info)).to_full_string()
-        )
+        return _m(self.message_for_miner, extra=get_extra_info(info)).to_full_string()
 
 
 # ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─────
@@ -187,8 +186,9 @@ class MinerLogLine(BaseModel):
         """The same line as an `_m` object, for mirroring into the internal logger."""
         return _m(self.message, extra=get_extra_info(self.fields))
 
-    def write_to_miner_log(self, result: JobResult) -> None:
-        result.incentive_logs.append(self.as_internal_log().to_full_string())
+    def to_log_line(self) -> str:
+        """Render this line as a string; the caller appends it to incentive_logs."""
+        return self.as_internal_log().to_full_string()
 
 
 def mining_score_calculated(result: JobResult, is_rented_after_cutoff: bool) -> MinerLogLine:
