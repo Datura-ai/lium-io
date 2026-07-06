@@ -91,9 +91,8 @@ class MinerLogLine(BaseModel):
         """The same line as an `_m` object, for mirroring into the internal logger."""
         return _m(self.message, extra=get_extra_info(self.fields))
 
-    @classmethod
+    @staticmethod
     def _no_payout(
-        cls,
         result: JobResult,
         reason: ZeroIncentiveReason,
         message: str,
@@ -110,7 +109,7 @@ class MinerLogLine(BaseModel):
             "incentive": 0.0,
             **(extra_fields or {}),
         }
-        return cls(
+        return MinerLogLine(
             message=message,
             fields=fields,
             reason=reason,
@@ -120,9 +119,9 @@ class MinerLogLine(BaseModel):
 
     # ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─
 
-    @classmethod
-    def no_payout_because_spot_tier(cls, result: JobResult) -> MinerLogLine:
-        return cls._no_payout(
+    @staticmethod
+    def no_payout_because_spot_tier(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.SPOT_TIER,
             message=(
@@ -132,9 +131,9 @@ class MinerLogLine(BaseModel):
             internal_message="Executor excluded from both pools - spot tier",
         )
 
-    @classmethod
-    def no_payout_because_discord_not_connected(cls, result: JobResult) -> MinerLogLine:
-        return cls._no_payout(
+    @staticmethod
+    def no_payout_because_discord_not_connected(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.PROVIDER_DISCORD_NOT_CONNECTED,
             message=(
@@ -145,9 +144,9 @@ class MinerLogLine(BaseModel):
             internal_fields={"provider_discord_connected": result.provider_discord_connected},
         )
 
-    @classmethod
-    def no_payout_because_paused_for_new_rentals(cls, result: JobResult) -> MinerLogLine:
-        return cls._no_payout(
+    @staticmethod
+    def no_payout_because_paused_for_new_rentals(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.NEW_RENTALS_PAUSED,
             message=(
@@ -157,9 +156,9 @@ class MinerLogLine(BaseModel):
             internal_message="Executor excluded from both pools - paused for new rentals",
         )
 
-    @classmethod
-    def no_payout_because_running_own_default_job(cls, result: JobResult) -> MinerLogLine:
-        return cls._no_payout(
+    @staticmethod
+    def no_payout_because_running_own_default_job(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.MINER_DEFAULT_JOB,
             message=(
@@ -171,9 +170,9 @@ class MinerLogLine(BaseModel):
 
     # ── Group B: idle but not qualified for the unrented pool ─────────────────
 
-    @classmethod
-    def no_payout_because_gpu_model_not_in_unrented_program(cls, result: JobResult) -> MinerLogLine:
-        return cls._no_payout(
+    @staticmethod
+    def no_payout_because_gpu_model_not_in_unrented_program(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE,
             message=(
@@ -183,13 +182,13 @@ class MinerLogLine(BaseModel):
             ),
         )
 
-    @classmethod
+    @staticmethod
     def no_payout_because_price_above_market_soft_limit(
-        cls, result: JobResult, market_p90: float, rate: float
+        result: JobResult, market_p90: float, rate: float
     ) -> MinerLogLine:
         price_per_gpu = result.executor_info.price_per_gpu
         soft_limit = round(market_p90 * rate, 4)
-        return cls._no_payout(
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
             message=(
@@ -205,11 +204,11 @@ class MinerLogLine(BaseModel):
             },
         )
 
-    @classmethod
+    @staticmethod
     def no_payout_because_no_unrented_capacity_for_gpu_count(
-        cls, result: JobResult, count_bucket: int | None
+        result: JobResult, count_bucket: int | None
     ) -> MinerLogLine:
-        return cls._no_payout(
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.NO_UNRENTED_CAPACITY_FOR_GPU_COUNT,
             message=(
@@ -225,9 +224,9 @@ class MinerLogLine(BaseModel):
             },
         )
 
-    @classmethod
-    def no_payout_because_nvidia_driver_below_minimum(cls, result: JobResult) -> MinerLogLine:
-        return cls._no_payout(
+    @staticmethod
+    def no_payout_because_nvidia_driver_below_minimum(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.NVIDIA_DRIVER_BELOW_MINIMUM,
             message=(
@@ -241,9 +240,9 @@ class MinerLogLine(BaseModel):
             },
         )
 
-    @classmethod
-    def no_payout_because_sysbox_not_enabled(cls, result: JobResult) -> MinerLogLine:
-        return cls._no_payout(
+    @staticmethod
+    def no_payout_because_sysbox_not_enabled(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.SYSBOX_NOT_ENABLED,
             message=(
@@ -255,9 +254,9 @@ class MinerLogLine(BaseModel):
 
     # ── Calculation reports: the per-cycle lines every scored node gets ───────
 
-    @classmethod
-    def mining_score_calculated(cls, result: JobResult, is_rented_after_cutoff: bool) -> MinerLogLine:
-        return cls(
+    @staticmethod
+    def mining_score_calculated(result: JobResult, is_rented_after_cutoff: bool) -> MinerLogLine:
+        return MinerLogLine(
             message=(
                 "Mining score is calculated successfully. Formula: score * gpu_portion * gpu_count "
                 "/ total_gpu_count * sysbox_multiplier * uptime_multiplier * driver_multiplier"
@@ -278,11 +277,11 @@ class MinerLogLine(BaseModel):
             },
         )
 
-    @classmethod
+    @staticmethod
     def mining_incentive_calculated(
-        cls, hotkey: str, result: JobResult, total_mining_score: float, mining_share: float
+        hotkey: str, result: JobResult, total_mining_score: float, mining_share: float
     ) -> MinerLogLine:
-        return cls(
+        return MinerLogLine(
             message=(
                 "Incentive score is calculated successfully. Formula: mining_share * mining_score "
                 "/ total_mining_score"
@@ -299,9 +298,9 @@ class MinerLogLine(BaseModel):
             },
         )
 
-    @classmethod
-    def rental_incentive_calculated(cls, hotkey: str, result: JobResult, count_bucket: int) -> MinerLogLine:
-        return cls(
+    @staticmethod
+    def rental_incentive_calculated(hotkey: str, result: JobResult, count_bucket: int) -> MinerLogLine:
+        return MinerLogLine(
             message=(
                 "Rental price incentive for executor is calculated successfully. Formula: "
                 "rental_share * gpu_count * effective_rate / total_rental_cost"
@@ -330,10 +329,10 @@ class MinerLogLine(BaseModel):
             },
         )
 
-    @classmethod
-    def mining_score_missing(cls, hotkey: str, result: JobResult) -> MinerLogLine:
+    @staticmethod
+    def mining_score_missing(hotkey: str, result: JobResult) -> MinerLogLine:
         # Internal-error case: scoring finished without a mining score. Should not happen.
-        return cls(
+        return MinerLogLine(
             message="Mining score is not set for job result. This should not happen.",
             fields={
                 "hotkey": hotkey,
