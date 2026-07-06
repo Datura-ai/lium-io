@@ -52,6 +52,7 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     price_per_gpu: float | None = None
     ssh_host_key: str | None = None
     tdx_quote: str | None = None
+    tier: str | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

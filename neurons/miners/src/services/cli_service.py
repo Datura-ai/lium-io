@@ -543,12 +543,18 @@ class CliService:
                     "address": executor.address,
                     "port": executor.port,
                     "validator": executor.validator,
-                    "price_per_gpu": executor.price_per_gpu
+                    "price_per_gpu": executor.price_per_gpu,
+                    "tier": (executor.tier or "secure"),
                 }
                 for executor in executors
             ]
             for ex in result:
-                self.logger.info(f"{ex['uuid']} {ex['address']}:{ex['port']} -> validator: {ex['validator']}, price_per_gpu (USD/gpu/h): {ex['price_per_gpu']}")
+                self.logger.info(
+                    f"{ex['uuid']} {ex['address']}:{ex['port']} -> "
+                    f"validator: {ex['validator']}, "
+                    f"price_per_gpu (USD/gpu/h): {ex['price_per_gpu']}, "
+                    f"tier: {ex['tier']}"
+                )
             return True
         except Exception as e:
             self.logger.error("Failed in showing an executor: %s", str(e))

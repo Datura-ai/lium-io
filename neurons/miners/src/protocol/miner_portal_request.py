@@ -56,6 +56,7 @@ class SyncExecutorPayload(BaseModel):
     address: str
     port: int
     price_per_gpu: float | None = None
+    tier: str | None = None
 
 
 class AddExecutorRequest(BaseMinerPortalRequest):
