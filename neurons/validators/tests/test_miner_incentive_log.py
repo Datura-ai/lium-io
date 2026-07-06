@@ -225,3 +225,43 @@ def test_report_line_renders_string_and_builds_internal_log():
 
     # The same content is also available as an `_m` object for the internal logger.
     assert "Mining score is calculated" in line.as_internal_log().to_full_string()
+
+
+# ── DAH-2340: structured zero-incentive reasons travel as data ────────────────
+
+def test_to_reason_payload_is_clean_subset_without_internal_fields():
+    line = MinerLogLine.no_payout_because_discord_not_connected(_job(provider_discord_connected=False))
+    payload = line.to_reason_payload()
+
+    assert payload["reason"] == "provider_discord_not_connected"
+    assert payload["message_for_miner"] == line.message
+    assert payload["executor_id"] == "exec-1"        # miner_log_fields ride along
+    assert payload["incentive"] == 0.0
+    # never leak internal-only observability data into the channel payload
+    assert "internal_message" not in payload
+    assert "pool" not in payload
+
+
+def test_record_incentive_log_keeps_zero_reason_as_text_and_data():
+    job = _job()
+    job.record_incentive_log(MinerLogLine.no_payout_because_spot_tier(job))
+
+    # human text path (unchanged, backward compatible)
+    assert any("spot tier" in entry for entry in job.incentive_logs)
+    # structured data path (new)
+    assert [r.reason for r in job.zero_incentive_reasons] == [ZeroIncentiveReason.SPOT_TIER]
+
+
+def test_record_incentive_log_ignores_calculation_reports_for_the_data_path():
+    # A calc report has reason=None: it belongs in the log text but is NOT a zero-incentive reason.
+    job = _job(mining_score=1.0)
+    job.record_incentive_log(MinerLogLine.mining_score_calculated(job, is_rented_after_cutoff=False))
+
+    assert job.incentive_logs                      # still logged as text
+    assert job.zero_incentive_reasons == []        # but not surfaced as a structured reason
+
+
+def test_earning_executor_has_no_structured_reasons_so_stale_reason_clears():
+    # Each cycle builds a fresh JobResult; an executor that earns records no reason,
+    # so the next published row carries [] and a previous cycle's reason clears (DAH-2340).
+    assert _job().zero_incentive_reasons == []

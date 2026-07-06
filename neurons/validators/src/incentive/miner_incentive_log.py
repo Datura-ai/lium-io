@@ -91,6 +91,18 @@ class MinerLogLine(BaseModel):
         """Render as one string; the caller appends it to result.incentive_logs."""
         return self.as_internal_log().to_full_string()
 
+    def to_reason_payload(self) -> dict[str, Any]:
+        """Clean machine-readable subset published on MACHINE_SPEC_CHANNEL (DAH-2340).
+
+        Carries the stable `reason` code, the miner-facing message and the structured
+        `fields` — never the internal_* observability data. Downstream keys off `reason`.
+        """
+        return {
+            "reason": self.reason.value if self.reason else None,
+            "message_for_miner": self.message,
+            **{key: value for key, value in self.fields.items() if key != "reason"},
+        }
+
     def as_internal_log(self) -> _StructuredMessage:
         """The same line as an `_m` object, for mirroring into the internal logger."""
         return _m(self.message, extra=get_extra_info(self.fields))

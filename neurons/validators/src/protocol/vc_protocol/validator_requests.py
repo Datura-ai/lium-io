@@ -55,6 +55,20 @@ class AuthenticateRequest(BaseValidatorRequest):
         return cls(payload=payload, signature=f"0x{keypair.sign(payload.blob_for_signing()).hex()}")
 
 
+class IncentiveReason(pydantic.BaseModel):
+    """One structured reason an executor earns 0 subnet incentive (DAH-2340).
+
+    `reason` is a stable, append-only machine-readable code the backend keys off;
+    `message_for_miner` is free text. Extra miner_log_fields ride along via
+    extra='allow', keeping the contract additive without a schema change.
+    """
+
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    reason: str
+    message_for_miner: str
+
+
 class ExecutorSpecRequest(BaseValidatorRequest):
     message_type: RequestType = RequestType.ExecutorSpecRequest
     miner_hotkey: str
@@ -87,6 +101,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     attestation_digest: str | None = None
     tdx_attestation_passed: bool | None = None
     gpu_attestation_passed: bool | None = None
+    incentive_reasons: list[IncentiveReason] = []
 
 
 class RentedMachineRequest(BaseValidatorRequest):
