@@ -53,6 +53,7 @@ def test_default_shared_config_has_all_fields() -> None:
     assert len(DEFAULT_SHARED_CONFIG.driver_cuda_map) > 0
     assert DEFAULT_SHARED_CONFIG.machine_max_price_rate == 3.0
     assert DEFAULT_SHARED_CONFIG.machine_min_price_rate == 0.5
+    assert DEFAULT_SHARED_CONFIG.soft_limit_price_rate == 1.1
     assert DEFAULT_SHARED_CONFIG.rental_fees_rate == 0.9
     assert DEFAULT_SHARED_CONFIG.collateral_days == 7
     assert DEFAULT_SHARED_CONFIG.collateral_contract_address == "0x7DCCb5659c70Ce2104A9bb79E9E257473ECbe628"
@@ -72,6 +73,14 @@ def test_machine_prices_p90_accepts_values_and_serializes() -> None:
     config = DEFAULT_SHARED_CONFIG.model_copy(update={"machine_prices_p90": {"NVIDIA H100 PCIe": 1.6}})
     assert config.machine_prices_p90 == {"NVIDIA H100 PCIe": 1.6}
     assert config.model_dump()["machine_prices_p90"] == {"NVIDIA H100 PCIe": 1.6}
+
+
+def test_soft_limit_price_rate_defaults_when_absent() -> None:
+    # backward-compatible: a config built without the new field falls back to 1.1
+    config = SharedConfig.model_validate(
+        {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "soft_limit_price_rate"}
+    )
+    assert config.soft_limit_price_rate == 1.1
 
 
 def test_shared_config_serializes_to_json() -> None:

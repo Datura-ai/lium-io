@@ -114,6 +114,7 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
     },
     machine_max_price_rate=3.0,
     machine_min_price_rate=0.5,
+    soft_limit_price_rate=1.1,
     rental_fees_rate=0.9,
     collateral_days=7,
     collateral_contract_address="0x7DCCb5659c70Ce2104A9bb79E9E257473ECbe628",

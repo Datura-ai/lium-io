@@ -15,6 +15,9 @@ class SharedConfig(BaseModel):
     # Scalars
     machine_max_price_rate: float
     machine_min_price_rate: float
+    # unrented incentive cutoff multiplier: an unrented executor priced above
+    # machine_prices_p90[gpu] * this rate forfeits the unrented incentive (DAH-2250)
+    soft_limit_price_rate: float = Field(default=1.1)
     rental_fees_rate: float
     collateral_days: int
     collateral_contract_address: str
