@@ -6,10 +6,32 @@ fields, and that a line actually lands in JobResult.incentive_logs.
 """
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
-from incentive.miner_incentive_log import MinerLogLine
+from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 from services.task_service import JobResult
 
 H200 = "NVIDIA H200"
+
+
+def test_reason_enum_pins_the_stable_code_contract():
+    # Append-only contract: dashboards and the backend (DAH-2340) key off these
+    # exact strings. Renaming any value is a breaking change.
+    assert {r.value for r in ZeroIncentiveReason} == {
+        "spot_tier",
+        "provider_discord_not_connected",
+        "new_rentals_paused",
+        "miner_default_job",
+        "gpu_model_not_eligible_for_unrented_incentive",
+        "price_above_market_p90_soft_limit",
+        "no_unrented_capacity_for_gpu_count",
+        "nvidia_driver_below_minimum",
+        "sysbox_not_enabled",
+    }
+
+
+def test_constructor_returns_enum_reason():
+    line = MinerLogLine.no_payout_because_spot_tier(_job())
+    assert line.reason is ZeroIncentiveReason.SPOT_TIER
+    assert line.reason == "spot_tier"  # StrEnum: JSON/string behaviour unchanged
 
 
 def _job(**overrides) -> JobResult:
