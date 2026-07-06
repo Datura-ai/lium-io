@@ -424,6 +424,12 @@ prepare_sshd_runtime
 if ! start_sshd_if_needed; then
     log "Fallback sshd start failed"
 fi
+# start_sshd_if_needed may have *adopted* an sshd that appeared concurrently
+# (either before its running-check or by losing the bind race) — that daemon
+# loaded the pre-hardening config, so nudge it like the converge path does.
+# No-op when the config did not change; redundant-but-harmless SIGHUP when
+# the daemon we just started already read the hardened config.
+reload_sshd_if_config_changed
 release_lock
 spawn_watchdog
 

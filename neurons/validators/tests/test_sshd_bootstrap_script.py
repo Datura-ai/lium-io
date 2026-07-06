@@ -9,6 +9,7 @@ of the race-safe flow runs for real without root or a container:
 - fall back to own bring-up when the image never starts sshd,
 - skip the grace wait entirely when the image ships no sshd binary,
 - tolerate losing the sshd start race (bind conflict),
+- reload the hardened config when the fallback path adopts an sshd,
 - fail (exit 1) only when sshd is genuinely not serving,
 - require a :22 listener for success, not just a process,
 - proceed after the shared setup-lock times out.
@@ -17,6 +18,7 @@ of the race-safe flow runs for real without root or a container:
 from __future__ import annotations
 
 import os
+import signal
 import stat
 import subprocess
 from pathlib import Path
@@ -285,6 +287,27 @@ def test_tolerates_losing_the_sshd_start_race(harness):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "sshd was started concurrently" in result.stdout
+
+
+def test_fallback_adopt_after_bind_race_reloads_hardened_config(harness):
+    """The adopted (image-started) sshd loaded the pre-hardening config, so the
+    fallback path must SIGHUP the master after hardening — not just converge."""
+    harness.install_sshd_bin(SSHD_LOSES_BIND_RACE)
+    master = subprocess.Popen(["/bin/sleep", "60"])
+    (harness.run_dir / "sshd.pid").write_text(f"{master.pid}\n")
+
+    try:
+        result = harness.run("--grace", "1")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "sshd was started concurrently" in result.stdout
+        assert f"Sent SIGHUP to sshd (pid {master.pid})" in result.stdout
+        # SIGHUP's default disposition terminates sleep — proof it was delivered.
+        assert master.wait(timeout=5) == -signal.SIGHUP
+    finally:
+        if master.poll() is None:
+            master.kill()
+            master.wait()
 
 
 def test_fails_when_sshd_never_serves(harness):
