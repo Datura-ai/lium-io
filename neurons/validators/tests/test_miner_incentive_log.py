@@ -105,12 +105,10 @@ def test_no_capacity_reason_carries_bucket_fields():
     assert reason.miner_log_fields["count_bucket"] == 8
 
 
-def test_write_to_miner_log_appends_message_and_reason_code():
+def test_to_log_line_renders_message_and_reason_code():
     job = _job()
-    miner_log.no_payout_because_spot_tier().write_to_miner_log(job)
+    entry = miner_log.no_payout_because_spot_tier().to_log_line(job)
 
-    assert len(job.incentive_logs) == 1
-    entry = job.incentive_logs[0]
     assert "spot tier" in entry            # human message
     assert "spot_tier" in entry            # machine reason code in the structured payload
     assert str(job.executor_info.uuid) in entry
@@ -149,12 +147,11 @@ def test_report_builder_message_and_keys(line, message_fragment, expected_keys):
         assert key in line.fields
 
 
-def test_report_line_writes_to_miner_log_and_builds_internal_log():
+def test_report_line_renders_string_and_builds_internal_log():
     job = _job(mining_score=1.0)
     line = miner_log.mining_score_calculated(job, is_rented_after_cutoff=False)
 
-    line.write_to_miner_log(job)
-    assert job.incentive_logs and "Mining score is calculated" in job.incentive_logs[0]
+    assert "Mining score is calculated" in line.to_log_line()
 
     # The same content is also available as an `_m` object for the internal logger.
     assert "Mining score is calculated" in line.as_internal_log().to_full_string()
