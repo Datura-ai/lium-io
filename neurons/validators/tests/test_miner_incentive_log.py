@@ -229,7 +229,7 @@ def test_report_line_renders_string_and_builds_internal_log():
 
 # ── DAH-2340: structured zero-incentive reasons travel as data ────────────────
 
-def test_to_reason_payload_is_clean_subset_without_internal_fields():
+def test_to_reason_payload_is_clean_subset_without_internal_fields() -> None:
     line = MinerLogLine.no_payout_because_discord_not_connected(_job(provider_discord_connected=False))
     payload = line.to_reason_payload()
 
@@ -242,7 +242,7 @@ def test_to_reason_payload_is_clean_subset_without_internal_fields():
     assert "pool" not in payload
 
 
-def test_record_incentive_log_keeps_zero_reason_as_text_and_data():
+def test_record_incentive_log_keeps_zero_reason_as_text_and_data() -> None:
     job = _job()
     job.record_incentive_log(MinerLogLine.no_payout_because_spot_tier(job))
 
@@ -252,7 +252,7 @@ def test_record_incentive_log_keeps_zero_reason_as_text_and_data():
     assert [reason["reason"] for reason in job.zero_incentive_reasons] == [ZeroIncentiveReason.SPOT_TIER]
 
 
-def test_record_incentive_log_ignores_calculation_reports_for_the_data_path():
+def test_record_incentive_log_ignores_calculation_reports_for_the_data_path() -> None:
     # A calc report has reason=None: it belongs in the log text but is NOT a zero-incentive reason.
     job = _job(mining_score=1.0)
     job.record_incentive_log(MinerLogLine.mining_score_calculated(job, is_rented_after_cutoff=False))

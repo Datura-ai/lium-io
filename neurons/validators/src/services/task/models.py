@@ -77,10 +77,12 @@ class JobResult(BaseModel):
     seconds_per_block: int | None = None
     fixed_ratio: float | None = None
 
-    
-    incentive_logs: list[str] = []
+
+    # Delivery buffers with dedicated export paths (full_log_text, direct publish);
+    # excluded so no model_dump ever serializes them raw.
+    incentive_logs: list[str] = Field(default_factory=list, exclude=True)
     # DAH-2340 wire payloads for the backend; [] when the executor earns normally
-    zero_incentive_reasons: list[dict[str, Any]] = []
+    zero_incentive_reasons: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
 
     def record_incentive_log(self, line: "MinerLogLine") -> None:
         """Append the line to the miner-facing log; zero-incentive lines also become data for the backend."""

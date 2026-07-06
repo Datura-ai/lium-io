@@ -101,7 +101,8 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     attestation_digest: str | None = None
     tdx_attestation_passed: bool | None = None
     gpu_attestation_passed: bool | None = None
-    incentive_reasons: list[IncentiveReason] = []
+    # None = validator predates DAH-2340 (key absent); [] = evaluated, earns normally
+    incentive_reasons: list[IncentiveReason] | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

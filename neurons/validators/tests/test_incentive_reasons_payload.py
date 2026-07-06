@@ -3,15 +3,17 @@ zero-incentive reasons as DATA, and the validator ExecutorSpecRequest that goes
 over the WebSocket validates them into typed IncentiveReason objects — the reason
 never has to be parsed back out of log_text downstream.
 """
+from typing import Any
+
 from incentive.miner_incentive_log import MinerLogLine
 from protocol.vc_protocol.validator_requests import ExecutorSpecRequest, IncentiveReason
 
 pytest_plugins = ["fixtures.incentive_fixtures"]
 
 
-def _spec(reasons: list[dict] | None = None) -> ExecutorSpecRequest:
+def _spec(reasons: list[dict[str, Any]] | None = None) -> ExecutorSpecRequest:
     """Build the ExecutorSpecRequest exactly as the redis→WS bridge does; omit reasons like an old payload would."""
-    request_kwargs: dict = dict(
+    request_kwargs: dict[str, Any] = dict(
         miner_hotkey="hk",
         miner_coldkey="ck",
         validator_hotkey="vk",
@@ -31,7 +33,7 @@ def _spec(reasons: list[dict] | None = None) -> ExecutorSpecRequest:
     return ExecutorSpecRequest(**request_kwargs)
 
 
-def test_published_payload_carries_reason_codes_as_data_not_just_log_text(create_job_result):
+def test_published_payload_carries_reason_codes_as_data_not_just_log_text(create_job_result) -> None:
     job = create_job_result()
     job.record_incentive_log(MinerLogLine.no_payout_because_spot_tier(job))
 
@@ -43,7 +45,7 @@ def test_published_payload_carries_reason_codes_as_data_not_just_log_text(create
     assert spec.incentive_reasons[0].message_for_miner  # miner-facing text present
 
 
-def test_extra_miner_log_fields_survive_on_the_typed_model(create_job_result):
+def test_extra_miner_log_fields_survive_on_the_typed_model(create_job_result) -> None:
     job = create_job_result()
     job.executor_info = job.executor_info.model_copy(update={"price_per_gpu": 4.23})
     job.record_incentive_log(
@@ -57,5 +59,5 @@ def test_extra_miner_log_fields_survive_on_the_typed_model(create_job_result):
     assert reason.model_dump()["soft_limit_threshold"] == 4.2262
 
 
-def test_missing_key_defaults_to_empty_list_for_backward_compat():
-    assert _spec().incentive_reasons == []
+def test_payload_without_the_key_parses_as_none_meaning_not_reported() -> None:
+    assert _spec().incentive_reasons is None

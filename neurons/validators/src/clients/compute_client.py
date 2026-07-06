@@ -317,7 +317,7 @@ class ComputeClient:
                             incentive_formula_version=data.get("incentive_formula_version"),
                             incentive_formula_inputs=data.get("incentive_formula_inputs"),
                             log_text=data["log_text"],
-                            incentive_reasons=data.get("incentive_reasons", []),
+                            incentive_reasons=data.get("incentive_reasons"),
                             miner_hotkey=data["miner_hotkey"],
                             miner_coldkey=data["miner_coldkey"],
                             validator_hotkey=validator_hotkey,
