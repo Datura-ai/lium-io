@@ -3864,42 +3864,88 @@ class DockerService:
                         ),
                     )
 
+                # DAH-2345: the container is gone once remove_container succeeds; a failure
+                # in any post-container teardown step below must not fail the undeploy, or the
+                # backend retries a doomed request and penalizes the miner for a pod that is
+                # already removed. Each step is guarded individually and only logged on error.
+
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
+                # (self-guarding: logs and never raises)
                 await self._cleanup_custom_build_artifacts(
                     ssh_client=ssh_client,
                     pod_id=payload.pod_id,
                     default_extra=default_extra,
                 )
 
-                await run_logged_rental_docker_sdk_operation(
-                    operation="prune_images",
-                    log_extra=default_extra,
-                    call=docker_client.prune_images,
-                )
+                try:
+                    await run_logged_rental_docker_sdk_operation(
+                        operation="prune_images",
+                        log_extra=default_extra,
+                        call=docker_client.prune_images,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            "delete_container post-teardown step failed (non-fatal)",
+                            extra=get_extra_info(
+                                {**default_extra, "step": "prune_images", "error": str(exc)}
+                            ),
+                        ),
+                    )
 
                 if payload.local_volume:
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="remove_volume",
-                        log_extra=default_extra,
-                        call=lambda: docker_client.remove_volume(
-                            volume_name=payload.local_volume
-                        ),
-                        volume_name=payload.local_volume,
-                        volume_role="local",
-                    )
+                    try:
+                        await run_logged_rental_docker_sdk_operation(
+                            operation="remove_volume",
+                            log_extra=default_extra,
+                            call=lambda: docker_client.remove_volume(
+                                volume_name=payload.local_volume
+                            ),
+                            volume_name=payload.local_volume,
+                            volume_role="local",
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "delete_container post-teardown step failed (non-fatal)",
+                                extra=get_extra_info(
+                                    {
+                                        **default_extra,
+                                        "step": "remove_volume_local",
+                                        "volume_name": payload.local_volume,
+                                        "error": str(exc),
+                                    }
+                                ),
+                            ),
+                        )
 
                 if payload.external_volume:
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="remove_volume",
-                        log_extra=default_extra,
-                        call=lambda: docker_client.remove_volume(
-                            volume_name=payload.external_volume
-                        ),
-                        volume_name=payload.external_volume,
-                        volume_role="external",
-                    )
-                    await self.disable_s3fs_volume_plugin(ssh_client)
+                    try:
+                        await run_logged_rental_docker_sdk_operation(
+                            operation="remove_volume",
+                            log_extra=default_extra,
+                            call=lambda: docker_client.remove_volume(
+                                volume_name=payload.external_volume
+                            ),
+                            volume_name=payload.external_volume,
+                            volume_role="external",
+                        )
+                        await self.disable_s3fs_volume_plugin(ssh_client)
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "delete_container post-teardown step failed (non-fatal)",
+                                extra=get_extra_info(
+                                    {
+                                        **default_extra,
+                                        "step": "remove_volume_external",
+                                        "volume_name": payload.external_volume,
+                                        "error": str(exc),
+                                    }
+                                ),
+                            ),
+                        )
 
                 logger.info(
                     _m(
@@ -3915,21 +3961,42 @@ class DockerService:
                     ),
                 )
 
-                await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
+                try:
+                    await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            "delete_container post-teardown step failed (non-fatal)",
+                            extra=get_extra_info(
+                                {**default_extra, "step": "remove_rented_machine", "error": str(exc)}
+                            ),
+                        ),
+                    )
+
                 # Stop inspector only after the last customer pod leaves this executor.
-                if (
-                    settings.ENABLE_INSPECTOR
-                    and payload.workload_kind != WorkloadKind.FILLER
-                    and not await self._has_rented_customer_containers(executor_info)
-                ):
-                    await self._run_inspector_collector_lifecycle(
-                        ssh_client=ssh_client,
-                        executor_info=executor_info,
-                        action="stop",
-                        default_extra={
-                            **default_extra,
-                            "container_name": payload.container_name,
-                        },
+                try:
+                    if (
+                        settings.ENABLE_INSPECTOR
+                        and payload.workload_kind != WorkloadKind.FILLER
+                        and not await self._has_rented_customer_containers(executor_info)
+                    ):
+                        await self._run_inspector_collector_lifecycle(
+                            ssh_client=ssh_client,
+                            executor_info=executor_info,
+                            action="stop",
+                            default_extra={
+                                **default_extra,
+                                "container_name": payload.container_name,
+                            },
+                        )
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            "delete_container post-teardown step failed (non-fatal)",
+                            extra=get_extra_info(
+                                {**default_extra, "step": "inspector_stop", "error": str(exc)}
+                            ),
+                        ),
                     )
 
                 # Port release now handled by backend
