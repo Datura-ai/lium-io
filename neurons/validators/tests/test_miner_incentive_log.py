@@ -235,12 +235,12 @@ def test_to_incentive_reason_is_clean_subset_without_internal_fields() -> None:
 
     assert reason.reason == "provider_discord_not_connected"
     assert reason.message_for_miner == line.message
-    payload = reason.model_dump()
-    assert payload["executor_id"] == "exec-1"        # miner_log_fields ride along
-    assert payload["incentive"] == 0.0
-    # never leak internal-only observability data into the channel payload
-    assert "internal_message" not in payload
-    assert "pool" not in payload
+    assert reason.context["executor_id"] == "exec-1"        # miner_log_fields ride along
+    assert reason.context["incentive"] == 0.0
+    # never leak internal-only observability data or duplicate the top-level code
+    assert "internal_message" not in reason.context
+    assert "pool" not in reason.context
+    assert "reason" not in reason.context
 
 
 def test_record_incentive_log_keeps_zero_reason_as_text_and_data() -> None:

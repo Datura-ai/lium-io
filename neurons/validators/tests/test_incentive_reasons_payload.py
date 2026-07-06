@@ -45,7 +45,7 @@ def test_published_payload_carries_reason_codes_as_data_not_just_log_text(create
     assert spec.incentive_reasons[0].message_for_miner  # miner-facing text present
 
 
-def test_extra_miner_log_fields_survive_on_the_typed_model(create_job_result) -> None:
+def test_miner_log_fields_survive_in_the_context_field(create_job_result) -> None:
     job = create_job_result()
     job.executor_info = job.executor_info.model_copy(update={"price_per_gpu": 4.23})
     job.record_incentive_log(
@@ -55,8 +55,8 @@ def test_extra_miner_log_fields_survive_on_the_typed_model(create_job_result) ->
 
     reason = spec.incentive_reasons[0]
     assert reason.reason == "price_above_market_p90_soft_limit"
-    # extra='allow' keeps the structured context next to the stable code
-    assert reason.model_dump()["soft_limit_threshold"] == 4.2262
+    # the per-reason details ride in the explicit context field
+    assert reason.context["soft_limit_threshold"] == 4.2262
 
 
 def test_payload_without_the_key_parses_as_none_meaning_not_reported() -> None:

@@ -43,7 +43,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 from core.utils import _m, _StructuredMessage, get_extra_info
 
@@ -78,15 +78,14 @@ class IncentiveReason(BaseModel):
 
     Single definition for the whole validator: built here by the catalog
     (`MinerLogLine.to_incentive_reason`) and reused by `ExecutorSpecRequest`.
-    `reason` is a stable, append-only machine-readable code the backend keys off;
-    `message_for_miner` is free text. Extra miner_log_fields ride along via
-    extra='allow', keeping the contract additive without a schema change.
+    The contract stays additive by growing `context` keys, never by renaming.
     """
 
-    model_config = ConfigDict(extra="allow")
-
-    reason: str
-    message_for_miner: str
+    reason: str               # stable, APPEND-ONLY machine-readable code the backend keys off
+    message_for_miner: str    # free text, may change any time
+    # per-reason details shown next to the message, e.g. soft_limit_threshold,
+    # gpu_model, gpu_count, executor_id, incentive
+    context: dict[str, Any] = Field(default_factory=dict)
 
 
 class MinerLogLine(BaseModel):
@@ -111,8 +110,9 @@ class MinerLogLine(BaseModel):
 
     def to_incentive_reason(self) -> IncentiveReason:
         """Typed wire reason for MACHINE_SPEC_CHANNEL (DAH-2340): zero-incentive lines only, never internal_* fields."""
-        # model_validate, not kwargs: fields already carries "reason" (for Loki extra) — later key wins.
-        return IncentiveReason.model_validate({**self.fields, "reason": self.reason.value, "message_for_miner": self.message})
+        # fields carries "reason" for the Loki extra; in the wire model the code already sits top-level.
+        context: dict[str, Any] = {key: value for key, value in self.fields.items() if key != "reason"}
+        return IncentiveReason(reason=self.reason.value, message_for_miner=self.message, context=context)
 
     def as_internal_log(self) -> _StructuredMessage:
         """The same line as an `_m` object, for mirroring into the internal logger."""
