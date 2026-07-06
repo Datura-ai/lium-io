@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
-from core.utils import _m, get_extra_info
+from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
     from services.task_service import JobResult
@@ -87,7 +87,7 @@ class MinerLogLine(BaseModel):
         """Render as one string; the caller appends it to result.incentive_logs."""
         return _m(self.message, extra=get_extra_info(self.fields)).to_full_string()
 
-    def as_internal_log(self):
+    def as_internal_log(self) -> _StructuredMessage:
         """The same line as an `_m` object, for mirroring into the internal logger."""
         return _m(self.message, extra=get_extra_info(self.fields))
 

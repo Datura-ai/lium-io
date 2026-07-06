@@ -86,7 +86,7 @@ class DefaultIncentive(BaseIncentive):
         self.miner_incentives = {}
         self.mining_share = 1 - self.burn_share
 
-    async def _pre_process_job_result(self, hotkey: str, result: JobResult):
+    async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Process a job result.
 
         Args:
@@ -101,7 +101,7 @@ class DefaultIncentive(BaseIncentive):
             self.failed_executors += 1
         return result
 
-    async def _post_process_job_result(self, hotkey: str, result: JobResult):
+    async def _post_process_job_result(self, hotkey: str, result: JobResult) -> JobResult:
         """Process a job result.
 
         Args:
