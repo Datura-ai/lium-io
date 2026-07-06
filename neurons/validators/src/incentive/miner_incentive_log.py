@@ -36,6 +36,7 @@ Open THIS file to see everything a miner can be told and exactly how each messag
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
@@ -44,6 +45,26 @@ from core.utils import _m, get_extra_info
 
 if TYPE_CHECKING:
     from services.task_service import JobResult
+
+
+class ZeroIncentiveReason(StrEnum):
+    """Machine-readable codes for every reason a validated executor earns 0.
+
+    APPEND-ONLY contract: Loki dashboards and the backend (DAH-2340 structured
+    payload) key off these exact strings — renaming a value is a breaking change.
+    """
+
+    # Group A: excluded from BOTH pools
+    SPOT_TIER = "spot_tier"
+    PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
+    NEW_RENTALS_PAUSED = "new_rentals_paused"
+    MINER_DEFAULT_JOB = "miner_default_job"
+    # Group B: idle but not qualified for the unrented pool
+    GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE = "gpu_model_not_eligible_for_unrented_incentive"
+    PRICE_ABOVE_MARKET_P90_SOFT_LIMIT = "price_above_market_p90_soft_limit"
+    NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
+    NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
+    SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
 
 
 class MinerLogLine(BaseModel):
@@ -58,7 +79,7 @@ class MinerLogLine(BaseModel):
 
     message: str                                                   # plain-English, shown to the miner
     fields: dict[str, Any] = Field(default_factory=dict)           # structured payload next to the message
-    reason: str | None = None                                      # machine-readable zero-incentive code; None for reports
+    reason: ZeroIncentiveReason | None = None                      # machine-readable zero-incentive code; None for reports
     internal_message: str | None = None                            # separate internal-log wording (both-pools exclusions only)
     internal_fields: dict[str, Any] = Field(default_factory=dict)  # extra fields for that internal log
 
@@ -74,7 +95,7 @@ class MinerLogLine(BaseModel):
     def _no_payout(
         cls,
         result: JobResult,
-        reason: str,
+        reason: ZeroIncentiveReason,
         message: str,
         extra_fields: dict[str, Any] | None = None,
         internal_message: str | None = None,
@@ -103,7 +124,7 @@ class MinerLogLine(BaseModel):
     def no_payout_because_spot_tier(cls, result: JobResult) -> MinerLogLine:
         return cls._no_payout(
             result,
-            reason="spot_tier",
+            reason=ZeroIncentiveReason.SPOT_TIER,
             message=(
                 "No subnet incentive: this executor is on the spot tier, and spot-tier "
                 "executors do not earn subnet incentive."
@@ -115,7 +136,7 @@ class MinerLogLine(BaseModel):
     def no_payout_because_discord_not_connected(cls, result: JobResult) -> MinerLogLine:
         return cls._no_payout(
             result,
-            reason="provider_discord_not_connected",
+            reason=ZeroIncentiveReason.PROVIDER_DISCORD_NOT_CONNECTED,
             message=(
                 "No subnet incentive: provider Discord is not connected. Connect your "
                 "provider Discord for this executor to start earning incentive."
@@ -128,7 +149,7 @@ class MinerLogLine(BaseModel):
     def no_payout_because_paused_for_new_rentals(cls, result: JobResult) -> MinerLogLine:
         return cls._no_payout(
             result,
-            reason="new_rentals_paused",
+            reason=ZeroIncentiveReason.NEW_RENTALS_PAUSED,
             message=(
                 "No subnet incentive: this executor is paused for new rentals and earns "
                 "nothing while paused. Resume new rentals to start earning again."
@@ -140,7 +161,7 @@ class MinerLogLine(BaseModel):
     def no_payout_because_running_own_default_job(cls, result: JobResult) -> MinerLogLine:
         return cls._no_payout(
             result,
-            reason="miner_default_job",
+            reason=ZeroIncentiveReason.MINER_DEFAULT_JOB,
             message=(
                 "No subnet incentive: this executor is running your own default job instead "
                 "of a Lium job, and executors on your own job do not earn subnet incentive."
@@ -154,7 +175,7 @@ class MinerLogLine(BaseModel):
     def no_payout_because_gpu_model_not_in_unrented_program(cls, result: JobResult) -> MinerLogLine:
         return cls._no_payout(
             result,
-            reason="gpu_model_not_eligible_for_unrented_incentive",
+            reason=ZeroIncentiveReason.GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE,
             message=(
                 f"No subnet incentive while idle: GPU model {result.gpu_model} is not part of "
                 "the unrented (idle-node) incentive program, so this executor earns nothing "
@@ -170,7 +191,7 @@ class MinerLogLine(BaseModel):
         soft_limit = round(market_p90 * rate, 4)
         return cls._no_payout(
             result,
-            reason="price_above_market_p90_soft_limit",
+            reason=ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
             message=(
                 f"No unrented incentive: your price ${price_per_gpu}/GPU/h is above the market "
                 f"soft price limit ${soft_limit} (90th-percentile market rate ${market_p90} x "
@@ -190,7 +211,7 @@ class MinerLogLine(BaseModel):
     ) -> MinerLogLine:
         return cls._no_payout(
             result,
-            reason="no_unrented_capacity_for_gpu_count",
+            reason=ZeroIncentiveReason.NO_UNRENTED_CAPACITY_FOR_GPU_COUNT,
             message=(
                 f"No unrented incentive: there is currently no unrented-incentive capacity for "
                 f"{result.gpu_count}x {result.gpu_model} (its GPU-count tier has no cap this "
@@ -208,7 +229,7 @@ class MinerLogLine(BaseModel):
     def no_payout_because_nvidia_driver_below_minimum(cls, result: JobResult) -> MinerLogLine:
         return cls._no_payout(
             result,
-            reason="nvidia_driver_below_minimum",
+            reason=ZeroIncentiveReason.NVIDIA_DRIVER_BELOW_MINIMUM,
             message=(
                 f"No unrented incentive: NVIDIA driver {result.nvidia_driver_version} is below "
                 "the minimum version required by the network. Upgrade the NVIDIA driver on this "
@@ -224,7 +245,7 @@ class MinerLogLine(BaseModel):
     def no_payout_because_sysbox_not_enabled(cls, result: JobResult) -> MinerLogLine:
         return cls._no_payout(
             result,
-            reason="sysbox_not_enabled",
+            reason=ZeroIncentiveReason.SYSBOX_NOT_ENABLED,
             message=(
                 "No unrented incentive: this executor does not run the sysbox runtime, which is "
                 "required for unrented incentive. Enable sysbox on this executor to earn."
