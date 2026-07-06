@@ -89,6 +89,9 @@ class FakeApiClient:
         self.pruned_images = False
         self.created_volumes = []
         self.removed_volumes = []
+        self.removed_containers = []
+        self.remove_volume_error = None
+        self.remove_container_error = None
         self.timeout = 60
         self.closed = False
 
@@ -140,12 +143,19 @@ class FakeApiClient:
         self.pruned_images = True
         return {"ImagesDeleted": []}
 
+    def remove_container(self, container_name, **kwargs):
+        self.removed_containers.append((container_name, kwargs, self.timeout))
+        if self.remove_container_error is not None:
+            raise self.remove_container_error
+
     def create_volume(self, **kwargs):
         self.created_volumes.append({**kwargs, "client_timeout": self.timeout})
         return {"Name": kwargs.get("name")}
 
     def remove_volume(self, volume_name, **kwargs):
-        self.removed_volumes.append((volume_name, kwargs))
+        self.removed_volumes.append((volume_name, kwargs, self.timeout))
+        if self.remove_volume_error is not None:
+            raise self.remove_volume_error
 
     def close(self):
         self.closed = True
@@ -888,7 +898,13 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         timeout=133,
     )
     await client.prune_images()
-    await client.remove_volume(volume_name="volume_test", force=True)
+    await client.remove_container(
+        container_name="pod_test",
+        force=True,
+        remove_volumes=True,
+        timeout=181,
+    )
+    await client.remove_volume(volume_name="volume_test", force=True, timeout=182)
 
     assert api_client.created_volumes == [
         {
@@ -900,7 +916,29 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
     ]
     assert api_client.timeout == 60
     assert api_client.pruned_images is True
-    assert api_client.removed_volumes == [("volume_test", {"force": True})]
+    assert api_client.removed_containers == [
+        ("pod_test", {"force": True, "v": True}, 181)
+    ]
+    assert api_client.removed_volumes == [("volume_test", {"force": True}, 182)]
+
+
+@pytest.mark.asyncio
+async def test_delete_helper_restores_sdk_timeout_after_failure():
+    api_client = FakeApiClient()
+    api_client.remove_volume_error = TimeoutError("slow volume delete")
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(RentalDockerOperationError, match="slow volume delete"):
+        await client.remove_volume(
+            volume_name="volume_slow",
+            force=True,
+            timeout=182,
+        )
+
+    assert api_client.removed_volumes == [
+        ("volume_slow", {"force": True}, 182)
+    ]
+    assert api_client.timeout == 60
 
 
 @pytest.mark.asyncio

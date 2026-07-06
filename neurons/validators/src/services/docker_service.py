@@ -126,6 +126,8 @@ _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
 _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
+_DELETE_CONTAINER_TIMEOUT_SEC = 180
+_DELETE_VOLUME_TIMEOUT_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 HOST_KEY_REQUIRED_EXTRA = {
@@ -547,10 +549,12 @@ class DockerService:
                     container_name=container_name,
                     force=True,
                     remove_volumes=False,
+                    timeout=_DELETE_CONTAINER_TIMEOUT_SEC,
                 ),
                 container_name=container_name,
                 force=True,
                 remove_volumes=False,
+                timeout_seconds=_DELETE_CONTAINER_TIMEOUT_SEC,
             )
         except asyncio.CancelledError:
             raise
@@ -3839,10 +3843,12 @@ class DockerService:
                             container_name=payload.container_name,
                             force=True,
                             remove_volumes=True,
+                            timeout=_DELETE_CONTAINER_TIMEOUT_SEC,
                         ),
                         container_name=payload.container_name,
                         force=True,
                         remove_volumes=True,
+                        timeout_seconds=_DELETE_CONTAINER_TIMEOUT_SEC,
                     )
                 except Exception as exc:
                     # DAH-2345: deletion is idempotent for every workload kind — a container
@@ -3900,10 +3906,12 @@ class DockerService:
                             operation="remove_volume",
                             log_extra=default_extra,
                             call=lambda: docker_client.remove_volume(
-                                volume_name=payload.local_volume
+                                volume_name=payload.local_volume,
+                                timeout=_DELETE_VOLUME_TIMEOUT_SEC,
                             ),
                             volume_name=payload.local_volume,
                             volume_role="local",
+                            timeout_seconds=_DELETE_VOLUME_TIMEOUT_SEC,
                         )
                     except Exception as exc:
                         logger.error(
@@ -3926,10 +3934,12 @@ class DockerService:
                             operation="remove_volume",
                             log_extra=default_extra,
                             call=lambda: docker_client.remove_volume(
-                                volume_name=payload.external_volume
+                                volume_name=payload.external_volume,
+                                timeout=_DELETE_VOLUME_TIMEOUT_SEC,
                             ),
                             volume_name=payload.external_volume,
                             volume_role="external",
+                            timeout_seconds=_DELETE_VOLUME_TIMEOUT_SEC,
                         )
                         await self.disable_s3fs_volume_plugin(ssh_client)
                     except Exception as exc:

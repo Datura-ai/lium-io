@@ -117,12 +117,14 @@ class RecordingRentalDockerClient:
         container_name: str,
         force: bool = True,
         remove_volumes: bool = True,
+        timeout: int | None = None,
     ) -> None:
         self.removed_containers.append(
             {
                 "container_name": container_name,
                 "force": force,
                 "remove_volumes": remove_volumes,
+                "timeout": timeout,
             }
         )
 
@@ -143,9 +145,15 @@ class RecordingRentalDockerClient:
             }
         )
 
-    async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
+    async def remove_volume(
+        self,
+        *,
+        volume_name: str,
+        force: bool = False,
+        timeout: int | None = None,
+    ) -> None:
         self.removed_volumes.append(
-            {"volume_name": volume_name, "force": force}
+            {"volume_name": volume_name, "force": force, "timeout": timeout}
         )
 
     async def prune_images(self) -> None:
@@ -739,11 +747,12 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
             "container_name": HOSTILE_CONTAINER_NAME,
             "force": True,
             "remove_volumes": True,
+            "timeout": 180,
         }
     ]
     assert docker_client.pruned_images == 1
     assert docker_client.removed_volumes == [
-        {"volume_name": "volume_lifecycle", "force": False}
+        {"volume_name": "volume_lifecycle", "force": False, "timeout": 180}
     ]
 
 

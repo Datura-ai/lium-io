@@ -103,12 +103,14 @@ class _FakeRentalDockerClient:
         container_name: str,
         force: bool = True,
         remove_volumes: bool = True,
+        timeout: int | None = None,
     ) -> None:
         self.removed_containers.append(
             {
                 "container_name": container_name,
                 "force": force,
                 "remove_volumes": remove_volumes,
+                "timeout": timeout,
             }
         )
         if self.remove_error is not None:
@@ -131,9 +133,15 @@ class _FakeRentalDockerClient:
             }
         )
 
-    async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
+    async def remove_volume(
+        self,
+        *,
+        volume_name: str,
+        force: bool = False,
+        timeout: int | None = None,
+    ) -> None:
         self.removed_volumes.append(
-            {"volume_name": volume_name, "force": force}
+            {"volume_name": volume_name, "force": force, "timeout": timeout}
         )
         if self.remove_volume_error is not None:
             raise self.remove_volume_error
@@ -891,11 +899,12 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
             "container_name": payload.container_name,
             "force": True,
             "remove_volumes": True,
+            "timeout": 180,
         }
     ]
     assert docker_service.rental_docker_client_factory.client.pruned_images == 1
     assert docker_service.rental_docker_client_factory.client.removed_volumes == [
-        {"volume_name": payload.local_volume, "force": False}
+        {"volume_name": payload.local_volume, "force": False, "timeout": 180}
     ]
     docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
         executor_info,
@@ -956,7 +965,7 @@ async def test_delete_customer_rental_treats_missing_container_as_deleted(
     assert result.pod_id == payload.pod_id
     assert docker_service.rental_docker_client_factory.client.pruned_images == 1
     assert docker_service.rental_docker_client_factory.client.removed_volumes == [
-        {"volume_name": payload.local_volume, "force": False}
+        {"volume_name": payload.local_volume, "force": False, "timeout": 180}
     ]
     docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
         executor_info,
@@ -1074,6 +1083,7 @@ async def test_delete_container_volume_read_timeout_still_deleted(
             "container_name": payload.container_name,
             "force": True,
             "remove_volumes": True,
+            "timeout": 180,
         }
     ]
     docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
@@ -1170,7 +1180,7 @@ async def test_delete_container_prune_images_failure_still_deleted(
     # prune ran (and raised); the local volume is still removed afterwards
     assert docker_service.rental_docker_client_factory.client.pruned_images == 1
     assert docker_service.rental_docker_client_factory.client.removed_volumes == [
-        {"volume_name": payload.local_volume, "force": False}
+        {"volume_name": payload.local_volume, "force": False, "timeout": 180}
     ]
     docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
         executor_info,

@@ -249,11 +249,13 @@ class RentalDockerSdkClient:
         container_name: str,
         force: bool = True,
         remove_volumes: bool = True,
+        timeout: int | None = None,
     ) -> None:
         await self._call_api(
             container_name,
             operation_label="remove container",
             api_method=self._api_client.remove_container,
+            client_timeout=timeout,
             force=force,
             v=remove_volumes,
         )
@@ -279,11 +281,18 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK create volume failed", exc)
             ) from exc
 
-    async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:
+    async def remove_volume(
+        self,
+        *,
+        volume_name: str,
+        force: bool = False,
+        timeout: int | None = None,
+    ) -> None:
         await self._call_api(
             volume_name,
             operation_label="remove volume",
             api_method=self._api_client.remove_volume,
+            client_timeout=timeout,
             force=force,
         )
 
@@ -298,9 +307,22 @@ class RentalDockerSdkClient:
         if close is not None:
             await asyncio.to_thread(close)
 
-    async def _call_api(self, *args, operation_label: str, api_method, **kwargs) -> None:
+    async def _call_api(
+        self,
+        *args,
+        operation_label: str,
+        api_method,
+        client_timeout: int | None = None,
+        **kwargs,
+    ) -> None:
         try:
-            await asyncio.to_thread(api_method, *args, **kwargs)
+            await asyncio.to_thread(
+                self._call_api_sync,
+                *args,
+                api_method=api_method,
+                client_timeout=client_timeout,
+                **kwargs,
+            )
         except Exception as exc:
             raise RentalDockerOperationError(
                 _wrap_error_message(f"Docker SDK {operation_label} failed", exc)
@@ -419,6 +441,26 @@ class RentalDockerSdkClient:
                 driver=driver,
                 driver_opts=driver_opts,
             )
+        finally:
+            if should_override_timeout:
+                self._api_client.timeout = original_timeout
+
+    def _call_api_sync(
+        self,
+        *args,
+        api_method,
+        client_timeout: int | None,
+        **kwargs,
+    ) -> None:
+        original_timeout = getattr(self._api_client, "timeout", None)
+        should_override_timeout = client_timeout is not None and hasattr(
+            self._api_client,
+            "timeout",
+        )
+        if should_override_timeout:
+            self._api_client.timeout = None if client_timeout == 0 else client_timeout
+        try:
+            api_method(*args, **kwargs)
         finally:
             if should_override_timeout:
                 self._api_client.timeout = original_timeout
