@@ -176,7 +176,7 @@ class Settings(BaseSettings):
     SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=True, description="Enable verbose asyncssh SSH handshake debug logging")
 
     # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
-    # whose price_per_gpu exceeds market p90 * SOFT_LIMIT_PRICE_RATE loses the unrented
+    # whose price_per_gpu exceeds market p90 * soft_limit_price_rate loses the unrented
     # rental incentive while staying active. When False, the breach is only logged
     # (shadow mode) so prod impact can be observed before enforcing.
     ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)
