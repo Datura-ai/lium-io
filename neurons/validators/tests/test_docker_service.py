@@ -898,6 +898,118 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
 
 
 @pytest.mark.asyncio
+async def test_delete_customer_rental_treats_missing_container_as_deleted(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.redis_service.get_rented_machine = AsyncMock(return_value=None)
+    docker_service.rental_docker_client_factory.client.remove_error = Exception(
+        "Docker SDK remove container failed: 404 Client Error: Not Found "
+        '("No such container: pod_missing")'
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_missing",
+        local_volume="volume_missing",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerDeleted)
+    assert result.pod_id == payload.pod_id
+    assert docker_service.rental_docker_client_factory.client.pruned_images == 1
+    assert docker_service.rental_docker_client_factory.client.removed_volumes == [
+        {"volume_name": payload.local_volume, "force": False}
+    ]
+    docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
+        executor_info,
+        payload.container_name,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_failure_msg_includes_underlying_error(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.rental_docker_client_factory.client.remove_error = Exception(
+        "Docker SDK remove container failed: 500 Server Error: daemon exploded"
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_stuck",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
+    assert "500 Server Error: daemon exploded" in result.msg
+
+
+@pytest.mark.asyncio
 async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service):
     executor_info = ExecutorSSHInfo(
         uuid="exec-1",

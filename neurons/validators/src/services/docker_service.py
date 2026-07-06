@@ -3845,14 +3845,15 @@ class DockerService:
                         remove_volumes=True,
                     )
                 except Exception as exc:
-                    if (
-                        payload.workload_kind != WorkloadKind.FILLER
-                        or not _is_missing_docker_container_error(exc)
-                    ):
+                    # DAH-2345: deletion is idempotent for every workload kind — a container
+                    # that is already gone (e.g. removed by failed-create cleanup) must not
+                    # fail the delete, or the backend retries a doomed request until
+                    # force-removal and penalizes the miner.
+                    if not _is_missing_docker_container_error(exc):
                         raise
                     logger.info(
                         _m(
-                            "Filler container is already absent",
+                            "Container is already absent",
                             extra=get_extra_info(
                                 {
                                     **default_extra,
@@ -3958,7 +3959,8 @@ class DockerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=str(log_text),
+                # str(log_text) drops extra, hiding the cause from the backend
+                msg=f"Unknown Error delete_container: {e}",
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
