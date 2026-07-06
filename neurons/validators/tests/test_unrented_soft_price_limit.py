@@ -1,7 +1,7 @@
 """DAH-2250 — unrented incentive soft price limit.
 
 An unrented executor priced above the market p90 ceiling
-(machine_prices_p90[gpu] * SOFT_LIMIT_PRICE_RATE) forfeits the unrented rental
+(machine_prices_p90[gpu] * the shared config's soft_limit_price_rate) forfeits the unrented rental
 incentive while staying active. Enforcement is gated by
 ENABLE_UNRENTED_SOFT_PRICE_LIMIT; while the flag is off the breach is only
 logged (shadow mode) and the payout is unchanged.
