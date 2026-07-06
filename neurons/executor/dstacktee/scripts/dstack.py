@@ -141,7 +141,7 @@ class QemuConfig:
                 self.pic = False
 
 
-def gen_vm_config(vm_dir, host_port, manifest=None, os_image_hash=None):
+def gen_vm_config(vm_dir, host_port, manifest=None, os_image_hash=None, ovmf_variant=None):
     shared_dir = os.path.join(vm_dir, "shared")
     for filename in ["config.json", ".sys-config.json"]:
         config_file = os.path.join(shared_dir, filename)
@@ -160,28 +160,27 @@ def gen_vm_config(vm_dir, host_port, manifest=None, os_image_hash=None):
 
             qemu_cfg = QemuConfig()
             qemu_version_str = get_qemu_version_string()
-            update_guest_config(
-                config_file,
-                {
-                    "vm_config": json.dumps(
-                        {
-                            "spec_version": 1,
-                            "os_image_hash": os_image_hash,
-                            "cpu_count": manifest["vcpu"],
-                            "memory_size": manifest["memory"] * 1024 * 1024,
-                            "qemu_single_pass_add_pages": qemu_cfg.single_pass_add_pages,
-                            "pic": qemu_cfg.pic,
-                            "pci_hole64_size": qemu_cfg.pci_hole64_size,
-                            "num_gpus": num_gpus,
-                            "num_nvswitches": num_nvswitches,
-                            "hugepages": False,
-                            "hotplug_off": qemu_cfg.hotplug_off,
-                            "qemu_version": qemu_version_str,
-                            "image": manifest.get("image"),
-                        }
-                    )
-                },
-            )
+            vm_config = {
+                "spec_version": 1,
+                "os_image_hash": os_image_hash,
+                "cpu_count": manifest["vcpu"],
+                "memory_size": manifest["memory"] * 1024 * 1024,
+                "qemu_single_pass_add_pages": qemu_cfg.single_pass_add_pages,
+                "pic": qemu_cfg.pic,
+                "pci_hole64_size": qemu_cfg.pci_hole64_size,
+                "num_gpus": num_gpus,
+                "num_nvswitches": num_nvswitches,
+                "hugepages": False,
+                "hotplug_off": qemu_cfg.hotplug_off,
+                "qemu_version": qemu_version_str,
+                "image": manifest.get("image"),
+            }
+            # The verifier prefers an explicit OVMF variant over inferring it from
+            # the image name (which mis-picks Stable202505 for dstack-nvidia-0.5.11);
+            # stamp it from the image metadata like upstream dstack-vmm does.
+            if ovmf_variant:
+                vm_config["ovmf_variant"] = ovmf_variant
+            update_guest_config(config_file, {"vm_config": json.dumps(vm_config)})
 
 
 @dataclass
@@ -523,7 +522,13 @@ class DStackManager:
             img_metadata = json.load(f)
 
         os_image_hash = open(os.path.join(image_path, "digest.txt"), "r").read().strip()
-        gen_vm_config(vm_dir, host_port, manifest, os_image_hash)
+        gen_vm_config(
+            vm_dir,
+            host_port,
+            manifest,
+            os_image_hash,
+            ovmf_variant=img_metadata.get("ovmf_variant"),
+        )
 
         mem_gb = manifest["memory"] // 1024
         vcpu_count = manifest["vcpu"]
@@ -635,7 +640,15 @@ class DStackManager:
                 )
                 bus_nr += count + 1
         if gpus:
-            cmd_args.extend(["-object", "iommufd,id=iommufd0"])
+            # QEMU 9.2.1 (dstack fork) fails VFIO_DEVICE_BIND_IOMMUFD (EINVAL)
+            # against mainline 6.16+ kernels; fall back to the legacy type1
+            # container there (needs a raised vfio_iommu_type1.dma_entry_limit —
+            # TDX shared/private conversions exhaust the default 65535 entries).
+            qemu_ver = get_qemu_version()
+            use_iommufd = bool(qemu_ver and qemu_ver >= (10, 0, 0))
+            iommufd_suffix = ",iommufd=iommufd0" if use_iommufd else ""
+            if use_iommufd:
+                cmd_args.extend(["-object", "iommufd,id=iommufd0"])
             if not hugepages:
                 for dev in gpus:
                     slot = dev["slot"]
@@ -644,7 +657,7 @@ class DStackManager:
                             "-device",
                             f"pcie-root-port,id=pci.{dev_num},bus=pcie.0,chassis={dev_num}",
                             "-device",
-                            f"vfio-pci,host={slot},bus=pci.{dev_num},iommufd=iommufd0",
+                            f"vfio-pci,host={slot},bus=pci.{dev_num}{iommufd_suffix}",
                         ]
                     )
                     dev_num += 1
@@ -657,7 +670,7 @@ class DStackManager:
                             "-device",
                             f"pcie-root-port,id=pci.{dev_num},bus=pcie.node{node},chassis={dev_num}",
                             "-device",
-                            f"vfio-pci,host={slot},bus=pci.{dev_num},iommufd=iommufd0",
+                            f"vfio-pci,host={slot},bus=pci.{dev_num}{iommufd_suffix}",
                         ]
                     )
                     dev_num += 1
@@ -668,7 +681,7 @@ class DStackManager:
                         "-device",
                         f"pcie-root-port,id=pci.{dev_num},bus=pcie.0,chassis={dev_num}",
                         "-device",
-                        f"vfio-pci,host={slot},bus=pci.{dev_num},iommufd=iommufd0",
+                        f"vfio-pci,host={slot},bus=pci.{dev_num}{iommufd_suffix}",
                     ]
                 )
                 dev_num += 1
