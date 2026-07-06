@@ -85,7 +85,7 @@ class MinerLogLine(BaseModel):
 
     def to_log_line(self) -> str:
         """Render as one string; the caller appends it to result.incentive_logs."""
-        return _m(self.message, extra=get_extra_info(self.fields)).to_full_string()
+        return self.as_internal_log().to_full_string()
 
     def as_internal_log(self) -> _StructuredMessage:
         """The same line as an `_m` object, for mirroring into the internal logger."""
