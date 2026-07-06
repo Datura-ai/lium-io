@@ -319,6 +319,8 @@ class ComputeClient:
                             price_per_gpu=data["price_per_gpu"],
                             collateral_deposited=data["collateral_deposited"],
                             ssh_pub_keys=data["ssh_pub_keys"],
+                            incentive=data.get("incentive"),
+                            default_job_owner=data.get("default_job_owner"),
                         )
 
                         async with self.lock:

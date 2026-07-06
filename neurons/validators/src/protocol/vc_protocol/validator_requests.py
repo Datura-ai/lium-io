@@ -71,6 +71,8 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     job_batch_id: str
     collateral_deposited: bool
     ssh_pub_keys: list[str] | None = None
+    incentive: float | None = None
+    default_job_owner: str | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):
