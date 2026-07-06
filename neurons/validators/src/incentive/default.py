@@ -10,7 +10,7 @@ import bittensor
 
 from core.config import get_total_burn_emission, settings
 from core.utils import _m, get_extra_info, get_logger
-from incentive import miner_incentive_log as miner_log
+from incentive.miner_incentive_log import MinerLogLine
 from incentive.base import BaseIncentive
 from services.task_service import JobResult
 
@@ -108,13 +108,13 @@ class DefaultIncentive(BaseIncentive):
             result: Job execution result to process
         """
         if result.mining_score is None:
-            error_report = miner_log.mining_score_missing(hotkey, result)
+            error_report = MinerLogLine.mining_score_missing(hotkey, result)
             result.incentive_logs.append(error_report.to_log_line())
             return result
 
         result.incentive = (self.mining_share * result.mining_score / self.total_mining_score) if self.total_mining_score > 0 else 0.0
         self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
-        report = miner_log.mining_incentive_calculated(
+        report = MinerLogLine.mining_incentive_calculated(
             hotkey, result, self.total_mining_score, self.mining_share
         )
         result.incentive_logs.append(report.to_log_line())
@@ -207,7 +207,7 @@ class DefaultIncentive(BaseIncentive):
         job_result.mining_score *= (
             job_result.sysbox_multiplier * job_result.uptime_multiplier * job_result.driver_multiplier
         )
-        line = miner_log.mining_score_calculated(job_result, is_rented_after_cutoff)
+        line = MinerLogLine.mining_score_calculated(job_result, is_rented_after_cutoff)
         job_result.incentive_logs.append(line.to_log_line())
         logger.info(line.as_internal_log())
         return job_result
