@@ -1,11 +1,13 @@
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
 from datura.requests.miner_requests import ExecutorSSHInfo
-from incentive.miner_incentive_log import MinerLogLine
+
+if TYPE_CHECKING:
+    from incentive.miner_incentive_log import MinerLogLine
 
 
 class JobResult(BaseModel):
@@ -77,21 +79,14 @@ class JobResult(BaseModel):
 
     
     incentive_logs: list[str] = []
-    # Structured zero-incentive reasons for this cycle; travel to the backend as data,
-    # never re-parsed from log text (DAH-2340). Empty when the executor earns normally.
-    zero_incentive_reasons: list[MinerLogLine] = []
+    # DAH-2340 wire payloads for the backend; [] when the executor earns normally
+    zero_incentive_reasons: list[dict[str, Any]] = []
 
-    def record_incentive_log(self, line: MinerLogLine) -> None:
-        """Record one incentive log line as BOTH human text and structured data.
-
-        Appends the rendered string to incentive_logs; when the line is a zero-incentive
-        reason (carries a machine-readable code), also keeps the structured line so the
-        reason can flow to the backend as data — text and data come from one object and
-        cannot drift (DAH-2340).
-        """
+    def record_incentive_log(self, line: "MinerLogLine") -> None:
+        """Append the line to the miner-facing log; zero-incentive lines also become data for the backend."""
         self.incentive_logs.append(line.to_log_line())
         if line.reason is not None:
-            self.zero_incentive_reasons.append(line)
+            self.zero_incentive_reasons.append(line.to_reason_payload())
 
     @property
     def incentive_source(self) -> str:

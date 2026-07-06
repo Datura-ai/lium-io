@@ -738,9 +738,8 @@ class MinerService:
                         "incentive_formula_inputs": result.incentive_formula_inputs,
                         "log_status": result.log_status,
                         "log_text": result.full_log_text,
-                        # Structured zero-incentive reasons as data (DAH-2340); empty when the
-                        # executor earns normally, so a stale reason clears on the next cycle.
-                        "incentive_reasons": [reason.to_reason_payload() for reason in result.zero_incentive_reasons],
+                        # [] when the executor earns normally — clears a stale reason next cycle (DAH-2340)
+                        "incentive_reasons": result.zero_incentive_reasons,
                         "collateral_deposited": result.collateral_deposited,
                         "ssh_pub_keys": result.ssh_pub_keys,
                         "attestation_digest": result.attestation_digest,

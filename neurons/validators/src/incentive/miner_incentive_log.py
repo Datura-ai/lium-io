@@ -32,7 +32,9 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 
 The scoring code (rental_price.py / default.py) detects each condition where its
 data naturally lives (some per-executor upfront, some only after cohort aggregation),
-builds the matching line and appends `line.to_log_line()` to result.incentive_logs.
+builds the matching line and records it via `result.record_incentive_log(line)` —
+which appends the text to incentive_logs AND, for zero-incentive lines, ships the
+structured reason to the backend (DAH-2340). Never append to incentive_logs directly.
 Open THIS file to see everything a miner can be told and exactly how each message reads.
 """
 
@@ -75,10 +77,10 @@ class MinerLogLine(BaseModel):
     """One line of the miner-facing incentive log.
 
     Built ONLY via the named constructors below (the catalog). The constructor bakes
-    every field in; rendering takes no arguments:
+    every field in; recording takes no arguments:
 
         line: MinerLogLine = MinerLogLine.no_payout_because_spot_tier(result)
-        result.incentive_logs.append(line.to_log_line())
+        result.record_incentive_log(line)
     """
 
     message: str                                                   # plain-English, shown to the miner
@@ -92,16 +94,8 @@ class MinerLogLine(BaseModel):
         return self.as_internal_log().to_full_string()
 
     def to_reason_payload(self) -> dict[str, Any]:
-        """Clean machine-readable subset published on MACHINE_SPEC_CHANNEL (DAH-2340).
-
-        Carries the stable `reason` code, the miner-facing message and the structured
-        `fields` — never the internal_* observability data. Downstream keys off `reason`.
-        """
-        return {
-            "reason": self.reason.value if self.reason else None,
-            "message_for_miner": self.message,
-            **{key: value for key, value in self.fields.items() if key != "reason"},
-        }
+        """Wire payload for MACHINE_SPEC_CHANNEL (DAH-2340): zero-incentive lines only, never internal_* fields."""
+        return {**self.fields, "reason": self.reason.value, "message_for_miner": self.message}
 
     def as_internal_log(self) -> _StructuredMessage:
         """The same line as an `_m` object, for mirroring into the internal logger."""

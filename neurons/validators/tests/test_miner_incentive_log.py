@@ -249,7 +249,7 @@ def test_record_incentive_log_keeps_zero_reason_as_text_and_data():
     # human text path (unchanged, backward compatible)
     assert any("spot tier" in entry for entry in job.incentive_logs)
     # structured data path (new)
-    assert [r.reason for r in job.zero_incentive_reasons] == [ZeroIncentiveReason.SPOT_TIER]
+    assert [reason["reason"] for reason in job.zero_incentive_reasons] == [ZeroIncentiveReason.SPOT_TIER]
 
 
 def test_record_incentive_log_ignores_calculation_reports_for_the_data_path():
@@ -259,9 +259,3 @@ def test_record_incentive_log_ignores_calculation_reports_for_the_data_path():
 
     assert job.incentive_logs                      # still logged as text
     assert job.zero_incentive_reasons == []        # but not surfaced as a structured reason
-
-
-def test_earning_executor_has_no_structured_reasons_so_stale_reason_clears():
-    # Each cycle builds a fresh JobResult; an executor that earns records no reason,
-    # so the next published row carries [] and a previous cycle's reason clears (DAH-2340).
-    assert _job().zero_incentive_reasons == []
