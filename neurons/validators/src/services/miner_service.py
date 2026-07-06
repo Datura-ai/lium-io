@@ -739,7 +739,7 @@ class MinerService:
                         "log_status": result.log_status,
                         "log_text": result.full_log_text,
                         # [] when the executor earns normally — clears a stale reason next cycle (DAH-2340)
-                        "incentive_reasons": result.zero_incentive_reasons,
+                        "incentive_reasons": [reason.model_dump() for reason in result.zero_incentive_reasons],
                         "collateral_deposited": result.collateral_deposited,
                         "ssh_pub_keys": result.ssh_pub_keys,
                         "attestation_digest": result.attestation_digest,

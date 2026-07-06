@@ -8,6 +8,8 @@ import bittensor
 import pydantic
 from datura.requests.base import BaseRequest
 
+from incentive.miner_incentive_log import IncentiveReason
+
 
 class RequestType(enum.Enum):
     AuthenticateRequest = "AuthenticateRequest"
@@ -53,20 +55,6 @@ class AuthenticateRequest(BaseValidatorRequest):
             timestamp=int(time.time()),
         )
         return cls(payload=payload, signature=f"0x{keypair.sign(payload.blob_for_signing()).hex()}")
-
-
-class IncentiveReason(pydantic.BaseModel):
-    """One structured reason an executor earns 0 subnet incentive (DAH-2340).
-
-    `reason` is a stable, append-only machine-readable code the backend keys off;
-    `message_for_miner` is free text. Extra miner_log_fields ride along via
-    extra='allow', keeping the contract additive without a schema change.
-    """
-
-    model_config = pydantic.ConfigDict(extra="allow")
-
-    reason: str
-    message_for_miner: str
 
 
 class ExecutorSpecRequest(BaseValidatorRequest):

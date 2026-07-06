@@ -43,7 +43,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from core.utils import _m, _StructuredMessage, get_extra_info
 
@@ -73,6 +73,22 @@ class ZeroIncentiveReason(StrEnum):
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
 
 
+class IncentiveReason(BaseModel):
+    """One structured zero-incentive reason as it travels on the wire (DAH-2340).
+
+    Single definition for the whole validator: built here by the catalog
+    (`MinerLogLine.to_incentive_reason`) and reused by `ExecutorSpecRequest`.
+    `reason` is a stable, append-only machine-readable code the backend keys off;
+    `message_for_miner` is free text. Extra miner_log_fields ride along via
+    extra='allow', keeping the contract additive without a schema change.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    reason: str
+    message_for_miner: str
+
+
 class MinerLogLine(BaseModel):
     """One line of the miner-facing incentive log.
 
@@ -93,9 +109,10 @@ class MinerLogLine(BaseModel):
         """Render as one string; the caller appends it to result.incentive_logs."""
         return self.as_internal_log().to_full_string()
 
-    def to_reason_payload(self) -> dict[str, Any]:
-        """Wire payload for MACHINE_SPEC_CHANNEL (DAH-2340): zero-incentive lines only, never internal_* fields."""
-        return {**self.fields, "reason": self.reason.value, "message_for_miner": self.message}
+    def to_incentive_reason(self) -> IncentiveReason:
+        """Typed wire reason for MACHINE_SPEC_CHANNEL (DAH-2340): zero-incentive lines only, never internal_* fields."""
+        # model_validate, not kwargs: fields already carries "reason" (for Loki extra) — later key wins.
+        return IncentiveReason.model_validate({**self.fields, "reason": self.reason.value, "message_for_miner": self.message})
 
     def as_internal_log(self) -> _StructuredMessage:
         """The same line as an `_m` object, for mirroring into the internal logger."""

@@ -37,8 +37,8 @@ def test_published_payload_carries_reason_codes_as_data_not_just_log_text(create
     job = create_job_result()
     job.record_incentive_log(MinerLogLine.no_payout_because_spot_tier(job))
 
-    # zero_incentive_reasons is the exact list the publisher (miner_service) sends.
-    spec = _spec(job.zero_incentive_reasons)
+    # model_dump per reason is exactly what the publisher (miner_service) sends.
+    spec = _spec([reason.model_dump() for reason in job.zero_incentive_reasons])
 
     assert [reason.reason for reason in spec.incentive_reasons] == ["spot_tier"]
     assert isinstance(spec.incentive_reasons[0], IncentiveReason)
@@ -51,7 +51,7 @@ def test_extra_miner_log_fields_survive_on_the_typed_model(create_job_result) ->
     job.record_incentive_log(
         MinerLogLine.no_payout_because_price_above_market_soft_limit(job, market_p90=3.842, rate=1.1)
     )
-    spec = _spec(job.zero_incentive_reasons)
+    spec = _spec([reason.model_dump() for reason in job.zero_incentive_reasons])
 
     reason = spec.incentive_reasons[0]
     assert reason.reason == "price_above_market_p90_soft_limit"

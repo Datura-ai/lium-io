@@ -229,12 +229,13 @@ def test_report_line_renders_string_and_builds_internal_log():
 
 # ── DAH-2340: structured zero-incentive reasons travel as data ────────────────
 
-def test_to_reason_payload_is_clean_subset_without_internal_fields() -> None:
+def test_to_incentive_reason_is_clean_subset_without_internal_fields() -> None:
     line = MinerLogLine.no_payout_because_discord_not_connected(_job(provider_discord_connected=False))
-    payload = line.to_reason_payload()
+    reason = line.to_incentive_reason()
 
-    assert payload["reason"] == "provider_discord_not_connected"
-    assert payload["message_for_miner"] == line.message
+    assert reason.reason == "provider_discord_not_connected"
+    assert reason.message_for_miner == line.message
+    payload = reason.model_dump()
     assert payload["executor_id"] == "exec-1"        # miner_log_fields ride along
     assert payload["incentive"] == 0.0
     # never leak internal-only observability data into the channel payload
@@ -249,7 +250,7 @@ def test_record_incentive_log_keeps_zero_reason_as_text_and_data() -> None:
     # human text path (unchanged, backward compatible)
     assert any("spot tier" in entry for entry in job.incentive_logs)
     # structured data path (new)
-    assert [reason["reason"] for reason in job.zero_incentive_reasons] == [ZeroIncentiveReason.SPOT_TIER]
+    assert [reason.reason for reason in job.zero_incentive_reasons] == [ZeroIncentiveReason.SPOT_TIER]
 
 
 def test_record_incentive_log_ignores_calculation_reports_for_the_data_path() -> None:

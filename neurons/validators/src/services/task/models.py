@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
+from incentive.miner_incentive_log import IncentiveReason
+
 if TYPE_CHECKING:
     from incentive.miner_incentive_log import MinerLogLine
 
@@ -81,14 +83,14 @@ class JobResult(BaseModel):
     # Delivery buffers with dedicated export paths (full_log_text, direct publish);
     # excluded so no model_dump ever serializes them raw.
     incentive_logs: list[str] = Field(default_factory=list, exclude=True)
-    # DAH-2340 wire payloads for the backend; [] when the executor earns normally
-    zero_incentive_reasons: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
+    # DAH-2340 wire reasons for the backend; [] when the executor earns normally
+    zero_incentive_reasons: list[IncentiveReason] = Field(default_factory=list, exclude=True)
 
     def record_incentive_log(self, line: "MinerLogLine") -> None:
         """Append the line to the miner-facing log; zero-incentive lines also become data for the backend."""
         self.incentive_logs.append(line.to_log_line())
         if line.reason is not None:
-            self.zero_incentive_reasons.append(line.to_reason_payload())
+            self.zero_incentive_reasons.append(line.to_incentive_reason())
 
     @property
     def incentive_source(self) -> str:
