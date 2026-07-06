@@ -122,7 +122,17 @@ def test_discord_reason_carries_connected_flag_for_internal_log():
     job = _job()
     job.provider_discord_connected = False
     line = MinerLogLine.no_payout_because_discord_not_connected(job)
-    assert line.internal_fields == {"provider_discord_connected": False}
+    assert line.internal_fields["provider_discord_connected"] is False
+    assert line.internal_fields["pool"] == "none"
+
+
+def test_to_internal_log_renders_internal_message_with_pool_fields():
+    line = MinerLogLine.no_payout_because_spot_tier(_job())
+    rendered: str = line.to_internal_log().to_full_string()
+
+    assert "Executor excluded from both pools - spot tier" in rendered
+    assert "spot_tier" in rendered
+    assert '"pool": "none"' in rendered
 
 
 def test_soft_limit_reason_computes_threshold_and_fields():

@@ -395,10 +395,16 @@ class RentalPriceIncentive(DefaultIncentive):
         report: MinerLogLine = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
         result.incentive_logs.append(report.to_log_line())
 
-        # DAH-2327: an eligible unrented executor still finalizes at 0 when any factor of
-        # effective_rate collapses to 0 (no bucket capacity, driver below minimum, no
-        # sysbox). Tell the miner which one, otherwise the "calculated successfully" line
-        # above shows incentive 0 with no reason.
+        self._explain_zero_effective_rate(result, bucket)
+
+        # aggregate miner incentives
+        self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
+
+    def _explain_zero_effective_rate(self, result: JobResult, bucket: int) -> None:
+        """DAH-2327: an eligible unrented executor still finalizes at 0 when any factor of
+        effective_rate collapses to 0 (no bucket capacity, driver below minimum, no sysbox).
+        Tell the miner which one, otherwise the "calculated successfully" report shows
+        incentive 0 with no reason."""
         if result.unrented_cap_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_no_unrented_capacity_for_gpu_count(result, bucket)
             result.incentive_logs.append(reason.to_log_line())
@@ -408,9 +414,6 @@ class RentalPriceIncentive(DefaultIncentive):
         elif result.sysbox_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_sysbox_not_enabled(result)
             result.incentive_logs.append(reason.to_log_line())
-
-        # aggregate miner incentives
-        self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
 
     async def calculate_executor_score(
         self,
@@ -436,20 +439,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # scoring decision all read from the same source and cannot drift (DAH-2327).
         exclusion: MinerLogLine | None = self._reason_excluded_from_both_pools(job_result)
         if exclusion is not None:
-            logger.info(
-                _m(
-                    exclusion.internal_message,
-                    extra={
-                        "executor_id": str(job_result.executor_info.uuid),
-                        "gpu_model": job_result.gpu_model,
-                        "gpu_count": job_result.gpu_count,
-                        "reason": exclusion.reason,
-                        "score": 0,
-                        "pool": "none",
-                        **exclusion.internal_fields,
-                    },
-                )
-            )
+            logger.info(exclusion.to_internal_log())
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
             job_result.incentive_logs.append(exclusion.to_log_line())

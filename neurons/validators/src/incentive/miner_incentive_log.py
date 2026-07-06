@@ -81,7 +81,7 @@ class MinerLogLine(BaseModel):
     fields: dict[str, Any] = Field(default_factory=dict)           # structured payload next to the message
     reason: ZeroIncentiveReason | None = None                      # machine-readable zero-incentive code; None for reports
     internal_message: str | None = None                            # separate internal-log wording (both-pools exclusions only)
-    internal_fields: dict[str, Any] = Field(default_factory=dict)  # extra fields for that internal log
+    internal_fields: dict[str, Any] = Field(default_factory=dict)  # full extra dict for that internal log
 
     def to_log_line(self) -> str:
         """Render as one string; the caller appends it to result.incentive_logs."""
@@ -91,6 +91,14 @@ class MinerLogLine(BaseModel):
         """The same line as an `_m` object, for mirroring into the internal logger."""
         return _m(self.message, extra=get_extra_info(self.fields))
 
+    def to_internal_log(self) -> _StructuredMessage:
+        """The separate internal observability log (both-pools exclusions only).
+
+        Uses `internal_message`/`internal_fields` baked in by `_no_payout`; the caller
+        just does `logger.info(exclusion.to_internal_log())`.
+        """
+        return _m(self.internal_message, extra=self.internal_fields)
+
     @staticmethod
     def _no_payout(
         result: JobResult,
@@ -98,7 +106,7 @@ class MinerLogLine(BaseModel):
         message: str,
         extra_fields: dict[str, Any] | None = None,
         internal_message: str | None = None,
-        internal_fields: dict[str, Any] | None = None,
+        internal_extra_fields: dict[str, Any] | None = None,
     ) -> MinerLogLine:
         """Shared shape of every zero-incentive reason: executor identity + reason + incentive 0."""
         fields: dict[str, Any] = {
@@ -109,12 +117,23 @@ class MinerLogLine(BaseModel):
             "incentive": 0.0,
             **(extra_fields or {}),
         }
+        internal_fields: dict[str, Any] = {}
+        if internal_message is not None:
+            internal_fields = {
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "reason": reason,
+                "score": 0,
+                "pool": "none",
+                **(internal_extra_fields or {}),
+            }
         return MinerLogLine(
             message=message,
             fields=fields,
             reason=reason,
             internal_message=internal_message,
-            internal_fields=internal_fields or {},
+            internal_fields=internal_fields,
         )
 
     # ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─
@@ -141,7 +160,7 @@ class MinerLogLine(BaseModel):
                 "provider Discord for this executor to start earning incentive."
             ),
             internal_message="Executor excluded from both pools - provider Discord not connected",
-            internal_fields={"provider_discord_connected": result.provider_discord_connected},
+            internal_extra_fields={"provider_discord_connected": result.provider_discord_connected},
         )
 
     @staticmethod
