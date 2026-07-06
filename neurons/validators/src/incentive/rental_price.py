@@ -20,7 +20,7 @@ from core.config import get_total_burn_emission, settings, shared_client
 from core.utils import _m, get_logger
 from incentive.config import BASE_GPU_MAP
 from incentive.eligibility import is_missing_discord_after_cutoff
-from incentive.miner_incentive_log import MinerLogLine
+from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 
 if TYPE_CHECKING:
     from incentive.config import IncentiveConfig
@@ -204,7 +204,7 @@ class RentalPriceIncentive(DefaultIncentive):
                     "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
                     "soft_limit_threshold": p90 * SOFT_LIMIT_PRICE_RATE if p90 else None,
                     "enforced": enforced,
-                    "reason": "price_above_market_p90_soft_limit",
+                    "reason": ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
