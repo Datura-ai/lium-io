@@ -249,13 +249,15 @@ TDX_WHITELIST = {
     # (`hash in TDX_WHITELIST["COMPOSE_HASH"][env]`) keep working on the dict keys.
     "COMPOSE_HASH": {
         "PROD": {
-            # DAH-2338 — 0.5.11 measured compose: executor-runner pinned to the
-            # current prod runner digest sha256:b58211e7… (:latest, 2026-06-26),
-            # pre-launch sysbox force-install included. Replaces the legacy
-            # watchtower-era hash a77f05d5… — CVMs still on that compose must be
-            # redeployed under the digest-pinned scheme (the 0.5.11 migration
-            # re-creates them anyway). Assumes default `lium-cvm.sh new` flags.
-            "0995e41b73e98ba4798b40c79c3f671f193648b9cd895726753a89c5ff024b72": 2,
+            # DAH-2338 — executor-v1.108 measured compose: executor-runner pinned to
+            # daturaai/compute-subnet-executor-runner:latest @
+            # sha256:f85b948b6cb280423b17e34ea28c0f98139243ecea32cd42106f90d19dc619f1
+            # (executor @ sha256:94b5e734…, pushed 2026-07-07), init/pre-launch as
+            # of 077f42c1 (G1 GPU attestation guest env whitelist). Replaces v2
+            # 0995e41b… (executor-v1.107 runner b58211e7…) — CVMs on the old digest
+            # must redeploy with EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:f85b948b… .
+            # Assumes default `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo).
+            "ab4d14336f0762c0d8ec7631a69148246661de84ceead7a215f8a33b74fd43e6": 3,
         },
         "STAGE": {
             "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11": 1,
