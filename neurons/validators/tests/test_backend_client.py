@@ -3,6 +3,7 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 from neurons.validators.src.clients.backend_client import BackendClient
 from pydantic import BaseModel
@@ -310,3 +311,113 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
     assert result.filler_containers_by_executor == {
         "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     }
+
+
+def create_mock_session_with_attempts(side_effects, method: str = "post"):
+    """Session whose request yields one side effect per attempt (exception or response)."""
+    mock_session = AsyncMock()
+    mock_session.closed = False
+
+    cms = []
+    for effect in side_effects:
+        async_cm = AsyncMock()
+        if isinstance(effect, BaseException):
+            async_cm.__aenter__ = AsyncMock(side_effect=effect)
+        else:
+            async_cm.__aenter__ = AsyncMock(return_value=effect)
+        async_cm.__aexit__ = AsyncMock(return_value=None)
+        cms.append(async_cm)
+
+    if method == "get":
+        mock_session.get = MagicMock(side_effect=cms)
+    else:
+        mock_session.post = MagicMock(side_effect=cms)
+
+    return mock_session
+
+
+@pytest.mark.asyncio
+async def test_get_session_bounds_keepalive_timeout(reset_session):
+    """DAH-2360: pooled connections must not idle past the keepalive window."""
+    session = await BackendClient.get_session()
+    try:
+        assert session.connector._keepalive_timeout == BackendClient.KEEPALIVE_TIMEOUT_SECONDS
+    finally:
+        await BackendClient.close_session()
+
+
+@pytest.mark.asyncio
+async def test_post_retries_connection_error_then_succeeds(reset_session, client):
+    """DAH-2360: broken pipe on a stale pooled connection is retried, not surfaced."""
+    ok_response = create_mock_response(200, {"data": "ok", "count": 1})
+    mock_session = create_mock_session_with_attempts(
+        [aiohttp.ClientOSError(32, "Broken pipe"), ok_response], "post"
+    )
+
+    with (
+        patch.object(BackendClient, "get_session", return_value=mock_session),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
+        result = await client.post("/submit", SampleResponse)
+
+    assert result is not None
+    assert result.data == "ok"
+    assert mock_session.post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_retries_server_disconnected_then_succeeds(reset_session, client):
+    ok_response = create_mock_response(200, {"data": "ok", "count": 1})
+    mock_session = create_mock_session_with_attempts(
+        [aiohttp.ServerDisconnectedError(), ok_response], "get"
+    )
+
+    with (
+        patch.object(BackendClient, "get_session", return_value=mock_session),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
+        result = await client.get("/data", SampleResponse)
+
+    assert result is not None
+    assert result.data == "ok"
+    assert mock_session.get.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_post_returns_none_when_connection_retries_exhausted(reset_session, client):
+    attempts = 1 + BackendClient.CONNECTION_RETRY_ATTEMPTS
+    mock_session = create_mock_session_with_attempts(
+        [aiohttp.ClientOSError(32, "Broken pipe") for _ in range(attempts)], "post"
+    )
+
+    with (
+        patch.object(BackendClient, "get_session", return_value=mock_session),
+        patch("asyncio.sleep", new=AsyncMock()),
+    ):
+        result = await client.post("/submit", SampleResponse)
+
+    assert result is None
+    assert mock_session.post.call_count == attempts
+
+
+@pytest.mark.asyncio
+async def test_post_timeout_is_not_retried(reset_session, client):
+    """Timeouts may have reached the backend — retrying could double-run long operations."""
+    mock_session = create_mock_session_with_attempts([TimeoutError()], "post")
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        result = await client.post("/submit", SampleResponse, timeout=1)
+
+    assert result is None
+    assert mock_session.post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_post_generic_client_error_is_not_retried(reset_session, client):
+    mock_session = create_mock_session_with_attempts([aiohttp.ClientError("boom")], "post")
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        result = await client.post("/submit", SampleResponse)
+
+    assert result is None
+    assert mock_session.post.call_count == 1
