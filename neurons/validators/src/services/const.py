@@ -255,6 +255,11 @@ TDX_WHITELIST = {
         },
         "STAGE": {
             "72c9c91a1b72cb016e1ed2ac85cdb1414502165dc3eb3723642f30a5ef0fcb11": 1,
+            # DAH-2338 — 0.5.11 staging compose: executor-runner pinned to
+            # daturaai/compute-subnet-executor-runner:dev digest sha256:58db7cd5…
+            # (pushed 2026-07-06), pre-launch sysbox force-install included.
+            # Assumes default `lium-cvm.sh new` flags (no --enable-logs/--enable-sysinfo).
+            "feedf7cb08a9905f3ef66eb9bab4af310310965589e5aed070594c326bf44e16": 2,
         },
         "LOCAL": {
             "2d655bf8eca15eaec6cc5800acae99eaeb21fc3dafcfcf594139c827596a7828": 1,
