@@ -91,76 +91,14 @@ class BackendClient:
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
     ) -> T | None:
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        context = {"url": url, "method": "GET"}
-
-        try:
-            headers = self._get_signature_headers() if add_signature else {}
-            if extra_headers:
-                headers.update(extra_headers)
-
-            session = await self.get_session()
-            for attempt in range(1 + self.CONNECTION_RETRY_ATTEMPTS):
-                try:
-                    start_time = time.perf_counter()
-                    async with session.get(
-                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
-                    ) as resp:
-                        elapsed_ms = (time.perf_counter() - start_time) * 1000
-                        logger.info(
-                            _m(
-                                "HTTP GET completed",
-                                extra=get_extra_info({**context, "status": resp.status, "elapsed_ms": round(elapsed_ms, 1)}),
-                            )
-                        )
-                        if resp.status != 200:
-                            logger.error(
-                                _m(
-                                    "HTTP GET failed",
-                                    extra=get_extra_info({**context, "status": resp.status}),
-                                )
-                            )
-                            return None
-
-                        try:
-                            data = await resp.json()
-                        except (aiohttp.ContentTypeError, json.JSONDecodeError) as e:
-                            logger.error(
-                                _m("Invalid JSON", extra=get_extra_info({**context, "error": str(e)}))
-                            )
-                            return None
-
-                        try:
-                            return response_model.model_validate(data)
-                        except ValidationError as e:
-                            logger.error(
-                                _m("Validation failed", extra=get_extra_info({**context, "error": str(e)}))
-                            )
-                            return None
-                except self.CONNECTION_ERRORS as e:
-                    if attempt >= self.CONNECTION_RETRY_ATTEMPTS:
-                        raise
-                    logger.warning(
-                        _m(
-                            "GET connection error, retrying",
-                            extra=get_extra_info(
-                                {**context, "error": str(e), "attempt": attempt + 1}
-                            ),
-                        )
-                    )
-                    await asyncio.sleep(self.CONNECTION_RETRY_BACKOFF_SECONDS[attempt])
-
-        except TimeoutError:
-            logger.error(_m("GET timeout", extra=get_extra_info(context)))
-            return None
-        except aiohttp.ClientError as e:
-            logger.error(_m("GET client error", extra=get_extra_info({**context, "error": str(e)})))
-            return None
-        except Exception as e:
-            logger.error(
-                _m("GET error", extra=get_extra_info({**context, "error": str(e)})), exc_info=True
-            )
-            return None
+        return await self._request(
+            "GET",
+            path,
+            response_model,
+            add_signature=add_signature,
+            timeout=timeout,
+            extra_headers=extra_headers,
+        )
 
     async def post(
         self,
@@ -172,8 +110,30 @@ class BackendClient:
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
     ) -> T | None:
+        return await self._request(
+            "POST",
+            path,
+            response_model,
+            json_data=json_data,
+            add_signature=add_signature,
+            timeout=timeout,
+            extra_headers=extra_headers,
+        )
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        response_model: type[T],
+        *,
+        json_data: dict[str, Any] | None = None,
+        add_signature: bool = True,
+        timeout: int = 30,
+        extra_headers: dict[str, str] | None = None,
+    ) -> T | None:
+        # single signed round-trip, retrying connection-level errors per backoff schedule
         url = f"{self.base_url}/{path.lstrip('/')}"
-        context = {"url": url, "method": "POST"}
+        context = {"url": url, "method": method}
 
         try:
             headers = self._get_signature_headers() if add_signature else {}
@@ -184,20 +144,24 @@ class BackendClient:
             for attempt in range(1 + self.CONNECTION_RETRY_ATTEMPTS):
                 try:
                     start_time = time.perf_counter()
-                    async with session.post(
-                        url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=timeout)
+                    async with session.request(
+                        method,
+                        url,
+                        headers=headers,
+                        json=json_data,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
                     ) as resp:
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
                         logger.info(
                             _m(
-                                "HTTP POST completed",
+                                f"HTTP {method} completed",
                                 extra=get_extra_info({**context, "status": resp.status, "elapsed_ms": round(elapsed_ms, 1)}),
                             )
                         )
                         if resp.status != 200:
                             logger.error(
                                 _m(
-                                    "HTTP POST failed",
+                                    f"HTTP {method} failed",
                                     extra=get_extra_info({**context, "status": resp.status}),
                                 )
                             )
@@ -223,7 +187,7 @@ class BackendClient:
                         raise
                     logger.warning(
                         _m(
-                            "POST connection error, retrying",
+                            f"{method} connection error, retrying",
                             extra=get_extra_info(
                                 {**context, "error": str(e), "attempt": attempt + 1}
                             ),
@@ -232,16 +196,16 @@ class BackendClient:
                     await asyncio.sleep(self.CONNECTION_RETRY_BACKOFF_SECONDS[attempt])
 
         except TimeoutError:
-            logger.error(_m("POST timeout", extra=get_extra_info(context)))
+            logger.error(_m(f"{method} timeout", extra=get_extra_info(context)))
             return None
         except aiohttp.ClientError as e:
             logger.error(
-                _m("POST client error", extra=get_extra_info({**context, "error": str(e)}))
+                _m(f"{method} client error", extra=get_extra_info({**context, "error": str(e)}))
             )
             return None
         except Exception as e:
             logger.error(
-                _m("POST error", extra=get_extra_info({**context, "error": str(e)})), exc_info=True
+                _m(f"{method} error", extra=get_extra_info({**context, "error": str(e)})), exc_info=True
             )
             return None
 
