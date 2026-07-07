@@ -233,13 +233,11 @@ RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 TDX_WHITELIST = {
     "OS_IMAGE_HASH": set(
         [
-            # dstack-nvidia 0.5.5 — upstream download.dstack.org build
-            "9b69bb1698bacbb6985409a2c272bcb892e09cdcea63d5399c6768b67d3ff677",
-            # DAH-2311 — dstack-nvidia 0.5.5 rebuilt with NVIDIA driver 595.71.05
-            # (private-ml-sdk git_revision 0a1dcf7, prod/non-dev image)
-            "dbfde5432af2762da24d2ee3f39dcb7fdb676064fce1891edab3f6d924e8dc3d",
             # DAH-2338 — official upstream dstack-nvidia 0.5.11 (meta-dstack v0.5.11
-            # release, git_revision ce04e924, NVIDIA driver 595.58.03, prod/non-dev image)
+            # release, git_revision ce04e924, NVIDIA driver 595.58.03, prod/non-dev
+            # image). Single-image policy: the legacy 0.5.5 hashes (upstream 9b69bb16…
+            # and DAH-2311 rebuilt dbfde543…) are removed — CVMs still booting them
+            # must be redeployed on 0.5.11.
             "a6eafc5f007f642d8ea90c7fa8881f1e6715720ccb531941a28218f4f26d7b02",
         ]
     ),
