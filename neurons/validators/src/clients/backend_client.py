@@ -41,8 +41,10 @@ class BackendClient:
         aiohttp.ClientConnectorError,
         aiohttp.ClientOSError,
     )
-    CONNECTION_RETRY_ATTEMPTS: ClassVar[int] = 2
-    CONNECTION_RETRY_BACKOFF_SECONDS: ClassVar[float] = 0.5
+    # Short first pause (a stale connection heals instantly), longer second one
+    # so a restarting backend pod has time to become ready.
+    CONNECTION_RETRY_BACKOFF_SECONDS: ClassVar[tuple[float, ...]] = (1.0, 5.0)
+    CONNECTION_RETRY_ATTEMPTS: ClassVar[int] = len(CONNECTION_RETRY_BACKOFF_SECONDS)
     # Drop idle pooled connections well before the server/ingress closes them.
     KEEPALIVE_TIMEOUT_SECONDS: ClassVar[int] = 30
 
@@ -146,7 +148,7 @@ class BackendClient:
                             ),
                         )
                     )
-                    await asyncio.sleep(self.CONNECTION_RETRY_BACKOFF_SECONDS)
+                    await asyncio.sleep(self.CONNECTION_RETRY_BACKOFF_SECONDS[attempt])
 
         except TimeoutError:
             logger.error(_m("GET timeout", extra=get_extra_info(context)))
@@ -227,7 +229,7 @@ class BackendClient:
                             ),
                         )
                     )
-                    await asyncio.sleep(self.CONNECTION_RETRY_BACKOFF_SECONDS)
+                    await asyncio.sleep(self.CONNECTION_RETRY_BACKOFF_SECONDS[attempt])
 
         except TimeoutError:
             logger.error(_m("POST timeout", extra=get_extra_info(context)))
