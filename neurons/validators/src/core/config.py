@@ -155,8 +155,8 @@ class Settings(BaseSettings):
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     BURNERS: list[int] = [4, 206, 207, 208]
-    # Duplicate entries are slot weights: UID 47 holds the aggregated share of 5 retired burners.
-    NEW_BURNERS: list[int] = [187, 188, 189, 190, 191, 47, 47, 47, 47, 47]
+    # Duplicate entries are slot weights: UID 47 holds the aggregated share of 7 retired burners.
+    NEW_BURNERS: list[int] = [187, 188, 189, 47, 47, 47, 47, 47, 47, 47]
     ENABLE_NEW_BURN_LOGIC: bool = True
 
     ENABLE_NO_COLLATERAL: bool = True
