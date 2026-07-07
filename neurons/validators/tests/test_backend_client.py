@@ -45,7 +45,7 @@ def create_mock_response(status: int, json_data: dict | None = None):
     return mock_resp
 
 
-def create_mock_session(mock_response, method: str = "get"):
+def create_mock_session(mock_response):
     mock_session = AsyncMock()
     mock_session.closed = False
     mock_session.close = AsyncMock()
@@ -54,10 +54,7 @@ def create_mock_session(mock_response, method: str = "get"):
     async_cm.__aenter__ = AsyncMock(return_value=mock_response)
     async_cm.__aexit__ = AsyncMock(return_value=None)
 
-    if method == "get":
-        mock_session.get = MagicMock(return_value=async_cm)
-    else:
-        mock_session.post = MagicMock(return_value=async_cm)
+    mock_session.request = MagicMock(return_value=async_cm)
 
     return mock_session
 
@@ -66,7 +63,7 @@ def create_mock_session(mock_response, method: str = "get"):
 async def test_get_success(reset_session, client):
     response_data = {"data": "test", "count": 42}
     mock_response = create_mock_response(200, response_data)
-    mock_session = create_mock_session(mock_response, "get")
+    mock_session = create_mock_session(mock_response)
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         result = await client.get("/data", SampleResponse)
@@ -94,7 +91,7 @@ async def test_get_pod_rental_active_uses_internal_endpoint(client):
 @pytest.mark.asyncio
 async def test_get_non_200_status(reset_session, client):
     mock_response = create_mock_response(500)
-    mock_session = create_mock_session(mock_response, "get")
+    mock_session = create_mock_session(mock_response)
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         result = await client.get("/data", SampleResponse)
@@ -105,7 +102,7 @@ async def test_get_non_200_status(reset_session, client):
 async def test_get_validation_error(reset_session, client):
     invalid_data = {"wrong_field": "value"}
     mock_response = create_mock_response(200, invalid_data)
-    mock_session = create_mock_session(mock_response, "get")
+    mock_session = create_mock_session(mock_response)
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         result = await client.get("/data", SampleResponse)
@@ -118,7 +115,7 @@ async def test_get_timeout(reset_session, client):
     async_cm = AsyncMock()
     async_cm.__aenter__ = AsyncMock(side_effect=TimeoutError())
     async_cm.__aexit__ = AsyncMock()
-    mock_session.get = MagicMock(return_value=async_cm)
+    mock_session.request = MagicMock(return_value=async_cm)
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         result = await client.get("/data", SampleResponse, timeout=1)
@@ -129,12 +126,12 @@ async def test_get_timeout(reset_session, client):
 async def test_get_with_signature(reset_session, client):
     response_data = {"data": "test", "count": 42}
     mock_response = create_mock_response(200, response_data)
-    mock_session = create_mock_session(mock_response, "get")
+    mock_session = create_mock_session(mock_response)
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         await client.get("/data", SampleResponse, add_signature=True)
 
-        call_args = mock_session.get.call_args
+        call_args = mock_session.request.call_args
         headers = call_args.kwargs.get("headers", {})
         assert "hotkey" in headers
         assert "timestamp" in headers
@@ -146,7 +143,7 @@ async def test_post_success(reset_session, client):
     request_data = {"action": "create"}
     response_data = {"data": "created", "count": 1}
     mock_response = create_mock_response(200, response_data)
-    mock_session = create_mock_session(mock_response, "post")
+    mock_session = create_mock_session(mock_response)
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         result = await client.post("/submit", SampleResponse, json_data=request_data)
@@ -159,13 +156,13 @@ async def test_post_success(reset_session, client):
 async def test_url_construction(reset_session, client):
     response_data = {"data": "test", "count": 42}
     mock_response = create_mock_response(200, response_data)
-    mock_session = create_mock_session(mock_response, "get")
+    mock_session = create_mock_session(mock_response)
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         await client.get("/some/path", SampleResponse)
 
-        call_args = mock_session.get.call_args
-        assert call_args[0][0] == "https://api.example.com/some/path"
+        call_args = mock_session.request.call_args
+        assert call_args[0] == ("GET", "https://api.example.com/some/path")
 
 
 @pytest.mark.asyncio
@@ -301,7 +298,7 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
         },
     }
     mock_response = create_mock_response(200, response_data)
-    mock_session = create_mock_session(mock_response, "get")
+    mock_session = create_mock_session(mock_response)
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         result = await client.get_all_rented_executors()
@@ -313,7 +310,7 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
     }
 
 
-def create_mock_session_with_attempts(side_effects, method: str = "post"):
+def create_mock_session_with_attempts(side_effects):
     """Session whose request yields one side effect per attempt (exception or response)."""
     mock_session = AsyncMock()
     mock_session.closed = False
@@ -328,10 +325,7 @@ def create_mock_session_with_attempts(side_effects, method: str = "post"):
         async_cm.__aexit__ = AsyncMock(return_value=None)
         cms.append(async_cm)
 
-    if method == "get":
-        mock_session.get = MagicMock(side_effect=cms)
-    else:
-        mock_session.post = MagicMock(side_effect=cms)
+    mock_session.request = MagicMock(side_effect=cms)
 
     return mock_session
 
@@ -351,7 +345,7 @@ async def test_post_retries_connection_error_then_succeeds(reset_session, client
     """DAH-2360: broken pipe on a stale pooled connection is retried, not surfaced."""
     ok_response = create_mock_response(200, {"data": "ok", "count": 1})
     mock_session = create_mock_session_with_attempts(
-        [aiohttp.ClientOSError(32, "Broken pipe"), ok_response], "post"
+        [aiohttp.ClientOSError(32, "Broken pipe"), ok_response]
     )
 
     with (
@@ -362,14 +356,14 @@ async def test_post_retries_connection_error_then_succeeds(reset_session, client
 
     assert result is not None
     assert result.data == "ok"
-    assert mock_session.post.call_count == 2
+    assert mock_session.request.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_get_retries_server_disconnected_then_succeeds(reset_session, client):
     ok_response = create_mock_response(200, {"data": "ok", "count": 1})
     mock_session = create_mock_session_with_attempts(
-        [aiohttp.ServerDisconnectedError(), ok_response], "get"
+        [aiohttp.ServerDisconnectedError(), ok_response]
     )
 
     with (
@@ -380,14 +374,14 @@ async def test_get_retries_server_disconnected_then_succeeds(reset_session, clie
 
     assert result is not None
     assert result.data == "ok"
-    assert mock_session.get.call_count == 2
+    assert mock_session.request.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_post_returns_none_when_connection_retries_exhausted(reset_session, client):
     attempts = 1 + BackendClient.CONNECTION_RETRY_ATTEMPTS
     mock_session = create_mock_session_with_attempts(
-        [aiohttp.ClientOSError(32, "Broken pipe") for _ in range(attempts)], "post"
+        [aiohttp.ClientOSError(32, "Broken pipe") for _ in range(attempts)]
     )
     sleep_mock = AsyncMock()
 
@@ -398,7 +392,7 @@ async def test_post_returns_none_when_connection_retries_exhausted(reset_session
         result = await client.post("/submit", SampleResponse)
 
     assert result is None
-    assert mock_session.post.call_count == attempts
+    assert mock_session.request.call_count == attempts
     assert [c.args[0] for c in sleep_mock.await_args_list] == list(
         BackendClient.CONNECTION_RETRY_BACKOFF_SECONDS
     )
@@ -407,21 +401,21 @@ async def test_post_returns_none_when_connection_retries_exhausted(reset_session
 @pytest.mark.asyncio
 async def test_post_timeout_is_not_retried(reset_session, client):
     """Timeouts may have reached the backend — retrying could double-run long operations."""
-    mock_session = create_mock_session_with_attempts([TimeoutError()], "post")
+    mock_session = create_mock_session_with_attempts([TimeoutError()])
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         result = await client.post("/submit", SampleResponse, timeout=1)
 
     assert result is None
-    assert mock_session.post.call_count == 1
+    assert mock_session.request.call_count == 1
 
 
 @pytest.mark.asyncio
 async def test_post_generic_client_error_is_not_retried(reset_session, client):
-    mock_session = create_mock_session_with_attempts([aiohttp.ClientError("boom")], "post")
+    mock_session = create_mock_session_with_attempts([aiohttp.ClientError("boom")])
 
     with patch.object(BackendClient, "get_session", return_value=mock_session):
         result = await client.post("/submit", SampleResponse)
 
     assert result is None
-    assert mock_session.post.call_count == 1
+    assert mock_session.request.call_count == 1
