@@ -389,15 +389,19 @@ async def test_post_returns_none_when_connection_retries_exhausted(reset_session
     mock_session = create_mock_session_with_attempts(
         [aiohttp.ClientOSError(32, "Broken pipe") for _ in range(attempts)], "post"
     )
+    sleep_mock = AsyncMock()
 
     with (
         patch.object(BackendClient, "get_session", return_value=mock_session),
-        patch("asyncio.sleep", new=AsyncMock()),
+        patch("asyncio.sleep", new=sleep_mock),
     ):
         result = await client.post("/submit", SampleResponse)
 
     assert result is None
     assert mock_session.post.call_count == attempts
+    assert [c.args[0] for c in sleep_mock.await_args_list] == list(
+        BackendClient.CONNECTION_RETRY_BACKOFF_SECONDS
+    )
 
 
 @pytest.mark.asyncio
