@@ -138,6 +138,12 @@ _CREATE_CONTAINER_SSH_KEEPALIVE_INTERVAL_SEC = 30
 _CREATE_CONTAINER_SSH_KEEPALIVE_COUNT_MAX = 4
 _DOCKER_PULL_TIMEOUT_SECONDS = DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS
 _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS = 30
+# PoC: fixed GPU power limit management, applied ONLY on the whitelisted stage
+# machine (RTX A4000, min 100W / max 140W). Lower on rental start, restore max
+# on container delete. Staging-only experiment — do not merge to prod as-is.
+_POC_POWER_LIMIT_EXECUTOR_IPS = {"149.36.1.151"}
+_POC_POWER_LIMIT_RENTED_W = 100
+_POC_POWER_LIMIT_DEFAULT_W = 140
 
 
 def _missing_rental_docker_host_key_log_text(
@@ -2695,6 +2701,40 @@ class DockerService:
                 )
             )
 
+    async def _apply_poc_power_limit(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        watts: int,
+        default_extra: dict[str, Any],
+    ) -> None:
+        # set a fixed GPU power limit on the whitelisted PoC executor; never raises
+        if executor_info.address not in _POC_POWER_LIMIT_EXECUTOR_IPS:
+            return
+        try:
+            result = await ssh_client.run(f"nvidia-smi -pl {watts}", check=True, timeout=30)
+            logger.info(
+                _m(
+                    "PoC power limit applied",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "poc_power_limit_watts": watts,
+                            "stdout": str(result.stdout).strip(),
+                        }
+                    ),
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "PoC power limit failed (non-fatal)",
+                    extra=get_extra_info(
+                        {**default_extra, "poc_power_limit_watts": watts, "error": str(exc)}
+                    ),
+                ),
+            )
+
     async def create_container(
         self,
         payload: ContainerCreateRequest,
@@ -3387,6 +3427,12 @@ class DockerService:
                     await self.finish_stream_logs()
 
                     current_step = "finalize"
+                    await self._apply_poc_power_limit(
+                        ssh_client=ssh_client,
+                        executor_info=executor_info,
+                        watts=_POC_POWER_LIMIT_RENTED_W,
+                        default_extra=default_extra,
+                    )
                     await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
                     if (
                         settings.ENABLE_INSPECTOR
@@ -3887,6 +3933,13 @@ class DockerService:
                 # in any post-container teardown step below must not fail the undeploy, or the
                 # backend retries a doomed request and penalizes the miner for a pod that is
                 # already removed. Each step is guarded individually and only logged on error.
+
+                await self._apply_poc_power_limit(
+                    ssh_client=ssh_client,
+                    executor_info=executor_info,
+                    watts=_POC_POWER_LIMIT_DEFAULT_W,
+                    default_extra=default_extra,
+                )
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
