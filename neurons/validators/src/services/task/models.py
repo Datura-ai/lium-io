@@ -26,6 +26,7 @@ class JobResult(BaseModel):
     is_rented: bool = False
     is_spot: bool = False
     is_new_rentals_paused: bool = False
+    default_job_opted_out: bool = False  # opted out of the Lium default job: no incentive while unrented
     provider_discord_connected: bool = True
     rental_created_at: datetime | None = None
     default_job_owner: str | None = None  # "miner" | "lium" | None; miner default job is excluded from unrented incentive

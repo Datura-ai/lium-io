@@ -17,7 +17,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 1. ZERO-INCENTIVE REASONS — each records the fact "this executor gets NO payout
    because <reason>" (`MinerLogLine.no_payout_because_*` constructors):
    Group A — earns nothing in EITHER pool (built by `_reason_excluded_from_both_pools`):
-     spot tier, Discord not connected, paused for new rentals, running own default job
+     spot tier, Discord not connected, paused for new rentals, running own default job,
+     opted out of the Lium default job
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
@@ -59,6 +60,7 @@ class ZeroIncentiveReason(StrEnum):
     PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
     NEW_RENTALS_PAUSED = "new_rentals_paused"
     MINER_DEFAULT_JOB = "miner_default_job"
+    DEFAULT_JOB_OPTED_OUT = "default_job_opted_out"
     # Group B: idle but not qualified for the unrented pool
     GPU_MODEL_NOT_ELIGIBLE_FOR_UNRENTED_INCENTIVE = "gpu_model_not_eligible_for_unrented_incentive"
     PRICE_ABOVE_MARKET_P90_SOFT_LIMIT = "price_above_market_p90_soft_limit"
@@ -185,6 +187,19 @@ class MinerLogLine(BaseModel):
                 "of a Lium job, and executors on your own job do not earn subnet incentive."
             ),
             internal_message="Executor excluded from both pools - running miner's own default job",
+        )
+
+    @staticmethod
+    def no_payout_because_default_job_opted_out(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.DEFAULT_JOB_OPTED_OUT,
+            message=(
+                "No subnet incentive: this executor is opted out of the Lium default job and "
+                "forfeits incentive while unrented. Opt back in to the Lium default job to "
+                "earn while idle."
+            ),
+            internal_message="Executor excluded from both pools - opted out of the Lium default job",
         )
 
     # ── Group B: idle but not qualified for the unrented pool ─────────────────

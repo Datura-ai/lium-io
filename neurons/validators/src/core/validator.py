@@ -316,6 +316,9 @@ class Validator:
                                         and not (
                                             job_result.is_new_rentals_paused and not job_result.is_rented
                                         )
+                                        and not (
+                                            job_result.default_job_opted_out and not job_result.is_rented
+                                        )
                                     ):
                                         total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
 

@@ -163,6 +163,25 @@ class DefaultIncentive(BaseIncentive):
             job_result.mining_score = 0
             return job_result
 
+        if job_result.default_job_opted_out and not job_result.is_rented:
+            logger.info(
+                _m(
+                    "Executor excluded from mining pool - opted out of the Lium default job",
+                    extra=get_extra_info(
+                        {
+                            "executor_id": str(job_result.executor_info.uuid),
+                            "gpu_model": job_result.gpu_model,
+                            "gpu_count": job_result.gpu_count,
+                            "reason": "default_job_opted_out",
+                            "score": 0,
+                            "pool": "none",
+                        }
+                    ),
+                )
+            )
+            job_result.mining_score = 0
+            return job_result
+
         # GPU count calculation
         job_result.total_gpu_count = self.total_gpu_model_count_map.get(job_result.gpu_model, 0)
         if not job_result.total_gpu_count:

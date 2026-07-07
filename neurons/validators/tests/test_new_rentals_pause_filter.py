@@ -18,6 +18,7 @@ from protocol.vc_protocol.compute_requests import (
 )
 from services.miner_service import MinerService
 from services.task.result_handler import ResultHandler
+from tests.helpers import build_state
 
 
 def _executor(executor_id: str) -> ExecutorSSHInfo:
@@ -140,6 +141,25 @@ def test_rented_executors_response_parses_new_rentals_paused_executor_ids():
     assert result.new_rentals_paused_executor_ids == ["paused-executor"]
 
 
+def test_rented_executors_response_defaults_default_job_opted_out_executor_ids():
+    """Older backend responses without opt-out IDs remain compatible."""
+    result = RentedExecutorsResponse.model_validate({"executors": {}})
+
+    assert result.default_job_opted_out_executor_ids == []
+
+
+def test_rented_executors_response_parses_default_job_opted_out_executor_ids():
+    """Backend opted-out executor IDs are available to incentive handling."""
+    result = RentedExecutorsResponse.model_validate(
+        {
+            "executors": {},
+            "default_job_opted_out_executor_ids": ["opted-out-executor"],
+        }
+    )
+
+    assert result.default_job_opted_out_executor_ids == ["opted-out-executor"]
+
+
 def test_rented_executors_response_defaults_provider_discord_connected_executor_ids_to_unknown():
     """Older backend responses without Discord executor IDs remain non-penalizing."""
     result = RentedExecutorsResponse.model_validate({"executors": {}})
@@ -230,6 +250,49 @@ def test_result_handler_reads_provider_discord_connected_executor_ids():
 
     assert ResultHandler._get_provider_discord_connected(connected_context) is True
     assert ResultHandler._get_provider_discord_connected(disconnected_context) is False
+
+
+@pytest.mark.asyncio
+async def test_handle_result_flags_default_job_opted_out_executor(context_factory):
+    """An executor in the backend opt-out list gets default_job_opted_out=True."""
+    rented_data = RentedExecutorsResponse(
+        executors={},
+        default_job_opted_out_executor_ids=["executor-123"],
+    )
+    state = build_state(rented_data=rented_data)
+    ctx = context_factory(state=state, score=1.0, job_score=1.0, rented=False)
+    handler = ResultHandler(redis_service=None, dry_run=True)
+
+    result = await handler.handle_result(
+        context=ctx,
+        miner_info=SimpleNamespace(miner_hotkey="miner-hotkey", job_batch_id="batch-1"),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="ok",
+        success=True,
+    )
+
+    assert result.default_job_opted_out is True
+
+
+@pytest.mark.asyncio
+async def test_handle_result_defaults_default_job_opted_out_to_false(context_factory):
+    """An executor absent from the backend opt-out list keeps default_job_opted_out=False."""
+    rented_data = RentedExecutorsResponse(executors={})
+    state = build_state(rented_data=rented_data)
+    ctx = context_factory(state=state, score=1.0, job_score=1.0, rented=False)
+    handler = ResultHandler(redis_service=None, dry_run=True)
+
+    result = await handler.handle_result(
+        context=ctx,
+        miner_info=SimpleNamespace(miner_hotkey="miner-hotkey", job_batch_id="batch-1"),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="ok",
+        success=True,
+    )
+
+    assert result.default_job_opted_out is False
 
 
 @pytest.mark.asyncio

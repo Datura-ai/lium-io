@@ -33,6 +33,7 @@ def _make_job(
     is_new_rentals_paused: bool = False,
     provider_discord_connected: bool = True,
     default_job_owner: str | None = None,
+    default_job_opted_out: bool = False,
 ) -> JobResult:
     return JobResult(
         executor_info=ExecutorSSHInfo(
@@ -57,6 +58,7 @@ def _make_job(
         is_new_rentals_paused=is_new_rentals_paused,
         provider_discord_connected=provider_discord_connected,
         default_job_owner=default_job_owner,
+        default_job_opted_out=default_job_opted_out,
         collateral_deposited=True,
         sysbox_runtime=True,
     )
@@ -207,6 +209,7 @@ async def test_shadow_mode_does_not_append_incentive_log(monkeypatch):
         ({"provider_discord_connected": False}, ["Discord", "provider_discord_not_connected"]),
         ({"is_new_rentals_paused": True}, ["paused", "new_rentals_paused"]),
         ({"default_job_owner": "miner"}, ["default job", "miner_default_job"]),
+        ({"default_job_opted_out": True}, ["opted out", "default_job_opted_out"]),
     ],
 )
 @pytest.mark.asyncio
@@ -329,3 +332,15 @@ def test_reason_excluded_from_both_pools_returns_first_match_and_none():
     # spot precedes discord when both apply — order is preserved
     both = _make_job(1.0, is_spot=True, provider_discord_connected=False)
     assert incentive._reason_excluded_from_both_pools(both).reason == "spot_tier"
+
+
+def test_default_job_opted_out_excludes_only_while_unrented():
+    # Mirrors is_new_rentals_paused semantics: an opted-out executor forfeits
+    # incentive while unrented, but a RENTED opted-out executor is not excluded.
+    incentive = _build_incentive()
+
+    unrented = _make_job(1.0, default_job_opted_out=True)
+    assert incentive._reason_excluded_from_both_pools(unrented).reason == "default_job_opted_out"
+
+    rented = _make_job(1.0, default_job_opted_out=True, is_rented=True)
+    assert incentive._reason_excluded_from_both_pools(rented) is None

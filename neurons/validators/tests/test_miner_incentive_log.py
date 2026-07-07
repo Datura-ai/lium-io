@@ -20,6 +20,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "provider_discord_not_connected",
         "new_rentals_paused",
         "miner_default_job",
+        "default_job_opted_out",
         "gpu_model_not_eligible_for_unrented_incentive",
         "price_above_market_p90_soft_limit",
         "no_unrented_capacity_for_gpu_count",
@@ -77,6 +78,11 @@ def _job(**overrides) -> JobResult:
             lambda job: MinerLogLine.no_payout_because_running_own_default_job(job),
             "miner_default_job",
             "own default job",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_default_job_opted_out(job),
+            "default_job_opted_out",
+            "opted out",
         ),
         (
             lambda job: MinerLogLine.no_payout_because_gpu_model_not_in_unrented_program(job),

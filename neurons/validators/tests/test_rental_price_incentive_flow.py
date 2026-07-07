@@ -144,6 +144,7 @@ def _make_rented_data(
     new_rentals_paused_executor_ids: list[str] | None = None,
     provider_discord_connected_executor_ids: list[str] | None = None,
     default_job_owner_by_executor: dict[str, str] | None = None,
+    default_job_opted_out_executor_ids: list[str] | None = None,
 ) -> RentedExecutorsResponse:
     executors = {}
     for executor_id in rented_executor_ids or []:
@@ -161,6 +162,7 @@ def _make_rented_data(
         new_rentals_paused_executor_ids=new_rentals_paused_executor_ids or [],
         provider_discord_connected_executor_ids=provider_discord_connected_executor_ids,
         default_job_owner_by_executor=default_job_owner_by_executor or {},
+        default_job_opted_out_executor_ids=default_job_opted_out_executor_ids or [],
     )
 
 
@@ -2817,6 +2819,83 @@ async def test_rental_price_paused_unrented_excluded_from_incentives_but_still_v
     assert secure_rented.is_rented is True
     assert secure_rented.total_gpu_count == 16
     assert validator.miner_scores["miner_secure_rented"] > 0
+
+
+@pytest.mark.asyncio
+async def test_rental_price_default_job_opted_out_unrented_earns_nothing(
+    validator_with_rental_price,
+    mock_subtensor_client,
+    mock_settings,
+    create_job_result,
+    create_neuron_info,
+    mock_price_provider,
+):
+    """An executor opted out of the Lium default job earns nothing while unrented
+    (mirrors is_new_rentals_paused semantics):
+    - it is excluded from both pools (mining + rental)
+    - it does not dilute secure unrented bucket caps
+    A RENTED opted-out executor keeps the normal rental-based mining incentive.
+    """
+    validator = validator_with_rental_price
+    validator.miner_scores = {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner_secure_unrented"),
+        create_neuron_info(uid=3, hotkey="miner_opted_out_rented"),
+        create_neuron_info(uid=4, hotkey="miner_opted_out"),
+    ]
+
+    secure_unrented = _job(
+        create_job_result, executor_id="exec-secure-unrented",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    opted_out_rented = _job(
+        create_job_result, executor_id="exec-opted-out-rented",
+        gpu_model="H100", gpu_count=8, is_rented=True,
+    )
+    opted_out = _job(
+        create_job_result, executor_id="exec-opted-out",
+        gpu_model="H100", gpu_count=8, is_rented=False,
+    )
+    opted_out_rented.default_job_opted_out = True
+    opted_out.default_job_opted_out = True
+
+    all_job_results = {
+        "miner_secure_unrented": [secure_unrented],
+        "miner_opted_out_rented": [opted_out_rented],
+        "miner_opted_out": [opted_out],
+    }
+
+    validator.backend_client.get_all_rented_executors = AsyncMock(
+        return_value=_make_rented_data(
+            rented_executor_ids=["exec-opted-out-rented"],
+            default_job_opted_out_executor_ids=[
+                "exec-opted-out",
+                "exec-opted-out-rented",
+            ],
+        )
+    )
+
+    await _run_sync_with_jobs(validator, miners, all_job_results)
+
+    # Opted-out and unrented -> excluded from both pools, earns nothing
+    assert opted_out.mining_score == 0
+    assert opted_out.eligible_for_rental_share is False
+    assert (opted_out.incentive or 0.0) == 0.0
+    assert validator.miner_scores.get("miner_opted_out", 0.0) == pytest.approx(0.0, abs=0.0001)
+
+    # The opted-out unrented executor must not dilute the secure unrented bucket
+    assert secure_unrented.eligible_for_rental_share is True
+    assert secure_unrented.total_unrented_by_gpu_type == 8
+    assert secure_unrented.unrented_cap_multiplier == pytest.approx(1.0)
+    assert (secure_unrented.incentive or 0.0) > 0.0
+
+    # Opted-out but RENTED -> normal rental-based mining incentive
+    assert opted_out_rented.is_rented is True
+    assert opted_out_rented.total_gpu_count == 16
+    assert validator.miner_scores["miner_opted_out_rented"] > 0
 
 
 @pytest.mark.asyncio

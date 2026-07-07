@@ -113,6 +113,10 @@ class ResultHandler:
             context.state.rented_data
             and executor_info.uuid in context.state.rented_data.new_rentals_paused_executor_ids
         )
+        default_job_opted_out = bool(
+            context.state.rented_data
+            and executor_info.uuid in context.state.rented_data.default_job_opted_out_executor_ids
+        )
         default_job_owner = (
             context.state.rented_data.get_default_job_owner(executor_info.uuid)
             if context.state.rented_data
@@ -177,6 +181,7 @@ class ResultHandler:
             is_rented=context.rented,
             is_spot=is_spot,
             is_new_rentals_paused=is_new_rentals_paused,
+            default_job_opted_out=default_job_opted_out,
             provider_discord_connected=provider_discord_connected,
             rental_created_at=self._get_rental_created_at(context),
             default_job_owner=default_job_owner,
