@@ -682,6 +682,10 @@ class RentalPriceIncentive(DefaultIncentive):
                 # executors excluded from incentive pools should not inflate estimates.
                 if result.is_spot or is_missing_discord_after_cutoff(result):
                     continue
+                # Explicit opted-out check (not is_excluded_from_unrented_pool):
+                # the is_new_rentals_paused half is intentionally deferred to a follow-up.
+                if result.default_job_opted_out and not result.is_rented:
+                    continue
                 total_gpu_model_count_map[result.gpu_model] = (
                     total_gpu_model_count_map.get(result.gpu_model, 0) + result.gpu_count
                 )

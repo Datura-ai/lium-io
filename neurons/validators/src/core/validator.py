@@ -313,12 +313,7 @@ class Validator:
                                         and (job_result.score > 0 or job_result.job_score > 0)
                                         and not job_result.is_spot
                                         and not is_missing_discord_after_cutoff(job_result)
-                                        and not (
-                                            job_result.is_new_rentals_paused and not job_result.is_rented
-                                        )
-                                        and not (
-                                            job_result.default_job_opted_out and not job_result.is_rented
-                                        )
+                                        and not job_result.is_excluded_from_unrented_pool
                                     ):
                                         total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
 

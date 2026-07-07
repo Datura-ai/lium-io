@@ -78,7 +78,7 @@ class RentedExecutorsResponse(BaseModel):
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
     spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
     new_rentals_paused_executor_ids: list[str] = []  # executor_ids paused from unrented incentives
-    default_job_opted_out_executor_ids: list[str] = []  # executor_ids opted out of the Lium default job (no unrented incentive)
+    default_job_opted_out_executor_ids: set[str] = set()  # executor_ids opted out of the Lium default job (no unrented incentive); set for O(1) hot-path membership
     provider_discord_connected_executor_ids: list[str] | None = None  # executor_ids whose provider has connected Discord
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).

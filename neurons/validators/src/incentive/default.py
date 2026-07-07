@@ -120,6 +120,31 @@ class DefaultIncentive(BaseIncentive):
         result.incentive_logs.append(report.to_log_line())
         return result
 
+    def _log_and_zero_unrented_exclusion(
+        self,
+        job_result: JobResult,
+        message: str,
+        reason: str,
+    ) -> JobResult:
+        """Log an unrented-pool exclusion and return the result with a zeroed score."""
+        logger.info(
+            _m(
+                message,
+                extra=get_extra_info(
+                    {
+                        "executor_id": str(job_result.executor_info.uuid),
+                        "gpu_model": job_result.gpu_model,
+                        "gpu_count": job_result.gpu_count,
+                        "reason": reason,
+                        "score": 0,
+                        "pool": "none",
+                    }
+                ),
+            )
+        )
+        job_result.mining_score = 0
+        return job_result
+
     async def calculate_executor_score(
         self,
         job_result: JobResult,
@@ -145,42 +170,18 @@ class DefaultIncentive(BaseIncentive):
         # directly. The active rental_price algorithm handles this before it
         # calls into DefaultIncentive.
         if job_result.is_new_rentals_paused and not job_result.is_rented:
-            logger.info(
-                _m(
-                    "Executor excluded from mining pool - paused for new rentals",
-                    extra=get_extra_info(
-                        {
-                            "executor_id": str(job_result.executor_info.uuid),
-                            "gpu_model": job_result.gpu_model,
-                            "gpu_count": job_result.gpu_count,
-                            "reason": "new_rentals_paused",
-                            "score": 0,
-                            "pool": "none",
-                        }
-                    ),
-                )
+            return self._log_and_zero_unrented_exclusion(
+                job_result,
+                message="Executor excluded from mining pool - paused for new rentals",
+                reason="new_rentals_paused",
             )
-            job_result.mining_score = 0
-            return job_result
 
         if job_result.default_job_opted_out and not job_result.is_rented:
-            logger.info(
-                _m(
-                    "Executor excluded from mining pool - opted out of the Lium default job",
-                    extra=get_extra_info(
-                        {
-                            "executor_id": str(job_result.executor_info.uuid),
-                            "gpu_model": job_result.gpu_model,
-                            "gpu_count": job_result.gpu_count,
-                            "reason": "default_job_opted_out",
-                            "score": 0,
-                            "pool": "none",
-                        }
-                    ),
-                )
+            return self._log_and_zero_unrented_exclusion(
+                job_result,
+                message="Executor excluded from mining pool - opted out of the Lium default job",
+                reason="default_job_opted_out",
             )
-            job_result.mining_score = 0
-            return job_result
 
         # GPU count calculation
         job_result.total_gpu_count = self.total_gpu_model_count_map.get(job_result.gpu_model, 0)

@@ -193,6 +193,29 @@ async def test_get_snapshot_excludes_spot_executor_from_mining_totals(
     assert snapshot.mining.total_gpu_model_count_map == {"H100": 8}
 
 
+@pytest.mark.asyncio
+async def test_get_snapshot_excludes_opted_out_unrented_executor_from_mining_totals(
+    rental_config, mock_redis, mock_price_provider, monkeypatch
+):
+    """Unrented opted-out executor is excluded from snapshot totals; a rented one still counts."""
+    opted_out_unrented = _make_job("exec-opted-out", "H100", 8, is_rented=False)
+    opted_out_unrented.default_job_opted_out = True
+    opted_out_rented = _make_job("exec-opted-out-rented", "H100", 4, is_rented=True)
+    opted_out_rented.default_job_opted_out = True
+    job_results = {
+        "miner_regular": [_make_job("exec-regular", "H100", 8, is_rented=False)],
+        "miner_opted_out": [opted_out_unrented],
+        "miner_opted_out_rented": [opted_out_rented],
+    }
+    incentive = _make_incentive(rental_config, mock_redis, mock_price_provider, job_results, monkeypatch)
+
+    await incentive.calculate_mining_scores()
+    snapshot = incentive.get_snapshot()
+
+    assert snapshot.mining.total_gpu_count == 12  # 8 regular + 4 rented opted-out
+    assert snapshot.mining.total_gpu_model_count_map == {"H100": 12}
+
+
 # ── estimate_executor() — unrented path ──────────────────────────────────────
 
 @pytest.mark.asyncio

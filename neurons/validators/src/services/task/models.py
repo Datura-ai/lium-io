@@ -74,6 +74,12 @@ class JobResult(BaseModel):
     def is_successful(self):
         return (self.score > 0 or self.job_score > 0) and self.gpu_model and self.gpu_count > 0
 
+    @property
+    def is_excluded_from_unrented_pool(self) -> bool:
+        """Opted out of Lium default job or paused for new rentals — no unrented incentive."""
+        has_exclusion_flag: bool = self.is_new_rentals_paused or self.default_job_opted_out
+        return has_exclusion_flag and not self.is_rented
+
 
 class ValidationEvent(BaseModel):
     event: str

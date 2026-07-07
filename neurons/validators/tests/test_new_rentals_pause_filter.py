@@ -145,19 +145,20 @@ def test_rented_executors_response_defaults_default_job_opted_out_executor_ids()
     """Older backend responses without opt-out IDs remain compatible."""
     result = RentedExecutorsResponse.model_validate({"executors": {}})
 
-    assert result.default_job_opted_out_executor_ids == []
+    assert result.default_job_opted_out_executor_ids == set()
 
 
 def test_rented_executors_response_parses_default_job_opted_out_executor_ids():
-    """Backend opted-out executor IDs are available to incentive handling."""
+    """A JSON list of backend opted-out executor IDs parses into a set for O(1) lookups."""
     result = RentedExecutorsResponse.model_validate(
         {
             "executors": {},
-            "default_job_opted_out_executor_ids": ["opted-out-executor"],
+            "default_job_opted_out_executor_ids": ["opted-out-executor", "opted-out-executor"],
         }
     )
 
-    assert result.default_job_opted_out_executor_ids == ["opted-out-executor"]
+    assert isinstance(result.default_job_opted_out_executor_ids, set)
+    assert result.default_job_opted_out_executor_ids == {"opted-out-executor"}
 
 
 def test_rented_executors_response_defaults_provider_discord_connected_executor_ids_to_unknown():
