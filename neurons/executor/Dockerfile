@@ -43,9 +43,15 @@ RUN pdm install --prod
 # heavy and fragile, so it lives in its own opt-in layer for CVM runner builds
 # only. The single pin pulls nv_attestation_sdk, the local GPU verifier
 # (cc_admin) and pynvml transitively — same pin as the private-ml-sdk reference.
+#
+# Install into an ISOLATED prefix and expose it to the pdm venv via a
+# low-priority .pth. Installing into the venv directly downgrades pinned deps
+# (typing_extensions/setuptools) and breaks pydantic; `pdm run pip install`
+# targets the base interpreter, which the venv the executor runs in never sees.
 ARG INSTALL_GPU_ATTESTATION=false
 RUN if [ "$INSTALL_GPU_ATTESTATION" = "true" ]; then \
-      pdm run pip install nv-ppcie-verifier==1.5.0; \
+      pip install --target /opt/gpu-attest nv-ppcie-verifier==1.5.0 && \
+      echo /opt/gpu-attest > /root/app/.venv/lib/python3.11/site-packages/gpu-attest.pth; \
     fi
 
 COPY . .

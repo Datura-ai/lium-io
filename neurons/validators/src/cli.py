@@ -13,6 +13,7 @@ from clients.subtensor_client import SubtensorClient
 from services.ioc import ioc
 from services.miner_service import MinerService
 from services.docker_service import DockerService
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.file_encrypt_service import FileEncryptService
 from payload_models.payloads import (
     MinerJobRequestPayload,
@@ -145,6 +146,7 @@ async def _request_job_to_miner(miner_hotkey: str):
                 miner_port=miner.axon_info.port,
             ),
             encrypted_files=encrypted_files,
+            rented_data=RentedExecutorsResponse(executors={}),
         )
         print('job_result:', result)
     finally:
