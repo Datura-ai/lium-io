@@ -32,6 +32,20 @@ class BackendClient:
     _session: ClassVar[aiohttp.ClientSession | None] = None
     _session_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
 
+    # DAH-2360: writing to a stale pooled keep-alive connection fails with
+    # EPIPE before the request reaches the backend, so these errors are safe
+    # to retry even for non-idempotent POSTs. Timeouts and 5xx are NOT retried:
+    # by then the request may have reached the backend and run server-side.
+    CONNECTION_ERRORS: ClassVar[tuple[type[Exception], ...]] = (
+        aiohttp.ServerDisconnectedError,
+        aiohttp.ClientConnectorError,
+        aiohttp.ClientOSError,
+    )
+    CONNECTION_RETRY_ATTEMPTS: ClassVar[int] = 2
+    CONNECTION_RETRY_BACKOFF_SECONDS: ClassVar[float] = 0.5
+    # Drop idle pooled connections well before the server/ingress closes them.
+    KEEPALIVE_TIMEOUT_SECONDS: ClassVar[int] = 30
+
     def __init__(self, base_url: str, keypair: bittensor.Keypair):
         self.base_url = base_url.rstrip("/")
         self.keypair = keypair
@@ -41,7 +55,11 @@ class BackendClient:
         if cls._session is None or cls._session.closed:
             async with cls._session_lock:
                 if cls._session is None or cls._session.closed:
-                    connector = aiohttp.TCPConnector(limit=100, limit_per_host=10)
+                    connector = aiohttp.TCPConnector(
+                        limit=100,
+                        limit_per_host=10,
+                        keepalive_timeout=cls.KEEPALIVE_TIMEOUT_SECONDS,
+                    )
                     cls._session = aiohttp.ClientSession(
                         timeout=aiohttp.ClientTimeout(total=None),
                         connector=connector,
@@ -80,41 +98,55 @@ class BackendClient:
                 headers.update(extra_headers)
 
             session = await self.get_session()
-            start_time = time.perf_counter()
-            async with session.get(
-                url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
-            ) as resp:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(
-                    _m(
-                        "HTTP GET completed",
-                        extra=get_extra_info({**context, "status": resp.status, "elapsed_ms": round(elapsed_ms, 1)}),
-                    )
-                )
-                if resp.status != 200:
-                    logger.error(
+            for attempt in range(1 + self.CONNECTION_RETRY_ATTEMPTS):
+                try:
+                    start_time = time.perf_counter()
+                    async with session.get(
+                        url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+                    ) as resp:
+                        elapsed_ms = (time.perf_counter() - start_time) * 1000
+                        logger.info(
+                            _m(
+                                "HTTP GET completed",
+                                extra=get_extra_info({**context, "status": resp.status, "elapsed_ms": round(elapsed_ms, 1)}),
+                            )
+                        )
+                        if resp.status != 200:
+                            logger.error(
+                                _m(
+                                    "HTTP GET failed",
+                                    extra=get_extra_info({**context, "status": resp.status}),
+                                )
+                            )
+                            return None
+
+                        try:
+                            data = await resp.json()
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError) as e:
+                            logger.error(
+                                _m("Invalid JSON", extra=get_extra_info({**context, "error": str(e)}))
+                            )
+                            return None
+
+                        try:
+                            return response_model.model_validate(data)
+                        except ValidationError as e:
+                            logger.error(
+                                _m("Validation failed", extra=get_extra_info({**context, "error": str(e)}))
+                            )
+                            return None
+                except self.CONNECTION_ERRORS as e:
+                    if attempt >= self.CONNECTION_RETRY_ATTEMPTS:
+                        raise
+                    logger.warning(
                         _m(
-                            "HTTP GET failed",
-                            extra=get_extra_info({**context, "status": resp.status}),
+                            "GET connection error, retrying",
+                            extra=get_extra_info(
+                                {**context, "error": str(e), "attempt": attempt + 1}
+                            ),
                         )
                     )
-                    return None
-
-                try:
-                    data = await resp.json()
-                except (aiohttp.ContentTypeError, json.JSONDecodeError) as e:
-                    logger.error(
-                        _m("Invalid JSON", extra=get_extra_info({**context, "error": str(e)}))
-                    )
-                    return None
-
-                try:
-                    return response_model.model_validate(data)
-                except ValidationError as e:
-                    logger.error(
-                        _m("Validation failed", extra=get_extra_info({**context, "error": str(e)}))
-                    )
-                    return None
+                    await asyncio.sleep(self.CONNECTION_RETRY_BACKOFF_SECONDS)
 
         except TimeoutError:
             logger.error(_m("GET timeout", extra=get_extra_info(context)))
@@ -147,41 +179,55 @@ class BackendClient:
                 headers.update(extra_headers)
 
             session = await self.get_session()
-            start_time = time.perf_counter()
-            async with session.post(
-                url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=timeout)
-            ) as resp:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                logger.info(
-                    _m(
-                        "HTTP POST completed",
-                        extra=get_extra_info({**context, "status": resp.status, "elapsed_ms": round(elapsed_ms, 1)}),
-                    )
-                )
-                if resp.status != 200:
-                    logger.error(
+            for attempt in range(1 + self.CONNECTION_RETRY_ATTEMPTS):
+                try:
+                    start_time = time.perf_counter()
+                    async with session.post(
+                        url, headers=headers, json=json_data, timeout=aiohttp.ClientTimeout(total=timeout)
+                    ) as resp:
+                        elapsed_ms = (time.perf_counter() - start_time) * 1000
+                        logger.info(
+                            _m(
+                                "HTTP POST completed",
+                                extra=get_extra_info({**context, "status": resp.status, "elapsed_ms": round(elapsed_ms, 1)}),
+                            )
+                        )
+                        if resp.status != 200:
+                            logger.error(
+                                _m(
+                                    "HTTP POST failed",
+                                    extra=get_extra_info({**context, "status": resp.status}),
+                                )
+                            )
+                            return None
+
+                        try:
+                            data = await resp.json()
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError) as e:
+                            logger.error(
+                                _m("Invalid JSON", extra=get_extra_info({**context, "error": str(e)}))
+                            )
+                            return None
+
+                        try:
+                            return response_model.model_validate(data)
+                        except ValidationError as e:
+                            logger.error(
+                                _m("Validation failed", extra=get_extra_info({**context, "error": str(e)}))
+                            )
+                            return None
+                except self.CONNECTION_ERRORS as e:
+                    if attempt >= self.CONNECTION_RETRY_ATTEMPTS:
+                        raise
+                    logger.warning(
                         _m(
-                            "HTTP POST failed",
-                            extra=get_extra_info({**context, "status": resp.status}),
+                            "POST connection error, retrying",
+                            extra=get_extra_info(
+                                {**context, "error": str(e), "attempt": attempt + 1}
+                            ),
                         )
                     )
-                    return None
-
-                try:
-                    data = await resp.json()
-                except (aiohttp.ContentTypeError, json.JSONDecodeError) as e:
-                    logger.error(
-                        _m("Invalid JSON", extra=get_extra_info({**context, "error": str(e)}))
-                    )
-                    return None
-
-                try:
-                    return response_model.model_validate(data)
-                except ValidationError as e:
-                    logger.error(
-                        _m("Validation failed", extra=get_extra_info({**context, "error": str(e)}))
-                    )
-                    return None
+                    await asyncio.sleep(self.CONNECTION_RETRY_BACKOFF_SECONDS)
 
         except TimeoutError:
             logger.error(_m("POST timeout", extra=get_extra_info(context)))
