@@ -111,7 +111,8 @@ async def test_new_logic_distributes_partial_burn_share(
     [
         (1, 10, 0.10),  # single-slot burner gets 1/10
         (3, 10, 0.30),  # DAH-2089: UID 47 owns 3/10 slots → 30%
-        (5, 10, 0.50),  # majority burner
+        (5, 10, 0.50),  # DAH-2125: UID 47 owns 5/10 slots → 50%
+        (7, 10, 0.70),  # DAH-2362: UID 47 owns 7/10 slots → 70%
         (4, 4, 1.00),   # entire pool collapsed to one UID
     ],
 )
@@ -171,6 +172,34 @@ async def test_new_logic_dah_2089_uid_47_absorbs_retired_burner_shares(
     per_slot = TOTAL_BURN_EMISSION / 10
     assert scores["hk_47"] == pytest.approx(per_slot * 3)
     for uid in (187, 188, 189, 190, 191, 192, 193):
+        assert scores[f"hk_{uid}"] == pytest.approx(per_slot)
+    assert sum(scores.values()) == pytest.approx(TOTAL_BURN_EMISSION)
+
+
+@pytest.mark.asyncio
+async def test_new_logic_dah_2362_production_layout_gives_uid_47_seventy_percent(
+    burn_service, monkeypatch, mock_settings, create_neuron_info
+):
+    """DAH-2362 invariant: UID 47 holds 7 slots and receives exactly 70% of burn_share,
+    while the 3 remaining burners keep 10% each."""
+    # Arrange — production NEW_BURNERS layout introduced by DAH-2362
+    monkeypatch.setattr(
+        "core.config.settings.NEW_BURNERS",
+        [187, 188, 189, 47, 47, 47, 47, 47, 47, 47],
+    )
+    miners = _make_miners(create_neuron_info, [187, 188, 189, 47])
+
+    # Act
+    scores = burn_service.calculate_burn_scores(
+        miners=miners,
+        burn_share=TOTAL_BURN_EMISSION,
+        last_mechanism_step_block=None,
+    )
+
+    # Assert — UID 47 (7 slots) gets 70%, other 3 burners get 10% each, total = burn_share
+    per_slot = TOTAL_BURN_EMISSION / 10
+    assert scores["hk_47"] == pytest.approx(per_slot * 7)
+    for uid in (187, 188, 189):
         assert scores[f"hk_{uid}"] == pytest.approx(per_slot)
     assert sum(scores.values()) == pytest.approx(TOTAL_BURN_EMISSION)
 
