@@ -24,6 +24,11 @@ MIN_CIPHER_LEN = 64
 # Cap on stderr bytes captured per failure. Last 2 KB is kept when longer.
 STDERR_TAIL_BYTES = 2048
 
+# Hard cap on the remote verifyx run. Memory/storage/network probes can legitimately take
+# minutes, so this is generous — it only cuts true hangs (same silent-hang class as the
+# matrix check, DAH-2365) instead of blocking until the outer JOB_TIME_OUT cancellation.
+VERIFYX_COMMAND_TIMEOUT_SECONDS = 600
+
 
 class VerifyXFailureClass(str, Enum):
     SSH_TRANSPORT = "SSH_TRANSPORT"
@@ -244,7 +249,7 @@ class VerifyXValidationService:
     async def _run_ssh_command(self, shell, command: str) -> SSHCapture:
         """Run SSH command; on transport failure populate `transport_error`, else the payload fields."""
         try:
-            result = await shell.ssh_client.run(command)
+            result = await shell.ssh_client.run(command, timeout=VERIFYX_COMMAND_TIMEOUT_SECONDS)
         except Exception as e:
             return SSHCapture(transport_error=f"{type(e).__name__}: {e}")
 

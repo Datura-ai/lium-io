@@ -311,11 +311,8 @@ class MinerService:
                         for executor_info in msg.executors
                     ]
 
-                    results = [
-                        result
-                        for result in await asyncio.gather(*tasks, return_exceptions=True)
-                        if result and not isinstance(result, Exception) and not isinstance(result, BaseException)
-                    ]
+                    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    results = self._filter_task_results(msg.executors, raw_results, default_extra)
 
                     logger.info(
                         _m(
@@ -427,6 +424,30 @@ class MinerService:
                 payload,
                 str(e),
             )
+
+    def _filter_task_results(self, executors, raw_results, default_extra: dict) -> list:
+        # keep successful JobResults; log every executor whose task ended in an
+        # exception/timeout/empty result instead of silently dropping it (DAH-2365)
+        results = []
+        for executor_info, result in zip(executors, raw_results):
+            if result and not isinstance(result, BaseException):
+                results.append(result)
+                continue
+            logger.warning(
+                _m(
+                    "Executor task dropped without result",
+                    extra=get_extra_info(
+                        {
+                            **default_extra,
+                            "executor_uuid": str(executor_info.uuid),
+                            "executor_ip_address": executor_info.address,
+                            "error_type": type(result).__name__ if result is not None else None,
+                            "error": str(result) if result is not None else "empty result",
+                        }
+                    ),
+                ),
+            )
+        return results
 
     def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
         executor_info = ExecutorSSHInfo(
@@ -1543,11 +1564,8 @@ class MinerService:
                     for executor_info in msg.executors
                 ]
 
-                results = [
-                    result
-                    for result in await asyncio.gather(*tasks, return_exceptions=True)
-                    if result and not isinstance(result, Exception) and not isinstance(result, BaseException)
-                ]
+                raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                results = self._filter_task_results(msg.executors, raw_results, default_extra)
 
                 logger.info(
                     _m(
