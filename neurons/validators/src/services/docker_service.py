@@ -112,6 +112,12 @@ LOG_STREAM_INTERVAL = 0.5  # 500ms — keeps build-log p95 emit→publish under 
 # would violate the SSE latency requirement.
 IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 
+# DAH-2364: SIGTERM grace window (docker stop -t semantics) given to a container before
+# forced removal. SIGKILL-only removal of GPU-heavy workloads repeatedly wedged
+# containerd/sysbox ("could not kill container ... did not receive an exit event"),
+# leaving orphaned containers that hold GPUs and brick the executor.
+CONTAINER_STOP_GRACE_SECONDS = 30
+
 DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
 }
@@ -3962,6 +3968,48 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
+                # DAH-2364: graceful stop first (SIGTERM + grace window) so the workload
+                # can exit cleanly before the forced removal below. Applies to customer
+                # rentals and fillers alike. Any stop failure is swallowed — the forced
+                # removal stays the single source of truth for deletion success.
+                try:
+                    await run_logged_rental_docker_sdk_operation(
+                        operation="stop_container",
+                        log_extra=default_extra,
+                        call=lambda: docker_client.stop(
+                            container_name=payload.container_name,
+                            timeout=CONTAINER_STOP_GRACE_SECONDS,
+                        ),
+                        container_name=payload.container_name,
+                        stop_grace_seconds=CONTAINER_STOP_GRACE_SECONDS,
+                    )
+                except Exception as exc:
+                    if _is_missing_docker_container_error(exc):
+                        logger.info(
+                            _m(
+                                "Graceful stop skipped: container is already absent",
+                                extra=get_extra_info(
+                                    {
+                                        **default_extra,
+                                        "container_name": payload.container_name,
+                                    }
+                                ),
+                            ),
+                        )
+                    else:
+                        logger.warning(
+                            _m(
+                                "Graceful container stop failed; proceeding to forced removal",
+                                extra=get_extra_info(
+                                    {
+                                        **default_extra,
+                                        "container_name": payload.container_name,
+                                        "error": str(exc),
+                                    }
+                                ),
+                            ),
+                        )
+
                 try:
                     await run_logged_rental_docker_sdk_operation(
                         operation="remove_container",
