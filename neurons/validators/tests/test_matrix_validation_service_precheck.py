@@ -11,6 +11,7 @@ executors alike. What remains tested here:
 """
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -205,3 +206,60 @@ async def test_non_string_uuid_in_result_json_falls_back(service_with_mock_wrapp
     assert result.success is True
     assert result.returned_uuid == _FIXED_UUID
     assert result.metrics is None  # untrusted metrics from the malformed line are dropped
+
+
+# --- SSH-run timeout → timed_out result + remote process kill (DAH-2365) ----
+@pytest.mark.asyncio
+async def test_matmul_run_is_bounded_by_timeout(service_with_mock_wrapper):
+    """The matmul SSH run must carry an explicit timeout so a wedged GPU can't hang the pipeline."""
+    svc, _ = service_with_mock_wrapper
+    ssh = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(stdout="UUID: foo", stderr=""))
+    )
+    await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(),
+    )
+    assert ssh.run.await_args_list[0].kwargs["timeout"] == mvs.MATRIX_VERIFY_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_ssh_timeout_returns_timed_out_result_and_kills_remote(service_with_mock_wrapper):
+    """On timeout the result reports timed_out=True and the leaked remote process is pkill'ed."""
+    svc, _ = service_with_mock_wrapper
+    run_mock = AsyncMock(
+        side_effect=[asyncio.TimeoutError(), SimpleNamespace(stdout="", stderr="")]
+    )
+    ssh = SimpleNamespace(run=run_mock)
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(),
+    )
+    assert result.success is False
+    assert result.timed_out is True
+    assert "timed out" in result.error_message
+    # second SSH call is the best-effort kill of the leaked matmul process
+    assert run_mock.await_count == 2
+    pkill_cmd = run_mock.await_args_list[1].args[0]
+    assert "pkill -f" in pkill_cmd
+    assert "decrypt_challenge.py" in pkill_cmd
+
+
+@pytest.mark.asyncio
+async def test_ssh_timeout_kill_failure_still_returns_timed_out(service_with_mock_wrapper):
+    """A failing pkill (dead connection) must not mask the timed-out result."""
+    svc, _ = service_with_mock_wrapper
+    run_mock = AsyncMock(side_effect=[asyncio.TimeoutError(), RuntimeError("connection lost")])
+    ssh = SimpleNamespace(run=run_mock)
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=ssh,
+        executor_info=_executor_info(),
+        default_extra={},
+        machine_spec=_machine_spec(),
+    )
+    assert result.success is False
+    assert result.timed_out is True

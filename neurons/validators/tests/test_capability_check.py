@@ -17,6 +17,7 @@ class DummyValidationService:
         should_raise: bool = False,
         error_message: str = "",
         metrics: dict | None = None,
+        timed_out: bool = False,
     ):
         """
         Args:
@@ -24,11 +25,13 @@ class DummyValidationService:
             should_raise: Whether to raise an exception instead of returning
             error_message: The exception message if should_raise=True or error in ValidationResult
             metrics: Optional FP32 TFLOPS metrics dict to surface on the ValidationResult
+            timed_out: Whether the returned ValidationResult reports an SSH-run timeout
         """
         self.success = success
         self.should_raise = should_raise
         self.error_message = error_message
         self.metrics = metrics
+        self.timed_out = timed_out
         # Track what parameters the check called us with
         self.called_with: dict | None = None
 
@@ -62,6 +65,7 @@ class DummyValidationService:
             stderr="",
             error_message="" if self.success else self.error_message or "Validation failed",
             metrics=self.metrics,
+            timed_out=self.timed_out,
         )
 
 
@@ -118,6 +122,27 @@ async def test_capability_check(
         assert validation_service.called_with is not None
         assert validation_service.called_with["machine_spec"] == specs
         assert validation_service.called_with["executor_info"] == ctx.executor
+
+
+@pytest.mark.asyncio
+async def test_capability_check_timeout_emits_verify_timeout_reason(context_factory):
+    # Arrange: validation reports an SSH-run timeout (wedged GPU, DAH-2365)
+    validation_service = DummyValidationService(
+        success=False,
+        error_message="Matrix multiplication timed out after 120s",
+        timed_out=True,
+    )
+    services = build_services(validation=validation_service)
+    state = build_state(specs={"gpu": {"count": 2}})
+    ctx = context_factory(services=services, state=state)
+
+    # Act
+    result = await CapabilityCheck().run(ctx)
+
+    # Assert: failure is reported with the dedicated timeout reason_code
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_TIMEOUT.reason
+    assert result.event.what_we_saw["error"] == "Matrix multiplication timed out after 120s"
 
 
 @pytest.mark.asyncio

@@ -899,6 +899,17 @@ class CapabilityMessages:
         impact="Score set to 0",
         remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
     )
+    VERIFY_TIMEOUT = MessageTemplate(
+        event="GPU capability verification timed out",
+        reason="GPU_VERIFY_TIMEOUT",
+        severity="error",
+        category="env",
+        impact="Score set to 0",
+        remediation=(
+            "The matrix-multiplication probe did not finish in time. Check nvidia-smi for "
+            "stuck processes or leftover containers holding VRAM on the executor."
+        ),
+    )
 
 
 class ScoreMessages:
