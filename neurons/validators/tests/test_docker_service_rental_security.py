@@ -108,7 +108,7 @@ class RecordingRentalDockerClient:
     async def start(self, *, container_name: str) -> None:
         self.started_containers.append(container_name)
 
-    async def stop(self, *, container_name: str) -> None:
+    async def stop(self, *, container_name: str, timeout: int | None = None) -> None:
         self.stopped_containers.append(container_name)
 
     async def remove_container(
@@ -733,7 +733,9 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
         ["CONTAINER_MARKER"],
     )
     assert docker_client.started_containers == [HOSTILE_CONTAINER_NAME]
-    assert docker_client.stopped_containers == [HOSTILE_CONTAINER_NAME]
+    # two stops: the explicit stop_container call + the graceful stop inside
+    # delete_container (DAH-2364)
+    assert docker_client.stopped_containers == [HOSTILE_CONTAINER_NAME, HOSTILE_CONTAINER_NAME]
     assert docker_client.removed_containers == [
         {
             "container_name": HOSTILE_CONTAINER_NAME,

@@ -7,6 +7,7 @@ import pytest_asyncio
 from tenacity import Future, RetryError
 
 from services.docker_service import (
+    CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
     VolumeMinSizeError,
     _parse_volume_size_to_bytes,
@@ -55,6 +56,7 @@ class _FakeRentalDockerClient:
         self.exec_specs = []
         self.started_containers = []
         self.stopped_containers = []
+        self.stop_timeouts = []
         self.removed_containers = []
         self.created_volumes = []
         self.removed_volumes = []
@@ -93,8 +95,9 @@ class _FakeRentalDockerClient:
         if self.start_error is not None:
             raise self.start_error
 
-    async def stop(self, *, container_name: str) -> None:
+    async def stop(self, *, container_name: str, timeout: int | None = None) -> None:
         self.stopped_containers.append(container_name)
+        self.stop_timeouts.append(timeout)
         if self.stop_error is not None:
             raise self.stop_error
 
@@ -963,6 +966,126 @@ async def test_delete_customer_rental_treats_missing_container_as_deleted(
         executor_info,
         payload.container_name,
     )
+
+
+@pytest.mark.asyncio
+async def test_delete_container_stops_gracefully_before_forced_removal(
+    docker_service,
+    monkeypatch,
+):
+    # Arrange: healthy teardown path (DAH-2364 — SIGTERM grace before force removal)
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_graceful",
+        local_volume="volume_graceful",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    # Act
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    # Assert: graceful stop with the grace window happened, then the forced removal
+    assert isinstance(result, ContainerDeleted)
+    client = docker_service.rental_docker_client_factory.client
+    assert client.stopped_containers == [payload.container_name]
+    assert client.stop_timeouts == [CONTAINER_STOP_GRACE_SECONDS]
+    assert client.removed_containers == [
+        {
+            "container_name": payload.container_name,
+            "force": True,
+            "remove_volumes": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_container_stop_failure_still_removes(
+    docker_service,
+    monkeypatch,
+):
+    # Arrange: the graceful stop fails (e.g. wedged runtime) — removal must proceed
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.rental_docker_client_factory.client.stop_error = Exception(
+        "Docker SDK stop failed: 500 Server Error"
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_stop_fails",
+        local_volume="volume_stop_fails",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    # Act
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    # Assert: stop failure is swallowed, forced removal still runs and succeeds
+    assert isinstance(result, ContainerDeleted)
+    client = docker_service.rental_docker_client_factory.client
+    assert client.stopped_containers == [payload.container_name]
+    assert client.removed_containers == [
+        {
+            "container_name": payload.container_name,
+            "force": True,
+            "remove_volumes": True,
+        }
+    ]
 
 
 @pytest.mark.asyncio
