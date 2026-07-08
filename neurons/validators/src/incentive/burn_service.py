@@ -16,6 +16,29 @@ from services.const import BURNER_EMISSION
 logger = get_logger(__name__)
 
 
+def _burner_coldkey_matches(miner: bittensor.NeuronInfo) -> bool:
+    """Return True when the miner UID has no configured coldkey or coldkey matches."""
+    expected_coldkey = settings.BURNER_COLDKEYS.get(miner.uid)
+    if expected_coldkey is None:
+        return True
+
+    if miner.coldkey == expected_coldkey:
+        return True
+
+    logger.error(
+        _m(
+            "Burner coldkey mismatch — withholding burn weight",
+            extra={
+                "miner_uid": miner.uid,
+                "miner_hotkey": miner.hotkey,
+                "expected_coldkey": expected_coldkey,
+                "actual_coldkey": miner.coldkey,
+            },
+        )
+    )
+    return False
+
+
 class BurnService:
     """Service for calculating burn emission distribution across burner nodes.
 
@@ -104,6 +127,8 @@ class BurnService:
             slots = slot_weights.get(miner.uid, 0)
             if slots == 0:
                 continue
+            if not _burner_coldkey_matches(miner):
+                continue
 
             score = burn_score_per_slot * slots
             burn_scores[miner.hotkey] = score
@@ -179,6 +204,8 @@ class BurnService:
 
         for miner in miners:
             if miner.uid == main_burner:
+                if not _burner_coldkey_matches(miner):
+                    continue
                 burn_scores[miner.hotkey] = main_burner_score
 
                 logger.debug(
@@ -198,6 +225,8 @@ class BurnService:
                     )
                 )
             elif miner.uid in other_burners:
+                if not _burner_coldkey_matches(miner):
+                    continue
                 burn_scores[miner.hotkey] = other_burner_score
 
                 logger.debug(

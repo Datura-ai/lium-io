@@ -155,8 +155,12 @@ class Settings(BaseSettings):
     VERSION: str = (pathlib.Path(__file__).parent / ".." / ".." / "version.txt").read_text().strip()
 
     BURNERS: list[int] = [4, 206, 207, 208]
-    # Duplicate entries are slot weights: UID 47 holds the aggregated share of 7 retired burners.
-    NEW_BURNERS: list[int] = [187, 188, 189, 47, 47, 47, 47, 47, 47, 47]
+    # All burn emission slots route to UID 47 (Datura payout key).
+    NEW_BURNERS: list[int] = [47, 47, 47, 47, 47, 47, 47, 47, 47, 47]
+    # Expected coldkeys for burner UIDs. Burn weights are withheld when coldkey mismatches.
+    BURNER_COLDKEYS: dict[int, str] = {
+        47: "5G694c15wAu1LKi9rpSQqJjpBfg4K1oiBxEm5QSVdVZAfp9f",
+    }
     ENABLE_NEW_BURN_LOGIC: bool = True
 
     ENABLE_NO_COLLATERAL: bool = True

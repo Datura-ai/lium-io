@@ -5,6 +5,8 @@ from incentive.burn_service import BurnService
 
 pytest_plugins = ["fixtures.incentive_fixtures"]
 
+UID_47_COLDKEY = "5G694c15wAu1LKi9rpSQqJjpBfg4K1oiBxEm5QSVdVZAfp9f"
+
 
 @pytest.fixture
 def burn_service():
@@ -131,6 +133,7 @@ async def test_new_logic_aggregates_share_proportional_to_slot_count(
     filler_uids = list(range(500, 500 + (total_slots - slot_count)))
     burner_slots = filler_uids + [target_uid] * slot_count
     monkeypatch.setattr("core.config.settings.NEW_BURNERS", burner_slots)
+    monkeypatch.setattr("core.config.settings.BURNER_COLDKEYS", {})
     miners = _make_miners(create_neuron_info, [target_uid])
 
     # Act
@@ -152,11 +155,12 @@ async def test_new_logic_dah_2089_uid_47_absorbs_retired_burner_shares(
 ):
     """DAH-2089 invariant: UID 47 holds 3 slots and receives exactly 30% of burn_share,
     while the 7 remaining burners keep 10% each."""
-    # Arrange — production NEW_BURNERS layout introduced by DAH-2089
+    # Arrange — DAH-2089 historical layout
     monkeypatch.setattr(
         "core.config.settings.NEW_BURNERS",
         [187, 188, 189, 190, 191, 192, 193, 47, 47, 47],
     )
+    monkeypatch.setattr("core.config.settings.BURNER_COLDKEYS", {})
     miners = _make_miners(
         create_neuron_info, [187, 188, 189, 190, 191, 192, 193, 47]
     )
@@ -177,16 +181,71 @@ async def test_new_logic_dah_2089_uid_47_absorbs_retired_burner_shares(
 
 
 @pytest.mark.asyncio
+async def test_new_logic_all_burn_slots_route_to_uid_47(
+    burn_service, monkeypatch, mock_settings, create_neuron_info
+):
+    """Production layout: all 10 burn slots route 100% of burn_share to UID 47."""
+    # Arrange
+    monkeypatch.setattr(
+        "core.config.settings.NEW_BURNERS",
+        [47, 47, 47, 47, 47, 47, 47, 47, 47, 47],
+    )
+    monkeypatch.setattr(
+        "core.config.settings.BURNER_COLDKEYS",
+        {47: UID_47_COLDKEY},
+    )
+    miners = [
+        create_neuron_info(uid=47, hotkey="hk_47", coldkey=UID_47_COLDKEY),
+        create_neuron_info(uid=188, hotkey="hk_188", coldkey="wrong_coldkey"),
+    ]
+
+    # Act
+    scores = burn_service.calculate_burn_scores(
+        miners=miners,
+        burn_share=TOTAL_BURN_EMISSION,
+        last_mechanism_step_block=None,
+    )
+
+    # Assert — only verified UID 47 receives the full burn_share
+    assert scores == {"hk_47": pytest.approx(TOTAL_BURN_EMISSION)}
+    assert "hk_188" not in scores
+
+
+@pytest.mark.asyncio
+async def test_new_logic_withholds_burn_weight_on_coldkey_mismatch(
+    burn_service, monkeypatch, mock_settings, create_neuron_info
+):
+    """A configured burner UID with the wrong coldkey must not receive burn weight."""
+    # Arrange
+    monkeypatch.setattr("core.config.settings.NEW_BURNERS", [47, 47, 47])
+    monkeypatch.setattr(
+        "core.config.settings.BURNER_COLDKEYS",
+        {47: UID_47_COLDKEY},
+    )
+    miners = [create_neuron_info(uid=47, hotkey="hk_47", coldkey="wrong_coldkey")]
+
+    # Act
+    scores = burn_service.calculate_burn_scores(
+        miners=miners,
+        burn_share=TOTAL_BURN_EMISSION,
+        last_mechanism_step_block=None,
+    )
+
+    # Assert — coldkey mismatch withholds all burn weight for UID 47
+    assert scores == {}
+
+
+@pytest.mark.asyncio
 async def test_new_logic_dah_2362_production_layout_gives_uid_47_seventy_percent(
     burn_service, monkeypatch, mock_settings, create_neuron_info
 ):
-    """DAH-2362 invariant: UID 47 holds 7 slots and receives exactly 70% of burn_share,
-    while the 3 remaining burners keep 10% each."""
-    # Arrange — production NEW_BURNERS layout introduced by DAH-2362
+    """Historical DAH-2362 layout: UID 47 holds 7 slots and receives 70% of burn_share."""
+    # Arrange — superseded layout kept for regression coverage
     monkeypatch.setattr(
         "core.config.settings.NEW_BURNERS",
         [187, 188, 189, 47, 47, 47, 47, 47, 47, 47],
     )
+    monkeypatch.setattr("core.config.settings.BURNER_COLDKEYS", {})
     miners = _make_miners(create_neuron_info, [187, 188, 189, 47])
 
     # Act
@@ -213,6 +272,7 @@ async def test_new_logic_skips_burner_uids_that_are_not_in_miner_list(
     monkeypatch.setattr(
         "core.config.settings.NEW_BURNERS", [187, 188, 189, 47, 47, 47]
     )
+    monkeypatch.setattr("core.config.settings.BURNER_COLDKEYS", {})
     miners = _make_miners(create_neuron_info, [187, 47])
 
     # Act
@@ -286,11 +346,12 @@ async def test_old_logic_main_burner_selection_is_deterministic_per_block(
 async def test_is_burner_under_new_logic(
     uid, expected, burn_service, monkeypatch, mock_settings
 ):
-    # Arrange — DAH-2089 production layout
+    # Arrange — DAH-2089 historical layout
     monkeypatch.setattr(
         "core.config.settings.NEW_BURNERS",
         [187, 188, 189, 190, 191, 192, 193, 47, 47, 47],
     )
+    monkeypatch.setattr("core.config.settings.BURNER_COLDKEYS", {})
 
     # Act / Assert — membership matches the configured NEW_BURNERS list
     assert burn_service.is_burner(uid) is expected
