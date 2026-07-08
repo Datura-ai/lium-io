@@ -1,14 +1,24 @@
+import asyncio
 import time
 import random
 import logging
 import json
 import os
+import shlex
 import uuid as uuid4
 from dataclasses import dataclass
+
+import asyncssh
+
 from core.utils import _m, get_extra_info
 from ctypes import CDLL, c_longlong, POINTER, c_void_p, c_char_p
 
 logger = logging.getLogger(__name__)
+
+# Hard cap on the remote matmul run. Real runs finish in 4-27s; without a cap a wedged
+# GPU (e.g. VRAM held by an orphaned container, DAH-2364) hangs the whole pipeline until
+# the outer JOB_TIME_OUT cancellation, which dies silently without a reason_code (DAH-2365).
+MATRIX_VERIFY_TIMEOUT_SECONDS = 120
 
 
 class DMCompVerifyWrapper:
@@ -135,6 +145,7 @@ class ValidationResult:
     stderr: str = ""
     error_message: str = ""
     metrics: dict | None = None
+    timed_out: bool = False
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -195,6 +206,18 @@ class ValidationService:
         max_dim_k = max_elements // (2 * dim_n) - dim_n
 
         return max_dim_k
+
+    async def _kill_remote_matmul(self, ssh_client, script_path: str, log_extra: dict) -> None:
+        # best-effort kill of the leaked matmul process so it stops holding GPU memory
+        try:
+            await ssh_client.run(f"pkill -f {shlex.quote(script_path)}", timeout=10)
+        except Exception as e:
+            logger.warning(
+                _m(
+                    f"Failed to kill remote matmul process: {e}",
+                    extra=get_extra_info(log_extra),
+                )
+            )
 
     async def validate_gpu_model_and_process_job(
         self,
@@ -283,7 +306,21 @@ class ValidationService:
 
             # Run the script
             try:
-                result = await ssh_client.run(command)
+                result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
+            except (asyncssh.TimeoutError, asyncio.TimeoutError):
+                # asyncssh's timeout only abandons the local wait — the remote process keeps
+                # running and holding GPU memory, so it must be killed explicitly.
+                error_msg = (
+                    f"Matrix multiplication timed out after {MATRIX_VERIFY_TIMEOUT_SECONDS}s"
+                )
+                logger.error(_m(error_msg, extra=get_extra_info(log_extra)))
+                await self._kill_remote_matmul(ssh_client, script_path, log_extra)
+                return ValidationResult(
+                    success=False,
+                    expected_uuid=verifier_params.uuid,
+                    error_message=error_msg,
+                    timed_out=True,
+                )
             except Exception as e:
                 error_msg = f"Failed to execute SSH command: {str(e)}"
                 logger.error(_m(error_msg, extra=get_extra_info(log_extra)))

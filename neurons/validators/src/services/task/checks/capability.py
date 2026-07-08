@@ -80,8 +80,9 @@ class CapabilityCheck:
         elif failure_reason:
             failure_details = {"error": failure_reason}
 
+        template = Msg.VERIFY_TIMEOUT if result is not None and result.timed_out else Msg.VERIFY_FAILED
         event = render_message(
-            Msg.VERIFY_FAILED,
+            template,
             ctx=ctx,
             check_id=self.check_id,
             what=failure_details,
