@@ -123,27 +123,27 @@ class ContainerCleanup:
         # reap orphaned anonymous volumes left behind by container removals without -v
         extra = {"executor_uuid": executor_uuid}
         try:
-            volumes = await self.get_dangling_anonymous_volumes(ssh_client)
-            if volumes is None:
+            dangling_anonymous = await self.get_dangling_anonymous_volumes(ssh_client)
+            if dangling_anonymous is None:
                 logger.warning(_m("Listing dangling volumes failed", extra=extra))
                 return 0
 
-            volumes = volumes[:VOLUME_RM_MAX_PER_PASS]
-            if not volumes:
+            to_remove = dangling_anonymous[:VOLUME_RM_MAX_PER_PASS]
+            if not to_remove:
                 return 0
 
             if self.dry_run:
                 logger.info(
                     _m(
-                        f"[DRY RUN] Would remove {len(volumes)} dangling anonymous volume(s)",
-                        extra=extra | {"volumes": volumes, "dry_run": True},
+                        f"[DRY RUN] Would remove {len(to_remove)} dangling anonymous volume(s)",
+                        extra=extra | {"volumes": to_remove, "dry_run": True},
                     )
                 )
                 return 0
 
-            await ssh_client.run(DockerCommand.volume_remove(*volumes))
-            logger.info(_m(f"Removed {len(volumes)} dangling anonymous volume(s)", extra=extra))
-            return len(volumes)
+            await ssh_client.run(DockerCommand.volume_remove(*to_remove))
+            logger.info(_m(f"Removed {len(to_remove)} dangling anonymous volume(s)", extra=extra))
+            return len(to_remove)
 
         except Exception as e:
             logger.warning(
