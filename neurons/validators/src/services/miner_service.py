@@ -429,14 +429,26 @@ class MinerService:
                 str(e),
             )
 
-    def _filter_task_results(self, executors, raw_results, default_extra: dict) -> list:
+    def _filter_task_results(
+        self,
+        executors: list[ExecutorSSHInfo],
+        raw_results: list,
+        default_extra: dict,
+    ) -> list[JobResult]:
         # keep successful JobResults; log every executor whose task ended in an
         # exception/timeout/empty result instead of silently dropping it (DAH-2365)
-        results = []
+        results: list[JobResult] = []
         for executor_info, result in zip(executors, raw_results):
             if result and not isinstance(result, BaseException):
                 results.append(result)
                 continue
+            if result is None:
+                error_type = None
+                error = "empty result"
+            else:
+                error_type = type(result).__name__
+                # str(TimeoutError()) is "", so fall back to the type name to avoid an empty error
+                error = str(result) or error_type
             logger.warning(
                 _m(
                     "Executor task dropped without result",
@@ -445,8 +457,8 @@ class MinerService:
                             **default_extra,
                             "executor_uuid": str(executor_info.uuid),
                             "executor_ip_address": executor_info.address,
-                            "error_type": type(result).__name__ if result is not None else None,
-                            "error": str(result) if result is not None else "empty result",
+                            "error_type": error_type,
+                            "error": error,
                         }
                     ),
                 ),
