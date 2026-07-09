@@ -43,7 +43,7 @@ class DindVerifier:
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                 logger.error(_m("DinD creation failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
-                await ssh_client.run(DockerCommand.remove(name))
+                await ssh_client.run(DockerCommand.remove_with_volumes(name))
                 return DindProbeResult(
                     success=False,
                     log_text=f"dind: check failed port={port.internal}",
@@ -96,7 +96,7 @@ class DindVerifier:
                     else:
                         logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
 
-            await ssh_client.run(DockerCommand.remove(name))
+            await ssh_client.run(DockerCommand.remove_with_volumes(name))
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
             return DindProbeResult(
@@ -111,7 +111,7 @@ class DindVerifier:
                 _m("DinD check failed", extra=get_extra_info({**log_ctx, "error": str(e)})),
                 exc_info=True,
             )
-            await ssh_client.run(DockerCommand.remove(name))
+            await ssh_client.run(DockerCommand.remove_with_volumes(name))
             return DindProbeResult(
                 success=False,
                 log_text=f"dind: check failed port={port.internal}",

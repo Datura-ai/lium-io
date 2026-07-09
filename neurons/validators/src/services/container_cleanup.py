@@ -1,6 +1,5 @@
 import logging
 import re
-from datetime import datetime, timezone
 from typing import Optional
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -13,10 +12,6 @@ from services.const import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Protects the small window where a fresh anonymous volume exists
-# before/while its container is being created.
-ANON_VOLUME_MIN_AGE_MINUTES = 60
 
 # Anonymous docker volumes are named with a 64-char hex hash.
 ANON_VOLUME_NAME_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -49,11 +44,6 @@ class ContainerCleanup:
         try:
             # Get all containers with rental prefixes.
             all_containers = await self._get_all_rental_containers(ssh_client)
-            if not all_containers:
-                # Still sweep orphaned anonymous volumes on idle executors.
-                await self.prune_dangling_anonymous_volumes(ssh_client, executor_uuid)
-                return 0, []
-
             extra["total_containers"] = len(all_containers)
 
             # Get currently rented containers for this executor
@@ -133,33 +123,14 @@ class ContainerCleanup:
             if result.exit_status != 0:
                 return 0
 
-            candidates = [
-                name.strip()
-                for name in (result.stdout or "").strip().split("\n")
-                if ANON_VOLUME_NAME_PATTERN.match(name.strip())
+            # A dangling volume is referenced by no container, and an anonymous
+            # one cannot be legitimately reclaimed later — safe to remove.
+            # Named volumes (volume_<pod_id> etc.) never match the hex pattern.
+            stale_volumes = [
+                name
+                for name in (line.strip() for line in (result.stdout or "").split("\n"))
+                if ANON_VOLUME_NAME_PATTERN.match(name)
             ]
-            if not candidates:
-                return 0
-
-            # docker volume inspect may exit non-zero if a candidate vanished
-            # between ls and inspect — parse whatever stdout it produced.
-            inspect_result = await ssh_client.run(
-                DockerCommand.volume_inspect_created(candidates)
-            )
-            now = datetime.now(timezone.utc)
-            stale_volumes = []
-            for line in (inspect_result.stdout or "").strip().split("\n"):
-                parts = line.strip().split(maxsplit=1)
-                if len(parts) != 2:
-                    continue
-                name, created_raw = parts
-                created_at = self._parse_volume_created_at(created_raw)
-                if created_at is None:
-                    continue
-                age_minutes = (now - created_at).total_seconds() / 60
-                if age_minutes > ANON_VOLUME_MIN_AGE_MINUTES:
-                    stale_volumes.append(name)
-
             if not stale_volumes:
                 return 0
 
@@ -167,25 +138,16 @@ class ContainerCleanup:
                 logger.info(
                     _m(
                         f"[DRY RUN] Would remove {len(stale_volumes)} dangling anonymous volume(s)",
-                        extra={
-                            **extra,
-                            "volume_count": len(stale_volumes),
-                            "volumes": stale_volumes,
-                            "dry_run": True,
-                        },
+                        extra={**extra, "volumes": stale_volumes, "dry_run": True},
                     )
                 )
                 return 0
 
-            await ssh_client.run(DockerCommand.volume_remove_batch(stale_volumes))
+            await ssh_client.run(DockerCommand.volume_remove(*stale_volumes))
             logger.info(
                 _m(
                     f"Removed {len(stale_volumes)} dangling anonymous volume(s)",
-                    extra={
-                        **extra,
-                        "removed_count": len(stale_volumes),
-                        "removed_volumes": stale_volumes,
-                    },
+                    extra={**extra, "volumes": stale_volumes},
                 )
             )
             return len(stale_volumes)
@@ -198,21 +160,6 @@ class ContainerCleanup:
                 )
             )
             return 0
-
-    def _parse_volume_created_at(self, raw: str) -> Optional[datetime]:
-        # parse docker's RFC3339 CreatedAt, tolerating nanoseconds and 'Z' suffix
-        try:
-            value = raw.strip()
-            if value.endswith("Z"):
-                value = value[:-1] + "+00:00"
-            # trim fractional seconds beyond microseconds (Go emits nanoseconds)
-            value = re.sub(r"\.(\d{6})\d+", r".\1", value)
-            parsed = datetime.fromisoformat(value)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed
-        except (ValueError, TypeError):
-            return None
 
     async def force_remove_health_checks(
         self,
@@ -234,7 +181,7 @@ class ContainerCleanup:
         """
         try:
             result = await ssh_client.run(
-                "docker ps -q --filter 'name=^health_check_' | xargs -r docker rm -f"
+                "docker ps -q --filter 'name=^health_check_' | xargs -r docker rm -fv"
             )
             removed = [
                 line for line in (result.stdout or "").strip().split("\n")

@@ -64,4 +64,4 @@ class ContainerRunner:
 
     async def cleanup(self, ssh_client: SSHClientConnection, name: str):
         """Remove container."""
-        await ssh_client.run(DockerCommand.remove(name))
+        await ssh_client.run(DockerCommand.remove_with_volumes(name))
