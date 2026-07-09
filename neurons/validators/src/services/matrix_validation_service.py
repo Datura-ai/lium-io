@@ -210,7 +210,9 @@ class ValidationService:
     async def _kill_remote_matmul(self, ssh_client, script_path: str, log_extra: dict) -> None:
         # best-effort kill of the leaked matmul process so it stops holding GPU memory
         try:
-            await ssh_client.run(f"pkill -f {shlex.quote(script_path)}", timeout=10)
+            # SIGKILL: a SIGTERM can be ignored/slow on a wedged process; -9 is strictly
+            # more reliable outside pure D-state (where no signal lands anyway)
+            await ssh_client.run(f"pkill -9 -f {shlex.quote(script_path)}", timeout=10)
         except Exception as e:
             logger.warning(
                 _m(
