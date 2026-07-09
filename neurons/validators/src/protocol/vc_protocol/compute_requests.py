@@ -132,9 +132,9 @@ class DefaultDockerImage(BaseModel, extra="allow"):
     docker_image: str
     docker_image_tag: str
     docker_image_size: int | None = None
-    # DAH-2265: bare manifest-list digest ("sha256:…") the backend says is current for this
-    # image. None when the backend has no recorded digest. Compared against the executor's
-    # local RepoDigest to flag stale content cached under an unchanged tag.
+    # DAH-2380: bare manifest-list digest ("sha256:…") the validator fetches from Docker Hub.
+    # Kept on the model for backward compatibility with older responses; no longer populated
+    # by the backend.
     docker_image_digest: str | None = None
 
     @property

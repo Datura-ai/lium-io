@@ -2,22 +2,26 @@ import logging
 from typing import Annotated
 
 import bittensor
+from clients.backend_client import BackendClient
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
-
-from clients.backend_client import BackendClient
-from core.config import settings
-from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationError, AttestationNonce, AttestationService
 from services.collateral_contract_service import CollateralContractService
+from services.default_docker_image_digest_service import (
+    DefaultDockerImageDigestService,
+    get_default_docker_image_digest_service,
+)
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
 from services.redis_service import RedisService
-from services.ssh_service import SSHService
 from services.verifyx_validation_service import VerifyXValidationService
+
+from core.config import settings
+from core.utils import _m, get_extra_info
+from services.ssh_service import SSHService
 
 from .models import JobResult
 from .pipeline_factory import PipelineFactory
@@ -35,6 +39,9 @@ class TaskService:
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         backend_client: Annotated[BackendClient, Depends(BackendClient)],
+        default_docker_image_digest_service: Annotated[
+            DefaultDockerImageDigestService, Depends(get_default_docker_image_digest_service)
+        ],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
         self.ssh_service = ssh_service
@@ -51,6 +58,7 @@ class TaskService:
             collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
             backend_client=backend_client,
+            default_docker_image_digest_service=default_docker_image_digest_service,
         )
 
     async def create_task(

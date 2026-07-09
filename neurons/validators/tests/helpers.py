@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from neurons.validators.src.services.task.pipeline import (
@@ -53,6 +55,12 @@ def build_context_config(**overrides) -> ContextConfig:
     return ContextConfig(**base)
 
 
+def _default_digest_service() -> Mock:
+    service = Mock()
+    service.get_digest = Mock(return_value=None)
+    return service
+
+
 def build_services(**overrides) -> ContextServices:
     base = dict(
         ssh=None,
@@ -65,6 +73,7 @@ def build_services(**overrides) -> ContextServices:
         shell=None,
         score_calculator=DummyScoreCalc(),
         backend=None,
+        default_docker_image_digests=_default_digest_service(),
         container_cleanup=None,
     )
     base.update(overrides)

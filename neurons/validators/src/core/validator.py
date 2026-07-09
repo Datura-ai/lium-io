@@ -3,35 +3,34 @@ import json
 import os
 import time
 
-from payload_models.payloads import MinerJobRequestPayload
 from clients.backend_client import BackendClient
-
-from core.config import settings
+from clients.subtensor_client import SubtensorClient
 from incentive.eligibility import is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
-from core.utils import _m, get_extra_info, get_logger
-from clients.subtensor_client import SubtensorClient
+from payload_models.payloads import MinerJobRequestPayload
+from services.attestation_service import AttestationService
+from services.collateral_contract_service import CollateralContractService
+from services.default_docker_image_digest_service import get_default_docker_image_digest_service
 from services.docker_service import DockerService
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
+from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
-from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
+from services.matrix_validation_service import ValidationService
 from services.miner_service import MinerService
 from services.redis_service import GPU_ESTIMATES_CHANNEL, PENDING_PODS_PREFIX, RedisService
-from services.ssh_service import SSHService
-from services.task_service import TaskService, JobResult
-from services.matrix_validation_service import ValidationService
+from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import VerifyXValidationService
-from services.collateral_contract_service import CollateralContractService
-from services.attestation_service import AttestationService
-from services.const import IS_NOT_DEPOSITED_SCORE_MULTIPLIER
 
+from core.config import settings
+from core.utils import _m, get_extra_info, get_logger
+from services.ssh_service import SSHService
 
 logger = get_logger(__name__)
 
@@ -74,6 +73,8 @@ class Validator:
             base_url=settings.COMPUTE_REST_API_URL or "",
             keypair=keypair,
         )
+        self.default_docker_image_digest_service = get_default_docker_image_digest_service()
+        asyncio.create_task(self.default_docker_image_digest_service.run_refresh_loop())
 
         port_tester = PortTester()
         runner = ContainerRunner()
@@ -97,6 +98,7 @@ class Validator:
             executor_connectivity_service=self.executor_connectivity_service,
             backend_client=self.backend_client,
             attestation_service=self.attestation_service,
+            default_docker_image_digest_service=self.default_docker_image_digest_service,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,

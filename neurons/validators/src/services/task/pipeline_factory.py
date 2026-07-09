@@ -16,6 +16,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.collateral_contract_service import CollateralContractService
 from services.const import GPU_MODEL_RATES, LIB_NVIDIA_ML_DIGESTS, MAX_GPU_COUNT
 from services.container_cleanup import ContainerCleanup
+from services.default_docker_image_digest_service import DefaultDockerImageDigestService
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.inspector_validation_service import InspectorValidationService
 from services.interactive_shell_service import InteractiveShellService
@@ -91,6 +92,7 @@ class PipelineFactory:
         collateral_contract_service: CollateralContractService,
         executor_connectivity_service: ExecutorConnectivityService,
         backend_client: BackendClient,
+        default_docker_image_digest_service: DefaultDockerImageDigestService,
     ):
         """Initialize pipeline factory with required services.
 
@@ -111,6 +113,7 @@ class PipelineFactory:
         self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
         self.backend_client = backend_client
+        self.default_docker_image_digest_service = default_docker_image_digest_service
 
         dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
         logger.info(f"ContainerCleanup dry_run={dry_run}")
@@ -192,6 +195,7 @@ class PipelineFactory:
                 shell=shell,
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
+                default_docker_image_digests=self.default_docker_image_digest_service,
                 container_cleanup=self.container_cleanup,
             ),
             config=ContextConfig(
