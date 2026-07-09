@@ -139,6 +139,10 @@ class Settings(BaseSettings):
     # content under the same tag, fails verification early (score 0, reason surfaced to the
     # provider). Fails open: an unmeasured signal (None) is never penalised.
     CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 9, 12, 0, 0)
+    # DAH-2380: how often the validator re-fetches default cache-template digests from Docker Hub.
+    DEFAULT_DOCKER_IMAGE_DIGEST_REFRESH_SECONDS: int = Field(
+        env="DEFAULT_DOCKER_IMAGE_DIGEST_REFRESH_SECONDS", default=3600
+    )
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that

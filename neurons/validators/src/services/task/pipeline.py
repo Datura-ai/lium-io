@@ -13,6 +13,7 @@ from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
 from services.redis_service import RedisService
 from services.collateral_contract_service import CollateralContractService
+from services.default_docker_image_digest_service import DefaultDockerImageDigestService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
 from services.executor_connectivity_service import ExecutorConnectivityService
@@ -35,6 +36,7 @@ class ContextServices:
     shell: InteractiveShellService
     score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
     backend: BackendClient
+    default_docker_image_digests: DefaultDockerImageDigestService
     container_cleanup: ContainerCleanup
 
 

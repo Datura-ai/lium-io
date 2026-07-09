@@ -27,12 +27,8 @@ from tests.helpers import build_services, build_state
 _IMAGE = DefaultDockerImage(
     docker_image="daturaai/torch", docker_image_tag="2.4.0", docker_image_size=12_000_000_000
 )
-_IMAGE_WITH_DIGEST = DefaultDockerImage(
-    docker_image="daturaai/torch",
-    docker_image_tag="2.4.0",
-    docker_image_size=12_000_000_000,
-    docker_image_digest="sha256:aaa",
-)
+_IMAGE_REF = "daturaai/torch:2.4.0"
+_IMAGE_DIGEST = "sha256:aaa"
 _LOCAL_MATCH = '["daturaai/torch@sha256:aaa"]'
 _LOCAL_MISMATCH = '["daturaai/torch@sha256:bbb"]'
 _GPU = "NVIDIA H200"
@@ -58,6 +54,24 @@ def _ssh(exit_status=0, stdout="", raises=False):
     else:
         ssh.run = AsyncMock(return_value=Mock(exit_status=exit_status, stdout=stdout))
     return ssh
+
+
+def _digest_service(*, digest: str | None = None, by_ref: dict[str, str] | None = None):
+    service = Mock()
+    if by_ref is not None:
+        service.get_digest = Mock(side_effect=lambda ref: by_ref.get(ref))
+    else:
+        service.get_digest = Mock(return_value=digest)
+    return service
+
+
+def _services(backend_images, digest_map: dict[str, str] | None = None):
+    return build_services(
+        backend=_backend(images=backend_images),
+        default_docker_image_digests=(
+            _digest_service(by_ref=digest_map) if digest_map is not None else _digest_service()
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -204,10 +218,10 @@ async def test_fails_open_when_inspect_raises(context_factory):
 
 @pytest.mark.asyncio
 async def test_digest_match_publishes_true(context_factory):
-    # Branch 4: cached + local RepoDigest == backend digest → match True.
+    # Branch 4: cached + local RepoDigest == validator digest cache → match True.
     ssh = _ssh(exit_status=0, stdout=_LOCAL_MATCH)
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        services=_services([_IMAGE], {_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
         ssh=ssh,
     )
@@ -227,9 +241,9 @@ async def test_digest_match_publishes_true(context_factory):
 
 @pytest.mark.asyncio
 async def test_digest_mismatch_publishes_false(context_factory):
-    # Branch 5: cached + local RepoDigest != backend digest → match False (stale content).
+    # Branch 5: cached + local RepoDigest != validator digest cache → match False (stale content).
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        services=_services([_IMAGE], {_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
         ssh=_ssh(exit_status=0, stdout=_LOCAL_MISMATCH),
     )
@@ -243,16 +257,9 @@ async def test_digest_mismatch_publishes_false(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_digest_match_normalizes_repo_at_sha_backend_value(context_factory):
-    # M3: a backend digest pasted as "repo@sha256:…" must compare only on the bare sha.
-    image = DefaultDockerImage(
-        docker_image="daturaai/torch",
-        docker_image_tag="2.4.0",
-        docker_image_size=12_000_000_000,
-        docker_image_digest="daturaai/torch@sha256:aaa",
-    )
+async def test_digest_match_uses_validator_digest_cache(context_factory):
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[image])),
+        services=_services([_IMAGE], {_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
         ssh=_ssh(exit_status=0, stdout=_LOCAL_MATCH),
     )
@@ -264,8 +271,8 @@ async def test_digest_match_normalizes_repo_at_sha_backend_value(context_factory
 
 
 @pytest.mark.asyncio
-async def test_digest_none_when_backend_digest_missing(context_factory):
-    # Branch 2: cached, but backend published no digest → match None, cached stays True.
+async def test_digest_none_when_validator_digest_missing(context_factory):
+    # Branch 2: cached, but the validator digest cache has no entry → match None, cached stays True.
     ctx = context_factory(
         services=build_services(backend=_backend(images=[_IMAGE])),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
@@ -291,7 +298,7 @@ async def test_digest_none_when_backend_digest_missing(context_factory):
 async def test_digest_none_when_no_repo_match(context_factory, stdout):
     # Branch 3: cached + backend digest set, but no RepoDigest for THIS repo → match None.
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        services=_services([_IMAGE], {_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
         ssh=_ssh(exit_status=0, stdout=stdout),
     )
@@ -309,7 +316,7 @@ async def test_digest_fails_open_on_unparseable_stdout(context_factory):
     # Branch 3 variant: cached + backend digest set, RepoDigests JSON is garbage → match None,
     # never raises.
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        services=_services([_IMAGE], {_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
         ssh=_ssh(exit_status=0, stdout="not json at all"),
     )
@@ -348,7 +355,7 @@ async def test_digest_mismatch_fails_after_cutoff(context_factory, monkeypatch):
     # Stale content under the same tag + after cutoff → fatal fail.
     _set_cutoff(monkeypatch, active=True)
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        services=_services([_IMAGE], {_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
         ssh=_ssh(exit_status=0, stdout=_LOCAL_MISMATCH),
     )
@@ -382,7 +389,7 @@ async def test_cached_passes_after_cutoff(context_factory, monkeypatch):
 async def test_digest_match_passes_after_cutoff(context_factory, monkeypatch):
     _set_cutoff(monkeypatch, active=True)
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        services=_services([_IMAGE], {_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
         ssh=_ssh(exit_status=0, stdout=_LOCAL_MATCH),
     )
@@ -416,7 +423,7 @@ async def test_digest_skipped_passes_after_cutoff(context_factory, monkeypatch):
     # Cached but RepoDigest unreadable for this repo → DIGEST_SKIPPED, never a fatal fail.
     _set_cutoff(monkeypatch, active=True)
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[_IMAGE_WITH_DIGEST])),
+        services=_services([_IMAGE], {_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
         ssh=_ssh(exit_status=0, stdout="[]"),
     )
