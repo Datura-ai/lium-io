@@ -635,7 +635,7 @@ async def test_A13_egress_failure_aborts_before_build(svc, monkeypatch):
     # The build must NOT run when egress filtering can't be guaranteed.
     assert not any("docker build" in c for c in esl.seen)
     # But the DinD container is still torn down.
-    assert any(f"docker rm -f" in c and f"lium-dind-build-{payload.pod_id}" in c
+    assert any(f"docker rm -fv" in c and f"lium-dind-build-{payload.pod_id}" in c
                for c in ssh_client.calls)
 
 
@@ -659,7 +659,7 @@ async def test_A14_dind_container_always_torn_down(svc, monkeypatch):
     )
     assert ok is True and step is None
     assert any(
-        "docker rm -f" in c and f"lium-dind-build-{payload.pod_id}" in c
+        "docker rm -fv" in c and f"lium-dind-build-{payload.pod_id}" in c
         for c in ssh_client.calls
     ), ssh_client.calls
 

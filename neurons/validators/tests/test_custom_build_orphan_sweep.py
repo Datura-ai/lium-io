@@ -94,7 +94,7 @@ async def test_sweep_removes_orphan_dind_container():
     result = await check.run(ctx)
     assert result.passed is True
 
-    dind_rm_calls = [c for c in calls if "docker rm -f lium-dind-build-" in c]
+    dind_rm_calls = [c for c in calls if "docker rm -fv lium-dind-build-" in c]
     assert any("lium-dind-build-POD-DEAD" in c for c in dind_rm_calls)
     assert not any("lium-dind-build-POD-ALIVE" in c for c in dind_rm_calls)
 

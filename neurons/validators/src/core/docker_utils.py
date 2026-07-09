@@ -74,6 +74,26 @@ class DockerCommand:
         return f"/usr/bin/docker volume rm {volume_name} 2>/dev/null || true"
 
     @staticmethod
+    def volume_ls_dangling() -> str:
+        """Build docker volume ls command listing dangling volume names."""
+        return "/usr/bin/docker volume ls -qf dangling=true"
+
+    @staticmethod
+    def volume_inspect_created(volume_names: list[str]) -> str:
+        """Build docker volume inspect command printing name and creation time per line."""
+        names = " ".join(shlex.quote(name) for name in volume_names)
+        return (
+            "/usr/bin/docker volume inspect "
+            f"--format '{{{{.Name}}}} {{{{.CreatedAt}}}}' {names} 2>/dev/null"
+        )
+
+    @staticmethod
+    def volume_remove_batch(volume_names: list[str]) -> str:
+        """Build docker volume rm command for multiple volumes, tolerating per-volume failures."""
+        names = " ".join(shlex.quote(name) for name in volume_names)
+        return f"/usr/bin/docker volume rm {names} 2>/dev/null || true"
+
+    @staticmethod
     def inspect_created_timestamp(container_id: str) -> str:
         """Build docker inspect command to get creation timestamp in seconds."""
         return (

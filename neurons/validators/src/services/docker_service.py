@@ -375,7 +375,7 @@ class DockerService:
         container holding `pod_<id>`, and the next same-command attempt would
         otherwise collide with "container name already in use". Between
         attempts (after the backoff sleep, just before the next `docker run`)
-        we issue `docker rm -f <container_name>` so the rm→run window stays
+        we issue `docker rm -fv <container_name>` so the rm→run window stays
         tight. Cleanup failures are warning-logged but do not abort the loop.
 
         DAH-2133: if Docker fails to mount an existing vloopback volume because
@@ -547,11 +547,11 @@ class DockerService:
                 call=lambda: docker_client.remove_container(
                     container_name=container_name,
                     force=True,
-                    remove_volumes=False,
+                    remove_volumes=True,
                 ),
                 container_name=container_name,
                 force=True,
-                remove_volumes=False,
+                remove_volumes=True,
             )
         except asyncio.CancelledError:
             raise
@@ -628,8 +628,9 @@ class DockerService:
         warning_event: str,
     ) -> None:
         try:
-            # Remove only the failed container object; named volumes stay intact.
-            await ssh_client.run(f"/usr/bin/docker rm -f {shlex.quote(container_name)}")
+            # Reap the failed container together with its anonymous volumes (dind
+            # images declare VOLUME /var/lib/docker); named volumes are unaffected by -v.
+            await ssh_client.run(f"/usr/bin/docker rm -fv {shlex.quote(container_name)}")
         except asyncio.CancelledError:
             raise
         except Exception as rm_exc:
@@ -2657,7 +2658,7 @@ class DockerService:
                 )
         try:
             await ssh_client.run(
-                f"/usr/bin/docker rm -f {shlex.quote(dind_name)} 2>/dev/null || true",
+                f"/usr/bin/docker rm -fv {shlex.quote(dind_name)} 2>/dev/null || true",
                 check=False,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
@@ -3205,7 +3206,7 @@ class DockerService:
                 # same verified-port pool the rental allocated. Reuse the open
                 # ssh_client so we don't pay for a second connect (and don't widen
                 # the TOCTOU gap). No wait — the rental takes priority; the
-                # port-allocated retry loop + `docker rm -f` are the backstop for
+                # port-allocated retry loop + `docker rm -fv` are the backstop for
                 # any residual race.
                 current_step = "port_check_wait"
                 wait_ok, wait_msg = await self.wait_for_port_check_containers(

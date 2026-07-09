@@ -3449,7 +3449,7 @@ async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
 
 # ---------------------------------------------------------------------------
 # DAH-2018: container-name conflict — between port-allocated retries we
-# `docker rm -f <container_name>` to release the name Docker reserved during
+# `docker rm -fv <container_name>` to release the name Docker reserved during
 # the prior `docker run` parse. Cleanup runs AFTER the backoff sleep so the
 # rm→run window stays tight; cleanup failures warn-log but never abort.
 # ---------------------------------------------------------------------------
@@ -3459,7 +3459,7 @@ async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
 async def test_create_container_removes_stale_container_between_port_retries(
     docker_service, monkeypatch,
 ):
-    """Between port-allocated retries: sleep first, then docker rm -f, then re-run.
+    """Between port-allocated retries: sleep first, then docker rm -fv, then re-run.
 
     Pins both the rm command itself and the ordering vs the backoff sleep, so
     the rm→run window stays as tight as possible.
@@ -3501,7 +3501,7 @@ async def test_create_container_removes_stale_container_between_port_retries(
     assert events == [
         ("execute", 1),
         ("sleep", 5),
-        ("ssh_run", "/usr/bin/docker rm -f pod_test"),
+        ("ssh_run", "/usr/bin/docker rm -fv pod_test"),
         ("execute", 2),
     ]
 
@@ -3510,7 +3510,7 @@ async def test_create_container_removes_stale_container_between_port_retries(
 async def test_port_retry_continues_when_rm_cleanup_fails(
     docker_service, monkeypatch,
 ):
-    """A failing `docker rm -f` must warning-log but not abort the retry loop."""
+    """A failing `docker rm -fv` must warning-log but not abort the retry loop."""
     calls = {"n": 0}
 
     async def fake_execute(*, ssh_client, command, log_tag, log_text, log_extra, timeout):
@@ -3556,9 +3556,34 @@ async def test_port_retry_continues_when_rm_cleanup_fails(
 
     assert calls["n"] == 2
     # rm was attempted exactly once (between the two execute attempts).
-    assert rm_calls == ["/usr/bin/docker rm -f pod_test"]
+    assert rm_calls == ["/usr/bin/docker rm -fv pod_test"]
     # And the failure was warning-logged with the documented tag.
     assert any("PORT_RETRY_STALE_RM_FAILED" in m for m in warning_msgs)
+
+
+@pytest.mark.asyncio
+async def test_remove_failed_rental_container_for_retry_removes_anonymous_volumes(
+    docker_service,
+):
+    """DAH-2375: SDK failed-create cleanup passes remove_volumes=True so anonymous
+    volumes (dind images declare VOLUME /var/lib/docker) don't leak; named volumes
+    are never removed by it."""
+    docker_client = _FakeRentalDockerClient()
+
+    await docker_service._remove_failed_rental_container_for_retry(
+        docker_client=docker_client,
+        container_name="pod_test",
+        default_extra={},
+        warning_event="PORT_RETRY_STALE_RM_FAILED",
+    )
+
+    assert docker_client.removed_containers == [
+        {
+            "container_name": "pod_test",
+            "force": True,
+            "remove_volumes": True,
+        }
+    ]
 
 
 @pytest.mark.asyncio
