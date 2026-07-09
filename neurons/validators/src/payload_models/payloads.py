@@ -596,6 +596,7 @@ class FailedContainerErrorCodes(enum.Enum):
     UnknownError = "UnknownError"
     NoSshKeys = "NoSshKeys"
     ContainerNotRunning = "ContainerNotRunning"
+    DeletionInProgress = "DeletionInProgress"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
     ExceptionError = "ExceptionError"

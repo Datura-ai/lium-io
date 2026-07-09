@@ -194,6 +194,7 @@ _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
 _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
+_DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
 HOST_KEY_REQUIRED_EXTRA = {
     "ssh_host_key_missing": True,
     "docker_sdk_host_key_required": True,
@@ -321,16 +322,24 @@ def _parse_volume_size_to_bytes(value: str | None) -> int | None:
     return int(float(number) * _VOLUME_SIZE_SUFFIX_MULTIPLIERS[suffix.lower()])
 
 
-def _is_missing_docker_container_error(exc: Exception) -> bool:
-    if _DOCKER_NO_SUCH_CONTAINER_PHRASE in str(exc):
-        return True
+def _exception_texts(exc: Exception) -> list[str]:
+    texts = [str(exc)]
     if isinstance(exc, RetryError):
         last_exception = exc.last_attempt.exception()
-        return (
-            last_exception is not None
-            and _DOCKER_NO_SUCH_CONTAINER_PHRASE in str(last_exception)
-        )
-    return False
+        if last_exception is not None:
+            texts.append(str(last_exception))
+    return texts
+
+
+def _is_missing_docker_container_error(exc: Exception) -> bool:
+    return any(_DOCKER_NO_SUCH_CONTAINER_PHRASE in text for text in _exception_texts(exc))
+
+
+def _is_docker_container_removal_in_progress_error(exc: Exception) -> bool:
+    return any(
+        all(phrase in text.lower() for phrase in _DOCKER_REMOVAL_IN_PROGRESS_PHRASES)
+        for text in _exception_texts(exc)
+    )
 
 
 def _is_stale_vloopback_mountpoint_error(exc: Exception) -> bool:
@@ -4580,10 +4589,7 @@ class DockerService:
         docker_client: RentalDockerSdkClient,
         payload: ContainerDeleteRequest,
         log: _BoundLog,
-    ) -> None:
-        # DAH-2345: deletion is idempotent for every workload kind — a container that is already
-        # gone (e.g. removed by failed-create cleanup) must not fail the delete, or the backend
-        # retries a doomed request until force-removal and penalizes the miner.
+    ) -> FailedContainerRequest | None:
         try:
             await run_logged_rental_docker_sdk_operation(
                 operation="remove_container",
@@ -4598,6 +4604,29 @@ class DockerService:
                 remove_volumes=True,
             )
         except Exception as exc:
+            if _is_docker_container_removal_in_progress_error(exc):
+                # Docker is still processing the original force-remove request;
+                # let the backend keep polling without treating this as terminal.
+                error_msg = str(exc)
+                log.info(
+                    "Container deletion is still in progress",
+                    container_name=payload.container_name,
+                    error=error_msg,
+                )
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
+                    msg=error_msg,
+                    error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+                    error_code=FailedContainerErrorCodes.DeletionInProgress,
+                )
+
+            # DAH-2345: deletion is idempotent for every workload kind — a container
+            # that is already gone (e.g. removed by failed-create cleanup) must not
+            # fail the delete, or the backend retries a doomed request until
+            # force-removal and penalizes the miner.
             if not _is_missing_docker_container_error(exc):
                 raise
             log.info(
@@ -4605,6 +4634,7 @@ class DockerService:
                 container_name=payload.container_name,
                 error=str(exc),
             )
+        return None
 
     async def delete_container(
         self,
@@ -4663,7 +4693,9 @@ class DockerService:
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.
                 try:
-                    await self._force_remove_container(docker_client, payload, log)
+                    removal_failure = await self._force_remove_container(docker_client, payload, log)
+                    if removal_failure is not None:
+                        return removal_failure
                 except Exception:
                     # DAH-2427: a failed force-remove (backend FAILED / STOP_FAILED) is the
                     # classic wedge path — sweep before propagating so a wedged card does not

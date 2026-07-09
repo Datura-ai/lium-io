@@ -24,6 +24,7 @@ from payload_models.payloads import (
     ContainerStartRequest,
     ContainerStopRequest,
     FailedContainerErrorTypes,
+    FailedContainerErrorCodes,
     FailedContainerRequest,
     PayloadPortMapping,
     ProfilerStepName,
@@ -1388,6 +1389,55 @@ async def test_delete_container_failure_msg_includes_underlying_error(
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
     assert "500 Server Error: daemon exploded" in result.msg
+
+
+@pytest.mark.asyncio
+async def test_delete_container_removal_in_progress_returns_soft_failure(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    remove_error = (
+        "Docker SDK remove container failed: 409 Client Error: Conflict "
+        '("removal of container pod_stuck is already in progress")'
+    )
+    docker_service.rental_docker_client_factory.client.remove_error = Exception(remove_error)
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_stuck",
+        local_volume="volume_stuck",
+    )
+    executor_info = _delete_container_executor_info(payload.executor_id)
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
+    assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
+    assert result.msg == remove_error
+    assert docker_service.rental_docker_client_factory.client.pruned_images == 0
+    assert docker_service.rental_docker_client_factory.client.removed_volumes == []
+    docker_service.redis_service.remove_rented_machine.assert_not_awaited()
 
 
 def _delete_container_executor_info(executor_id: str) -> ExecutorSSHInfo:
