@@ -1,5 +1,6 @@
 import logging
 import re
+from dataclasses import dataclass
 from typing import Optional
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -15,6 +16,17 @@ logger = logging.getLogger(__name__)
 
 # Anonymous docker volumes are named with a 64-char hex hash.
 ANON_VOLUME_NAME_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass
+class DanglingVolumesResult:
+    success: bool
+    volumes: list[str]
+
+
+def filter_unnamed_volumes_only(volumes: list[str]) -> list[str]:
+    # anonymous volumes carry a docker-generated 64-hex name; named ones never match
+    return [name for name in volumes if ANON_VOLUME_NAME_PATTERN.match(name)]
 
 
 class ContainerCleanup:
@@ -119,38 +131,33 @@ class ContainerCleanup:
         # reap orphaned anonymous volumes left behind by container removals without -v
         extra = {"executor_uuid": executor_uuid}
         try:
-            result = await ssh_client.run(DockerCommand.volume_ls_dangling())
-            if result.exit_status != 0:
+            dangling_volumes: DanglingVolumesResult = await self.get_dangling_volumes(ssh_client)
+
+            if not dangling_volumes.success:
+                logger.warning(_m("Listing dangling volumes failed", extra=extra))
                 return 0
 
-            # A dangling volume is referenced by no container, and an anonymous
-            # one cannot be legitimately reclaimed later — safe to remove.
-            # Named volumes (volume_<pod_id> etc.) never match the hex pattern.
-            stale_volumes = [
-                name
-                for name in (line.strip() for line in (result.stdout or "").split("\n"))
-                if ANON_VOLUME_NAME_PATTERN.match(name)
-            ]
-            if not stale_volumes:
+            dangling_unnamed_volumes: list[str] = filter_unnamed_volumes_only(dangling_volumes.volumes)
+            if not dangling_unnamed_volumes:
                 return 0
 
             if self.dry_run:
                 logger.info(
                     _m(
-                        f"[DRY RUN] Would remove {len(stale_volumes)} dangling anonymous volume(s)",
-                        extra={**extra, "volumes": stale_volumes, "dry_run": True},
+                        f"[DRY RUN] Would remove {len(dangling_unnamed_volumes)} dangling anonymous volume(s)",
+                        extra={**extra, "volumes": dangling_unnamed_volumes, "dry_run": True},
                     )
                 )
                 return 0
 
-            await ssh_client.run(DockerCommand.volume_remove(*stale_volumes))
+            await ssh_client.run(DockerCommand.volume_remove(*dangling_unnamed_volumes))
             logger.info(
                 _m(
-                    f"Removed {len(stale_volumes)} dangling anonymous volume(s)",
-                    extra={**extra, "volumes": stale_volumes},
+                    f"Removed {len(dangling_unnamed_volumes)} dangling anonymous volume(s)",
+                    extra={**extra, "volumes": dangling_unnamed_volumes},
                 )
             )
-            return len(stale_volumes)
+            return len(dangling_unnamed_volumes)
 
         except Exception as e:
             logger.warning(
@@ -160,6 +167,14 @@ class ContainerCleanup:
                 )
             )
             return 0
+
+    async def get_dangling_volumes(self, ssh_client) -> "DanglingVolumesResult":
+        # names of volumes referenced by no container (anonymous AND named)
+        result = await ssh_client.run(DockerCommand.volume_ls_dangling())
+        if result.exit_status != 0:
+            return DanglingVolumesResult(success=False, volumes=[])
+        volumes = [line.strip() for line in (result.stdout or "").split("\n") if line.strip()]
+        return DanglingVolumesResult(success=True, volumes=volumes)
 
     async def force_remove_health_checks(
         self,
