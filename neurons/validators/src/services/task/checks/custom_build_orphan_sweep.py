@@ -153,7 +153,7 @@ class CustomBuildOrphanSweepCheck:
         # Defensive — only act on names matching our prefix.
         if not name.startswith(BUILD_DIND_PREFIX):
             return False
-        cmd = f'/usr/bin/docker rm -f {name} 2>/dev/null || true'
+        cmd = f'/usr/bin/docker rm -fv {name} 2>/dev/null || true'
         try:
             await ssh.run(cmd, check=False)
             return True

@@ -2,7 +2,11 @@
 
 DAH-1991: cleanup must pick up `health_check_*` in addition to `pod_*` and
 `container_*` so a stale backend probe cannot hold the rental port range.
+
+DAH-2375: prune_dangling_anonymous_volumes must reap orphaned anonymous
+volumes left behind by historical `docker rm` without `-v`.
 """
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -324,3 +328,168 @@ async def test_force_remove_health_checks_swallows_exceptions():
     count = await cleanup.force_remove_health_checks(ssh_client=ssh, executor_uuid=EXECUTOR_UUID)
 
     assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# DAH-2375: prune_dangling_anonymous_volumes — reap anonymous volumes orphaned
+# by container removals without -v.
+# ---------------------------------------------------------------------------
+
+ANON_VOLUME_OLD = "a" * 64
+ANON_VOLUME_YOUNG = "b" * 64
+ANON_VOLUME_BAD_TS = "c" * 64
+
+
+def _created_at(age_minutes: float) -> str:
+    """RFC3339 CreatedAt string with nanoseconds, age_minutes in the past."""
+    created = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    return created.strftime("%Y-%m-%dT%H:%M:%S") + ".123456789Z"
+
+
+def _volume_ssh_mock(dangling: list[str], created_by_name: dict[str, str]):
+    """Build an ssh mock simulating docker volume ls / inspect / rm."""
+    rm_calls: list[str] = []
+
+    async def handler(cmd, *args, **kwargs):
+        if "docker volume ls" in cmd:
+            return MagicMock(exit_status=0, stdout="\n".join(dangling), stderr="")
+        if "docker volume inspect" in cmd:
+            lines = [
+                f"{name} {created}"
+                for name, created in created_by_name.items()
+                if name in cmd
+            ]
+            return MagicMock(exit_status=0, stdout="\n".join(lines), stderr="")
+        if "docker volume rm" in cmd:
+            rm_calls.append(cmd)
+            return MagicMock(exit_status=0, stdout="", stderr="")
+        return MagicMock(exit_status=0, stdout="", stderr="")
+
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=handler)
+    return ssh, rm_calls
+
+
+@pytest.mark.asyncio
+async def test_prune_removes_old_dangling_anonymous_volume():
+    ssh, rm_calls = _volume_ssh_mock(
+        dangling=[ANON_VOLUME_OLD],
+        created_by_name={ANON_VOLUME_OLD: _created_at(age_minutes=120)},
+    )
+    cleanup = ContainerCleanup()
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == 1
+    assert any("docker volume rm" in c and ANON_VOLUME_OLD in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_prune_keeps_named_volumes_even_if_dangling():
+    ssh, rm_calls = _volume_ssh_mock(
+        dangling=["volume_abc", "hc_x", "executor_db_data", "pod_123"],
+        created_by_name={},
+    )
+    cleanup = ContainerCleanup()
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == 0
+    assert not rm_calls
+    # No inspect either — nothing matched the anonymous 64-hex pattern.
+    issued = [call.args[0] for call in ssh.run.await_args_list]
+    assert not any("docker volume inspect" in cmd for cmd in issued)
+
+
+@pytest.mark.asyncio
+async def test_prune_keeps_young_anonymous_volume():
+    ssh, rm_calls = _volume_ssh_mock(
+        dangling=[ANON_VOLUME_YOUNG],
+        created_by_name={ANON_VOLUME_YOUNG: _created_at(age_minutes=5)},
+    )
+    cleanup = ContainerCleanup()
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == 0
+    assert not rm_calls
+
+
+@pytest.mark.asyncio
+async def test_prune_keeps_volume_with_unparseable_created_at():
+    ssh, rm_calls = _volume_ssh_mock(
+        dangling=[ANON_VOLUME_BAD_TS],
+        created_by_name={ANON_VOLUME_BAD_TS: "not-a-timestamp"},
+    )
+    cleanup = ContainerCleanup()
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == 0
+    assert not rm_calls
+
+
+@pytest.mark.asyncio
+async def test_prune_removes_old_but_keeps_young_and_named_mixed():
+    ssh, rm_calls = _volume_ssh_mock(
+        dangling=[ANON_VOLUME_OLD, ANON_VOLUME_YOUNG, "volume_pod1"],
+        created_by_name={
+            ANON_VOLUME_OLD: _created_at(age_minutes=90),
+            ANON_VOLUME_YOUNG: _created_at(age_minutes=10),
+        },
+    )
+    cleanup = ContainerCleanup()
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == 1
+    assert len(rm_calls) == 1
+    assert ANON_VOLUME_OLD in rm_calls[0]
+    assert ANON_VOLUME_YOUNG not in rm_calls[0]
+    assert "volume_pod1" not in rm_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_prune_never_raises_on_ssh_failure():
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=Exception("ssh broken"))
+    cleanup = ContainerCleanup()
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_dry_run_skips_removal():
+    ssh, rm_calls = _volume_ssh_mock(
+        dangling=[ANON_VOLUME_OLD],
+        created_by_name={ANON_VOLUME_OLD: _created_at(age_minutes=120)},
+    )
+    cleanup = ContainerCleanup(dry_run=True)
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == 0
+    assert not rm_calls
+
+
+@pytest.mark.asyncio
+async def test_cleanup_invokes_volume_prune():
+    """cleanup() must trigger the dangling-volume sweep at the end."""
+    ssh, rm_calls = _volume_ssh_mock(
+        dangling=[ANON_VOLUME_OLD],
+        created_by_name={ANON_VOLUME_OLD: _created_at(age_minutes=120)},
+    )
+    cleanup = ContainerCleanup(stale_threshold_minutes=15)
+
+    removed_count, removed_names = await cleanup.cleanup(
+        ssh_client=ssh,
+        rented_data=None,
+        executor_uuid=EXECUTOR_UUID,
+    )
+
+    # Container return contract unchanged; the volume was still pruned.
+    assert removed_count == 0
+    assert removed_names == []
+    assert any("docker volume rm" in c and ANON_VOLUME_OLD in c for c in rm_calls)
