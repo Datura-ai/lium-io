@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 # Anonymous docker volumes are named with a 64-char hex hash.
 ANON_VOLUME_NAME_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
-# Cap names per `docker volume rm` so a large historical backlog can't overflow
-# the shell argument length limit and fail the whole removal.
-VOLUME_RM_BATCH_SIZE = 200
+# Remove at most this many per pass; GC runs each cycle, so a backlog drains
+# over a few passes without a huge `docker volume rm` command.
+VOLUME_RM_MAX_PER_PASS = 200
 
 
 class ContainerCleanup:
@@ -127,6 +127,8 @@ class ContainerCleanup:
             if volumes is None:
                 logger.warning(_m("Listing dangling volumes failed", extra=extra))
                 return 0
+
+            volumes = volumes[:VOLUME_RM_MAX_PER_PASS]
             if not volumes:
                 return 0
 
@@ -139,22 +141,9 @@ class ContainerCleanup:
                 )
                 return 0
 
-            # Remove in batches (arg-length safe) and count what docker actually
-            # reaped — it prints one removed volume name per stdout line — rather
-            # than assuming every requested name was removed.
-            removed = 0
-            for start in range(0, len(volumes), VOLUME_RM_BATCH_SIZE):
-                batch = volumes[start:start + VOLUME_RM_BATCH_SIZE]
-                result = await ssh_client.run(DockerCommand.volume_remove(*batch))
-                removed += sum(1 for line in (result.stdout or "").splitlines() if line.strip())
-
-            logger.info(
-                _m(
-                    f"Removed {removed} dangling anonymous volume(s)",
-                    extra=extra | {"requested": len(volumes)},
-                )
-            )
-            return removed
+            await ssh_client.run(DockerCommand.volume_remove(*volumes))
+            logger.info(_m(f"Removed {len(volumes)} dangling anonymous volume(s)", extra=extra))
+            return len(volumes)
 
         except Exception as e:
             logger.warning(
