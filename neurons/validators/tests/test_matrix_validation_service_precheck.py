@@ -245,7 +245,7 @@ async def test_ssh_timeout_returns_timed_out_result_and_kills_remote(service_wit
     # second SSH call is the best-effort kill of the leaked matmul process
     assert run_mock.await_count == 2
     pkill_cmd = run_mock.await_args_list[1].args[0]
-    assert "pkill -f" in pkill_cmd
+    assert "pkill -9 -f" in pkill_cmd
     assert "decrypt_challenge.py" in pkill_cmd
 
 
