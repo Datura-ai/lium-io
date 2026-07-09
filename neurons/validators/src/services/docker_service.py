@@ -1147,7 +1147,7 @@ class DockerService:
                 "/usr/bin/docker ps -q "
                 f"--filter {container_filter} "
                 f"--filter {health_check_filter} "
-                "| xargs -r /usr/bin/docker rm -f"
+                "| xargs -r /usr/bin/docker rm -fv"
             )
             await client.run(remove_cmd)
 
@@ -1837,7 +1837,7 @@ class DockerService:
                     raise_exception=True,
                 )
             finally:
-                command = f"/usr/bin/docker rm -f {temp_container_name}"
+                command = f"/usr/bin/docker rm -fv {temp_container_name}"
                 await self.execute_and_stream_logs(
                     ssh_client=ssh_client,
                     command=command,

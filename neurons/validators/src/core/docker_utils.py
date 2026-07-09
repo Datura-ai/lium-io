@@ -33,11 +33,6 @@ class DockerCommand:
         )
 
     @staticmethod
-    def remove(name: str) -> str:
-        """Build docker rm command."""
-        return f"/usr/bin/docker rm -f {name}"
-
-    @staticmethod
     def remove_with_volumes(name: str) -> str:
         """Build docker rm command that also removes anonymous volumes."""
         return f"/usr/bin/docker rm -fv {name}"
@@ -64,34 +59,16 @@ class DockerCommand:
         return f"/usr/bin/docker inspect {container_id} --format '{{{{.State.ExitCode}}}}' 2>&1"
 
     @staticmethod
-    def volume_prune() -> str:
-        """Build docker volume prune command."""
-        return "/usr/bin/docker volume prune -af"
-
-    @staticmethod
-    def volume_remove(volume_name: str) -> str:
-        """Build docker volume rm command."""
-        return f"/usr/bin/docker volume rm {volume_name} 2>/dev/null || true"
+    def volume_remove(*volume_names: str) -> str:
+        """Build docker volume rm command, tolerating per-volume failures."""
+        names = " ".join(shlex.quote(name) for name in volume_names)
+        return f"/usr/bin/docker volume rm {names} 2>/dev/null || true"
 
     @staticmethod
     def volume_ls_dangling() -> str:
         """Build docker volume ls command listing dangling volume names."""
         return "/usr/bin/docker volume ls -qf dangling=true"
 
-    @staticmethod
-    def volume_inspect_created(volume_names: list[str]) -> str:
-        """Build docker volume inspect command printing name and creation time per line."""
-        names = " ".join(shlex.quote(name) for name in volume_names)
-        return (
-            "/usr/bin/docker volume inspect "
-            f"--format '{{{{.Name}}}} {{{{.CreatedAt}}}}' {names} 2>/dev/null"
-        )
-
-    @staticmethod
-    def volume_remove_batch(volume_names: list[str]) -> str:
-        """Build docker volume rm command for multiple volumes, tolerating per-volume failures."""
-        names = " ".join(shlex.quote(name) for name in volume_names)
-        return f"/usr/bin/docker volume rm {names} 2>/dev/null || true"
 
     @staticmethod
     def inspect_created_timestamp(container_id: str) -> str:
