@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
-from services.container_cleanup import ContainerCleanup
+from services.container_cleanup import VOLUME_RM_BATCH_SIZE, ContainerCleanup
 
 
 def _ssh_mock_from_calls(call_handler):
@@ -347,7 +347,9 @@ def _volume_ssh_mock(dangling: list[str]):
             return MagicMock(exit_status=0, stdout="\n".join(dangling), stderr="")
         if "docker volume rm" in cmd:
             rm_calls.append(cmd)
-            return MagicMock(exit_status=0, stdout="", stderr="")
+            # docker prints one removed volume name per line to stdout
+            echoed = "\n".join(name for name in dangling if name in cmd)
+            return MagicMock(exit_status=0, stdout=echoed, stderr="")
         return MagicMock(exit_status=0, stdout="", stderr="")
 
     return _ssh_mock_from_calls(handler), rm_calls
@@ -380,6 +382,40 @@ async def test_prune_removes_anonymous_keeps_named_mixed():
     assert ANON_VOLUME_A in rm_calls[0]
     assert ANON_VOLUME_B in rm_calls[0]
     assert "volume_pod1" not in rm_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_prune_batches_large_backlog_and_counts_actual_removals():
+    """A backlog larger than VOLUME_RM_BATCH_SIZE is removed in several `rm`
+    calls, and the returned count reflects what docker actually reaped."""
+    backlog = [f"{i:064x}" for i in range(VOLUME_RM_BATCH_SIZE + 50)]
+    ssh, rm_calls = _volume_ssh_mock(dangling=backlog)
+    cleanup = ContainerCleanup()
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == len(backlog)
+    assert len(rm_calls) == 2  # 200 + 50
+
+
+@pytest.mark.asyncio
+async def test_prune_reports_actual_removals_not_requested():
+    """If docker reaps fewer than requested (e.g. one raced back into use),
+    the count reflects reality, not the input length."""
+    ssh = AsyncMock()
+
+    async def run(cmd, *args, **kwargs):
+        if "docker volume ls" in cmd:
+            return MagicMock(exit_status=0, stdout=f"{ANON_VOLUME_A}\n{ANON_VOLUME_B}", stderr="")
+        # docker removed only A; B stayed (in use) and was silently skipped
+        return MagicMock(exit_status=0, stdout=ANON_VOLUME_A, stderr="")
+
+    ssh.run = AsyncMock(side_effect=run)
+    cleanup = ContainerCleanup()
+
+    removed = await cleanup.prune_dangling_anonymous_volumes(ssh, EXECUTOR_UUID)
+
+    assert removed == 1
 
 
 @pytest.mark.asyncio
