@@ -3971,17 +3971,28 @@ class DockerService:
                 # DAH-2364: graceful stop first (SIGTERM + grace window) so the workload
                 # can exit cleanly before the forced removal below. Applies to customer
                 # rentals and fillers alike. Any stop failure is swallowed — the forced
-                # removal stays the single source of truth for deletion success.
+                # removal stays the single source of truth for deletion success. The stop
+                # is called directly (not via run_logged_rental_docker_sdk_operation) so an
+                # expected failure — chiefly an already-absent container — is not logged at
+                # ERROR and does not raise a false failed-deletion alert (DAH-2364).
+                stop_started = time.monotonic()
                 try:
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="stop_container",
-                        log_extra=default_extra,
-                        call=lambda: docker_client.stop(
-                            container_name=payload.container_name,
-                            timeout=CONTAINER_STOP_GRACE_SECONDS,
-                        ),
+                    await docker_client.stop(
                         container_name=payload.container_name,
-                        stop_grace_seconds=CONTAINER_STOP_GRACE_SECONDS,
+                        timeout=CONTAINER_STOP_GRACE_SECONDS,
+                    )
+                    logger.info(
+                        _m(
+                            "Graceful container stop completed",
+                            extra=get_extra_info(
+                                {
+                                    **default_extra,
+                                    "container_name": payload.container_name,
+                                    "stop_grace_seconds": CONTAINER_STOP_GRACE_SECONDS,
+                                    "duration_ms": int((time.monotonic() - stop_started) * 1000),
+                                }
+                            ),
+                        ),
                     )
                 except Exception as exc:
                     if _is_missing_docker_container_error(exc):
