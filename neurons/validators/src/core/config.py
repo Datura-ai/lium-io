@@ -175,17 +175,16 @@ class Settings(BaseSettings):
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")
 
-    # DAH-2272: raise the asyncssh logger to DEBUG (debug level 2) so the SSH
-    # handshake (banner / key exchange / auth) is logged per connection. Enabled
-    # by default while DAH-2272 is under investigation, so the handshake trace is
-    # captured whenever the rare slow-connect transient hits; set
-    # SSH_DEBUG_LOGGING=false (env) to silence it without a deploy. Lives on the
-    # main settings (not DebugSettings, which is local-dev only) so it is
-    # configurable in staging/prod where the real slow connects happen.
-    # TODO(DAH-2272): flip default back to False once the slow-connect
-    # investigation is closed — debug-level handshake logging shouldn't ship on
-    # by default long-term.
-    SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=True, description="Enable verbose asyncssh SSH handshake debug logging")
+    # DAH-2272: when on, raise the asyncssh logger to DEBUG (debug level 2) so the
+    # SSH handshake (banner / key exchange / auth) is logged per connection, and
+    # emit the per-connect ``ssh_connect_phase_timing`` breakdown (see
+    # ``services.ssh_connect_timing``). Off by default now that the slow-connect
+    # investigation is closed — this instrumentation is kept in the tree so it can
+    # be re-enabled without a code change by setting SSH_DEBUG_LOGGING=true (env)
+    # for a future investigation. Lives on the main settings (not DebugSettings,
+    # which is local-dev only) so it is configurable in staging/prod where the
+    # real slow connects happen.
+    SSH_DEBUG_LOGGING: bool = Field(env="SSH_DEBUG_LOGGING", default=False, description="Enable verbose asyncssh SSH handshake debug logging and per-connect phase timing")
 
     # DAH-2250 — unrented incentive soft price limit. When True, an unrented executor
     # whose price_per_gpu exceeds market p90 * SOFT_LIMIT_PRICE_RATE loses the unrented

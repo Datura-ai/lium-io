@@ -4,8 +4,9 @@ Splits a single ``asyncssh.connect`` into its phases **without changing how the
 connection is established** — so we can attribute a slow connect to the network,
 the remote sshd, or the validator. It does this by attaching an observation-only
 ``SSHClient`` (a documented asyncssh extension point) that timestamps the
-connection lifecycle callbacks, then emits one structured
-``ssh_connect_phase_timing`` log line per connect.
+connection lifecycle callbacks, then — when ``SSH_DEBUG_LOGGING`` is enabled
+(off by default; DAH-2272) — emits one structured ``ssh_connect_phase_timing``
+log line per connect.
 
 Phases (each the gap between two asyncssh ``SSHClient`` callbacks):
 
@@ -46,6 +47,7 @@ from typing import AsyncIterator
 
 import asyncssh
 
+from core.config import settings
 from core.utils import _m, get_extra_info
 from payload_models.payloads import now_ms
 
@@ -152,31 +154,36 @@ async def connect_with_phase_timing(
         client_factory=lambda: _PhaseTimingSSHClient(marks, log_extra, host),
         **connect_kwargs,
     ) as conn:
-        end = now_ms()
-        tcp_done = marks.get("tcp_done_ms")
-        auth_begin = marks.get("auth_begin_ms")
-        auth_done = marks.get("auth_done_ms")
+        # DAH-2272: the per-connect phase-timing line is diagnostic-only and off by
+        # default (SSH_DEBUG_LOGGING). Skip building/emitting it when the flag is
+        # off so normal operation stays quiet; the abnormal ``ssh_connection_lost``
+        # warning in the client callback still fires regardless.
+        if settings.SSH_DEBUG_LOGGING:
+            end = now_ms()
+            tcp_done = marks.get("tcp_done_ms")
+            auth_begin = marks.get("auth_begin_ms")
+            auth_done = marks.get("auth_done_ms")
 
-        def _delta(a, b):
-            return (b - a) if (a is not None and b is not None) else None
+            def _delta(a, b):
+                return (b - a) if (a is not None and b is not None) else None
 
-        extra = {
-            **log_extra,
-            "host": host,
-            "port": connect_kwargs.get("port"),
-            "tcp_connect_ms": _delta(t0, tcp_done),
-            "ssh_handshake_ms": _delta(tcp_done, auth_begin),  # banner + KEX
-            "ssh_auth_ms": _delta(auth_begin, auth_done),      # authentication
-            "ssh_login_ms": _delta(tcp_done, auth_done),       # robust combined
-            "total_connect_ms": end - t0,
-            "server_version": _safe_extra(conn, "server_version"),
-            "cipher": _safe_extra(conn, "recv_cipher"),
-            "mac": _safe_extra(conn, "recv_mac"),
-        }
-        if marks.get("auth_banner"):
-            extra["auth_banner"] = marks["auth_banner"]
-        if marks.get("server_debug_msgs"):
-            extra["server_debug_msgs"] = marks["server_debug_msgs"]
+            extra = {
+                **log_extra,
+                "host": host,
+                "port": connect_kwargs.get("port"),
+                "tcp_connect_ms": _delta(t0, tcp_done),
+                "ssh_handshake_ms": _delta(tcp_done, auth_begin),  # banner + KEX
+                "ssh_auth_ms": _delta(auth_begin, auth_done),      # authentication
+                "ssh_login_ms": _delta(tcp_done, auth_done),       # robust combined
+                "total_connect_ms": end - t0,
+                "server_version": _safe_extra(conn, "server_version"),
+                "cipher": _safe_extra(conn, "recv_cipher"),
+                "mac": _safe_extra(conn, "recv_mac"),
+            }
+            if marks.get("auth_banner"):
+                extra["auth_banner"] = marks["auth_banner"]
+            if marks.get("server_debug_msgs"):
+                extra["server_debug_msgs"] = marks["server_debug_msgs"]
 
-        logger.info(_m("ssh_connect_phase_timing", extra=get_extra_info(extra)))
+            logger.info(_m("ssh_connect_phase_timing", extra=get_extra_info(extra)))
         yield conn
