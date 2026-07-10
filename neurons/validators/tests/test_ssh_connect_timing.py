@@ -83,6 +83,16 @@ def _record(caplog, message):
     return None
 
 
+@pytest.fixture(autouse=True)
+def _ssh_debug_logging_on(monkeypatch):
+    """DAH-2272: the phase-timing line is off by default (SSH_DEBUG_LOGGING=False).
+
+    These tests exercise the instrumentation itself, so enable it. The
+    suppression test overrides this back to False.
+    """
+    monkeypatch.setattr(sct.settings, "SSH_DEBUG_LOGGING", True)
+
+
 @pytest.mark.asyncio
 async def test_logs_three_way_phase_split(monkeypatch, caplog):
     """connection_made/begin_auth/auth_completed → tcp / handshake / auth split."""
@@ -187,6 +197,28 @@ async def test_clean_connection_lost_is_silent(monkeypatch, caplog):
             pass
 
     assert _record(caplog, "ssh_connection_lost") is None
+
+
+@pytest.mark.asyncio
+async def test_phase_timing_suppressed_when_flag_off(monkeypatch, caplog):
+    """DAH-2272: with SSH_DEBUG_LOGGING off the per-connect line is NOT emitted,
+    but the connection is still established/closed and abnormal drops still warn."""
+    monkeypatch.setattr(sct.settings, "SSH_DEBUG_LOGGING", False)
+    conn = _fake_conn()
+    _clock(monkeypatch, [1000, 1100, 1300, 1400, 1450])
+    exc = ConnectionResetError("keepalive timeout")
+    monkeypatch.setattr(sct.asyncssh, "connect", _connect_returning(conn, lost_exc=exc))
+
+    with caplog.at_level(logging.INFO, logger=MODULE_LOGGER):
+        async with connect_with_phase_timing(host="h", port=22) as client:
+            assert client is conn
+
+    # The per-connection phase-timing line is gated off ...
+    assert _record(caplog, "ssh_connect_phase_timing") is None
+    # ... but the abnormal-drop warning is independent of the flag and still fires.
+    assert _record(caplog, "ssh_connection_lost") is not None
+    conn.close.assert_called_once()
+    conn.wait_closed.assert_awaited_once()
 
 
 @pytest.mark.asyncio
