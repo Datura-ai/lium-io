@@ -1,5 +1,17 @@
 from pydantic import BaseModel, ConfigDict, Field
 
+# Default cache-template docker images (full backend DOCKER_IMAGES entries). Used as the
+# packaged fallback when a shared-config payload omits the field (e.g. an older backend);
+# in production the backend's DOCKER_IMAGES list is the single source of truth (DAH-2380).
+# Entries stay untyped dicts (like gpu_architectures) so the backend can add or change
+# metadata keys without a lium-core release; consumers read only the keys they need.
+# fmt: off
+DEFAULT_DOCKER_IMAGES: tuple[dict, ...] = (
+    {"image": "daturaai/pytorch", "tag": "2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind", "pytorch": 2.12, "python": 3.12, "cuda": 12.8, "ubuntu": 24.04, "size": 12022823632},
+    {"image": "daturaai/pytorch", "tag": "2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind", "pytorch": 2.12, "python": 3.12, "cuda": 13.0, "ubuntu": 24.04, "size": 12022823632},
+)
+# fmt: on
+
 
 class SharedConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -26,3 +38,9 @@ class SharedConfig(BaseModel):
     max_initial_port_count: int
     total_burn_emission: float
     require_storage_limit_supported: bool = False
+
+    # Lists
+    # default cache-template docker images, served verbatim from the backend
+    # DOCKER_IMAGES list; the validator derives repo:tag refs from image/tag to
+    # pre-fetch Docker Hub digests (DAH-2380)
+    default_docker_images: tuple[dict, ...] = DEFAULT_DOCKER_IMAGES
