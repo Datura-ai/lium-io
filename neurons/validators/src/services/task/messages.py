@@ -724,6 +724,13 @@ class PortCountMessages:
         impact="Score set to 0",
         remediation="Increase port range or check port mappings configuration.",
     )
+    FILLER_SKIPPED = MessageTemplate(
+        event="Port count check skipped for active filler",
+        reason="PORT_COUNT_SKIPPED_ACTIVE_FILLER",
+        severity="info",
+        category="policy",
+        impact="Active filler publishes the executor's free ports; count recovers when the filler stops.",
+    )
 
 
 VERIFYX_DEBUG_DOC_URL = (

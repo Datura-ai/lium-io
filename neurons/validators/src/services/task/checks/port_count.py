@@ -37,6 +37,25 @@ class PortCountCheck:
         )
 
         if not is_rented and port_count < MIN_PORT_COUNT:
+            # A filler container is published with all of the executor's free ports (DAH-2385),
+            # so a low count is expected while it runs — skip instead of zeroing the score,
+            # same filler tolerance as the capability/verifyx/gpu_usage checks.
+            filler_container = _get_filler_only_container(ctx)
+            if filler_container:
+                event = render_message(
+                    Msg.FILLER_SKIPPED,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "available_port_count": port_count,
+                        "filler_container": filler_container,
+                    },
+                )
+                return CheckResult(
+                    passed=True,
+                    event=event,
+                    updates={"port_count": port_count, "state": updated_state},
+                )
             event = render_message(
                 Msg.INSUFFICIENT_PORTS,
                 ctx=ctx,
@@ -63,3 +82,14 @@ class PortCountCheck:
             event=event,
             updates={"port_count": port_count, "state": updated_state},
         )
+
+
+def _get_filler_only_container(ctx: Context) -> str | None:
+    rented_data = ctx.state.rented_data
+    if not rented_data:
+        return None
+
+    filler_container = rented_data.get_filler_container(ctx.executor.uuid)
+    rented_executor = rented_data.executors.get(ctx.executor.uuid)
+    has_customer_rental = bool(rented_executor and rented_executor.pods)
+    return filler_container if filler_container and not has_customer_rental else None

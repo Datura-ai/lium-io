@@ -65,3 +65,37 @@ async def test_port_count_insufficient_passes_when_rented(context_factory):
     assert result.passed is True
     assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
     assert result.updates["port_count"] == MIN_PORT_COUNT - 1
+
+
+@pytest.mark.asyncio
+async def test_port_count_insufficient_passes_when_filler_occupies_node(context_factory):
+    """A filler-only node passes: the filler container publishes the executor's free ports,
+    so a low count is expected and must not zero the score (DAH-2385)."""
+    rented_data = RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={"executor-123": "filler_12bc2580"},
+    )
+    ctx = context_factory(state=build_state(verified_port_count=MIN_PORT_COUNT - 1, rented_data=rented_data))
+
+    result = await PortCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert result.updates["port_count"] == MIN_PORT_COUNT - 1
+    assert result.updates["state"].specs["available_port_count"] == MIN_PORT_COUNT - 1
+
+
+@pytest.mark.asyncio
+async def test_port_count_sufficient_records_normally_with_filler(context_factory):
+    """With a filler present but enough free ports, the check records the count as usual."""
+    rented_data = RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={"executor-123": "filler_12bc2580"},
+    )
+    ctx = context_factory(state=build_state(verified_port_count=MIN_PORT_COUNT + 1, rented_data=rented_data))
+
+    result = await PortCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.PORT_COUNT_RECORDED.reason
+    assert result.updates["port_count"] == MIN_PORT_COUNT + 1
