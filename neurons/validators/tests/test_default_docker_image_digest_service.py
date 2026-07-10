@@ -85,6 +85,31 @@ async def test_refresh_drops_ref_when_fetch_fails():
 
 
 @pytest.mark.asyncio
+async def test_refresh_reads_image_refs_from_shared_config_when_none_provided():
+    """With no static image_refs, the service pulls the list from shared config.
+
+    This is the DAH-2380 single-source-of-truth path: the backend serves the
+    default template refs via /v1/shared-config, so no hardcoded copy lives here.
+    """
+    service = DefaultDockerImageDigestService(refresh_seconds=60)  # image_refs=None
+
+    with (
+        patch(
+            "neurons.validators.src.services.default_docker_image_digest_service"
+            "._shared_config_image_refs",
+            return_value=("daturaai/pytorch:shared",),
+        ),
+        patch(
+            "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
+            new=AsyncMock(return_value="sha256:shared"),
+        ),
+    ):
+        await service.refresh()
+
+    assert service.get_digest("daturaai/pytorch:shared") == "sha256:shared"
+
+
+@pytest.mark.asyncio
 async def test_get_digest_returns_none_for_unknown_image():
     service = DefaultDockerImageDigestService(image_refs=(), refresh_seconds=60)
     assert service.get_digest("daturaai/pytorch:missing") is None
