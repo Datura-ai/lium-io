@@ -236,14 +236,15 @@ class RentalDockerSdkClient:
             api_method=self._api_client.start,
         )
 
-    async def stop(self, *, container_name: str, timeout: int | None = None) -> None:
-        # timeout is the SIGTERM grace window: dockerd waits this many seconds for the
-        # container to exit before escalating to SIGKILL (docker stop -t semantics)
+    async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
+        # stop_grace_seconds is the SIGTERM grace window: dockerd waits this many seconds for
+        # the container to exit before escalating to SIGKILL (docker stop -t semantics). Named
+        # distinctly because `timeout` on this class means the HTTP client timeout (create_volume).
         await self._call_api(
             container_name,
             operation_label="stop",
             api_method=self._api_client.stop,
-            timeout=timeout,
+            timeout=stop_grace_seconds,
         )
 
     async def remove_container(

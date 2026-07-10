@@ -108,7 +108,7 @@ class RecordingRentalDockerClient:
     async def start(self, *, container_name: str) -> None:
         self.started_containers.append(container_name)
 
-    async def stop(self, *, container_name: str, timeout: int | None = None) -> None:
+    async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
         self.stopped_containers.append(container_name)
 
     async def remove_container(

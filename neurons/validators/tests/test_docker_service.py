@@ -57,8 +57,10 @@ class _FakeRentalDockerClient:
         self.exec_specs = []
         self.started_containers = []
         self.stopped_containers = []
-        self.stop_timeouts = []
+        self.stop_grace_seconds_calls = []
         self.removed_containers = []
+        # (operation, container_name) tuples shared by stop/remove, so tests can assert ordering
+        self.container_call_order = []
         self.created_volumes = []
         self.removed_volumes = []
         self.pruned_images = 0
@@ -96,9 +98,10 @@ class _FakeRentalDockerClient:
         if self.start_error is not None:
             raise self.start_error
 
-    async def stop(self, *, container_name: str, timeout: int | None = None) -> None:
+    async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
         self.stopped_containers.append(container_name)
-        self.stop_timeouts.append(timeout)
+        self.stop_grace_seconds_calls.append(stop_grace_seconds)
+        self.container_call_order.append(("stop", container_name))
         if self.stop_error is not None:
             raise self.stop_error
 
@@ -116,6 +119,7 @@ class _FakeRentalDockerClient:
                 "remove_volumes": remove_volumes,
             }
         )
+        self.container_call_order.append(("remove", container_name))
         if self.remove_error is not None:
             raise self.remove_error
 
@@ -1017,8 +1021,11 @@ async def test_delete_container_stops_gracefully_before_forced_removal(
     # Assert: graceful stop with the grace window happened, then the forced removal
     assert isinstance(result, ContainerDeleted)
     client = docker_service.rental_docker_client_factory.client
-    assert client.stopped_containers == [payload.container_name]
-    assert client.stop_timeouts == [CONTAINER_STOP_GRACE_SECONDS]
+    assert client.container_call_order == [
+        ("stop", payload.container_name),
+        ("remove", payload.container_name),
+    ]
+    assert client.stop_grace_seconds_calls == [CONTAINER_STOP_GRACE_SECONDS]
     assert client.removed_containers == [
         {
             "container_name": payload.container_name,
@@ -1142,6 +1149,122 @@ async def test_delete_container_stop_failure_still_removes(
             "remove_volumes": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_delete_container_stop_missing_container_logs_info_and_removes(
+    docker_service,
+    monkeypatch,
+    caplog,
+):
+    # Arrange: the container is already gone when the graceful stop runs — must log info
+    # (not warning/error, which would raise a false failed-deletion alert) and still remove
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+    docker_service.rental_docker_client_factory.client.stop_error = Exception(
+        "Docker SDK stop failed: 404 Client Error: No such container: pod_stop_absent"
+    )
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_stop_absent",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        result = await docker_service.delete_container(
+            payload=payload,
+            executor_info=executor_info,
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+
+    # Assert: absent container on stop is info-level only, forced removal still runs
+    assert isinstance(result, ContainerDeleted)
+    client = docker_service.rental_docker_client_factory.client
+    assert client.container_call_order == [
+        ("stop", payload.container_name),
+        ("remove", payload.container_name),
+    ]
+    stop_records = [r for r in caplog.records if "Graceful stop skipped" in str(r.msg)]
+    assert [r.levelno for r in stop_records] == [logging.INFO]
+    assert not any(
+        "Graceful container stop failed" in str(r.msg) for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_filler_skips_graceful_stop(
+    docker_service,
+    monkeypatch,
+):
+    # Arrange: FILLER teardown races the backend's FILLER_STOP_WAIT_TIMEOUT_SECONDS budget,
+    # so it must keep the SIGKILL-only path with no graceful stop
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        container_name="filler_no_grace",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    # Act
+    result = await docker_service.delete_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    # Assert: no graceful stop, straight to forced removal
+    assert isinstance(result, ContainerDeleted)
+    client = docker_service.rental_docker_client_factory.client
+    assert client.stopped_containers == []
+    assert client.container_call_order == [("remove", payload.container_name)]
 
 
 @pytest.mark.asyncio
