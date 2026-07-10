@@ -115,9 +115,10 @@ LOG_STREAM_INTERVAL = 0.5  # 500ms — keeps build-log p95 emit→publish under 
 IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 
 # DAH-2364: SIGTERM grace window (docker stop -t semantics) given to a container before
-# forced removal. SIGKILL-only removal of GPU-heavy workloads repeatedly wedged
-# containerd/sysbox ("could not kill container ... did not receive an exit event"),
-# leaving orphaned containers that hold GPUs and brick the executor.
+# forced removal. SIGKILL-only removal of GPU-heavy workloads repeatedly triggered a
+# containerd/sysbox wedge ("could not kill container ... did not receive an exit event";
+# root cause: sysbox-fs FUSE deadlock, fixed separately), leaving orphaned containers
+# that hold GPUs and brick the executor.
 CONTAINER_STOP_GRACE_SECONDS = 30
 
 DOCKER_VOLUME_PLUGINS = {
