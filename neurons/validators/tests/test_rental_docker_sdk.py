@@ -80,6 +80,7 @@ class FakeApiClient:
         self.host_config_kwargs = None
         self.created_container = None
         self.started = []
+        self.stopped = []
         self.exec_created = []
         self.exec_started = []
         self.exec_inspected = []
@@ -113,6 +114,9 @@ class FakeApiClient:
 
     def start(self, container_name):
         self.started.append(container_name)
+
+    def stop(self, container_name, timeout=None):
+        self.stopped.append({"container_name": container_name, "timeout": timeout})
 
     def exec_create(self, **kwargs):
         self.events.append("exec_create")
@@ -394,6 +398,34 @@ async def test_image_exists_returns_false_for_missing_image():
     assert await client.image_exists(image="registry.example/missing:tag") is False
 
     assert api_client.inspected_images == ["registry.example/missing:tag"]
+
+
+@pytest.mark.asyncio
+async def test_stop_forwards_grace_as_docker_py_timeout():
+    # Arrange: the SIGTERM grace must cross into docker-py as its `timeout` kwarg —
+    # every delete test fakes this client, so this seam is the only place it's verified
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    # Act
+    await client.stop(container_name="pod_stop", stop_grace_seconds=30)
+
+    # Assert
+    assert api_client.stopped == [{"container_name": "pod_stop", "timeout": 30}]
+
+
+@pytest.mark.asyncio
+async def test_stop_without_grace_keeps_docker_py_default():
+    # Arrange: callers that pass no grace (e.g. pause-pod stop_container) must keep
+    # docker-py's timeout=None, i.e. the daemon default grace
+    api_client = FakeApiClient()
+    client = RentalDockerSdkClient(api_client)
+
+    # Act
+    await client.stop(container_name="pod_stop_default")
+
+    # Assert
+    assert api_client.stopped == [{"container_name": "pod_stop_default", "timeout": None}]
 
 
 @pytest.mark.asyncio
