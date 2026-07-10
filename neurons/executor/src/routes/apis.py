@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import os
 import threading
@@ -39,6 +40,50 @@ _container_log_stream_executor = ThreadPoolExecutor(
 )
 _active_follow_log_streams = 0
 _active_follow_log_streams_lock = asyncio.Lock()
+
+METRICS_MAX_CONCURRENT = 3
+METRICS_TIMEOUT_SECONDS = 8.0
+CONTAINER_LOOKUP_TIMEOUT_SECONDS = 5.0
+
+# Dedicated pool for blocking metrics/docker work: psutil, pynvml and docker-py
+# calls must never run on the event loop (a single hung call there blocks /ping
+# and /upload_ssh_key for its whole duration). A separate pool also isolates
+# leaked threads: wait_for cancels the coroutine but cannot kill a stuck thread,
+# so a wedged docker daemon degrades metrics only, never the whole agent.
+_metrics_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="metrics")
+_metrics_semaphore = asyncio.Semaphore(METRICS_MAX_CONCURRENT)
+
+
+async def _run_in_metrics_pool(label: str, func, timeout: float | None = None):
+    # run one blocking call in the dedicated pool, bounded by a timeout read at call time
+    if timeout is None:
+        timeout = METRICS_TIMEOUT_SECONDS
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(_metrics_executor, func), timeout=timeout)
+    except TimeoutError:
+        logger.warning(
+            "%s timed out after %.1fs in the metrics pool, returning 503 "
+            "(worker thread may be leaked)",
+            label,
+            timeout,
+        )
+        raise HTTPException(status_code=503, detail="Executor busy, metrics collection timed out")
+
+
+async def _run_metrics_call(label: str, func):
+    # reject immediately when all metrics slots are busy instead of queueing on the event loop
+    if _metrics_semaphore.locked():
+        logger.warning(
+            "%s rejected: %d concurrent metrics calls already running",
+            label,
+            METRICS_MAX_CONCURRENT,
+        )
+        raise HTTPException(
+            status_code=503, detail="Executor busy, too many concurrent metrics requests"
+        )
+    async with _metrics_semaphore:
+        return await _run_in_metrics_pool(label, func)
 
 
 def _normalize_log_tail(tail: Optional[int]) -> int:
@@ -233,7 +278,7 @@ async def hardware_utilization(
     Returns:
         dict: Hardware utilization metrics including CPU, memory, storage, and GPU
     """
-    return get_system_metrics()
+    return await _run_metrics_call("hardware_utilization", get_system_metrics)
 
 
 @apis_router.post("/containers/{container_name}")
@@ -253,7 +298,10 @@ async def container_hardware_utilization(
     Returns:
         dict: Container-specific hardware utilization metrics
     """
-    return get_container_metrics(container_name, payload.gpu_uuids)
+    return await _run_metrics_call(
+        f"container_utilization:{container_name}",
+        functools.partial(get_container_metrics, container_name, payload.gpu_uuids),
+    )
 
 
 @apis_router.post("/ping")
@@ -314,9 +362,16 @@ async def stream_container_logs(
         if not reserved_follow_stream:
             raise HTTPException(status_code=429, detail="Too many active live log streams")
 
-    try:
+    def _lookup_container():
         client = docker.from_env()
-        container = client.containers.get(container_name)
+        return client.containers.get(container_name)
+
+    try:
+        container = await _run_in_metrics_pool(
+            f"container_logs_lookup:{container_name}",
+            _lookup_container,
+            timeout=CONTAINER_LOOKUP_TIMEOUT_SECONDS,
+        )
     except Exception:
         if reserved_follow_stream:
             await _release_follow_log_stream()
