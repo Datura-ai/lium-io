@@ -29,15 +29,26 @@ _REGISTRY_API = "https://registry-1.docker.io/v2"
 
 
 def _shared_config_image_refs() -> tuple[str, ...]:
-    """Default cache-template image refs served by the backend via shared config.
+    """Default cache-template image refs derived from the backend shared config.
 
-    The single source of truth is the backend ``DOCKER_IMAGES`` list, published on
-    ``/v1/shared-config``; ``SharedConfigClient`` falls back to the packaged lium-core
-    default when the backend is unreachable, so the returned tuple is always valid.
+    The single source of truth is the backend ``DOCKER_IMAGES`` list, published
+    verbatim on ``/v1/shared-config`` as ``default_docker_images`` (full metadata
+    dicts); the ``repo:tag`` refs are derived here from the ``image``/``tag`` keys.
+    ``SharedConfigClient`` falls back to the packaged lium-core default when the
+    backend is unreachable, so the returned tuple is always valid. An entry missing
+    ``image`` or ``tag`` is skipped (fail open) rather than producing a broken ref.
     """
     from core.config import shared_client
 
-    return tuple(shared_client.config.default_docker_image_refs)
+    refs: list[str] = []
+    for entry in shared_client.config.default_docker_images:
+        image = entry.get("image")
+        tag = entry.get("tag")
+        if image and tag:
+            refs.append(f"{image}:{tag}")
+        else:
+            logger.warning("Skipping malformed default docker image entry: %r", entry)
+    return tuple(refs)
 
 
 async def fetch_registry_digest(session: aiohttp.ClientSession, image_ref: str) -> str | None:
