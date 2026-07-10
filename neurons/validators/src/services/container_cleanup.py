@@ -123,7 +123,7 @@ class ContainerCleanup:
         # reap orphaned anonymous volumes left behind by container removals without -v
         extra = {"executor_uuid": executor_uuid}
         try:
-            dangling_anonymous_volumes: list[str] = await self.get_dangling_anonymous_volumes(ssh_client)
+            dangling_anonymous_volumes: Optional[list[str]] = await self.get_dangling_anonymous_volumes(ssh_client)
             if dangling_anonymous_volumes is None:
                 logger.warning(_m("Listing dangling volumes failed", extra=extra))
                 return 0
