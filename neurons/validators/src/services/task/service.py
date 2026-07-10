@@ -9,10 +9,6 @@ from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayloa
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationError, AttestationNonce, AttestationService
 from services.collateral_contract_service import CollateralContractService
-from services.default_docker_image_digest_service import (
-    DefaultDockerImageDigestService,
-    get_default_docker_image_digest_service,
-)
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.interactive_shell_service import InteractiveShellService
 from services.matrix_validation_service import ValidationService
@@ -39,9 +35,6 @@ class TaskService:
         collateral_contract_service: Annotated[CollateralContractService, Depends(CollateralContractService)],
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         backend_client: Annotated[BackendClient, Depends(BackendClient)],
-        default_docker_image_digest_service: Annotated[
-            DefaultDockerImageDigestService, Depends(get_default_docker_image_digest_service)
-        ],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
     ):
         self.ssh_service = ssh_service
@@ -58,7 +51,6 @@ class TaskService:
             collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
             backend_client=backend_client,
-            default_docker_image_digest_service=default_docker_image_digest_service,
         )
 
     async def create_task(
@@ -70,6 +62,7 @@ class TaskService:
         public_key: str,
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
+        default_docker_image_digests: dict[str, str],
         attestation_nonce: AttestationNonce | None = None,
     ):
         """New pipeline-based validation task implementation."""
@@ -125,6 +118,7 @@ class TaskService:
                     public_key=public_key,
                     encrypted_files=encrypted_files,
                     rented_data=rented_data,
+                    default_docker_image_digests=default_docker_image_digests,
                     tdx_attestation_passed=attestation_passed,
                     gpu_attestation_passed=gpu_attestation_passed,
                 )

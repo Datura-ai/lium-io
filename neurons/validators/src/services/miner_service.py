@@ -185,6 +185,7 @@ class MinerService:
         payload: MinerJobRequestPayload,
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
+        default_docker_image_digests: dict[str, str],
     ):
         """Request job to miner - uses REST API if configured, otherwise WebSocket."""
         if settings.USE_REST_API:
@@ -197,7 +198,9 @@ class MinerService:
                     }),
                 ),
             )
-            return await self._request_job_to_miner(payload, encrypted_files, rented_data)
+            return await self._request_job_to_miner(
+                payload, encrypted_files, rented_data, default_docker_image_digests
+            )
         else:
             logger.info(
                 _m(
@@ -303,6 +306,7 @@ class MinerService:
                                     public_key=public_key.decode("utf-8"),
                                     encrypted_files=encrypted_files,
                                     rented_data=rented_data,
+                                    default_docker_image_digests=default_docker_image_digests,
                                     attestation_nonce=attestation_nonce,
                                 ),
                                 timeout=settings.JOB_TIME_OUT - 120
@@ -1453,6 +1457,7 @@ class MinerService:
         payload: MinerJobRequestPayload,
         encrypted_files: MinerJobEnryptedFiles,
         rented_data: RentedExecutorsResponse,
+        default_docker_image_digests: dict[str, str],
     ):
         """REST API version of request_job_to_miner."""
         my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
@@ -1535,6 +1540,7 @@ class MinerService:
                                 public_key=public_key.decode("utf-8"),
                                 encrypted_files=encrypted_files,
                                 rented_data=rented_data,
+                                default_docker_image_digests=default_docker_image_digests,
                                 attestation_nonce=attestation_nonce,
                             ),
                             timeout=settings.JOB_TIME_OUT - 120

@@ -71,7 +71,7 @@ async def _run_set_weights_and_capture(mock_subtensor_client, miners, miner_scor
 
 
 async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_batch_id="2024-01-01 00:00:00"):
-    async def request_job_side_effect(payload, encrypted_files, rented_data):
+    async def request_job_side_effect(payload, encrypted_files, rented_data, default_docker_image_digests):
         hotkey = payload.miner_hotkey
         results = job_results_by_hotkey.get(hotkey, [])
         return {
