@@ -89,7 +89,32 @@ def test_shared_config_serializes_to_json() -> None:
     assert "machine_prices" in data
     assert "gpu_architectures" in data
     assert "require_storage_limit_supported" in data
+    assert "default_docker_image_refs" in data
     assert isinstance(data["gpu_architectures"]["NVIDIA B200"]["arch"], str)
+
+
+def test_default_docker_image_refs_default() -> None:
+    # packaged fallback: the two current default cache-template images
+    assert DEFAULT_SHARED_CONFIG.default_docker_image_refs == (
+        "daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind",
+        "daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind",
+    )
+
+
+def test_default_docker_image_refs_defaults_when_absent() -> None:
+    # backward-compatible: a payload from an older backend without the field
+    # falls back to the packaged default instead of failing validation
+    config = SharedConfig.model_validate(
+        {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "default_docker_image_refs"}
+    )
+    assert config.default_docker_image_refs == DEFAULT_SHARED_CONFIG.default_docker_image_refs
+
+
+def test_default_docker_image_refs_round_trips_through_json() -> None:
+    refs = ("daturaai/pytorch:cuda12.8-dind", "daturaai/pytorch:cuda13.0-dind")
+    config = DEFAULT_SHARED_CONFIG.model_copy(update={"default_docker_image_refs": refs})
+    restored = SharedConfig.model_validate_json(config.model_dump_json())
+    assert restored.default_docker_image_refs == refs
 
 
 # ==================== Utils tests (dict_diff) ====================

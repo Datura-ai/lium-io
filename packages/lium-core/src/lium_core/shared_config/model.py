@@ -1,5 +1,13 @@
 from pydantic import BaseModel, ConfigDict, Field
 
+# Default cache-template image refs (repo:tag). Used as the packaged fallback when a
+# shared-config payload omits the field (e.g. an older backend); in production the
+# backend's DOCKER_IMAGES list is the single source of truth (DAH-2380).
+DEFAULT_DOCKER_IMAGE_REFS: tuple[str, ...] = (
+    "daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind",
+    "daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind",
+)
+
 
 class SharedConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -26,3 +34,8 @@ class SharedConfig(BaseModel):
     max_initial_port_count: int
     total_burn_emission: float
     require_storage_limit_supported: bool = False
+
+    # Lists
+    # default cache-template images (repo:tag) whose Docker Hub digests the validator
+    # pre-fetches; authoritative list is served from the backend DOCKER_IMAGES (DAH-2380)
+    default_docker_image_refs: tuple[str, ...] = DEFAULT_DOCKER_IMAGE_REFS
