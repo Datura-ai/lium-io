@@ -38,8 +38,8 @@ class CachedTemplateVerificationCheck:
     when the image is already present. This check resolves the recommended image from the
     backend (the same ``/executors/default-docker-image`` endpoint the executor uses) and
     probes ``docker image inspect`` on the executor. The expected manifest digest comes from
-    the validator's Docker Hub digest cache (``DefaultDockerImageDigestService``), not the
-    backend response.
+    the per-cycle Docker Hub digest snapshot fetched at job-cycle start (``ctx.config``),
+    not the backend response.
 
     Two-phase by ``settings.CACHED_TEMPLATE_CUTOFF``:
       * Before the cutoff — advisory only: emits a structured event and publishes
@@ -104,7 +104,7 @@ class CachedTemplateVerificationCheck:
         image_ref = images[0].image_ref
         docker_image = images[0].docker_image
         # Bare manifest digest the validator fetched from Docker Hub for this image, if any.
-        backend_digest = ctx.services.default_docker_image_digests.get_digest(image_ref)
+        backend_digest = ctx.config.default_docker_image_digests.get(image_ref)
 
         try:
             inspect = await ctx.ssh.run(

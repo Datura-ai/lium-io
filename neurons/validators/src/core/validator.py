@@ -11,7 +11,7 @@ from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
 from services.attestation_service import AttestationService
 from services.collateral_contract_service import CollateralContractService
-from services.default_docker_image_digest_service import get_default_docker_image_digest_service
+from services.default_docker_image_digest_service import fetch_default_image_digests
 from services.docker_service import DockerService
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
@@ -73,8 +73,6 @@ class Validator:
             base_url=settings.COMPUTE_REST_API_URL or "",
             keypair=keypair,
         )
-        self.default_docker_image_digest_service = get_default_docker_image_digest_service()
-
         port_tester = PortTester()
         runner = ContainerRunner()
         self.executor_connectivity_service = ExecutorConnectivityService(
@@ -97,7 +95,6 @@ class Validator:
             executor_connectivity_service=self.executor_connectivity_service,
             backend_client=self.backend_client,
             attestation_service=self.attestation_service,
-            default_docker_image_digest_service=self.default_docker_image_digest_service,
         )
         self.docker_service = DockerService(
             ssh_service=ssh_service,
@@ -217,15 +214,17 @@ class Validator:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
 
-                # DAH-2380: refresh default cache-template digests from Docker Hub at the
+                # DAH-2380: fetch default cache-template digests from Docker Hub at the
                 # start of each job cycle, so verification compares executors against the
-                # current tags. Fail-open — a Docker Hub hiccup must never block the cycle.
+                # current tags. Fail-open — a Docker Hub hiccup must never block the cycle;
+                # an empty snapshot makes the digest check skip (never penalizes a miner).
                 try:
-                    await self.default_docker_image_digest_service.refresh()
+                    default_image_digests = await fetch_default_image_digests()
                 except Exception as exc:
+                    default_image_digests = {}
                     logger.error(
                         _m(
-                            "[sync] default docker image digest refresh failed; using last cache",
+                            "[sync] default docker image digest fetch failed; digest checks skip this cycle",
                             extra=get_extra_info({**self.default_extra, "error": str(exc)}),
                         ),
                     )
@@ -274,6 +273,7 @@ class Validator:
                             ),
                             encrypted_files=encrypted_files,
                             rented_data=rented_executors,
+                            default_docker_image_digests=default_image_digests,
                         )
                     )
                     for miner in miners

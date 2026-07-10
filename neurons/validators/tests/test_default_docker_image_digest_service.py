@@ -1,19 +1,15 @@
-"""Tests for DefaultDockerImageDigestService (DAH-2380)."""
+"""Tests for the default docker image digest snapshot (DAH-2380)."""
 
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from neurons.validators.src.services.default_docker_image_digest_service import (
-    DefaultDockerImageDigestService,
-    _bare_digest,
+    fetch_default_image_digests,
     fetch_registry_digest,
 )
 
-
-def test_bare_digest_strips_repo_prefix():
-    assert _bare_digest("daturaai/pytorch@sha256:abc") == "sha256:abc"
-    assert _bare_digest("sha256:abc") == "sha256:abc"
+_MODULE = "neurons.validators.src.services.default_docker_image_digest_service"
 
 
 @pytest.mark.asyncio
@@ -42,68 +38,45 @@ async def test_fetch_registry_digest_returns_bare_digest():
 
 
 @pytest.mark.asyncio
-async def test_refresh_populates_digest_map():
-    service = DefaultDockerImageDigestService(image_refs=("daturaai/pytorch:test",))
-
-    with patch(
-        "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
-        new=AsyncMock(return_value="sha256:abc"),
-    ):
-        await service.refresh()
-
-    assert service.get_digest("daturaai/pytorch:test") == "sha256:abc"
-
-
-@pytest.mark.asyncio
-async def test_refresh_drops_ref_when_fetch_fails():
-    """A ref that fails to refresh is cleared, not left stale (fail open).
-
-    Regression for the DIGEST_MISMATCH false-positive: a stale digest kept after
-    a failed fetch would mismatch a re-pushed tag and zero an honest miner.
-    """
-    service = DefaultDockerImageDigestService(image_refs=("daturaai/pytorch:test",))
-
-    with patch(
-        "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
-        new=AsyncMock(return_value="sha256:abc"),
-    ):
-        await service.refresh()
-    assert service.get_digest("daturaai/pytorch:test") == "sha256:abc"
-
-    with patch(
-        "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
-        new=AsyncMock(return_value=None),
-    ):
-        await service.refresh()
-    assert service.get_digest("daturaai/pytorch:test") is None
-
-
-@pytest.mark.asyncio
-async def test_refresh_reads_image_refs_from_shared_config_when_none_provided():
-    """With no static image_refs, the service pulls the list from shared config.
-
-    This is the DAH-2380 single-source-of-truth path: the backend serves the
-    default template refs via /v1/shared-config, so no hardcoded copy lives here.
-    """
-    service = DefaultDockerImageDigestService()  # image_refs=None
-
+async def test_fetch_default_image_digests_builds_snapshot():
     with (
-        patch(
-            "neurons.validators.src.services.default_docker_image_digest_service"
-            "._shared_config_image_refs",
-            return_value=("daturaai/pytorch:shared",),
-        ),
-        patch(
-            "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
-            new=AsyncMock(return_value="sha256:shared"),
-        ),
+        patch(f"{_MODULE}._shared_config_image_refs", return_value=("daturaai/pytorch:test",)),
+        patch(f"{_MODULE}.fetch_registry_digest", new=AsyncMock(return_value="sha256:abc")),
     ):
-        await service.refresh()
+        digests = await fetch_default_image_digests()
 
-    assert service.get_digest("daturaai/pytorch:shared") == "sha256:shared"
+    assert digests == {"daturaai/pytorch:test": "sha256:abc"}
 
 
 @pytest.mark.asyncio
-async def test_get_digest_returns_none_for_unknown_image():
-    service = DefaultDockerImageDigestService(image_refs=())
-    assert service.get_digest("daturaai/pytorch:missing") is None
+async def test_fetch_default_image_digests_drops_ref_when_fetch_fails():
+    """A ref that fails to fetch is absent from the snapshot, not stale (fail open).
+
+    Regression for the DIGEST_MISMATCH false-positive: a stale digest kept after a
+    failed fetch would mismatch a re-pushed tag and zero an honest miner's score.
+    """
+    with (
+        patch(f"{_MODULE}._shared_config_image_refs", return_value=("daturaai/pytorch:test",)),
+        patch(f"{_MODULE}.fetch_registry_digest", new=AsyncMock(return_value=None)),
+    ):
+        digests = await fetch_default_image_digests()
+
+    assert digests == {}
+    # An absent ref makes the verification check find no digest to compare (skip).
+    assert digests.get("daturaai/pytorch:test") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_default_image_digests_reads_refs_from_shared_config():
+    """The ref list is the backend single-source-of-truth via shared config.
+
+    No hardcoded copy lives in the validator: whatever ``_shared_config_image_refs``
+    returns is exactly what gets fetched and keyed in the snapshot.
+    """
+    with (
+        patch(f"{_MODULE}._shared_config_image_refs", return_value=("daturaai/pytorch:shared",)),
+        patch(f"{_MODULE}.fetch_registry_digest", new=AsyncMock(return_value="sha256:shared")),
+    ):
+        digests = await fetch_default_image_digests()
+
+    assert digests == {"daturaai/pytorch:shared": "sha256:shared"}

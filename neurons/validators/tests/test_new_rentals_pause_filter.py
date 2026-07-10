@@ -259,6 +259,7 @@ async def test_websocket_request_job_validates_paused_unrented_executors(monkeyp
             _payload(),
             MagicMock(),
             rented_data,
+            {},
         )
 
     assert [job.executor_info.uuid for job in result["results"]] == ["paused-executor", "available-executor"]
@@ -299,6 +300,7 @@ async def test_rest_request_job_validates_paused_unrented_executors(monkeypatch)
         _payload(),
         MagicMock(),
         rented_data,
+        {},
     )
 
     assert [job.executor_info.uuid for job in result["results"]] == ["paused-executor", "available-executor"]

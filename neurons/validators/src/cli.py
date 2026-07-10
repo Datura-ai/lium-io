@@ -10,6 +10,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from core.utils import configure_logs_of_other_modules, _m, get_extra_info, get_logger
 from core.validator import Validator
 from clients.subtensor_client import SubtensorClient
+from services.default_docker_image_digest_service import fetch_default_image_digests
 from services.ioc import ioc
 from services.miner_service import MinerService
 from services.docker_service import DockerService
@@ -147,6 +148,7 @@ async def _request_job_to_miner(miner_hotkey: str):
             ),
             encrypted_files=encrypted_files,
             rented_data=RentedExecutorsResponse(executors={}),
+            default_docker_image_digests=await fetch_default_image_digests(),
         )
         print('job_result:', result)
     finally:
