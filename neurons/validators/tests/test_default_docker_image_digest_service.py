@@ -43,10 +43,7 @@ async def test_fetch_registry_digest_returns_bare_digest():
 
 @pytest.mark.asyncio
 async def test_refresh_populates_digest_map():
-    service = DefaultDockerImageDigestService(
-        image_refs=("daturaai/pytorch:test",),
-        refresh_seconds=60,
-    )
+    service = DefaultDockerImageDigestService(image_refs=("daturaai/pytorch:test",))
 
     with patch(
         "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
@@ -64,10 +61,7 @@ async def test_refresh_drops_ref_when_fetch_fails():
     Regression for the DIGEST_MISMATCH false-positive: a stale digest kept after
     a failed fetch would mismatch a re-pushed tag and zero an honest miner.
     """
-    service = DefaultDockerImageDigestService(
-        image_refs=("daturaai/pytorch:test",),
-        refresh_seconds=60,
-    )
+    service = DefaultDockerImageDigestService(image_refs=("daturaai/pytorch:test",))
 
     with patch(
         "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
@@ -91,7 +85,7 @@ async def test_refresh_reads_image_refs_from_shared_config_when_none_provided():
     This is the DAH-2380 single-source-of-truth path: the backend serves the
     default template refs via /v1/shared-config, so no hardcoded copy lives here.
     """
-    service = DefaultDockerImageDigestService(refresh_seconds=60)  # image_refs=None
+    service = DefaultDockerImageDigestService()  # image_refs=None
 
     with (
         patch(
@@ -111,5 +105,5 @@ async def test_refresh_reads_image_refs_from_shared_config_when_none_provided():
 
 @pytest.mark.asyncio
 async def test_get_digest_returns_none_for_unknown_image():
-    service = DefaultDockerImageDigestService(image_refs=(), refresh_seconds=60)
+    service = DefaultDockerImageDigestService(image_refs=())
     assert service.get_digest("daturaai/pytorch:missing") is None

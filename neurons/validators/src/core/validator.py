@@ -74,10 +74,6 @@ class Validator:
             keypair=keypair,
         )
         self.default_docker_image_digest_service = get_default_docker_image_digest_service()
-        # Retain the task ref so the background refresh loop isn't garbage-collected mid-run.
-        self._digest_refresh_task = asyncio.create_task(
-            self.default_docker_image_digest_service.run_refresh_loop()
-        )
 
         port_tester = PortTester()
         runner = ContainerRunner()
@@ -220,6 +216,19 @@ class Validator:
             if current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB:
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
+
+                # DAH-2380: refresh default cache-template digests from Docker Hub at the
+                # start of each job cycle, so verification compares executors against the
+                # current tags. Fail-open — a Docker Hub hiccup must never block the cycle.
+                try:
+                    await self.default_docker_image_digest_service.refresh()
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            "[sync] default docker image digest refresh failed; using last cache",
+                            extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                        ),
+                    )
 
                 # Fetch all rented executors from backend API
                 rented_executors = await self.backend_client.get_all_rented_executors()

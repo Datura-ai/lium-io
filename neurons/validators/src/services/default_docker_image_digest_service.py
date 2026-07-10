@@ -16,8 +16,6 @@ from functools import lru_cache
 
 import aiohttp
 
-from core.config import settings
-
 logger = logging.getLogger(__name__)
 
 _MANIFEST_ACCEPT = (
@@ -81,20 +79,11 @@ async def fetch_registry_digest(session: aiohttp.ClientSession, image_ref: str) 
 class DefaultDockerImageDigestService:
     """In-memory image_ref → bare sha256 digest map, refreshed from Docker Hub."""
 
-    def __init__(
-        self,
-        image_refs: tuple[str, ...] | None = None,
-        refresh_seconds: int | None = None,
-    ) -> None:
+    def __init__(self, image_refs: tuple[str, ...] | None = None) -> None:
         # None → resolve the current list from shared config on each refresh, so a new
-        # backend template is picked up without a validator restart. An explicit tuple
-        # pins the list (used by tests).
+        # backend template is picked up automatically. An explicit tuple pins the list
+        # (used by tests).
         self._image_refs = image_refs
-        self._refresh_seconds = (
-            refresh_seconds
-            if refresh_seconds is not None
-            else settings.DEFAULT_DOCKER_IMAGE_DIGEST_REFRESH_SECONDS
-        )
         self._digests: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
@@ -141,17 +130,6 @@ class DefaultDockerImageDigestService:
                 "Refreshed %d default docker image digest(s) from Docker Hub",
                 len(updated),
             )
-
-    async def run_refresh_loop(self) -> None:
-        """Background loop: refresh on boot, then every ``refresh_seconds``."""
-        while True:
-            try:
-                await self.refresh()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error("Unexpected error refreshing default image digests: %s", exc)
-            await asyncio.sleep(self._refresh_seconds)
 
 
 @lru_cache
