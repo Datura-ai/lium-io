@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import ipaddress
 import logging
 import math
@@ -164,6 +165,64 @@ def _missing_rental_docker_host_key_log_text(
         "Missing executor SSH host key for rental Docker SDK operation",
         extra=get_extra_info({**default_extra, **HOST_KEY_REQUIRED_EXTRA, "error": str(exc)}),
     )
+
+
+class _BoundLog:
+    # structured logger bound to a default_extra, so a call site stays one line
+    def __init__(self, base_extra: dict):
+        self.base_extra = base_extra
+
+    def _message(self, message: str, **fields):
+        return _m(message, extra=get_extra_info({**self.base_extra, **fields}))
+
+    def info(self, message: str, **fields) -> None:
+        logger.info(self._message(message, **fields))
+
+    def warning(self, message: str, **fields) -> None:
+        logger.warning(self._message(message, **fields))
+
+    def error(self, message: str, *, exc_info: bool = False, **fields) -> None:
+        logger.error(self._message(message, **fields), exc_info=exc_info)
+
+
+def _delete_container_log_extra(
+    payload: ContainerDeleteRequest,
+    executor_info: ExecutorSSHInfo,
+) -> dict:
+    return {
+        "miner_hotkey": payload.miner_hotkey,
+        "executor_uuid": payload.executor_id,
+        "pod_id": payload.pod_id,
+        "workload_kind": payload.workload_kind.value,
+        "executor_ip_address": executor_info.address,
+        "executor_port": executor_info.port,
+        "executor_ssh_username": executor_info.ssh_username,
+        "executor_ssh_port": executor_info.ssh_port,
+    }
+
+
+def _validate_delete_volume_names(payload: ContainerDeleteRequest) -> None:
+    # raise ValueError on an unsafe volume name; the quoted result is unused, these names
+    # reach the Docker SDK rather than a shell
+    if payload.local_volume:
+        _quote_safe_docker_volume_name(payload.local_volume, field_name="local_volume")
+    if payload.external_volume:
+        _quote_safe_docker_volume_name(payload.external_volume, field_name="external_volume")
+
+
+@contextlib.contextmanager
+def _best_effort(log: _BoundLog, step: str, **fields):
+    # swallow a post-removal teardown failure: the container is already gone, so failing the
+    # request here would make the backend retry a doomed undeploy and penalize the miner
+    try:
+        yield
+    except Exception as exc:
+        log.error(
+            "delete_container post-teardown step failed (non-fatal)",
+            step=step,
+            error=str(exc),
+            **fields,
+        )
 
 
 # DAH-2183: fresh vloopback sizing — compute effective volume/storage limits
@@ -3861,6 +3920,94 @@ class DockerService:
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
 
+    def _container_deleted(self, payload: ContainerDeleteRequest) -> ContainerDeleted:
+        return ContainerDeleted(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+        )
+
+    def _failed_delete(self, payload: ContainerDeleteRequest, msg: str) -> FailedContainerRequest:
+        return FailedContainerRequest(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            msg=msg,
+            error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+            error_code=FailedContainerErrorCodes.UnknownError,
+        )
+
+    async def _stop_container_gracefully(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> None:
+        # DAH-2364: SIGTERM plus a grace window, so the workload exits cleanly before the forced
+        # removal. Never fatal — the forced removal stays the single source of truth for deletion.
+        # Called directly rather than through run_logged_rental_docker_sdk_operation so that an
+        # expected failure — chiefly an already-absent container — is not logged at ERROR and does
+        # not raise a false failed-deletion alert.
+        stop_started = time.monotonic()
+        try:
+            await docker_client.stop(
+                container_name=payload.container_name,
+                timeout=CONTAINER_STOP_GRACE_SECONDS,
+            )
+        except Exception as exc:
+            if _is_missing_docker_container_error(exc):
+                log.info(
+                    "Graceful stop skipped: container is already absent",
+                    container_name=payload.container_name,
+                )
+            else:
+                log.warning(
+                    "Graceful container stop failed; proceeding to forced removal",
+                    container_name=payload.container_name,
+                    error=str(exc),
+                )
+            return
+
+        log.info(
+            "Graceful container stop completed",
+            container_name=payload.container_name,
+            stop_grace_seconds=CONTAINER_STOP_GRACE_SECONDS,
+            duration_ms=int((time.monotonic() - stop_started) * 1000),
+        )
+
+    async def _force_remove_container(
+        self,
+        docker_client: RentalDockerSdkClient,
+        payload: ContainerDeleteRequest,
+        log: _BoundLog,
+    ) -> None:
+        # DAH-2345: deletion is idempotent for every workload kind — a container that is already
+        # gone (e.g. removed by failed-create cleanup) must not fail the delete, or the backend
+        # retries a doomed request until force-removal and penalizes the miner.
+        try:
+            await run_logged_rental_docker_sdk_operation(
+                operation="remove_container",
+                log_extra=log.base_extra,
+                call=lambda: docker_client.remove_container(
+                    container_name=payload.container_name,
+                    force=True,
+                    remove_volumes=True,
+                ),
+                container_name=payload.container_name,
+                force=True,
+                remove_volumes=True,
+            )
+        except Exception as exc:
+            if not _is_missing_docker_container_error(exc):
+                raise
+            log.info(
+                "Container is already absent",
+                container_name=payload.container_name,
+                error=str(exc),
+            )
+
     async def delete_container(
         self,
         payload: ContainerDeleteRequest,
@@ -3868,55 +4015,20 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
-        default_extra = {
-            "miner_hotkey": payload.miner_hotkey,
-            "executor_uuid": payload.executor_id,
-            "pod_id": payload.pod_id,
-            "workload_kind": payload.workload_kind.value,
-            "executor_ip_address": executor_info.address,
-            "executor_port": executor_info.port,
-            "executor_ssh_username": executor_info.ssh_username,
-            "executor_ssh_port": executor_info.ssh_port,
-        }
+        default_extra = _delete_container_log_extra(payload, executor_info)
+        log = _BoundLog(default_extra)
 
-        logger.info(
-            _m(
-                "Deleting Docker Container",
-                extra=get_extra_info({**default_extra, "payload": str(payload)}),
-            ),
-        )
+        log.info("Deleting Docker Container", payload=str(payload))
 
         try:
-            if payload.local_volume:
-                _quote_safe_docker_volume_name(
-                    payload.local_volume,
-                    field_name="local_volume",
-                )
-            if payload.external_volume:
-                _quote_safe_docker_volume_name(
-                    payload.external_volume,
-                    field_name="external_volume",
-                )
+            _validate_delete_volume_names(payload)
         except ValueError as exc:
-            log_text = _m(
-                "Invalid Docker volume name",
-                extra=get_extra_info({**default_extra, "error": str(exc)}),
-            )
-            logger.error(log_text)
-            return FailedContainerRequest(
-                miner_hotkey=payload.miner_hotkey,
-                executor_id=payload.executor_id,
-                pod_id=payload.pod_id,
-                workload_kind=payload.workload_kind,
-                msg=str(log_text),
-                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-                error_code=FailedContainerErrorCodes.UnknownError,
-            )
+            log.error("Invalid Docker volume name", error=str(exc))
+            return self._failed_delete(payload, msg="Invalid Docker volume name")
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
         pkey = asyncssh.import_private_key(private_key)
 
-        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
             known_hosts_policy = await self._prepare_known_hosts_policy(
                 executor_info,
@@ -3924,35 +4036,15 @@ class DockerService:
                 default_extra,
             )
         except AttestationError as exc:
-            log_text = _m(
-                "Attestation failed",
-                extra=get_extra_info({**default_extra, "error": str(exc)}),
-            )
-            logger.error(log_text)
-            return FailedContainerRequest(
-                miner_hotkey=payload.miner_hotkey,
-                executor_id=payload.executor_id,
-                pod_id=payload.pod_id,
-                workload_kind=payload.workload_kind,
-                msg=str(log_text),
-                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-                error_code=FailedContainerErrorCodes.UnknownError,
-            )
+            log.error("Attestation failed", error=str(exc))
+            return self._failed_delete(payload, msg="Attestation failed")
 
         try:
             require_rental_docker_ssh_host_key(executor_info)
         except RentalDockerConnectionError as exc:
             log_text = _missing_rental_docker_host_key_log_text(default_extra, exc)
             logger.error(log_text)
-            return FailedContainerRequest(
-                miner_hotkey=payload.miner_hotkey,
-                executor_id=payload.executor_id,
-                pod_id=payload.pod_id,
-                workload_kind=payload.workload_kind,
-                msg=str(log_text),
-                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-                error_code=FailedContainerErrorCodes.UnknownError,
-            )
+            return self._failed_delete(payload, msg=str(log_text))
 
         try:
             async with (
@@ -3968,96 +4060,11 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
-                # DAH-2364: graceful stop first (SIGTERM + grace window) so the workload
-                # can exit cleanly before the forced removal below. Applies to customer
-                # rentals and fillers alike. Any stop failure is swallowed — the forced
-                # removal stays the single source of truth for deletion success. The stop
-                # is called directly (not via run_logged_rental_docker_sdk_operation) so an
-                # expected failure — chiefly an already-absent container — is not logged at
-                # ERROR and does not raise a false failed-deletion alert (DAH-2364).
-                stop_started = time.monotonic()
-                try:
-                    await docker_client.stop(
-                        container_name=payload.container_name,
-                        timeout=CONTAINER_STOP_GRACE_SECONDS,
-                    )
-                    logger.info(
-                        _m(
-                            "Graceful container stop completed",
-                            extra=get_extra_info(
-                                {
-                                    **default_extra,
-                                    "container_name": payload.container_name,
-                                    "stop_grace_seconds": CONTAINER_STOP_GRACE_SECONDS,
-                                    "duration_ms": int((time.monotonic() - stop_started) * 1000),
-                                }
-                            ),
-                        ),
-                    )
-                except Exception as exc:
-                    if _is_missing_docker_container_error(exc):
-                        logger.info(
-                            _m(
-                                "Graceful stop skipped: container is already absent",
-                                extra=get_extra_info(
-                                    {
-                                        **default_extra,
-                                        "container_name": payload.container_name,
-                                    }
-                                ),
-                            ),
-                        )
-                    else:
-                        logger.warning(
-                            _m(
-                                "Graceful container stop failed; proceeding to forced removal",
-                                extra=get_extra_info(
-                                    {
-                                        **default_extra,
-                                        "container_name": payload.container_name,
-                                        "error": str(exc),
-                                    }
-                                ),
-                            ),
-                        )
+                await self._stop_container_gracefully(docker_client, payload, log)
 
-                try:
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="remove_container",
-                        log_extra=default_extra,
-                        call=lambda: docker_client.remove_container(
-                            container_name=payload.container_name,
-                            force=True,
-                            remove_volumes=True,
-                        ),
-                        container_name=payload.container_name,
-                        force=True,
-                        remove_volumes=True,
-                    )
-                except Exception as exc:
-                    # DAH-2345: deletion is idempotent for every workload kind — a container
-                    # that is already gone (e.g. removed by failed-create cleanup) must not
-                    # fail the delete, or the backend retries a doomed request until
-                    # force-removal and penalizes the miner.
-                    if not _is_missing_docker_container_error(exc):
-                        raise
-                    logger.info(
-                        _m(
-                            "Container is already absent",
-                            extra=get_extra_info(
-                                {
-                                    **default_extra,
-                                    "container_name": payload.container_name,
-                                    "error": str(exc),
-                                }
-                            ),
-                        ),
-                    )
-
-                # DAH-2345: the container is gone once remove_container succeeds; a failure
-                # in any post-container teardown step below must not fail the undeploy, or the
-                # backend retries a doomed request and penalizes the miner for a pod that is
-                # already removed. Each step is guarded individually and only logged on error.
+                # Fatal boundary: the forced removal is the only step whose failure fails the
+                # undeploy. Every step below runs after the container is gone and is best-effort.
+                await self._force_remove_container(docker_client, payload, log)
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
@@ -4071,28 +4078,20 @@ class DockerService:
                 # DAH-2356: restore the pre-cap GPU power limits after a Lium PEARL filler is
                 # removed, so the next rental gets the machine at its original power.
                 if payload.workload_kind == WorkloadKind.FILLER:
-                    await restore_filler_pod_gpu_power_limits(
-                        ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
-                    )
+                    with _best_effort(log, "restore_filler_gpu_power"):
+                        await restore_filler_pod_gpu_power_limits(
+                            ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
+                        )
 
-                try:
+                with _best_effort(log, "prune_images"):
                     await run_logged_rental_docker_sdk_operation(
                         operation="prune_images",
                         log_extra=default_extra,
                         call=docker_client.prune_images,
                     )
-                except Exception as exc:
-                    logger.error(
-                        _m(
-                            "delete_container post-teardown step failed (non-fatal)",
-                            extra=get_extra_info(
-                                {**default_extra, "step": "prune_images", "error": str(exc)}
-                            ),
-                        ),
-                    )
 
                 if payload.local_volume:
-                    try:
+                    with _best_effort(log, "remove_volume_local", volume_name=payload.local_volume):
                         await run_logged_rental_docker_sdk_operation(
                             operation="remove_volume",
                             log_extra=default_extra,
@@ -4102,23 +4101,11 @@ class DockerService:
                             volume_name=payload.local_volume,
                             volume_role="local",
                         )
-                    except Exception as exc:
-                        logger.error(
-                            _m(
-                                "delete_container post-teardown step failed (non-fatal)",
-                                extra=get_extra_info(
-                                    {
-                                        **default_extra,
-                                        "step": "remove_volume_local",
-                                        "volume_name": payload.local_volume,
-                                        "error": str(exc),
-                                    }
-                                ),
-                            ),
-                        )
 
                 if payload.external_volume:
-                    try:
+                    with _best_effort(
+                        log, "remove_volume_external", volume_name=payload.external_volume
+                    ):
                         await run_logged_rental_docker_sdk_operation(
                             operation="remove_volume",
                             log_extra=default_extra,
@@ -4129,49 +4116,20 @@ class DockerService:
                             volume_role="external",
                         )
                         await self.disable_s3fs_volume_plugin(ssh_client)
-                    except Exception as exc:
-                        logger.error(
-                            _m(
-                                "delete_container post-teardown step failed (non-fatal)",
-                                extra=get_extra_info(
-                                    {
-                                        **default_extra,
-                                        "step": "remove_volume_external",
-                                        "volume_name": payload.external_volume,
-                                        "error": str(exc),
-                                    }
-                                ),
-                            ),
-                        )
 
-                logger.info(
-                    _m(
-                        "Remove rented machine from redis",
-                        extra=get_extra_info(
-                            {
-                                **default_extra,
-                                "container_name": payload.container_name,
-                                "local_volume": payload.local_volume,
-                                "external_volume": payload.external_volume,
-                            }
-                        ),
-                    ),
+                log.info(
+                    "Remove rented machine from redis",
+                    container_name=payload.container_name,
+                    local_volume=payload.local_volume,
+                    external_volume=payload.external_volume,
                 )
-
-                try:
-                    await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
-                except Exception as exc:
-                    logger.error(
-                        _m(
-                            "delete_container post-teardown step failed (non-fatal)",
-                            extra=get_extra_info(
-                                {**default_extra, "step": "remove_rented_machine", "error": str(exc)}
-                            ),
-                        ),
+                with _best_effort(log, "remove_rented_machine"):
+                    await self.redis_service.remove_rented_machine(
+                        executor_info, payload.container_name
                     )
 
                 # Stop inspector only after the last customer pod leaves this executor.
-                try:
+                with _best_effort(log, "inspector_stop"):
                     if (
                         settings.ENABLE_INSPECTOR
                         and payload.workload_kind != WorkloadKind.FILLER
@@ -4186,48 +4144,17 @@ class DockerService:
                                 "container_name": payload.container_name,
                             },
                         )
-                except Exception as exc:
-                    logger.error(
-                        _m(
-                            "delete_container post-teardown step failed (non-fatal)",
-                            extra=get_extra_info(
-                                {**default_extra, "step": "inspector_stop", "error": str(exc)}
-                            ),
-                        ),
-                    )
 
                 # Port release now handled by backend
 
-                logger.info(
-                    _m(
-                        "Deleted Docker Container",
-                        extra=get_extra_info({**default_extra, "payload": str(payload)}),
-                    ),
-                )
+                log.info("Deleted Docker Container", payload=str(payload))
 
-                return ContainerDeleted(
-                    miner_hotkey=payload.miner_hotkey,
-                    executor_id=payload.executor_id,
-                    pod_id=payload.pod_id,
-                    workload_kind=payload.workload_kind,
-                )
+                return self._container_deleted(payload)
         except Exception as e:
-            log_text = _m(
-                "Unknown Error delete_container",
-                extra=get_extra_info({**default_extra, "error": str(e)}),
-            )
-            logger.error(log_text, exc_info=True)
+            log.error("Unknown Error delete_container", error=str(e), exc_info=True)
 
-            return FailedContainerRequest(
-                miner_hotkey=payload.miner_hotkey,
-                executor_id=payload.executor_id,
-                pod_id=payload.pod_id,
-                workload_kind=payload.workload_kind,
-                # str(log_text) drops extra, hiding the cause from the backend
-                msg=f"Unknown Error delete_container: {e}",
-                error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-                error_code=FailedContainerErrorCodes.UnknownError,
-            )
+            # str(log_text) drops extra, hiding the cause from the backend
+            return self._failed_delete(payload, msg=f"Unknown Error delete_container: {e}")
 
     async def install_jupyter_server(
         self,
