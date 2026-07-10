@@ -8,6 +8,7 @@ import re
 import secrets
 import shlex
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -94,7 +95,7 @@ from services.ssh_connect_timing import connect_with_phase_timing
 from tenacity import RetryError
 
 from core.config import settings
-from core.utils import _m, get_extra_info, retry_ssh_command
+from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -169,28 +170,28 @@ def _missing_rental_docker_host_key_log_text(
 
 class _BoundLog:
     # structured logger bound to a default_extra, so a call site stays one line
-    def __init__(self, base_extra: dict):
+    def __init__(self, base_extra: dict[str, Any]):
         self.base_extra = base_extra
 
-    def _message(self, message: str, **fields):
+    def _message(self, message: str, **fields: Any) -> _StructuredMessage:
         return _m(message, extra=get_extra_info({**self.base_extra, **fields}))
 
     # stacklevel=2 keeps the logged file/function/line pointing at the call site
     # rather than at this wrapper
-    def info(self, message: str, **fields) -> None:
+    def info(self, message: str, **fields: Any) -> None:
         logger.info(self._message(message, **fields), stacklevel=2)
 
-    def warning(self, message: str, **fields) -> None:
+    def warning(self, message: str, **fields: Any) -> None:
         logger.warning(self._message(message, **fields), stacklevel=2)
 
-    def error(self, message: str, *, exc_info: bool = False, **fields) -> None:
+    def error(self, message: str, *, exc_info: bool = False, **fields: Any) -> None:
         logger.error(self._message(message, **fields), exc_info=exc_info, stacklevel=2)
 
 
 def _delete_container_log_extra(
     payload: ContainerDeleteRequest,
     executor_info: ExecutorSSHInfo,
-) -> dict:
+) -> dict[str, Any]:
     return {
         "miner_hotkey": payload.miner_hotkey,
         "executor_uuid": payload.executor_id,
@@ -213,7 +214,7 @@ def _validate_delete_volume_names(payload: ContainerDeleteRequest) -> None:
 
 
 @contextlib.contextmanager
-def _best_effort(log: _BoundLog, step: str, **fields):
+def _best_effort_delete_step(log: _BoundLog, step: str, **fields: Any) -> Iterator[None]:
     # swallow a post-removal teardown failure: the container is already gone, so failing the
     # request here would make the backend retry a doomed undeploy and penalize the miner
     try:
@@ -3952,11 +3953,19 @@ class DockerService:
         # Called directly rather than through run_logged_rental_docker_sdk_operation so that an
         # expected failure — chiefly an already-absent container — is not logged at ERROR and does
         # not raise a false failed-deletion alert.
+        if payload.workload_kind == WorkloadKind.FILLER:
+            # The backend preempts a filler before a customer rent with a 30s total budget
+            # (FILLER_STOP_WAIT_TIMEOUT_SECONDS) and starts the rent anyway on timeout. A grace
+            # window equal to that budget lets a SIGTERM-ignoring filler burn all of it inside
+            # docker stop, so the customer pod would land on GPUs the filler still holds.
+            # Fillers keep the pre-DAH-2364 SIGKILL-only removal.
+            return
+
         stop_started = time.monotonic()
         try:
             await docker_client.stop(
                 container_name=payload.container_name,
-                timeout=CONTAINER_STOP_GRACE_SECONDS,
+                stop_grace_seconds=CONTAINER_STOP_GRACE_SECONDS,
             )
         except Exception as exc:
             if _is_missing_docker_container_error(exc):
@@ -4080,12 +4089,12 @@ class DockerService:
                 # DAH-2356: restore the pre-cap GPU power limits after a Lium PEARL filler is
                 # removed, so the next rental gets the machine at its original power.
                 if payload.workload_kind == WorkloadKind.FILLER:
-                    with _best_effort(log, "restore_filler_gpu_power"):
+                    with _best_effort_delete_step(log, "restore_filler_gpu_power"):
                         await restore_filler_pod_gpu_power_limits(
                             ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
                         )
 
-                with _best_effort(log, "prune_images"):
+                with _best_effort_delete_step(log, "prune_images"):
                     await run_logged_rental_docker_sdk_operation(
                         operation="prune_images",
                         log_extra=default_extra,
@@ -4093,7 +4102,9 @@ class DockerService:
                     )
 
                 if payload.local_volume:
-                    with _best_effort(log, "remove_volume_local", volume_name=payload.local_volume):
+                    with _best_effort_delete_step(
+                        log, "remove_volume_local", volume_name=payload.local_volume
+                    ):
                         await run_logged_rental_docker_sdk_operation(
                             operation="remove_volume",
                             log_extra=default_extra,
@@ -4105,7 +4116,7 @@ class DockerService:
                         )
 
                 if payload.external_volume:
-                    with _best_effort(
+                    with _best_effort_delete_step(
                         log, "remove_volume_external", volume_name=payload.external_volume
                     ):
                         await run_logged_rental_docker_sdk_operation(
@@ -4125,13 +4136,13 @@ class DockerService:
                     local_volume=payload.local_volume,
                     external_volume=payload.external_volume,
                 )
-                with _best_effort(log, "remove_rented_machine"):
+                with _best_effort_delete_step(log, "remove_rented_machine"):
                     await self.redis_service.remove_rented_machine(
                         executor_info, payload.container_name
                     )
 
                 # Stop inspector only after the last customer pod leaves this executor.
-                with _best_effort(log, "inspector_stop"):
+                with _best_effort_delete_step(log, "inspector_stop"):
                     if (
                         settings.ENABLE_INSPECTOR
                         and payload.workload_kind != WorkloadKind.FILLER
