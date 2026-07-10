@@ -89,32 +89,37 @@ def test_shared_config_serializes_to_json() -> None:
     assert "machine_prices" in data
     assert "gpu_architectures" in data
     assert "require_storage_limit_supported" in data
-    assert "default_docker_image_refs" in data
+    assert "default_docker_images" in data
     assert isinstance(data["gpu_architectures"]["NVIDIA B200"]["arch"], str)
 
 
-def test_default_docker_image_refs_default() -> None:
-    # packaged fallback: the two current default cache-template images
-    assert DEFAULT_SHARED_CONFIG.default_docker_image_refs == (
+def test_default_docker_images_default() -> None:
+    # packaged fallback: the two current default cache-template images, as full
+    # backend DOCKER_IMAGES entries (untyped dicts)
+    images = DEFAULT_SHARED_CONFIG.default_docker_images
+    assert [f"{img['image']}:{img['tag']}" for img in images] == [
         "daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind",
         "daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind",
-    )
+    ]
+    # full metadata rides along so future consumers can read it
+    assert all({"image", "tag", "cuda", "size"} <= img.keys() for img in images)
 
 
-def test_default_docker_image_refs_defaults_when_absent() -> None:
+def test_default_docker_images_defaults_when_absent() -> None:
     # backward-compatible: a payload from an older backend without the field
     # falls back to the packaged default instead of failing validation
     config = SharedConfig.model_validate(
-        {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "default_docker_image_refs"}
+        {k: v for k, v in DEFAULT_SHARED_CONFIG.model_dump().items() if k != "default_docker_images"}
     )
-    assert config.default_docker_image_refs == DEFAULT_SHARED_CONFIG.default_docker_image_refs
+    assert config.default_docker_images == DEFAULT_SHARED_CONFIG.default_docker_images
 
 
-def test_default_docker_image_refs_round_trips_through_json() -> None:
-    refs = ("daturaai/pytorch:cuda12.8-dind", "daturaai/pytorch:cuda13.0-dind")
-    config = DEFAULT_SHARED_CONFIG.model_copy(update={"default_docker_image_refs": refs})
+def test_default_docker_images_round_trips_through_json() -> None:
+    # unknown metadata keys must survive the trip untouched (untyped dicts by design)
+    images = ({"image": "daturaai/pytorch", "tag": "cuda12.8-dind", "new_key": 1},)
+    config = DEFAULT_SHARED_CONFIG.model_copy(update={"default_docker_images": images})
     restored = SharedConfig.model_validate_json(config.model_dump_json())
-    assert restored.default_docker_image_refs == refs
+    assert restored.default_docker_images == images
 
 
 # ==================== Utils tests (dict_diff) ====================
