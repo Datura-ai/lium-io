@@ -1,15 +1,53 @@
 """Tests for the default docker image digest snapshot (DAH-2380)."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-
 from neurons.validators.src.services.default_docker_image_digest_service import (
+    _shared_config_image_refs,
     fetch_default_image_digests,
     fetch_registry_digest,
 )
 
 _MODULE = "neurons.validators.src.services.default_docker_image_digest_service"
+
+
+def _shared_client_with(images) -> SimpleNamespace:
+    return SimpleNamespace(config=SimpleNamespace(default_docker_images=images))
+
+
+def test_shared_config_image_refs_derives_repo_tag_from_structured_entries():
+    """Refs are derived locally from the structured default_docker_images field.
+
+    The backend serves its DOCKER_IMAGES entries verbatim (full metadata); only
+    image/tag participate in the ref, extra keys are ignored.
+    """
+    images = (
+        {"image": "daturaai/pytorch", "tag": "cuda12.8-dind", "cuda": 12.8, "size": 123},
+        {"image": "daturaai/pytorch", "tag": "cuda13.0-dind", "cuda": 13.0, "size": 456},
+    )
+    with patch("core.config.shared_client", _shared_client_with(images)):
+        refs = _shared_config_image_refs()
+
+    assert refs == (
+        "daturaai/pytorch:cuda12.8-dind",
+        "daturaai/pytorch:cuda13.0-dind",
+    )
+
+
+def test_shared_config_image_refs_skips_malformed_entries():
+    """An entry missing image or tag is dropped (fail open), not a broken ref."""
+    images = (
+        {"image": "daturaai/pytorch", "tag": "cuda12.8-dind"},
+        {"image": "daturaai/pytorch"},  # no tag
+        {"tag": "orphan-tag"},  # no image
+        {},
+    )
+    with patch("core.config.shared_client", _shared_client_with(images)):
+        refs = _shared_config_image_refs()
+
+    assert refs == ("daturaai/pytorch:cuda12.8-dind",)
 
 
 @pytest.mark.asyncio
