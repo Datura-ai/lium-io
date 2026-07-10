@@ -175,14 +175,16 @@ class _BoundLog:
     def _message(self, message: str, **fields):
         return _m(message, extra=get_extra_info({**self.base_extra, **fields}))
 
+    # stacklevel=2 keeps the logged file/function/line pointing at the call site
+    # rather than at this wrapper
     def info(self, message: str, **fields) -> None:
-        logger.info(self._message(message, **fields))
+        logger.info(self._message(message, **fields), stacklevel=2)
 
     def warning(self, message: str, **fields) -> None:
-        logger.warning(self._message(message, **fields))
+        logger.warning(self._message(message, **fields), stacklevel=2)
 
     def error(self, message: str, *, exc_info: bool = False, **fields) -> None:
-        logger.error(self._message(message, **fields), exc_info=exc_info)
+        logger.error(self._message(message, **fields), exc_info=exc_info, stacklevel=2)
 
 
 def _delete_container_log_extra(
