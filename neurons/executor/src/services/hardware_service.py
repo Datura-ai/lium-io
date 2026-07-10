@@ -1,9 +1,27 @@
+import subprocess
+import threading
+
 import psutil
 import pynvml
 import docker
 from core.logger import get_logger
 
 logger = get_logger(__name__)
+
+DF_TIMEOUT_SECONDS = 5.0
+DOCKER_CLIENT_TIMEOUT_SECONDS = 5.0
+
+_docker_client = None
+_docker_client_lock = threading.Lock()
+
+
+def _get_docker_client():
+    # one shared client with a bounded API timeout, so a wedged docker daemon cannot hold a call forever
+    global _docker_client
+    with _docker_client_lock:
+        if _docker_client is None:
+            _docker_client = docker.from_env(timeout=DOCKER_CLIENT_TIMEOUT_SECONDS)
+        return _docker_client
 
 
 def _parse_df_output(df_output: str) -> dict:
@@ -44,14 +62,19 @@ def _parse_df_output(df_output: str) -> dict:
         return {"total": 0, "used": 0, "available": 0, "utilization": 0.0}
 
 
-def _get_filesystem_usage(container, mount_point: str) -> dict:
+def _get_filesystem_usage(container_name: str, mount_point: str) -> dict:
     """
     Get filesystem usage for a specific mount point inside the container.
-    
+
+    Runs `docker exec ... df -k` as a subprocess instead of docker-py exec_run:
+    df against a dead FUSE mount hangs in uninterruptible D-state forever, and a
+    docker-py call stuck on it can never be reclaimed, while a subprocess is
+    killed on timeout.
+
     Args:
-        container: Docker container object
+        container_name: Name of the Docker container
         mount_point: Mount point path (e.g., "/", "/root")
-    
+
     Returns:
         dict: {
             "total": int,  # Total size in KB
@@ -59,22 +82,36 @@ def _get_filesystem_usage(container, mount_point: str) -> dict:
             "available": int,  # Available size in KB
             "utilization": float  # Utilization percentage
             "mount_point": str    # Mount point path
+            "stale": bool         # Present and True when collection timed out
         }
     """
+    empty = {"total": 0, "used": 0, "available": 0, "utilization": 0.0, "mount_point": mount_point}
     try:
-        # Execute df -k inside the container to get metrics in KB
-        exec_result = container.exec_run(f"df -k {mount_point}", user="root")
-        if exec_result.exit_code != 0:
-            logger.warning(f"Failed to get filesystem usage for {mount_point}: {exec_result.output.decode()}")
-            return {"total": 0, "used": 0, "available": 0, "utilization": 0.0, "mount_point": mount_point}
-        
-        output = exec_result.output.decode('utf-8')
-        result = _parse_df_output(output)
-        result["mount_point"] = mount_point
-        return result
+        result = subprocess.run(
+            ["docker", "exec", "-u", "root", container_name, "df", "-k", mount_point],
+            capture_output=True,
+            timeout=DF_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"df -k {mount_point} in {container_name} timed out after {DF_TIMEOUT_SECONDS}s, "
+            "returning stale zeros"
+        )
+        return {**empty, "stale": True}
     except Exception as e:
         logger.warning(f"Error getting filesystem usage for {mount_point}: {e}")
-        return {"total": 0, "used": 0, "available": 0, "utilization": 0.0, "mount_point": mount_point}
+        return empty
+
+    if result.returncode != 0:
+        logger.warning(
+            f"Failed to get filesystem usage for {mount_point}: "
+            f"{result.stderr.decode('utf-8', errors='replace')}"
+        )
+        return empty
+
+    parsed = _parse_df_output(result.stdout.decode("utf-8"))
+    parsed["mount_point"] = mount_point
+    return parsed
 
 
 def get_system_metrics():
@@ -174,7 +211,7 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
     """
     try:
         # Get Docker client
-        client = docker.from_env()
+        client = _get_docker_client()
         container = client.containers.get(container_name)
 
         # Get container stats (non-streaming, single sample)
@@ -203,7 +240,7 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
             memory_utilization = round((memory_usage / memory_limit) * 100.0, 2)
 
         # Get actual filesystem usage from inside the container
-        storage_metrics = _get_filesystem_usage(container, "/")
+        storage_metrics = _get_filesystem_usage(container_name, "/")
         
         # Get volume metrics if there's a vloopback volume
         volume_metrics = None
@@ -213,7 +250,7 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
             if mount.get("Driver", "").startswith("vloopback"):
                 mount_point = mount.get("Destination", "")
                 if mount_point:
-                    volume_metrics = _get_filesystem_usage(container, mount_point)
+                    volume_metrics = _get_filesystem_usage(container_name, mount_point)
                     break
 
         # Get GPU metrics for specified UUIDs only

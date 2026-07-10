@@ -5,12 +5,14 @@ on:
     branches: [main, dev]
     paths:
       - 'neurons/validators/**'
+      - 'neurons/executor/**'
       - 'datura/**'
       - '.github/workflows/test.yml'
   push:
     branches: [main]
     paths:
       - 'neurons/validators/**'
+      - 'neurons/executor/**'
       - 'datura/**'
 
 permissions:
@@ -53,3 +55,33 @@ jobs:
           ENABLE_TDX_ATTESTATION: True
           TDX_VERIFIER_URL: http://localhost:8000/verify
         run: pdm run pytest tests/ -v --tb=short --strict-markers
+
+  executor:
+    name: Executor Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: neurons/executor
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.11'
+
+      - name: Install pdm
+        uses: pdm-project/setup-pdm@v4
+        with:
+          cache: true
+          cache-dependency-path: neurons/executor/pdm.lock
+
+      - name: Install dependencies
+        run: pdm install
+
+      - name: Run tests
+        run: mkdir -p tmp && pdm run pytest tests/ -v --tb=short
