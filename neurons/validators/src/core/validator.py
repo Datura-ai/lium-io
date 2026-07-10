@@ -74,7 +74,10 @@ class Validator:
             keypair=keypair,
         )
         self.default_docker_image_digest_service = get_default_docker_image_digest_service()
-        asyncio.create_task(self.default_docker_image_digest_service.run_refresh_loop())
+        # Retain the task ref so the background refresh loop isn't garbage-collected mid-run.
+        self._digest_refresh_task = asyncio.create_task(
+            self.default_docker_image_digest_service.run_refresh_loop()
+        )
 
         port_tester = PortTester()
         runner = ContainerRunner()
