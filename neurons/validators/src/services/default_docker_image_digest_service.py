@@ -87,7 +87,14 @@ class DefaultDockerImageDigestService:
         return self._digests.get(image_ref)
 
     async def refresh(self) -> None:
-        """Pull current digests for every configured default image ref."""
+        """Pull current digests for every configured default image ref.
+
+        Replaces the cache wholesale: a ref whose fetch fails this round is
+        *dropped* rather than left pointing at a stale digest. A missing digest
+        makes the verification check fail open (skip); a stale one would produce
+        a false ``DIGEST_MISMATCH`` against a re-pushed tag and zero an honest
+        miner's score (DAH-2380).
+        """
         updated: dict[str, str] = {}
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -97,15 +104,21 @@ class DefaultDockerImageDigestService:
                     updated[image_ref] = digest
 
         async with self._lock:
-            self._digests.update(updated)
+            self._digests = updated
 
+        failed = [ref for ref in self._image_refs if ref not in updated]
+        if failed:
+            logger.warning(
+                "Dropped %d default docker image digest(s) after a failed refresh "
+                "(check fails open for these): %s",
+                len(failed),
+                ", ".join(failed),
+            )
         if updated:
             logger.info(
                 "Refreshed %d default docker image digest(s) from Docker Hub",
                 len(updated),
             )
-        else:
-            logger.warning("Default docker image digest refresh returned no digests")
 
     async def run_refresh_loop(self) -> None:
         """Background loop: refresh on boot, then every ``refresh_seconds``."""

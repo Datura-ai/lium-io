@@ -58,6 +58,33 @@ async def test_refresh_populates_digest_map():
 
 
 @pytest.mark.asyncio
+async def test_refresh_drops_ref_when_fetch_fails():
+    """A ref that fails to refresh is cleared, not left stale (fail open).
+
+    Regression for the DIGEST_MISMATCH false-positive: a stale digest kept after
+    a failed fetch would mismatch a re-pushed tag and zero an honest miner.
+    """
+    service = DefaultDockerImageDigestService(
+        image_refs=("daturaai/pytorch:test",),
+        refresh_seconds=60,
+    )
+
+    with patch(
+        "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
+        new=AsyncMock(return_value="sha256:abc"),
+    ):
+        await service.refresh()
+    assert service.get_digest("daturaai/pytorch:test") == "sha256:abc"
+
+    with patch(
+        "neurons.validators.src.services.default_docker_image_digest_service.fetch_registry_digest",
+        new=AsyncMock(return_value=None),
+    ):
+        await service.refresh()
+    assert service.get_digest("daturaai/pytorch:test") is None
+
+
+@pytest.mark.asyncio
 async def test_get_digest_returns_none_for_unknown_image():
     service = DefaultDockerImageDigestService(image_refs=(), refresh_seconds=60)
     assert service.get_digest("daturaai/pytorch:missing") is None
