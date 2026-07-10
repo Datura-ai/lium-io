@@ -272,10 +272,3 @@ TDX_WHITELIST = {
         },
     }
 }
-
-# Default cache-template images whose digests the validator pre-fetches from Docker Hub
-# (DAH-2380). Keep in sync with lium-io-backend `DOCKER_IMAGES`.
-DEFAULT_DOCKER_IMAGE_REFS: tuple[str, ...] = (
-    "daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind",
-    "daturaai/pytorch:2.12.0-py3.12-cuda13.0.2-devel-ubuntu24.04-dind",
-)

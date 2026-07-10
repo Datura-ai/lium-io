@@ -2,6 +2,8 @@
 
 The validator resolves the recommended image from the backend (image + tag only) and
 compares the executor's local RepoDigest against a digest map built here from Docker Hub.
+The set of default images is read from the backend shared config (``SharedConfig``),
+whose source of truth is the backend ``DOCKER_IMAGES`` list — no hardcoded copy here.
 Uses the manifest-list media type so the digest matches what `docker pull` records in
 RepoDigests on amd64 GPU nodes.
 """
@@ -13,7 +15,6 @@ import logging
 from functools import lru_cache
 
 import aiohttp
-from services.const import DEFAULT_DOCKER_IMAGE_REFS
 
 from core.config import settings
 
@@ -25,6 +26,18 @@ _MANIFEST_ACCEPT = (
 )
 _REGISTRY_AUTH_URL = "https://auth.docker.io/token"
 _REGISTRY_API = "https://registry-1.docker.io/v2"
+
+
+def _shared_config_image_refs() -> tuple[str, ...]:
+    """Default cache-template image refs served by the backend via shared config.
+
+    The single source of truth is the backend ``DOCKER_IMAGES`` list, published on
+    ``/v1/shared-config``; ``SharedConfigClient`` falls back to the packaged lium-core
+    default when the backend is unreachable, so the returned tuple is always valid.
+    """
+    from core.config import shared_client
+
+    return tuple(shared_client.config.default_docker_image_refs)
 
 
 def _bare_digest(digest: str | None) -> str | None:
@@ -70,9 +83,12 @@ class DefaultDockerImageDigestService:
 
     def __init__(
         self,
-        image_refs: tuple[str, ...] = DEFAULT_DOCKER_IMAGE_REFS,
+        image_refs: tuple[str, ...] | None = None,
         refresh_seconds: int | None = None,
     ) -> None:
+        # None → resolve the current list from shared config on each refresh, so a new
+        # backend template is picked up without a validator restart. An explicit tuple
+        # pins the list (used by tests).
         self._image_refs = image_refs
         self._refresh_seconds = (
             refresh_seconds
@@ -86,6 +102,11 @@ class DefaultDockerImageDigestService:
         """Bare ``sha256:…`` for a previously refreshed ``repo:tag``, or None."""
         return self._digests.get(image_ref)
 
+    def _resolve_image_refs(self) -> tuple[str, ...]:
+        if self._image_refs is not None:
+            return self._image_refs
+        return _shared_config_image_refs()
+
     async def refresh(self) -> None:
         """Pull current digests for every configured default image ref.
 
@@ -95,10 +116,11 @@ class DefaultDockerImageDigestService:
         a false ``DIGEST_MISMATCH`` against a re-pushed tag and zero an honest
         miner's score (DAH-2380).
         """
+        image_refs = self._resolve_image_refs()
         updated: dict[str, str] = {}
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for image_ref in self._image_refs:
+            for image_ref in image_refs:
                 digest = await fetch_registry_digest(session, image_ref)
                 if digest:
                     updated[image_ref] = digest
@@ -106,7 +128,7 @@ class DefaultDockerImageDigestService:
         async with self._lock:
             self._digests = updated
 
-        failed = [ref for ref in self._image_refs if ref not in updated]
+        failed = [ref for ref in image_refs if ref not in updated]
         if failed:
             logger.warning(
                 "Dropped %d default docker image digest(s) after a failed refresh "
