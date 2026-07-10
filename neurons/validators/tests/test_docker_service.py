@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from uuid import uuid4, UUID
 from datetime import datetime
@@ -1025,6 +1026,61 @@ async def test_delete_container_stops_gracefully_before_forced_removal(
             "remove_volumes": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_delete_container_logs_point_at_the_call_site(
+    docker_service,
+    monkeypatch,
+    caplog,
+):
+    # Arrange: the bound logger must keep file/function/line on the caller, not on itself
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+
+    payload = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        container_name="pod_call_site",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="services.docker_service"):
+        await docker_service.delete_container(
+            payload=payload,
+            executor_info=executor_info,
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+
+    # Assert
+    functions = {
+        record.funcName
+        for record in caplog.records
+        if str(record.msg) in ("Deleting Docker Container", "Deleted Docker Container")
+    }
+    assert functions == {"delete_container"}
 
 
 @pytest.mark.asyncio
