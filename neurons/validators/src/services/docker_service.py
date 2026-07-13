@@ -172,13 +172,19 @@ class VolumeMinSizeError(Exception):
 
 
 _FAILED_CONTAINER_LOGS_TAIL_LINES = 100
-# Keep the tail, not the head: a dying entrypoint prints its fatal error last.
+# Bounded so a crash-looping worker can't flood the log line; keep the tail,
+# not the head — a dying entrypoint prints its fatal error last.
 _FAILED_CONTAINER_LOGS_MAX_CHARS = 4000
 
 
 @dataclass
 class FailedContainerDiagnostics:
-    """Post-mortem of a container that died during create_container (DAH-2395)."""
+    """Post-mortem of a container that died during create_container (DAH-2395).
+
+    This is the only durable record of WHY the container died: cleanup
+    force-removes it right after, and the executor host belongs to the miner,
+    so there is no second chance to inspect anything.
+    """
 
     state: dict | None = None  # parsed `docker inspect .State`: OOMKilled, ExitCode, Error, ...
     logs_tail: str | None = None  # bounded tail of `docker logs`
@@ -1407,6 +1413,9 @@ class DockerService:
             diagnostics.capture_error = "; ".join(capture_errors)
 
         state: dict = diagnostics.state or {}
+        # OOMKilled/ExitCode as top-level fields so Loki can filter on them
+        # directly (`json | container_oom_killed="true"`) without digging
+        # through the nested state object.
         logger.warning(
             _m(
                 "Failed container diagnostics before cleanup",
@@ -1432,7 +1441,9 @@ class DockerService:
         remove_volume: bool = False,
     ) -> None:
         try:
-            # DAH-2395: read the death evidence before `rm -fv` destroys it.
+            # DAH-2395: read the death evidence before `rm -fv` destroys it —
+            # without this line, "why did the container die" (OOM vs entrypoint
+            # crash) is unanswerable: the host is the miner's, not ours.
             await self.capture_failed_container_diagnostics(
                 ssh_client=ssh_client,
                 default_extra=default_extra,
