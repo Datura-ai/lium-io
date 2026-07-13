@@ -68,8 +68,9 @@ def _get_filesystem_usage(container_name: str, mount_point: str) -> dict:
 
     Runs `docker exec ... df -k` as a subprocess instead of docker-py exec_run:
     df against a dead FUSE mount hangs in uninterruptible D-state forever, and a
-    docker-py call stuck on it can never be reclaimed, while a subprocess is
-    killed on timeout.
+    docker-py call stuck on it can never be reclaimed. As a subprocess the
+    `docker exec` client is killed on timeout, which frees the executor's pool
+    thread (the `df` inside the container stays wedged, but the agent is not).
 
     Args:
         container_name: Name of the Docker container
@@ -85,7 +86,7 @@ def _get_filesystem_usage(container_name: str, mount_point: str) -> dict:
             "stale": bool         # Present and True when collection timed out
         }
     """
-    empty = {"total": 0, "used": 0, "available": 0, "utilization": 0.0, "mount_point": mount_point}
+    zero_usage = {"total": 0, "used": 0, "available": 0, "utilization": 0.0, "mount_point": mount_point}
     try:
         result = subprocess.run(
             ["docker", "exec", "-u", "root", container_name, "df", "-k", mount_point],
@@ -97,19 +98,19 @@ def _get_filesystem_usage(container_name: str, mount_point: str) -> dict:
             f"df -k {mount_point} in {container_name} timed out after {DF_TIMEOUT_SECONDS}s, "
             "returning stale zeros"
         )
-        return {**empty, "stale": True}
+        return {**zero_usage, "stale": True}
     except Exception as e:
         logger.warning(f"Error getting filesystem usage for {mount_point}: {e}")
-        return empty
+        return zero_usage
 
     if result.returncode != 0:
         logger.warning(
             f"Failed to get filesystem usage for {mount_point}: "
             f"{result.stderr.decode('utf-8', errors='replace')}"
         )
-        return empty
+        return zero_usage
 
-    parsed = _parse_df_output(result.stdout.decode("utf-8"))
+    parsed = _parse_df_output(result.stdout.decode("utf-8", errors="replace"))
     parsed["mount_point"] = mount_point
     return parsed
 
