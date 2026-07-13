@@ -1,5 +1,6 @@
 import asyncio
 import ipaddress
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -168,6 +169,20 @@ _VOLUME_SIZE_SUFFIX_MULTIPLIERS = {
 
 class VolumeMinSizeError(Exception):
     """Fresh vloopback sizing produced a volume smaller than the requested minimum."""
+
+
+_FAILED_CONTAINER_LOGS_TAIL_LINES = 100
+# Keep the tail, not the head: a dying entrypoint prints its fatal error last.
+_FAILED_CONTAINER_LOGS_MAX_CHARS = 4000
+
+
+@dataclass
+class FailedContainerDiagnostics:
+    """Post-mortem of a container that died during create_container (DAH-2395)."""
+
+    state: dict | None = None  # parsed `docker inspect .State`: OOMKilled, ExitCode, Error, ...
+    logs_tail: str | None = None  # bounded tail of `docker logs`
+    capture_error: str | None = None  # why (part of) the capture failed, when it did
 
 
 @dataclass
@@ -1341,6 +1356,73 @@ class DockerService:
                 exc_info=True,
             )
 
+    async def capture_failed_container_diagnostics(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        default_extra: dict,
+        container_name: str,
+    ) -> FailedContainerDiagnostics:
+        """Read why a container died (inspect .State + logs tail) and log it.
+
+        Runs right before the failed container is force-removed: after that the
+        OOMKilled/ExitCode verdict and the entrypoint output are gone, and the
+        executor host belongs to the miner, so this log line is the only
+        evidence left (DAH-2395: DPHN exit-137 deaths were undiagnosable).
+        Best-effort — never raises (cancellation excepted), so the cleanup
+        itself is never blocked by a diagnostics failure.
+        """
+        diagnostics = FailedContainerDiagnostics()
+        capture_errors: list[str] = []
+        container = shlex.quote(container_name)
+
+        try:
+            inspect_result = await ssh_client.run(
+                f"/usr/bin/docker inspect -f '{{{{json .State}}}}' {container}"
+            )
+            if inspect_result.exit_status == 0:
+                parsed_state = json.loads(inspect_result.stdout or "null")
+                if isinstance(parsed_state, dict):
+                    diagnostics.state = parsed_state
+                else:
+                    capture_errors.append(f"inspect: non-object state JSON: {parsed_state!r}")
+            else:
+                capture_errors.append(f"inspect: {(inspect_result.stderr or '').strip()}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            capture_errors.append(f"inspect: {exc}")
+
+        try:
+            logs_result = await ssh_client.run(
+                f"/usr/bin/docker logs --tail {_FAILED_CONTAINER_LOGS_TAIL_LINES} {container} 2>&1 || true"
+            )
+            logs_text: str = logs_result.stdout or ""
+            diagnostics.logs_tail = logs_text[-_FAILED_CONTAINER_LOGS_MAX_CHARS:]
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            capture_errors.append(f"logs: {exc}")
+
+        if capture_errors:
+            diagnostics.capture_error = "; ".join(capture_errors)
+
+        state: dict = diagnostics.state or {}
+        logger.warning(
+            _m(
+                "Failed container diagnostics before cleanup",
+                extra=get_extra_info({
+                    **default_extra,
+                    "container_name": container_name,
+                    "container_state": diagnostics.state,
+                    "container_oom_killed": state.get("OOMKilled"),
+                    "container_exit_code": state.get("ExitCode"),
+                    "container_logs_tail": diagnostics.logs_tail,
+                    "diagnostics_capture_error": diagnostics.capture_error,
+                }),
+            )
+        )
+        return diagnostics
+
     async def cleanup_failed_container_creation(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -1350,6 +1432,13 @@ class DockerService:
         remove_volume: bool = False,
     ) -> None:
         try:
+            # DAH-2395: read the death evidence before `rm -fv` destroys it.
+            await self.capture_failed_container_diagnostics(
+                ssh_client=ssh_client,
+                default_extra=default_extra,
+                container_name=container_name,
+            )
+
             container = shlex.quote(container_name)
             await retry_ssh_command(
                 ssh_client,
