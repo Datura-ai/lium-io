@@ -5,9 +5,10 @@ import os
 import threading
 import time
 import tomllib
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import bittensor
 import docker
@@ -54,7 +55,7 @@ _metrics_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="metric
 _metrics_semaphore = asyncio.Semaphore(METRICS_MAX_CONCURRENT)
 
 
-async def _run_in_metrics_pool(label: str, func, timeout: float | None = None):
+async def _run_in_metrics_pool(label: str, func: Callable[[], Any], timeout: float | None = None) -> Any:
     # run one blocking call in the dedicated pool, bounded by a timeout read at call time
     if timeout is None:
         timeout = METRICS_TIMEOUT_SECONDS
@@ -71,7 +72,7 @@ async def _run_in_metrics_pool(label: str, func, timeout: float | None = None):
         raise HTTPException(status_code=503, detail="Executor busy, metrics collection timed out")
 
 
-async def _run_metrics_call(label: str, func):
+async def _run_metrics_call(label: str, func: Callable[[], Any]) -> Any:
     # reject immediately when all metrics slots are busy instead of queueing on the event loop
     if _metrics_semaphore.locked():
         logger.warning(
