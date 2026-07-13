@@ -23,6 +23,7 @@ from payload_models.payloads import (
     FailedContainerErrorTypes,
     FailedContainerRequest,
     PayloadPortMapping,
+    ProfilerStepName,
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
@@ -1234,13 +1235,21 @@ async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service)
         root_dir="/root/app dir",
     )
 
-    command = docker_service._build_inspector_collector_command(
+    start_command = docker_service._build_inspector_collector_command(
         executor_info,
         "start",
     )
+    stop_command = docker_service._build_inspector_collector_command(
+        executor_info,
+        "stop",
+    )
 
-    assert command == (
-        "/usr/bin/python3 '/root/app dir/src/inspector_executor.py' --start-collector"
+    assert start_command == (
+        "nohup /usr/bin/python3 '/root/app dir/src/inspector_executor.py'"
+        " --start-collector >/dev/null 2>&1 &"
+    )
+    assert stop_command == (
+        "/usr/bin/python3 '/root/app dir/src/inspector_executor.py' --stop-collector"
     )
 
 
@@ -1302,7 +1311,7 @@ async def test_inspector_lifecycle_logs_success(docker_service, caplog):
         )
 
     assert any(
-        "Inspector collector start succeeded" in rec.getMessage()
+        "Inspector collector start launched" in rec.getMessage()
         for rec in caplog.records
     )
 
@@ -1399,7 +1408,7 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
-    await docker_service.create_container(
+    result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
         keypair=Mock(ss58_address="validator-hotkey"),
@@ -1411,6 +1420,11 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
     assert lifecycle_spy.await_args.kwargs["ssh_client"] is ssh_client
     assert lifecycle_spy.await_args.kwargs["executor_info"] == executor_info
     assert lifecycle_spy.await_args.kwargs["default_extra"]["container_name"] == f"pod_{pod_id}"
+    inspector_step = next(
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+    )
+    assert inspector_step.skipped is False
+    assert inspector_step.duration is not None and inspector_step.duration >= 0
 
 
 @pytest.mark.asyncio
@@ -1452,7 +1466,7 @@ async def test_create_customer_rental_skips_inspector_collector_when_disabled(
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
-    await docker_service.create_container(
+    result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
         keypair=Mock(ss58_address="validator-hotkey"),
@@ -1460,6 +1474,10 @@ async def test_create_customer_rental_skips_inspector_collector_when_disabled(
     )
 
     lifecycle_spy.assert_not_awaited()
+    inspector_step = next(
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+    )
+    assert inspector_step.skipped is True
 
 
 @pytest.mark.asyncio
@@ -1496,7 +1514,7 @@ async def test_create_filler_skips_inspector_collector_start(docker_service, mon
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
-    await docker_service.create_container(
+    result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
         keypair=Mock(ss58_address="validator-hotkey"),
@@ -1504,6 +1522,10 @@ async def test_create_filler_skips_inspector_collector_start(docker_service, mon
     )
 
     lifecycle_spy.assert_not_awaited()
+    inspector_step = next(
+        p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
+    )
+    assert inspector_step.skipped is True
 
 
 @pytest.mark.asyncio

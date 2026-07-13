@@ -440,6 +440,7 @@ def _summary_calls(mock_logger):
 async def test_summary_emitted_on_success(svc, monkeypatch):
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(ds_module.settings, "ENABLE_INSPECTOR", False)
     mock_logger = Mock()
     monkeypatch.setattr(ds_module, "logger", mock_logger)
 
@@ -452,7 +453,13 @@ async def test_summary_emitted_on_success(svc, monkeypatch):
     assert isinstance(extra["total_duration_ms"], int)
     names = {s["name"] for s in extra["profile_steps"]}
     assert "Docker pull step finished" in names
+    assert "Inspector collector start step finished" in names
     assert "Finished in subnet." in names
+    inspector = next(
+        s for s in extra["profile_steps"]
+        if s["name"] == "Inspector collector start step finished"
+    )
+    assert inspector["skipped"] is True
 
 
 @pytest.mark.asyncio

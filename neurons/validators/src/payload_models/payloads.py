@@ -424,6 +424,7 @@ class ProfilerStepName(str, enum.Enum):
     CONTAINER_RUNNING_CHECK = "Container running check step finished"
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
+    INSPECTOR_START = "Inspector collector start step finished"
     FINISHED_IN_SUBNET = "Finished in subnet."
 
 

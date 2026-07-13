@@ -309,7 +309,10 @@ class DockerService:
             "stop": "--stop-collector",
         }[action]
         script = f"{executor_info.root_dir.rstrip('/')}/src/inspector_executor.py"
-        return f"{shlex.quote(executor_info.python_path)} {shlex.quote(script)} {flag}"
+        command = f"{shlex.quote(executor_info.python_path)} {shlex.quote(script)} {flag}"
+        if action == "start":
+            command = f"nohup {command} >/dev/null 2>&1 &"
+        return command
 
     async def _run_inspector_collector_lifecycle(
         self,
@@ -334,9 +337,10 @@ class DockerService:
             stderr = getattr(result, "stderr", "") or ""
             if exit_status != 0:
                 raise RuntimeError(f"exit_status={exit_status} stderr={stderr}")
+            outcome = "launched" if action == "start" else "succeeded"
             logger.info(
                 _m(
-                    f"Inspector collector {action} succeeded",
+                    f"Inspector collector {action} {outcome}",
                     extra=get_extra_info(log_extra),
                 ),
             )
@@ -3487,10 +3491,11 @@ class DockerService:
 
                     current_step = "finalize"
                     await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
-                    if (
+                    inspector_enabled = (
                         settings.ENABLE_INSPECTOR
                         and payload.workload_kind != WorkloadKind.FILLER
-                    ):
+                    )
+                    if inspector_enabled:
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,
                             executor_info=executor_info,
@@ -3500,6 +3505,14 @@ class DockerService:
                                 "container_name": container_name,
                             },
                         )
+                    profilers.append(
+                        ProfilerStep.since(
+                            ProfilerStepName.INSPECTOR_START,
+                            prev_timestamp,
+                            skipped=not inspector_enabled,
+                        )
+                    )
+                    prev_timestamp = now_ms()
                 except Exception:
                     await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
