@@ -88,45 +88,17 @@ class Settings(BaseSettings):
         return wallet
 
     def get_bittensor_config(self) -> bittensor.Config:
-        parser = argparse.ArgumentParser()
-        # bittensor.wallet.add_args(parser)
-        # bittensor.subtensor.add_args(parser)
-        # bittensor.axon.add_args(parser)
+        # bittensor >=10.3.2 ignores argparse defaults (BT_NO_PARSE_CLI_ARGS is on by
+        # default), so assign values directly or Subtensor silently falls back to finney
+        config = bittensor.Config(argparse.ArgumentParser())
 
         if self.BITTENSOR_NETWORK:
-            if "--subtensor.network" in parser._option_string_actions:
-                parser._handle_conflict_resolve(
-                    None,
-                    [("--subtensor.network", parser._option_string_actions["--subtensor.network"])],
-                )
-
-            parser.add_argument(
-                "--subtensor.network",
-                type=str,
-                help="network",
-                default=self.BITTENSOR_NETWORK,
-            )
+            config.subtensor.network = self.BITTENSOR_NETWORK
 
         if self.BITTENSOR_CHAIN_ENDPOINT:
-            if "--subtensor.chain_endpoint" in parser._option_string_actions:
-                parser._handle_conflict_resolve(
-                    None,
-                    [
-                        (
-                            "--subtensor.chain_endpoint",
-                            parser._option_string_actions["--subtensor.chain_endpoint"],
-                        )
-                    ],
-                )
+            config.subtensor.chain_endpoint = self.BITTENSOR_CHAIN_ENDPOINT
 
-            parser.add_argument(
-                "--subtensor.chain_endpoint",
-                type=str,
-                help="chain endpoint",
-                default=self.BITTENSOR_CHAIN_ENDPOINT,
-            )
-
-        return bittensor.Config(parser)
+        return config
 
 
 settings = Settings()
