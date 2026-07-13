@@ -57,7 +57,11 @@ class CachedTemplateVerificationCheck:
     """
 
     check_id = "executor.validate.cached_template"
-    fatal = True
+    # TODO(2026-07-14): restore `fatal = True` to enable this gate. Temporarily False so that a
+    # `passed=False` result (NOT_CACHED / DIGEST_MISMATCH on/after the cutoff) does NOT halt the
+    # pipeline — the check stays advisory during the DAH-2380 digest rollout. Pairs with
+    # CACHED_TEMPLATE_CUTOFF (deferred to 2026-07-14 12:00 UTC in core/config.py); flip both back.
+    fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
         gpu_model = ctx.state.gpu_model

@@ -138,7 +138,11 @@ class Settings(BaseSettings):
     # unrented executor that has not pre-pulled the recommended default image, or holds stale
     # content under the same tag, fails verification early (score 0, reason surfaced to the
     # provider). Fails open: an unmeasured signal (None) is never penalised.
-    CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 9, 12, 0, 0)
+    # TODO(2026-07-14): restore datetime(2026, 7, 9, 12, 0, 0). Cutoff deferred one day to keep
+    # the check advisory during the DAH-2380 Docker Hub digest rollout. The gate is ALSO held
+    # off by fatal=False on CachedTemplateVerificationCheck (see the TODO there) — re-enable both
+    # together tomorrow.
+    CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 14, 12, 0, 0)
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that
