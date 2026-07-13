@@ -38,6 +38,11 @@ class SharedConfig(BaseModel):
     max_initial_port_count: int
     total_burn_emission: float
     require_storage_limit_supported: bool = False
+    # Provider payout timing (DAH-2370). Surfaced so the provider portal can show
+    # an expected (not guaranteed) payout time. Optional with defaults so older
+    # serialized configs still validate.
+    payout_delay_days: int = Field(default=2)
+    payout_processing_hour_utc: int = Field(default=17)
 
     # Lists
     # default cache-template docker images, served verbatim from the backend

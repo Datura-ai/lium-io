@@ -123,4 +123,6 @@ DEFAULT_SHARED_CONFIG = SharedConfig(
     max_initial_port_count=200,
     total_burn_emission=0.91,
     require_storage_limit_supported=False,
+    payout_delay_days=2,
+    payout_processing_hour_utc=17,
 )
