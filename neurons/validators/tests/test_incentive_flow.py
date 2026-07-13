@@ -85,7 +85,14 @@ async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_b
     validator.subtensor_client.get_time_from_block = AsyncMock(return_value=job_batch_id)
     validator.miner_service.request_job_to_miner = AsyncMock(side_effect=request_job_side_effect)
 
-    await validator.sync()
+    # DAH-2380: sync() fetches default docker image digests from Docker Hub at job-cycle
+    # start. Stub it here so these unit tests never hit the network (the real fetch would
+    # open aiohttp connections to auth.docker.io / registry-1.docker.io per cycle).
+    with patch(
+        "core.validator.fetch_default_image_digests",
+        new=AsyncMock(return_value={}),
+    ):
+        await validator.sync()
 
 
 # Existing test scenarios
