@@ -33,11 +33,6 @@ from services.task_service import JobResult
 
 logger = get_logger(__name__)
 
-# DAH-2250 — unrented incentive soft price limit (section 3 of the market-pricing
-# proposal). An unrented executor whose price_per_gpu exceeds the market p90 times
-# this multiplier forfeits the unrented rental incentive but stays active.
-SOFT_LIMIT_PRICE_RATE = 1.1
-
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
 
@@ -177,7 +172,7 @@ class RentalPriceIncentive(DefaultIncentive):
         return base_model
 
     def _is_over_soft_price_limit(self, result: JobResult) -> bool:
-        # miner price_per_gpu above the market p90 ceiling (p90 * SOFT_LIMIT_PRICE_RATE)
+        # miner price_per_gpu above the market p90 ceiling (p90 * soft_limit_price_rate)
         price_per_gpu = result.executor_info.price_per_gpu
         if not price_per_gpu:
             return False
@@ -185,12 +180,13 @@ class RentalPriceIncentive(DefaultIncentive):
         p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
         if not p90:
             return False
-        return price_per_gpu > p90 * SOFT_LIMIT_PRICE_RATE
+        return price_per_gpu > p90 * shared_client.config.soft_limit_price_rate
 
     def _log_soft_price_limit(self, result: JobResult) -> None:
         # structured log for every unrented executor over the p90 soft ceiling
         enforced = settings.ENABLE_UNRENTED_SOFT_PRICE_LIMIT
         p90 = shared_client.config.machine_prices_p90.get(result.gpu_model)
+        rate = shared_client.config.soft_limit_price_rate
         logger.info(
             _m(
                 "Unrented executor over market p90 soft price limit"
@@ -201,8 +197,8 @@ class RentalPriceIncentive(DefaultIncentive):
                     "gpu_count": result.gpu_count,
                     "price_per_gpu": result.executor_info.price_per_gpu,
                     "machine_price_p90": p90,
-                    "soft_limit_rate": SOFT_LIMIT_PRICE_RATE,
-                    "soft_limit_threshold": p90 * SOFT_LIMIT_PRICE_RATE if p90 else None,
+                    "soft_limit_rate": rate,
+                    "soft_limit_threshold": p90 * rate if p90 else None,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
