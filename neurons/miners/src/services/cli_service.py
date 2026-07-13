@@ -242,8 +242,8 @@ class CliService:
         uid = self.get_uid_for_hotkey(self.hotkey)
         self.logger.info(f"UID for hotkey {self.hotkey}: {uid}")
         associated_evm = node.query(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid, uid])
-        address_bytes = associated_evm.value[0][0]
-        evm_address_hex = "0x" + bytes(address_bytes).hex()
+        # async-substrate-interface 2.x decodes the record: ("0x…", block_number)
+        evm_address_hex = associated_evm.value[0]
 
         self.logger.info(_m(
             f"EVM address for hotkey {self.hotkey}: {evm_address_hex}",
