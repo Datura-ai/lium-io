@@ -1,4 +1,3 @@
-import argparse
 import pathlib
 from datetime import datetime
 from enum import Enum
@@ -350,7 +349,7 @@ class Settings(BaseSettings):
     def get_bittensor_config(self) -> bittensor.Config:
         # bittensor >=10.3.2 ignores argparse defaults (BT_NO_PARSE_CLI_ARGS is on by
         # default), so assign values directly or Subtensor silently falls back to finney
-        config = bittensor.Config(argparse.ArgumentParser())
+        config = bittensor.Config()
 
         if self.BITTENSOR_NETWORK:
             config.subtensor.network = self.BITTENSOR_NETWORK
