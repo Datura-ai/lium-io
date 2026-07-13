@@ -81,8 +81,10 @@ def _set_cutoff(monkeypatch, *, active: bool) -> None:
 
 
 def test_check_is_fatal():
-    # DAH-2265: the check is fatal-capable; run() only returns passed=False after the cutoff.
-    assert CachedTemplateVerificationCheck.fatal is True
+    # TODO(2026-07-14): restore `assert CachedTemplateVerificationCheck.fatal is True`.
+    # DAH-2380 rollout: the check is temporarily fatal=False so a passed=False result never halts
+    # the pipeline (run() still returns passed=False after the cutoff — only the halt is off).
+    assert CachedTemplateVerificationCheck.fatal is False
 
 
 @pytest.mark.asyncio
