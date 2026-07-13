@@ -15,7 +15,7 @@ _docker_client = None
 _docker_client_lock = threading.Lock()
 
 
-def _get_docker_client():
+def _get_docker_client() -> docker.DockerClient:
     # one shared client with a bounded API timeout, so a wedged docker daemon cannot hold a call forever
     global _docker_client
     with _docker_client_lock:
