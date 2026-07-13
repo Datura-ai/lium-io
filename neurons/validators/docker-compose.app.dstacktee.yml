@@ -34,6 +34,18 @@ services:
       # {OS_IMAGE_HASH} is substituted by the verifier, not compose.
       - DSTACK_VERIFIER_IMAGE_DOWNLOAD_URL=https://github.com/Datura-ai/private-ml-sdk/releases/download/v0.5.5/mr_{OS_IMAGE_HASH}.tar.gz
 
+  # QEMU 10.2.1 (Canonical 1:10.2.1+ds-1ubuntu3.1) ACPI oracle + RTMR1 raw-kernel
+  # fix. A verifier image embeds exactly one QEMU version's ACPI oracle, so this
+  # second verifier receives only quotes whose vm_config qemu_version >= 10; the
+  # 9.2.1 prod fleet keeps routing to dstack-verifier above. Live but inert until a
+  # QEMU >= 10 host appears. Source: Datura-ai/dstack@spike/qemu10-oracle-rebuild
+  # (6124e6ea).
+  dstack-verifier-qemu10:
+    image: daturaai/dstack-verifier@sha256:3151aab51d618a0996cc353979c72b04f2137fd5be17be7487f1242faab3f83d
+    restart: unless-stopped
+    environment:
+      - DSTACK_VERIFIER_IMAGE_DOWNLOAD_URL=https://github.com/Datura-ai/private-ml-sdk/releases/download/v0.5.5/mr_{OS_IMAGE_HASH}.tar.gz
+
   validator:
     image: daturaai/compute-subnet-validator:latest
     env_file: ./.env
@@ -44,6 +56,7 @@ services:
       - REDIS_PORT=6379
       - ENABLE_TDX_ATTESTATION=true
       - TDX_VERIFIER_URL=http://dstack-verifier:8080/verify
+      - TDX_VERIFIER_QEMU10_URL=http://dstack-verifier-qemu10:8080/verify
       - ENABLE_ATTESTATION_WHITELIST=true
       - DEPLOY_ENV=PROD
     ports:
@@ -56,6 +69,7 @@ services:
       - db
       - redis
       - dstack-verifier
+      - dstack-verifier-qemu10
 
   connector:
     image: daturaai/compute-subnet-validator:latest
