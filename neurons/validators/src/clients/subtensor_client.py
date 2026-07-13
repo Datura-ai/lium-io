@@ -150,7 +150,7 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            subtensor = bittensor.subtensor(config=self.config)
+            subtensor = bittensor.Subtensor(config=self.config)
 
             # check registered
             self.check_registered(subtensor)
@@ -182,7 +182,7 @@ class SubtensorClient:
         with _log_sync_block("set_subtensor.initialize", extra=self.default_extra):
             self.initialize_subtensor()
 
-    def check_registered(self, subtensor: bittensor.subtensor):
+    def check_registered(self, subtensor: bittensor.Subtensor):
         try:
             if not subtensor.is_hotkey_registered(
                 netuid=self.netuid,
@@ -244,8 +244,8 @@ class SubtensorClient:
             node = self.get_node()
             associated_evms = node.query_map(module="SubtensorModule", storage_function="AssociatedEvmAddress", params=[self.netuid])
             for uid, evm_address in associated_evms:
-                address_bytes = evm_address.value[0][0]
-                evm_address_hex = "0x" + bytes(address_bytes).hex()
+                # async-substrate-interface 2.x yields decoded records: ("0x…", block_number)
+                evm_address_hex = evm_address[0]
                 self.uid_to_evm_address[uid] = evm_address_hex
 
             """Update the map of miner_hotkey -> evm_address for all miners."""
@@ -653,7 +653,7 @@ class SubtensorClient:
         cls._initialized = False
 
     @classmethod
-    def get_subtensor(cls) -> bittensor.subtensor:
+    def get_subtensor(cls) -> bittensor.Subtensor:
         """Get the subtensor instance directly."""
         if cls._subtensor is None:
             instance = cls.get_instance()

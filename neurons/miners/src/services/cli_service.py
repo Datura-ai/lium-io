@@ -69,7 +69,7 @@ class CliService:
         Get a SubstrateInterface node connection using the current config.
         :return: SubstrateInterface instance
         """
-        self.subtensor = bt.subtensor(config=self.config)
+        self.subtensor = bt.Subtensor(config=self.config)
         return self.subtensor.substrate
 
     def print_extrinsic_receipt(self, receipt) -> dict:
@@ -209,7 +209,7 @@ class CliService:
             print('Please enter your bittensor wallet password:')
             self.subtensor.transfer(
                 wallet=self.wallet,
-                dest=ss58_address,
+                destination_ss58=ss58_address,
                 amount=Balance.from_tao(amount, self.netuid),
                 wait_for_inclusion=True,
                 wait_for_finalization=True

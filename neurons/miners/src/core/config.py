@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:
             raise RuntimeError("Wallet not configured")
-        wallet = bittensor.wallet(
+        wallet = bittensor.Wallet(
             name=self.BITTENSOR_WALLET_NAME,
             hotkey=self.BITTENSOR_WALLET_HOTKEY_NAME,
             path=str(self.BITTENSOR_WALLET_DIRECTORY),
@@ -87,7 +87,7 @@ class Settings(BaseSettings):
         wallet.hotkey_file.get_keypair()  # this raises errors if the keys are inaccessible
         return wallet
 
-    def get_bittensor_config(self) -> bittensor.config:
+    def get_bittensor_config(self) -> bittensor.Config:
         parser = argparse.ArgumentParser()
         # bittensor.wallet.add_args(parser)
         # bittensor.subtensor.add_args(parser)
@@ -126,7 +126,7 @@ class Settings(BaseSettings):
                 default=self.BITTENSOR_CHAIN_ENDPOINT,
             )
 
-        return bittensor.config(parser)
+        return bittensor.Config(parser)
 
 
 settings = Settings()
