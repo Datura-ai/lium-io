@@ -3,7 +3,6 @@ import logging
 import json
 import time
 from datetime import datetime
-from core.config import settings
 from core.db import get_session
 from daos.pod_log import PodLog, PodLogDao
 
@@ -11,7 +10,11 @@ from daos.pod_log import PodLog, PodLogDao
 logging.basicConfig(filename="container_monitor.log", level=logging.INFO,
                     format='%(message)s')  # we will log pre-formatted JSON strings
 
-monitor_prefix = "container_"  # only monitor containers with this prefix
+# Container-name prefixes the validator creates for real workloads: rental pods
+# (pod_*) and idle-node default jobs (filler_*). The legacy "container_" prefix
+# matches only the validator's throwaway port-check probes today, so watching it
+# recorded pure probe noise while every pod/filler death went unlogged (DAH-2395).
+MONITORED_CONTAINER_PREFIXES: tuple[str, ...] = ("pod_", "filler_")
 
 
 # Helper: Determine stop reason classification
@@ -74,7 +77,7 @@ def handle_event(event):
     container_id = event.get("id") or event.get("Actor", {}).get("ID")
     name = attrs.get("name")
 
-    if not name or not name.startswith(monitor_prefix) or name == f"{monitor_prefix}{settings.MINER_HOTKEY_SS58_ADDRESS}":
+    if not name or not name.startswith(MONITORED_CONTAINER_PREFIXES):
         return
 
     pod_log = PodLog(
