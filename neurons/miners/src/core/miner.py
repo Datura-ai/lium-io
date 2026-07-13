@@ -37,7 +37,7 @@ class Miner:
             "external_ip": settings.EXTERNAL_IP_ADDRESS,
         }
 
-        self.axon = bittensor.axon(
+        self.axon = bittensor.Axon(
             wallet=self.wallet,
             external_port=settings.EXTERNAL_PORT,
             external_ip=settings.EXTERNAL_IP_ADDRESS,
@@ -64,7 +64,7 @@ class Miner:
             if self.should_exit:
                 return
 
-            subtensor = await bittensor.async_subtensor(config=self.config).initialize()
+            subtensor = await bittensor.AsyncSubtensor(config=self.config).initialize()
             if self.should_exit:
                 await subtensor.close()
                 return

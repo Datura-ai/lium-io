@@ -13,7 +13,7 @@ dependencies = [
     "async-substrate-interface>=2.0.4",
     "bittensor-cli>=9.22.0",
     "bittensor-commit-reveal>=0.4.0",
-    "celium-collateral==1.1.6",
+    "celium-collateral==1.2.0",
     "databases>=0.9.0",
     "datura @ file:///${PROJECT_ROOT}/../../datura",
     "lium-core>=0.1.4",
