@@ -274,6 +274,28 @@ class GpuPowerLimitMessages:
         category="env",
         impact="Proceed",
     )
+    SKIPPED_ACTIVE_LIUM_FILLER = MessageTemplate(
+        event="GPU power limit check skipped for active Lium default job",
+        reason="GPU_POWER_LIMIT_SKIPPED_LIUM_FILLER",
+        severity="info",
+        category="policy",
+        impact="Proceed; Lium lowered the limit for its own idle filler, node stays rentable",
+    )
+    RESTORED_STALE_CAP = MessageTemplate(
+        event="Below-floor GPU power limits are Lium's own filler caps",
+        reason="GPU_POWER_LIMIT_RESTORED_STALE_CAP",
+        severity="warning",
+        category="policy",
+        impact="Proceed without penalty; stale caps past the grace period were restored to the pre-cap limit",
+    )
+    RESCUE_STATE_UNAVAILABLE = MessageTemplate(
+        event="GPU power limit records unreadable, cannot rule out Lium's own cap",
+        reason="GPU_POWER_LIMIT_STATE_UNAVAILABLE",
+        severity="warning",
+        category="env",
+        impact="Proceed without penalty this cycle; the check re-runs once Redis answers again",
+        remediation="Check the validator's Redis health.",
+    )
 
 
 class NvmlDigestMessages:
