@@ -287,9 +287,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     #       (d) installs a 30s self-heal restart watchdog (sshd_bootstrap.sh:119-156)
     #     The validator then only re-ensures ~/.ssh for key injection.
     #   * Jupyter: skip the validator's run_jupyter path. Instead, when `enable_jupyter`
-    #     is also set, the validator forwards ENABLE_JUPYTER (+ a validator-chosen
-    #     JUPYTER_TOKEN and JUPYTER_PORT) as `docker run -e` env vars so the image's
-    #     start.sh launches Jupyter itself.
+    #     is also set, the validator forwards a validator-chosen JUPYTER_PASSWORD as a
+    #     `docker run -e` env var so the image's start.sh launches Jupyter itself and
+    #     serves it as that token. JUPYTER_PASSWORD is the only Jupyter variable these
+    #     images read (start.sh gates on it and hardcodes the in-container port 8888).
     # None/False (default) preserves the always-bootstrap + run_jupyter behavior.
     # Populated by lium-io-backend in a follow-up; ships inert here (no producer sets it yet).
     ships_sshd: bool | None = None
