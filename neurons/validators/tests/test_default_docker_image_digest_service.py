@@ -8,6 +8,7 @@ from neurons.validators.src.services.default_docker_image_digest_service import 
     _shared_config_image_refs,
     fetch_default_image_digests,
     fetch_registry_digest,
+    is_default_docker_image,
 )
 
 _MODULE = "neurons.validators.src.services.default_docker_image_digest_service"
@@ -48,6 +49,18 @@ def test_shared_config_image_refs_skips_malformed_entries():
         refs = _shared_config_image_refs()
 
     assert refs == ("daturaai/pytorch:cuda12.8-dind",)
+
+
+def test_is_default_docker_image_matches_shared_config_refs():
+    """Exact repo:tag match against the shared-config refs — the login-skip predicate."""
+    images = ({"image": "daturaai/pytorch", "tag": "cuda12.8-dind"},)
+    with patch("core.config.shared_client", _shared_client_with(images)):
+        assert is_default_docker_image("daturaai/pytorch:cuda12.8-dind") is True
+        # A different tag of the same repo is a user image, not a default one.
+        assert is_default_docker_image("daturaai/pytorch:custom") is False
+        assert is_default_docker_image("private/repo:cuda12.8-dind") is False
+        assert is_default_docker_image(None) is False
+        assert is_default_docker_image("") is False
 
 
 @pytest.mark.asyncio
