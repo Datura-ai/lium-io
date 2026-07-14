@@ -51,32 +51,6 @@ def _shared_config_image_refs() -> tuple[str, ...]:
     return tuple(refs)
 
 
-def is_default_docker_image(image_ref: str | None) -> bool:
-    """True when ``image_ref`` is one of the default cache-template images.
-
-    These images are public on Docker Hub and pre-cached on the executors, so a
-    deploy that uses one needs no registry credentials — see the login skip in
-    ``DockerService.create_container``. Matching is exact against the shared-config
-    ``repo:tag`` refs, which is what the backend sends for a default-image rental.
-
-    Fail-closed: this runs on the rental deploy path, so any failure to read the
-    shared config returns False — the deploy then logs in exactly as it does today,
-    rather than a rental failing on an unreadable optimization hint.
-    """
-    if not image_ref:
-        return False
-    try:
-        return image_ref in _shared_config_image_refs()
-    except Exception:
-        logger.warning(
-            "Could not read default docker images from shared config; "
-            "treating %s as a non-default image",
-            image_ref,
-            exc_info=True,
-        )
-        return False
-
-
 async def fetch_registry_digest(session: aiohttp.ClientSession, image_ref: str) -> str | None:
     """Return the registry manifest digest for ``repository:tag``, or None on any error."""
     repository, _, tag = image_ref.partition(":")

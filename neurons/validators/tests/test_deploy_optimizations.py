@@ -18,7 +18,6 @@ Covers (from the plan's Test Plan):
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -698,17 +697,6 @@ _DEFAULT_IMAGE = "daturaai/pytorch:2.12.0-py3.12-cuda12.8-devel-ubuntu24.04-dind
 _CREDS = {"docker_username": "renter", "docker_password": "renter-secret"}
 
 
-def _patch_default_images(monkeypatch, *refs: str):
-    """Point the shared config at ``refs`` so the real predicate runs against them."""
-    entries = tuple(
-        {"image": ref.split(":", 1)[0], "tag": ref.split(":", 1)[1]} for ref in refs
-    )
-    monkeypatch.setattr(
-        "core.config.shared_client",
-        SimpleNamespace(config=SimpleNamespace(default_docker_images=entries)),
-    )
-
-
 def _login_step(result):
     return next(p for p in result.profilers if p.name == ProfilerStepName.DOCKER_LOGIN)
 
@@ -716,12 +704,16 @@ def _login_step(result):
 @pytest.mark.asyncio
 async def test_docker_login_skipped_for_default_image_even_with_credentials(svc, monkeypatch):
     """The default images are public and pre-cached, so the login is pure latency —
-    skip it even though the backend attached the renter's saved credentials."""
+    skip it even though the backend attached the renter's saved credentials.
+
+    `ships_sshd` IS the "renter selected a default image" signal: the backend sets it
+    from the same check that resolves the recommended image (`ships_sshd=is_cached`).
+    The validator trusts it rather than re-deriving default-ness from the image ref.
+    """
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    _patch_default_images(monkeypatch, _DEFAULT_IMAGE)
 
-    result = await _run(svc, _payload(docker_image=_DEFAULT_IMAGE, **_CREDS))
+    result = await _run(svc, _payload(docker_image=_DEFAULT_IMAGE, ships_sshd=True, **_CREDS))
 
     assert isinstance(result, ContainerCreated)
     assert _docker_client(svc).login_calls == [], "docker login must NOT run for a default image"
@@ -731,10 +723,25 @@ async def test_docker_login_skipped_for_default_image_even_with_credentials(svc,
 @pytest.mark.asyncio
 async def test_docker_login_runs_for_non_default_image_with_credentials(svc, monkeypatch):
     """DEFAULT-PATH REGRESSION GUARD: a user image with credentials still logs in —
-    a private registry pull depends on it."""
+    a private registry pull depends on it. The backend sends ships_sshd=False here."""
     ssh_client = _ssh_client(inspect_exit=1)
     _patch_happy(svc, monkeypatch, ssh_client)
-    _patch_default_images(monkeypatch, _DEFAULT_IMAGE)
+
+    result = await _run(
+        svc, _payload(docker_image="private/repo:1.0.0", ships_sshd=False, **_CREDS)
+    )
+
+    assert isinstance(result, ContainerCreated)
+    assert _docker_client(svc).login_calls == [{"username": "renter", "password": "renter-secret"}]
+    assert _login_step(result).skipped is False
+
+
+@pytest.mark.asyncio
+async def test_docker_login_runs_when_ships_sshd_is_none(svc, monkeypatch):
+    """LEGACY-PATH REGRESSION GUARD: retry/filler rentals omit ships_sshd (None). That
+    is not a default-image signal, so the login must still run when credentials exist."""
+    ssh_client = _ssh_client(inspect_exit=1)
+    _patch_happy(svc, monkeypatch, ssh_client)
 
     result = await _run(svc, _payload(docker_image="private/repo:1.0.0", **_CREDS))
 
@@ -749,7 +756,6 @@ async def test_docker_login_step_marked_skipped_when_no_credentials(svc, monkeyp
     reporting a 0ms step that looks like real work."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    _patch_default_images(monkeypatch, _DEFAULT_IMAGE)
 
     result = await _run(svc, _payload(docker_image="private/repo:1.0.0"))
 
@@ -759,12 +765,12 @@ async def test_docker_login_step_marked_skipped_when_no_credentials(svc, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_docker_login_runs_for_custom_build_from_default_base(svc, monkeypatch):
-    """A custom build's `FROM` may pull a private base image, so the login stays —
-    even when the payload's docker_image happens to be a default ref."""
+async def test_docker_login_runs_for_custom_build(svc, monkeypatch):
+    """A custom build's `FROM` may pull a private base image, so the login stays. The
+    backend guarantees this by forcing is_cached=False (→ ships_sshd=False) for custom
+    builds, even when the base image happens to be a default ref."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
-    _patch_default_images(monkeypatch, _DEFAULT_IMAGE)
     monkeypatch.setattr(svc, "_custom_build_image", AsyncMock(return_value=(True, None)))
 
     result = await _run(
@@ -772,6 +778,7 @@ async def test_docker_login_runs_for_custom_build_from_default_base(svc, monkeyp
         _payload(
             docker_image=_DEFAULT_IMAGE,
             dockerfile_content=f"FROM {_DEFAULT_IMAGE}\nRUN echo hi\n",
+            ships_sshd=False,
             **_CREDS,
         ),
     )

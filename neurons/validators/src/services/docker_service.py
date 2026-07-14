@@ -58,7 +58,6 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
-from services.default_docker_image_digest_service import is_default_docker_image
 from services.gpu_power_limit import (
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
@@ -3085,12 +3084,17 @@ class DockerService:
                 # itself almost always skipped (the image is pre-cached on the executor).
                 # The backend still attaches credentials whenever the renter has any
                 # saved, which costs a round-trip to auth.docker.io on every such deploy
-                # (~1.1s median in prod). Skip the login on that path; a custom build may
-                # pull a private base image in its `FROM`, so it keeps the login.
+                # (~1.1s median in prod). Skip the login on that path.
+                #
+                # `ships_sshd` IS the "renter selected a default image" signal — the
+                # backend sets it from the same check that resolves the recommended image
+                # for this executor's GPU+driver (executor.py: `ships_sshd=is_cached`,
+                # with `is_cached=False` forced for custom builds, whose `FROM` may pull a
+                # private base image and so must keep the login). Don't re-derive it here:
+                # a second, validator-side notion of "is this a default image?" could
+                # disagree with the backend's and skip a login that was actually needed.
                 has_credentials = bool(payload.docker_username and payload.docker_password)
-                skip_login = not has_credentials or (
-                    not is_custom_build and is_default_docker_image(payload.docker_image)
-                )
+                skip_login = not has_credentials or bool(payload.ships_sshd)
                 if skip_login:
                     if has_credentials:
                         logger.info(
