@@ -58,6 +58,7 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
+from services.default_docker_image_digest_service import is_default_docker_image
 from services.gpu_power_limit import (
     apply_filler_gpu_power_limits,
     raise_low_power_limits_to_default,
@@ -3074,7 +3075,26 @@ class DockerService:
                 #     log_text=f"Logging out of Docker registry",
                 #     log_extra=default_extra,
                 # )
-                if payload.docker_username and payload.docker_password:
+                # The default cache-template images are public Docker Hub refs, so a
+                # registry login buys nothing for them — the pull needs no auth and is
+                # itself almost always skipped (the image is pre-cached on the executor).
+                # The backend still attaches credentials whenever the renter has any
+                # saved, which costs a round-trip to auth.docker.io on every such deploy
+                # (~1.1s median in prod). Skip the login on that path; a custom build may
+                # pull a private base image in its `FROM`, so it keeps the login.
+                has_credentials = bool(payload.docker_username and payload.docker_password)
+                skip_login = not has_credentials or (
+                    not is_custom_build and is_default_docker_image(payload.docker_image)
+                )
+                if skip_login:
+                    if has_credentials:
+                        logger.info(
+                            _m(
+                                "Skipping docker login for default cache-template image",
+                                extra=get_extra_info(default_extra),
+                            )
+                        )
+                else:
                     current_step = "docker_login"
                     try:
                         await run_logged_rental_docker_sdk_operation(
@@ -3097,7 +3117,11 @@ class DockerService:
                         )
 
                 # Add profiler for docker login
-                profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_LOGIN, prev_timestamp))
+                profilers.append(
+                    ProfilerStep.since(
+                        ProfilerStepName.DOCKER_LOGIN, prev_timestamp, skipped=skip_login
+                    )
+                )
                 prev_timestamp = now_ms()
 
                 # When `dockerfile_content` is set, build the image on the executor
