@@ -4,9 +4,9 @@ from unittest.mock import Mock
 import asyncssh
 import pytest
 from helpers import build_context_config, build_services, build_state
+from neurons.validators.src.core.docker_utils import _collect_host_context
 from neurons.validators.src.services.task.checks.rented_machine import (
     TenantEnforcementCheck,
-    _collect_host_context,
     _collect_pod_diagnostics,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
@@ -528,8 +528,10 @@ async def test_collect_pod_diagnostics_reports_exited_container():
 
     diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
 
-    assert diagnostics["state"] == state
-    assert diagnostics["logs_tail"].endswith("traceback line 2\n")
+    assert diagnostics["container_status"] == "exited"
+    assert diagnostics["container_exit_code"] == 137
+    assert diagnostics["container_oom_killed"] is False
+    assert diagnostics["container_logs_tail"].endswith("traceback line 2\n")
     assert any("docker inspect" in cmd for cmd in ssh.commands_called)
     assert any("docker logs" in cmd for cmd in ssh.commands_called)
     # Pod-scoped commands all carry the pod name; host-context probes do not.
@@ -552,9 +554,9 @@ async def test_collect_pod_diagnostics_handles_removed_container():
 
     diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
 
-    assert "state" not in diagnostics
-    assert diagnostics["inspect_error"] == "Error: No such object: pod_abc"
-    assert "logs_tail" not in diagnostics
+    assert diagnostics["container_status"] is None
+    assert "Error: No such object: pod_abc" in diagnostics["diagnostics_capture_error"]
+    assert diagnostics["container_logs_tail"] is None
 
 
 @pytest.mark.asyncio
@@ -563,8 +565,8 @@ async def test_collect_pod_diagnostics_never_raises_on_ssh_failure():
 
     diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
 
-    assert "inspect_error" in diagnostics
-    assert "ssh failed" in diagnostics["inspect_error"]
+    assert diagnostics["diagnostics_capture_error"] is not None
+    assert "ssh failed" in diagnostics["diagnostics_capture_error"]
 
 
 @pytest.mark.asyncio
@@ -587,8 +589,8 @@ async def test_collect_pod_diagnostics_includes_host_context_when_available():
 
     diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
 
-    assert diagnostics["state"]["OOMKilled"] is True
-    assert diagnostics["host_context"] == {
+    assert diagnostics["container_oom_killed"] is True
+    assert diagnostics["container_host_context"] == {
         "host_boot_time": "2026-04-03 10:07:20",
         "executor_container_name": "executor-executor-1",
         "executor_container_started_at": "2026-04-20T03:23:42.619916501Z",
