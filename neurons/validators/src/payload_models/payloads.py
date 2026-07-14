@@ -46,7 +46,6 @@ class CustomOptions(BaseModel):
     @staticmethod
     def _sanitize_volumes(volumes: list[str]) -> list[str]:
         """Sanitize volume mounts to prevent command injection."""
-        import re
         sanitized = []
         for volume in volumes:
             if not volume or not volume.strip():
@@ -226,6 +225,13 @@ class PayloadPortMapping(BaseModel):
     external_port: int
 
 
+class GpuPowerLimit(BaseModel):
+    # DAH-2356: one GPU's power cap for the Lium PEARL default job (see gpu_power_limits below).
+    # gt=0: reject a buggy backend value (0/negative) at the boundary, not as a hardware-minimum cap.
+    gpu_uuid: str
+    watts: int = Field(gt=0)
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
     """Container creation request from the backend.
 
@@ -279,6 +285,12 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # deploy (RuntimeError -> FailedContainerRequest). None/False keeps
     # bootstrap failures lenient (logged, deploy continues).
     ships_sshd: bool | None = None
+    # DAH-2356: per-GPU power caps for the Lium PEARL default-job (FILLER) container. Applied
+    # host-side via `nvidia-smi -pl` (clamped to the GPU's live min/max) before the filler starts;
+    # the pre-cap limit is recorded and restored on delete. None -> no cap (customer rentals, DPHN,
+    # miner default jobs). MUST be declared here or pydantic drops it on deserialization of the
+    # backend's request.
+    gpu_power_limits: list[GpuPowerLimit] | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):

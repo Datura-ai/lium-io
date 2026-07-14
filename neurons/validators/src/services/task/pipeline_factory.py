@@ -308,7 +308,9 @@ class PipelineFactory:
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
-                GpuPowerLimitCheck(),
+                # restore_stale_caps=False: dry run must not run nvidia-smi -pl on the executor or
+                # consume the shared gpu_power_restore:* records the production pipeline relies on.
+                GpuPowerLimitCheck(restore_stale_caps=False),
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),

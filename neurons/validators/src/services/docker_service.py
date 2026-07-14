@@ -1,82 +1,82 @@
 import asyncio
 import ipaddress
+import logging
 import math
 import random
-from dataclasses import dataclass
-import logging
 import re
+import secrets
+import shlex
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
-from uuid import uuid4, UUID
-import shlex
-import secrets
+from uuid import UUID, uuid4
+
 import aiohttp
 import asyncssh
 import bittensor
 import redis.exceptions
-from datura.requests.miner_requests import ExecutorSSHInfo
-from fastapi import Depends
-from tenacity import RetryError
-from payload_models.payloads import (
-    ContainerCreateRequest,
-    ContainerBaseRequest,
-    ContainerDeleteRequest,
-    ContainerStartRequest,
-    ContainerStopRequest,
-    AddSshPublicKeyRequest,
-    RemoveSshPublicKeysRequest,
-    ContainerCreated,
-    ContainerDeleted,
-    ContainerStarted,
-    ContainerStopped,
-    SshPubKeyAdded,
-    SshPubKeyRemoved,
-    FailedContainerErrorCodes,
-    FailedContainerRequest,
-    FailedContainerErrorTypes,
-    ExternalVolumeInfo,
-    InstallJupyterServerRequest,
-    JupyterServerInstalled,
-    JupyterInstallationFailed,
-    CustomOptions,
-    ContainerWarningCode,
-    PayloadPortMapping,
-    ProfilerStep,
-    ProfilerStepName,
-    WorkloadKind,
-    now_ms,
-)
-from protocol.vc_protocol.compute_requests import RentedMachine
-
-from core.config import settings
 from core.docker_utils import (
     ContainerDeathDiagnostics,
     collect_container_death_diagnostics,
 )
-from core.utils import _m, get_extra_info, retry_ssh_command
-from services.ssh_connect_timing import connect_with_phase_timing
+from datura.requests.miner_requests import ExecutorSSHInfo
+from fastapi import Depends
+from payload_models.payloads import (
+    AddSshPublicKeyRequest,
+    ContainerBaseRequest,
+    ContainerCreated,
+    ContainerCreateRequest,
+    ContainerDeleted,
+    ContainerDeleteRequest,
+    ContainerStartRequest,
+    ContainerStopRequest,
+    ContainerWarningCode,
+    CustomOptions,
+    ExternalVolumeInfo,
+    FailedContainerErrorCodes,
+    FailedContainerErrorTypes,
+    FailedContainerRequest,
+    InstallJupyterServerRequest,
+    JupyterInstallationFailed,
+    JupyterServerInstalled,
+    PayloadPortMapping,
+    ProfilerStep,
+    ProfilerStepName,
+    RemoveSshPublicKeysRequest,
+    SshPubKeyAdded,
+    SshPubKeyRemoved,
+    WorkloadKind,
+    now_ms,
+)
+from services.attestation_service import AttestationError, AttestationService
 from services.const import (
     FILLER_CONTAINER_PREFIX,
+    MIN_PORT_COUNT,
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
-    MIN_PORT_COUNT,
 )
+from services.gpu_power_limit import (
+    apply_filler_gpu_power_limits,
+    raise_low_power_limits_to_default,
+    restore_all_host_gpu_power_limits,
+    restore_filler_pod_gpu_power_limits,
+    restore_tracked_gpu_power_limits,
+)
+from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
 )
-from services.attestation_service import AttestationService, AttestationError
-from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.rental_docker_observability import (
     exec_logged_rental_docker_sdk_operation,
     rental_run_spec_log_fields,
     run_logged_rental_docker_sdk_operation,
 )
 from services.rental_docker_sdk import (
+    DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     ContainerExecSpec,
     ContainerRunSpec,
-    DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     DeviceMount,
     PortBinding,
     RentalDockerConnectionError,
@@ -89,6 +89,11 @@ from services.rental_docker_sdk import (
     build_remove_authorized_keys_exec_spec,
     require_rental_docker_ssh_host_key,
 )
+from services.ssh_connect_timing import connect_with_phase_timing
+from tenacity import RetryError
+
+from core.config import settings
+from core.utils import _m, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
@@ -948,7 +953,7 @@ class DockerService:
                     status, error = await asyncio.wait_for(self._stream_process_output(process, log_tag), timeout=timeout)
                 else:
                     status, error = await self._stream_process_output(process, log_tag)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             status = False
             error = "Process timed out"
             await self.stream_log(error, "error", log_tag)
@@ -1200,7 +1205,7 @@ class DockerService:
         active_container_names: list[str] | None = None,
         active_volume_names: list[str] | None = None,
     ):
-        command = f'/usr/bin/docker ps -a --format "{{{{.Names}}}}"'
+        command = '/usr/bin/docker ps -a --format "{{.Names}}"'
         result = await ssh_client.run(command)
         if result.stdout.strip():
             # Optional pre-GC delay (default 0). DAH-1524 removed the 10s
@@ -1851,7 +1856,7 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
     ):
         # disable volume plugin
-        command = f"/usr/bin/docker plugin disable s3fs -f"
+        command = "/usr/bin/docker plugin disable s3fs -f"
         await ssh_client.run(command)
 
     async def run_jupyter(
@@ -1960,7 +1965,7 @@ class DockerService:
         timeout: int | None = None,
     ):
         """Get Docker storage info using docker info command"""
-        command = f"/usr/bin/docker info --format '{{{{.DockerRootDir}}}}'"
+        command = "/usr/bin/docker info --format '{{.DockerRootDir}}'"
         if timeout is None:
             result = await ssh_client.run(command)
         else:
@@ -3213,6 +3218,44 @@ class DockerService:
                     payload.gpu_uuids,
                 )
 
+                # DAH-2356: cap GPU power for the Lium PEARL filler (only PEARL carries
+                # gpu_power_limits). Fail-closed: apply undoes any partial work on failure, and the
+                # raise records this create FAILED (12h backoff) — never run the miner uncapped.
+                if payload.workload_kind == WorkloadKind.FILLER and payload.gpu_power_limits:
+                    current_step = "gpu_power_cap"
+                    cap_applied = await apply_filler_gpu_power_limits(
+                        ssh_client,
+                        payload.gpu_power_limits,
+                        self.redis_service,
+                        payload.pod_id,
+                        payload.executor_id,
+                        log_extra=default_extra,
+                    )
+                    if not cap_applied:
+                        raise RuntimeError("GPU power cap could not be applied; refusing to start PEARL filler uncapped")
+                else:
+                    # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
+                    # without its own cap starts, so a customer (or an uncapped filler) never
+                    # inherits a reduced limit. Best-effort, never blocks the rental.
+                    if payload.gpu_uuids:
+                        await restore_tracked_gpu_power_limits(
+                            ssh_client, self.redis_service, payload.gpu_uuids, log_extra=default_extra
+                        )
+                    else:
+                        # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
+                        await restore_all_host_gpu_power_limits(
+                            ssh_client, self.redis_service, log_extra=default_extra
+                        )
+                    # State-free last-resort net: if a pre-cap record was lost, the record-based
+                    # restore above did nothing — lift anything still below the check's floor back
+                    # to the GPU's own default, so the customer never starts on a capped GPU.
+                    await raise_low_power_limits_to_default(
+                        ssh_client,
+                        payload.executor_id,
+                        payload.gpu_uuids or None,
+                        log_extra=default_extra,
+                    )
+
                 # DAH-1524: build_gpu_flags issues 2-3 serial SSH probes (proc minor
                 # map, shared nodes, and a slow nvidia-smi -q -x fallback). Profile it
                 # apart from the docker run so a slow probe doesn't read as a slow run.
@@ -3287,7 +3330,7 @@ class DockerService:
                         log_tag=log_tag,
                     )
 
-                    logger.info(f"Container creation step finished")
+                    logger.info("Container creation step finished")
 
                     # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
                     # --gpus prestart hook, +sysbox/storage-opt) from the post-run
@@ -3952,6 +3995,13 @@ class DockerService:
                     pod_id=payload.pod_id,
                     default_extra=default_extra,
                 )
+
+                # DAH-2356: restore the pre-cap GPU power limits after a Lium PEARL filler is
+                # removed, so the next rental gets the machine at its original power.
+                if payload.workload_kind == WorkloadKind.FILLER:
+                    await restore_filler_pod_gpu_power_limits(
+                        ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
+                    )
 
                 try:
                     await run_logged_rental_docker_sdk_operation(
