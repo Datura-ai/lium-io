@@ -1,6 +1,5 @@
 import asyncio
 import ipaddress
-import json
 import math
 import random
 from dataclasses import dataclass
@@ -51,6 +50,10 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import RentedMachine
 
 from core.config import settings
+from core.docker_utils import (
+    ContainerDeathDiagnostics,
+    collect_container_death_diagnostics,
+)
 from core.utils import _m, get_extra_info, retry_ssh_command
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.const import (
@@ -169,26 +172,6 @@ _VOLUME_SIZE_SUFFIX_MULTIPLIERS = {
 
 class VolumeMinSizeError(Exception):
     """Fresh vloopback sizing produced a volume smaller than the requested minimum."""
-
-
-_FAILED_CONTAINER_LOGS_TAIL_LINES = 100
-# Bounded so a crash-looping worker can't flood the log line; keep the tail,
-# not the head — a dying entrypoint prints its fatal error last.
-_FAILED_CONTAINER_LOGS_MAX_CHARS = 4000
-
-
-@dataclass
-class FailedContainerDiagnostics:
-    """Post-mortem of a container that died during create_container (DAH-2395).
-
-    This is the only durable record of WHY the container died: cleanup
-    force-removes it right after, and the executor host belongs to the miner,
-    so there is no second chance to inspect anything.
-    """
-
-    state: dict | None = None  # parsed `docker inspect .State`: OOMKilled, ExitCode, Error, ...
-    logs_tail: str | None = None  # bounded tail of `docker logs`
-    capture_error: str | None = None  # why (part of) the capture failed, when it did
 
 
 @dataclass
@@ -1367,8 +1350,8 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         default_extra: dict,
         container_name: str,
-    ) -> FailedContainerDiagnostics:
-        """Read why a container died (inspect .State + logs tail) and log it.
+    ) -> ContainerDeathDiagnostics:
+        """Read why a container died (inspect .State + logs tail + host context) and log it.
 
         Runs right before the failed container is force-removed: after that the
         OOMKilled/ExitCode verdict and the entrypoint output are gone, and the
@@ -1377,56 +1360,18 @@ class DockerService:
         Best-effort — never raises (cancellation excepted), so the cleanup
         itself is never blocked by a diagnostics failure.
         """
-        diagnostics = FailedContainerDiagnostics()
-        capture_errors: list[str] = []
-        container = shlex.quote(container_name)
+        diagnostics = await collect_container_death_diagnostics(ssh_client, container_name)
 
-        try:
-            inspect_result = await ssh_client.run(
-                f"/usr/bin/docker inspect -f '{{{{json .State}}}}' {container}"
-            )
-            if inspect_result.exit_status == 0:
-                parsed_state = json.loads(inspect_result.stdout or "null")
-                if isinstance(parsed_state, dict):
-                    diagnostics.state = parsed_state
-                else:
-                    capture_errors.append(f"inspect: non-object state JSON: {parsed_state!r}")
-            else:
-                capture_errors.append(f"inspect: {(inspect_result.stderr or '').strip()}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            capture_errors.append(f"inspect: {exc}")
-
-        try:
-            logs_result = await ssh_client.run(
-                f"/usr/bin/docker logs --tail {_FAILED_CONTAINER_LOGS_TAIL_LINES} {container} 2>&1 || true"
-            )
-            logs_text: str = logs_result.stdout or ""
-            diagnostics.logs_tail = logs_text[-_FAILED_CONTAINER_LOGS_MAX_CHARS:]
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            capture_errors.append(f"logs: {exc}")
-
-        if capture_errors:
-            diagnostics.capture_error = "; ".join(capture_errors)
-
-        state: dict = diagnostics.state or {}
-        # OOMKilled/ExitCode as top-level fields so Loki can filter on them
-        # directly (`json | container_oom_killed="true"`) without digging
-        # through the nested state object.
+        # Flat OOMKilled/ExitCode as top-level fields so Loki can filter on them
+        # directly (`json | container_oom_killed="true"`); same shape as the
+        # run-time pod-death path so both are queryable together.
         logger.warning(
             _m(
                 "Failed container diagnostics before cleanup",
                 extra=get_extra_info({
                     **default_extra,
                     "container_name": container_name,
-                    "container_state": diagnostics.state,
-                    "container_oom_killed": state.get("OOMKilled"),
-                    "container_exit_code": state.get("ExitCode"),
-                    "container_logs_tail": diagnostics.logs_tail,
-                    "diagnostics_capture_error": diagnostics.capture_error,
+                    **diagnostics.to_log_fields(),
                 }),
             )
         )

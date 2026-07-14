@@ -1,10 +1,8 @@
-import json
-import shlex
 from collections.abc import Iterable
 
 import asyncssh
 
-from core.docker_utils import DockerCommand
+from core.docker_utils import DockerCommand, collect_container_death_diagnostics
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 
 from ...const import (
@@ -304,105 +302,14 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
     return pod_running, ssh_keys
 
 
-_POD_LOG_TAIL_LINES = 50
-_POD_LOG_TAIL_CHAR_LIMIT = 4000
+async def _collect_pod_diagnostics(
+    ssh_client: asyncssh.SSHClientConnection, container_name: str
+) -> dict[str, object]:
+    """Diagnostics for a pod the ps-running check reported as down (run-time death).
 
-
-async def _collect_pod_diagnostics(ssh_client, container_name: str) -> dict:
-    """Collect raw Docker diagnostics for a pod that the ps-running check reported as down.
-
-    Uses the already-open SSH session to query the executor's local Docker daemon. Returns
-    whatever it can: container state (ExitCode, OOMKilled, Error, FinishedAt, ...) and a
-    tail of stdout/stderr logs. When the container has been removed both calls fail and we
-    surface the errors so the operator can distinguish "exited in place" from "rm'd".
+    Shares one collector and one flat Loki field shape with the create-time
+    failure path in docker_service (DAH-2395 / DAH-2193), so container deaths at
+    create time and run time are queryable together.
     """
-    quoted_name = shlex.quote(container_name)
-    result: dict = {}
-
-    try:
-        state_cmd = f"/usr/bin/docker inspect --format '{{{{json .State}}}}' {quoted_name}"
-        inspect_result = await ssh_client.run(state_cmd)
-        raw_state = (inspect_result.stdout or "").strip()
-        if raw_state:
-            state = json.loads(raw_state)
-            result["state"] = {
-                "Status": state.get("Status"),
-                "ExitCode": state.get("ExitCode"),
-                "OOMKilled": state.get("OOMKilled"),
-                "Error": state.get("Error"),
-                "StartedAt": state.get("StartedAt"),
-                "FinishedAt": state.get("FinishedAt"),
-            }
-        else:
-            stderr = getattr(inspect_result, "stderr", "")
-            stderr = stderr.strip() if isinstance(stderr, str) else ""
-            result["inspect_error"] = stderr or "empty stdout"
-    except Exception as exc:
-        result["inspect_error"] = str(exc)
-
-    try:
-        logs_cmd = (
-            f"/usr/bin/docker logs --tail {_POD_LOG_TAIL_LINES} {quoted_name} 2>&1"
-        )
-        logs_result = await ssh_client.run(logs_cmd)
-        tail = (logs_result.stdout or "")[-_POD_LOG_TAIL_CHAR_LIMIT:]
-        if tail:
-            result["logs_tail"] = tail
-    except Exception as exc:
-        result["logs_error"] = str(exc)
-
-    host_context = await _collect_host_context(ssh_client)
-    if host_context:
-        result["host_context"] = host_context
-
-    return result
-
-
-async def _collect_host_context(ssh_client) -> dict:
-    """Collect executor-host context that helps distinguish real pod failure from host reboot
-    or executor-container restart.
-
-    Two independent signals:
-      - `host_boot_time` from `uptime -s` — if it is close to the pod's FinishedAt, the host
-        likely rebooted and the pod did not come back up on its own.
-      - `executor_container_started_at` — if far newer than `host_boot_time`, the executor
-        container itself restarted (watchtower, compose restart, autoheal) without a full
-        host reboot. The executor container is located via the compose service label so
-        that the lookup survives renames.
-
-    All failures are swallowed into `*_error` fields — this runs on the already-open SSH
-    session, so we prefer empty signal over raising and losing the rest of the event.
-    """
-    result: dict = {}
-
-    try:
-        uptime_result = await ssh_client.run("uptime -s")
-        boot_time = (uptime_result.stdout or "").strip()
-        if boot_time:
-            result["host_boot_time"] = boot_time
-    except Exception as exc:
-        result["host_boot_error"] = str(exc)
-
-    try:
-        name_cmd = (
-            "/usr/bin/docker ps -a "
-            "--filter label=com.docker.compose.service=executor "
-            "--format '{{.Names}}' | head -n 1"
-        )
-        name_result = await ssh_client.run(name_cmd)
-        executor_name = (name_result.stdout or "").strip().splitlines()[0:1]
-        executor_name = executor_name[0] if executor_name else ""
-        if executor_name:
-            quoted_executor = shlex.quote(executor_name)
-            start_cmd = (
-                f"/usr/bin/docker inspect --format '{{{{.State.StartedAt}}}}' {quoted_executor}"
-            )
-            start_result = await ssh_client.run(start_cmd)
-            started_at = (start_result.stdout or "").strip()
-            if started_at:
-                result["executor_container_name"] = executor_name
-                result["executor_container_started_at"] = started_at
-    except Exception as exc:
-        result["executor_container_error"] = str(exc)
-
-    return result
+    diagnostics = await collect_container_death_diagnostics(ssh_client, container_name)
+    return diagnostics.to_log_fields()

@@ -12,11 +12,11 @@ import asyncio
 from unittest.mock import Mock, patch
 
 import pytest
-from services.docker_service import (
-    _FAILED_CONTAINER_LOGS_MAX_CHARS,
-    DockerService,
-    FailedContainerDiagnostics,
+from core.docker_utils import (
+    _CONTAINER_DEATH_LOG_MAX_CHARS,
+    ContainerDeathDiagnostics,
 )
+from services.docker_service import DockerService
 
 CONTAINER_NAME = "filler_63409a62-e024-414d-99aa-ba6f30be1bfd"
 DEFAULT_EXTRA: dict = {"miner_hotkey": "test_miner", "executor_uuid": "test_executor"}
@@ -151,8 +151,9 @@ async def test_diagnostics_reports_missing_container_without_failing(docker_serv
         )
 
     # Assert
-    assert isinstance(diagnostics, FailedContainerDiagnostics)
-    assert diagnostics.state is None
+    assert isinstance(diagnostics, ContainerDeathDiagnostics)
+    assert diagnostics.exit_code is None
+    assert diagnostics.oom_killed is None
     assert "No such container" in diagnostics.capture_error
     assert len(_diagnostics_log_extras(mock_logger)) == 1
 
@@ -174,7 +175,7 @@ async def test_diagnostics_treats_non_object_inspect_json_as_capture_error(docke
         )
 
     # Assert
-    assert diagnostics.state is None
+    assert diagnostics.status is None
     assert "inspect" in diagnostics.capture_error
     assert len(_diagnostics_log_extras(mock_logger)) == 1
 
@@ -184,7 +185,7 @@ async def test_diagnostics_logs_tail_is_size_bounded(docker_service):
     # Arrange: an oversized log where the fatal line is at the very end
     ssh_client = _FakeSSHClient()
     ssh_client.results_by_substring["docker inspect"] = _SSHRunResult(stdout=INSPECT_STATE_JSON)
-    oversized_logs = ("x" * (_FAILED_CONTAINER_LOGS_MAX_CHARS * 3)) + "FATAL: worker crashed"
+    oversized_logs = ("x" * (_CONTAINER_DEATH_LOG_MAX_CHARS * 3)) + "FATAL: worker crashed"
     ssh_client.results_by_substring["docker logs"] = _SSHRunResult(stdout=oversized_logs)
 
     # Act
@@ -196,7 +197,7 @@ async def test_diagnostics_logs_tail_is_size_bounded(docker_service):
         )
 
     # Assert: bounded, and the tail (where the death reason lives) is preserved
-    assert len(diagnostics.logs_tail) == _FAILED_CONTAINER_LOGS_MAX_CHARS
+    assert len(diagnostics.logs_tail) == _CONTAINER_DEATH_LOG_MAX_CHARS
     assert diagnostics.logs_tail.endswith("FATAL: worker crashed")
 
 
