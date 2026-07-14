@@ -8,7 +8,9 @@ Covers (from the plan's Test Plan):
   (DAH-2265) — the image ships+starts sshd itself, so the validator only
   re-ensures ~/.ssh for key injection. Includes the DEFAULT-PATH REGRESSION
   GUARD. When `ships_sshd` is set with `enable_jupyter`, the validator forwards
-  ENABLE_JUPYTER as a docker-run env var instead of running run_jupyter.
+  JUPYTER_PASSWORD as a docker-run env var instead of running run_jupyter — that
+  is the only Jupyter variable the image's start.sh reads — and falls back to
+  run_jupyter if the mapped docker port is not the 8888 the image hardcodes.
 - Profile summary log (#3): emitted once on success, survives the mixed-shape
   profilers list, and NOT emitted on the failure path.
 - Backward compat: payloads omitting `ships_sshd` deserialize with None.
@@ -377,8 +379,8 @@ async def test_ships_sshd_false_preserves_lenient_bootstrap_failure(svc, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_ships_sshd_true_forwards_jupyter_env_instead_of_run_jupyter(svc, monkeypatch):
-    """DAH-2265: ships_sshd + enable_jupyter → forward ENABLE_JUPYTER as a
+async def test_ships_sshd_true_forwards_jupyter_password_instead_of_run_jupyter(svc, monkeypatch):
+    """DAH-2265: ships_sshd + enable_jupyter → forward JUPYTER_PASSWORD as a
     docker-run env var and let the image launch Jupyter, rather than running
     the validator's run_jupyter path."""
     ssh_client = _ssh_client(inspect_exit=0)
@@ -396,22 +398,43 @@ async def test_ships_sshd_true_forwards_jupyter_env_instead_of_run_jupyter(svc, 
     svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_not_awaited()
     svc.run_jupyter.assert_not_awaited()
 
-    # ENABLE_JUPYTER (+ token + port) is forwarded as create-time container env so
-    # the image's start.sh launches Jupyter itself (it reads them once at startup).
+    # JUPYTER_PASSWORD is forwarded as create-time container env: it is the ONLY
+    # Jupyter variable the image's start.sh reads (`if [[ $JUPYTER_PASSWORD ]]` →
+    # `jupyter lab --ServerApp.token=$JUPYTER_PASSWORD`). Forwarding ENABLE_JUPYTER /
+    # JUPYTER_TOKEN instead left the gate closed and Jupyter never started.
     env = _created_run_spec(svc).environment
-    assert env.get("ENABLE_JUPYTER") == "true"
-    assert env.get("JUPYTER_PORT") == "8888"
-    token = env.get("JUPYTER_TOKEN")
+    token = env.get("JUPYTER_PASSWORD")
     assert token
 
-    # The returned URL uses the same token the validator forwarded to the image.
+    # The returned URL uses the same token the image will serve Jupyter as.
     assert result.jupyter_url == f"http://127.0.0.1:30888/lab?token={token}"
+
+
+@pytest.mark.asyncio
+async def test_image_managed_jupyter_falls_back_when_docker_port_is_not_8888(svc, monkeypatch):
+    """The image's start.sh hardcodes `jupyter lab --port=8888`. If the mapped docker
+    port ever moved off 8888 the image's Jupyter would be unreachable, so the validator
+    must fall back to its own run_jupyter rather than silently serving nothing."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(
+        svc, "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], (9999, 30888))),
+    )
+
+    result = await _run(svc, _payload(ships_sshd=True, enable_jupyter=True))
+
+    assert isinstance(result, ContainerCreated)
+    # sshd is still the image's job, but Jupyter falls back to the validator.
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_not_awaited()
+    svc.run_jupyter.assert_awaited_once()
+    assert "JUPYTER_PASSWORD" not in _created_run_spec(svc).environment
 
 
 @pytest.mark.asyncio
 async def test_ships_sshd_none_with_jupyter_uses_run_jupyter(svc, monkeypatch):
     """Regression guard: the default path (ships_sshd None) still runs the
-    validator's run_jupyter and does NOT forward ENABLE_JUPYTER."""
+    validator's run_jupyter and does NOT forward JUPYTER_PASSWORD."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
     monkeypatch.setattr(
@@ -424,7 +447,7 @@ async def test_ships_sshd_none_with_jupyter_uses_run_jupyter(svc, monkeypatch):
     assert isinstance(result, ContainerCreated)
     svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
     svc.run_jupyter.assert_awaited_once()
-    assert "ENABLE_JUPYTER" not in _created_run_spec(svc).environment
+    assert "JUPYTER_PASSWORD" not in _created_run_spec(svc).environment
 
 
 @pytest.mark.asyncio

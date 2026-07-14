@@ -131,6 +131,11 @@ CONTAINER_STOP_GRACE_SECONDS = 30
 # and avoid the containerd/sysbox wedge. Keep in sync with compute-app FILLER_STOP_WAIT_TIMEOUT_SECONDS.
 FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
 
+# In-container port the cache-template images' start.sh hardcodes for Jupyter
+# (`jupyter lab --port=8888`). It reads no port from the environment, so the
+# image-managed Jupyter path is only safe while the mapped docker port is this one.
+IMAGE_JUPYTER_DOCKER_PORT = 8888
+
 DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
 }
@@ -3213,19 +3218,37 @@ class DockerService:
                 # Get the container path from the first volume
                 local_volume_path = custom_options.volumes[0].split(':')[-1] if custom_options.volumes else '/root'
                 # DAH-2265: default-image / cached-template rentals set `ships_sshd`.
-                # Those images run their own start.sh, which starts sshd
-                # unconditionally and launches Jupyter when ENABLE_JUPYTER is set. So
-                # rather than have the validator bootstrap sshd and run run_jupyter
-                # post-create (see below), we let the image do it: forward
-                # ENABLE_JUPYTER (+ a validator-chosen token and the mapped port) as
-                # container env vars. These MUST be present at `docker run` time —
-                # start.sh (the image entrypoint) reads them once at container startup,
-                # so a post-create /etc/environment write would be too late. They are
-                # injected into custom_options.environment here so _build_rental_container_run_spec
-                # carries them into the run spec (create-time env), not the post-create
+                # Those images run their own start.sh, which starts sshd unconditionally
+                # and launches Jupyter itself. Rather than have the validator bootstrap
+                # sshd and run run_jupyter post-create (see below), we let the image do
+                # both and forward the Jupyter token as a container env var.
+                #
+                # The image's contract is JUPYTER_PASSWORD and nothing else: start.sh
+                # gates on `if [[ $JUPYTER_PASSWORD ]]` and hands it straight to
+                # `jupyter lab --ServerApp.token=$JUPYTER_PASSWORD`, with the in-container
+                # port hardcoded to 8888. It reads neither ENABLE_JUPYTER nor JUPYTER_PORT
+                # (no image in computenet-docker-images does), so forwarding only those
+                # left start.sh's gate closed: Jupyter never started, yet the port was
+                # still mapped, so the pod came up Running with a Jupyter URL that reset
+                # the connection. JUPYTER_PASSWORD is also the name the validator's own
+                # run_jupyter.sh takes (`--password=`), so both paths now agree.
+                #
+                # This MUST be set at `docker run` time — start.sh (the image entrypoint)
+                # reads the environment once at container startup, so a post-create
+                # /etc/environment write would be too late. It is injected into
+                # custom_options.environment here so _build_rental_container_run_spec
+                # carries it into the run spec (create-time env), not the post-create
                 # add_environment_variables step.
+                #
+                # Guard on the mapped docker port: start.sh always binds 8888, so if the
+                # mapping ever moved off that port the image's Jupyter would be
+                # unreachable. Fall back to the validator's run_jupyter in that case
+                # rather than silently serving nothing.
                 image_managed_jupyter = bool(
-                    payload.ships_sshd and payload.enable_jupyter and jupyter_port_map
+                    payload.ships_sshd
+                    and payload.enable_jupyter
+                    and jupyter_port_map
+                    and jupyter_port_map[0] == IMAGE_JUPYTER_DOCKER_PORT
                 )
                 image_jupyter_token = (
                     secrets.token_hex(16) if image_managed_jupyter else None
@@ -3233,9 +3256,7 @@ class DockerService:
                 if image_managed_jupyter:
                     custom_options.environment = {
                         **(custom_options.environment or {}),
-                        "ENABLE_JUPYTER": "true",
-                        "JUPYTER_TOKEN": image_jupyter_token,
-                        "JUPYTER_PORT": str(jupyter_port_map[0]),
+                        "JUPYTER_PASSWORD": image_jupyter_token,
                     }
 
                 container_name = self.get_container_name(payload)
@@ -3586,10 +3607,10 @@ class DockerService:
                     if payload.enable_jupyter and jupyter_port_map:
                         current_step = "jupyter_setup"
                         if image_managed_jupyter:
-                            # DAH-2265: the image's start.sh already launched Jupyter
-                            # from the ENABLE_JUPYTER / JUPYTER_TOKEN / JUPYTER_PORT env
-                            # vars forwarded at `docker run` above. Don't run
-                            # run_jupyter; just build the URL from the token we chose.
+                            # DAH-2265: the image's start.sh already launched Jupyter from
+                            # the JUPYTER_PASSWORD forwarded at `docker run` above, and
+                            # serves it as that token. Don't run run_jupyter; just build
+                            # the URL from the same token.
                             jupyter_token = image_jupyter_token
                         else:
                             jupyter_token = secrets.token_hex(16)
