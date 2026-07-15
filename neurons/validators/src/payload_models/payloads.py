@@ -291,8 +291,16 @@ class ContainerCreateRequest(ContainerBaseRequest):
     #     `docker run -e` env var so the image's start.sh launches Jupyter itself and
     #     serves it as that token. JUPYTER_PASSWORD is the only Jupyter variable these
     #     images read (start.sh gates on it and hardcodes the in-container port 8888).
+    # CAVEAT — this only holds when the image's own start.sh actually runs. start.sh is
+    # the image CMD, exec'd by the ENTRYPOINT (/pytorch-entrypoint.sh). A renter-supplied
+    # `startup_commands` is passed as the container command and REPLACES that CMD, and a
+    # renter `entrypoint` replaces the ENTRYPOINT — either way start.sh never runs and the
+    # image starts no sshd/Jupyter. The validator therefore only takes the skip path when
+    # BOTH are empty (see docker_service.create_container `image_manages_services`); with
+    # an override present it falls back to the full bootstrap + run_jupyter.
     # None/False (default) preserves the always-bootstrap + run_jupyter behavior.
-    # Populated by lium-io-backend in a follow-up; ships inert here (no producer sets it yet).
+    # Set by lium-io-backend as `ships_sshd=is_cached` (DAH-1524) for default/cached-template
+    # images, independent of startup_commands — so the skip path is reachable in production.
     ships_sshd: bool | None = None
     # DAH-2356: per-GPU power caps for the Lium PEARL default-job (FILLER) container. Applied
     # host-side via `nvidia-smi -pl` (clamped to the GPU's live min/max) before the filler starts;
