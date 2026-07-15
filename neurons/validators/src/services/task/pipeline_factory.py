@@ -35,6 +35,7 @@ from .checks import (
     DuplicateExecutorCheck,
     FinalizeCheck,
     GpuCountCheck,
+    FillerMiningHealthCheck,
     GpuFingerprintCheck,
     GpuModelValidCheck,
     GpuPowerLimitCheck,
@@ -272,6 +273,9 @@ class PipelineFactory:
                 InspectorRentedCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
+                # DAH-2419: non-fatal diagnostic — snaps the worker log when a filler is up but not
+                # holding the GPU (dead/wedged). Never changes score; runs after GPU usage is known.
+                FillerMiningHealthCheck(),
                 VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),
@@ -326,6 +330,9 @@ class PipelineFactory:
                 SysboxRequiredCheck(),
                 TenantEnforcementCheck(),
                 GpuUsageCheck(),
+                # DAH-2419: non-fatal diagnostic — snaps the worker log when a filler is up but not
+                # holding the GPU (dead/wedged). Never changes score; runs after GPU usage is known.
+                FillerMiningHealthCheck(),
                 # VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),

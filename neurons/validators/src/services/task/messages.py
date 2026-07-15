@@ -690,6 +690,31 @@ class GpuUsageMessages:
     )
 
 
+class FillerMiningHealthMessages:
+    NO_FILLER = MessageTemplate(
+        event="No Lium filler on executor",
+        reason="FILLER_MINING_HEALTH_NO_FILLER",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    MINING_OK = MessageTemplate(
+        event="Lium filler is holding the GPU",
+        reason="FILLER_MINING_HEALTH_OK",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
+    NOT_MINING = MessageTemplate(
+        event="Lium filler running but not mining",
+        reason="FILLER_MINING_HEALTH_NOT_MINING",
+        severity="warning",
+        category="runtime",
+        # Diagnostic only — never fails the miner or changes score.
+        impact="Diagnostic: worker log captured for investigation",
+    )
+
+
 class PortConnectivityMessages:
     SKIPPED_RENTED = MessageTemplate(
         event="Port connectivity skipped for rented executor",

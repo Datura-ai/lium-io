@@ -4,6 +4,7 @@ from .capability import CapabilityCheck
 from .collateral import CollateralCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
 from .duplicate_executor import DuplicateExecutorCheck
+from .filler_mining_health import FillerMiningHealthCheck
 from .finalize import FinalizeCheck
 from .gpu_count import GpuCountCheck
 from .gpu_fingerprint import GpuFingerprintCheck
@@ -34,6 +35,7 @@ __all__ = [
     "CollateralCheck",
     "CustomBuildOrphanSweepCheck",
     "DuplicateExecutorCheck",
+    "FillerMiningHealthCheck",
     "FinalizeCheck",
     "GpuCountCheck",
     "GpuFingerprintCheck",
