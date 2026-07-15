@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from uuid import uuid4, UUID
 from datetime import datetime
 
+from docker.errors import APIError
 import pytest
 import pytest_asyncio
 from tenacity import Future, RetryError
@@ -12,9 +13,15 @@ from services.docker_service import (
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
     VolumeMinSizeError,
+    _is_docker_container_removal_in_progress_error,
     _parse_volume_size_to_bytes,
 )
-from services.rental_docker_sdk import ContainerExecResult, build_gpu_docker_config
+from services.rental_docker_sdk import (
+    ContainerExecResult,
+    RentalDockerOperationError,
+    _wrap_error_message,
+    build_gpu_docker_config,
+)
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
     ContainerCreateRequest,
@@ -846,6 +853,25 @@ def _make_retry_error(exc: Exception) -> RetryError:
     future = Future(1)
     future.set_exception(exc)
     return RetryError(future)
+
+
+def test_docker_container_removal_in_progress_detection_covers_docker_py_api_error():
+    exc = APIError(
+        "409 Client Error for http+docker://ssh/v1.52/containers/pod_stuck: "
+        'Conflict ("removal of container pod_stuck is already in progress")'
+    )
+    wrapped = RentalDockerOperationError(_wrap_error_message("Docker SDK remove container failed", exc))
+
+    assert _is_docker_container_removal_in_progress_error(exc)
+    assert _is_docker_container_removal_in_progress_error(wrapped)
+    assert _is_docker_container_removal_in_progress_error(_make_retry_error(exc))
+    assert _is_docker_container_removal_in_progress_error(_make_retry_error(wrapped))
+    assert not _is_docker_container_removal_in_progress_error(
+        APIError(
+            "409 Client Error for http+docker://ssh/v1.52/containers/pod_stuck: "
+            'Conflict ("container name is already in use")'
+        )
+    )
 
 
 @pytest.mark.asyncio
