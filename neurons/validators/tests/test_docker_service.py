@@ -1507,6 +1507,57 @@ async def test_create_filler_skips_inspector_collector_start(docker_service, mon
 
 
 @pytest.mark.asyncio
+async def test_create_container_failure_msg_includes_step_and_error(docker_service, monkeypatch):
+    # A create failure must carry the failing step + the underlying error into the returned message,
+    # so the backend stores the real cause instead of a bare "Failed create_container".
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service,
+        "add_environment_variables_with_rental_docker",
+        AsyncMock(side_effect=RuntimeError("Failed to set environment variables")),
+    )
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "set_environment"
+    assert "Failed to set environment variables" in result.msg
+
+
+@pytest.mark.asyncio
 async def test_delete_last_customer_rental_stops_inspector_collector(
     docker_service,
     retry_ssh_mock,

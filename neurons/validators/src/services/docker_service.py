@@ -3593,12 +3593,11 @@ class DockerService:
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
             # Port release now handled by backend
-            failure_msg = str(log_text)
-            if (
-                current_step == "docker_sdk_ssh_host_key"
-                and isinstance(e, RentalDockerConnectionError)
-            ):
-                failure_msg = f"{failure_msg}: {e}"
+            # Carry the failing step's exception text into the returned message so the backend stores
+            # the real cause instead of a bare "Failed create_container" (capped to keep it small; the
+            # full traceback stays in the exc_info log above). failure_step already rides the response.
+            error_text = (str(e) or e.__class__.__name__)[:500]
+            failure_msg = f"{str(log_text)}: {error_text}"
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
