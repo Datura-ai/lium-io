@@ -72,8 +72,8 @@ class FillerMiningHealthCheck:
         key = _CAPTURE_KEY.format(executor_id=ctx.executor.uuid)
         now = datetime.now(timezone.utc).timestamp()
         try:
-            last = await ctx.services.redis.get(key)
-            if last is not None and now - float(last) < _CAPTURE_COOLDOWN_SECONDS:
+            last_capture = await ctx.services.redis.get(key)
+            if last_capture is not None and now - float(last_capture) < _CAPTURE_COOLDOWN_SECONDS:
                 return False
             await ctx.services.redis.set(key, str(now))
         except Exception:
@@ -82,6 +82,4 @@ class FillerMiningHealthCheck:
 
 
 def _filler_holds_gpu(filler_container: str, gpu_processes: list[dict]) -> bool:
-    # Mining => the filler container is the process actually holding the GPU. If no GPU process belongs
-    # to it (dead worker, or a firmware-wedged card whose process is already gone), it isn't mining.
     return any(process.get("container_name") == filler_container for process in gpu_processes)
