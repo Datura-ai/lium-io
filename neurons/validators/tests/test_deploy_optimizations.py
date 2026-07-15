@@ -28,6 +28,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
+    CustomOptions,
     FailedContainerRequest,
     PayloadPortMapping,
     ProfilerStep,
@@ -447,6 +448,61 @@ async def test_ships_sshd_none_with_jupyter_uses_run_jupyter(svc, monkeypatch):
     svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
     svc.run_jupyter.assert_awaited_once()
     assert "JUPYTER_PASSWORD" not in _created_run_spec(svc).environment
+
+
+@pytest.mark.asyncio
+async def test_ships_sshd_with_startup_commands_runs_bootstrap_and_run_jupyter(svc, monkeypatch):
+    """Regression (reviewer arhangel66, CHANGES_REQUESTED): a non-empty
+    startup_commands is passed as the container command and REPLACES the image
+    CMD (/start.sh) — the script that starts sshd and launches Jupyter. With
+    ships_sshd set BUT startup_commands present, start.sh never runs, so the
+    validator must NOT take the skip path: it must run its own sshd bootstrap
+    AND run_jupyter, else the pod comes up with dead SSH and a Jupyter URL that
+    resets. Port is 8888 so the ONLY thing forcing the fallback is the override,
+    not the port guard."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(
+        svc, "generate_portMappings",
+        AsyncMock(return_value=([(22, 20001, 20001)], (8888, 30888))),
+    )
+
+    result = await _run(
+        svc,
+        _payload(
+            ships_sshd=True,
+            enable_jupyter=True,
+            custom_options=CustomOptions(startup_commands="sleep infinity"),
+        ),
+    )
+
+    assert isinstance(result, ContainerCreated)
+    # Both validator-managed paths must run — the image's start.sh was replaced.
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
+    svc.run_jupyter.assert_awaited_once()
+    # No image-managed Jupyter env is forwarded on the validator-managed fallback.
+    assert "JUPYTER_PASSWORD" not in _created_run_spec(svc).environment
+
+
+@pytest.mark.asyncio
+async def test_ships_sshd_with_entrypoint_override_runs_bootstrap(svc, monkeypatch):
+    """Same failure mode via the other override: a renter entrypoint replaces
+    /pytorch-entrypoint.sh (the ENTRYPOINT that execs the CMD /start.sh), so
+    start.sh never runs and the image starts no sshd. The validator must fall
+    back to its own bootstrap even though ships_sshd is set."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    result = await _run(
+        svc,
+        _payload(
+            ships_sshd=True,
+            custom_options=CustomOptions(entrypoint="bash"),
+        ),
+    )
+
+    assert isinstance(result, ContainerCreated)
+    svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
 
 
 @pytest.mark.asyncio

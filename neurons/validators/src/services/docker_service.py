@@ -3244,12 +3244,28 @@ class DockerService:
                 # carries it into the run spec (create-time env), not the post-create
                 # add_environment_variables step.
                 #
+                # The image only runs its own start.sh — and therefore only starts
+                # sshd and Jupyter itself — when we let its default CMD/ENTRYPOINT
+                # run. A renter-supplied `startup_commands` is passed as the container
+                # command and REPLACES the image CMD (`/start.sh`); a renter-supplied
+                # `entrypoint` replaces `/pytorch-entrypoint.sh`, which is the script
+                # that execs that CMD. In either case start.sh never runs, so the
+                # image starts neither sshd nor Jupyter, and the validator must keep
+                # managing both even though ships_sshd is set. commit 2345af85 reverted
+                # this exact skip for precisely this reason (a custom startup_commands
+                # replaces the image CMD); ships_sshd alone is not sufficient. Only take
+                # the image-managed path when neither override is present.
+                image_manages_services = bool(
+                    payload.ships_sshd
+                    and not (custom_options.startup_commands and custom_options.startup_commands.strip())
+                    and not (custom_options.entrypoint and custom_options.entrypoint.strip())
+                )
                 # Guard on the mapped docker port: start.sh always binds 8888, so if the
                 # mapping ever moved off that port the image's Jupyter would be
                 # unreachable. Fall back to the validator's run_jupyter in that case
                 # rather than silently serving nothing.
                 image_managed_jupyter = bool(
-                    payload.ships_sshd
+                    image_manages_services
                     and payload.enable_jupyter
                     and jupyter_port_map
                     and jupyter_port_map[0] == IMAGE_JUPYTER_DOCKER_PORT
@@ -3586,13 +3602,17 @@ class DockerService:
                     )
 
                     current_step = "ssh_bootstrap"
-                    if payload.ships_sshd:
+                    if image_manages_services:
                         # DAH-2265: the default image / cached template ships and
                         # starts sshd itself (its start.sh runs `service ssh start`
                         # unconditionally). Skip the validator's sshd bootstrap
                         # entirely. The public-key injection above already created
                         # ~/.ssh (mkdir -p /root/.ssh in the authorized_keys exec spec),
                         # so the skip path needs nothing further here.
+                        # Note: gated on image_manages_services, not payload.ships_sshd
+                        # alone — a renter startup_commands/entrypoint override replaces
+                        # the CMD/ENTRYPOINT that runs start.sh, so the image would not
+                        # start sshd and we must fall through to the bootstrap below.
                         logger.info(
                             _m(
                                 "Skipping SSH-server bootstrap; template ships sshd",
