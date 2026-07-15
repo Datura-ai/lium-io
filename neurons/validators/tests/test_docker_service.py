@@ -1231,6 +1231,12 @@ async def test_delete_filler_skips_graceful_stop(
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
 
+    restore_filler_power = AsyncMock(return_value=0)
+    monkeypatch.setattr(
+        "services.docker_service.restore_filler_pod_gpu_power_limits",
+        restore_filler_power,
+    )
+
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
 
@@ -1265,6 +1271,9 @@ async def test_delete_filler_skips_graceful_stop(
     client = docker_service.rental_docker_client_factory.client
     assert client.stopped_containers == []
     assert client.container_call_order == [("remove", payload.container_name)]
+    # DAH-2356 still restores the filler's GPU power caps even though the graceful stop is skipped
+    restore_filler_power.assert_awaited_once()
+    assert restore_filler_power.await_args.args[2] == payload.pod_id
 
 
 @pytest.mark.asyncio
