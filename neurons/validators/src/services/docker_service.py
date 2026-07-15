@@ -121,6 +121,15 @@ IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 # that hold GPUs and brick the executor.
 CONTAINER_STOP_GRACE_SECONDS = 30
 
+# Fillers get a shorter grace window than customer workloads. The backend preempts a filler
+# before a customer rent with a total budget of FILLER_STOP_WAIT_TIMEOUT_SECONDS (30s in
+# compute-app) and starts the rent anyway on timeout. This grace must stay strictly below that
+# budget with room for the forced removal and the stopped-callback, so a SIGTERM-ignoring filler
+# can never burn the whole budget inside docker stop and hold the GPUs into the customer rent.
+# Half the budget leaves ~15s of headroom while still letting a well-behaved filler exit cleanly
+# and avoid the containerd/sysbox wedge. Keep in sync with compute-app FILLER_STOP_WAIT_TIMEOUT_SECONDS.
+FILLER_CONTAINER_STOP_GRACE_SECONDS = 15
+
 DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
 }
@@ -3954,19 +3963,19 @@ class DockerService:
         # Called directly rather than through run_logged_rental_docker_sdk_operation so that an
         # expected failure — chiefly an already-absent container — is not logged at ERROR and does
         # not raise a false failed-deletion alert.
-        if payload.workload_kind == WorkloadKind.FILLER:
-            # The backend preempts a filler before a customer rent with a 30s total budget
-            # (FILLER_STOP_WAIT_TIMEOUT_SECONDS) and starts the rent anyway on timeout. A grace
-            # window equal to that budget lets a SIGTERM-ignoring filler burn all of it inside
-            # docker stop, so the customer pod would land on GPUs the filler still holds.
-            # Fillers keep the pre-DAH-2364 SIGKILL-only removal.
-            return
+        # Fillers use a shorter grace window (see FILLER_CONTAINER_STOP_GRACE_SECONDS) so a
+        # SIGTERM-ignoring filler cannot outlast the backend's preemption budget.
+        stop_grace_seconds = (
+            FILLER_CONTAINER_STOP_GRACE_SECONDS
+            if payload.workload_kind == WorkloadKind.FILLER
+            else CONTAINER_STOP_GRACE_SECONDS
+        )
 
         stop_started = time.monotonic()
         try:
             await docker_client.stop(
                 container_name=payload.container_name,
-                stop_grace_seconds=CONTAINER_STOP_GRACE_SECONDS,
+                stop_grace_seconds=stop_grace_seconds,
             )
         except Exception as exc:
             if _is_missing_docker_container_error(exc):
@@ -3985,7 +3994,7 @@ class DockerService:
         log.info(
             "Graceful container stop completed",
             container_name=payload.container_name,
-            stop_grace_seconds=CONTAINER_STOP_GRACE_SECONDS,
+            stop_grace_seconds=stop_grace_seconds,
             duration_ms=int((time.monotonic() - stop_started) * 1000),
         )
 

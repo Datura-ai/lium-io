@@ -9,6 +9,7 @@ from tenacity import Future, RetryError
 
 from services.docker_service import (
     CONTAINER_STOP_GRACE_SECONDS,
+    FILLER_CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
     VolumeMinSizeError,
     _parse_volume_size_to_bytes,
@@ -1216,12 +1217,13 @@ async def test_delete_container_stop_missing_container_logs_info_and_removes(
 
 
 @pytest.mark.asyncio
-async def test_delete_filler_skips_graceful_stop(
+async def test_delete_filler_stops_with_reduced_grace(
     docker_service,
     monkeypatch,
 ):
     # Arrange: FILLER teardown races the backend's FILLER_STOP_WAIT_TIMEOUT_SECONDS budget,
-    # so it must keep the SIGKILL-only path with no graceful stop
+    # so it gets a shorter grace window than a customer rental — but still a graceful stop
+    # so a well-behaved filler exits cleanly and avoids the containerd/sysbox wedge
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
     monkeypatch.setattr(
@@ -1266,12 +1268,16 @@ async def test_delete_filler_skips_graceful_stop(
         private_key="encrypted",
     )
 
-    # Assert: no graceful stop, straight to forced removal
+    # Assert: graceful stop with the reduced filler grace window, then the forced removal
     assert isinstance(result, ContainerDeleted)
     client = docker_service.rental_docker_client_factory.client
-    assert client.stopped_containers == []
-    assert client.container_call_order == [("remove", payload.container_name)]
-    # DAH-2356 still restores the filler's GPU power caps even though the graceful stop is skipped
+    assert client.container_call_order == [
+        ("stop", payload.container_name),
+        ("remove", payload.container_name),
+    ]
+    assert client.stop_grace_seconds_calls == [FILLER_CONTAINER_STOP_GRACE_SECONDS]
+    assert FILLER_CONTAINER_STOP_GRACE_SECONDS < CONTAINER_STOP_GRACE_SECONDS
+    # DAH-2356 still restores the filler's GPU power caps after the graceful stop
     restore_filler_power.assert_awaited_once()
     assert restore_filler_power.await_args.args[2] == payload.pod_id
 
