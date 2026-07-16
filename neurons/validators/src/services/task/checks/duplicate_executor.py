@@ -25,7 +25,7 @@ class DuplicateExecutorCheck:
         )
 
         if is_duplicate:
-            what = {
+            what: dict[str, str] = {
                 "executor_uuid": ctx.executor.uuid,
                 "miner_hotkey": ctx.miner_hotkey,
             }
