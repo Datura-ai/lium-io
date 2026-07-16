@@ -1,16 +1,20 @@
 import asyncio
 import logging
-import time
 import subprocess
+import time
+
 import aiohttp
 import click
-import pynvml
+import gpu_ghost_cure
 import psutil
-
+import pynvml
 from services.pull_lock import cache_pull_lock
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+GHOST_CONSECUTIVE_SAMPLES = 3
+GHOST_CURE_COOLDOWN_SECONDS = 600
 
 
 class GPUMetricsTracker:
@@ -286,6 +290,35 @@ async def manage_docker_images(
                 await asyncio.sleep(first_interval)
 
 
+async def ghost_watchdog(interval: int = 60):
+    # cure GPUs stuck in the Blackwell GSP utilization latch ("ghost GPU"): util pinned
+    # at 100% with ~0 MiB and zero processes, sustained across samples -> run a clean
+    # CUDA context open/close in a child process (see gpu_ghost_cure.py, DAH-2431)
+    streak: dict[str, int] = {}
+    last_cure: dict[str, float] = {}
+
+    while True:
+        try:
+            ghosts = await asyncio.to_thread(gpu_ghost_cure.detect_ghosts)
+            streak = {uuid: streak.get(uuid, 0) + 1 for uuid in ghosts}
+            for uuid, samples in streak.items():
+                if samples < GHOST_CONSECUTIVE_SAMPLES:
+                    continue
+                if time.time() - last_cure.get(uuid, 0.0) < GHOST_CURE_COOLDOWN_SECONDS:
+                    continue
+                logger.warning(
+                    f"Ghost GPU {uuid}: util latched for {samples} samples, running cure"
+                )
+                last_cure[uuid] = time.time()
+                cured = await asyncio.to_thread(gpu_ghost_cure.spawn_cure, uuid)
+                logger.warning(
+                    f"Ghost GPU {uuid}: cure result: {'CLEARED' if cured else 'STILL LATCHED'}"
+                )
+        except Exception as e:
+            logger.error(f"Ghost watchdog error: {e}")
+        await asyncio.sleep(interval)
+
+
 @click.command()
 @click.option("--program_id", prompt="Program ID", help="Program ID for monitoring")
 @click.option("--signature", prompt="Signature", help="Signature for verification")
@@ -306,7 +339,8 @@ def main(
             # scrape_gpu_metrics(
             #     interval, program_id, signature, executor_id, validator_hotkey, compute_rest_app_url
             # ),
-            manage_docker_images(compute_rest_app_url)
+            manage_docker_images(compute_rest_app_url),
+            ghost_watchdog(),
         )
 
     asyncio.run(run_all())
