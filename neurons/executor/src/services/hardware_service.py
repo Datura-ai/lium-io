@@ -142,17 +142,21 @@ def get_system_metrics():
     gpus = []
     try:
         pynvml.nvmlInit()
-        gpu_count = pynvml.nvmlDeviceGetCount()
-        
-        for i in range(gpu_count):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            gpus.append({
-                "utilization": util.gpu,                  # %
-                "memory": mem.used / mem.total * 100.0    # %
-            })
-        pynvml.nvmlShutdown()
+        # finally: a leaked NVML handle in the long-lived executor process blocks any later
+        # per-GPU maintenance with "in use by another client" (DAH-2427 review finding).
+        try:
+            gpu_count = pynvml.nvmlDeviceGetCount()
+
+            for i in range(gpu_count):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                gpus.append({
+                    "utilization": util.gpu,                  # %
+                    "memory": mem.used / mem.total * 100.0    # %
+                })
+        finally:
+            pynvml.nvmlShutdown()
     except (pynvml.NVMLError, pynvml.NVMLError_NotSupported, pynvml.NVMLError_DriverNotLoaded) as e:
         # This is expected on systems without NVIDIA GPUs or drivers
         logger.debug(f"No GPU available: {e}")
@@ -259,33 +263,35 @@ def get_container_metrics(container_name: str, gpu_uuids: list[str]):
         if gpu_uuids:
             try:
                 pynvml.nvmlInit()
+                # finally: a leaked NVML handle in the long-lived executor process blocks any
+                # later per-GPU maintenance with "in use by another client" (DAH-2427 review).
+                try:
+                    for gpu_uuid in gpu_uuids:
+                        try:
+                            # Get GPU handle by UUID
+                            handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
 
-                for gpu_uuid in gpu_uuids:
-                    try:
-                        # Get GPU handle by UUID
-                        handle = pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)
+                            # Get utilization rates
+                            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
 
-                        # Get utilization rates
-                        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                            # Get memory info
+                            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
 
-                        # Get memory info
-                        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-
-                        gpus.append({
-                            "uuid": gpu_uuid,
-                            "utilization": util.gpu,                  # %
-                            "memory": mem.used / mem.total * 100.0    # %
-                        })
-                    except pynvml.NVMLError as e:
-                        logger.warning(f"Error getting metrics for GPU {gpu_uuid}: {e}")
-                        # Add entry with zero values if GPU not accessible
-                        gpus.append({
-                            "uuid": gpu_uuid,
-                            "utilization": 0.0,
-                            "memory": 0.0
-                        })
-
-                pynvml.nvmlShutdown()
+                            gpus.append({
+                                "uuid": gpu_uuid,
+                                "utilization": util.gpu,                  # %
+                                "memory": mem.used / mem.total * 100.0    # %
+                            })
+                        except pynvml.NVMLError as e:
+                            logger.warning(f"Error getting metrics for GPU {gpu_uuid}: {e}")
+                            # Add entry with zero values if GPU not accessible
+                            gpus.append({
+                                "uuid": gpu_uuid,
+                                "utilization": 0.0,
+                                "memory": 0.0
+                            })
+                finally:
+                    pynvml.nvmlShutdown()
             except (pynvml.NVMLError, pynvml.NVMLError_NotSupported, pynvml.NVMLError_DriverNotLoaded) as e:
                 logger.debug(f"No GPU available: {e}")
             except Exception as e:

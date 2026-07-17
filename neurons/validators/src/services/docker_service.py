@@ -54,6 +54,7 @@ from payload_models.payloads import (
 from services.attestation_service import AttestationError, AttestationService
 from services.const import (
     FILLER_CONTAINER_PREFIX,
+    GPU_WEDGE_SWEEP_SETTLE_SECONDS,
     MIN_PORT_COUNT,
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
@@ -65,6 +66,7 @@ from services.gpu_power_limit import (
     restore_filler_pod_gpu_power_limits,
     restore_tracked_gpu_power_limits,
 )
+from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
@@ -92,6 +94,7 @@ from services.rental_docker_sdk import (
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
+from services.task.runner import SSHCommandRunner
 from tenacity import RetryError
 
 from core.config import settings
@@ -4192,7 +4195,16 @@ class DockerService:
 
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.
-                await self._force_remove_container(docker_client, payload, log)
+                try:
+                    await self._force_remove_container(docker_client, payload, log)
+                except Exception:
+                    # DAH-2427: a failed force-remove (backend FAILED / STOP_FAILED) is the
+                    # classic wedge path — sweep before propagating so a wedged card does not
+                    # outlive the failed delete. No-op while a live compute app still exists.
+                    if payload.workload_kind == WorkloadKind.FILLER:
+                        with _best_effort_delete_step(log, "sweep_wedged_gpus_after_failed_remove"):
+                            await _sweep_wedged_gpus_after_teardown(ssh_client, log)
+                    raise
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
@@ -4210,6 +4222,11 @@ class DockerService:
                         await restore_filler_pod_gpu_power_limits(
                             ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
                         )
+                    # DAH-2427: force-removing a CUDA workload can leave an orphaned kernel
+                    # pinning the card (ghost GPU); cure it right here so the ghost never
+                    # outlives the teardown and never reaches the next renter.
+                    with _best_effort_delete_step(log, "sweep_wedged_gpus"):
+                        await _sweep_wedged_gpus_after_teardown(ssh_client, log)
 
                 with _best_effort_delete_step(log, "prune_images"):
                     await run_logged_rental_docker_sdk_operation(
@@ -4732,3 +4749,34 @@ class DockerService:
         extra_ports = [max_port + i for i in range(extra_count)]
 
         return list(PREFERRED_POD_PORTS) + extra_ports
+
+
+async def _sweep_wedged_gpus_after_teardown(
+    ssh_client: asyncssh.SSHClientConnection, log: "_BoundLog"
+) -> None:
+    """Cure any GPU the removed container left wedged; best-effort, caller guards errors.
+
+    The signature is sampled twice, before and after a settle window, because the moment just
+    after a SIGKILL is when a draining workload looks most like an orphaned kernel. A card that
+    reads healthy immediately cannot be wedged, so the common teardown pays one cheap query
+    pair and skips the wait entirely.
+    """
+    runner = SSHCommandRunner(ssh_client, max_retries=0)
+
+    if not await query_wedged_gpu_uuids(runner):
+        return
+
+    await asyncio.sleep(GPU_WEDGE_SWEEP_SETTLE_SECONDS)
+    wedged_uuids: list[str] = await query_wedged_gpu_uuids(runner)
+    if not wedged_uuids:
+        return
+
+    for cure_outcome in await cure_wedged_gpus(runner, wedged_uuids):
+        log.info(
+            "Wedged GPU cure attempted after teardown",
+            gpu_uuid=cure_outcome.gpu_uuid,
+            cured=cure_outcome.cured,
+            exit_code=cure_outcome.exit_code,
+            output=cure_outcome.output,
+            error=cure_outcome.error,
+        )

@@ -688,6 +688,27 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Rental ended but container still running. Remove it: docker stop {orphaned_container}",
     )
+    GPU_WEDGE_CURED = MessageTemplate(
+        event="Ghost GPU cured in place",
+        reason="GPU_WEDGE_CURED",
+        severity="warning",
+        category="runtime",
+        impact="Latched busy counter cleared by a CUDA context cycle; validation continues",
+    )
+    GPU_WEDGED = MessageTemplate(
+        event="Wedged GPU detected",
+        reason="GPU_WEDGED",
+        severity="error",
+        category="runtime",
+        impact="Validation skipped; score set to 0; the CUDA context cure did not clear the card",
+        remediation=(
+            "GPU pinned at full utilization with no memory and no process — a latched Blackwell "
+            "busy counter left by a hard-killed GPU process (ghost GPU, DAH-2427). If the "
+            "automatic cure did not clear it, run a CUDA context open/close on the card "
+            "(CUDA_VISIBLE_DEVICES=<uuid> python3 + cuInit/cuCtxCreate/cuCtxDestroy); "
+            "nvidia-smi -r is unreliable across driver builds."
+        ),
+    )
 
 
 class PortConnectivityMessages:

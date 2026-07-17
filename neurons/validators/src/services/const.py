@@ -102,6 +102,16 @@ UNRENTED_MULTIPLIER = 1
 GPU_UTILIZATION_LIMIT = 5  # percent
 GPU_MEMORY_UTILIZATION_LIMIT = 5  # percent
 
+# DAH-2427 ghost GPU: an orphaned CUDA kernel left by a hard-killed GPU process pins the
+# card at full utilization with no memory and no process attached (observed for days on
+# RTX PRO 6000 nodes). The "no memory" half is expressed in whichever unit each data source
+# provides: the periodic check reads NVML memory-utilization percent, the teardown sweep
+# reads nvidia-smi used MiB.
+GPU_WEDGE_UTILIZATION_MIN = 95  # percent
+GPU_WEDGE_MEMORY_MAX = 1  # percent (periodic check, NVML memory-utilization)
+GPU_WEDGE_SWEEP_MEMORY_MAX_MIB = 16  # teardown sweep, nvidia-smi memory.used
+GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is removed
+
 MIN_PORT_COUNT = 3
 BATCH_PORT_VERIFICATION_SIZE = 300
 BATCH_PORT_TIMEOUT = 40
