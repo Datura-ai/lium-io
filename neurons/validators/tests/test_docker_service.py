@@ -1297,7 +1297,7 @@ async def test_delete_container_redis_failures_still_deleted(
     )
     monkeypatch.setattr(
         docker_service,
-        "_has_rented_customer_containers",
+        "_has_rented_containers",
         AsyncMock(side_effect=Exception("redis down")),
     )
 
@@ -1855,7 +1855,8 @@ async def test_create_customer_rental_skips_inspector_collector_when_disabled(
 
 
 @pytest.mark.asyncio
-async def test_create_filler_skips_inspector_collector_start(docker_service, monkeypatch):
+async def test_create_filler_starts_inspector_collector(docker_service, monkeypatch):
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -1895,11 +1896,12 @@ async def test_create_filler_skips_inspector_collector_start(docker_service, mon
         private_key="encrypted",
     )
 
-    lifecycle_spy.assert_not_awaited()
+    lifecycle_spy.assert_awaited_once()
+    assert lifecycle_spy.await_args.kwargs["action"] == "start"
     inspector_step = next(
         p for p in result.profilers if p.name == ProfilerStepName.INSPECTOR_START
     )
-    assert inspector_step.skipped is True
+    assert inspector_step.skipped is False
 
 
 @pytest.mark.asyncio
@@ -1987,11 +1989,12 @@ async def test_delete_customer_rental_keeps_collector_with_remaining_pods(
 
 
 @pytest.mark.asyncio
-async def test_delete_filler_skips_inspector_collector_stop(
+async def test_delete_last_filler_stops_inspector_collector(
     docker_service,
     retry_ssh_mock,
     monkeypatch,
 ):
+    monkeypatch.setattr("services.docker_service.settings.ENABLE_INSPECTOR", True)
     _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
@@ -2022,7 +2025,8 @@ async def test_delete_filler_skips_inspector_collector_stop(
         private_key="encrypted",
     )
 
-    lifecycle_spy.assert_not_awaited()
+    lifecycle_spy.assert_awaited_once()
+    assert lifecycle_spy.await_args.kwargs["action"] == "stop"
 
 
 @pytest.mark.asyncio
@@ -2040,11 +2044,11 @@ async def test_inspector_lifecycle_sees_remaining_rented_containers(docker_servi
         return_value={"containers": [{"name": "pod_still_running"}]}
     )
 
-    assert await docker_service._has_rented_customer_containers(executor_info) is True
+    assert await docker_service._has_rented_containers(executor_info) is True
 
     docker_service.redis_service.get_rented_machine = AsyncMock(return_value=None)
 
-    assert await docker_service._has_rented_customer_containers(executor_info) is False
+    assert await docker_service._has_rented_containers(executor_info) is False
 
 
 @pytest.mark.asyncio
