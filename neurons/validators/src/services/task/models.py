@@ -50,6 +50,8 @@ class JobResult(BaseModel):
     gpu_portion: float | None = None                    # Portion of the GPU model for scoring logic
     total_gpu_count: int | None = None                  # Total number of GPUs of the same model
     incentive: float | None = None                      # Incentive score for the executor in this cycle
+    mining_share: float | None = None
+    total_mining_score: float | None = None
 
     # V2 incentive relevant fields
     effective_rate: float | None = None              # Effective rate for the executor in this cycle for scoring logic
@@ -63,6 +65,14 @@ class JobResult(BaseModel):
     rental_share: float | None = None                  # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                    # Burn share for the executor in this cycle for scoring logic
     total_rental_cost: float | None = None              # Total rental cost for the executor in this cycle for scoring logic
+    rental_share_raw: float | None = None
+    total_burn_emission: float | None = None
+    validator_tao_price_usd: float | None = None
+    validator_alpha_rate_tao_per_block: float | None = None
+    estimated_epoch_emission_usd: float | None = None
+    tempo_blocks: int | None = None
+    seconds_per_block: int | None = None
+    fixed_ratio: float | None = None
 
     
     incentive_logs: list[str] = []
@@ -79,6 +89,62 @@ class JobResult(BaseModel):
     @property
     def node_state_at_cycle(self) -> str:
         return "rented" if self.is_rented else "idle"
+
+    @property
+    def incentive_formula_version(self) -> str:
+        return "rental_price_v2" if self.eligible_for_rental_share else "mining_v1"
+
+    @property
+    def incentive_formula_inputs(self) -> dict[str, Any]:
+        """Snapshot the exact scalar inputs needed to explain this cycle's incentive."""
+        if self.eligible_for_rental_share:
+            return {
+                "rental_share": self.rental_share,
+                "rental_share_raw": self.rental_share_raw,
+                "total_burn_emission": self.total_burn_emission,
+                "burn_share": self.burn_share,
+                "gpu_model": self.gpu_model,
+                "gpu_count": self.gpu_count,
+                "hourly_rate": self.hourly_rate,
+                "unrented_cap_multiplier": self.unrented_cap_multiplier,
+                "sysbox_multiplier": self.sysbox_multiplier,
+                "driver_multiplier": self.driver_multiplier,
+                "effective_rate": self.effective_rate,
+                "total_rental_cost": self.total_rental_cost,
+                "count_bucket": self.count_bucket,
+                "max_cap": self.max_cap,
+                "total_unrented_by_gpu_type": self.total_unrented_by_gpu_type,
+                "cap_dilution_applied": self.cap_dilution_applied,
+                "validator_tao_price_usd": self.validator_tao_price_usd,
+                "validator_alpha_rate_tao_per_block": self.validator_alpha_rate_tao_per_block,
+                "estimated_epoch_emission_usd": self.estimated_epoch_emission_usd,
+                "tempo_blocks": self.tempo_blocks,
+                "seconds_per_block": self.seconds_per_block,
+                "fixed_ratio": self.fixed_ratio,
+            }
+        return {
+            "score": self.score,
+            "mining_share": self.mining_share,
+            "mining_score": self.mining_score,
+            "total_mining_score": self.total_mining_score,
+            "rental_share": self.rental_share,
+            "rental_share_raw": self.rental_share_raw,
+            "total_burn_emission": self.total_burn_emission,
+            "burn_share": self.burn_share,
+            "gpu_portion": self.gpu_portion,
+            "gpu_model": self.gpu_model,
+            "gpu_count": self.gpu_count,
+            "total_gpu_count": self.total_gpu_count,
+            "sysbox_multiplier": self.sysbox_multiplier,
+            "uptime_multiplier": self.uptime_multiplier,
+            "driver_multiplier": self.driver_multiplier,
+            "validator_tao_price_usd": self.validator_tao_price_usd,
+            "validator_alpha_rate_tao_per_block": self.validator_alpha_rate_tao_per_block,
+            "estimated_epoch_emission_usd": self.estimated_epoch_emission_usd,
+            "tempo_blocks": self.tempo_blocks,
+            "seconds_per_block": self.seconds_per_block,
+            "fixed_ratio": self.fixed_ratio,
+        }
 
     @property
     def full_log_text(self):

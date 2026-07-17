@@ -313,6 +313,8 @@ class ComputeClient:
                             incentive=data.get("incentive"),
                             incentive_source=data.get("incentive_source"),
                             node_state_at_cycle=data.get("node_state_at_cycle"),
+                            incentive_formula_version=data.get("incentive_formula_version"),
+                            incentive_formula_inputs=data.get("incentive_formula_inputs"),
                             log_text=data["log_text"],
                             miner_hotkey=data["miner_hotkey"],
                             miner_coldkey=data["miner_coldkey"],

@@ -2,6 +2,7 @@ import enum
 import json
 import time
 from datetime import datetime
+from typing import Any
 
 import bittensor
 import pydantic
@@ -75,6 +76,8 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     incentive: float | None = None
     incentive_source: str | None = None
     node_state_at_cycle: str | None = None
+    incentive_formula_version: str | None = None
+    incentive_formula_inputs: dict[str, Any] | None = None
     collateral_deposited: bool
     ssh_pub_keys: list[str] | None = None
     # CVM attestation provenance (minimal-G5: the connector must not drop these).
