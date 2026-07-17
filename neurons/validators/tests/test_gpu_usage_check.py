@@ -1,7 +1,8 @@
-import pytest
+from unittest.mock import AsyncMock, MagicMock
 
-from neurons.validators.src.services.const import POD_CONTAINER_PREFIX
+import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from neurons.validators.src.services.const import POD_CONTAINER_PREFIX
 from neurons.validators.src.services.task.checks.gpu_usage import GpuUsageCheck
 from neurons.validators.src.services.task.messages import GpuUsageMessages as Msg
 
@@ -146,3 +147,175 @@ async def test_gpu_usage_rejects_unmapped_filler_container(context_factory):
 
     assert result.passed is False
     assert result.event.reason_code == Msg.USAGE_HIGH.reason
+
+
+# --- DAH-2427: ghost-GPU detection (util pinned, no memory, no processes) ---
+# Stateless by design (review feedback): see the signature -> cure immediately (the CUDA
+# context cycle is harmless) -> verdict from re-sampling the live card. Cured = node stays.
+
+WEDGED_UUID = "GPU-bdf72357-83a7-09d3-9809-729c734aa80a"
+HEALTHY_UUID = "GPU-dde887f6-488b-085f-a7b0-a71557f3e330"
+
+GPU_QUERY_PREFIX = "nvidia-smi --query-gpu="
+COMPUTE_APPS_PREFIX = "nvidia-smi --query-compute-apps="
+CURE_PREFIX = "CUDA_VISIBLE_DEVICES="
+
+
+def _wedged_detail(uuid: str = WEDGED_UUID) -> dict:
+    return {"uuid": uuid, "gpu_utilization": 100, "memory_utilization": 0}
+
+
+def _ssh_result(exit_code: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
+    return MagicMock(exit_code=exit_code, stdout=stdout, stderr=stderr, error_message=None)
+
+
+def _mock_runner(requery_gpu_csv: str = "", cure_exit_code: int = 0) -> MagicMock:
+    """Route the three commands the ghost path can issue: cure, GPU re-query, compute apps."""
+
+    async def route(command: str, **_kwargs) -> MagicMock:
+        if command.startswith(CURE_PREFIX):
+            return _ssh_result(exit_code=cure_exit_code, stdout="ctx open/close OK" if cure_exit_code == 0 else "AssertionError")
+        if command.startswith(GPU_QUERY_PREFIX):
+            return _ssh_result(stdout=requery_gpu_csv)
+        if command.startswith(COMPUTE_APPS_PREFIX):
+            return _ssh_result(stdout="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    runner = MagicMock()
+    runner.run = AsyncMock(side_effect=route)
+    return runner
+
+
+def _commands(runner: MagicMock) -> list[str]:
+    return [call.args[0] for call in runner.run.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_ghost_cured_in_place_passes(context_factory):
+    runner = _mock_runner(requery_gpu_csv=f"{WEDGED_UUID}, 0, 0\n")
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.GPU_WEDGE_CURED.reason
+    assert any(cmd.startswith(CURE_PREFIX) and WEDGED_UUID in cmd for cmd in _commands(runner))
+
+
+@pytest.mark.asyncio
+async def test_ghost_still_latched_after_cure_fails_the_check(context_factory):
+    runner = _mock_runner(requery_gpu_csv=f"{WEDGED_UUID}, 100, 0\n")
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_WEDGED.reason
+    assert result.event.what_we_saw["still_wedged"] == [WEDGED_UUID]
+
+
+@pytest.mark.asyncio
+async def test_verdict_comes_from_the_card_not_the_cure_exit_code(context_factory):
+    """A failed cure command with a clean re-query still passes — the card is the truth."""
+    runner = _mock_runner(requery_gpu_csv=f"{WEDGED_UUID}, 0, 0\n", cure_exit_code=1)
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.GPU_WEDGE_CURED.reason
+    assert result.event.what_we_saw["cure_results"][0].exit_code == 1
+
+
+@pytest.mark.asyncio
+async def test_no_commands_when_no_ghost_signature(context_factory):
+    runner = _mock_runner()
+    state = build_state(
+        gpu_details=[{"uuid": HEALTHY_UUID, "gpu_utilization": 0, "memory_utilization": 0}],
+        gpu_processes=[],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+    runner.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wedge_signature_with_processes_keeps_legacy_path(context_factory):
+    runner = _mock_runner()
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[{"pid": 1234, "name": "python"}])
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    runner.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_only_the_ghost_uuid_is_cured_on_a_mixed_host(context_factory):
+    runner = _mock_runner(requery_gpu_csv=f"{WEDGED_UUID}, 0, 0\n{HEALTHY_UUID}, 0, 0\n")
+    state = build_state(
+        gpu_details=[
+            _wedged_detail(),
+            {"uuid": HEALTHY_UUID, "gpu_utilization": 0, "memory_utilization": 0},
+        ],
+        gpu_processes=[],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    await GpuUsageCheck().run(ctx)
+
+    cure_commands = [cmd for cmd in _commands(runner) if cmd.startswith(CURE_PREFIX)]
+    assert len(cure_commands) == 1
+    assert WEDGED_UUID in cure_commands[0]
+    assert not any(HEALTHY_UUID in cmd for cmd in cure_commands)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_detects_ghost_without_curing(context_factory):
+    runner = _mock_runner()
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    result = await GpuUsageCheck(dry_run=True).run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_WEDGED.reason
+    assert result.event.what_we_saw["cure_attempted"] is False
+    runner.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_falls_back_to_the_usage_guard(context_factory):
+    runner = MagicMock()
+    runner.run = AsyncMock(side_effect=RuntimeError("ssh exploded"))
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    # Detection is an addition to the process guard — its failure must not break validation.
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_ghost_event_payload_serializes_to_json(context_factory):
+    runner = _mock_runner(requery_gpu_csv=f"{WEDGED_UUID}, 0, 0\n")
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, runner=runner)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    dumped = result.event.model_dump(mode="json")["what_we_saw"]
+    assert dumped["wedged_gpus"][0]["gpu_uuid"] == WEDGED_UUID
+    assert dumped["cure_results"][0]["gpu_uuid"] == WEDGED_UUID
+    assert dumped["still_wedged"] == []

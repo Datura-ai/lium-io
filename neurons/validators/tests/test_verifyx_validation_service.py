@@ -100,3 +100,21 @@ async def test_nonzero_exit_with_nonempty_stdout_classified_as_executor_crash(ca
     assert result.diagnostics["exit_status"] == 1
     # stdout_len is reported against the raw stdout bytes/chars, not the stripped length.
     assert result.diagnostics["stdout_len"] == len(partial_stdout)
+
+
+@pytest.mark.asyncio
+async def test_run_ssh_command_is_bounded_by_the_hard_timeout():
+    """DAH-2427/DAH-2365: a hung verifyx run must be cut off, not hold its CUDA context forever."""
+    from unittest.mock import AsyncMock
+
+    from neurons.validators.src.services import verifyx_validation_service as vvs
+
+    run = AsyncMock(return_value=SimpleNamespace(stdout="ok", stderr="", exit_status=0))
+    shell = SimpleNamespace(ssh_client=SimpleNamespace(run=run))
+    service = vvs.VerifyXValidationService.__new__(vvs.VerifyXValidationService)
+
+    await service._run_ssh_command(shell, "python verifyx_executor.py")
+
+    run.assert_awaited_once_with(
+        "python verifyx_executor.py", timeout=vvs.VERIFYX_COMMAND_TIMEOUT_SECONDS
+    )

@@ -165,12 +165,16 @@ async def manage_docker_images(
     driver_version = "unknown"
     try:
         pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Get first GPU
-        gpu_name = pynvml.nvmlDeviceGetName(handle)
-        driver_version = pynvml.nvmlSystemGetDriverVersion()
-        if isinstance(gpu_name, bytes):
-            gpu_name = gpu_name.decode("utf-8")
-        pynvml.nvmlShutdown()
+        # finally: a leaked NVML handle makes this process the "in use by another client"
+        # blocker for any later per-GPU maintenance (DAH-2427 review finding).
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Get first GPU
+            gpu_name = pynvml.nvmlDeviceGetName(handle)
+            driver_version = pynvml.nvmlSystemGetDriverVersion()
+            if isinstance(gpu_name, bytes):
+                gpu_name = gpu_name.decode("utf-8")
+        finally:
+            pynvml.nvmlShutdown()
     except Exception as e:
         logger.error(f"Failed to get GPU name: {e}")
 

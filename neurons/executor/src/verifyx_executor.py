@@ -1,6 +1,9 @@
 import argparse
 import ctypes
 import os
+import signal
+import sys
+from types import FrameType
 
 
 class VerifyXExecutor:
@@ -20,8 +23,19 @@ class VerifyXExecutor:
     def _create_service(self):
         return self.lib.service_new()
 
+    def close(self) -> None:
+        # DAH-2427: a context left behind becomes an orphaned kernel that pins the card at
+        # 100% with no process, so release it on every exit we can still run code on — a clean
+        # finish, an exception, or a signal. A hang inside the native execute() is NOT one of
+        # them (handlers only run between bytecodes); GpuUsageCheck is the backstop there.
+        # Idempotent so finally + signal + __del__ can all call it; getattr guards __del__
+        # when __init__ raised early.
+        if getattr(self, "service", None) is not None:
+            self.lib.service_del(self.service)
+            self.service = None
+
     def __del__(self):
-        self.lib.service_del(self.service)
+        self.close()
 
     def _decode_string(self, ptr):
         return ctypes.string_at(ptr).decode("utf-8") if ptr else None
@@ -42,8 +56,22 @@ def main():
     args = parser.parse_args()
 
     executor = VerifyXExecutor(args.lib)
-    result = executor.execute(args.cipher_text, args.seed)
-    print(result)
+
+    def _release_and_exit(signum: int, frame: FrameType | None) -> None:
+        executor.close()
+        sys.exit(128 + signum)
+
+    # SIGHUP too: a validator-side timeout closes the SSH channel, and OpenSSH signals the
+    # remote command with SIGHUP whose default action would kill us before cleanup runs.
+    signal.signal(signal.SIGTERM, _release_and_exit)
+    signal.signal(signal.SIGINT, _release_and_exit)
+    signal.signal(signal.SIGHUP, _release_and_exit)
+
+    try:
+        result = executor.execute(args.cipher_text, args.seed)
+        print(result)
+    finally:
+        executor.close()
 
 
 if __name__ == "__main__":

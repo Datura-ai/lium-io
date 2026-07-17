@@ -325,7 +325,9 @@ class PipelineFactory:
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
                 TenantEnforcementCheck(),
-                GpuUsageCheck(),
+                # dry_run=True: reports a ghost GPU but runs no pkill + nvidia-smi reset on the
+                # executor and leaves the shared wedge timers the production pipeline relies on.
+                GpuUsageCheck(dry_run=True),
                 # VerifyXCheck(),
                 TdxHostCheck(),
                 CapabilityCheck(),
