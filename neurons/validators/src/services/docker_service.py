@@ -440,7 +440,7 @@ class DockerService:
                 ),
             )
 
-    async def _has_rented_customer_containers(
+    async def _has_rented_containers(
         self,
         executor_info: ExecutorSSHInfo,
     ) -> bool:
@@ -3679,11 +3679,7 @@ class DockerService:
 
                     current_step = "finalize"
                     await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
-                    inspector_enabled = (
-                        settings.ENABLE_INSPECTOR
-                        and payload.workload_kind != WorkloadKind.FILLER
-                    )
-                    if inspector_enabled:
+                    if settings.ENABLE_INSPECTOR:
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,
                             executor_info=executor_info,
@@ -3697,7 +3693,7 @@ class DockerService:
                         ProfilerStep.since(
                             ProfilerStepName.INSPECTOR_START,
                             prev_timestamp,
-                            skipped=not inspector_enabled,
+                            skipped=not settings.ENABLE_INSPECTOR,
                         )
                     )
                     prev_timestamp = now_ms()
@@ -4275,12 +4271,11 @@ class DockerService:
                         executor_info, payload.container_name
                     )
 
-                # Stop inspector only after the last customer pod leaves this executor.
+                # Stop inspector only after the last rented pod leaves this executor.
                 with _best_effort_delete_step(log, "inspector_stop"):
                     if (
                         settings.ENABLE_INSPECTOR
-                        and payload.workload_kind != WorkloadKind.FILLER
-                        and not await self._has_rented_customer_containers(executor_info)
+                        and not await self._has_rented_containers(executor_info)
                     ):
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,
