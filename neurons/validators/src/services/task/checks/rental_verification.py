@@ -1,8 +1,17 @@
 from __future__ import annotations
 
-from core.config import settings
-from protocol.vc_protocol.compute_requests import GPU_RUNTIME_NVML_MISMATCH_REASON
+from datetime import datetime, timedelta
 
+import asyncssh
+
+from core.config import settings
+from core.docker_utils import DockerCommand, collect_container_death_diagnostics
+from protocol.vc_protocol.compute_requests import (
+    GPU_RUNTIME_NVML_MISMATCH_REASON,
+    FillerRunActiveResponse,
+)
+
+from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -46,20 +55,27 @@ class RentalVerificationCheck:
         has_customer_rental = bool(rented_executor and rented_executor.pods)
         filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
         if filler_container and not has_customer_rental:
-            event = render_message(
-                Msg.SKIPPED,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "skipped": True,
-                    "reason": "active filler runtime",
-                    "filler_container": filler_container,
-                },
-            )
-            return CheckResult(
-                passed=True,
-                event=event,
-                updates={},
+            # ISSUE-050: the backend's word alone is not proof the filler is alive — some hosts
+            # remove Lium filler containers while the run stays RUNNING and keep earning
+            # unrented incentive. Verify the container on the host, mirroring the customer-pod
+            # flow in RentedMachineCheck (SSH liveness probe + live backend re-check on miss).
+            # Rollout is gated: CHECK_ENABLED is the master switch (shadow: observe and log only),
+            # ENFORCEMENT additionally withholds incentive.
+            if not settings.FILLER_LIVENESS_CHECK_ENABLED:
+                event = render_message(
+                    Msg.SKIPPED,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "skipped": True,
+                        "reason": "active filler runtime",
+                        "filler_container": filler_container,
+                    },
+                )
+                return CheckResult(passed=True, event=event, updates={})
+
+            return await self._verify_filler_alive(
+                ctx, filler_container, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
             )
 
         # Get required info from context
@@ -208,3 +224,152 @@ class RentalVerificationCheck:
             await ctx.services.container_cleanup.force_remove_health_checks(
                 ctx.ssh, ctx.executor.uuid
             )
+
+    async def _verify_filler_alive(
+        self, ctx: Context, filler_container: str, *, enforce: bool
+    ) -> CheckResult:
+        """Verify the Lium filler container actually runs on the host.
+
+        In shadow mode (enforce=False) every outcome keeps passed=True so scoring is
+        unchanged; the emitted events are the observable artifact. Only a confirmed
+        kill (container gone, run still RUNNING past grace) fails in enforcement mode.
+        """
+        try:
+            ps_result: asyncssh.SSHCompletedProcess = await ctx.ssh.run(
+                DockerCommand.ps_running(filler_container)
+            )
+        except (asyncssh.Error, OSError) as exc:
+            # SSH transport died mid-cycle: filler state is unknown, do not re-check.
+            event = render_message(
+                Msg.FILLER_TRANSPORT_UNREACHABLE,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "filler_container": filler_container,
+                    "executor_uuid": ctx.executor.uuid,
+                    "transport_error": repr(exc),
+                    "enforced": enforce,
+                },
+            )
+            return CheckResult(passed=not enforce, event=event, updates={})
+
+        if ps_result.exit_status != 0:
+            # docker daemon error (e.g. restarting) — indistinguishable from a kill, so fail open.
+            return self._filler_state_unknown_result(
+                ctx,
+                filler_container,
+                reason="docker ps failed on host",
+                details={"exit_status": ps_result.exit_status},
+            )
+
+        filler_running: bool = bool(ps_result.stdout.strip())
+        if filler_running:
+            event = render_message(
+                Msg.FILLER_VERIFIED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
+                    "verified": True,
+                    "filler_container": filler_container,
+                    "executor_uuid": ctx.executor.uuid,
+                },
+            )
+            return CheckResult(passed=True, event=event, updates={})
+
+        # Container is missing: the rented_data snapshot may be stale (the run was stopped or is
+        # still starting mid-cycle) — re-check the live run state before penalizing, like the pod
+        # flow does with get_pod_rental_active.
+        filler_run_id: str = filler_container.removeprefix(FILLER_CONTAINER_PREFIX)
+        filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
+            filler_run_id
+        )
+
+        if filler_run is None:
+            return self._filler_state_unknown_result(
+                ctx, filler_container, reason="filler-run re-check API unavailable"
+            )
+
+        if not filler_run.active:
+            # Not RUNNING right now: either mid-transition (STARTING/STOPPING — the snapshot also
+            # lists those) or already terminal. Nothing provably wrong on the host — pass and let
+            # the next cycle see the settled state.
+            return self._filler_state_unknown_result(
+                ctx,
+                filler_container,
+                reason="filler run is not in RUNNING state",
+                details={"filler_run_status": filler_run.status},
+            )
+
+        run_age: timedelta | None = (
+            datetime.utcnow() - filler_run.started_at if filler_run.started_at else None
+        )
+        if run_age is None or run_age < timedelta(minutes=FILLER_LIVENESS_GRACE_MINUTES):
+            return self._filler_state_unknown_result(
+                ctx,
+                filler_container,
+                reason="filler run within startup grace window",
+                details={"run_age_seconds": run_age.total_seconds() if run_age else None},
+            )
+
+        return await self._filler_killed_result(
+            ctx,
+            filler_container,
+            filler_run_status=filler_run.status,
+            run_age=run_age,
+            enforce=enforce,
+        )
+
+    async def _filler_killed_result(
+        self,
+        ctx: Context,
+        filler_container: str,
+        *,
+        filler_run_status: str | None,
+        run_age: timedelta,
+        enforce: bool,
+    ) -> CheckResult:
+        """Render the confirmed-kill verdict: capture death diagnostics and emit FILLER_KILLED."""
+        try:
+            diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
+            death_fields: dict[str, object] = diagnostics.to_log_fields()
+        except Exception as exc:
+            death_fields = {"diagnostics_capture_error": repr(exc)}
+
+        event = render_message(
+            Msg.FILLER_KILLED,
+            ctx=ctx,
+            check_id=self.check_id,
+            severity=None if enforce else "warning",
+            impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
+            what={
+                "verified": False,
+                "filler_container": filler_container,
+                "executor_uuid": ctx.executor.uuid,
+                "filler_run_status": filler_run_status,
+                "run_age_seconds": run_age.total_seconds(),
+                "enforced": enforce,
+                **death_fields,
+            },
+        )
+        return CheckResult(passed=not enforce, event=event, updates={})
+
+    def _filler_state_unknown_result(
+        self,
+        ctx: Context,
+        filler_container: str,
+        *,
+        reason: str,
+        details: dict[str, object] | None = None,
+    ) -> CheckResult:
+        event = render_message(
+            Msg.FILLER_STATE_UNKNOWN,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                "filler_container": filler_container,
+                "executor_uuid": ctx.executor.uuid,
+                "reason": reason,
+                **(details or {}),
+            },
+        )
+        return CheckResult(passed=True, event=event, updates={})

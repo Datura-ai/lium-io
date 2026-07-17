@@ -173,6 +173,13 @@ class Settings(BaseSettings):
         default=True,
     )
     SKIP_RENTAL_VERIFICATION: bool = Field(env="SKIP_RENTAL_VERIFICATION", default=False)
+    # ISSUE-050 filler liveness. CHECK_ENABLED is the master switch: shadow mode runs the SSH
+    # probe + backend re-check and logs the verdict, but never withholds incentive; switching it
+    # off disables the probe entirely. ENFORCEMENT (only effective while CHECK_ENABLED is on)
+    # additionally fails the fatal check — no unrented incentive — when a host killed the Lium
+    # filler container. Rollout: shadow first, flip enforcement after the shadow data is clean.
+    FILLER_LIVENESS_CHECK_ENABLED: bool = Field(env="FILLER_LIVENESS_CHECK_ENABLED", default=True)
+    FILLER_LIVENESS_ENFORCEMENT_ENABLED: bool = Field(env="FILLER_LIVENESS_ENFORCEMENT_ENABLED", default=False)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")

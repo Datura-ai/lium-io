@@ -17,6 +17,7 @@ from protocol.vc_protocol.compute_requests import (
     DefaultDockerImage,
     DefaultDockerImagesResponse,
     ExecutorHealthCheckResponse,
+    FillerRunActiveResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
 )
@@ -246,6 +247,14 @@ class BackendClient:
         return await self.get(
             f"/internal/pods/{pod_id}/rental-active",
             PodRentalActiveResponse,
+            timeout=10,
+        )
+
+    async def get_filler_run_active(self, filler_run_id: str) -> FillerRunActiveResponse | None:
+        """Fetch whether the backend still considers a Lium filler run active."""
+        return await self.get(
+            f"/internal/filler-runs/{filler_run_id}/active",
+            FillerRunActiveResponse,
             timeout=10,
         )
 
