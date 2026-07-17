@@ -69,6 +69,18 @@ class NetworkEMA(BaseModel):
     ema_verifyx_upload_speed: float | None = None
 
 
+class ManualRentalInfo(BaseModel):
+    """Specs a special manual (bare-metal) rental is force-passed against.
+
+    A manually-rented node is never contacted, so these cannot be scraped — the backend sends
+    what the node was last verified to have, and it is the sole basis for the forced score.
+    Both fields are load-bearing: the incentive layer maps gpu_model to a total-count denominator
+    and multiplies by gpu_count, so a missing model or a zero count means zero emission.
+    """
+    gpu_model: str
+    gpu_count: int
+
+
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
@@ -82,6 +94,10 @@ class RentedExecutorsResponse(BaseModel):
     # executor_id → "miner" | "lium"; absent = no default job. Parsed leniently as str for
     # forward-compatibility (a future owner value must not break parsing of the whole response).
     default_job_owner_by_executor: dict[str, str] = {}
+    # executor_id → specs to force-pass against. Present only for executors carrying a pod flagged
+    # as a special manual (bare-metal) rental. Defaults to empty so an older backend that omits the
+    # field force-passes nobody (fail-closed) rather than everybody.
+    manual_rental_executors: dict[str, ManualRentalInfo] = {}
 
     @field_validator("filler_containers_by_executor")
     @classmethod
@@ -97,6 +113,10 @@ class RentedExecutorsResponse(BaseModel):
 
     def get_default_job_owner(self, executor_uuid: str) -> str | None:
         return self.default_job_owner_by_executor.get(str(executor_uuid))
+
+    def get_manual_rental_info(self, executor_uuid: str) -> "ManualRentalInfo | None":
+        """Specs to force-pass this executor against, or None if it is not a manual rental."""
+        return self.manual_rental_executors.get(str(executor_uuid))
 
 
 class PodRentalActiveResponse(BaseModel):

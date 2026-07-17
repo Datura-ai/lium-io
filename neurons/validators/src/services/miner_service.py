@@ -62,6 +62,7 @@ from services.attestation_service import AttestationService
 from services.docker_service import DockerService
 from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
+from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,11 @@ REST_SSH_SUBMIT_TIMEOUT = 30  # Timeout for SSH key submission requests
 REST_CONTAINER_OP_TIMEOUT = 30  # Timeout for container operations
 REST_POD_LOGS_TIMEOUT = 30  # Timeout for pod logs requests
 REST_SSH_REMOVE_TIMEOUT = 10  # Timeout for SSH key removal requests
+
+# Emitted instead of a validation result for an executor under a special manual (bare-metal)
+# rental. Distinct string so manual passes are greppable in Loki and can never be mistaken for a
+# node that actually passed validation -- nothing about this node was verified.
+MANUAL_RENTAL_FORCED_PASS_EVENT = "Executor force-passed as special manual rental (not validated)"
 
 
 class MinerService:
@@ -276,6 +282,17 @@ class MinerService:
                     msg = None
 
                 if msg is None:
+                    # Deliberately NOT force-passed, unlike the zero-executors case below. There we
+                    # know the miner is alive and chose to drop the executor because it could not
+                    # install our key -- exactly the manual-rental shape. Here we have no signal
+                    # from the miner at all, so we cannot distinguish "renter holds the box" from
+                    # "this miner is gone"; force-passing would pay emissions on strictly less
+                    # evidence than the case it is meant to cover. This assumes the miner neuron is
+                    # shared infrastructure independent of the rented host (CENTRAL_MODE), so that
+                    # an unreachable miner is a real fault rather than an expected consequence of
+                    # handing the box over -- CENTRAL_MODE defaults to False and confirming the
+                    # target deployment is still an open question on the plan.
+                    # Accepted for beta -- see the plan's V3 "Known limitation".
                     return self._build_failed_job_result(
                         payload,
                         "Miner did not respond after SSH key submission",
@@ -290,7 +307,13 @@ class MinerService:
                             ),
                         ),
                     )
-                    if len(msg.executors) == 0:
+                    if len(msg.executors) == 0 and not self._has_manual_rental_executors(
+                        payload, rented_data
+                    ):
+                        # Zero executors is normally a miner failure. It is the *expected* shape when
+                        # every executor this miner has is under a manual rental, though -- the miner
+                        # drops each one because it can no longer install our key. Only fail when
+                        # there is genuinely nothing to score; otherwise fall through to synthesis.
                         return self._build_failed_job_result(
                             payload,
                             "Miner returned zero executors in AcceptSSHKeyRequest",
@@ -317,6 +340,9 @@ class MinerService:
 
                     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
                     results = self._filter_task_results(msg.executors, raw_results, default_extra)
+                    results.extend(
+                        self._build_manual_rental_results(payload, rented_data, existing=results)
+                    )
 
                     logger.info(
                         _m(
@@ -463,6 +489,171 @@ class MinerService:
                     ),
                 ),
             )
+        return results
+
+    def _iter_manual_rental_candidates(
+        self,
+        payload: MinerJobRequestPayload,
+        rented_data: RentedExecutorsResponse | None,
+    ):
+        """Yield (executor_uuid, info, rented_executor) for this miner's force-passable rentals.
+
+        Shared by the cheap `_has_manual_rental_executors` probe and the actual synthesis so the
+        two can never disagree about which executors qualify.
+        """
+        if not rented_data or not rented_data.manual_rental_executors:
+            return
+
+        for executor_uuid, info in rented_data.manual_rental_executors.items():
+            executor_uuid = str(executor_uuid)
+
+            rented_executor = rented_data.executors.get(executor_uuid)
+            if not rented_executor:
+                # Flagged by the backend but not listed as rented (e.g. the pod is DELETING, which
+                # get_rented_pods_with_ports excludes). Without an address there is nothing to build.
+                continue
+            if rented_executor.miner_hotkey != payload.miner_hotkey:
+                # Belongs to a different miner's job request.
+                continue
+            if info.gpu_model not in BASE_GPU_MAP:
+                # A real result can never reach the incentive layer with an unknown model --
+                # GpuModelValidCheck is fatal and halts the pipeline first. A synthetic one skips
+                # the whole pipeline, so it has to make that check itself: RentalPriceIncentive's
+                # get_base_model_for_gpu does a raising BASE_GPU_MAP[...] subscript, and it is
+                # called from calculate_mining_scores, which has no per-result try/except. An
+                # unknown model (e.g. a SKU retired from the map since the rental was created)
+                # would therefore abort weight-setting for EVERY miner on the subnet this cycle.
+                # Dropping the entry costs this one node its emission; raising costs everyone's.
+                logger.warning(
+                    _m(
+                        "Manual rental executor has a GPU model that is not in BASE_GPU_MAP; "
+                        "skipping its forced pass to protect this cycle's weight calculation",
+                        extra=get_extra_info({
+                            "job_batch_id": payload.job_batch_id,
+                            "miner_hotkey": payload.miner_hotkey,
+                            "executor_uuid": executor_uuid,
+                            "gpu_model": info.gpu_model,
+                        }),
+                    ),
+                )
+                continue
+
+            yield executor_uuid, info, rented_executor
+
+    def _has_manual_rental_executors(
+        self,
+        payload: MinerJobRequestPayload,
+        rented_data: RentedExecutorsResponse | None,
+    ) -> bool:
+        """Whether this miner has any force-passable manual rental, without building anything.
+
+        Used to decide whether a zero-executor AcceptSSHKeyRequest is a genuine miner failure or
+        the expected shape when every executor has been handed to a renter.
+        """
+        return any(self._iter_manual_rental_candidates(payload, rented_data))
+
+    def _build_manual_rental_results(
+        self,
+        payload: MinerJobRequestPayload,
+        rented_data: RentedExecutorsResponse | None,
+        existing: list[JobResult],
+    ) -> list[JobResult]:
+        """Synthesise forced-pass results for this miner's special manual (bare-metal) rentals.
+
+        A manually-rented node is handed to the renter at root level and the platform stops
+        provisioning it, so the miner can no longer install our SSH key on it. The miner silently
+        drops such an executor from AcceptSSHKeyRequest (it filters on a successful pubkey upload),
+        which means TaskService.create_task never runs for it and it would score 0. The forced pass
+        therefore has to be synthesised out here, from the backend's list, rather than short-circuited
+        inside per-executor validation.
+
+        The node is never contacted: score, gpu_model and gpu_count come entirely from the backend.
+
+        `spec` is deliberately left None. The backend skips its whole executor upsert on a null spec,
+        which is what we want -- a synthesised spec that validated but disagreed with the stored row
+        would flip the executor inactive and take billing down with it.
+        """
+        already_scored = {str(result.executor_info.uuid) for result in existing}
+        results: list[JobResult] = []
+
+        for executor_uuid, info, rented_executor in self._iter_manual_rental_candidates(
+            payload, rented_data
+        ):
+            if executor_uuid in already_scored:
+                # The node answered after all. A real result always beats a synthesised one.
+                continue
+
+            try:
+                executor_port = int(rented_executor.executor_ip_port)
+            except (TypeError, ValueError):
+                executor_port = 0
+
+            executor_info = ExecutorSSHInfo(
+                uuid=executor_uuid,
+                address=rented_executor.executor_ip_address,
+                port=executor_port,
+                # No SSH is attempted for a manual rental; these exist only to satisfy the model.
+                ssh_username="",
+                ssh_port=0,
+                python_path="",
+                root_dir="",
+            )
+
+            # Read the incentive-layer gates off rented_data exactly as ResultHandler does, rather
+            # than hardcoding them: forcing score=1.0 buys a place in the mining pool, it does not
+            # exempt the node from spot-tier or Discord exclusions.
+            is_spot = executor_uuid in (rented_data.spot_executor_ids or [])
+            discord_connected_ids = rented_data.provider_discord_connected_executor_ids
+            provider_discord_connected = (
+                True if discord_connected_ids is None else executor_uuid in discord_connected_ids
+            )
+
+            log_text = _m(
+                MANUAL_RENTAL_FORCED_PASS_EVENT,
+                extra=get_extra_info({
+                    "job_batch_id": payload.job_batch_id,
+                    "miner_hotkey": payload.miner_hotkey,
+                    "executor_uuid": executor_uuid,
+                    "executor_ip_address": rented_executor.executor_ip_address,
+                    "gpu_model": info.gpu_model,
+                    "gpu_count": info.gpu_count,
+                    "reason": "special_manual_rental",
+                }),
+            ).to_full_string()
+
+            results.append(
+                JobResult(
+                    spec=None,
+                    executor_info=executor_info,
+                    score=1.0,
+                    job_score=1.0,
+                    job_batch_id=payload.job_batch_id,
+                    log_status="success",
+                    log_text=log_text,
+                    gpu_model=info.gpu_model,
+                    gpu_count=info.gpu_count,
+                    # Rented exempts the minimum-driver gate, which we cannot measure here.
+                    is_rented=True,
+                    # Not measurable without the node; a false reading would silently cut the score.
+                    sysbox_runtime=True,
+                    is_spot=is_spot,
+                    provider_discord_connected=provider_discord_connected,
+                )
+            )
+
+        if results:
+            logger.info(
+                _m(
+                    "Forced pass for special manual rentals",
+                    extra=get_extra_info({
+                        "job_batch_id": payload.job_batch_id,
+                        "miner_hotkey": payload.miner_hotkey,
+                        "executors": len(results),
+                        "executor_uuids": [str(r.executor_info.uuid) for r in results],
+                    }),
+                ),
+            )
+
         return results
 
     def _build_failed_job_result(self, payload: MinerJobRequestPayload, reason: str):
@@ -1557,7 +1748,11 @@ class MinerService:
                         ),
                     ),
                 )
-                if len(msg.executors) == 0:
+                if len(msg.executors) == 0 and not self._has_manual_rental_executors(
+                    payload, rented_data
+                ):
+                    # See the WebSocket path: zero executors is the expected shape when every
+                    # executor is under a manual rental, so only fail when nothing can be scored.
                     return self._build_failed_job_result(
                         payload,
                         "Miner returned zero executors in AcceptSSHKeyRequest",
@@ -1584,6 +1779,9 @@ class MinerService:
 
                 raw_results = await asyncio.gather(*tasks, return_exceptions=True)
                 results = self._filter_task_results(msg.executors, raw_results, default_extra)
+                results.extend(
+                    self._build_manual_rental_results(payload, rented_data, existing=results)
+                )
 
                 logger.info(
                     _m(
