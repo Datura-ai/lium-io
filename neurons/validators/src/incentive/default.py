@@ -107,6 +107,8 @@ class DefaultIncentive(BaseIncentive):
         Args:
             result: Job execution result to process
         """
+        result.mining_share = self.mining_share
+        result.total_mining_score = self.total_mining_score
         if result.mining_score is None:
             error_report: MinerLogLine = MinerLogLine.mining_score_missing(hotkey, result)
             result.incentive_logs.append(error_report.to_log_line())

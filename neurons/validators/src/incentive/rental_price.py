@@ -147,8 +147,12 @@ class RentalPriceIncentive(DefaultIncentive):
         self.cap_multiplier_by_bucket: dict[tuple[str, int], float] = {}
         self.total_rental_cost = 0.0
         self.rental_share = 0.0
+        self.rental_share_raw = 0.0
         self.burn_share = 0.0
+        self.total_burn_emission = get_total_burn_emission()
         self.epoch_subnet_emission: float = 0.0
+        self.validator_tao_price_usd: float | None = None
+        self.validator_alpha_rate_tao_per_block: float | None = None
         # Store the snapshot so estimation can derive per-model totals from it.
         self._seed_snapshot = snapshot
 
@@ -321,9 +325,10 @@ class RentalPriceIncentive(DefaultIncentive):
             self.total_rental_cost += cap_mult * weighted_sum
 
         rental_share_raw = await self._calculate_rental_share(self.total_rental_cost)
+        self.rental_share_raw = rental_share_raw
 
         # Cap rental_share at the burn-emission share (sourced from shared config, DAH-2274)
-        total_burn_emission = get_total_burn_emission()
+        total_burn_emission = self.total_burn_emission
         rental_share_capped = rental_share_raw > total_burn_emission
         self.rental_share = min(rental_share_raw, total_burn_emission)
 
@@ -362,7 +367,9 @@ class RentalPriceIncentive(DefaultIncentive):
             result: Job execution result to process
         """
         if not result.eligible_for_rental_share:
-            return await super()._post_process_job_result(hotkey, result) # use default incentive logic.
+            result = await super()._post_process_job_result(hotkey, result) # use default incentive logic.
+            self._set_cycle_formula_context(result)
+            return result
 
         # state updates
         base_model = self.get_base_model_for_gpu(result.gpu_model)
@@ -384,6 +391,7 @@ class RentalPriceIncentive(DefaultIncentive):
             * result.sysbox_multiplier
             * result.driver_multiplier
         )
+        self._set_cycle_formula_context(result)
 
         # calculate incentive score
         result.incentive = (
@@ -399,6 +407,19 @@ class RentalPriceIncentive(DefaultIncentive):
 
         # aggregate miner incentives
         self.miner_incentives[hotkey] = self.miner_incentives.get(hotkey, 0.0) + result.incentive
+
+    def _set_cycle_formula_context(self, result: JobResult) -> None:
+        result.rental_share = self.rental_share
+        result.rental_share_raw = self.rental_share_raw
+        result.burn_share = self.burn_share
+        result.total_burn_emission = self.total_burn_emission
+        result.total_rental_cost = self.total_rental_cost
+        result.validator_tao_price_usd = self.validator_tao_price_usd
+        result.validator_alpha_rate_tao_per_block = self.validator_alpha_rate_tao_per_block
+        result.estimated_epoch_emission_usd = self.epoch_subnet_emission
+        result.tempo_blocks = TEMPO
+        result.seconds_per_block = SECONDS_PER_BLOCK
+        result.fixed_ratio = FIXED_RATIO
 
     def _explain_zero_effective_rate(self, result: JobResult, bucket: int) -> None:
         """DAH-2327: an eligible unrented executor still finalizes at 0 when any factor of
@@ -640,6 +661,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     )
                 )
                 return 0.0
+
+            self.validator_tao_price_usd = tao_price
+            self.validator_alpha_rate_tao_per_block = alpha_rate
 
             # Calculate epoch subnet emission and store for estimation use
             epoch_subnet_emission = TEMPO * tao_price * alpha_rate

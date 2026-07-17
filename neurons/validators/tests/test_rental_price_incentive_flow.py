@@ -219,6 +219,18 @@ async def test_rental_price_scenario_basic_mixed(
 
     await _run_sync_with_jobs(validator, miners, all_job_results)
 
+    rented_result = all_job_results["miner_a"][0]
+    idle_result = all_job_results["miner_b"][0]
+    assert rented_result.incentive_formula_version == "mining_v1"
+    assert rented_result.incentive_formula_inputs["mining_share"] == pytest.approx(1 - TOTAL_BURN_EMISSION)
+    assert rented_result.incentive_formula_inputs["total_mining_score"] == pytest.approx(
+        rented_result.mining_score
+    )
+    assert idle_result.incentive_formula_version == "rental_price_v2"
+    assert idle_result.incentive_formula_inputs["validator_tao_price_usd"] == TAO_PRICE
+    assert idle_result.incentive_formula_inputs["validator_alpha_rate_tao_per_block"] == ALPHA_RATE
+    assert idle_result.incentive_formula_inputs["max_cap"] == MAX_UNRENTED_GPUS_AGGREGATE["H100"]
+
     # Verify rental-specific logging for rented vs unrented executors
     from tests.helpers import (
         assert_incentive_log_present,
