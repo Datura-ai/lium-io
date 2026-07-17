@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient
 from clients.subtensor_client import SubtensorClient
@@ -456,6 +457,14 @@ class Validator:
                         miners=miners,
                         last_mechanism_step_block=last_mechanism_step_block,
                     )
+
+                    # A cycle can run across wall-clock boundaries. Stamp every executor
+                    # once, after scoring is final, so accounting and UTC day bucketing use
+                    # one stable boundary across all downstream views.
+                    scored_at = datetime.now(UTC)
+                    for results in incentive.job_results.values():
+                        for result in results:
+                            result.scored_at = scored_at
 
                     # PHASE 3: Accumulate scores with burning applied
                     for miner_hotkey, score in cycle_scores.items():

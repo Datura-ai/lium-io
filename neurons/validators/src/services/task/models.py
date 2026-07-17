@@ -16,6 +16,9 @@ class JobResult(BaseModel):
     job_batch_id: str
     log_status: str
     log_text: str
+    # One timestamp shared by every executor finalized in this validator cycle.
+    # It is assigned after final weights are calculated and is the accounting/day key.
+    scored_at: datetime | None = None
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False
@@ -63,6 +66,19 @@ class JobResult(BaseModel):
 
     
     incentive_logs: list[str] = []
+
+    @property
+    def incentive_source(self) -> str:
+        """Classify the executor's finalized contribution for this cycle."""
+        if self.incentive is None:
+            return "unknown"
+        if self.incentive <= 0:
+            return "zero_incentive"
+        return "rented_emission" if self.is_rented else "idle_incentive"
+
+    @property
+    def node_state_at_cycle(self) -> str:
+        return "rented" if self.is_rented else "idle"
 
     @property
     def full_log_text(self):

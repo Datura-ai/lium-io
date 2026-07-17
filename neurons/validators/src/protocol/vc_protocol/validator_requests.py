@@ -1,6 +1,7 @@
 import enum
 import json
 import time
+from datetime import datetime
 
 import bittensor
 import pydantic
@@ -69,6 +70,11 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     log_text: str | None
     log_status: str | None
     job_batch_id: str
+    netuid: int | None = None
+    scored_at: datetime | None = None
+    incentive: float | None = None
+    incentive_source: str | None = None
+    node_state_at_cycle: str | None = None
     collateral_deposited: bool
     ssh_pub_keys: list[str] | None = None
     # CVM attestation provenance (minimal-G5: the connector must not drop these).
