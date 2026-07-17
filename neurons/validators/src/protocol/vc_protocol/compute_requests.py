@@ -124,6 +124,12 @@ class PodRentalActiveResponse(BaseModel):
     rental_closed_at: datetime | None = None
 
 
+class FillerRunActiveResponse(BaseModel):
+    active: bool
+    status: str | None = None
+    started_at: datetime | None = None
+
+
 class ExecutorUptimeResponse(BaseModel):
     executor_ip_address: str
     executor_ip_port: str

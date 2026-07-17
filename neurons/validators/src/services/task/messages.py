@@ -985,6 +985,40 @@ class RentalVerificationMessages:
         impact="Proceed with existing rental status",
         remediation="Check backend API connectivity and logs",
     )
+    FILLER_VERIFIED = MessageTemplate(
+        event="Lium default job runtime verified",
+        reason="FILLER_RUNTIME_VERIFIED",
+        severity="info",
+        category="policy",
+        impact="Unrented incentive continues: the Lium default job container is running",
+    )
+    FILLER_KILLED = MessageTemplate(
+        event="Lium default job container was removed on the host",
+        reason="FILLER_CONTAINER_MISSING",
+        severity="error",
+        category="policy",
+        impact="Unrented incentive withheld: the Lium default job container disappeared while its run is active",
+        remediation=(
+            "Do not stop or remove Lium default-job (filler_*) containers. "
+            "Incentive resumes once a default job runs undisturbed. "
+            "Contact Lium support if this container was not removed by you."
+        ),
+    )
+    FILLER_STATE_UNKNOWN = MessageTemplate(
+        event="Lium default job state could not be verified",
+        reason="FILLER_STATE_UNKNOWN",
+        severity="warning",
+        category="policy",
+        impact="Proceed without penalty",
+    )
+    FILLER_TRANSPORT_UNREACHABLE = MessageTemplate(
+        event="SSH transport lost while verifying Lium default job",
+        reason="FILLER_TRANSPORT_UNREACHABLE",
+        severity="warning",
+        category="runtime",
+        impact="Filler state unknown for this cycle",
+        remediation="Ensure the executor is reachable over SSH and stays online",
+    )
 
 
 class FinalizeMessages:

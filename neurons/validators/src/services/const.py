@@ -224,6 +224,9 @@ PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 2
 POD_CONTAINER_PREFIX = "pod_"
 FILLER_CONTAINER_PREFIX = "filler_"
 FILLER_CONTAINER_GRACE_MINUTES = 15
+# ISSUE-050: a filler run younger than this is not penalized for a missing container —
+# it may still be finishing its create/stop race with the backend snapshot.
+FILLER_LIVENESS_GRACE_MINUTES = 10
 
 # Owner of an executor's active default job, as reported by compute-app.
 # An executor running the miner's OWN default job earns no unrented incentive.

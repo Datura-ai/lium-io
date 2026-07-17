@@ -1,22 +1,38 @@
+from datetime import datetime, timedelta
+
+import asyncssh
 import pytest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     ExecutorHealthCheckResponse,
+    FillerRunActiveResponse,
 )
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
+from neurons.validators.src.services.task.pipeline import CheckResult, Context
 
 from tests.helpers import build_services, build_state
 
 
 class DummyBackendClient:
-    def __init__(self, *, response: ExecutorHealthCheckResponse | None):
+    def __init__(
+        self,
+        *,
+        response: ExecutorHealthCheckResponse | None,
+        filler_run_active: FillerRunActiveResponse | None = None,
+    ):
         self.response = response
         self.called_with: dict | None = None
+        self.filler_run_active = filler_run_active
+        self.filler_run_active_calls: list[str] = []
+
+    async def get_filler_run_active(self, filler_run_id: str) -> FillerRunActiveResponse | None:
+        self.filler_run_active_calls.append(filler_run_id)
+        return self.filler_run_active
 
     async def check_executor_health(
         self,
@@ -405,30 +421,233 @@ async def test_rental_verification_skips_cleanup_when_no_ports():
     assert not _has_health_check_cleanup(ssh.commands)
 
 
-@pytest.mark.asyncio
-async def test_rental_verification_skips_filler_only_executor():
-    backend_client = DummyBackendClient(
-        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
-    )
+class FillerSSHClient:
+    """Mock SSH client answering the filler docker-ps liveness probe."""
+
+    def __init__(
+        self,
+        *,
+        running: bool = True,
+        exit_status: int = 0,
+        raise_on_run: BaseException | None = None,
+    ):
+        self.running = running
+        self.exit_status = exit_status
+        self.raise_on_run = raise_on_run
+        self.commands: list[str] = []
+
+    async def run(self, command: str) -> Mock:
+        self.commands.append(command)
+        if self.raise_on_run is not None:
+            raise self.raise_on_run
+        result = Mock()
+        result.exit_status = self.exit_status
+        result.stdout = "container_id_123" if self.running and "docker ps" in command else ""
+        result.stderr = ""
+        return result
+
+
+def _filler_context(
+    *,
+    backend_client: DummyBackendClient,
+    ssh_client: FillerSSHClient,
+    filler_container: str = "filler_11111111-2222-3333-4444-555555555555",
+) -> Context:
     services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(
         specs={"verified_ports": [8080]},
         rented_data=RentedExecutorsResponse(
             executors={},
-            filler_containers_by_executor={"executor-123": "filler_active"},
+            filler_containers_by_executor={"executor-123": filler_container},
+        ),
+    )
+    from tests.helpers import make_context
+
+    return make_context(services=services, state=state, ssh=ssh_client)
+
+
+async def _run_filler_check(ctx: Context, *, check_enabled: bool = True, enforcement: bool = False) -> CheckResult:
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
+        mock_settings.SKIP_RENTAL_VERIFICATION = False
+        mock_settings.FILLER_LIVENESS_CHECK_ENABLED = check_enabled
+        mock_settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED = enforcement
+        return await RentalVerificationCheck().run(ctx)
+
+
+def _killed_filler_backend() -> DummyBackendClient:
+    return DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={}),
+        filler_run_active=FillerRunActiveResponse(
+            active=True,
+            status="RUNNING",
+            started_at=datetime.utcnow() - timedelta(minutes=30),
         ),
     )
 
-    from tests.helpers import make_context
-    ctx = make_context(services=services, state=state)
 
-    with patch("neurons.validators.src.services.task.checks.rental_verification.settings") as mock_settings:
-        mock_settings.SKIP_RENTAL_VERIFICATION = False
-        result = await RentalVerificationCheck().run(ctx)
+@pytest.mark.parametrize("enforcement", [False, True])
+@pytest.mark.asyncio
+async def test_rental_verification_filler_liveness_disabled_keeps_legacy_skip(enforcement: bool):
+    """CHECK_ENABLED is the master kill switch: off means no probe, even with enforcement on."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, check_enabled=False, enforcement=enforcement)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.SKIPPED.reason
+    assert ssh_client.commands == []
+    assert backend_client.filler_run_active_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_running_passes():
+    """A filler container alive on the host passes; no health check, no re-check."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ssh_client = FillerSSHClient(running=True)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_VERIFIED.reason
     assert backend_client.called_with is None
+    assert backend_client.filler_run_active_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_killed_shadow_mode_passes_but_logs():
+    """Shadow mode: a killed filler is logged with enforced=False but incentive is untouched."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=False)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+    assert result.event.what_we_saw["enforced"] is False
+    assert backend_client.filler_run_active_calls == ["11111111-2222-3333-4444-555555555555"]
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_killed_enforcement_fails():
+    """Enforcement mode: a killed filler fails the fatal check -> no unrented incentive."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+    assert result.event.what_we_saw["enforced"] is True
+    assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_missing_within_grace_passes():
+    """A run younger than the grace window is not penalized for a missing container."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={}),
+        filler_run_active=FillerRunActiveResponse(
+            active=True,
+            status="RUNNING",
+            started_at=datetime.utcnow() - timedelta(minutes=2),
+        ),
+    )
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+
+
+@pytest.mark.parametrize("enforcement", [False, True])
+@pytest.mark.asyncio
+async def test_rental_verification_filler_not_running_state_is_benign(enforcement: bool):
+    """A run not in RUNNING (stopped or mid-transition) is benign: pass, no health check."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={}),
+        filler_run_active=FillerRunActiveResponse(active=False, status="STOPPED"),
+    )
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=enforcement)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+    assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_docker_ps_error_fails_open():
+    """A failing docker daemon (non-zero docker ps exit) must not be mistaken for a kill."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False, exit_status=1)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+    assert backend_client.filler_run_active_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_active_api_error_fails_open():
+    """If the filler-run re-check API is unavailable, do not punish the miner."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={}),
+        filler_run_active=None,
+    )
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+    assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_ssh_transport_error_fails_without_recheck():
+    """Enforcement: a dead SSH transport means filler state is unknown -> fail the cycle, no re-check."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ssh_client = FillerSSHClient(raise_on_run=asyncssh.Error(code=1, reason="connection lost"))
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
+    assert backend_client.filler_run_active_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_ssh_transport_error_shadow_mode_passes():
+    """Shadow mode: a dead SSH transport is logged but never fails the cycle."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ssh_client = FillerSSHClient(raise_on_run=asyncssh.Error(code=1, reason="connection lost"))
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+
+    result = await _run_filler_check(ctx, enforcement=False)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
 
 
 @pytest.mark.asyncio
