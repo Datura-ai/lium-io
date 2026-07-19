@@ -1,0 +1,86 @@
+{
+  "message_type": "ContainerCreated",
+  "miner_hotkey": "miner",
+  "executor_id": "00000000-0000-0000-0000-0000000000e1",
+  "pod_id": "00000000-0000-0000-0000-0000000000b1",
+  "workload_kind": "CUSTOMER_RENTAL",
+  "container_name": "pod_00000000-0000-0000-0000-0000000000b1",
+  "volume_name": "volume_00000000-0000-0000-0000-0000000000b1",
+  "port_maps": [
+    [
+      22,
+      20001
+    ]
+  ],
+  "profilers": [
+    {
+      "name": "Started in subnet",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Port mappings generated",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "SSH connection established",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Docker login step finished",
+      "duration": "<duration_ms>",
+      "skipped": true
+    },
+    {
+      "name": "Docker pull step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Container cleaning step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Docker volume creation step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "GPU device probe step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Port-check wait step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Docker run step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Container running check step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "SSH service installation step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Adding public keys step finished",
+      "duration": "<duration_ms>"
+    },
+    {
+      "name": "Inspector collector start step finished",
+      "duration": "<duration_ms>",
+      "skipped": true
+    },
+    {
+      "name": "Finished in subnet.",
+      "duration": "<duration_ms>"
+    }
+  ],
+  "backup_log_id": "b1",
+  "restore_path": "/r",
+  "jupyter_url": null,
+  "warnings": [],
+  "storage_limit_gb": 20,
+  "volume_limit_gb": 10,
+  "local_volume_path": "/root"
+}

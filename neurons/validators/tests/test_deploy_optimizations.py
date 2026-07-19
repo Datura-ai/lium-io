@@ -391,12 +391,18 @@ async def test_ships_sshd_true_forwards_jupyter_password_instead_of_run_jupyter(
         AsyncMock(return_value=([(22, 20001, 20001)], (8888, 30888))),
     )
 
-    result = await _run(svc, _payload(ships_sshd=True, enable_jupyter=True))
+    result = await _run(svc, _payload(ships_sshd=True, enable_jupyter=True, **_CREDS))
 
     assert isinstance(result, ContainerCreated)
     # Neither the validator sshd bootstrap nor run_jupyter should run.
     svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_not_awaited()
     svc.run_jupyter.assert_not_awaited()
+
+    # WHY (oracle B10 fold, DAH-2382): the image-managed bundle also skips the docker
+    # login — ships_sshd is the default-image signal, so even with renter credentials
+    # attached the login must not run and its profiler step must say skipped.
+    assert _docker_client(svc).login_calls == []
+    assert _login_step(result).skipped is True
 
     # JUPYTER_PASSWORD is forwarded as create-time container env: it is the ONLY
     # Jupyter variable the image's start.sh reads (`if [[ $JUPYTER_PASSWORD ]]` →
@@ -442,12 +448,18 @@ async def test_ships_sshd_none_with_jupyter_uses_run_jupyter(svc, monkeypatch):
         AsyncMock(return_value=([(22, 20001, 20001)], (8888, 30888))),
     )
 
-    result = await _run(svc, _payload(enable_jupyter=True))
+    result = await _run(svc, _payload(enable_jupyter=True, **_CREDS))
 
     assert isinstance(result, ContainerCreated)
     svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once()
     svc.run_jupyter.assert_awaited_once()
     assert "JUPYTER_PASSWORD" not in _created_run_spec(svc).environment
+
+    # WHY (oracle B11 fold, DAH-2382): the validator-managed branch keeps the docker
+    # login — ships_sshd None with credentials is no default-image signal, so the
+    # login must run and the DOCKER_LOGIN profiler step must not claim skipped.
+    assert _docker_client(svc).login_calls == [{"username": "renter", "password": "renter-secret"}]
+    assert _login_step(result).skipped is False
 
 
 @pytest.mark.asyncio

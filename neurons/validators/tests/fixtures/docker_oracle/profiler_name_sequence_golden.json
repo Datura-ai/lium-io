@@ -1,0 +1,17 @@
+[
+  "Started in subnet",
+  "Port mappings generated",
+  "SSH connection established",
+  "Docker login step finished",
+  "Docker pull step finished",
+  "Container cleaning step finished",
+  "Docker volume creation step finished",
+  "GPU device probe step finished",
+  "Port-check wait step finished",
+  "Docker run step finished",
+  "Container running check step finished",
+  "SSH service installation step finished",
+  "Adding public keys step finished",
+  "Inspector collector start step finished",
+  "Finished in subnet."
+]

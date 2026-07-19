@@ -1,0 +1,107 @@
+{
+  "daemon": {
+    "cmd": [
+      "sh",
+      "-c",
+      "trap : TERM INT; sleep infinity & wait"
+    ],
+    "entrypoint": null,
+    "env": {
+      "E7_SECRET_TOKEN": "<masked>",
+      "E7_SENTINEL": "sentinel-value",
+      "NVIDIA_DRIVER_CAPABILITIES": "all",
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    },
+    "env_keys": [
+      "E7_SECRET_TOKEN",
+      "E7_SENTINEL",
+      "NVIDIA_DRIVER_CAPABILITIES",
+      "PATH"
+    ],
+    "host_config": {
+      "binds": [
+        "volume_00000000-0000-0000-0000-0000000000e7:/root:rw"
+      ],
+      "cap_add": [
+        "NET_ADMIN"
+      ],
+      "devices": [
+        {
+          "CgroupPermissions": "rwm",
+          "PathInContainer": "/dev/net/tun",
+          "PathOnHost": "/dev/net/tun"
+        }
+      ],
+      "memory": 1073741824,
+      "nano_cpus": 1000000000,
+      "port_bindings": {
+        "22/tcp": [
+          "20001"
+        ]
+      },
+      "restart_policy": {
+        "MaximumRetryCount": 0,
+        "Name": "unless-stopped"
+      },
+      "sysctls": {
+        "net.ipv4.conf.all.src_valid_mark": "1"
+      }
+    },
+    "labels": {}
+  },
+  "delete": {
+    "removed_after_force_remove": true,
+    "running_after_graceful_stop": false
+  },
+  "redis_call_order": [],
+  "run_spec": {
+    "cap_add": [
+      "NET_ADMIN"
+    ],
+    "command": [
+      "sh",
+      "-c",
+      "trap : TERM INT; sleep infinity & wait"
+    ],
+    "cpu_count": 1,
+    "device_requests": [],
+    "devices": [
+      {
+        "path_in_container": "/dev/net/tun",
+        "path_on_host": "/dev/net/tun",
+        "permissions": "rwm"
+      }
+    ],
+    "entrypoint": null,
+    "environment": {
+      "E7_SECRET_TOKEN": "<masked>",
+      "E7_SENTINEL": "sentinel-value",
+      "NVIDIA_DRIVER_CAPABILITIES": "all"
+    },
+    "image": "alpine:3.20",
+    "memory_gb": 1,
+    "name": "pod_00000000-0000-0000-0000-0000000000e7",
+    "ports": [
+      {
+        "container_port": 22,
+        "host_port": 20001,
+        "protocol": "tcp"
+      }
+    ],
+    "restart_policy": "unless-stopped",
+    "runtime": null,
+    "shm_size": null,
+    "storage_limit_gb": null,
+    "sysctls": {
+      "net.ipv4.conf.all.src_valid_mark": "1"
+    },
+    "volumes": [
+      {
+        "read_only": false,
+        "source": "volume_00000000-0000-0000-0000-0000000000e7",
+        "target": "/root"
+      }
+    ]
+  },
+  "schema": "e7-differential-probe/v1"
+}

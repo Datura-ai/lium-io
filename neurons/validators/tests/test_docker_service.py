@@ -23,6 +23,7 @@ from payload_models.payloads import (
     ContainerDeleted,
     ContainerStartRequest,
     ContainerStopRequest,
+    FailedContainerErrorCodes,
     FailedContainerErrorTypes,
     FailedContainerRequest,
     PayloadPortMapping,
@@ -1027,6 +1028,10 @@ async def test_delete_container_stops_gracefully_before_forced_removal(
         ("remove", payload.container_name),
     ]
     assert client.stop_grace_seconds_calls == [CONTAINER_STOP_GRACE_SECONDS]
+    # WHY (DAH-2382 D2): the customer grace window is a wire contract
+    # (docker stop -t 30) — pin the literal, not just the constant, so a silent
+    # constant change cannot pass characterization
+    assert client.stop_grace_seconds_calls == [30]
     assert client.removed_containers == [
         {
             "container_name": payload.container_name,
@@ -1095,6 +1100,7 @@ async def test_delete_container_logs_point_at_the_call_site(
 async def test_delete_container_stop_failure_still_removes(
     docker_service,
     monkeypatch,
+    caplog,
 ):
     # Arrange: the graceful stop fails (e.g. wedged runtime) — removal must proceed
     ssh_client = AsyncMock()
@@ -1132,12 +1138,13 @@ async def test_delete_container_stop_failure_still_removes(
     )
 
     # Act
-    result = await docker_service.delete_container(
-        payload=payload,
-        executor_info=executor_info,
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
+    with caplog.at_level(logging.WARNING, logger="services.docker_service"):
+        result = await docker_service.delete_container(
+            payload=payload,
+            executor_info=executor_info,
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
 
     # Assert: stop failure is swallowed, forced removal still runs and succeeds
     assert isinstance(result, ContainerDeleted)
@@ -1150,6 +1157,15 @@ async def test_delete_container_stop_failure_still_removes(
             "remove_volumes": True,
         }
     ]
+    # WHY (DAH-2382 D4): a failed graceful stop is demoted to a single WARNING —
+    # never an ERROR, never fatal — because the forced removal stays the single
+    # source of truth for deletion
+    stop_warnings = [
+        r
+        for r in caplog.records
+        if str(r.msg) == "Graceful container stop failed; proceeding to forced removal"
+    ]
+    assert [r.levelno for r in stop_warnings] == [logging.WARNING]
 
 
 @pytest.mark.asyncio
@@ -1277,6 +1293,9 @@ async def test_delete_filler_stops_with_reduced_grace(
     ]
     assert client.stop_grace_seconds_calls == [FILLER_CONTAINER_STOP_GRACE_SECONDS]
     assert FILLER_CONTAINER_STOP_GRACE_SECONDS < CONTAINER_STOP_GRACE_SECONDS
+    # WHY (DAH-2382 D3): the DAH-2364 filler grace must stay below the backend's
+    # 30s preemption budget — pin the literal 15, not just the constant
+    assert client.stop_grace_seconds_calls == [15]
     # DAH-2356 still restores the filler's GPU power caps after the graceful stop
     restore_filler_power.assert_awaited_once()
     assert restore_filler_power.await_args.args[2] == payload.pod_id
@@ -1595,6 +1614,16 @@ async def test_delete_container_remove_container_error_fails_undeploy(
     assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
     assert "500 Server Error: daemon exploded" in result.msg
     docker_service.redis_service.remove_rented_machine.assert_not_awaited()
+    # WHY (DAH-2382 D5): the fatal-remove funnel shape is a classifier surface —
+    # byte-frozen msg prefix + the raw str(exc) tail, error_code UnknownError,
+    # and (unlike the create funnel) NO failure_step
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
+    assert result.msg.startswith("Unknown Error delete_container: ")
+    assert result.msg == (
+        "Unknown Error delete_container: "
+        "Docker SDK remove container failed: 500 Server Error: daemon exploded"
+    )
+    assert result.failure_step is None
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,8 @@ from payload_models.payloads import (
     ExternalVolumeInfo,
     PayloadPortMapping,
     RemoveSshPublicKeysRequest,
+    SshPubKeyAdded,
+    SshPubKeyRemoved,
     WorkloadKind,
 )
 from services.docker_service import DockerService
@@ -622,7 +624,7 @@ async def test_add_ssh_key_writes_public_keys_as_stdin_data(
         user_public_keys=[HOSTILE_PUBLIC_KEY],
     )
 
-    await docker_service.add_ssh_key(
+    result = await docker_service.add_ssh_key(
         payload,
         executor_info,
         keypair,
@@ -639,6 +641,10 @@ async def test_add_ssh_key_writes_public_keys_as_stdin_data(
     assert spec.container_name == HOSTILE_CONTAINER_NAME
     assert HOSTILE_PUBLIC_KEY not in " ".join(spec.argv)
     assert spec.stdin == f"{HOSTILE_PUBLIC_KEY}\n"
+    # WHY (oracle D12): this test used to discard the return value — freeze the
+    # success ack the backend consumes: SshPubKeyAdded echoing the request keys.
+    assert isinstance(result, SshPubKeyAdded)
+    assert result.user_public_keys == [HOSTILE_PUBLIC_KEY]
 
 
 @pytest.mark.asyncio
@@ -659,7 +665,7 @@ async def test_remove_ssh_key_writes_public_keys_as_stdin_data(
         user_public_keys=[HOSTILE_PUBLIC_KEY],
     )
 
-    await docker_service.remove_ssh_keys(
+    result = await docker_service.remove_ssh_keys(
         payload,
         executor_info,
         keypair,
@@ -676,6 +682,11 @@ async def test_remove_ssh_key_writes_public_keys_as_stdin_data(
     assert spec.container_name == HOSTILE_CONTAINER_NAME
     assert HOSTILE_PUBLIC_KEY not in " ".join(spec.argv)
     assert spec.stdin == f"{HOSTILE_PUBLIC_KEY}\n"
+    # WHY (oracle D13): freeze the remove ack shape even though the backend
+    # silently drops it today (SshPubKeyRemoved is not in the backend RequestType,
+    # DRAFT §8) — extraction must not change the wire shape regardless.
+    assert isinstance(result, SshPubKeyRemoved)
+    assert result.user_public_keys == [HOSTILE_PUBLIC_KEY]
 
 
 @pytest.mark.asyncio
