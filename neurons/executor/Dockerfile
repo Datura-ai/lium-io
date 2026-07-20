@@ -11,6 +11,7 @@ RUN apt-get update \
      build-essential \
      ca-certificates \
      curl \
+     e2fsprogs \
      git \
      gnupg \
      libffi-dev \
