@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eux -o pipefail
 
+# disk reserve: validator-cycle writes must survive a 100%-full host disk
+bash setup_disk_reserve.sh || echo "[disk-reserve] setup failed; continuing without reserve"
+bash setup_disk_reserve.sh janitor &
+# re-enter cwd through the overlay mount (the old dentry would bypass it)
+cd /root/app
+
 # ensure docker group matches host socket
 SOCK=/var/run/docker.sock
 if [ -S "$SOCK" ]; then
