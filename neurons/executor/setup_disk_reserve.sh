@@ -54,9 +54,14 @@ setup_backing_fs() {
     fi
 
     # nodiscard is mandatory: default mkfs.ext4 discards blocks and silently
-    # destroys the fallocate reservation
+    # destroys the fallocate reservation. lazy init must be off too: the
+    # kernel's post-mount ext4lazyinit zeroes inode tables via WRITE_ZEROES,
+    # which loop turns into hole-punching in the backing file (~80M of the
+    # reservation lost; a write into a hole on a full disk aborts the journal
+    # and flips the reserve read-only)
+    local mkfs_opts="nodiscard,lazy_itable_init=0,lazy_journal_init=0"
     if [ "$(blkid -o value -s TYPE "$loop" 2>/dev/null)" != "ext4" ]; then
-        mkfs.ext4 -q -F -E nodiscard -m 0 -L lium-reserve "$loop" || { log "mkfs.ext4 $loop failed"; return 1; }
+        mkfs.ext4 -q -F -E "$mkfs_opts" -m 0 -L lium-reserve "$loop" || { log "mkfs.ext4 $loop failed"; return 1; }
     fi
 
     mkdir -p "$MNT" || return 1
@@ -64,9 +69,18 @@ setup_backing_fs() {
         # reserve content is disposable — rebuild a corrupted fs instead of
         # staying unprotected forever
         log "mount failed — re-creating reserve fs on $loop"
-        mkfs.ext4 -q -F -E nodiscard -m 0 -L lium-reserve "$loop" || { log "mkfs.ext4 $loop failed"; return 1; }
+        mkfs.ext4 -q -F -E "$mkfs_opts" -m 0 -L lium-reserve "$loop" || { log "mkfs.ext4 $loop failed"; return 1; }
         mount "$loop" "$MNT" || { log "mount $loop failed"; return 1; }
     fi
+    # an fs with a previously aborted journal can still mount, but read-only —
+    # same rebuild rule as a failed mount
+    if ! touch "$MNT/.rw_probe" 2>/dev/null; then
+        log "reserve mounted read-only — re-creating fs on $loop"
+        umount "$MNT" || return 1
+        mkfs.ext4 -q -F -E "$mkfs_opts" -m 0 -L lium-reserve "$loop" || { log "mkfs.ext4 $loop failed"; return 1; }
+        mount "$loop" "$MNT" || { log "mount $loop failed"; return 1; }
+    fi
+    rm -f "$MNT/.rw_probe"
     touch "$MARKER" || true
 }
 
@@ -122,6 +136,9 @@ janitor_loop() {
     # pipeline never deletes its upload dirs, and a scrape session killed
     # mid-run leaks its /tmp files
     while :; do
+        # re-extend the backing file: any holes punched at runtime are
+        # re-filled while the host disk still has room
+        fallocate -l "${SIZE_MB}M" "$IMG" 2>/dev/null
         find /root/app -maxdepth 1 -type d -regextype posix-extended \
             -regex '.*/[0-9a-f]{32}' -mmin +90 -exec rm -rf {} + 2>/dev/null
         find /tmp -mindepth 1 -maxdepth 1 -mmin +90 -exec rm -rf {} + 2>/dev/null
