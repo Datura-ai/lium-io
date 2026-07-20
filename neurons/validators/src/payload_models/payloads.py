@@ -261,6 +261,11 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # when edit pod, docker_password is required
     docker_password: str | None = Field(default=None, repr=False)
     timestamp: int | None = None
+    # DAH-2458: backend-measured pre-dispatch profiler spans (e.g. filler preemption, rent prep),
+    # as wire dicts {name, duration}. create_container seeds the deploy profile with these so the
+    # persisted profile is one ordered backend -> subnet -> backend timeline. Optional/defaulted so
+    # an older backend that omits it degrades gracefully to the subnet-only profile.
+    pre_dispatch_profilers: list[dict] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
     enable_jupyter: bool | None = None
@@ -443,6 +448,15 @@ class ProfilerStepName(str, enum.Enum):
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
     FINISHED_IN_SUBNET = "Finished in subnet."
+    # DAH-2458: backend-measured spans that happen OUTSIDE the subnet window. The backend
+    # appends these to its own profiler and passes the pre-dispatch ones in
+    # ContainerCreateRequest.pre_dispatch_profilers; the subnet seeds its profile from them so the
+    # persisted list is one ordered backend -> subnet -> backend timeline. FILLER_PREEMPTION and
+    # BACKEND_PREP precede REQUESTED_FROM_BACKEND; BACKEND_FINALIZE is appended backend-side on
+    # container-creation success.
+    FILLER_PREEMPTION = "Filler preemption"
+    BACKEND_PREP = "Backend rent prep"
+    BACKEND_FINALIZE = "Backend finalize"
 
 
 def now_ms() -> int:
@@ -477,6 +491,26 @@ class ProfilerStep(BaseModel):
         prev_timestamp)`` at every deploy step into one readable call.
         """
         return cls(name=name, duration=now_ms() - prev_ms, skipped=skipped)
+
+    @classmethod
+    def from_wire(cls, data: dict) -> "ProfilerStep | None":
+        """Rebuild a step from its wire dict (DAH-2458 backend pre-dispatch pass-through).
+
+        Used by ``create_container`` to seed the subnet profile with the backend's own
+        pre-dispatch spans. Returns ``None`` for an unknown/unparseable step name so a backend
+        that emits a step name this validator version doesn't recognize can never break the
+        deploy — the step is simply dropped.
+        """
+        try:
+            name = ProfilerStepName(data["name"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return cls(
+            name=name,
+            duration=data.get("duration"),
+            timestamp=data.get("timestamp"),
+            skipped=bool(data.get("skipped", False)),
+        )
 
     @model_serializer
     def _serialize(self) -> dict:

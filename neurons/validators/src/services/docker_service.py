@@ -2871,6 +2871,13 @@ class DockerService:
 
         # Deploy container profiler
         profilers = []
+        # DAH-2458: seed with the backend's own pre-dispatch spans (measured before this request
+        # reached the subnet, e.g. the filler-preemption wait) so the persisted profile is one
+        # ordered backend -> subnet -> backend timeline. Unknown step names are dropped, never fatal.
+        for wire_step in payload.pre_dispatch_profilers or []:
+            seeded = ProfilerStep.from_wire(wire_step)
+            if seeded is not None:
+                profilers.append(seeded)
         if payload.timestamp:
             profilers.append(ProfilerStep(name=ProfilerStepName.REQUESTED_FROM_BACKEND, timestamp=payload.timestamp))
             prev_timestamp = payload.timestamp
@@ -3714,8 +3721,18 @@ class DockerService:
                         )
                     raise
 
-                # Add profiler for ssh service installation
-                profilers.append(ProfilerStep.since(ProfilerStepName.FINISHED_IN_SUBNET, prev_timestamp))
+                # DAH-2458: final step. Stamp the subnet's wall-clock finish time onto it (in
+                # addition to its duration) so the backend derives its finalize span directly as
+                # pending_finished_at - this timestamp, instead of reconstructing the subnet's
+                # finish moment from the sum of every step's duration.
+                finished_ms = now_ms()
+                profilers.append(
+                    ProfilerStep(
+                        name=ProfilerStepName.FINISHED_IN_SUBNET,
+                        duration=finished_ms - prev_timestamp,
+                        timestamp=finished_ms,
+                    )
+                )
 
                 if payload.workload_kind == WorkloadKind.FILLER:
                     await self.redis_service.remove_pending_pod(
