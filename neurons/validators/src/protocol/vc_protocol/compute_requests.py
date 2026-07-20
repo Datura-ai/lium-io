@@ -158,9 +158,9 @@ class DefaultDockerImage(BaseModel, extra="allow"):
     docker_image: str
     docker_image_tag: str
     docker_image_size: int | None = None
-    # DAH-2380: bare manifest-list digest ("sha256:…") the validator fetches from Docker Hub.
-    # Kept on the model for backward compatibility with older responses; no longer populated
-    # by the backend.
+    # Bare manifest-list digest ("sha256:…"). Populated by the backend again as of
+    # DAH-2461 (resolved live from Docker Hub) so executors can pull digest-pinned;
+    # the validator still verifies against its OWN Hub snapshot (DAH-2380), not this field.
     docker_image_digest: str | None = None
 
     @property

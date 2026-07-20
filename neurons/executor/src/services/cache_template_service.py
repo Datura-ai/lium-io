@@ -108,6 +108,11 @@ async def _ensure_template(client: "docker.DockerClient", data: dict) -> None:
     docker_image = data.get("docker_image")
     docker_image_tag = data.get("docker_image_tag")
     docker_image_size = data.get("docker_image_size") or 0
+    # DAH-2461: bare "sha256:…" digest the backend resolved live from Docker Hub.
+    # When present it is the source of truth for freshness: digest-pinned pulls are
+    # content-addressed, so they bypass provider registry mirrors that keep serving
+    # a stale manifest for the tag (and 403 on digests they don't have cached).
+    expected_digest = data.get("docker_image_digest")
 
     if not docker_image or not docker_image_tag:
         logger.warning(f"Skipping malformed cache template entry: {data}")
@@ -115,12 +120,19 @@ async def _ensure_template(client: "docker.DockerClient", data: dict) -> None:
 
     image_ref = f"{docker_image}:{docker_image_tag}"
 
-    # Only query the registry for the digest when the image is already cached;
-    # on a first pull there is nothing to compare against, so skip the call and
-    # avoid a needless registry manifest request (counts against pull limits).
     local = await _local_digests(client, image_ref)
     remote: str | None = None
-    if local:
+    if expected_digest:
+        if any(expected_digest in digest for digest in local):
+            logger.info(
+                f"Cache template {image_ref} already at backend digest ({expected_digest}); skipping pull"
+            )
+            return
+    elif local:
+        # Legacy fallback (backend sent no digest): only query the daemon for the
+        # remote digest when the image is already cached; on a first pull there is
+        # nothing to compare against, so skip the call and avoid a needless registry
+        # manifest request (counts against pull limits).
         remote = await _remote_digest(client, image_ref)
         # Re-pull only if we can confirm the remote digest changed. If the remote
         # digest is unreadable (rate limit / auth), keep the cached copy rather
@@ -149,9 +161,18 @@ async def _ensure_template(client: "docker.DockerClient", data: dict) -> None:
         if not acquired:
             logger.info(f"Another puller holds the lock; skipping {image_ref} this cycle")
             return
-        logger.info(f"Pulling cache template {image_ref} (remote={remote}, local={local})")
-        await asyncio.to_thread(client.images.pull, docker_image, docker_image_tag)
-        logger.info(f"Successfully pulled {image_ref}")
+        if expected_digest:
+            pinned_ref = f"{docker_image}@{expected_digest}"
+            logger.info(f"Pulling cache template {pinned_ref} (local={local})")
+            image = await asyncio.to_thread(client.images.pull, pinned_ref)
+            # Re-point the tag at the pinned build: a digest pull alone leaves the
+            # tag (possibly poisoned by a stale mirror) untouched.
+            await asyncio.to_thread(image.tag, docker_image, docker_image_tag)
+            logger.info(f"Successfully pulled {image_ref} at {expected_digest}")
+        else:
+            logger.info(f"Pulling cache template {image_ref} (remote={remote}, local={local})")
+            await asyncio.to_thread(client.images.pull, docker_image, docker_image_tag)
+            logger.info(f"Successfully pulled {image_ref}")
 
     await _cleanup_old_tags(client, docker_image, docker_image_tag)
 

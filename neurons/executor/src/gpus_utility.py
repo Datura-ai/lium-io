@@ -144,6 +144,56 @@ async def scrape_gpu_metrics(
             pynvml.nvmlShutdown()
 
 
+def _local_tag_matches_digest(template: str, expected_digest: str) -> bool:
+    # True when the locally cached template already carries the expected RepoDigest
+    inspect_result = subprocess.run(
+        ['docker', 'image', 'inspect', '--format', '{{json .RepoDigests}}', template],
+        capture_output=True,
+        text=True
+    )
+    if inspect_result.returncode != 0:
+        return False
+    return expected_digest in inspect_result.stdout
+
+
+def _pull_template_image(docker_image: str, docker_image_tag: str, expected_digest: str | None) -> bool:
+    # pull the template; with a backend digest, pin the pull (repo@sha256:…) and re-point
+    # the tag — tag pulls resolve through provider registry mirrors, which can serve a
+    # stale manifest, while digest pulls are content-addressed and bypass them (DAH-2461)
+    template = f"{docker_image}:{docker_image_tag}"
+    if expected_digest:
+        pinned_ref = f"{docker_image}@{expected_digest}"
+        pull_result = subprocess.run(
+            ['docker', 'pull', pinned_ref],
+            capture_output=True,
+            text=True
+        )
+        if pull_result.returncode != 0:
+            logger.error(f"Failed to pull {pinned_ref}: {pull_result.stderr}")
+            return False
+        tag_result = subprocess.run(
+            ['docker', 'tag', pinned_ref, template],
+            capture_output=True,
+            text=True
+        )
+        if tag_result.returncode != 0:
+            logger.error(f"Failed to tag {pinned_ref} as {template}: {tag_result.stderr}")
+            return False
+        logger.info(f"Successfully pulled {template} at {expected_digest}")
+        return True
+
+    pull_result = subprocess.run(
+        ['docker', 'pull', template],
+        capture_output=True,
+        text=True
+    )
+    if pull_result.returncode != 0:
+        logger.error(f"Failed to pull {template}: {pull_result.stderr}")
+        return False
+    logger.info(f"Successfully pulled {template}")
+    return True
+
+
 async def manage_docker_images(
     compute_rest_app_url: str,
     min_disk_space_multiplier: float = 3.0,  # Minimum disk space required (3x image size)
@@ -207,6 +257,9 @@ async def manage_docker_images(
                         docker_image = data['docker_image']
                         docker_image_tag = data['docker_image_tag']
                         docker_image_size = data['docker_image_size']
+                        # DAH-2461: optional bare "sha256:…" digest resolved by the backend
+                        # from Docker Hub; absent on older backends.
+                        expected_digest = data.get('docker_image_digest')
                         
                         # Check if no templates were found for the GPU
                         if not docker_image or not docker_image_tag:
@@ -245,6 +298,15 @@ async def manage_docker_images(
                         else:
                             logger.warning(f"Failed to list Docker images: {docker_list_result.stderr}")
 
+                        # DAH-2461: with a backend digest, skip pulling when the local tag
+                        # already matches — otherwise this loop's unconditional tag pull
+                        # would re-poison the tag on hosts behind a stale registry mirror.
+                        if expected_digest and _local_tag_matches_digest(template, expected_digest):
+                            logger.info(
+                                f"Template {template} already at backend digest ({expected_digest}); skipping pull"
+                            )
+                            continue
+
                         # Process template and pull image
                         required_space = int(docker_image_size * min_disk_space_multiplier)
                         
@@ -264,16 +326,9 @@ async def manage_docker_images(
                                     f"Another puller holds the lock; skipping {template} this cycle"
                                 )
                                 continue
-                            pull_result = subprocess.run(
-                                ['docker', 'pull', template],
-                                capture_output=True,
-                                text=True
-                            )
+                            pulled = _pull_template_image(docker_image, docker_image_tag, expected_digest)
 
-                        if pull_result.returncode == 0:
-                            logger.info(f"Successfully pulled {template}")
-                        else:
-                            logger.error(f"Failed to pull {template}: {pull_result.stderr}")
+                        if not pulled:
                             had_error = True
 
                     # Sleep once per full sweep: retry sooner if anything failed.
