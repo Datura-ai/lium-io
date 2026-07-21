@@ -48,7 +48,14 @@ setup_backing_fs() {
         ensure_loop_node "$loop" || return 1
     else
         [ -f "$MARKER" ] && log "WARNING: reserve initialized earlier but no loop attached — previous device may have leaked"
-        loop=$(losetup -f 2>&1) || { log "losetup -f failed: $loop"; return 1; }
+        # stderr dropped so a stray warning cannot corrupt the path; the shape
+        # check below is the validation ([ -b ] would be wrong here: the node
+        # may legally not exist yet — ensure_loop_node creates it)
+        loop=$(losetup -f 2>/dev/null)
+        case "$loop" in
+            /dev/loop[0-9]*) ;;
+            *) log "losetup -f failed (no free loop device?)"; return 1 ;;
+        esac
         ensure_loop_node "$loop" || return 1
         losetup "$loop" "$IMG" || { log "losetup $loop $IMG failed"; return 1; }
     fi
