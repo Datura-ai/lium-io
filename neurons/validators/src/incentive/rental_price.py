@@ -11,6 +11,7 @@ rental subsidy. See `incentive/config.py:MAX_UNRENTED_GPUS_BY_TYPE`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import bittensor
@@ -111,6 +112,19 @@ class RentalPriceEstimate(BaseModel):
     rental_share: float | None = None                   # Rental share for the executor in this cycle for scoring logic
     burn_share: float | None = None                     # Burn share for the executor in this cycle for scoring logic
     total_rental_cost: float | None = None              # Total rental cost for the executor in this cycle for scoring logic
+
+
+@dataclass
+class _PartiallyRentedSplitPortions:
+    """The two virtual JobResults a partially rented split node is scored as (DAH-2467).
+
+    `sibling_results` is the miner's own list that both portions live in during scoring, so the
+    free portion can be folded back out of it once both are scored.
+    """
+
+    sibling_results: list[JobResult]
+    rented_portion: JobResult
+    free_portion: JobResult
 
 
 class RentalPriceIncentive(DefaultIncentive):
@@ -258,35 +272,34 @@ class RentalPriceIncentive(DefaultIncentive):
         to each portion unchanged, then merged back into the single executor result — downstream
         consumers (machine-spec publish, backend accounting) expect one message per executor.
         """
-        split_portions: list[tuple[list[JobResult], JobResult, JobResult]] = (
-            self._expand_partially_rented_split_results()
-        )
+        split_portions: list[_PartiallyRentedSplitPortions] = self._expand_partially_rented_split_results()
         await super().calculate_mining_scores()
         self._merge_partially_rented_split_results(split_portions)
 
-    def _expand_partially_rented_split_results(self) -> list[tuple[list[JobResult], JobResult, JobResult]]:
-        split_portions: list[tuple[list[JobResult], JobResult, JobResult]] = []
-        for results in self.job_results.values():
-            for result in list(results):
+    def _expand_partially_rented_split_results(self) -> list[_PartiallyRentedSplitPortions]:
+        split_portions: list[_PartiallyRentedSplitPortions] = []
+        for sibling_results in self.job_results.values():
+            for result in list(sibling_results):
                 free_gpu_count: int | None = self._free_gpu_count_of_partially_rented_split(result)
                 if free_gpu_count is None:
                     continue
+                rented_gpu_count: int = result.rented_gpu_count
                 free_portion: JobResult = result.model_copy(deep=True)
                 free_portion.gpu_count = free_gpu_count
                 free_portion.is_rented = False
                 free_portion.rental_created_at = None
                 free_portion.rented_gpu_count = None
                 free_portion.incentive_logs = []
-                result.gpu_count = result.rented_gpu_count
-                results.append(free_portion)
-                split_portions.append((results, result, free_portion))
+                result.gpu_count = rented_gpu_count
+                sibling_results.append(free_portion)
+                split_portions.append(_PartiallyRentedSplitPortions(sibling_results, result, free_portion))
                 logger.info(
                     _m(
                         "Partially rented split node scored in both pools",
                         extra={
                             "executor_id": str(result.executor_info.uuid),
                             "gpu_model": result.gpu_model,
-                            "rented_gpu_count": result.gpu_count,
+                            "rented_gpu_count": rented_gpu_count,
                             "free_gpu_count": free_gpu_count,
                         },
                     )
@@ -302,17 +315,17 @@ class RentalPriceIncentive(DefaultIncentive):
         return free_gpu_count if free_gpu_count > 0 else None
 
     @staticmethod
-    def _merge_partially_rented_split_results(
-        split_portions: list[tuple[list[JobResult], JobResult, JobResult]],
-    ) -> None:
+    def _merge_partially_rented_split_results(split_portions: list[_PartiallyRentedSplitPortions]) -> None:
         # Fold the free portion back into the executor's single result: full gpu_count restored,
         # incentives summed (miner_incentives already accumulated both during post-processing),
         # both pools' calculation logs kept for the miner.
-        for results, rented_portion, free_portion in split_portions:
-            rented_portion.gpu_count += free_portion.gpu_count
-            rented_portion.incentive = (rented_portion.incentive or 0.0) + (free_portion.incentive or 0.0)
-            rented_portion.incentive_logs.extend(free_portion.incentive_logs)
-            results.remove(free_portion)
+        for portions in split_portions:
+            portions.rented_portion.gpu_count += portions.free_portion.gpu_count
+            portions.rented_portion.incentive = (portions.rented_portion.incentive or 0.0) + (
+                portions.free_portion.incentive or 0.0
+            )
+            portions.rented_portion.incentive_logs.extend(portions.free_portion.incentive_logs)
+            portions.sibling_results.remove(portions.free_portion)
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:
         """Aggregate per-`(base_model, bucket)` metrics for the rental-share
