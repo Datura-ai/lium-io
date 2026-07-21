@@ -796,7 +796,7 @@ async def test_tenant_enforcement_allows_mapped_filler_with_customer_rental(cont
         executor_uuid,
         {"containers": [{"name": pod_container, "pod_id": "pod-1"}], "owner_flag": False},
     )
-    rented_data.filler_containers_by_executor[executor_uuid] = [filler_container]
+    rented_data.filler_containers_by_executor[executor_uuid] = filler_container
     score_calculator = DummyScoreCalculator(actual_score=1.0, job_score=1.0)
     services = build_services(
         score_calculator=score_calculator,
