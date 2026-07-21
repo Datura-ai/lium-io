@@ -28,7 +28,7 @@ class MinerPortalAPI:
     """
 
     _snapshot: dict[str, list[dict[str, Any]]] = {}
-    _snapshot_fetched_at: float = 0.0
+    _snapshot_fetched_at: float | None = None
     _last_refresh_attempt_at: float = 0.0
     _refresh_lock: asyncio.Lock = asyncio.Lock()
 
@@ -40,13 +40,15 @@ class MinerPortalAPI:
         snapshot = await cls._get_snapshot()
         executors = snapshot.get(miner_hotkey, [])
         if executor_id:
-            executors = [e for e in executors if str(e.get("id")) == str(executor_id)]
+            # case-insensitive: the replaced DB-side filter compared UUIDs, not strings
+            wanted_id = str(executor_id).lower()
+            executors = [e for e in executors if str(e.get("id")).lower() == wanted_id]
         return executors
 
     @classmethod
     def _is_fresh(cls) -> bool:
         return (
-            bool(cls._snapshot)
+            cls._snapshot_fetched_at is not None
             and time.monotonic() - cls._snapshot_fetched_at < SNAPSHOT_TTL_SECONDS
         )
 
@@ -65,24 +67,60 @@ class MinerPortalAPI:
             cls._last_refresh_attempt_at = time.monotonic()
 
             try:
-                snapshot = await cls._fetch_bulk()
+                snapshot = await cls._fetch_bulk_snapshot()
+            except asyncio.CancelledError:
+                # bypasses `except Exception`; without this log a cancelled refresh
+                # (validator dropped the connection mid-fetch) would leave no trace
+                logger.warning(
+                    _m("Executor snapshot refresh cancelled mid-fetch", extra=get_extra_info({}))
+                )
+                raise
             except Exception as e:
+                had_snapshot = cls._snapshot_fetched_at is not None
                 logger.error(
                     _m(
-                        "Failed to refresh executor snapshot from portal - serving stale snapshot",
+                        "Failed to refresh executor snapshot from portal - serving stale snapshot"
+                        if had_snapshot
+                        else "No executor snapshot available and portal refresh failed"
+                        " - serving EMPTY executor list for ALL miners",
                         extra=get_extra_info(
                             {
+                                "url": cls._bulk_snapshot_url(),
                                 "error": str(e),
+                                "error_type": type(e).__name__,
                                 "stale_hotkeys": len(cls._snapshot),
                                 "stale_age_seconds": int(
                                     time.monotonic() - cls._snapshot_fetched_at
                                 )
-                                if cls._snapshot
+                                if cls._snapshot_fetched_at is not None
+                                else None,
+                            }
+                        ),
+                    ),
+                    exc_info=True,
+                )
+                return cls._snapshot
+
+            if not snapshot and cls._snapshot:
+                # a sudden "no opted-in miners at all" is far more likely a portal bug than
+                # a real mass opt-out; replacing the snapshot would zero every fleet
+                logger.warning(
+                    _m(
+                        "Portal returned an empty bulk snapshot while a populated one exists"
+                        " - keeping the previous snapshot",
+                        extra=get_extra_info(
+                            {
+                                "previous_hotkeys": len(cls._snapshot),
+                                "stale_age_seconds": int(
+                                    time.monotonic() - cls._snapshot_fetched_at
+                                )
+                                if cls._snapshot_fetched_at is not None
                                 else None,
                             }
                         ),
                     )
                 )
+                cls._snapshot_fetched_at = time.monotonic()
                 return cls._snapshot
 
             cls._snapshot = snapshot
@@ -101,9 +139,13 @@ class MinerPortalAPI:
             return cls._snapshot
 
     @classmethod
-    async def _fetch_bulk(cls) -> dict[str, list[dict[str, Any]]]:
+    def _bulk_snapshot_url(cls) -> str:
+        return f"{settings.MINER_PORTAL_API_URL}/miners/executors"
+
+    @classmethod
+    async def _fetch_bulk_snapshot(cls) -> dict[str, list[dict[str, Any]]]:
         # one portal request for every opted-in miner's executors, grouped by hotkey
-        api_url = f"{settings.MINER_PORTAL_API_URL}/miners/executors"
+        api_url = cls._bulk_snapshot_url()
 
         keypair = settings.get_bittensor_wallet().get_hotkey()
         auth = AuthenticateRequest.from_keypair(keypair)
@@ -122,7 +164,11 @@ class MinerPortalAPI:
                         f"portal bulk executors returned {resp.status}: {text[:200]}"
                     )
                 data = await resp.json()
-                if not isinstance(data, dict):
+                # reject anything but {hotkey: [executor, ...]}: caching e.g. an
+                # ApiResponse envelope would silently zero every fleet for a full TTL
+                if not isinstance(data, dict) or not all(
+                    isinstance(executors, list) for executors in data.values()
+                ):
                     raise RuntimeError(
                         f"unexpected portal bulk response shape: {type(data).__name__}"
                     )
