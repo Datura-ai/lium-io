@@ -777,8 +777,8 @@ async def test_rental_verification_filler_active_api_error_fails_open():
 
 
 @pytest.mark.asyncio
-async def test_rental_verification_filler_ssh_transport_error_fails_without_recheck():
-    """Enforcement: a dead SSH transport means filler state is unknown -> fail the cycle, no re-check."""
+async def test_rental_verification_filler_ssh_transport_error_never_punished_even_in_enforcement():
+    """A lost SSH connection is not evidence of a kill: fail open even under enforcement, no re-check."""
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, details={})
     )
@@ -787,7 +787,7 @@ async def test_rental_verification_filler_ssh_transport_error_fails_without_rech
 
     result = await _run_filler_check(ctx, enforcement=True)
 
-    assert result.passed is False
+    assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
     assert backend_client.filler_run_active_calls == []
 

@@ -1039,7 +1039,7 @@ class RentalVerificationMessages:
         reason="FILLER_TRANSPORT_UNREACHABLE",
         severity="warning",
         category="runtime",
-        impact="Filler state unknown for this cycle",
+        impact="No penalty: a lost connection is not evidence of a kill; re-checked next cycle",
         remediation="Ensure the executor is reachable over SSH and stays online",
     )
 

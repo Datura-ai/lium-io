@@ -249,19 +249,16 @@ class RentalVerificationCheck:
                 DockerCommand.ps_running(filler_container)
             )
         except (asyncssh.Error, OSError) as exc:
-            # SSH transport died mid-cycle: filler state is unknown, do not re-check.
-            event = render_message(
-                Msg.FILLER_TRANSPORT_UNREACHABLE,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "filler_container": filler_container,
-                    "executor_uuid": ctx.executor.uuid,
-                    "transport_error": repr(exc),
-                    "enforced": enforce,
-                },
+            # SSH transport died mid-cycle: a lost connection is not evidence the owner killed the
+            # filler, so never penalize it even under enforcement — fail open. A real kill still
+            # surfaces as REMOVED/STOPPED on a later cycle once the connection is back.
+            return self._filler_state_unknown_result(
+                ctx,
+                filler_container,
+                reason="ssh transport unreachable",
+                details={"transport_error": repr(exc)},
+                template=Msg.FILLER_TRANSPORT_UNREACHABLE,
             )
-            return CheckResult(passed=not enforce, event=event, updates={})
 
         if ps_result.exit_status != 0:
             # docker daemon error (e.g. restarting) — indistinguishable from a kill, so fail open.
@@ -450,9 +447,10 @@ class RentalVerificationCheck:
         *,
         reason: str,
         details: dict[str, object] | None = None,
+        template: MessageTemplate = Msg.FILLER_STATE_UNKNOWN,
     ) -> CheckResult:
         event = render_message(
-            Msg.FILLER_STATE_UNKNOWN,
+            template,
             ctx=ctx,
             check_id=self.check_id,
             what={
