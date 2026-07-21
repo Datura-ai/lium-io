@@ -254,9 +254,9 @@ class ContainerCleanup:
         if executor:
             rented_containers.update(pod.container_name for pod in executor.pods)
 
-        filler_container = rented_data.get_filler_container(executor_uuid)
-        if filler_container:
-            rented_containers.add(filler_container)
+        # Every filler container on the node is protected — a GPU-split node runs one per VRAM
+        # bundle (DAH-2465), and reaping a sibling kills a live worker mid-cycle.
+        rented_containers.update(rented_data.get_filler_containers(executor_uuid))
 
         return rented_containers
 
