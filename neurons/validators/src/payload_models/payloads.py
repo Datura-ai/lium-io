@@ -460,6 +460,7 @@ class ProfilerStepName(str, enum.Enum):
     PORT_CHECK_WAIT = "Port-check wait step finished"
     DOCKER_RUN = "Docker run step finished"
     CONTAINER_RUNNING_CHECK = "Container running check step finished"
+    ENCRYPTED_VOLUME_SETUP = "Encrypted volume setup step finished"
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"

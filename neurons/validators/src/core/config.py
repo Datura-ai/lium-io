@@ -336,6 +336,8 @@ class Settings(BaseSettings):
             "container IP. Build still has full public-internet egress."
         ),
     )
+    
+    VOLUME_MASTER_SECRET: str = Field(env="VOLUME_MASTER_SECRET", default="volume-secret")
 
     DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 

@@ -148,6 +148,11 @@ class RecordingRentalDockerClient:
             {"volume_name": volume_name, "force": force}
         )
 
+    async def mount_source_for_destination(
+        self, *, container_name: str, destination: str
+    ) -> str | None:
+        return None
+
     async def prune_images(self) -> None:
         self.pruned_images += 1
 

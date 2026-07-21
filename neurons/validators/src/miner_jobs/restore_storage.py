@@ -4,6 +4,8 @@ import subprocess
 import tempfile
 import re
 
+from workspace_mount import VolumeAccess, detect_volume_access
+
 # Setup logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("restore_storage")
@@ -136,12 +138,13 @@ def pull_aws_cli():
     run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"], command_label="docker pull daturaai/aws-cli")
 
 
-def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
+def docker_base_command(args, volumes=None, volume_args=None, entrypoint=None, interactive=False):
     command = ["/usr/bin/docker", "run", "--rm"]
     if interactive:
         command.append("-i")
     for volume in volumes or []:
         command.extend(["-v", volume])
+    command.extend(volume_args or [])
     if entrypoint:
         command.extend(["--entrypoint", entrypoint])
     command.extend(
@@ -153,6 +156,17 @@ def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
         ]
     )
     return command
+
+
+def workspace_command(args, volume_access: VolumeAccess, entrypoint: str, interactive: bool = False) -> list[str]:
+    if volume_access.encrypted:
+        return volume_access.docker_exec_args(entrypoint, interactive=interactive)
+    return docker_base_command(
+        args,
+        volume_args=volume_access.docker_run_args(),
+        entrypoint=entrypoint,
+        interactive=interactive,
+    )
 
 
 def aws_head_object(args):
@@ -169,37 +183,26 @@ def aws_head_object(args):
     run_command_args(command, command_label="docker run aws s3api head-object")
 
 
-def ensure_restore_path(args):
-    restore_path = os.path.expanduser(args.restore_path)
+def ensure_restore_path(args, volume_access: VolumeAccess, restore_path: str):
     # tar's -C target must exist before the S3 stream starts. Creating it in the
     # same mounted-volume context avoids a broken pipe from aws when tar exits early.
-    command = docker_base_command(
-        args,
-        volumes=[f"{args.target_volume}:{args.target_volume_path}"],
-        entrypoint="mkdir",
-    ) + [
+    command = workspace_command(args, volume_access, "mkdir") + [
         "-p",
         restore_path,
     ]
     run_command_args(command, command_label="docker run mkdir restore target")
 
 
-def aws_restore(args):
+def aws_restore(args, volume_access: VolumeAccess, restore_path: str):
     # aws s3 cp s3://$BUCKET_NAME/backups/my-folder-2025-09-02.tar.gz - \
     # | tar -xzpf - -C $RESTORE_PATH
-    restore_path = os.path.expanduser(args.restore_path)
     aws_command = docker_base_command(args, entrypoint="aws") + [
         "s3",
         "cp",
         f"s3://{args.backup_volume_name}/{args.backup_source_path}",
         "-",
     ]
-    tar_command = docker_base_command(
-        args,
-        volumes=[f"{args.target_volume}:{args.target_volume_path}"],
-        entrypoint="tar",
-        interactive=True,
-    ) + [
+    tar_command = workspace_command(args, volume_access, "tar", interactive=True) + [
         "--xattrs",
         "--acls",
         "-xzpf",
@@ -242,11 +245,13 @@ def aws_restore(args):
 def restore_storage(args):
     progress = 0
     try:
+        volume_access = detect_volume_access(args.target_volume, args.target_volume_path)
+
         logger.info("=" * 70)
         logger.info("Restore operation started")
         logger.info("=" * 70)
 
-        logger.info("Step 1: Pulling aws cli...")
+        logger.info("Step 1: Preparing workspace and pulling aws cli...")
         pull_aws_cli()
         logger.info("Aws cli pulled")
         progress = 10
@@ -275,7 +280,8 @@ def restore_storage(args):
         )
 
         logger.info("Step 3: Preparing restore destination...")
-        ensure_restore_path(args)
+        restore_path = volume_access.normalized_path(args.restore_path)
+        ensure_restore_path(args, volume_access, restore_path)
         logger.info("Restore destination verified")
 
         logger.info("Step 4: Restoring from aws s3...")
@@ -289,7 +295,7 @@ def restore_storage(args):
             args.auth_token,
             args.restore_log_id,
         )
-        aws_restore(args)
+        aws_restore(args, volume_access, restore_path)
         logger.info("Restore from aws s3 completed")
         progress = 90
         update_restore_log(
