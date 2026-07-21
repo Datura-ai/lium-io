@@ -119,7 +119,7 @@ async def test_gpu_usage_allows_exact_mapped_filler_container(context_factory):
         gpu_processes=[{"pid": 3217038, "container_name": filler_container}],
         rented_data=RentedExecutorsResponse(
             executors={},
-            filler_containers_by_executor={"executor-123": [filler_container]},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
         ),
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
@@ -138,7 +138,7 @@ async def test_gpu_usage_rejects_unmapped_filler_container(context_factory):
         gpu_processes=[{"pid": 3217038, "container_name": "filler_other"}],
         rented_data=RentedExecutorsResponse(
             executors={},
-            filler_containers_by_executor={"executor-123": ["filler_active"]},
+            all_filler_containers_by_executor={"executor-123": ["filler_active"]},
         ),
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
@@ -335,7 +335,7 @@ async def test_gpu_usage_allows_multiple_filler_bundles_on_split_node(context_fa
         ],
         rented_data=RentedExecutorsResponse(
             executors={},
-            filler_containers_by_executor={"executor-123": [bundle_a, bundle_b]},
+            all_filler_containers_by_executor={"executor-123": [bundle_a, bundle_b]},
         ),
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)

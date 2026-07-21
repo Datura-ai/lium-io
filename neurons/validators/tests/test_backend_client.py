@@ -268,7 +268,7 @@ def test_rented_executors_response_keeps_customer_rentals_separate_from_filler()
     )
 
     assert result.executors["executor-123"].pods[0].container_name == "pod_pod-1"
-    assert result.filler_containers_by_executor == {"executor-123": ["filler_active"]}
+    assert result.filler_containers_by_executor == {"executor-123": "filler_active"}
     assert result.get_filler_container("executor-123") == "filler_active"
     assert result.get_filler_container("executor-456") is None
 
@@ -285,7 +285,7 @@ def test_rented_executors_response_filters_non_filler_container_names():
         }
     )
 
-    assert result.filler_containers_by_executor == {"executor-123": ["filler_active"]}
+    assert result.filler_containers_by_executor == {"executor-123": "filler_active"}
 
 
 @pytest.mark.asyncio
@@ -306,7 +306,7 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
     assert result is not None
     assert result.executors == {}
     assert result.filler_containers_by_executor == {
-        "executor-123": ["filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"]
+        "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     }
 
 
@@ -419,3 +419,22 @@ async def test_post_generic_client_error_is_not_retried(reset_session, client):
 
     assert result is None
     assert mock_session.request.call_count == 1
+
+
+def test_get_filler_containers_prefers_list_field_and_falls_back_to_legacy():
+    # DAH-2465 additive protocol: the list field wins when present; an older backend that only sends
+    # the single legacy map still yields its one filler (so deploy order never breaks protection).
+    new_backend = RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={"exec-legacy-too": "filler_ignored"},
+        all_filler_containers_by_executor={"exec-split": ["filler_a", "filler_b"]},
+    )
+    assert new_backend.get_filler_containers("exec-split") == ["filler_a", "filler_b"]
+
+    old_backend = RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={"exec-single": "filler_only"},
+    )
+    assert old_backend.get_filler_containers("exec-single") == ["filler_only"]
+    assert old_backend.get_filler_container("exec-single") == "filler_only"
+    assert old_backend.get_filler_containers("exec-unknown") == []
