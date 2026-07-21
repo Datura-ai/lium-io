@@ -268,7 +268,7 @@ def test_rented_executors_response_keeps_customer_rentals_separate_from_filler()
     )
 
     assert result.executors["executor-123"].pods[0].container_name == "pod_pod-1"
-    assert result.filler_containers_by_executor == {"executor-123": "filler_active"}
+    assert result.filler_containers_by_executor == {"executor-123": ["filler_active"]}
     assert result.get_filler_container("executor-123") == "filler_active"
     assert result.get_filler_container("executor-456") is None
 
@@ -285,7 +285,7 @@ def test_rented_executors_response_filters_non_filler_container_names():
         }
     )
 
-    assert result.filler_containers_by_executor == {"executor-123": "filler_active"}
+    assert result.filler_containers_by_executor == {"executor-123": ["filler_active"]}
 
 
 @pytest.mark.asyncio
@@ -306,7 +306,7 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
     assert result is not None
     assert result.executors == {}
     assert result.filler_containers_by_executor == {
-        "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+        "executor-123": ["filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"]
     }
 
 

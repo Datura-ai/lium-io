@@ -66,7 +66,7 @@ def _rented_data(executor_uuid: str, pods: list[str]):
     resp = MagicMock()
     resp.executors = {executor_uuid: executor_mock}
     resp.filler_containers_by_executor = {}
-    resp.get_filler_container.side_effect = lambda key: resp.filler_containers_by_executor.get(str(key))
+    resp.get_filler_containers.side_effect = lambda key: resp.filler_containers_by_executor.get(str(key), [])
     return resp
 
 
@@ -199,7 +199,7 @@ async def test_cleanup_preserves_active_filler_container():
     )
     cleanup = ContainerCleanup(stale_threshold_minutes=15)
     rented_data = _rented_data(EXECUTOR_UUID, [])
-    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: name}
+    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: [name]}
 
     removed_count, removed_names = await cleanup.cleanup(
         ssh_client=ssh,
@@ -433,3 +433,25 @@ async def test_cleanup_invokes_volume_prune():
     assert removed_count == 0
     assert removed_names == []
     assert any("docker volume rm" in c and ANON_VOLUME_A in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_every_filler_bundle_on_split_node():
+    # DAH-2465: both bundle fillers must survive the stale-reaper — protecting only one let the
+    # validator kill the sibling mid-cycle.
+    bundle_a, bundle_b = "filler_bundle_a", "filler_bundle_b"
+    ssh, rm_calls = _make_ssh_mock(
+        containers=[bundle_a, bundle_b],
+        ages_by_name={bundle_a: 60, bundle_b: 60},
+    )
+    cleanup = ContainerCleanup(stale_threshold_minutes=15)
+    rented_data = _rented_data(EXECUTOR_UUID, [])
+    rented_data.filler_containers_by_executor = {EXECUTOR_UUID: [bundle_a, bundle_b]}
+
+    removed_count, removed_names = await cleanup.cleanup(
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_count == 0
+    assert removed_names == []
+    assert not any("docker rm -f" in c for c in rm_calls)
