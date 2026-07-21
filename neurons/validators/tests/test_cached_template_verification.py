@@ -10,6 +10,7 @@ An autouse fixture pins the cutoff to the future by default so the advisory-mode
 are wall-clock-independent; cutoff-enforcement tests opt in with ``_set_cutoff(active=True)``.
 """
 
+import json
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock
 
@@ -53,6 +54,21 @@ def _ssh(exit_status=0, stdout="", raises=False):
         ssh.run = AsyncMock(side_effect=RuntimeError("ssh down"))
     else:
         ssh.run = AsyncMock(return_value=Mock(exit_status=exit_status, stdout=stdout))
+    return ssh
+
+
+def _result(exit_status=0, stdout=""):
+    return Mock(exit_status=exit_status, stdout=stdout)
+
+
+def _ssh_seq(*results):
+    """SSH whose successive ``run`` calls return the given results in order.
+
+    DAH-2470 makes a second call on the failure path (the prefetch-state read), so these
+    tests need to answer the two calls differently. An Exception instance is raised.
+    """
+    ssh = AsyncMock()
+    ssh.run = AsyncMock(side_effect=list(results))
     return ssh
 
 
@@ -432,6 +448,102 @@ async def test_digest_skipped_passes_after_cutoff(context_factory, monkeypatch):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.DIGEST_SKIPPED.reason
+
+
+# --- DAH-2470 prefetch-state passthrough --------------------------------------------------
+#
+# When this check zeroes a node it also carries the executor's own record of what its
+# cache-prefetch loop was doing, so a reader can tell a provider-side cause from ours. The
+# read happens on the failure path only, and can never change the verdict.
+
+_PREFETCH_STATE = json.dumps(
+    {
+        "schema_version": 1,
+        "executor_version": "4.0.3",
+        "sweep_count": 208,
+        "images": {
+            _IMAGE_REF: {
+                "last_outcome": "remote_digest_unreadable",
+                "last_error": "429 Client Error: Too Many Requests",
+                "outcome_counts": {"remote_digest_unreadable": 208},
+            }
+        },
+    }
+)
+
+
+def _failing_ctx(context_factory, monkeypatch, ssh):
+    """Context that lands on DIGEST_MISMATCH after the cutoff — i.e. the node is zeroed."""
+    _set_cutoff(monkeypatch, active=True)
+    return context_factory(
+        services=_services([_IMAGE]),
+        config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=ssh,
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefetch_state_attached_on_failure(context_factory, monkeypatch):
+    ssh = _ssh_seq(_result(stdout=_LOCAL_MISMATCH), _result(stdout=_PREFETCH_STATE))
+    ctx = _failing_ctx(context_factory, monkeypatch, ssh)
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    state = result.event.what_we_saw["prefetch_state"]
+    assert state["sweep_count"] == 208
+    assert state["images"][_IMAGE_REF]["last_outcome"] == "remote_digest_unreadable"
+    # Read from the executor container, over the connection the check already holds.
+    assert "/var/lib/lium/cache_prefetch_state.json" in ssh.run.await_args.args[0]
+    assert ssh.run.await_args.kwargs["check"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state_result", "expected"),
+    [
+        (_result(exit_status=1), "missing"),
+        (_result(stdout="   "), "empty"),
+        (_result(stdout="{not json"), "unparseable"),
+        (_result(stdout='"a string, not an object"'), "unparseable"),
+        (_result(stdout="x" * 9000), "oversized"),
+        (RuntimeError("connection closed"), "ssh_read_failed"),
+    ],
+)
+async def test_prefetch_state_absence_is_itself_a_finding(
+    context_factory, monkeypatch, state_result, expected
+):
+    # Each way the read can fall short must be distinguishable: an executor too old to
+    # write the file reads differently from one whose loop crashed.
+    ssh = _ssh_seq(_result(stdout=_LOCAL_MISMATCH), state_result)
+    ctx = _failing_ctx(context_factory, monkeypatch, ssh)
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    # The verdict is decided before the read and is never touched by it.
+    assert result.passed is False
+    assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
+    assert result.event.what_we_saw["prefetch_state"]["unavailable"] == expected
+
+
+@pytest.mark.asyncio
+async def test_healthy_node_issues_no_extra_ssh_call(context_factory, monkeypatch):
+    # Roughly three quarters of checked nodes pass. None of them may pay for this.
+    _set_cutoff(monkeypatch, active=True)
+    ssh = _ssh_seq(_result(stdout=_LOCAL_MATCH))
+    ctx = context_factory(
+        services=_services([_IMAGE]),
+        config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
+        state=build_state(gpu_model=_GPU, specs=_SPECS),
+        ssh=ssh,
+    )
+
+    result = await CachedTemplateVerificationCheck().run(ctx)
+
+    assert result.passed is True
+    assert ssh.run.await_count == 1
+    assert "prefetch_state" not in result.event.what_we_saw
 
 
 @pytest.mark.asyncio
