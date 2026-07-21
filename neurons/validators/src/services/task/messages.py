@@ -1012,6 +1012,21 @@ class RentalVerificationMessages:
             "Contact Lium support if this container was not removed by you."
         ),
     )
+    FILLER_KILL_SUSPECTED = MessageTemplate(
+        event="Lium default job was stopped on the host — first strike",
+        reason="FILLER_KILL_SUSPECTED",
+        severity="warning",
+        category="policy",
+        impact="No penalty yet: a lone SIGTERM/SIGKILL stop could be the worker itself; repeat incidents will be treated as an external kill",
+        remediation="Do not stop Lium default-job (filler_*) containers; repeated stops cost unrented incentive.",
+    )
+    FILLER_CRASHED = MessageTemplate(
+        event="Lium default job died on its own",
+        reason="FILLER_CRASHED",
+        severity="warning",
+        category="runtime",
+        impact="No penalty: the filler crashed, hit OOM or failed to start — self-heal territory, not an external kill",
+    )
     FILLER_STATE_UNKNOWN = MessageTemplate(
         event="Lium default job state could not be verified",
         reason="FILLER_STATE_UNKNOWN",

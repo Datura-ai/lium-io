@@ -70,6 +70,27 @@ class RedisService:
             )
             raise
 
+    async def register_filler_kill_strike(
+        self, executor_uuid: str, filler_run_id: str, ttl_seconds: int
+    ) -> int:
+        """Count one suspicious-kill INCIDENT per filler run, strikes accumulated per executor.
+
+        The same dead run is observed every validation cycle; SETNX on the run id makes it a
+        single strike no matter how many cycles see it. Returns the executor's current strike
+        count inside the TTL window.
+        """
+        async with self.lock:
+            is_new_incident = await self.redis.set(
+                f"filler_kill_seen:{filler_run_id}", "1", nx=True, ex=ttl_seconds
+            )
+            strikes_key = f"filler_kill_strikes:{executor_uuid}"
+            if is_new_incident:
+                strikes = await self.redis.incr(strikes_key)
+                await self.redis.expire(strikes_key, ttl_seconds)
+                return int(strikes)
+            current = await self.redis.get(strikes_key)
+            return int(current) if current else 1
+
     async def publish(self, channel: str, message: dict):
         """Publish a message to a Redis channel."""
         await self.redis.publish(channel, json.dumps(message))

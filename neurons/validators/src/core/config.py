@@ -180,6 +180,10 @@ class Settings(BaseSettings):
     # filler container. Rollout: shadow first, flip enforcement after the shadow data is clean.
     FILLER_LIVENESS_CHECK_ENABLED: bool = Field(env="FILLER_LIVENESS_CHECK_ENABLED", default=True)
     FILLER_LIVENESS_ENFORCEMENT_ENABLED: bool = Field(env="FILLER_LIVENESS_ENFORCEMENT_ENABLED", default=False)
+    # Ambiguous SIGTERM/SIGKILL stops (a process could in theory exit 143 itself): the first
+    # incident per executor is logged only; from this many incidents in the strike window the
+    # stop is treated as an external kill and punished.
+    FILLER_KILL_STRIKE_THRESHOLD: int = Field(env="FILLER_KILL_STRIKE_THRESHOLD", default=2)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     CONTAINER_CLEANUP_DRY_RUN: bool = Field(env="CONTAINER_CLEANUP_DRY_RUN", default=False, description="Dry run mode for stale container cleanup")

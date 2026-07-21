@@ -14,6 +14,7 @@ from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
 from neurons.validators.src.services.task.pipeline import CheckResult, Context
+from core.docker_utils import ContainerDeathDiagnostics
 
 from tests.helpers import build_services, build_state
 
@@ -452,8 +453,9 @@ def _filler_context(
     backend_client: DummyBackendClient,
     ssh_client: FillerSSHClient,
     filler_container: str = "filler_11111111-2222-3333-4444-555555555555",
+    redis_service: "FakeStrikeRedis | None" = None,
 ) -> Context:
-    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
+    services = build_services(backend=backend_client, container_cleanup=ContainerCleanup(), redis=redis_service)
     state = build_state(
         specs={"verified_ports": [8080]},
         rented_data=RentedExecutorsResponse(
@@ -471,6 +473,7 @@ async def _run_filler_check(ctx: Context, *, check_enabled: bool = True, enforce
         mock_settings.SKIP_RENTAL_VERIFICATION = False
         mock_settings.FILLER_LIVENESS_CHECK_ENABLED = check_enabled
         mock_settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED = enforcement
+        mock_settings.FILLER_KILL_STRIKE_THRESHOLD = 2
         return await RentalVerificationCheck().run(ctx)
 
 
@@ -520,27 +523,67 @@ async def test_rental_verification_filler_running_passes():
     assert backend_client.filler_run_active_calls == []
 
 
+class FakeStrikeRedis:
+    """Fake RedisService for the kill-strike path."""
+
+    def __init__(self, strikes_to_return: int):
+        self.strikes_to_return = strikes_to_return
+        self.calls: list[tuple[str, str, int]] = []
+
+    async def register_filler_kill_strike(self, executor_uuid: str, filler_run_id: str, ttl_seconds: int) -> int:
+        self.calls.append((executor_uuid, filler_run_id, ttl_seconds))
+        return self.strikes_to_return
+
+
+REMOVED_DIAGNOSTICS = ContainerDeathDiagnostics(
+    capture_error="inspect: error: no such object: filler_x",
+    logs_tail="Error response from daemon: No such container: filler_x",
+)
+STOPPED_DIAGNOSTICS = ContainerDeathDiagnostics(
+    status="exited", exit_code=143, oom_killed=False,
+    started_at="2026-07-20T06:00:00Z", finished_at="2026-07-20T09:00:00Z",
+)
+CRASHED_DIAGNOSTICS = ContainerDeathDiagnostics(
+    status="exited", exit_code=1, oom_killed=False,
+    started_at="2026-07-20T06:00:00Z", finished_at="2026-07-20T06:01:00Z",
+)
+OOM_DIAGNOSTICS = ContainerDeathDiagnostics(status="exited", exit_code=137, oom_killed=True)
+NEVER_STARTED_DIAGNOSTICS = ContainerDeathDiagnostics(status="created", exit_code=0)
+
+
+def _patch_diagnostics(monkeypatch, diagnostics: ContainerDeathDiagnostics) -> None:
+    async def fake_collect(ssh_client, container_name):
+        return diagnostics
+    monkeypatch.setattr(
+        "neurons.validators.src.services.task.checks.rental_verification.collect_container_death_diagnostics",
+        fake_collect,
+    )
+
+
 @pytest.mark.asyncio
-async def test_rental_verification_filler_killed_shadow_mode_passes_but_logs():
-    """Shadow mode: a killed filler is logged with enforced=False but incentive is untouched."""
+async def test_rental_verification_filler_removed_shadow_mode_passes_but_logs(monkeypatch):
+    """Shadow mode: a REMOVED filler (external rm) is logged with enforced=False, incentive untouched."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(running=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+    _patch_diagnostics(monkeypatch, REMOVED_DIAGNOSTICS)
 
     result = await _run_filler_check(ctx, enforcement=False)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
     assert result.event.what_we_saw["enforced"] is False
+    assert result.event.what_we_saw["death_kind"] == "removed"
     assert backend_client.filler_run_active_calls == ["11111111-2222-3333-4444-555555555555"]
 
 
 @pytest.mark.asyncio
-async def test_rental_verification_filler_killed_enforcement_fails():
-    """Enforcement mode: a killed filler fails the fatal check -> no unrented incentive."""
+async def test_rental_verification_filler_removed_enforcement_fails(monkeypatch):
+    """Enforcement: a REMOVED filler fails the fatal check outright -> no unrented incentive."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(running=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+    _patch_diagnostics(monkeypatch, REMOVED_DIAGNOSTICS)
 
     result = await _run_filler_check(ctx, enforcement=True)
 
@@ -548,6 +591,81 @@ async def test_rental_verification_filler_killed_enforcement_fails():
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
     assert result.event.what_we_saw["enforced"] is True
     assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_stopped_first_strike_is_suspected_not_punished(monkeypatch):
+    """A lone SIGTERM stop could be the worker itself: strike 1 -> logged, passed even in enforcement."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    strike_redis = FakeStrikeRedis(strikes_to_return=1)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client, redis_service=strike_redis)
+    _patch_diagnostics(monkeypatch, STOPPED_DIAGNOSTICS)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_KILL_SUSPECTED.reason
+    assert result.event.what_we_saw["kill_strikes"] == 1
+    assert strike_redis.calls[0][1] == "11111111-2222-3333-4444-555555555555"
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_stopped_second_strike_is_punished(monkeypatch):
+    """Second stop incident within the window -> treated as an external kill."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    strike_redis = FakeStrikeRedis(strikes_to_return=2)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client, redis_service=strike_redis)
+    _patch_diagnostics(monkeypatch, STOPPED_DIAGNOSTICS)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+    assert result.event.what_we_saw["death_kind"] == "stopped"
+    assert result.event.what_we_saw["kill_strikes"] == 2
+    assert result.event.what_we_saw["kill_timing"] == "after_running"
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_stopped_without_redis_falls_back_to_strict(monkeypatch):
+    """No strike storage -> the ambiguous stop takes the strict verdict, not a free pass forever."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+    _patch_diagnostics(monkeypatch, STOPPED_DIAGNOSTICS)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+
+
+@pytest.mark.parametrize(
+    "diagnostics,expected_death_kind",
+    [
+        (CRASHED_DIAGNOSTICS, "self_crashed"),
+        (OOM_DIAGNOSTICS, "oom_killed"),
+        (NEVER_STARTED_DIAGNOSTICS, "never_started"),
+        (ContainerDeathDiagnostics(), "unknown"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_rental_verification_filler_self_death_never_punished(monkeypatch, diagnostics, expected_death_kind):
+    """Crash / OOM / never-started / unknown are self-heal territory: pass even in enforcement, no strike."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    strike_redis = FakeStrikeRedis(strikes_to_return=99)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client, redis_service=strike_redis)
+    _patch_diagnostics(monkeypatch, diagnostics)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_CRASHED.reason
+    assert result.event.what_we_saw["death_kind"] == expected_death_kind
+    assert strike_redis.calls == []
 
 
 @pytest.mark.asyncio
