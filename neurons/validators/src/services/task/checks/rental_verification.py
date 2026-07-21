@@ -22,7 +22,7 @@ from ...const import (
     FILLER_KILL_STRIKE_TTL_SECONDS,
     FILLER_LIVENESS_GRACE_MINUTES,
 )
-from ..messages import RentalVerificationMessages as Msg, render_message
+from ..messages import MessageTemplate, RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -343,9 +343,11 @@ class RentalVerificationCheck:
         REMOVED (container gone) is punishable outright — nothing legitimate deletes a
         RUNNING run's container. STOPPED (SIGTERM/SIGKILL) could in theory be the worker
         exiting 143 itself, so the first incident per executor is a logged strike and only
-        repeat incidents within the strike window are punished. Every other death kind
-        (self-crash, OOM, never started, clean exit, unknown) is self-heal territory and
-        never punished.
+        repeat incidents within the strike window are punished. Strikes are only counted
+        under enforcement, so an executor always gets its grace incident once enforcement
+        begins, never a strike carried over from the shadow period. HOST_REBOOT and every
+        self-death kind (self-crash, OOM, never started, clean exit, unknown) are self-heal
+        territory and never punished.
         """
         try:
             diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
@@ -377,26 +379,39 @@ class RentalVerificationCheck:
             return self._external_kill_result(ctx, enforce=enforce, what=common_what)
 
         if death_kind is ContainerDeathKind.STOPPED:
-            strikes = await self._register_kill_strike(ctx, filler_container)
-            common_what["kill_strikes"] = strikes
-            if strikes is None or strikes >= settings.FILLER_KILL_STRIKE_THRESHOLD:
-                return self._external_kill_result(ctx, enforce=enforce, what=common_what)
-            event = render_message(
-                Msg.FILLER_KILL_SUSPECTED,
-                ctx=ctx,
-                check_id=self.check_id,
-                what=common_what,
+            return await self._ambiguous_stop_result(
+                ctx, filler_container, enforce=enforce, what=common_what
             )
-            return CheckResult(passed=True, event=event, updates={})
 
-        # SELF_CRASHED / OOM_KILLED / NEVER_STARTED / CLEAN_EXIT / UNKNOWN: not the owner's kill.
-        event = render_message(
-            Msg.FILLER_CRASHED,
-            ctx=ctx,
-            check_id=self.check_id,
-            what=common_what,
-        )
+        # HOST_REBOOT / SELF_CRASHED / OOM_KILLED / NEVER_STARTED / CLEAN_EXIT / UNKNOWN:
+        # not the owner targeting the filler.
+        return self._passthrough_result(ctx, Msg.FILLER_CRASHED, common_what)
+
+    def _passthrough_result(
+        self, ctx: Context, template: MessageTemplate, what: dict[str, object]
+    ) -> CheckResult:
+        """Emit a non-penalizing verdict: the event is logged, incentive is untouched."""
+        event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event, updates={})
+
+    async def _ambiguous_stop_result(
+        self, ctx: Context, filler_container: str, *, enforce: bool, what: dict[str, object]
+    ) -> CheckResult:
+        """A SIGTERM/SIGKILL stop: count a strike (enforcement only) and punish past threshold.
+
+        Strikes are never counted in shadow — otherwise the first ENFORCED incident could inherit
+        a shadow-period strike and skip the grace incident. In shadow this is always a no-penalty
+        suspected event.
+        """
+        if not enforce:
+            what["kill_strikes"] = None
+            return self._passthrough_result(ctx, Msg.FILLER_KILL_SUSPECTED, what)
+
+        strikes = await self._register_kill_strike(ctx, filler_container)
+        what["kill_strikes"] = strikes
+        if strikes is None or strikes >= settings.FILLER_KILL_STRIKE_THRESHOLD:
+            return self._external_kill_result(ctx, enforce=enforce, what=what)
+        return self._passthrough_result(ctx, Msg.FILLER_KILL_SUSPECTED, what)
 
     async def _register_kill_strike(self, ctx: Context, filler_container: str) -> int | None:
         """One strike per filler run (deduped in Redis); None when Redis is unavailable.

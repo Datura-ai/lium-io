@@ -87,3 +87,35 @@ def test_uptime_from_docker_timestamps():
 def test_uptime_is_none_when_timestamps_missing():
     assert container_uptime_seconds(started_at=None, finished_at="2026-07-20T06:05:30Z") is None
     assert container_uptime_seconds(started_at="0001-01-01T00:00:00Z", finished_at="2026-07-20T06:05:30Z") is None
+
+
+def test_removed_capitalized_docker_casing_still_removed():
+    diagnostics = ContainerDeathDiagnostics(
+        capture_error="inspect: Error: No such object: filler_x",
+    )
+    assert classify_container_death(diagnostics) is ContainerDeathKind.REMOVED
+
+
+def test_sigterm_coinciding_with_executor_restart_is_host_reboot():
+    # executor stack (re)started right around the filler's death -> collateral of a reboot/restart.
+    diagnostics = ContainerDeathDiagnostics(
+        status="exited", exit_code=143, oom_killed=False,
+        finished_at="2026-07-20T09:00:00Z",
+        host_context={"executor_container_started_at": "2026-07-20T09:00:20Z"},
+    )
+    assert classify_container_death(diagnostics) is ContainerDeathKind.HOST_REBOOT
+
+
+def test_sigterm_with_old_executor_start_is_targeted_stop():
+    # executor up for days, only the filler was stopped -> targeted external stop.
+    diagnostics = ContainerDeathDiagnostics(
+        status="exited", exit_code=143, oom_killed=False,
+        finished_at="2026-07-20T09:00:00Z",
+        host_context={"executor_container_started_at": "2026-07-17T08:00:00Z"},
+    )
+    assert classify_container_death(diagnostics) is ContainerDeathKind.STOPPED
+
+
+def test_sigterm_without_host_context_is_stopped():
+    diagnostics = ContainerDeathDiagnostics(status="exited", exit_code=143, oom_killed=False)
+    assert classify_container_death(diagnostics) is ContainerDeathKind.STOPPED

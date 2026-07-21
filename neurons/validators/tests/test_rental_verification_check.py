@@ -548,6 +548,11 @@ CRASHED_DIAGNOSTICS = ContainerDeathDiagnostics(
     started_at="2026-07-20T06:00:00Z", finished_at="2026-07-20T06:01:00Z",
 )
 OOM_DIAGNOSTICS = ContainerDeathDiagnostics(status="exited", exit_code=137, oom_killed=True)
+HOST_REBOOT_DIAGNOSTICS = ContainerDeathDiagnostics(
+    status="exited", exit_code=143, oom_killed=False,
+    finished_at="2026-07-20T09:00:00Z",
+    host_context={"executor_container_started_at": "2026-07-20T09:00:20Z"},
+)
 NEVER_STARTED_DIAGNOSTICS = ContainerDeathDiagnostics(status="created", exit_code=0)
 
 
@@ -626,6 +631,40 @@ async def test_rental_verification_filler_stopped_second_strike_is_punished(monk
     assert result.event.what_we_saw["death_kind"] == "stopped"
     assert result.event.what_we_saw["kill_strikes"] == 2
     assert result.event.what_we_saw["kill_timing"] == "after_running"
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_stopped_shadow_does_not_register_strike(monkeypatch):
+    """Shadow must not count strikes, so the first ENFORCED incident always gets the grace strike."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    strike_redis = FakeStrikeRedis(strikes_to_return=99)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client, redis_service=strike_redis)
+    _patch_diagnostics(monkeypatch, STOPPED_DIAGNOSTICS)
+
+    result = await _run_filler_check(ctx, enforcement=False)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_KILL_SUSPECTED.reason
+    assert result.event.what_we_saw["kill_strikes"] is None
+    assert strike_redis.calls == []
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_host_reboot_never_punished(monkeypatch):
+    """A SIGTERM that coincided with a host/executor restart is not a targeted kill: no penalty, no strike."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    strike_redis = FakeStrikeRedis(strikes_to_return=99)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client, redis_service=strike_redis)
+    _patch_diagnostics(monkeypatch, HOST_REBOOT_DIAGNOSTICS)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_CRASHED.reason
+    assert result.event.what_we_saw["death_kind"] == "host_reboot"
+    assert strike_redis.calls == []
 
 
 @pytest.mark.asyncio
