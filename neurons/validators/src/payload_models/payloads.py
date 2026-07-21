@@ -3,7 +3,7 @@ from datetime import datetime
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import BaseModel, Field, field_validator, model_serializer
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
 
 class CustomOptions(BaseModel):
@@ -497,20 +497,25 @@ class ProfilerStep(BaseModel):
         """Rebuild a step from its wire dict (DAH-2458 backend pre-dispatch pass-through).
 
         Used by ``create_container`` to seed the subnet profile with the backend's own
-        pre-dispatch spans. Returns ``None`` for an unknown/unparseable step name so a backend
-        that emits a step name this validator version doesn't recognize can never break the
-        deploy — the step is simply dropped.
+        pre-dispatch spans. Returns ``None`` for any step this validator version can't rebuild —
+        an unknown or missing name, a non-dict payload, OR a known name carrying a bad-typed
+        ``duration``/``timestamp`` — so a backend that emits something unexpected can never break
+        the deploy; the step is simply dropped.
+
+        The model construction stays INSIDE the guard: the seeding loop runs on the
+        container-creation path, so a ``ValidationError`` escaping here would abort a real
+        deploy. ``ValidationError`` subclasses ``ValueError``, but it is listed explicitly so
+        that guarantee stays visible if the model's field types are ever refactored.
         """
         try:
-            name = ProfilerStepName(data["name"])
-        except (KeyError, TypeError, ValueError):
+            return cls(
+                name=ProfilerStepName(data["name"]),
+                duration=data.get("duration"),
+                timestamp=data.get("timestamp"),
+                skipped=bool(data.get("skipped", False)),
+            )
+        except (KeyError, TypeError, ValueError, ValidationError):
             return None
-        return cls(
-            name=name,
-            duration=data.get("duration"),
-            timestamp=data.get("timestamp"),
-            skipped=bool(data.get("skipped", False)),
-        )
 
     @model_serializer
     def _serialize(self) -> dict:

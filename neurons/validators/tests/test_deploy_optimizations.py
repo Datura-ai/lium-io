@@ -750,6 +750,21 @@ def test_profiler_step_from_wire_drops_unknown_or_malformed_step():
     assert ProfilerStep.from_wire({"name": "Some future step", "duration": 5}) is None
     assert ProfilerStep.from_wire({"duration": 5}) is None  # missing name
     assert ProfilerStep.from_wire({}) is None
+    assert ProfilerStep.from_wire("not a dict") is None  # non-dict payload -> TypeError guarded
+
+
+def test_profiler_step_from_wire_drops_known_name_with_bad_typed_field():
+    """REVIEW FOLLOW-UP (#1149): a step whose name IS known but whose duration/timestamp is
+    bad-typed must be DROPPED, not raised. The seeding loop runs inside create_container, so a
+    ValidationError escaping from_wire would abort a real customer deploy — contradicting the
+    "never fatal" contract. Guards the model construction staying inside the try."""
+    assert ProfilerStep.from_wire({"name": "Filler preemption", "duration": "abc"}) is None
+    assert ProfilerStep.from_wire({"name": "Filler preemption", "timestamp": {"x": 1}}) is None
+    assert ProfilerStep.from_wire({"name": "Backend rent prep", "duration": [1, 2]}) is None
+
+    # A coercible numeric string is NOT a drop case — pydantic coerces it to int.
+    coerced = ProfilerStep.from_wire({"name": "Backend rent prep", "duration": "123"})
+    assert coerced is not None and coerced.duration == 123
 
 
 def test_container_created_profilers_round_trip():
