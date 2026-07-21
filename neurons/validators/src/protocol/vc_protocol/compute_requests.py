@@ -30,6 +30,9 @@ class RentedPod(BaseModel):
     container_name: str
     rented_ports: list[int] = []
     created_at: datetime | None = None
+    # GPUs this pod holds (DAH-2467). None = backend predates the field; the validator then
+    # treats the whole executor as rented (no per-GPU split scoring).
+    gpu_count: int | None = None
 
 
 class RentedExecutor(BaseModel):

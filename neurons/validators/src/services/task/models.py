@@ -27,6 +27,10 @@ class JobResult(BaseModel):
     gpu_splitting_min_count: int | None = None
     ssh_pub_keys: list[str] | None = None
     is_rented: bool = False
+    # GPUs held by rented pods (DAH-2467). None = unknown (old backend or not rented) — the
+    # executor is then scored whole-box; set and below gpu_count on a split node, the incentive
+    # engine scores the free GPUs in the unrented pool.
+    rented_gpu_count: int | None = None
     is_spot: bool = False
     is_new_rentals_paused: bool = False
     provider_discord_connected: bool = True
