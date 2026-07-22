@@ -42,6 +42,13 @@ class PortConnectivityCheck:
             ctx.state.sysbox_runtime,
             rented_ports=rented_ports,
             rented_pod_names=rented_pod_names,
+            log_ctx={
+                "pipeline_id": ctx.pipeline_id,
+                "job_batch_id": ctx.config.job_batch_id,
+                "miner_hotkey": ctx.miner_hotkey,
+                "executor_uuid": ctx.executor.uuid,
+                "executor_ip": ctx.executor.address,
+            },
         )
         verified_port_count = len(result.successful_ports)
         extra_info = {
