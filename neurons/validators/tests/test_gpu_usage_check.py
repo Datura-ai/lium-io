@@ -119,7 +119,7 @@ async def test_gpu_usage_allows_exact_mapped_filler_container(context_factory):
         gpu_processes=[{"pid": 3217038, "container_name": filler_container}],
         rented_data=RentedExecutorsResponse(
             executors={},
-            filler_containers_by_executor={"executor-123": filler_container},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
         ),
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
@@ -128,7 +128,7 @@ async def test_gpu_usage_allows_exact_mapped_filler_container(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
-    assert result.event.what_we_saw["filler_container"] == filler_container
+    assert result.event.what_we_saw["filler_containers"] == [filler_container]
 
 
 @pytest.mark.asyncio
@@ -138,7 +138,7 @@ async def test_gpu_usage_rejects_unmapped_filler_container(context_factory):
         gpu_processes=[{"pid": 3217038, "container_name": "filler_other"}],
         rented_data=RentedExecutorsResponse(
             executors={},
-            filler_containers_by_executor={"executor-123": "filler_active"},
+            all_filler_containers_by_executor={"executor-123": ["filler_active"]},
         ),
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
@@ -319,3 +319,29 @@ async def test_ghost_event_payload_serializes_to_json(context_factory):
     assert dumped["wedged_gpus"][0]["gpu_uuid"] == WEDGED_UUID
     assert dumped["cure_results"][0]["gpu_uuid"] == WEDGED_UUID
     assert dumped["still_wedged"] == []
+
+
+@pytest.mark.asyncio
+async def test_gpu_usage_allows_multiple_filler_bundles_on_split_node(context_factory):
+    # DAH-2465: a GPU-split node runs one filler per VRAM bundle; processes from ANY of the node's
+    # fillers must read as clean, not "GPU busy outside validator" (which zeroed the score).
+    bundle_a = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    bundle_b = "filler_9622d623-dcb3-27dc-52c6-ef6c937df3ae"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 98, "memory_utilization": 61}],
+        gpu_processes=[
+            {"pid": 3217038, "container_name": bundle_a},
+            {"pid": 3217099, "container_name": bundle_b},
+        ],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [bundle_a, bundle_b]},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+    assert result.event.what_we_saw["filler_containers"] == sorted([bundle_a, bundle_b])

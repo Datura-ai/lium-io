@@ -452,3 +452,22 @@ async def test_post_generic_client_error_is_not_retried(reset_session, client):
 
     assert result is None
     assert mock_session.request.call_count == 1
+
+
+def test_get_filler_containers_prefers_list_field_and_falls_back_to_legacy():
+    # DAH-2465 additive protocol: the list field wins when present; an older backend that only sends
+    # the single legacy map still yields its one filler (so deploy order never breaks protection).
+    new_backend = RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={"exec-legacy-too": "filler_ignored"},
+        all_filler_containers_by_executor={"exec-split": ["filler_a", "filler_b"]},
+    )
+    assert new_backend.get_filler_containers("exec-split") == ["filler_a", "filler_b"]
+
+    old_backend = RentedExecutorsResponse(
+        executors={},
+        filler_containers_by_executor={"exec-single": "filler_only"},
+    )
+    assert old_backend.get_filler_containers("exec-single") == ["filler_only"]
+    assert old_backend.get_filler_container("exec-single") == "filler_only"
+    assert old_backend.get_filler_containers("exec-unknown") == []

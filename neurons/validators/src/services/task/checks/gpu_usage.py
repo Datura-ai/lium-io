@@ -64,9 +64,11 @@ class GpuUsageCheck:
             return CheckResult(passed=True, event=event)
 
         rented_data = ctx.state.rented_data
-        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
-        if filler_container and all(
-            process.get("container_name") == filler_container for process in gpu_processes
+        # A GPU-split node runs one filler per VRAM bundle (DAH-2465): the GPU is "clean" as long as
+        # every process belongs to ONE OF the node's fillers, not a single expected container.
+        filler_containers = set(rented_data.get_filler_containers(ctx.executor.uuid)) if rented_data else set()
+        if filler_containers and all(
+            process.get("container_name") in filler_containers for process in gpu_processes
         ):
             event = render_message(
                 Msg.USAGE_OK,
@@ -74,7 +76,7 @@ class GpuUsageCheck:
                 check_id=self.check_id,
                 what={
                     "process_count": len(gpu_processes),
-                    "filler_container": filler_container,
+                    "filler_containers": sorted(filler_containers),
                 },
             )
             return CheckResult(passed=True, event=event)

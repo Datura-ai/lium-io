@@ -84,7 +84,14 @@ class ManualRentalInfo(BaseModel):
 class RentedExecutorsResponse(BaseModel):
     """Response with executors dict and banned GUIDs."""
     executors: dict[str, RentedExecutor]  # key = executor_id
+    # Legacy single-filler map (one container per executor), kept for a backend that predates the
+    # list field. Read via get_filler_containers' fallback, never directly.
     filler_containers_by_executor: dict[str, str] = {}  # executor_id -> filler_<FillerRun.id>
+    # executor_id -> ALL active filler container names. A GPU-split node runs one filler per VRAM
+    # bundle (DAH-2465); every listed container is protected from the stale-reaper and its GPU
+    # processes are tolerated. Additive over the legacy map above so backend/validator deploy in any
+    # order — an older backend leaves this empty and get_filler_containers falls back to the one.
+    all_filler_containers_by_executor: dict[str, list[str]] = {}
     banned_guids: list[str] = []
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
@@ -108,8 +115,30 @@ class RentedExecutorsResponse(BaseModel):
             if container_name.startswith(FILLER_CONTAINER_PREFIX)
         }
 
+    @field_validator("all_filler_containers_by_executor")
+    @classmethod
+    def keep_only_filler_container_lists(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        # A stray name must never protect a rogue container from cleanup.
+        return {
+            executor_id: filler_names
+            for executor_id, names in value.items()
+            if (filler_names := [name for name in names if name.startswith(FILLER_CONTAINER_PREFIX)])
+        }
+
+    def get_filler_containers(self, executor_uuid: str) -> list[str]:
+        # The full list when the backend sends it; otherwise fall back to the legacy single map, so a
+        # backend that predates the list field still protects its one filler.
+        containers = self.all_filler_containers_by_executor.get(str(executor_uuid))
+        if containers:
+            return containers
+        legacy_single = self.filler_containers_by_executor.get(str(executor_uuid))
+        return [legacy_single] if legacy_single else []
+
     def get_filler_container(self, executor_uuid: str) -> str | None:
-        return self.filler_containers_by_executor.get(str(executor_uuid))
+        # Any one of the node's fillers — enough for callers that only need "does a filler run here"
+        # (skip-checks, logging). Container protection and GPU-usage tolerance use get_filler_containers.
+        containers = self.get_filler_containers(executor_uuid)
+        return containers[0] if containers else None
 
     def get_default_job_owner(self, executor_uuid: str) -> str | None:
         return self.default_job_owner_by_executor.get(str(executor_uuid))
