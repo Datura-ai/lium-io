@@ -33,7 +33,13 @@ class ConnectivityOrchestrator:
         sysbox_runtime: bool,
         rented_ports: list[int] | None,
         ssh_client,
+        log_ctx: dict | None = None,
     ) -> PortVerificationResult:
+        log_ctx = {
+            **(log_ctx or {}),
+            "executor_uuid": executor_info.uuid,
+            "executor_ip": executor_info.address,
+        }
         rented = set(rented_ports) if rented_ports else set()
         ports = self.port_selector.select(executor_info, BATCH_PORT_VERIFICATION_SIZE, rented)
 
@@ -52,6 +58,7 @@ class ConnectivityOrchestrator:
             ports,
             ssh_client=ssh_client,
             host=executor_info.address,
+            log_ctx=log_ctx,
         )
 
         successful = list(probe_result.successful)
@@ -64,10 +71,7 @@ class ConnectivityOrchestrator:
             host=executor_info.address,
             container_name_prefix=f"container_{miner_hotkey}",
             sysbox_runtime=sysbox_runtime,
-            log_ctx={
-                "executor_uuid": executor_info.uuid,
-                "executor_ip": executor_info.address,
-            },
+            log_ctx=log_ctx,
         )
 
         if dind_result.success:

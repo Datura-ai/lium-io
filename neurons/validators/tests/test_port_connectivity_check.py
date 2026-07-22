@@ -60,6 +60,7 @@ class DummyConnectivityService:
         sysbox_runtime: bool,
         rented_ports: list[int] | None = None,
         rented_pod_names: list[str] | None = None,
+        log_ctx: dict | None = None,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
         # Track what parameters we were called with

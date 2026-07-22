@@ -4,6 +4,7 @@ import uuid
 
 import aiohttp
 
+from core.utils import _m, get_extra_info
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.models import PortPair
 from services.executor_connectivity.netcat_script import NetcatScript
@@ -25,8 +26,10 @@ class BatchVerifier:
         *,
         ssh_client,
         host: str,
+        log_ctx: dict | None = None,
     ) -> tuple[list[PortPair], list[PortPair]]:
         """Verify ports with retries."""
+        ctx = log_ctx or {}
         max_attempts = 2
         timeout_sec = 60
 
@@ -35,40 +38,48 @@ class BatchVerifier:
             container_name = f"port_test_{token[:8]}"
 
             logger.info(
-                "testing %s ports (attempt %s/%s, timeout=%ss)",
-                len(ports),
-                attempt,
-                max_attempts,
-                timeout_sec,
+                _m(
+                    f"testing {len(ports)} ports (attempt {attempt}/{max_attempts}, timeout={timeout_sec}s)",
+                    extra=get_extra_info(ctx),
+                )
             )
 
             try:
                 successful, failed = await asyncio.wait_for(
-                    self._attempt(ports, token, container_name, ssh_client, host),
+                    self._attempt(ports, token, container_name, ssh_client, host, ctx),
                     timeout=timeout_sec
                 )
 
                 if successful:
-                    logger.info("complete: %s/%s verified", len(successful), len(ports))
+                    logger.info(
+                        _m(f"complete: {len(successful)}/{len(ports)} verified", extra=get_extra_info(ctx))
+                    )
                     return successful, failed
 
                 if attempt < max_attempts:
-                    logger.warning("attempt %s failed, retrying in 2s", attempt)
+                    logger.warning(
+                        _m(f"attempt {attempt} failed, retrying in 2s", extra=get_extra_info(ctx))
+                    )
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
-                logger.error("attempt %s timed out after %ss", attempt, timeout_sec)
+                logger.error(
+                    _m(f"attempt {attempt} timed out after {timeout_sec}s", extra=get_extra_info(ctx))
+                )
                 await self.runner.cleanup(ssh_client, container_name)
                 if attempt < max_attempts:
                     await asyncio.sleep(2)
 
             except Exception as e:
-                logger.error("attempt %s failed: %s", attempt, e, exc_info=True)
+                logger.error(
+                    _m(f"attempt {attempt} failed: {e}", extra=get_extra_info(ctx)),
+                    exc_info=True,
+                )
                 await self.runner.cleanup(ssh_client, container_name)
                 if attempt < max_attempts:
                     await asyncio.sleep(2)
 
-        logger.error("all %s attempts failed", max_attempts)
+        logger.error(_m(f"all {max_attempts} attempts failed", extra=get_extra_info(ctx)))
         return [], ports
 
     async def _attempt(
@@ -78,22 +89,27 @@ class BatchVerifier:
         name: str,
         ssh_client,
         host: str,
+        log_ctx: dict | None = None,
     ) -> tuple[list[PortPair], list[PortPair]]:
         """Single verification attempt."""
+        ctx = log_ctx or {}
         script = NetcatScript.batch(ports, token, 0)
         start_result = await self.runner.run(ssh_client, name, script, "host", 60)
         if not start_result.ok:
             logger.warning(
-                "batch start failed: status=%s logs=%s",
-                start_result.status,
-                start_result.logs,
+                _m(
+                    f"batch start failed: status={start_result.status} logs={start_result.logs}",
+                    extra=get_extra_info(ctx),
+                )
             )
             return [], ports
 
         try:
             async with aiohttp.ClientSession() as session:
                 successful, failed = await self.port_tester.test_many(session, host, ports, token)
-                logger.info("progress: %s/%s verified", len(successful), len(ports))
+                logger.info(
+                    _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(ctx))
+                )
         finally:
             await self.runner.cleanup(ssh_client, name)
 
@@ -114,10 +130,14 @@ class FallbackVerifier:
         ssh_client,
         host: str,
         max_ports: int = 10,
+        log_ctx: dict | None = None,
     ) -> tuple[list[PortPair], list[PortPair]]:
         """Test ports one by one."""
+        ctx = log_ctx or {}
         ports_to_test = ports[:max_ports]
-        logger.info("fallback: testing %s ports sequentially", len(ports_to_test))
+        logger.info(
+            _m(f"fallback: testing {len(ports_to_test)} ports sequentially", extra=get_extra_info(ctx))
+        )
 
         successful, failed = [], []
 
@@ -133,10 +153,11 @@ class FallbackVerifier:
                     start_result = await self.runner.run(ssh_client, name, script, network_flag, 10)
                     if not start_result.ok:
                         logger.warning(
-                            "fallback: port %s failed to start: status=%s logs=%s",
-                            port.internal,
-                            start_result.status,
-                            start_result.logs,
+                            _m(
+                                f"fallback: port {port.internal} failed to start: "
+                                f"status={start_result.status} logs={start_result.logs}",
+                                extra=get_extra_info(ctx),
+                            )
                         )
                         failed.append(port)
                         continue
@@ -145,10 +166,10 @@ class FallbackVerifier:
                     await asyncio.sleep(1.0)
                     if await self.port_tester.test_one(session, host, port, token):
                         logger.info(
-                            "fallback: port %s ok (%s/%s)",
-                            port.internal,
-                            idx,
-                            len(ports_to_test),
+                            _m(
+                                f"fallback: port {port.internal} ok ({idx}/{len(ports_to_test)})",
+                                extra=get_extra_info(ctx),
+                            )
                         )
                         successful.append(port)
                     else:
@@ -156,9 +177,10 @@ class FallbackVerifier:
 
                 except Exception as e:
                     logger.error(
-                        "fallback: error testing port %s: %s",
-                        port.internal,
-                        str(e)[:100],
+                        _m(
+                            f"fallback: error testing port {port.internal}: {str(e)[:100]}",
+                            extra=get_extra_info(ctx),
+                        )
                     )
                     failed.append(port)
 
@@ -167,10 +189,14 @@ class FallbackVerifier:
                         try:
                             await self.runner.cleanup(ssh_client, name)
                         except Exception as e:
-                            logger.warning("fallback: cleanup failed: %s", str(e)[:50])
+                            logger.warning(
+                                _m(f"fallback: cleanup failed: {str(e)[:50]}", extra=get_extra_info(ctx))
+                            )
 
                     if idx < len(ports_to_test):
                         await asyncio.sleep(0.5)
 
-        logger.info("fallback: %s/%s verified", len(successful), len(ports_to_test))
+        logger.info(
+            _m(f"fallback: {len(successful)}/{len(ports_to_test)} verified", extra=get_extra_info(ctx))
+        )
         return successful, failed
