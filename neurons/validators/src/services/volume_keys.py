@@ -21,13 +21,7 @@ class VolumeKeyMaterial:
     key_id: str
 
 
-def volume_encryption_enabled(settings: Settings) -> bool:
-    return bool(settings.VOLUME_MASTER_SECRET)
-
-
 def derive_volume_passphrase(master_secret: str, key_id: str) -> str:
-    if not master_secret:
-        raise ValueError("VOLUME_MASTER_SECRET is required to derive volume passphrases")
     if not key_id:
         raise ValueError("key_id is required to derive volume passphrases")
     derived = HKDF(

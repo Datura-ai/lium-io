@@ -108,7 +108,7 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
-from services.volume_keys import VolumeKeyDeriver, volume_encryption_enabled
+from services.volume_keys import VolumeKeyDeriver
 
 logger = logging.getLogger(__name__)
 
@@ -427,7 +427,7 @@ def _should_encrypt_local_volume(
         and external_volume_info is None
         and workload_kind != WorkloadKind.FILLER
         and bool(is_sysbox)
-        and volume_encryption_enabled(settings)
+        and settings.ENABLE_VOLUME_ENCRYPTION
     )
 
 
@@ -1906,7 +1906,14 @@ class DockerService:
             f"{shlex.quote(docker_image)}",
             check=False,
         )
-        return result.exit_status == 0 and (result.stdout or "").strip() == "1"
+        if result.exit_status != 0:
+            stderr = (result.stderr or "")[:200]
+            stdout = (result.stdout or "")[:200]
+            raise RuntimeError(
+                "docker image inspect failed for volume-encryption label "
+                f"(exit_status={result.exit_status}): stderr={stderr!r} stdout={stdout!r}"
+            )
+        return (result.stdout or "").strip() == "1"
 
     async def teardown_encrypted_local_volume(
         self,
@@ -4056,30 +4063,29 @@ class DockerService:
                     payload.workload_kind,
                     payload.is_sysbox,
                 )
-                if use_encrypted_volume and (
-                    not payload.docker_image
-                    or not await self._image_has_encrypted_volume_label(
+                if use_encrypted_volume:
+                    current_step = "encrypted_volume_image_inspect"
+                    if not await self._image_has_encrypted_volume_label(
                         ssh_client,
                         payload.docker_image,
-                    )
-                ):
-                    use_encrypted_volume = False
-                    await self.stream_log(
-                        "Image missing lium.volume_encryption.enable=1; using plain local volume",
-                        "warning",
-                        log_tag,
-                    )
-                    logger.warning(
-                        _m(
-                            "Image missing volume-encryption label; falling back to plain volume",
-                            extra=get_extra_info({
-                                **default_extra,
-                                "container_name": container_name,
-                                "docker_image": payload.docker_image,
-                                "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
-                            }),
-                        ),
-                    )
+                    ):
+                        use_encrypted_volume = False
+                        await self.stream_log(
+                            "Image missing lium.volume_encryption.enable=1; using plain local volume",
+                            "warning",
+                            log_tag,
+                        )
+                        logger.warning(
+                            _m(
+                                "Image missing volume-encryption label; falling back to plain volume",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "container_name": container_name,
+                                    "docker_image": payload.docker_image,
+                                    "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
+                                }),
+                            ),
+                        )
                 if external_volume_info:
                     current_step = "external_volume_creation"
                     sysbox_subuid_base: int | None = None

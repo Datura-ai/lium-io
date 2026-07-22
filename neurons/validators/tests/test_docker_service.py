@@ -4808,7 +4808,12 @@ async def test_create_container_fresh_sizing_uses_effective_values(
 
 
 def test_should_encrypt_local_volume_requires_local_sysbox_customer_volume(monkeypatch):
-    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret")
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
 
     assert _should_encrypt_local_volume(
         "volume_test",
@@ -4854,8 +4859,11 @@ async def test_image_has_encrypted_volume_label(docker_service):
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout="0\n"))
     assert not await docker_service._image_has_encrypted_volume_label(ssh_client, "any/image:tag")
 
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(exit_status=1, stdout="1\n"))
-    assert not await docker_service._image_has_encrypted_volume_label(ssh_client, "any/image:tag")
+    ssh_client.run = AsyncMock(
+        return_value=_make_ssh_command_result(exit_status=1, stdout="1\n", stderr="inspect failed")
+    )
+    with pytest.raises(RuntimeError, match="docker image inspect failed"):
+        await docker_service._image_has_encrypted_volume_label(ssh_client, "any/image:tag")
 
 
 @pytest.mark.asyncio
@@ -4863,7 +4871,12 @@ async def test_create_container_encrypted_local_volume_docker_run_flags(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret")
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
     setup_spy = AsyncMock()
@@ -4925,7 +4938,12 @@ async def test_create_container_uses_plain_volume_when_encrypted_label_missing(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret")
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=False))
     setup_spy = AsyncMock()
@@ -4979,11 +4997,80 @@ async def test_create_container_uses_plain_volume_when_encrypted_label_missing(
 
 
 @pytest.mark.asyncio
+async def test_create_container_fails_when_encrypted_label_inspect_raises(
+    docker_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(
+        docker_service,
+        "_image_has_encrypted_volume_label",
+        AsyncMock(side_effect=RuntimeError("docker image inspect failed")),
+    )
+    setup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
+
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        is_sysbox=True,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+    keypair = Mock(ss58_address="validator-hotkey")
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerCreationFailed
+    assert result.failure_step == "encrypted_volume_image_inspect"
+    setup_spy.assert_not_awaited()
+    assert docker_service.rental_docker_client_factory.client.run_specs == []
+
+
+@pytest.mark.asyncio
 async def test_create_container_encrypted_setup_runs_before_ssh_bootstrap(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret")
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
     call_order: list[str] = []
@@ -5047,7 +5134,12 @@ async def test_create_container_s3fs_external_volume_skips_encrypted_mount(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret")
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
     _patch_create_container_happy_path(docker_service, monkeypatch)
     monkeypatch.setattr(
         docker_service,
@@ -5114,7 +5206,12 @@ async def test_create_container_filler_skips_encrypted_volume_setup(
     docker_service,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret")
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
     _patch_create_container_happy_path(docker_service, monkeypatch)
     setup_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
@@ -5169,7 +5266,12 @@ async def test_delete_container_teardowns_gocryptfs_before_remove(
     retry_ssh_mock,
     monkeypatch,
 ):
-    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", "test-master-secret")
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
     ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
     teardown_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "teardown_encrypted_local_volume", teardown_spy)
@@ -5256,7 +5358,7 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
 
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
-    master_secret = "super-secret-master-key"
+    master_secret = "test-master-secret-32-chars-long!!"
     volume_name = "volume_test"
     pod_id = "pod-id"
     passphrase = derive_volume_passphrase(master_secret, pod_id)
