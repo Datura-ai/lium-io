@@ -81,8 +81,6 @@ class ExecutorConnectivityService:
                     "verification failed",
                     extra=get_extra_info({
                         **log_ctx,
-                        "executor_uuid": executor_info.uuid,
-                        "executor_ip": executor_info.address,
                         "error": str(e),
                     }),
                 ),
