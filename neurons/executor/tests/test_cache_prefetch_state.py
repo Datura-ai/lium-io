@@ -23,6 +23,7 @@ from services.cache_prefetch_state import (  # noqa: E402
     SCHEMA_VERSION,
     CachePrefetchState,
     Outcome,
+    _ImageRecord,
 )
 
 from services import cache_template_service  # noqa: E402
@@ -210,6 +211,25 @@ def test_digest_change_is_timestamped():
 
     state.note_local_digests(IMAGE_REF, [f"{REPO}@{FRESH_DIGEST}"])
     assert _image(state)["digest_changed_at"] is not None
+
+
+def test_misspelled_field_raises_instead_of_being_published():
+    # Every writer runs under @_never_raises, so a bare dict would have absorbed the typo
+    # and shipped a document quietly missing the field. `slots=True` is what stops that;
+    # this test fails the moment someone drops it.
+    record = _ImageRecord()
+
+    with pytest.raises(AttributeError):
+        record.last_pul_ok_at = "typo"
+
+
+def test_published_images_are_a_copy_not_the_live_record():
+    state = CachePrefetchState(path=None)
+    state.note_local_digests(IMAGE_REF, [f"{REPO}@{FRESH_DIGEST}"])
+
+    _image(state)["local_digests"].append("mutated by a reader")
+
+    assert _image(state)["local_digests"] == [f"{REPO}@{FRESH_DIGEST}"]
 
 
 def test_malformed_template_gets_its_own_field():
