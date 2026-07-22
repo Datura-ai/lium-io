@@ -29,7 +29,7 @@ class MinerPortalAPI:
 
     _snapshot: dict[str, list[dict[str, Any]]] = {}
     _snapshot_fetched_at: float | None = None
-    _last_refresh_attempt_at: float = 0.0
+    _last_refresh_attempt_at: float | None = None
     _refresh_lock: asyncio.Lock = asyncio.Lock()
 
     @classmethod
@@ -61,8 +61,13 @@ class MinerPortalAPI:
         async with cls._refresh_lock:
             if cls._is_fresh():
                 return cls._snapshot
-            # after a failed refresh, don't hammer the portal on every call
-            if time.monotonic() - cls._last_refresh_attempt_at < FAILED_REFRESH_RETRY_SECONDS:
+            # after a failed refresh, don't hammer the portal on every call; None means
+            # never attempted - monotonic counts from host boot, so a 0.0 sentinel would
+            # silently swallow the very first refresh on a freshly booted host
+            if (
+                cls._last_refresh_attempt_at is not None
+                and time.monotonic() - cls._last_refresh_attempt_at < FAILED_REFRESH_RETRY_SECONDS
+            ):
                 return cls._snapshot
             cls._last_refresh_attempt_at = time.monotonic()
 

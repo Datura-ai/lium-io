@@ -34,14 +34,14 @@ def reset_cache():
     # fresh lock per test: asyncio primitives bind to the first loop that uses them
     MinerPortalAPI._snapshot = {}
     MinerPortalAPI._snapshot_fetched_at = None
-    MinerPortalAPI._last_refresh_attempt_at = 0.0
+    MinerPortalAPI._last_refresh_attempt_at = None
     MinerPortalAPI._refresh_lock = asyncio.Lock()
     yield
 
 
 def _expire_snapshot():
     MinerPortalAPI._snapshot_fetched_at -= SNAPSHOT_TTL_SECONDS + 1
-    MinerPortalAPI._last_refresh_attempt_at = 0.0
+    MinerPortalAPI._last_refresh_attempt_at = None
 
 
 async def test_one_bulk_call_serves_all_hotkeys(monkeypatch):
@@ -121,6 +121,19 @@ async def test_failed_refresh_backs_off_then_recovers(monkeypatch):
 
     assert await MinerPortalAPI.fetch_executors("hotkey-a", None) == SNAPSHOT["hotkey-a"]
     assert bulk.await_count == 2
+
+
+async def test_cold_start_on_young_host_still_refreshes(monkeypatch):
+    # regression: monotonic counts from host boot, so with a 0.0 backoff sentinel a
+    # process started <30s after boot silently skipped its very first refresh
+    monkeypatch.setattr("clients.miner_portal_api.time", Mock(monotonic=lambda: 5.0))
+    bulk = AsyncMock(return_value=SNAPSHOT)
+    monkeypatch.setattr(MinerPortalAPI, "_fetch_bulk_snapshot", bulk)
+
+    executors = await MinerPortalAPI.fetch_executors("hotkey-a", None)
+
+    assert executors == SNAPSHOT["hotkey-a"]
+    assert bulk.await_count == 1
 
 
 async def test_empty_refresh_keeps_populated_snapshot(monkeypatch):
