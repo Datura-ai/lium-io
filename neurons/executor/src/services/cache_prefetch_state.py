@@ -24,6 +24,7 @@ import copy
 import functools
 import json
 import os
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -167,6 +168,36 @@ def _drop_images(doc: dict) -> None:
     doc["images"] = {}
 
 
+@dataclass(slots=True)
+class _ImageRecord:
+    """Everything known about one template, as a type rather than a bare dict.
+
+    ``slots=True`` is the whole point: a mistyped field name raises instead of
+    quietly adding an attribute nobody publishes. That matters here more than
+    usual, because every writer below runs under ``@_never_raises`` — with a dict,
+    the typo would be swallowed and the document would ship missing the field.
+    """
+
+    last_outcome: str | None = None
+    last_outcome_at: str | None = None
+    last_error: str | None = None
+    local_digests: list[str] = field(default_factory=list)
+    local_digest_first_seen_at: str | None = None
+    digest_changed_at: str | None = None
+    last_local_error: str | None = None
+    expected_digest: str | None = None
+    remote_digest: str | None = None
+    last_remote_read_ok_at: str | None = None
+    last_remote_error: str | None = None
+    last_pull_attempt_at: str | None = None
+    last_pull_ok_at: str | None = None
+    last_pull_error: str | None = None
+    last_cleanup_error: str | None = None
+    last_disk_required_bytes: int | None = None
+    last_disk_available_bytes: int | None = None
+    outcome_counts: dict[str, int] = field(default_factory=dict)
+
+
 class CachePrefetchState:
     """Accumulates what the prefetch loop knows, and publishes it as JSON.
 
@@ -211,7 +242,7 @@ class CachePrefetchState:
         self._last_error: str | None = None
         self._outcome_counts: dict[str, int] = {}
 
-        self._images: dict[str, dict] = {}
+        self._images: dict[str, _ImageRecord] = {}
 
     # -- loop-level facts -------------------------------------------------------
 
@@ -269,93 +300,71 @@ class CachePrefetchState:
 
     # -- per-image facts --------------------------------------------------------
 
-    def _record(self, image_ref: str) -> dict:
-        return self._images.setdefault(
-            image_ref,
-            {
-                "last_outcome": None,
-                "last_outcome_at": None,
-                "last_error": None,
-                "local_digests": [],
-                "local_digest_first_seen_at": None,
-                "digest_changed_at": None,
-                "last_local_error": None,
-                "expected_digest": None,
-                "remote_digest": None,
-                "last_remote_read_ok_at": None,
-                "last_remote_error": None,
-                "last_pull_attempt_at": None,
-                "last_pull_ok_at": None,
-                "last_pull_error": None,
-                "last_cleanup_error": None,
-                "last_disk_required_bytes": None,
-                "last_disk_available_bytes": None,
-                "outcome_counts": {},
-            },
-        )
+    def _record(self, image_ref: str) -> _ImageRecord:
+        return self._images.setdefault(image_ref, _ImageRecord())
 
     @_never_raises
     def note_local_digests(
         self, image_ref: str, digests: list[str], error: object | None = None
     ) -> None:
         record = self._record(image_ref)
-        previous = record["local_digests"]
-        record["local_digests"] = list(digests)
-        record["last_local_error"] = _clip(error)
+        previous = record.local_digests
+        record.local_digests = list(digests)
+        record.last_local_error = _clip(error)
         if not previous and digests:
-            record["local_digest_first_seen_at"] = _utcnow()
+            record.local_digest_first_seen_at = _utcnow()
         elif previous and digests and previous != list(digests):
             # The content under the tag moved. This is the single clearest signal
             # that a pull actually landed, as opposed to merely being attempted.
-            record["digest_changed_at"] = _utcnow()
+            record.digest_changed_at = _utcnow()
 
     @_never_raises
     def note_expected_digest(self, image_ref: str, digest: str | None) -> None:
-        self._record(image_ref)["expected_digest"] = digest
+        self._record(image_ref).expected_digest = digest
 
     @_never_raises
     def note_remote_digest(
         self, image_ref: str, digest: str | None, error: object | None = None
     ) -> None:
         record = self._record(image_ref)
-        record["remote_digest"] = digest
-        record["last_remote_error"] = _clip(error)
+        record.remote_digest = digest
+        record.last_remote_error = _clip(error)
         if digest:
-            record["last_remote_read_ok_at"] = _utcnow()
+            record.last_remote_read_ok_at = _utcnow()
 
     @_never_raises
     def note_disk(self, image_ref: str, required_bytes: int, available_bytes: int) -> None:
         record = self._record(image_ref)
-        record["last_disk_required_bytes"] = required_bytes
-        record["last_disk_available_bytes"] = available_bytes
+        record.last_disk_required_bytes = required_bytes
+        record.last_disk_available_bytes = available_bytes
 
     @_never_raises
     def note_pull_attempt(self, image_ref: str) -> None:
-        self._record(image_ref)["last_pull_attempt_at"] = _utcnow()
+        self._record(image_ref).last_pull_attempt_at = _utcnow()
 
     @_never_raises
     def note_pull_ok(self, image_ref: str) -> None:
         record = self._record(image_ref)
-        record["last_pull_ok_at"] = _utcnow()
-        record["last_pull_error"] = None
+        record.last_pull_ok_at = _utcnow()
+        record.last_pull_error = None
 
     @_never_raises
     def note_pull_error(self, image_ref: str, error: object) -> None:
-        self._record(image_ref)["last_pull_error"] = _clip(error)
+        self._record(image_ref).last_pull_error = _clip(error)
 
     @_never_raises
     def note_cleanup_error(self, image_ref: str, error: object | None) -> None:
-        self._record(image_ref)["last_cleanup_error"] = _clip(error)
+        self._record(image_ref).last_cleanup_error = _clip(error)
 
     @_never_raises
     def record_image_outcome(
         self, image_ref: str, outcome: str, error: object | None = None
     ) -> None:
         record = self._record(image_ref)
-        record["last_outcome"] = outcome
-        record["last_outcome_at"] = _utcnow()
-        record["last_error"] = _clip(error)
-        counts = record["outcome_counts"]
+        record.last_outcome = outcome
+        record.last_outcome_at = _utcnow()
+        record.last_error = _clip(error)
+        counts = record.outcome_counts
         counts[outcome] = counts.get(outcome, 0) + 1
 
     # -- publication ------------------------------------------------------------
@@ -386,7 +395,8 @@ class CachePrefetchState:
             "last_outcome_at": self._last_outcome_at,
             "last_error": self._last_error,
             "outcome_counts": dict(self._outcome_counts),
-            "images": copy.deepcopy(self._images),
+            # `asdict` copies as it flattens, so `_fit` can trim its result freely.
+            "images": {ref: asdict(record) for ref, record in self._images.items()},
         }
 
     def render(self) -> str:
