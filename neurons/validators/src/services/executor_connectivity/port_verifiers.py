@@ -200,3 +200,65 @@ class FallbackVerifier:
             _m(f"fallback: {len(successful)}/{len(ports_to_test)} verified", extra=get_extra_info(log_ctx))
         )
         return successful, failed
+
+
+class SemiBatchVerifier:
+    """Verifies ports by publishing a whole batch in ONE container via -p.
+
+    Middle tier of the cascade: published ports are reached through the nat/DOCKER
+    DNAT chain, so they survive a ufw default-deny INPUT policy — the same policy
+    that silently drops BatchVerifier's --network=host listeners. Returns nothing
+    verified if the container cannot start, letting the caller fall through.
+    """
+
+    def __init__(self, port_tester: PortTester, runner: ContainerRunner):
+        self.port_tester = port_tester
+        self.runner = runner
+
+    async def verify(
+        self,
+        ports: list[PortPair],
+        *,
+        ssh_client,
+        host: str,
+        max_ports: int = 50,
+        log_ctx: dict | None = None,
+    ) -> tuple[list[PortPair], list[PortPair]]:
+        """Publish up to max_ports in one container, then probe them concurrently."""
+        log_ctx = log_ctx or {}
+        ports_to_test = ports[:max_ports]
+        token = uuid.uuid4().hex
+        container_name = f"port_test_pub_{token[:8]}"
+        script = NetcatScript.batch(ports_to_test, token, 0)
+        # external differs from internal when the miner advertises port_mappings
+        publish_flags = " ".join(f"-p {port.external}:{port.internal}" for port in ports_to_test)
+
+        logger.info(
+            _m(
+                f"semi-batch: publishing {len(ports_to_test)} ports in one container",
+                extra=get_extra_info(log_ctx),
+            )
+        )
+
+        # short self-kill window: a missed cleanup would otherwise hold every published
+        # port (and its docker-proxy) against the next cycle's verification
+        start_result = await self.runner.run(ssh_client, container_name, script, publish_flags, 20)
+        if not start_result.ok:
+            logger.warning(
+                _m(
+                    f"semi-batch start failed: status={start_result.status} logs={start_result.logs}",
+                    extra=get_extra_info(log_ctx),
+                )
+            )
+            return [], ports_to_test
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                successful, failed = await self.port_tester.test_many(session, host, ports_to_test, token)
+        finally:
+            await self.runner.cleanup(ssh_client, container_name)
+
+        logger.info(
+            _m(f"semi-batch: {len(successful)}/{len(ports_to_test)} verified", extra=get_extra_info(log_ctx))
+        )
+        return successful, failed
