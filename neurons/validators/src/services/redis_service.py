@@ -70,6 +70,37 @@ class RedisService:
             )
             raise
 
+    async def register_filler_kill_strike(
+        self, executor_uuid: str, filler_run_id: str, ttl_seconds: int
+    ) -> int:
+        """Count one suspicious-kill INCIDENT per filler run, strikes accumulated per executor.
+
+        The same dead run is observed every validation cycle; SETNX on the run id makes it a
+        single strike no matter how many cycles see it. Returns the executor's current strike
+        count inside the TTL window.
+        """
+        async with self.lock:
+            is_new_incident = await self.redis.set(
+                f"filler_kill_seen:{filler_run_id}", "1", nx=True, ex=ttl_seconds
+            )
+            strikes_key = f"filler_kill_strikes:{executor_uuid}"
+            if is_new_incident:
+                # INCR + EXPIRE in one MULTI so a crash between them can't orphan the key
+                # without a TTL (which would pin the executor above threshold forever).
+                async with self.redis.pipeline(transaction=True) as pipe:
+                    pipe.incr(strikes_key)
+                    pipe.expire(strikes_key, ttl_seconds)
+                    strikes, _ = await pipe.execute()
+                return int(strikes)
+            # Already-counted incident (same run seen again this window). Refresh the TTL so a
+            # persistent killer keeps its strikes alive; an honest node stops being observed and
+            # the key expires ttl_seconds after its last incident.
+            current_strikes = await self.redis.get(strikes_key)
+            if current_strikes is None:
+                return 1
+            await self.redis.expire(strikes_key, ttl_seconds)
+            return int(current_strikes)
+
     async def publish(self, channel: str, message: dict):
         """Publish a message to a Redis channel."""
         await self.redis.publish(channel, json.dumps(message))

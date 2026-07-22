@@ -2,6 +2,8 @@ import asyncio
 import json
 import shlex
 from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 
 import asyncssh
 
@@ -133,6 +135,97 @@ class ContainerDeathDiagnostics:
             "container_host_context": self.host_context,
             "diagnostics_capture_error": self.capture_error,
         }
+
+
+class ContainerDeathKind(str, Enum):
+    """Why a dead filler container died — decides whether the provider is punishable.
+
+    Only REMOVED and STOPPED are external kills (a container cannot rm or SIGTERM itself
+    from outside its own process tree); everything else is the filler's or the host's own
+    failure and belongs to self-heal (DAH-2419), never to incentive withholding.
+    """
+
+    REMOVED = "removed"  # container gone entirely — external `docker rm`
+    STOPPED = "stopped"  # exited by SIGKILL/SIGTERM (137/143), not OOM — external stop
+    HOST_REBOOT = "host_reboot"  # SIGTERM that coincided with a host reboot / executor restart
+    SELF_CRASHED = "self_crashed"  # nonzero exit other than the kill signals
+    OOM_KILLED = "oom_killed"  # kernel OOM kill (reports 137 + OOMKilled=true)
+    NEVER_STARTED = "never_started"  # created but never ran, or start failed
+    CLEAN_EXIT = "clean_exit"  # exit 0
+    UNKNOWN = "unknown"  # diagnostics incomplete — fail open
+
+
+_ZERO_DOCKER_TIMESTAMP_PREFIX = "0001-01-01"
+_KILL_SIGNAL_EXIT_CODES = (137, 143)  # 128+SIGKILL, 128+SIGTERM
+_REMOVED_MARKERS = ("no such object", "no such container")  # docker casing varies; match lowercased
+# A reboot/compose-restart SIGTERMs every container at once, so the executor stack restarts around
+# the same time. If it (re)started no earlier than this many seconds before the filler died, the
+# SIGTERM was collateral of that restart, not a filler-targeted `docker stop`.
+_HOST_RESTART_WINDOW_SECONDS = 600
+
+
+def _never_started(diagnostics: ContainerDeathDiagnostics) -> bool:
+    if diagnostics.status == "created":
+        return True
+    started = diagnostics.started_at or ""
+    return started.startswith(_ZERO_DOCKER_TIMESTAMP_PREFIX) if started else False
+
+
+def _stop_coincided_with_host_restart(diagnostics: ContainerDeathDiagnostics) -> bool:
+    """True when the executor stack restarted around the filler's death (reboot/compose restart).
+
+    Uses the executor container's start time (a UTC docker timestamp, same clock as FinishedAt) to
+    avoid the timezone ambiguity of `uptime -s`. A filler-targeted `docker stop` leaves the executor
+    stack untouched, so its start time stays hours/days before the death.
+    """
+    context = diagnostics.host_context or {}
+    executor_started = _parse_docker_timestamp(context.get("executor_container_started_at"))
+    finished = _parse_docker_timestamp(diagnostics.finished_at)
+    if executor_started is None or finished is None:
+        return False
+    return (executor_started - finished).total_seconds() > -_HOST_RESTART_WINDOW_SECONDS
+
+
+def classify_container_death(diagnostics: ContainerDeathDiagnostics) -> ContainerDeathKind:
+    capture_error = (diagnostics.capture_error or "").lower()
+    logs_tail = (diagnostics.logs_tail or "").lower()
+    if any(marker in capture_error or marker in logs_tail for marker in _REMOVED_MARKERS):
+        return ContainerDeathKind.REMOVED
+    if diagnostics.oom_killed:
+        return ContainerDeathKind.OOM_KILLED
+    if _never_started(diagnostics):
+        return ContainerDeathKind.NEVER_STARTED
+    if diagnostics.exit_code in _KILL_SIGNAL_EXIT_CODES:
+        if _stop_coincided_with_host_restart(diagnostics):
+            return ContainerDeathKind.HOST_REBOOT
+        return ContainerDeathKind.STOPPED
+    if diagnostics.exit_code == 0 and diagnostics.status is not None:
+        return ContainerDeathKind.CLEAN_EXIT
+    if isinstance(diagnostics.exit_code, int) and diagnostics.exit_code != 0:
+        return ContainerDeathKind.SELF_CRASHED
+    return ContainerDeathKind.UNKNOWN
+
+
+def _parse_docker_timestamp(value: str | None) -> datetime | None:
+    if not value or value.startswith(_ZERO_DOCKER_TIMESTAMP_PREFIX):
+        return None
+    # Docker prints RFC3339 with nanoseconds; fromisoformat takes at most microseconds.
+    trimmed = value.rstrip("Z")
+    if "." in trimmed:
+        seconds_part, fraction = trimmed.split(".", 1)
+        trimmed = f"{seconds_part}.{fraction[:6]}"
+    try:
+        return datetime.fromisoformat(trimmed)
+    except ValueError:
+        return None
+
+
+def container_uptime_seconds(started_at: str | None, finished_at: str | None) -> float | None:
+    started = _parse_docker_timestamp(started_at)
+    finished = _parse_docker_timestamp(finished_at)
+    if started is None or finished is None:
+        return None
+    return (finished - started).total_seconds()
 
 
 async def collect_container_death_diagnostics(

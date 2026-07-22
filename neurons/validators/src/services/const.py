@@ -224,6 +224,8 @@ PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 2
 POD_CONTAINER_PREFIX = "pod_"
 FILLER_CONTAINER_PREFIX = "filler_"
 FILLER_CONTAINER_GRACE_MINUTES = 15
+# ISSUE-050 strike window: how long suspicious-stop incidents count against an executor.
+FILLER_KILL_STRIKE_TTL_SECONDS = 7 * 24 * 3600
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.
 FILLER_LIVENESS_GRACE_MINUTES = 10

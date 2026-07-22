@@ -5,14 +5,24 @@ from datetime import datetime, timedelta
 import asyncssh
 
 from core.config import settings
-from core.docker_utils import DockerCommand, collect_container_death_diagnostics
+from core.docker_utils import (
+    ContainerDeathKind,
+    DockerCommand,
+    classify_container_death,
+    collect_container_death_diagnostics,
+    container_uptime_seconds,
+)
 from protocol.vc_protocol.compute_requests import (
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     FillerRunActiveResponse,
 )
 
-from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
-from ..messages import RentalVerificationMessages as Msg, render_message
+from ...const import (
+    FILLER_CONTAINER_PREFIX,
+    FILLER_KILL_STRIKE_TTL_SECONDS,
+    FILLER_LIVENESS_GRACE_MINUTES,
+)
+from ..messages import MessageTemplate, RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
@@ -239,19 +249,16 @@ class RentalVerificationCheck:
                 DockerCommand.ps_running(filler_container)
             )
         except (asyncssh.Error, OSError) as exc:
-            # SSH transport died mid-cycle: filler state is unknown, do not re-check.
-            event = render_message(
-                Msg.FILLER_TRANSPORT_UNREACHABLE,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    "filler_container": filler_container,
-                    "executor_uuid": ctx.executor.uuid,
-                    "transport_error": repr(exc),
-                    "enforced": enforce,
-                },
+            # SSH transport died mid-cycle: a lost connection is not evidence the owner killed the
+            # filler, so never penalize it even under enforcement — fail open. A real kill still
+            # surfaces as REMOVED/STOPPED on a later cycle once the connection is back.
+            return self._filler_state_unknown_result(
+                ctx,
+                filler_container,
+                reason="ssh transport unreachable",
+                details={"transport_error": repr(exc)},
+                template=Msg.FILLER_TRANSPORT_UNREACHABLE,
             )
-            return CheckResult(passed=not enforce, event=event, updates={})
 
         if ps_result.exit_status != 0:
             # docker daemon error (e.g. restarting) — indistinguishable from a kill, so fail open.
@@ -328,28 +335,108 @@ class RentalVerificationCheck:
         run_age: timedelta,
         enforce: bool,
     ) -> CheckResult:
-        """Render the confirmed-kill verdict: capture death diagnostics and emit FILLER_KILLED."""
+        """Classify WHY the container is dead; only an external kill may cost incentive.
+
+        REMOVED (container gone) is punishable outright — nothing legitimate deletes a
+        RUNNING run's container. STOPPED (SIGTERM/SIGKILL) could in theory be the worker
+        exiting 143 itself, so the first incident per executor is a logged strike and only
+        repeat incidents within the strike window are punished. Strikes are only counted
+        under enforcement, so an executor always gets its grace incident once enforcement
+        begins, never a strike carried over from the shadow period. HOST_REBOOT and every
+        self-death kind (self-crash, OOM, never started, clean exit, unknown) are self-heal
+        territory and never punished.
+        """
         try:
             diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
             death_fields: dict[str, object] = diagnostics.to_log_fields()
+            death_kind = classify_container_death(diagnostics)
+            uptime_seconds = container_uptime_seconds(diagnostics.started_at, diagnostics.finished_at)
         except Exception as exc:
             death_fields = {"diagnostics_capture_error": repr(exc)}
+            death_kind = ContainerDeathKind.UNKNOWN
+            uptime_seconds = None
 
+        kill_timing: str | None = None
+        if uptime_seconds is not None:
+            grace_seconds = FILLER_LIVENESS_GRACE_MINUTES * 60
+            kill_timing = "at_start" if uptime_seconds < grace_seconds else "after_running"
+
+        common_what: dict[str, object] = {
+            "filler_container": filler_container,
+            "executor_uuid": ctx.executor.uuid,
+            "filler_run_status": filler_run_status,
+            "run_age_seconds": run_age.total_seconds(),
+            "death_kind": death_kind.value,
+            "container_uptime_seconds": uptime_seconds,
+            "kill_timing": kill_timing,
+            **death_fields,
+        }
+
+        if death_kind is ContainerDeathKind.REMOVED:
+            return self._external_kill_result(ctx, enforce=enforce, what=common_what)
+
+        if death_kind is ContainerDeathKind.STOPPED:
+            return await self._ambiguous_stop_result(
+                ctx, filler_container, enforce=enforce, what=common_what
+            )
+
+        # HOST_REBOOT / SELF_CRASHED / OOM_KILLED / NEVER_STARTED / CLEAN_EXIT / UNKNOWN:
+        # not the owner targeting the filler.
+        return self._passthrough_result(ctx, Msg.FILLER_CRASHED, common_what)
+
+    def _passthrough_result(
+        self, ctx: Context, template: MessageTemplate, what: dict[str, object]
+    ) -> CheckResult:
+        """Emit a non-penalizing verdict: the event is logged, incentive is untouched."""
+        event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
+        return CheckResult(passed=True, event=event, updates={})
+
+    async def _ambiguous_stop_result(
+        self, ctx: Context, filler_container: str, *, enforce: bool, what: dict[str, object]
+    ) -> CheckResult:
+        """A SIGTERM/SIGKILL stop: count a strike (enforcement only) and punish past threshold.
+
+        Strikes are never counted in shadow — otherwise the first ENFORCED incident could inherit
+        a shadow-period strike and skip the grace incident. In shadow this is always a no-penalty
+        suspected event.
+        """
+        if not enforce:
+            what["kill_strikes"] = None
+            return self._passthrough_result(ctx, Msg.FILLER_KILL_SUSPECTED, what)
+
+        strikes = await self._register_kill_strike(ctx, filler_container)
+        what["kill_strikes"] = strikes
+        if strikes is None or strikes >= settings.FILLER_KILL_STRIKE_THRESHOLD:
+            return self._external_kill_result(ctx, enforce=enforce, what=what)
+        return self._passthrough_result(ctx, Msg.FILLER_KILL_SUSPECTED, what)
+
+    async def _register_kill_strike(self, ctx: Context, filler_container: str) -> int | None:
+        """One strike per filler run (deduped in Redis); None when Redis is unavailable.
+
+        None is treated as strikes-reached by the caller: an ambiguous stop with no working
+        strike storage falls back to the strict verdict rather than a free pass forever.
+        """
+        filler_run_id: str = filler_container.removeprefix(FILLER_CONTAINER_PREFIX)
+        redis_service = ctx.services.redis
+        if redis_service is None:
+            return None
+        try:
+            return await redis_service.register_filler_kill_strike(
+                ctx.executor.uuid, filler_run_id, FILLER_KILL_STRIKE_TTL_SECONDS
+            )
+        except Exception:
+            return None
+
+    def _external_kill_result(
+        self, ctx: Context, *, enforce: bool, what: dict[str, object]
+    ) -> CheckResult:
         event = render_message(
             Msg.FILLER_KILLED,
             ctx=ctx,
             check_id=self.check_id,
             severity=None if enforce else "warning",
             impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
-            what={
-                "verified": False,
-                "filler_container": filler_container,
-                "executor_uuid": ctx.executor.uuid,
-                "filler_run_status": filler_run_status,
-                "run_age_seconds": run_age.total_seconds(),
-                "enforced": enforce,
-                **death_fields,
-            },
+            what={"verified": False, "enforced": enforce, **what},
         )
         return CheckResult(passed=not enforce, event=event, updates={})
 
@@ -360,9 +447,10 @@ class RentalVerificationCheck:
         *,
         reason: str,
         details: dict[str, object] | None = None,
+        template: MessageTemplate = Msg.FILLER_STATE_UNKNOWN,
     ) -> CheckResult:
         event = render_message(
-            Msg.FILLER_STATE_UNKNOWN,
+            template,
             ctx=ctx,
             check_id=self.check_id,
             what={
