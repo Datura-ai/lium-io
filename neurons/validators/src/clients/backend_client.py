@@ -250,13 +250,20 @@ class BackendClient:
             timeout=10,
         )
 
-    async def get_filler_run_active(self, filler_run_id: str) -> FillerRunActiveResponse | None:
-        """Fetch whether the backend still considers a Lium filler run active."""
-        return await self.get(
-            f"/internal/filler-runs/{filler_run_id}/active",
-            FillerRunActiveResponse,
-            timeout=10,
-        )
+    async def get_filler_run_active(
+        self, filler_run_id: str, *, container_missing: bool = False
+    ) -> FillerRunActiveResponse | None:
+        """Fetch whether the backend still considers a Lium filler run active.
+
+        container_missing=True tells the backend this re-check was triggered by the filler
+        container being ABSENT on the host: the backend accumulates those reports and closes a
+        run the validator keeps seeing containerless (DAH-2471 zombie reconciliation). Older
+        backends simply ignore the query param.
+        """
+        path = f"/internal/filler-runs/{filler_run_id}/active"
+        if container_missing:
+            path += "?container_missing=true"
+        return await self.get(path, FillerRunActiveResponse, timeout=10)
 
     async def check_executor_health(
         self,

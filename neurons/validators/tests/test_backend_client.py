@@ -8,7 +8,11 @@ import pytest
 from neurons.validators.src.clients.backend_client import BackendClient
 from pydantic import BaseModel
 
-from protocol.vc_protocol.compute_requests import PodRentalActiveResponse, RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import (
+    FillerRunActiveResponse,
+    PodRentalActiveResponse,
+    RentedExecutorsResponse,
+)
 
 
 class SampleResponse(BaseModel):
@@ -84,6 +88,35 @@ async def test_get_pod_rental_active_uses_internal_endpoint(client):
     mock_get.assert_awaited_once_with(
         "/internal/pods/pod-1/rental-active",
         PodRentalActiveResponse,
+        timeout=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_filler_run_active_flags_missing_container(client):
+    # container_missing=True must ride on the query string — the backend's zombie-run
+    # reconciliation (DAH-2471) is fed by exactly this flag; a plain re-check sends none.
+    expected = MagicMock()
+
+    with patch.object(client, "get", AsyncMock(return_value=expected)) as mock_get:
+        result = await client.get_filler_run_active("run-1", container_missing=True)
+
+    assert result is expected
+    mock_get.assert_awaited_once_with(
+        "/internal/filler-runs/run-1/active?container_missing=true",
+        FillerRunActiveResponse,
+        timeout=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_filler_run_active_without_flag_keeps_plain_path(client):
+    with patch.object(client, "get", AsyncMock(return_value=None)) as mock_get:
+        await client.get_filler_run_active("run-1")
+
+    mock_get.assert_awaited_once_with(
+        "/internal/filler-runs/run-1/active",
+        FillerRunActiveResponse,
         timeout=10,
     )
 

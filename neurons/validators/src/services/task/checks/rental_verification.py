@@ -280,8 +280,11 @@ class RentalVerificationCheck:
         # still starting mid-cycle) — re-check the live run state before penalizing, like the pod
         # flow does with get_pod_rental_active.
         filler_run_id: str = filler_container.removeprefix(FILLER_CONTAINER_PREFIX)
+        # container_missing carries the observation to the backend: this re-check only ever happens
+        # when the container is gone from the host, and the backend uses the accumulated reports to
+        # close zombie RUNNING runs (DAH-2471).
         filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
-            filler_run_id
+            filler_run_id, container_missing=True
         )
 
         if filler_run is None:

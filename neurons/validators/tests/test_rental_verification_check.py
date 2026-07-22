@@ -29,9 +29,13 @@ class DummyBackendClient:
         self.called_with: dict | None = None
         self.filler_run_active = filler_run_active
         self.filler_run_active_calls: list[str] = []
+        self.filler_run_container_missing_flags: list[bool] = []
 
-    async def get_filler_run_active(self, filler_run_id: str) -> FillerRunActiveResponse | None:
+    async def get_filler_run_active(
+        self, filler_run_id: str, *, container_missing: bool = False
+    ) -> FillerRunActiveResponse | None:
         self.filler_run_active_calls.append(filler_run_id)
+        self.filler_run_container_missing_flags.append(container_missing)
         return self.filler_run_active
 
     async def check_executor_health(
@@ -533,6 +537,9 @@ async def test_rental_verification_filler_killed_shadow_mode_passes_but_logs():
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
     assert result.event.what_we_saw["enforced"] is False
     assert backend_client.filler_run_active_calls == ["11111111-2222-3333-4444-555555555555"]
+    # The re-check only happens when the container is gone, and it must SAY so — the backend's
+    # zombie-run reconciliation (DAH-2471) is fed by this flag.
+    assert backend_client.filler_run_container_missing_flags == [True]
 
 
 @pytest.mark.asyncio
