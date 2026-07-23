@@ -55,6 +55,9 @@ from payload_models.payloads import (
 )
 from services.attestation_service import AttestationError, AttestationService
 from services.const import (
+    DPHN_CACHE_FREE_MARGIN_GB,
+    DPHN_CACHE_LISTING_FLOOR_GB,
+    DPHN_CACHE_SIZE_GB,
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
@@ -1583,6 +1586,62 @@ class DockerService:
                 ),
                 exc_info=True,
             )
+
+    async def affordable_cache_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+    ) -> list[CacheVolume]:
+        """Which of the requested cache volumes this node can actually take.
+
+        DAH-2475: the backend asks for the cache it WANTS and cannot know whether the host already has
+        it — it only sees ~15-min-old telemetry. Deciding there meant charging the download on every
+        launch, so a node granted the cache once dropped below the threshold by exactly that download
+        and was refused it forever after: ~40 GB parked unmounted while every start re-downloaded it.
+
+        Here the answer is a fact, not a projection. A volume that already exists costs nothing to
+        mount, so it needs no check at all — that is what makes the decision idempotent. Only a volume
+        that must be downloaded is measured, against live free space, so the node keeps enough room to
+        stay in the rental listing (a delisted node is reachable by neither renters nor fillers).
+        """
+        if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+            return []
+        existing: set[str] = set(await self._find_cache_volumes_to_sweep(ssh_client, set(), default_extra))
+        present: list[CacheVolume] = [volume for volume in payload.cache_volumes if volume.name in existing]
+        if len(present) == len(payload.cache_volumes):
+            return list(payload.cache_volumes)
+
+        try:
+            docker_root_dir: str = await self.get_docker_root_dir(ssh_client)
+            free_gb: float = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Fail closed on the download, not on the launch: without a reading we cannot promise the
+            # new volume fits, but what is already on the host is free to mount either way.
+            logger.warning(
+                _m(
+                    "Could not measure free disk for the DPHN cache; granting only what already exists",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+            )
+            return present
+
+        floor_gb: int = DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
+        if free_gb - DPHN_CACHE_SIZE_GB <= floor_gb:
+            logger.info(
+                _m(
+                    "Node cannot afford the DPHN cache download; keeping only the volumes it already has",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "free_gb": round(free_gb, 1),
+                        "kept_volumes": [volume.name for volume in present],
+                    }),
+                )
+            )
+            return present
+        return list(payload.cache_volumes)
 
     async def _find_cache_volumes_to_sweep(
         self,
@@ -3555,6 +3614,16 @@ class DockerService:
                     ssh_client=ssh_client,
                     default_extra=default_extra,
                     skip_volume_names=protected_volume_names,
+                )
+
+                # DAH-2475: the backend asks for the cache it wants; only the host knows whether those
+                # volumes already exist, and therefore whether mounting them costs a download at all.
+                # Narrowing the request here — BEFORE the sweep, so its keep-list matches what is
+                # actually mounted — is what keeps the decision idempotent across launches.
+                payload.cache_volumes = await self.affordable_cache_volumes(
+                    ssh_client=ssh_client,
+                    payload=payload,
+                    default_extra=default_extra,
                 )
 
                 await self.sweep_stale_cache_volumes(
