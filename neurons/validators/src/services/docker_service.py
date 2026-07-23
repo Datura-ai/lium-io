@@ -26,6 +26,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    CacheVolume,
     ContainerBaseRequest,
     ContainerCreated,
     ContainerCreateRequest,
@@ -316,6 +317,41 @@ def _quote_safe_docker_volume_name(volume_name: str, *, field_name: str) -> str:
     if not _is_safe_docker_volume_name(volume_name):
         raise ValueError(f"Unsafe Docker volume name for {field_name}: {volume_name!r}")
     return shlex.quote(volume_name)
+
+
+def _validate_cache_volume(cache_volume: CacheVolume) -> None:
+    # raise ValueError on an unsafe FILLER cache volume. These mounts come from the backend, but a
+    # `/`-prefixed source would be a HOST bind-mount and a `:` would corrupt the `src:target:rw` bind
+    # spec — the name regex is the only guard, so validate defensively before it reaches the SDK.
+    name = cache_volume.name
+    if not _is_safe_docker_volume_name(name):
+        raise ValueError(f"Unsafe cache volume name: {name!r}")
+    # `volume_` marks the ephemeral run volumes every GC path deletes (clean_existing_containers,
+    # clean_stale_vloopback_volumes); a persistent cache volume must never wear that prefix.
+    if name.startswith("volume_"):
+        raise ValueError(f"Cache volume name must not use the ephemeral 'volume_' prefix: {name!r}")
+    target = cache_volume.target
+    if not target.startswith("/") or target == "/" or ":" in target or ".." in target.split("/"):
+        raise ValueError(f"Unsafe cache volume target: {target!r}")
+
+
+def _build_cache_volume_mounts(
+    payload: ContainerCreateRequest, occupied_targets: set[str]
+) -> list[VolumeMount]:
+    # Persistent named cache volumes for a FILLER container (DPHN model/runtime cache). Empty for any
+    # non-FILLER workload even when the field is set — a customer rental must never receive these
+    # mounts. A cache entry whose target collides with an already-mounted path (the run's own volume or
+    # /mnt) is skipped, since dockerd rejects a duplicate mount target and would fail the whole create.
+    if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+        return []
+    mounts: list[VolumeMount] = []
+    for cache_volume in payload.cache_volumes:
+        _validate_cache_volume(cache_volume)
+        if cache_volume.target in occupied_targets:
+            continue
+        occupied_targets.add(cache_volume.target)
+        mounts.append(VolumeMount(source=cache_volume.name, target=cache_volume.target))
+    return mounts
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -688,8 +724,12 @@ class DockerService:
         environment["NVIDIA_DRIVER_CAPABILITIES"] = "all"
 
         volumes = [VolumeMount(source=local_volume, target=local_volume_path)]
+        occupied_targets = {local_volume_path}
         if external_volume_name:
             volumes.append(VolumeMount(source=external_volume_name, target="/mnt"))
+            occupied_targets.add("/mnt")
+        # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
+        volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
 
         devices = (
             DeviceMount(path_on_host="/dev/net/tun", path_in_container="/dev/net/tun"),
