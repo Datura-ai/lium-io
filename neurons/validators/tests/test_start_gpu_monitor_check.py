@@ -78,7 +78,6 @@ async def test_start_gpu_monitor_check(
 ):
     # Create mock keypair (always present in production)
     mock_keypair = Mock()
-    mock_keypair.sign.return_value = b"\x00" * 64  # Mock signature
     mock_keypair.ss58_address = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
     # Create command results
@@ -144,10 +143,10 @@ async def test_start_gpu_monitor_check(
         # Second: start the monitor with nohup
         assert "nohup" in runner.commands_called[1]["command"]
         assert "/src/gpus_utility.py" in runner.commands_called[1]["command"]
-        assert "--program_id" in runner.commands_called[1]["command"]
-        assert "--signature 0x" in runner.commands_called[1]["command"]
-        assert f"--executor_id {ctx.executor.uuid}" in runner.commands_called[1]["command"]
-        assert "--validator_hotkey 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" in runner.commands_called[1]["command"]
         assert "--compute_rest_app_url http://validator:8000" in runner.commands_called[1]["command"]
+        # The script now only manages docker images; it no longer accepts the metrics-push arguments,
+        # and click would abort on an unknown option — so passing them must stay gone.
+        for removed_option in ("--program_id", "--signature", "--executor_id", "--validator_hotkey"):
+            assert removed_option not in runner.commands_called[1]["command"]
         assert runner.commands_called[1]["timeout"] == 50
         assert runner.commands_called[1]["retryable"] is False

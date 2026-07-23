@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict
-import uuid
 
 from ..messages import StartGpuMonitorMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
@@ -22,7 +21,6 @@ class StartGPUMonitorCheck:
         runner = ctx.runner
         executor = ctx.executor
 
-        validator_keypair = ctx.config.validator_keypair
         compute_rest_app_url = ctx.config.compute_rest_app_url
         script_relative_path = ctx.config.gpu_monitor_script_relative
 
@@ -52,14 +50,7 @@ class StartGPUMonitorCheck:
 
         # await runner.run("pip install aiohttp click pynvml psutil", timeout=30, retryable=True)
 
-        program_id = str(uuid.uuid4())
-        command_args: Dict[str, Any] = {
-            "program_id": program_id,
-            "signature": f"0x{validator_keypair.sign(program_id.encode()).hex()}",
-            "executor_id": executor.uuid,
-            "validator_hotkey": validator_keypair.ss58_address,
-            "compute_rest_app_url": compute_rest_app_url,
-        }
+        command_args: Dict[str, Any] = {"compute_rest_app_url": compute_rest_app_url}
 
         args_string = " ".join([f"--{k} {v}" for k, v in command_args.items()])
         start_cmd = (
