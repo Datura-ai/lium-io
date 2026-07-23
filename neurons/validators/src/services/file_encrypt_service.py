@@ -14,10 +14,13 @@ from payload_models.payloads import MinerJobEnryptedFiles
 
 from services.ssh_service import SSHService
 
+# ORDER IS LOAD-BEARING: machine_scrape derives its encryption key from the literal key order of
+# gpu_details[0], so this list must stay an exact mirror of that dict — same members, same order.
 KEYS_FOR_ENCRYPTION_KEY_GENERATION = [
     "gpu.name",
     "gpu.uuid",
     "gpu.capacity",
+    "gpu.memory_used_mb",
     "gpu.cuda",
     "gpu.power_limit",
     "gpu.power_default_limit",
