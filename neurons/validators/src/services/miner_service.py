@@ -56,7 +56,7 @@ from payload_models.payloads import (
 from tenacity import RetryError
 
 from core.config import settings
-from core.utils import _m, get_extra_info
+from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService
@@ -755,8 +755,20 @@ class MinerService:
                     exc_info=True,
                 )
 
-    def _handle_container_error(self, payload: ContainerBaseRequest, msg: str, error_code: FailedContainerErrorCodes):
+    def _handle_container_error(
+        self,
+        payload: ContainerBaseRequest,
+        msg: str | _StructuredMessage,
+        error_code: FailedContainerErrorCodes,
+    ):
+        # DAH-2475: ship the FULL text — headline plus the `extra` dict — to the backend. Callers build
+        # a _StructuredMessage whose extra carries the actual exception, but str() on it returns only
+        # the headline, so a create failure reached the backend (and filler_run.failure_reason) as a
+        # bare "Resulted in an exception". Every such failure then cost a manual investigation, and the
+        # 12h launch backoff was applied without anyone knowing what had failed. Logging keeps the
+        # structured object so `extra` still lands in Loki as fields.
         logger.error(msg)
+        detail: str = msg.to_full_string() if isinstance(msg, _StructuredMessage) else msg
 
         if isinstance(payload, ContainerCreateRequest):
             return FailedContainerRequest(
@@ -764,7 +776,7 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=error_code,
             )
@@ -775,7 +787,7 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=detail,
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=error_code,
             )
@@ -785,7 +797,7 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=detail,
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=error_code,
             )
@@ -795,7 +807,7 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=detail,
             )
         else:
             return FailedContainerRequest(
@@ -803,7 +815,7 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=detail,
                 error_type=FailedContainerErrorTypes.UnknownRequest,
                 error_code=error_code,
             )
@@ -924,7 +936,7 @@ class MinerService:
 
                         return self._handle_container_error(
                             payload=payload,
-                            msg=str(log_text),
+                            msg=log_text,
                             error_code=FailedContainerErrorCodes.InvalidExecutorId
                         )
 
@@ -946,7 +958,7 @@ class MinerService:
 
                         return self._handle_container_error(
                             payload=payload,
-                            msg=str(log_text),
+                            msg=log_text,
                             error_code=FailedContainerErrorCodes.RentingInProgress,
                         )
 
@@ -1103,7 +1115,7 @@ class MinerService:
 
                         return self._handle_container_error(
                             payload=payload,
-                            msg=str(log_text),
+                            msg=log_text,
                             error_code=FailedContainerErrorCodes.UnknownError,
                         )
 
@@ -1115,7 +1127,7 @@ class MinerService:
 
                     return self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.FailedMsgFromMiner,
                     )
                 else:
@@ -1126,7 +1138,7 @@ class MinerService:
 
                     return self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.UnknownError,
                     )
         except Exception as e:
@@ -1136,7 +1148,7 @@ class MinerService:
             )
             return self._handle_container_error(
                 payload=payload,
-                msg=str(log_text),
+                msg=log_text,
                 error_code=FailedContainerErrorCodes.ExceptionError,
             )
 
@@ -1235,7 +1247,7 @@ class MinerService:
                         pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
-                        msg=str(log_text),
+                        msg=log_text,
                     )
 
                 else:
@@ -1250,7 +1262,7 @@ class MinerService:
                         pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
-                        msg=str(log_text),
+                        msg=log_text,
                     )
 
         except Exception as e:
@@ -1264,7 +1276,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
-                msg=str(log_text),
+                msg=log_text,
             )
 
     async def add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
@@ -1363,7 +1375,7 @@ class MinerService:
                         return FailedAddDebugSshKey(
                             miner_hotkey=payload.miner_hotkey,
                             executor_id=payload.executor_id,
-                            msg=str(log_text),
+                            msg=log_text,
                         )
 
                     logger.info(
@@ -1392,7 +1404,7 @@ class MinerService:
                     return FailedAddDebugSshKey(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=str(log_text),
+                        msg=log_text,
                     )
 
         except Exception as e:
@@ -1405,7 +1417,7 @@ class MinerService:
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=str(log_text),
+                msg=log_text,
             )
 
     async def handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey):
@@ -1969,7 +1981,7 @@ class MinerService:
 
                     return self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.InvalidExecutorId
                     )
 
@@ -1993,7 +2005,7 @@ class MinerService:
 
                     return self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.RentingInProgress,
                     )
 
@@ -2075,7 +2087,7 @@ class MinerService:
                     )
                     result = self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.UnknownError,
                     )
 
@@ -2100,7 +2112,7 @@ class MinerService:
 
                 return self._handle_container_error(
                     payload=payload,
-                    msg=str(log_text),
+                    msg=log_text,
                     error_code=FailedContainerErrorCodes.FailedMsgFromMiner,
                 )
             else:
@@ -2111,7 +2123,7 @@ class MinerService:
 
                 return self._handle_container_error(
                     payload=payload,
-                    msg=str(log_text),
+                    msg=log_text,
                     error_code=FailedContainerErrorCodes.UnknownError,
                 )
         except Exception as e:
@@ -2121,7 +2133,7 @@ class MinerService:
             )
             return self._handle_container_error(
                 payload=payload,
-                msg=str(log_text),
+                msg=log_text,
                 error_code=FailedContainerErrorCodes.ExceptionError,
             )
 
@@ -2177,7 +2189,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=str(log_text),
+                    msg=log_text,
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2209,7 +2221,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=str(log_text),
+                    msg=log_text,
                 )
 
             else:
@@ -2224,7 +2236,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=str(log_text),
+                    msg=log_text,
                 )
 
         except Exception as e:
@@ -2238,7 +2250,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
-                msg=str(log_text),
+                msg=log_text,
             )
 
     async def _add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
@@ -2290,7 +2302,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=str(log_text),
+                    msg=log_text,
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2330,7 +2342,7 @@ class MinerService:
                     return FailedAddDebugSshKey(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=str(log_text),
+                        msg=log_text,
                     )
 
                 logger.info(
@@ -2359,7 +2371,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=str(log_text),
+                    msg=log_text,
                 )
 
         except Exception as e:
@@ -2372,7 +2384,7 @@ class MinerService:
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=str(log_text),
+                msg=log_text,
             )
 
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]
