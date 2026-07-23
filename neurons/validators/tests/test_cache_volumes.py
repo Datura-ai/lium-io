@@ -212,7 +212,7 @@ async def test_an_existing_cache_is_mounted_without_charging_for_it_again(docker
         ],
     )
 
-    affordable = await docker_service.affordable_cache_volumes(ssh_client, payload, {})
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
 
     assert [volume.name for volume in affordable] == ["dphn_cache_hf_v1", "dphn_cache_dp_v1"]
 
@@ -227,7 +227,7 @@ async def test_a_missing_cache_is_refused_when_the_download_would_delist_the_nod
         cache_volumes=[CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache")],
     )
 
-    assert await docker_service.affordable_cache_volumes(ssh_client, payload, {}) == []
+    assert await docker_service.select_affordable_cache_volumes(ssh_client, payload, {}) == []
 
 
 @pytest.mark.asyncio
@@ -238,7 +238,7 @@ async def test_a_missing_cache_is_granted_when_the_node_can_afford_the_download(
         cache_volumes=[CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache")],
     )
 
-    affordable = await docker_service.affordable_cache_volumes(ssh_client, payload, {})
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
 
     assert [volume.name for volume in affordable] == ["dphn_cache_hf_v1"]
 
@@ -256,7 +256,7 @@ async def test_a_tight_node_keeps_the_half_of_its_cache_that_already_exists(dock
         ],
     )
 
-    affordable = await docker_service.affordable_cache_volumes(ssh_client, payload, {})
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
 
     assert [volume.name for volume in affordable] == ["dphn_cache_hf_v1"]
 
@@ -269,7 +269,7 @@ async def test_a_customer_rental_never_gets_cache_volumes(docker_service):
         cache_volumes=[CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache")],
     )
 
-    assert await docker_service.affordable_cache_volumes(ssh_client, payload, {}) == []
+    assert await docker_service.select_affordable_cache_volumes(ssh_client, payload, {}) == []
 
 
 @pytest.mark.asyncio
@@ -291,7 +291,7 @@ async def test_an_unreadable_disk_grants_only_what_already_exists(docker_service
         ],
     )
 
-    affordable = await docker_service.affordable_cache_volumes(ssh_client, payload, {})
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
 
     assert [volume.name for volume in affordable] == ["dphn_cache_hf_v1"]
 

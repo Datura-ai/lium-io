@@ -1,12 +1,12 @@
 import logging
 import re
-import shlex
 from typing import Optional
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from core.docker_utils import DockerCommand
+from core.docker_utils import DockerCommand, df_available_bytes
 from core.utils import _m
 from services.const import (
+    DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
@@ -21,9 +21,9 @@ ANON_VOLUME_NAME_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 # DAH-2475: a node whose free disk has fallen below the rental listing floor must give the filler
 # cache back — it is worth ~37 GB and a delisted node earns nothing, so the cache is the first thing
-# to sacrifice. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB (100 GB), which is where
-# filters_for_available_executors stops offering the node for rent.
-DPHN_CACHE_RECLAIM_FREE_FLOOR_GB = 100
+# to sacrifice. This is the SAME floor the affordability gate keeps a node above, so they share one
+# constant: split them and a node could be granted a cache it is immediately reclaimed for.
+DPHN_CACHE_RECLAIM_FREE_FLOOR_GB = DPHN_CACHE_LISTING_FLOOR_GB
 
 # Remove at most this many per pass; GC runs each cycle, so a backlog drains
 # over a few passes without a huge `docker volume rm` command.
@@ -189,6 +189,14 @@ class ContainerCleanup:
         """
         extra = {"executor_uuid": executor_uuid}
         try:
+            # Cheapest and most selective guard first. Most executors hold no DPHN cache at all — PEARL
+            # nodes, miner-assigned nodes, nodes that never ran Dolphin — and this check runs on every
+            # node every cycle. Measuring the disk before knowing there is anything to reclaim made all
+            # of them start a throwaway container just to learn there was nothing to do.
+            cache_volumes = await self._get_dphn_cache_volumes(ssh_client)
+            if not cache_volumes:
+                return 0
+
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
             if await self._has_running_filler_container(ssh_client):
@@ -196,10 +204,6 @@ class ContainerCleanup:
 
             free_gb = await self._get_free_disk_gb(ssh_client)
             if free_gb is None or free_gb >= DPHN_CACHE_RECLAIM_FREE_FLOOR_GB:
-                return 0
-
-            cache_volumes = await self._get_dphn_cache_volumes(ssh_client)
-            if not cache_volumes:
                 return 0
 
             if self.dry_run:
@@ -247,20 +251,20 @@ class ContainerCleanup:
             return True  # cannot prove the node is idle -> do not reclaim
         return bool((result.stdout or "").strip())
 
-    async def _get_free_disk_gb(self, ssh_client) -> Optional[float]:
-        # Free space on the docker data root, in GB; None when it cannot be read. The root is DISCOVERED,
-        # not assumed: a node with docker moved to a dedicated disk would otherwise be judged by its
-        # root filesystem, and the reclaim would either never fire while docker's disk is full or fire
-        # and delete a healthy cache the node had room for.
+    async def _get_free_disk_gb(self, ssh_client) -> float | None:
+        # The root is DISCOVERED, not assumed: a node with docker moved to a dedicated disk would
+        # otherwise be judged by its root filesystem, and the reclaim would either never fire while
+        # docker's disk is full or fire and delete a healthy cache the node had room for.
         info = await ssh_client.run("/usr/bin/docker info --format '{{.DockerRootDir}}'")
         if getattr(info, "exit_status", 0) != 0:
             return None
         docker_root: str = (info.stdout or "").strip() or "/var/lib/docker"
-        result = await ssh_client.run(f"/bin/df -B1 --output=avail {shlex.quote(docker_root)} | tail -1")
-        if getattr(result, "exit_status", 0) != 0:
+        try:
+            return await df_available_bytes(ssh_client, docker_root) / (1024**3)
+        except Exception:
+            # A backstop that cannot measure declines rather than guesses; the caller treats None as
+            # "leave the cache alone".
             return None
-        raw = (result.stdout or "").strip()
-        return int(raw) / (1024**3) if raw.isdigit() else None
 
     async def _get_dphn_cache_volumes(self, ssh_client) -> list[str]:
         result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
