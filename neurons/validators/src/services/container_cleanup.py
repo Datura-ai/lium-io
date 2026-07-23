@@ -188,8 +188,9 @@ class ContainerCleanup:
         """
         extra = {"executor_uuid": executor_uuid}
         try:
-            containers = await self._get_all_rental_containers(ssh_client)
-            if any(name.strip().startswith(FILLER_CONTAINER_PREFIX) for name in containers):
+            # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
+            # filler_* would make "no live filler" false forever and the reclaim would never fire.
+            if await self._has_running_filler_container(ssh_client):
                 return 0
 
             free_gb = await self._get_free_disk_gb(ssh_client)
@@ -221,6 +222,15 @@ class ContainerCleanup:
         except Exception as e:
             logger.warning(_m("DPHN cache reclaim failed", extra=extra | {"error": str(e)}))
             return 0
+
+    async def _has_running_filler_container(self, ssh_client) -> bool:
+        # A cache a live filler still mounts is in use; docker refuses to remove it anyway.
+        result = await ssh_client.run(
+            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --format "{{{{.Names}}}}"'
+        )
+        if getattr(result, "exit_status", 0) != 0:
+            return True  # cannot prove the node is idle -> do not reclaim
+        return bool((result.stdout or "").strip())
 
     async def _get_free_disk_gb(self, ssh_client) -> Optional[float]:
         # Free space on the docker data root, in GB; None when it cannot be read.
