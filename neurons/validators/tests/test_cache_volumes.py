@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -230,3 +230,20 @@ async def test_sweep_never_touches_a_customer_rental_host(docker_service):
     await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
 
     assert ssh_client.commands == []
+
+
+@pytest.mark.asyncio
+async def test_rented_pod_cache_failure_does_not_fail_the_create(docker_service):
+    # DAH-2475/B2: the rented-machine hash is a cache the backend rebuilds every ~10 min, so a Redis
+    # blip at the last step must NOT propagate — raising here used to trip the cleanup path and
+    # destroy a container that was already built and running (throwing away a ~40 min DPHN download).
+    docker_service.redis_service.add_rented_pod = AsyncMock(side_effect=Exception("Timeout connecting to server"))
+
+    await docker_service._cache_rented_pod_best_effort(
+        executor_info=Mock(),
+        pod_id="pod",
+        container_name="filler_pod",
+        default_extra={},
+    )
+
+    docker_service.redis_service.add_rented_pod.assert_awaited_once()
