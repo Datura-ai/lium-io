@@ -1587,7 +1587,7 @@ class DockerService:
                 exc_info=True,
             )
 
-    async def affordable_cache_volumes(
+    async def select_affordable_cache_volumes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
@@ -3620,7 +3620,7 @@ class DockerService:
                 # volumes already exist, and therefore whether mounting them costs a download at all.
                 # Narrowing the request here — BEFORE the sweep, so its keep-list matches what is
                 # actually mounted — is what keeps the decision idempotent across launches.
-                payload.cache_volumes = await self.affordable_cache_volumes(
+                payload.cache_volumes = await self.select_affordable_cache_volumes(
                     ssh_client=ssh_client,
                     payload=payload,
                     default_extra=default_extra,
