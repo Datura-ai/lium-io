@@ -1247,7 +1247,7 @@ class MinerService:
                         pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
-                        msg=log_text,
+                        msg=log_text.to_full_string(),
                     )
 
                 else:
@@ -1262,7 +1262,7 @@ class MinerService:
                         pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
-                        msg=log_text,
+                        msg=log_text.to_full_string(),
                     )
 
         except Exception as e:
@@ -1276,7 +1276,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
-                msg=log_text,
+                msg=log_text.to_full_string(),
             )
 
     async def add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
@@ -1375,7 +1375,7 @@ class MinerService:
                         return FailedAddDebugSshKey(
                             miner_hotkey=payload.miner_hotkey,
                             executor_id=payload.executor_id,
-                            msg=log_text,
+                            msg=log_text.to_full_string(),
                         )
 
                     logger.info(
@@ -1404,7 +1404,7 @@ class MinerService:
                     return FailedAddDebugSshKey(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=log_text,
+                        msg=log_text.to_full_string(),
                     )
 
         except Exception as e:
@@ -1417,7 +1417,7 @@ class MinerService:
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=log_text,
+                msg=log_text.to_full_string(),
             )
 
     async def handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey):
@@ -2189,7 +2189,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text,
+                    msg=log_text.to_full_string(),
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2221,7 +2221,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text,
+                    msg=log_text.to_full_string(),
                 )
 
             else:
@@ -2236,7 +2236,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text,
+                    msg=log_text.to_full_string(),
                 )
 
         except Exception as e:
@@ -2250,7 +2250,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
-                msg=log_text,
+                msg=log_text.to_full_string(),
             )
 
     async def _add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
@@ -2302,7 +2302,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=log_text,
+                    msg=log_text.to_full_string(),
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2342,7 +2342,7 @@ class MinerService:
                     return FailedAddDebugSshKey(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=log_text,
+                        msg=log_text.to_full_string(),
                     )
 
                 logger.info(
@@ -2371,7 +2371,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=log_text,
+                    msg=log_text.to_full_string(),
                 )
 
         except Exception as e:
@@ -2384,7 +2384,7 @@ class MinerService:
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=log_text,
+                msg=log_text.to_full_string(),
             )
 
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]

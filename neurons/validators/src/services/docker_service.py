@@ -20,6 +20,7 @@ import bittensor
 import redis.exceptions
 from core.docker_utils import (
     ContainerDeathDiagnostics,
+    DockerCommand,
     collect_container_death_diagnostics,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -1517,6 +1518,35 @@ class DockerService:
                 exc_info=True,
             )
 
+    async def _find_cache_volumes_to_sweep(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        keep_names: set[str],
+        default_extra: dict,
+    ) -> list[str]:
+        # Cache volumes present on the host that this create no longer names, i.e. left by an older
+        # model or runtime. Empty on any listing failure — sweeping is never worth failing a launch.
+        try:
+            listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to list DPHN cache volumes",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+            return []
+        if listed.exit_status != 0:
+            return []
+        return sorted(
+            name
+            for name in (line.strip() for line in (listed.stdout or "").splitlines())
+            if name.startswith(DPHN_CACHE_VOLUME_PREFIX) and name not in keep_names
+        )
+
     async def sweep_stale_cache_volumes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -1529,51 +1559,36 @@ class DockerService:
         backend ask for a different name. Without this sweep the previous ~37 GB set would sit on the
         host forever (a named volume outside the `volume_` prefix is untouched by every other GC path)
         and each update would leak another set — the invariant is at most ONE model's cache per host.
-
-        Removing a volume a sibling bundle still has mounted is impossible: dockerd refuses to remove
-        an in-use volume and the command is best-effort, so live siblings need no locking. Best-effort
-        overall — a failed sweep must never block the launch.
         """
-        if payload.workload_kind != WorkloadKind.FILLER:
+        if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+            # No cache requested -> this is version GC with nothing to compare against, NOT a reclaim.
+            # Deleting here would thrash: the backend denies the cache to a node whose free disk sits
+            # under its threshold, but a node's free disk is LOWER precisely because the cache is
+            # already downloaded — so deny would delete it, free disk would rise back over the
+            # threshold, the next cycle would grant it again, and the node would re-download ~37 GB
+            # every cycle. Reclaiming a cache the node can no longer afford is the rental/disk-pressure
+            # path's job, where the decision is made against real free space.
             return
-        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes or []}
-        try:
-            listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
-            if getattr(listed, "exit_status", 0) != 0:
-                return
-            stale_volumes: list[str] = sorted(
-                name
-                for name in (line.strip() for line in (listed.stdout or "").splitlines())
-                if name.startswith(DPHN_CACHE_VOLUME_PREFIX) and name not in keep_names
+        if any(name.startswith(FILLER_CONTAINER_PREFIX) for name in payload.active_container_names or []):
+            # A live filler sibling still holds this node's cache and docker cannot remove an in-use
+            # volume, so the listing round-trip could only ever be a no-op here.
+            return
+
+        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
+        stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(ssh_client, keep_names, default_extra)
+        if not stale_volumes:
+            return
+        logger.info(
+            _m(
+                "Sweeping stale DPHN cache volumes",
+                extra=get_extra_info({
+                    **default_extra,
+                    "stale_volumes": stale_volumes,
+                    "kept_volumes": sorted(keep_names),
+                }),
             )
-            if not stale_volumes:
-                return
-            logger.info(
-                _m(
-                    "Sweeping stale DPHN cache volumes",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "stale_volumes": stale_volumes,
-                        "kept_volumes": sorted(keep_names),
-                    }),
-                )
-            )
-            volumes = " ".join(shlex.quote(volume) for volume in stale_volumes)
-            await retry_ssh_command(
-                ssh_client,
-                f"/usr/bin/docker volume rm {volumes} 2>/dev/null || true",
-                "sweep_stale_cache_volumes",
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                _m(
-                    "Failed to sweep stale DPHN cache volumes",
-                    extra=get_extra_info({**default_extra, "error": str(exc)}),
-                ),
-                exc_info=True,
-            )
+        )
+        await retry_ssh_command(ssh_client, DockerCommand.volume_remove(*stale_volumes), "sweep_stale_cache_volumes")
 
     async def capture_failed_container_diagnostics(
         self,

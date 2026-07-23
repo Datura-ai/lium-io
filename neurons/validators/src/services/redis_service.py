@@ -45,6 +45,11 @@ EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (second
 # Bounding the pool makes a burst QUEUE on an existing connection instead of opening a new one, and
 # the retry rides out a blip that lasts less than a second.
 REDIS_MAX_CONNECTIONS = 64
+# Seconds a caller waits for a pooled connection once all of them are busy. The pool MUST be a
+# BlockingConnectionPool for this: the default pool raises MaxConnectionsError instead of waiting,
+# and it raises from get_connection() BEFORE the retry wrapper is reached, so a bounded default pool
+# would convert an overload burst into exactly the hard failures this hardening exists to remove.
+REDIS_POOL_WAIT_TIMEOUT_SECONDS = 10
 REDIS_SOCKET_TIMEOUT_SECONDS = 10
 REDIS_CONNECT_TIMEOUT_SECONDS = 5
 REDIS_RETRY_ATTEMPTS = 3
@@ -57,15 +62,18 @@ logger = logging.getLogger(__name__)
 
 class RedisService:
     def __init__(self):
-        self.redis = aioredis.from_url(
-            settings.get_redis_connection_url(),
-            max_connections=REDIS_MAX_CONNECTIONS,
-            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-            socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
-            socket_keepalive=True,
-            health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
-            retry=Retry(ExponentialBackoff(cap=1.0, base=0.1), REDIS_RETRY_ATTEMPTS),
-            retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+        self.redis = aioredis.Redis(
+            connection_pool=aioredis.BlockingConnectionPool.from_url(
+                settings.get_redis_connection_url(),
+                max_connections=REDIS_MAX_CONNECTIONS,
+                timeout=REDIS_POOL_WAIT_TIMEOUT_SECONDS,
+                socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+                socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+                socket_keepalive=True,
+                health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+                retry=Retry(ExponentialBackoff(cap=1.0, base=0.1), REDIS_RETRY_ATTEMPTS),
+                retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+            )
         )
         self.lock = asyncio.Lock()
 
