@@ -178,6 +178,124 @@ class FakeSshClient:
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
 
 
+class HostSshClient(FakeSshClient):
+    """Answers the three questions the affordability decision asks: which cache volumes exist, where
+    the docker root is, and how much space is free on it."""
+
+    def __init__(self, listed_volumes: list[str], free_gb: float):
+        super().__init__(listed_volumes)
+        self._free_bytes = int(free_gb * 1024**3)
+
+    async def run(self, command: str, *args, **kwargs):
+        self.commands.append(command)
+        if "docker info" in command:
+            return SimpleNamespace(exit_status=0, stdout="/var/lib/docker\n", stderr="")
+        if "df -P -B1" in command:
+            body = f"Filesystem 1B-blocks Used Available Capacity\n/dev/sda1 1 1 {self._free_bytes} 1% /hostfs"
+            return SimpleNamespace(exit_status=0, stdout=body, stderr="")
+        stdout = self._listing if "volume ls" in command else ""
+        return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+
+
+@pytest.mark.asyncio
+async def test_an_existing_cache_is_mounted_without_charging_for_it_again(docker_service):
+    # THE bug this moved here to fix. The backend used to subtract the cache size on every launch, so a
+    # node granted the cache once fell below its own threshold by exactly that download and was refused
+    # it forever after. Mounting a volume that already exists costs zero disk, so no check applies —
+    # 170 GB free is under floor+margin+size (190) yet the cache must still be mounted.
+    ssh_client = HostSshClient(["dphn_cache_hf_v1", "dphn_cache_dp_v1"], free_gb=170)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[
+            CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache"),
+            CacheVolume(name="dphn_cache_dp_v1", target="/opt/dolphinpod"),
+        ],
+    )
+
+    affordable = await docker_service.affordable_cache_volumes(ssh_client, payload, {})
+
+    assert [volume.name for volume in affordable] == ["dphn_cache_hf_v1", "dphn_cache_dp_v1"]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_cache_is_refused_when_the_download_would_delist_the_node(docker_service):
+    # Nothing on the host yet, so the mount really does cost a download. Below floor+margin+size the
+    # node would drop out of the rental listing, where neither renters nor fillers can reach it.
+    ssh_client = HostSshClient(["volume_pod"], free_gb=170)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache")],
+    )
+
+    assert await docker_service.affordable_cache_volumes(ssh_client, payload, {}) == []
+
+
+@pytest.mark.asyncio
+async def test_a_missing_cache_is_granted_when_the_node_can_afford_the_download(docker_service):
+    ssh_client = HostSshClient(["volume_pod"], free_gb=250)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache")],
+    )
+
+    affordable = await docker_service.affordable_cache_volumes(ssh_client, payload, {})
+
+    assert [volume.name for volume in affordable] == ["dphn_cache_hf_v1"]
+
+
+@pytest.mark.asyncio
+async def test_a_tight_node_keeps_the_half_of_its_cache_that_already_exists(docker_service):
+    # A model bump renames one volume. The surviving one costs nothing, so it is still mounted; only
+    # the renamed one needs a download the node cannot afford.
+    ssh_client = HostSshClient(["dphn_cache_hf_v1"], free_gb=170)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[
+            CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache"),
+            CacheVolume(name="dphn_cache_dp_v2", target="/opt/dolphinpod"),
+        ],
+    )
+
+    affordable = await docker_service.affordable_cache_volumes(ssh_client, payload, {})
+
+    assert [volume.name for volume in affordable] == ["dphn_cache_hf_v1"]
+
+
+@pytest.mark.asyncio
+async def test_a_customer_rental_never_gets_cache_volumes(docker_service):
+    ssh_client = HostSshClient([], free_gb=1000)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        cache_volumes=[CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache")],
+    )
+
+    assert await docker_service.affordable_cache_volumes(ssh_client, payload, {}) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_disk_grants_only_what_already_exists(docker_service):
+    # Fail closed: without a reading we cannot promise the download fits, but what is already on the
+    # host is free to mount either way.
+    class BlindSshClient(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "df -P -B1" in command:
+                raise ConnectionResetError("ssh dropped while measuring the disk")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = BlindSshClient(["dphn_cache_hf_v1"], free_gb=1000)
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[
+            CacheVolume(name="dphn_cache_hf_v1", target="/root/.cache"),
+            CacheVolume(name="dphn_cache_dp_v2", target="/opt/dolphinpod"),
+        ],
+    )
+
+    affordable = await docker_service.affordable_cache_volumes(ssh_client, payload, {})
+
+    assert [volume.name for volume in affordable] == ["dphn_cache_hf_v1"]
+
+
 def _removed_volumes(ssh_client: FakeSshClient) -> list[str]:
     removals = [command for command in ssh_client.commands if "volume rm" in command]
     if not removals:

@@ -1,5 +1,6 @@
 import logging
 import re
+import shlex
 from typing import Optional
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -247,8 +248,15 @@ class ContainerCleanup:
         return bool((result.stdout or "").strip())
 
     async def _get_free_disk_gb(self, ssh_client) -> Optional[float]:
-        # Free space on the docker data root, in GB; None when it cannot be read.
-        result = await ssh_client.run("/bin/df -B1 --output=avail /var/lib/docker | tail -1")
+        # Free space on the docker data root, in GB; None when it cannot be read. The root is DISCOVERED,
+        # not assumed: a node with docker moved to a dedicated disk would otherwise be judged by its
+        # root filesystem, and the reclaim would either never fire while docker's disk is full or fire
+        # and delete a healthy cache the node had room for.
+        info = await ssh_client.run("/usr/bin/docker info --format '{{.DockerRootDir}}'")
+        if getattr(info, "exit_status", 0) != 0:
+            return None
+        docker_root: str = (info.stdout or "").strip() or "/var/lib/docker"
+        result = await ssh_client.run(f"/bin/df -B1 --output=avail {shlex.quote(docker_root)} | tail -1")
         if getattr(result, "exit_status", 0) != 0:
             return None
         raw = (result.stdout or "").strip()

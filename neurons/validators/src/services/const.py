@@ -227,6 +227,14 @@ FILLER_CONTAINER_PREFIX = "filler_"
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.
 DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
+# DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
+# downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
+# of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom
+# above that floor. Duplicated here on purpose: only the host knows whether the cache already exists,
+# so the affordability decision has to live next to that fact. Keep in step with the backend.
+DPHN_CACHE_SIZE_GB = 40
+DPHN_CACHE_LISTING_FLOOR_GB = 100
+DPHN_CACHE_FREE_MARGIN_GB = 50
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.
