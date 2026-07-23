@@ -10,18 +10,28 @@ imported: file_encrypt_service pulls in PyInstaller, and machine_scrape needs NV
 """
 
 import ast
-import re
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 
 def _gpu_keys_emitted_by_the_scrape() -> list[str]:
-    scrape = (SRC / "miner_jobs" / "machine_scrape.py").read_text()
-    # The gpu_details entry is the only dict literal built from "gpu.*" keys.
-    start = scrape.index('"gpu.name"')
-    end = scrape.index('"gpu.memory_utilization"', start)
-    return re.findall(r'"(gpu\.[a-z_]+)"', scrape[start:end + len('"gpu.memory_utilization"')])
+    """Every key of the gpu_details dict literal, in source order.
+
+    Read the whole dict node rather than slicing between two known keys: an anchor on today's last
+    key would silently stop seeing anything appended after it, and appending is exactly how the next
+    key gets added — the test would stay green through the very desync it exists to catch.
+    """
+    scrape = ast.parse((SRC / "miner_jobs" / "machine_scrape.py").read_text())
+    gpu_detail_dicts = [
+        node
+        for node in ast.walk(scrape)
+        if isinstance(node, ast.Dict)
+        and node.keys
+        and all(isinstance(key, ast.Constant) and str(key.value).startswith("gpu.") for key in node.keys)
+    ]
+    assert len(gpu_detail_dicts) == 1, f"expected exactly one gpu_details dict literal, found {len(gpu_detail_dicts)}"
+    return [key.value for key in gpu_detail_dicts[0].keys]
 
 
 def _keys_used_for_the_encryption_key() -> list[str]:
