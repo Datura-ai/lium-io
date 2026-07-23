@@ -26,6 +26,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    CacheVolume,
     ContainerBaseRequest,
     ContainerCreated,
     ContainerCreateRequest,
@@ -158,6 +159,10 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 _VLOOPBACK_REPAIR_IMAGE = "docker.io/library/alpine:3.19"
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
+# name with the model + runtime version baked in; the validator only needs the prefix, to recognise
+# which volumes belong to the cache when sweeping the ones the current create no longer asks for.
+DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -316,6 +321,39 @@ def _quote_safe_docker_volume_name(volume_name: str, *, field_name: str) -> str:
     if not _is_safe_docker_volume_name(volume_name):
         raise ValueError(f"Unsafe Docker volume name for {field_name}: {volume_name!r}")
     return shlex.quote(volume_name)
+
+
+def _validate_cache_volume(cache_volume: CacheVolume) -> None:
+    # raise ValueError on an unsafe FILLER cache volume. These mounts come from the backend, but a
+    # `/`-prefixed source would be a HOST bind-mount and a `:` would corrupt the `src:target:rw` bind
+    # spec — the name regex is the only guard, so validate defensively before it reaches the SDK.
+    name = cache_volume.name
+    if not _is_safe_docker_volume_name(name):
+        raise ValueError(f"Unsafe cache volume name: {name!r}")
+    # `volume_` marks the ephemeral run volumes every GC path deletes (clean_existing_containers,
+    # clean_stale_vloopback_volumes); a persistent cache volume must never wear that prefix.
+    if name.startswith("volume_"):
+        raise ValueError(f"Cache volume name must not use the ephemeral 'volume_' prefix: {name!r}")
+    target = cache_volume.target
+    if not target.startswith("/") or target == "/" or ":" in target or ".." in target.split("/"):
+        raise ValueError(f"Unsafe cache volume target: {target!r}")
+
+
+def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets: set[str]) -> list[VolumeMount]:
+    # Persistent named cache volumes for a FILLER container (DPHN model/runtime cache). Empty for any
+    # non-FILLER workload even when the field is set — a customer rental must never receive these
+    # mounts. A cache entry whose target collides with an already-mounted path (the run's own volume or
+    # /mnt) is skipped, since dockerd rejects a duplicate mount target and would fail the whole create.
+    if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+        return []
+    mounts: list[VolumeMount] = []
+    for cache_volume in payload.cache_volumes:
+        _validate_cache_volume(cache_volume)
+        if cache_volume.target in occupied_targets:
+            continue
+        occupied_targets.add(cache_volume.target)
+        mounts.append(VolumeMount(source=cache_volume.name, target=cache_volume.target))
+    return mounts
 
 
 def _is_vloopback_driver(driver: str) -> bool:
@@ -688,8 +726,12 @@ class DockerService:
         environment["NVIDIA_DRIVER_CAPABILITIES"] = "all"
 
         volumes = [VolumeMount(source=local_volume, target=local_volume_path)]
+        occupied_targets = {local_volume_path}
         if external_volume_name:
             volumes.append(VolumeMount(source=external_volume_name, target="/mnt"))
+            occupied_targets.add("/mnt")
+        # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
+        volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
 
         devices = (
             DeviceMount(path_on_host="/dev/net/tun", path_in_container="/dev/net/tun"),
@@ -1435,6 +1477,64 @@ class DockerService:
             logger.warning(
                 _m(
                     "Failed to clean stale vloopback volumes",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+
+    async def sweep_stale_cache_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+    ) -> None:
+        """Remove every DPHN cache volume on the host except the ones THIS create asks for.
+
+        The cache volume name carries the model + runtime version, so a Dolphin model update makes the
+        backend ask for a different name. Without this sweep the previous ~37 GB set would sit on the
+        host forever (a named volume outside the `volume_` prefix is untouched by every other GC path)
+        and each update would leak another set — the invariant is at most ONE model's cache per host.
+
+        Removing a volume a sibling bundle still has mounted is impossible: dockerd refuses to remove
+        an in-use volume and the command is best-effort, so live siblings need no locking. Best-effort
+        overall — a failed sweep must never block the launch.
+        """
+        if payload.workload_kind != WorkloadKind.FILLER:
+            return
+        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes or []}
+        try:
+            listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+            if getattr(listed, "exit_status", 0) != 0:
+                return
+            stale_volumes: list[str] = sorted(
+                name
+                for name in (line.strip() for line in (listed.stdout or "").splitlines())
+                if name.startswith(DPHN_CACHE_VOLUME_PREFIX) and name not in keep_names
+            )
+            if not stale_volumes:
+                return
+            logger.info(
+                _m(
+                    "Sweeping stale DPHN cache volumes",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "stale_volumes": stale_volumes,
+                        "kept_volumes": sorted(keep_names),
+                    }),
+                )
+            )
+            volumes = " ".join(shlex.quote(volume) for volume in stale_volumes)
+            await retry_ssh_command(
+                ssh_client,
+                f"/usr/bin/docker volume rm {volumes} 2>/dev/null || true",
+                "sweep_stale_cache_volumes",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to sweep stale DPHN cache volumes",
                     extra=get_extra_info({**default_extra, "error": str(exc)}),
                 ),
                 exc_info=True,
@@ -3320,6 +3420,12 @@ class DockerService:
                     skip_volume_names=protected_volume_names,
                 )
 
+                await self.sweep_stale_cache_volumes(
+                    ssh_client=ssh_client,
+                    payload=payload,
+                    default_extra=default_extra,
+                )
+
                 # Add profiler for docker volume creation
                 profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, prev_timestamp))
                 prev_timestamp = now_ms()
@@ -3806,8 +3912,11 @@ class DockerService:
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
-            # Port release now handled by backend
-            failure_msg = str(log_text)
+            # Port release now handled by backend.
+            # DAH-2475: the FULL text (headline + the extra dict holding the actual error and the
+            # failure_step), not just the headline — this string becomes filler_run.failure_reason on
+            # the backend, and a bare "Failed create_container" told us nothing about why.
+            failure_msg = log_text.to_full_string()
             if (
                 current_step == "docker_sdk_ssh_host_key"
                 and isinstance(e, RentalDockerConnectionError)

@@ -232,6 +232,16 @@ class GpuPowerLimit(BaseModel):
     watts: int = Field(gt=0)
 
 
+class CacheVolume(BaseModel):
+    # One persistent, stable-named docker volume mounted into a FILLER container so its model/runtime
+    # cache survives container teardown (a DPHN cold start otherwise re-downloads ~37 GB per start).
+    # Honored by the validator ONLY for workload_kind == FILLER; the delete request never names these,
+    # so they persist across stops. `name` must be a safe docker volume name and must NOT use the
+    # ephemeral `volume_` prefix (that prefix marks the run volumes every GC path deletes).
+    name: str
+    target: str
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
     """Container creation request from the backend.
 
@@ -313,6 +323,12 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # miner default jobs). MUST be declared here or pydantic drops it on deserialization of the
     # backend's request.
     gpu_power_limits: list[GpuPowerLimit] | None = None
+    # Extra persistent named volumes mounted into a FILLER container (DPHN model/runtime cache, so a
+    # restart reuses the warm cache instead of re-downloading ~37 GB). FILLER-only: the validator
+    # appends these mounts only for workload_kind == FILLER and never for a customer rental. None ->
+    # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
+    # drops it on deserialization of the backend's request.
+    cache_volumes: list[CacheVolume] | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
