@@ -434,10 +434,14 @@ class FillerSSHClient:
         running: bool = True,
         exit_status: int = 0,
         raise_on_run: BaseException | None = None,
+        dead_containers: set[str] | None = None,
     ):
         self.running = running
         self.exit_status = exit_status
         self.raise_on_run = raise_on_run
+        # Per-container control for GPU-split nodes: these answer the probe as gone while the rest
+        # of the node's containers answer as alive.
+        self.dead_containers = dead_containers or set()
         self.commands: list[str] = []
 
     async def run(self, command: str) -> Mock:
@@ -446,7 +450,9 @@ class FillerSSHClient:
             raise self.raise_on_run
         result = Mock()
         result.exit_status = self.exit_status
-        result.stdout = "container_id_123" if self.running and "docker ps" in command else ""
+        probed_container_is_dead = any(container in command for container in self.dead_containers)
+        container_running = self.running and not probed_container_is_dead
+        result.stdout = "container_id_123" if container_running and "docker ps" in command else ""
         result.stderr = ""
         return result
 
@@ -456,13 +462,18 @@ def _filler_context(
     backend_client: DummyBackendClient,
     ssh_client: FillerSSHClient,
     filler_container: str = "filler_11111111-2222-3333-4444-555555555555",
+    filler_containers: list[str] | None = None,
 ) -> Context:
+    # filler_containers = a GPU-split node's full bundle list (DAH-2465); the legacy single map is
+    # still populated so the protocol's fallback path stays covered.
+    all_containers: list[str] = filler_containers or [filler_container]
     services = build_services(backend=backend_client, container_cleanup=ContainerCleanup())
     state = build_state(
         specs={"verified_ports": [8080]},
         rented_data=RentedExecutorsResponse(
             executors={},
-            filler_containers_by_executor={"executor-123": filler_container},
+            filler_containers_by_executor={"executor-123": all_containers[0]},
+            all_filler_containers_by_executor={"executor-123": all_containers},
         ),
     )
     from tests.helpers import make_context
@@ -710,3 +721,66 @@ async def test_rental_verification_flag_false_when_no_customer_rental():
 
     assert result.passed is True
     assert backend_client.called_with["rental_in_progress"] is False
+
+
+# ---------------------------------------------------------------- GPU-split nodes (DAH-2465 bundles)
+
+_BUNDLE_A = "filler_aaaaaaaa-1111-2222-3333-444444444444"
+_BUNDLE_B = "filler_bbbbbbbb-1111-2222-3333-444444444444"
+
+
+@pytest.mark.asyncio
+async def test_filler_liveness_probes_every_bundle_container():
+    """A GPU-split node has one filler per bundle; all of them must be probed, not just the first."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, details={})
+    )
+    ssh_client = FillerSSHClient(running=True)
+    ctx = _filler_context(
+        backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
+    )
+
+    result = await _run_filler_check(ctx)
+
+    probed = [c for c in ssh_client.commands if "docker ps" in c]
+    assert any(_BUNDLE_A in c for c in probed)
+    assert any(_BUNDLE_B in c for c in probed)
+    assert result.passed is True
+    assert [entry["reason_code"] for entry in result.event.what_we_saw["checked_containers"]] == [
+        Msg.FILLER_VERIFIED.reason,
+        Msg.FILLER_VERIFIED.reason,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_filler_liveness_reports_dead_non_first_bundle_to_backend():
+    """Regression: a removed SIBLING bundle used to be invisible — no probe, no re-check, so the
+    backend never got the container_missing evidence and DAH-2471 could not reconcile that run."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(dead_containers={_BUNDLE_B})
+    ctx = _filler_context(
+        backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
+    )
+
+    await _run_filler_check(ctx, enforcement=False)
+
+    # Only the dead sibling triggers the live re-check, and it carries the reconciliation flag.
+    assert backend_client.filler_run_active_calls == [_BUNDLE_B.removeprefix("filler_")]
+    assert backend_client.filler_run_container_missing_flags == [True]
+
+
+@pytest.mark.asyncio
+async def test_filler_liveness_dead_sibling_decides_the_node_under_enforcement():
+    """Under enforcement one killed bundle withholds incentive even if the other bundle is fine."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(dead_containers={_BUNDLE_B})
+    ctx = _filler_context(
+        backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
+    )
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is False
+    reason_codes = [entry["reason_code"] for entry in result.event.what_we_saw["checked_containers"]]
+    assert reason_codes[0] == Msg.FILLER_VERIFIED.reason
+    assert reason_codes[1] != Msg.FILLER_VERIFIED.reason

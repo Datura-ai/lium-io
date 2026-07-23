@@ -53,8 +53,11 @@ class RentalVerificationCheck:
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         has_customer_rental = bool(rented_executor and rented_executor.pods)
-        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
-        if filler_container and not has_customer_rental:
+        # EVERY filler container on the node, not just one: a GPU-split DPHN node runs one filler per
+        # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
+        # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
+        filler_containers: list[str] = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        if filler_containers and not has_customer_rental:
             # ISSUE-050: the backend's word alone is not proof the filler is alive — some hosts
             # remove Lium filler containers while the run stays RUNNING and keep earning
             # unrented incentive. Verify the container on the host, mirroring the customer-pod
@@ -69,13 +72,13 @@ class RentalVerificationCheck:
                     what={
                         "skipped": True,
                         "reason": "active filler runtime",
-                        "filler_container": filler_container,
+                        "filler_containers": filler_containers,
                     },
                 )
                 return CheckResult(passed=True, event=event, updates={})
 
-            return await self._verify_filler_alive(
-                ctx, filler_container, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
+            return await self._verify_every_filler_alive(
+                ctx, filler_containers, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
             )
 
         # Get required info from context
@@ -224,6 +227,31 @@ class RentalVerificationCheck:
             await ctx.services.container_cleanup.force_remove_health_checks(
                 ctx.ssh, ctx.executor.uuid
             )
+
+    async def _verify_every_filler_alive(
+        self, ctx: Context, filler_containers: list[str], *, enforce: bool
+    ) -> CheckResult:
+        """Verify each of the node's filler containers, one per GPU bundle (DAH-2465).
+
+        Every container is probed independently, so a removed bundle is reported to the backend
+        (container_missing=true, feeding the DAH-2471 reconciliation) even while its siblings run
+        fine. A check may return only one result, so the decisive verdict wins: the first container
+        whose outcome withholds incentive fails the whole node, otherwise the last verdict stands.
+        Each container's reason code is listed on the returned event, so one log line covers the
+        whole node instead of hiding the siblings.
+        """
+        verdicts: list[tuple[str, CheckResult]] = [
+            (filler_container, await self._verify_filler_alive(ctx, filler_container, enforce=enforce))
+            for filler_container in filler_containers
+        ]
+        decisive: CheckResult = next(
+            (verdict for _, verdict in verdicts if not verdict.passed), verdicts[-1][1]
+        )
+        decisive.event.what_we_saw["checked_containers"] = [
+            {"filler_container": filler_container, "reason_code": verdict.event.reason_code}
+            for filler_container, verdict in verdicts
+        ]
+        return decisive
 
     async def _verify_filler_alive(
         self, ctx: Context, filler_container: str, *, enforce: bool
