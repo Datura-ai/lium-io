@@ -17,6 +17,19 @@ from services.task_service import JobResult
 logger = get_logger(__name__)
 
 
+def _referral_coldkey_verified(funding: bittensor.NeuronInfo) -> bool:
+    """Fail-closed coldkey check for the dedicated referral funding wallet (DAH-2481).
+
+    Emission is routed to ``REFERRAL_EMISSION_UID`` only when that UID's on-chain coldkey
+    equals the explicitly configured ``settings.REFERRAL_EMISSION_COLDKEY``. An empty
+    (unset) expected coldkey, or any mismatch, is treated as UNVERIFIED — so the referral
+    wallet is verified against its own key (independent of the burn ``BURNER_COLDKEYS``),
+    and emission is never sent to whatever hotkey happens to occupy the UID slot.
+    """
+    expected_coldkey = settings.REFERRAL_EMISSION_COLDKEY
+    return bool(expected_coldkey) and funding.coldkey == expected_coldkey
+
+
 def _parse_driver_version(value: str) -> tuple[int, ...] | None:
     """Parse a dotted NVIDIA driver version (e.g. "580.95.05") into an int tuple for
     ordering. Returns None when the value is missing or non-numeric."""
@@ -233,15 +246,95 @@ class DefaultIncentive(BaseIncentive):
             dict[str, float]: Scores with burning applied for each miner
         """
         # Calculate burn scores using BurnService
-        cycle_scores = self.burn_service.calculate_burn_scores(
+        burn_scores = self.burn_service.calculate_burn_scores(
             miners=miners,
             burn_share=self.burn_share,  # burn-emission share sourced from shared config (DAH-2274)
             last_mechanism_step_block=last_mechanism_step_block,
         )
+        cycle_scores = dict(burn_scores)
         for miner in miners:
             # Check if miner is a burner
             if miner.hotkey in cycle_scores:
                 continue
             cycle_scores[miner.hotkey] = self.miner_incentives.get(miner.hotkey, 0.0)
 
+        # DAH-2481: redirect a fixed fraction of the miner (non-burn) emission to the
+        # funding wallet so it can fund referral incentives (see _apply_referral_carveout).
+        self._apply_referral_carveout(cycle_scores, burn_scores, miners)
+
         return cycle_scores
+
+    def _apply_referral_carveout(
+        self,
+        cycle_scores: dict[str, float],
+        burn_scores: dict[str, float],
+        miners: list[bittensor.NeuronInfo],
+    ) -> None:
+        """DAH-2481 — grant a fixed fraction of miner emission to the referral funding wallet.
+
+        A configurable share (``settings.REFERRAL_EMISSION_SHARE``) of the miner
+        (non-burn) emission is carved off every miner proportionally and granted to the
+        dedicated referral funding wallet (``settings.REFERRAL_EMISSION_UID`` — a hotkey
+        registered on SN51 under its own coldkey, distinct from the burn UID) so it can
+        fund referral incentives.
+
+        Because the accumulated scores are normalized before they reach chain (see
+        ``subtensor_client.set_weights``), the carve-out only has to preserve proportions.
+        Totals still sum to 1 — each miner keeps ``1 - share`` of its emission and the
+        funding wallet gains the carved sum (its emission is separate from, and additive to,
+        the burn wallet's, so it is distinguishable on-chain).
+
+        No-op when the share is 0 (default). Fails closed via ``_referral_coldkey_verified``:
+        if the funding wallet is absent this cycle, or ``REFERRAL_EMISSION_COLDKEY`` is
+        unset, or that coldkey does not match on-chain, the miner emission is left
+        untouched — emission is never redirected to an unverified key. The share is clamped
+        to [0, 1] (and a non-positive/NaN share is a no-op) so a misconfigured value can
+        never drive miner weights negative.
+        """
+        share = min(max(settings.REFERRAL_EMISSION_SHARE, 0.0), 1.0)
+        if not (share > 0):  # also rejects NaN, which the clamp preserves
+            return
+
+        funding = next((m for m in miners if m.uid == settings.REFERRAL_EMISSION_UID), None)
+        if funding is None:
+            return
+        if not _referral_coldkey_verified(funding):
+            logger.warning(
+                _m(
+                    "Referral carve-out skipped — funding wallet coldkey unverified",
+                    extra={
+                        "referral_uid": settings.REFERRAL_EMISSION_UID,
+                        "funding_hotkey": funding.hotkey,
+                        "funding_coldkey": funding.coldkey,
+                        "expected_coldkey": settings.REFERRAL_EMISSION_COLDKEY,
+                    },
+                )
+            )
+            return
+
+        referral_total = 0.0
+        for hotkey, score in cycle_scores.items():
+            # Only carve from the miner pool: burn slots and the funding wallet's own
+            # entry are left untouched.
+            if hotkey in burn_scores or hotkey == funding.hotkey:
+                continue
+            cut = score * share
+            cycle_scores[hotkey] = score - cut
+            referral_total += cut
+
+        if referral_total <= 0:
+            return
+
+        cycle_scores[funding.hotkey] = cycle_scores.get(funding.hotkey, 0.0) + referral_total
+        logger.info(
+            _m(
+                "Referral emission carve-out applied",
+                extra={
+                    "referral_uid": settings.REFERRAL_EMISSION_UID,
+                    "referral_hotkey": funding.hotkey,
+                    "referral_share": share,
+                    "referral_total": referral_total,
+                    "pool": "referral",
+                },
+            )
+        )
