@@ -102,6 +102,9 @@ class Settings(BaseSettings):
     INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8000)
     BLOCKS_FOR_JOB: int = 75  # 15 minutes
     JOB_TIME_OUT: int = 60 * 15  # 15 minutes
+    FORCED_VALIDATION_INTERNAL_TOKEN: str | None = Field(
+        env="FORCED_VALIDATION_INTERNAL_TOKEN", default=None
+    )
 
     REDIS_HOST: str = Field(env="REDIS_HOST", default="localhost")
     REDIS_PORT: int = Field(env="REDIS_PORT", default=6379)

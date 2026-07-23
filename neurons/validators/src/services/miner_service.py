@@ -6,10 +6,9 @@ import time
 from typing import Annotated
 
 import aiohttp
-from asyncssh import SSHKey
 import asyncssh
 import bittensor
-from clients.miner_client import MinerClient
+from asyncssh import SSHKey
 from datura.requests.miner_requests import (
     AcceptJobRequest,
     AcceptSSHKeyRequest,
@@ -28,7 +27,6 @@ from datura.requests.validator_requests import (
     ssh_pubkey_signing_blob,
 )
 from fastapi import Depends
-from clients.validator_portal_api import ValidatorPortalAPI
 from payload_models.payloads import (
     BackupContainerRequest,
     RestoreContainerRequest,
@@ -55,6 +53,8 @@ from payload_models.payloads import (
 )
 from tenacity import RetryError
 
+from clients.miner_client import MinerClient
+from clients.validator_portal_api import ValidatorPortalAPI
 from core.config import settings
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -687,6 +687,129 @@ class MinerService:
             "miner_coldkey": payload.miner_coldkey,
             "results": [job_result],
         }
+
+    async def request_single_executor_validation(
+        self,
+        payload: MinerJobRequestPayload,
+        encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
+        executor_id: str,
+    ) -> JobResult:
+        if settings.USE_REST_API:
+            return await self._request_single_executor_validation_via_rest(
+                payload,
+                encrypted_files,
+                rented_data,
+                executor_id,
+            )
+        return await self._request_single_executor_validation_via_websocket(
+            payload,
+            encrypted_files,
+            rented_data,
+            executor_id,
+        )
+
+    @staticmethod
+    def _get_single_matching_executor(
+        executors: list[ExecutorSSHInfo],
+        executor_id: str,
+    ) -> ExecutorSSHInfo:
+        matches = [executor for executor in executors if executor.uuid == executor_id]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Miner returned {len(matches)} executors matching {executor_id}"
+            )
+        return matches[0]
+
+    async def _request_single_executor_validation_via_websocket(
+        self,
+        payload: MinerJobRequestPayload,
+        encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
+        executor_id: str,
+    ) -> JobResult:
+        loop = asyncio.get_event_loop()
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        default_extra = {
+            "job_batch_id": payload.job_batch_id,
+            "miner_hotkey": payload.miner_hotkey,
+            "miner_address": payload.miner_address,
+            "miner_port": payload.miner_port,
+            "executor_id": executor_id,
+        }
+
+        miner_client = MinerClient(
+            loop=loop,
+            miner_address=payload.miner_address,
+            miner_port=payload.miner_port,
+            miner_hotkey=payload.miner_hotkey,
+            my_hotkey=my_key.ss58_address,
+            keypair=my_key,
+            miner_url=f"ws://{payload.miner_address}:{payload.miner_port}/websocket/{my_key.ss58_address}",
+        )
+
+        private_key = None
+        public_key = None
+        async with miner_client:
+            try:
+                private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+                await miner_client.send_model(
+                    SSHPubKeySubmitRequest(
+                        public_key=public_key,
+                        validator_signature=self._sign_validator_pubkey(my_key, public_key),
+                        executor_id=executor_id,
+                        miner_hotkey=payload.miner_hotkey,
+                    )
+                )
+
+                msg = await asyncio.wait_for(
+                    miner_client.job_state.miner_accepted_ssh_key_or_failed_future,
+                    timeout=JOB_LENGTH,
+                )
+                if isinstance(msg, FailedRequest):
+                    raise RuntimeError(
+                        f"Miner returned FailedRequest: {msg.details or 'unknown reason'}"
+                    )
+                if not isinstance(msg, AcceptSSHKeyRequest):
+                    raise RuntimeError(f"Unexpected response from miner: {msg}")
+
+                executor = self._get_single_matching_executor(msg.executors, executor_id)
+                return await asyncio.wait_for(
+                    self.task_service.create_task(
+                        miner_info=payload,
+                        executor_info=executor,
+                        keypair=my_key,
+                        private_key=private_key.decode("utf-8"),
+                        public_key=public_key.decode("utf-8"),
+                        encrypted_files=encrypted_files,
+                        rented_data=rented_data,
+                        # forced validation has no per-cycle digest snapshot; empty is the
+                        # fail-open value that skips the digest check (never penalizes).
+                        default_docker_image_digests={},
+                    ),
+                    timeout=settings.JOB_TIME_OUT - 120,
+                )
+            finally:
+                if public_key is not None:
+                    try:
+                        await miner_client.send_model(
+                            SSHPubKeyRemoveRequest(
+                                public_key=public_key,
+                                validator_signature=self._sign_validator_pubkey(my_key, public_key),
+                                executor_id=executor_id,
+                                miner_hotkey=payload.miner_hotkey,
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            _m(
+                                "Failed to remove SSH key after forced validation",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "error": _get_error_details(e),
+                                }),
+                            ),
+                        )
 
     async def publish_machine_specs(
         self, results: list[JobResult], miner_hotkey: str, miner_coldkey: str
@@ -1682,6 +1805,83 @@ class MinerService:
         # Use model_dump_json and parse back to ensure proper serialization
         # This handles bytes fields correctly (base64 encoding)
         return json.loads(request.model_dump_json())
+
+    async def _request_single_executor_validation_via_rest(
+        self,
+        payload: MinerJobRequestPayload,
+        encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
+        executor_id: str,
+    ) -> JobResult:
+        my_key: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+        default_extra = {
+            "job_batch_id": payload.job_batch_id,
+            "miner_hotkey": payload.miner_hotkey,
+            "miner_address": payload.miner_address,
+            "miner_port": payload.miner_port,
+            "executor_id": executor_id,
+        }
+        base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+        private_key = None
+        public_key = None
+
+        try:
+            private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
+            ssh_request = SSHPubKeySubmitRequest(
+                public_key=public_key,
+                validator_signature=self._sign_validator_pubkey(my_key, public_key),
+                executor_id=executor_id,
+                miner_hotkey=payload.miner_hotkey,
+            )
+            headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
+            headers["Content-Type"] = "application/json"
+
+            status, response_data = await self._make_rest_request(
+                method="POST",
+                url=f"{base_url}/api/validator/ssh-pubkey-submit",
+                json_data=self._serialize_request(ssh_request),
+                headers=headers,
+                timeout=REST_SSH_SUBMIT_TIMEOUT,
+                log_extra=default_extra,
+                operation_name="Forced validation SSH key submit",
+            )
+            if status != 200 or response_data is None:
+                raise RuntimeError("Failed to submit SSH key to miner via REST API")
+
+            msg = _parse_miner_response(response_data)
+            if isinstance(msg, FailedRequest):
+                raise RuntimeError(
+                    f"Miner returned FailedRequest: {msg.details or 'unknown reason'}"
+                )
+            if not isinstance(msg, AcceptSSHKeyRequest):
+                raise RuntimeError(f"Unexpected response from miner: {msg}")
+
+            executor = self._get_single_matching_executor(msg.executors, executor_id)
+            return await asyncio.wait_for(
+                self.task_service.create_task(
+                    miner_info=payload,
+                    executor_info=executor,
+                    keypair=my_key,
+                    private_key=private_key.decode("utf-8"),
+                    public_key=public_key.decode("utf-8"),
+                    encrypted_files=encrypted_files,
+                    rented_data=rented_data,
+                    # forced validation has no per-cycle digest snapshot; empty is the
+                    # fail-open value that skips the digest check (never penalizes).
+                    default_docker_image_digests={},
+                ),
+                timeout=settings.JOB_TIME_OUT - 120,
+            )
+        finally:
+            if public_key is not None:
+                await self._remove_ssh_key_via_rest(
+                    base_url=base_url,
+                    my_key=my_key,
+                    public_key=public_key,
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=executor_id,
+                    log_extra=default_extra,
+                )
 
     async def _request_job_to_miner(
         self,

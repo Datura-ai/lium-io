@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Annotated
 
@@ -41,6 +42,8 @@ class TaskService:
         self.redis_service = redis_service
         self.attestation_service = attestation_service
         self.wallet = settings.get_bittensor_wallet()
+        self._active_validation_tasks_lock = asyncio.Lock()
+        self._active_validation_tasks: dict[str, asyncio.Task[JobResult]] = {}
 
         # Initialize pipeline factory with all required services
         self.pipeline_factory = PipelineFactory(
@@ -54,6 +57,63 @@ class TaskService:
         )
 
     async def create_task(
+        self,
+        miner_info: MinerJobRequestPayload,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+        public_key: str,
+        encrypted_files: MinerJobEnryptedFiles,
+        rented_data: RentedExecutorsResponse,
+        default_docker_image_digests: dict[str, str],
+        attestation_nonce: AttestationNonce | None = None,
+    ):
+        executor_id = executor_info.uuid
+
+        async with self._active_validation_tasks_lock:
+            task = self._active_validation_tasks.get(executor_id)
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    self._create_task_impl(
+                        miner_info=miner_info,
+                        executor_info=executor_info,
+                        keypair=keypair,
+                        private_key=private_key,
+                        public_key=public_key,
+                        encrypted_files=encrypted_files,
+                        rented_data=rented_data,
+                        default_docker_image_digests=default_docker_image_digests,
+                        attestation_nonce=attestation_nonce,
+                    )
+                )
+                self._active_validation_tasks[executor_id] = task
+            else:
+                # If a validation task was already started for this executor, join it
+                # instead of starting a competing pipeline.
+                logger.info(
+                    _m(
+                        "Joining active validation task",
+                        extra=get_extra_info({
+                            "job_batch_id": miner_info.job_batch_id,
+                            "miner_hotkey": miner_info.miner_hotkey,
+                            "executor_uuid": executor_id,
+                        }),
+                    ),
+                )
+
+        try:
+            return await task
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise RuntimeError("Validation task was cancelled") from exc
+            raise
+        finally:
+            if task.done():
+                async with self._active_validation_tasks_lock:
+                    if self._active_validation_tasks.get(executor_id) is task:
+                        self._active_validation_tasks.pop(executor_id, None)
+
+    async def _create_task_impl(
         self,
         miner_info: MinerJobRequestPayload,
         executor_info: ExecutorSSHInfo,

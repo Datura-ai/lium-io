@@ -23,6 +23,7 @@ from services.executor_connectivity.port_tester import PortTester
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
+from services.forced_validation import ForceValidationRequestStore, ForceValidationService
 from services.matrix_validation_service import ValidationService
 from services.miner_service import MinerService
 from services.redis_service import GPU_ESTIMATES_CHANNEL, PENDING_PODS_PREFIX, RedisService
@@ -107,6 +108,13 @@ class Validator:
             task_service=task_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+        )
+        self.force_validation_service = ForceValidationService(
+            store=ForceValidationRequestStore(self.redis_service),
+            miner_service=self.miner_service,
+            subtensor_client=self.subtensor_client,
+            backend_client=self.backend_client,
+            file_encrypt_service=self.file_encrypt_service,
         )
 
         # init miner_scores: always load from Redis if present so accumulated
