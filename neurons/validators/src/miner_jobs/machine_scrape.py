@@ -994,6 +994,10 @@ def get_machine_specs():
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
                     "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_total / (1024 ** 2),  # in MB
+                    # Bytes of VRAM actually resident. Distinct from gpu.memory_utilization below, which
+                    # is NVML's memory-BUS duty cycle (percent of time memory was read/written) and drops
+                    # to 0 on a loaded-but-idle worker.
+                    "gpu.memory_used_mb": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_used / (1024 ** 2),  # in MB
                     "gpu.cuda": f"{major}.{minor}",
                     "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
                     "gpu.power_default_limit": safeNvmlValue(
