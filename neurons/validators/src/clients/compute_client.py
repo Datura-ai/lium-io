@@ -262,6 +262,7 @@ class ComputeClient:
         validator_hotkey = self.my_hotkey()
 
         while True:
+            pubsub = None
             try:
                 pubsub = await self.miner_service.redis_service.subscribe(
                     MACHINE_SPEC_CHANNEL,
@@ -398,6 +399,14 @@ class ComputeClient:
                         }),
                     )
                 )
+            finally:
+                # The connection goes back to the (bounded) pubsub pool only on aclose(); without
+                # this every reconnect round leaked one, and the pool would drain within the hour.
+                if pubsub is not None:
+                    try:
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
 
             await asyncio.sleep(1)
 
