@@ -19,7 +19,12 @@ def docker_service() -> DockerService:
     )
 
 
-def _make_payload(*, workload_kind: WorkloadKind, cache_volumes: list[CacheVolume] | None) -> ContainerCreateRequest:
+def _make_payload(
+    *,
+    workload_kind: WorkloadKind,
+    cache_volumes: list[CacheVolume] | None,
+    active_container_names: list[str] | None = None,
+) -> ContainerCreateRequest:
     return ContainerCreateRequest(
         miner_hotkey="hk",
         executor_id="ex",
@@ -28,6 +33,7 @@ def _make_payload(*, workload_kind: WorkloadKind, cache_volumes: list[CacheVolum
         gpu_uuids=["g0"],
         workload_kind=workload_kind,
         cache_volumes=cache_volumes,
+        active_container_names=active_container_names or [],
     )
 
 
@@ -211,15 +217,17 @@ async def test_sweep_keeps_the_current_cache_and_unrelated_volumes(docker_servic
 
 
 @pytest.mark.asyncio
-async def test_sweep_removes_every_cache_when_the_node_gets_no_cache(docker_service):
-    # A node too disk-tight to keep its rental listing gets cache_volumes=None — its existing cache
-    # must be reclaimed rather than left occupying the disk that pushed it under the floor.
+async def test_sweep_leaves_the_cache_alone_when_no_cache_is_requested(docker_service):
+    # A node denied the cache (too little free disk) must NOT have its existing cache deleted here:
+    # its free disk is low BECAUSE the cache is downloaded, so deleting would raise free disk, the
+    # next cycle would grant the cache again, and the node would re-download ~37 GB forever.
+    # Reclaiming belongs to the rental/disk-pressure path.
     ssh_client = FakeSshClient(["dphn_cache_hf_old", "dphn_cache_dp_old", "volume_pod"])
     payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=None)
 
     await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
 
-    assert _removed_volumes(ssh_client) == ["dphn_cache_dp_old", "dphn_cache_hf_old"]
+    assert ssh_client.commands == []
 
 
 @pytest.mark.asyncio
@@ -247,3 +255,19 @@ async def test_rented_pod_cache_failure_does_not_fail_the_create(docker_service)
     )
 
     docker_service.redis_service.add_rented_pod.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sweep_is_skipped_while_a_live_filler_sibling_holds_the_cache(docker_service):
+    # Docker cannot remove a volume a sibling still mounts, so listing volumes there is a guaranteed
+    # no-op — skipping it keeps an extra SSH exec off every bundle create while a node fills.
+    ssh_client = FakeSshClient(["dphn_cache_hf_old", "dphn_cache_hf_new"])
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="dphn_cache_hf_new", target="/root/.cache")],
+        active_container_names=["filler_sibling"],
+    )
+
+    await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
+
+    assert ssh_client.commands == []
