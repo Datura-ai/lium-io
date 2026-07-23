@@ -16,9 +16,13 @@ GB = 1024**3
 
 
 class FakeSshClient:
-    def __init__(self, containers: list[str], volumes: list[str], free_gb: float):
+    """`docker volume rm` ends in `|| true`, so exit status says nothing about what was removed —
+    the fake must model the host's actual volume list, not just echo success."""
+
+    def __init__(self, containers: list[str], volumes: list[str], free_gb: float, refuses: set[str] | None = None):
         self._containers = "\n".join(containers)
-        self._volumes = "\n".join(volumes)
+        self._volumes = list(volumes)
+        self._refuses = refuses or set()
         self._free_bytes = str(int(free_gb * GB))
         self.commands: list[str] = []
 
@@ -26,8 +30,14 @@ class FakeSshClient:
         self.commands.append(command)
         if "df -B1" in command:
             stdout = self._free_bytes
+        elif "volume rm" in command:
+            # dockerd refuses a volume referenced by any container, in any state.
+            for name in _removal_targets(command):
+                if name not in self._refuses and name in self._volumes:
+                    self._volumes.remove(name)
+            stdout = ""
         elif "volume ls" in command:
-            stdout = self._volumes
+            stdout = "\n".join(self._volumes)
         elif "docker ps" in command:
             # Only `docker ps` without -a lists RUNNING containers; the reclaim guard uses that one.
             stdout = "" if "-a" in command else self._containers
@@ -36,11 +46,13 @@ class FakeSshClient:
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
 
 
+def _removal_targets(command: str) -> list[str]:
+    return command.split("volume rm ", 1)[1].split(" 2>/dev/null")[0].split()
+
+
 def _removed(ssh_client: FakeSshClient) -> list[str]:
     removals = [c for c in ssh_client.commands if "volume rm" in c]
-    if not removals:
-        return []
-    return sorted(removals[0].split("volume rm ", 1)[1].split(" 2>/dev/null")[0].split())
+    return sorted(_removal_targets(removals[0])) if removals else []
 
 
 @pytest.fixture
@@ -95,6 +107,29 @@ async def test_dry_run_reports_without_removing(cleanup):
 
     assert await dry.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
     assert _removed(ssh_client) == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_removal_is_never_reported_as_reclaimed(cleanup):
+    # `|| true` swallows dockerd's refusal, so counting the volumes we ASKED to remove reports a
+    # rescue that never happened — and the node stays delisted while telemetry says it was saved.
+    ssh_client = FakeSshClient(
+        containers=[], volumes=["dphn_cache_hf_x"], free_gb=10, refuses={"dphn_cache_hf_x"}
+    )
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
+
+
+@pytest.mark.asyncio
+async def test_only_the_volumes_that_actually_went_away_are_counted(cleanup):
+    ssh_client = FakeSshClient(
+        containers=[],
+        volumes=["dphn_cache_hf_x", "dphn_cache_dp_x"],
+        free_gb=10,
+        refuses={"dphn_cache_dp_x"},
+    )
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
 
 
 @pytest.mark.asyncio

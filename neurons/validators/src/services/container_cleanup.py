@@ -211,14 +211,28 @@ class ContainerCleanup:
                 return 0
 
             await ssh_client.run(DockerCommand.volume_remove(*cache_volumes))
+            # `volume_remove` ends in `|| true`, so its exit status cannot tell a removal from a
+            # refusal — and dockerd refuses any volume a container still references, in ANY state.
+            # Re-list instead: reporting a rescue that did not happen leaves the node delisted while
+            # the check event says it was saved.
+            surviving: set[str] = set(await self._get_dphn_cache_volumes(ssh_client))
+            reclaimed: list[str] = [name for name in cache_volumes if name not in surviving]
+            if not reclaimed:
+                logger.warning(
+                    _m(
+                        "DPHN cache reclaim removed nothing; dockerd still holds the volumes",
+                        extra=extra | {"volumes": cache_volumes, "free_gb": free_gb},
+                    )
+                )
+                return 0
             logger.info(
                 _m(
-                    f"Reclaimed {len(cache_volumes)} DPHN cache volume(s) to get the node back over "
+                    f"Reclaimed {len(reclaimed)} DPHN cache volume(s) to get the node back over "
                     "the rental listing floor",
-                    extra=extra | {"volumes": cache_volumes, "free_gb": free_gb},
+                    extra=extra | {"volumes": reclaimed, "kept_volumes": sorted(surviving), "free_gb": free_gb},
                 )
             )
-            return len(cache_volumes)
+            return len(reclaimed)
         except Exception as e:
             logger.warning(_m("DPHN cache reclaim failed", extra=extra | {"error": str(e)}))
             return 0
