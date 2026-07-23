@@ -28,8 +28,9 @@ class FakeSshClient:
             stdout = self._free_bytes
         elif "volume ls" in command:
             stdout = self._volumes
-        elif "ps -a" in command or "docker ps" in command:
-            stdout = self._containers
+        elif "docker ps" in command:
+            # Only `docker ps` without -a lists RUNNING containers; the reclaim guard uses that one.
+            stdout = "" if "-a" in command else self._containers
         else:
             stdout = ""
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
@@ -94,3 +95,14 @@ async def test_dry_run_reports_without_removing(cleanup):
 
     assert await dry.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
     assert _removed(ssh_client) == []
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_filler_does_not_block_the_reclaim(cleanup):
+    # `docker ps -a` would list a long-exited filler_* forever and wedge the guard; the check must
+    # look at RUNNING containers only.
+    ssh_client = FakeSshClient(containers=[], volumes=["dphn_cache_hf_x"], free_gb=10)
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
+    assert _removed(ssh_client) == ["dphn_cache_hf_x"]
+    assert not any("ps -a" in c for c in ssh_client.commands), "guard must not use `docker ps -a`"
