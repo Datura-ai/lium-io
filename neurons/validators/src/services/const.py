@@ -224,6 +224,10 @@ PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 2
 
 POD_CONTAINER_PREFIX = "pod_"
 FILLER_CONTAINER_PREFIX = "filler_"
+# DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
+# name with the model + runtime version baked in; the validator only needs the prefix, to recognise
+# which volumes belong to the cache when sweeping or reclaiming them.
+DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.

@@ -55,6 +55,7 @@ from payload_models.payloads import (
 )
 from services.attestation_service import AttestationError, AttestationService
 from services.const import (
+    DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
     MIN_PORT_COUNT,
@@ -160,10 +161,9 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 _VLOOPBACK_REPAIR_IMAGE = "docker.io/library/alpine:3.19"
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-# DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
-# name with the model + runtime version baked in; the validator only needs the prefix, to recognise
-# which volumes belong to the cache when sweeping the ones the current create no longer asks for.
-DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
+# DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
+# has to go. Covers the image layers and scratch the pod needs beyond its own volume.
+RENTAL_DISK_HEADROOM_GB = 20
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
@@ -1514,6 +1514,64 @@ class DockerService:
                         "pod_id": pod_id,
                         "error": str(exc),
                     }),
+                ),
+                exc_info=True,
+            )
+
+    async def reclaim_dphn_cache_for_rental(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+    ) -> None:
+        """Free the DPHN filler cache when a customer rental needs the disk it occupies.
+
+        DAH-2475: the cache is filler property worth ~37 GB. Once a customer rents the node the disk
+        belongs to the renter, so if what they asked for does not fit next to the cache, the cache
+        goes — reclaiming here rather than at filler-stop is what stops the node re-downloading it
+        every cycle (see sweep_stale_cache_volumes). Runs before volume sizing so the freed space is
+        already visible when the pod's volume is measured and created.
+
+        Only for CUSTOMER_RENTAL, only when the rental actually needs the room, and best-effort — a
+        failure here must never break the rent.
+        """
+        if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+            return
+        requested_gb: int | None = payload.volume_limit_gb
+        if not requested_gb:
+            return
+        try:
+            cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(ssh_client, set(), default_extra)
+            if not cache_volumes:
+                return
+
+            docker_root_dir = await self.get_docker_root_dir(ssh_client)
+            free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+            free_gb = free_bytes / (1024**3)
+            if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
+                return
+
+            logger.info(
+                _m(
+                    "Reclaiming DPHN cache volumes so the rental's volume fits",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "volumes": cache_volumes,
+                        "free_gb": round(free_gb, 1),
+                        "requested_gb": requested_gb,
+                    }),
+                )
+            )
+            await retry_ssh_command(
+                ssh_client, DockerCommand.volume_remove(*cache_volumes), "reclaim_dphn_cache_for_rental"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "DPHN cache reclaim for rental failed; continuing with the rent",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
                 ),
                 exc_info=True,
             )
@@ -3471,6 +3529,12 @@ class DockerService:
                 )
 
                 await self.sweep_stale_cache_volumes(
+                    ssh_client=ssh_client,
+                    payload=payload,
+                    default_extra=default_extra,
+                )
+
+                await self.reclaim_dphn_cache_for_rental(
                     ssh_client=ssh_client,
                     payload=payload,
                     default_extra=default_extra,

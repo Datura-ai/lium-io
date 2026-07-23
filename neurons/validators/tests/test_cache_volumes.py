@@ -271,3 +271,46 @@ async def test_sweep_is_skipped_while_a_live_filler_sibling_holds_the_cache(dock
     await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
 
     assert ssh_client.commands == []
+
+
+# ---------------------------------------------------------------- reclaim (levels 2 and 3)
+
+
+@pytest.mark.asyncio
+async def test_rental_reclaims_the_cache_when_the_requested_volume_does_not_fit(docker_service, monkeypatch):
+    # The disk belongs to the renter: if what they asked for does not fit next to the ~37GB filler
+    # cache, the cache goes. Reclaiming HERE (not at filler stop) is what stops the re-download loop.
+    ssh_client = FakeSshClient(["dphn_cache_hf_x", "dphn_cache_dp_x", "volume_pod"])
+    monkeypatch.setattr(docker_service, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
+    monkeypatch.setattr(docker_service, "_get_fs_available_bytes", AsyncMock(return_value=50 * 1024**3))
+    payload = _make_payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL, cache_volumes=None)
+    payload.volume_limit_gb = 100
+
+    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, payload, {})
+
+    assert _removed_volumes(ssh_client) == ["dphn_cache_dp_x", "dphn_cache_hf_x"]
+
+
+@pytest.mark.asyncio
+async def test_rental_keeps_the_cache_when_the_volume_already_fits(docker_service, monkeypatch):
+    ssh_client = FakeSshClient(["dphn_cache_hf_x", "volume_pod"])
+    monkeypatch.setattr(docker_service, "get_docker_root_dir", AsyncMock(return_value="/var/lib/docker"))
+    monkeypatch.setattr(docker_service, "_get_fs_available_bytes", AsyncMock(return_value=900 * 1024**3))
+    payload = _make_payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL, cache_volumes=None)
+    payload.volume_limit_gb = 100
+
+    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, payload, {})
+
+    assert _removed_volumes(ssh_client) == []
+
+
+@pytest.mark.asyncio
+async def test_filler_create_never_triggers_the_rental_reclaim(docker_service):
+    # A filler create must not reclaim its own cache — that is the thrash loop we designed out.
+    ssh_client = FakeSshClient(["dphn_cache_hf_x"])
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=None)
+    payload.volume_limit_gb = 100
+
+    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, payload, {})
+
+    assert ssh_client.commands == []
