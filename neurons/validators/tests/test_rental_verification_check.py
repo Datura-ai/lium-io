@@ -435,6 +435,7 @@ class FillerSSHClient:
         exit_status: int = 0,
         raise_on_run: BaseException | None = None,
         dead_containers: set[str] | None = None,
+        unreachable_containers: set[str] | None = None,
     ):
         self.running = running
         self.exit_status = exit_status
@@ -442,12 +443,16 @@ class FillerSSHClient:
         # Per-container control for GPU-split nodes: these answer the probe as gone while the rest
         # of the node's containers answer as alive.
         self.dead_containers = dead_containers or set()
+        # Per-container SSH failure, so one bundle can be unreachable while another is a real kill.
+        self.unreachable_containers = unreachable_containers or set()
         self.commands: list[str] = []
 
     async def run(self, command: str) -> Mock:
         self.commands.append(command)
         if self.raise_on_run is not None:
             raise self.raise_on_run
+        if any(container in command for container in self.unreachable_containers):
+            raise asyncssh.Error(code=1, reason="transport lost")
         result = Mock()
         result.exit_status = self.exit_status
         probed_container_is_dead = any(container in command for container in self.dead_containers)
@@ -784,3 +789,42 @@ async def test_filler_liveness_dead_sibling_decides_the_node_under_enforcement()
     reason_codes = [entry["reason_code"] for entry in result.event.what_we_saw["checked_containers"]]
     assert reason_codes[0] == Msg.FILLER_VERIFIED.reason
     assert reason_codes[1] != Msg.FILLER_VERIFIED.reason
+
+
+@pytest.mark.asyncio
+async def test_killed_bundle_decides_even_when_a_healthy_sibling_comes_last():
+    """Shadow: every verdict passes, so a positional pick would emit the healthy sibling's event
+    and the kill would never surface — the node must be judged by its worst container."""
+    backend_client = _killed_filler_backend()
+    # A is removed, B is alive and LAST in the list.
+    ssh_client = FillerSSHClient(dead_containers={_BUNDLE_A})
+    ctx = _filler_context(
+        backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
+    )
+
+    result = await _run_filler_check(ctx, enforcement=False)
+
+    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+    assert result.event.what_we_saw["filler_container"] == _BUNDLE_A
+    assert result.passed is True  # shadow never withholds incentive
+
+
+@pytest.mark.asyncio
+async def test_unreachable_bundle_does_not_mask_a_kill_behind_it():
+    """Enforcement: an SSH failure on an earlier bundle must not decide the node while a real kill
+    sits behind it — otherwise the node is penalised under the wrong reason and the kill is lost."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(unreachable_containers={_BUNDLE_A}, dead_containers={_BUNDLE_B})
+    ctx = _filler_context(
+        backend_client=backend_client, ssh_client=ssh_client, filler_containers=[_BUNDLE_A, _BUNDLE_B]
+    )
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+    assert result.event.what_we_saw["filler_container"] == _BUNDLE_B
+    assert result.passed is False
+    assert [entry["reason_code"] for entry in result.event.what_we_saw["checked_containers"]] == [
+        Msg.FILLER_TRANSPORT_UNREACHABLE.reason,
+        Msg.FILLER_KILLED.reason,
+    ]

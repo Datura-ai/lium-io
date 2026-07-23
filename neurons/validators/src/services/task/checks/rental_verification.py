@@ -15,6 +15,17 @@ from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
+# How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
+# bundle but the pipeline emits a single event, so the node must be judged by its worst container:
+# a confirmed kill outranks an indeterminate probe, which outranks a healthy one. Anything
+# unlisted sorts as healthy.
+_FILLER_VERDICT_SEVERITY: dict[str, int] = {
+    Msg.FILLER_KILLED.reason: 3,
+    Msg.FILLER_TRANSPORT_UNREACHABLE.reason: 2,
+    Msg.FILLER_STATE_UNKNOWN.reason: 1,
+    Msg.FILLER_VERIFIED.reason: 0,
+}
+
 
 class RentalVerificationCheck:
     """Verify executor rental status via backend API health check.
@@ -235,18 +246,20 @@ class RentalVerificationCheck:
 
         Every container is probed independently, so a removed bundle is reported to the backend
         (container_missing=true, feeding the DAH-2471 reconciliation) even while its siblings run
-        fine. A check may return only one result, so the decisive verdict wins: the first container
-        whose outcome withholds incentive fails the whole node, otherwise the last verdict stands.
-        Each container's reason code is listed on the returned event, so one log line covers the
-        whole node instead of hiding the siblings.
+        fine. A check may return only one result, so the node's verdict is its WORST container by
+        _FILLER_VERDICT_SEVERITY. Picking positionally would let a healthy or unreachable sibling
+        hide a kill: in shadow every verdict passes, so a killed non-last bundle would emit no
+        FILLER_KILLED at all, and under enforcement an early SSH failure would decide the node
+        while a real kill behind it went unlogged. Each container's reason code is also listed on
+        the returned event, so one log line still covers the whole node.
         """
         verdicts: list[tuple[str, CheckResult]] = [
             (filler_container, await self._verify_filler_alive(ctx, filler_container, enforce=enforce))
             for filler_container in filler_containers
         ]
-        decisive: CheckResult = next(
-            (verdict for _, verdict in verdicts if not verdict.passed), verdicts[-1][1]
-        )
+        decisive: CheckResult = max(
+            verdicts, key=lambda verdict: _FILLER_VERDICT_SEVERITY.get(verdict[1].event.reason_code, 0)
+        )[1]
         decisive.event.what_we_saw["checked_containers"] = [
             {"filler_container": filler_container, "reason_code": verdict.event.reason_code}
             for filler_container, verdict in verdicts
