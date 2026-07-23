@@ -1,5 +1,6 @@
 import logging
 
+from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import PortPair, PortProbeResult
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier
 
@@ -23,20 +24,26 @@ class PortProbe:
         *,
         ssh_client,
         host: str,
+        log_ctx: dict | None = None,
     ) -> PortProbeResult:
+        log_ctx = log_ctx or {}
         successful, failed = await self.batch_verifier.verify(
             ports,
             ssh_client=ssh_client,
             host=host,
+            log_ctx=log_ctx,
         )
 
         if not successful:
-            logger.warning("batch verification failed, trying fallback")
+            logger.warning(
+                _m("batch verification failed, trying fallback", extra=get_extra_info(log_ctx))
+            )
             successful, failed = await self.fallback_verifier.verify(
                 ports,
                 ssh_client=ssh_client,
                 host=host,
                 max_ports=10,
+                log_ctx=log_ctx,
             )
 
         return PortProbeResult(tuple(successful), tuple(failed))

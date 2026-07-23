@@ -31,8 +31,10 @@ class ExecutorConnectivityService:
         sysbox_runtime: bool = False,
         rented_ports: list[int] | None = None,
         rented_pod_names: list[str] | None = None,
+        log_ctx: dict | None = None,
     ) -> PortVerificationResult:
         """Verify executor port connectivity and DinD capability."""
+        log_ctx = log_ctx or {}
         t1 = time.monotonic()
         try:
             # Cleanup removed - test containers are ephemeral and short-lived anyway
@@ -42,6 +44,7 @@ class ExecutorConnectivityService:
                 miner_hotkey=miner_hotkey,
                 sysbox_runtime=sysbox_runtime,
                 rented_ports=rented_ports,
+                log_ctx=log_ctx,
             )
             sysbox_result = verification.sysbox_runtime
             if not sysbox_result and rented_ports and sysbox_runtime:
@@ -49,8 +52,7 @@ class ExecutorConnectivityService:
                     _m(
                         "Sysbox runtime fallback: using known value for rented executor",
                         extra=get_extra_info({
-                            "executor_uuid": executor_info.uuid,
-                            "executor_ip": executor_info.address,
+                            **log_ctx,
                             "miner_hotkey": miner_hotkey,
                             "rented_ports": rented_ports,
                             "verification_sysbox": verification.sysbox_runtime,
@@ -75,9 +77,13 @@ class ExecutorConnectivityService:
             return result
         except Exception as e:
             logger.error(
-                "verification failed: %s executor=%s",
-                str(e),
-                executor_info.address,
+                _m(
+                    "verification failed",
+                    extra=get_extra_info({
+                        **log_ctx,
+                        "error": str(e),
+                    }),
+                ),
                 exc_info=True,
             )
             return PortVerificationResult(
