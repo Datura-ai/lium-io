@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 from typing import Any, Dict
+import uuid
 
 from ..messages import StartGpuMonitorMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
 class StartGPUMonitorCheck:
-    """Ensure the GPU monitor agent is running so validators receive live telemetry.
+    """Ensure `gpus_utility.py` is running on the executor, where it keeps the Docker template
+    images synced and pruned.
 
-    This mirrors legacy logic that boots `gpus_utility.py` on the executor. Without it we
-    lose visibility into runtime utilisation, so the remainder of the pipeline may produce
-    misleading scores when GPUs are already busy.
+    The name is historical: the script also used to push GPU telemetry to the backend, but that
+    path was disabled on both ends long ago and deleted in DAH-2419. Runtime GPU utilisation now
+    reaches the backend through the machine-spec scrape instead. The metrics-push arguments below
+    are still sent so that executors running an older image (the miner picks the image version)
+    keep starting — the script accepts and ignores them, and they go once the fleet has rolled.
     """
 
     check_id = "prep.start_gpu_monitor"
@@ -21,6 +25,7 @@ class StartGPUMonitorCheck:
         runner = ctx.runner
         executor = ctx.executor
 
+        validator_keypair = ctx.config.validator_keypair
         compute_rest_app_url = ctx.config.compute_rest_app_url
         script_relative_path = ctx.config.gpu_monitor_script_relative
 
@@ -50,7 +55,14 @@ class StartGPUMonitorCheck:
 
         # await runner.run("pip install aiohttp click pynvml psutil", timeout=30, retryable=True)
 
-        command_args: Dict[str, Any] = {"compute_rest_app_url": compute_rest_app_url}
+        program_id = str(uuid.uuid4())
+        command_args: Dict[str, Any] = {
+            "program_id": program_id,
+            "signature": f"0x{validator_keypair.sign(program_id.encode()).hex()}",
+            "executor_id": executor.uuid,
+            "validator_hotkey": validator_keypair.ss58_address,
+            "compute_rest_app_url": compute_rest_app_url,
+        }
 
         args_string = " ".join([f"--{k} {v}" for k, v in command_args.items()])
         start_cmd = (
