@@ -1627,9 +1627,15 @@ class DockerService:
             # every cycle. Reclaiming a cache the node can no longer afford is the rental/disk-pressure
             # path's job, where the decision is made against real free space.
             return
-        if any(name.startswith(FILLER_CONTAINER_PREFIX) for name in payload.active_container_names or []):
-            # A live filler sibling still holds this node's cache and docker cannot remove an in-use
-            # volume, so the listing round-trip could only ever be a no-op here.
+        # A live filler SIBLING holds this node's cache and docker cannot remove an in-use volume, so
+        # the listing round-trip would be a no-op. The run being created is already STARTING in the
+        # backend by the time it builds this request, so its OWN container name is in the list too —
+        # counting it made this guard always true and the sweep never ran (caught on staging).
+        own_container_name: str = f"{FILLER_CONTAINER_PREFIX}{payload.pod_id}"
+        if any(
+            name.startswith(FILLER_CONTAINER_PREFIX) and name != own_container_name
+            for name in payload.active_container_names or []
+        ):
             return
 
         keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
