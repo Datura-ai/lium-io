@@ -988,16 +988,16 @@ def get_machine_specs():
 
             # Get GPU utilization rates
             utilization = nvmlDeviceGetUtilizationRates(handle)
+            memory_info = nvmlDeviceGetMemoryInfo(handle)
 
             data["data_gpu"]["gpu_details"].append(
                 {
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
-                    "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_total / (1024 ** 2),  # in MB
-                    # Bytes of VRAM actually resident. Distinct from gpu.memory_utilization below, which
-                    # is NVML's memory-BUS duty cycle (percent of time memory was read/written) and drops
-                    # to 0 on a loaded-but-idle worker.
-                    "gpu.memory_used_mb": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_used / (1024 ** 2),  # in MB
+                    "gpu.capacity": memory_info.c_nvmlMemory_t_total / (1024 ** 2),  # in MB
+                    # Not interchangeable with gpu.memory_utilization below: that one is NVML's
+                    # memory-BUS duty cycle, which drops to 0 on a loaded-but-idle GPU.
+                    "gpu.memory_used_mb": memory_info.c_nvmlMemory_t_used / (1024 ** 2),  # in MB
                     "gpu.cuda": f"{major}.{minor}",
                     "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
                     "gpu.power_default_limit": safeNvmlValue(

@@ -215,7 +215,23 @@ async def manage_docker_images(
 
 @click.command()
 @click.option("--compute_rest_app_url", prompt="Compute-app Url", help="Compute-app Url")
-def main(compute_rest_app_url: str):
+# Accepted and ignored: validators still pass these for the GPU-metrics push removed in DAH-2419.
+# The executor image version is chosen by the miner, so a validator can be newer or older than the
+# script it launches — click aborts on an unknown option, and the abort is silent because the
+# launcher only backs the command into the background. Drop these once the fleet has rolled.
+@click.option("--program_id", required=False, hidden=True)
+@click.option("--signature", required=False, hidden=True)
+@click.option("--executor_id", required=False, hidden=True)
+@click.option("--validator_hotkey", required=False, hidden=True)
+@click.option("--interval", required=False, hidden=True, type=int)
+def main(
+    compute_rest_app_url: str,
+    program_id: str | None,
+    signature: str | None,
+    executor_id: str | None,
+    validator_hotkey: str | None,
+    interval: int | None,
+):
     asyncio.run(manage_docker_images(compute_rest_app_url))
 
 
