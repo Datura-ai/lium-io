@@ -92,3 +92,63 @@ async def test_semi_batch_returns_empty_when_container_cannot_start(mocker):
     assert failed == ports
     port_tester.test_many.assert_not_called()
     runner.cleanup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_semi_batch_returns_empty_when_run_raises(mocker):
+    ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
+
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(side_effect=ConnectionError("ssh channel closed"))
+    runner.cleanup = mocker.AsyncMock()
+
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock()
+
+    verifier = SemiBatchVerifier(port_tester, runner)
+
+    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert successful == []
+    assert failed == ports
+    port_tester.test_many.assert_not_called()
+    runner.cleanup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_semi_batch_returns_empty_when_test_many_raises(mocker):
+    ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
+
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
+    runner.cleanup = mocker.AsyncMock()
+
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(side_effect=RuntimeError("probe blew up"))
+
+    verifier = SemiBatchVerifier(port_tester, runner)
+
+    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert successful == []
+    assert failed == ports
+    runner.cleanup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_semi_batch_survives_cleanup_failure(mocker):
+    ports = [PortPair(9000, 9000), PortPair(9001, 9001)]
+
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
+    runner.cleanup = mocker.AsyncMock(side_effect=ConnectionError("ssh dropped"))
+
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(return_value=(ports, []))
+
+    verifier = SemiBatchVerifier(port_tester, runner)
+
+    successful, failed = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert successful == ports
+    assert failed == []

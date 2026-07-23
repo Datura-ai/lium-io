@@ -3,6 +3,7 @@ import logging
 import uuid
 
 import aiohttp
+from asyncssh import SSHClientConnection
 
 from core.utils import _m, get_extra_info
 from services.executor_connectivity.container_runner import ContainerRunner
@@ -219,7 +220,7 @@ class SemiBatchVerifier:
         self,
         ports: list[PortPair],
         *,
-        ssh_client,
+        ssh_client: SSHClientConnection,
         host: str,
         max_ports: int = 50,
         log_ctx: dict | None = None,
@@ -240,23 +241,41 @@ class SemiBatchVerifier:
             )
         )
 
-        # short self-kill window: a missed cleanup would otherwise hold every published
-        # port (and its docker-proxy) against the next cycle's verification
-        start_result = await self.runner.run(ssh_client, container_name, script, publish_flags, 20)
-        if not start_result.ok:
-            logger.warning(
-                _m(
-                    f"semi-batch start failed: status={start_result.status} logs={start_result.logs}",
-                    extra=get_extra_info(log_ctx),
+        # any error below must not escape: an exception here would zero the whole
+        # verification (fatal PortCountCheck) instead of falling through to the
+        # sequential fallback tier
+        started = False
+        try:
+            # short self-kill window: a missed cleanup would otherwise hold every published
+            # port (and its docker-proxy) against the next cycle's verification
+            start_result = await self.runner.run(ssh_client, container_name, script, publish_flags, 20)
+            if not start_result.ok:
+                logger.warning(
+                    _m(
+                        f"semi-batch start failed: status={start_result.status} logs={start_result.logs}",
+                        extra=get_extra_info(log_ctx),
+                    )
                 )
+                return [], ports_to_test
+
+            started = True
+            async with aiohttp.ClientSession() as session:
+                successful, failed = await self.port_tester.test_many(session, host, ports_to_test, token)
+
+        except Exception as e:
+            logger.error(
+                _m(f"semi-batch: error: {str(e)[:100]}", extra=get_extra_info(log_ctx))
             )
             return [], ports_to_test
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                successful, failed = await self.port_tester.test_many(session, host, ports_to_test, token)
         finally:
-            await self.runner.cleanup(ssh_client, container_name)
+            if started:
+                try:
+                    await self.runner.cleanup(ssh_client, container_name)
+                except Exception as e:
+                    logger.warning(
+                        _m(f"semi-batch: cleanup failed: {str(e)[:50]}", extra=get_extra_info(log_ctx))
+                    )
 
         logger.info(
             _m(f"semi-batch: {len(successful)}/{len(ports_to_test)} verified", extra=get_extra_info(log_ctx))
