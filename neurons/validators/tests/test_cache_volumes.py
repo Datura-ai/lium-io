@@ -258,6 +258,23 @@ async def test_rented_pod_cache_failure_does_not_fail_the_create(docker_service)
 
 
 @pytest.mark.asyncio
+async def test_sweep_ignores_its_own_container_when_looking_for_siblings(docker_service):
+    # The run being created is already STARTING before the backend builds this request, so its OWN
+    # container name arrives in active_container_names. Counting it made the sibling guard always
+    # true and the sweep never ran on a real node (found on staging 2026-07-23).
+    ssh_client = FakeSshClient(["dphn_cache_hf_old", "dphn_cache_hf_new"])
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="dphn_cache_hf_new", target="/root/.cache")],
+        active_container_names=["filler_pod"],  # == f"filler_{payload.pod_id}"
+    )
+
+    await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
+
+    assert _removed_volumes(ssh_client) == ["dphn_cache_hf_old"]
+
+
+@pytest.mark.asyncio
 async def test_sweep_is_skipped_while_a_live_filler_sibling_holds_the_cache(docker_service):
     # Docker cannot remove a volume a sibling still mounts, so listing volumes there is a guaranteed
     # no-op — skipping it keeps an extra SSH exec off every bundle create while a node fills.
@@ -265,7 +282,7 @@ async def test_sweep_is_skipped_while_a_live_filler_sibling_holds_the_cache(dock
     payload = _make_payload(
         workload_kind=WorkloadKind.FILLER,
         cache_volumes=[CacheVolume(name="dphn_cache_hf_new", target="/root/.cache")],
-        active_container_names=["filler_sibling"],
+        active_container_names=["filler_sibling", "filler_pod"],
     )
 
     await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
