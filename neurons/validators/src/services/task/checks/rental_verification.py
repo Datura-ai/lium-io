@@ -15,6 +15,17 @@ from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
+# How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
+# bundle but the pipeline emits a single event, so the node must be judged by its worst container:
+# a confirmed kill outranks an indeterminate probe, which outranks a healthy one. Anything
+# unlisted sorts as healthy.
+_FILLER_VERDICT_SEVERITY: dict[str, int] = {
+    Msg.FILLER_KILLED.reason: 3,
+    Msg.FILLER_TRANSPORT_UNREACHABLE.reason: 2,
+    Msg.FILLER_STATE_UNKNOWN.reason: 1,
+    Msg.FILLER_VERIFIED.reason: 0,
+}
+
 
 class RentalVerificationCheck:
     """Verify executor rental status via backend API health check.
@@ -53,8 +64,11 @@ class RentalVerificationCheck:
         rented_data = ctx.state.rented_data
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         has_customer_rental = bool(rented_executor and rented_executor.pods)
-        filler_container = rented_data.get_filler_container(ctx.executor.uuid) if rented_data else None
-        if filler_container and not has_customer_rental:
+        # EVERY filler container on the node, not just one: a GPU-split DPHN node runs one filler per
+        # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
+        # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
+        filler_containers: list[str] = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        if filler_containers and not has_customer_rental:
             # ISSUE-050: the backend's word alone is not proof the filler is alive — some hosts
             # remove Lium filler containers while the run stays RUNNING and keep earning
             # unrented incentive. Verify the container on the host, mirroring the customer-pod
@@ -69,13 +83,13 @@ class RentalVerificationCheck:
                     what={
                         "skipped": True,
                         "reason": "active filler runtime",
-                        "filler_container": filler_container,
+                        "filler_containers": filler_containers,
                     },
                 )
                 return CheckResult(passed=True, event=event, updates={})
 
-            return await self._verify_filler_alive(
-                ctx, filler_container, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
+            return await self._verify_every_filler_alive(
+                ctx, filler_containers, enforce=settings.FILLER_LIVENESS_ENFORCEMENT_ENABLED
             )
 
         # Get required info from context
@@ -225,6 +239,33 @@ class RentalVerificationCheck:
                 ctx.ssh, ctx.executor.uuid
             )
 
+    async def _verify_every_filler_alive(
+        self, ctx: Context, filler_containers: list[str], *, enforce: bool
+    ) -> CheckResult:
+        """Verify each of the node's filler containers, one per GPU bundle (DAH-2465).
+
+        Every container is probed independently, so a removed bundle is reported to the backend
+        (container_missing=true, feeding the DAH-2471 reconciliation) even while its siblings run
+        fine. A check may return only one result, so the node's verdict is its WORST container by
+        _FILLER_VERDICT_SEVERITY. Picking positionally would let a healthy or unreachable sibling
+        hide a kill: in shadow every verdict passes, so a killed non-last bundle would emit no
+        FILLER_KILLED at all, and under enforcement an early SSH failure would decide the node
+        while a real kill behind it went unlogged. Each container's reason code is also listed on
+        the returned event, so one log line still covers the whole node.
+        """
+        verdicts: list[tuple[str, CheckResult]] = [
+            (filler_container, await self._verify_filler_alive(ctx, filler_container, enforce=enforce))
+            for filler_container in filler_containers
+        ]
+        decisive: CheckResult = max(
+            verdicts, key=lambda verdict: _FILLER_VERDICT_SEVERITY.get(verdict[1].event.reason_code, 0)
+        )[1]
+        decisive.event.what_we_saw["checked_containers"] = [
+            {"filler_container": filler_container, "reason_code": verdict.event.reason_code}
+            for filler_container, verdict in verdicts
+        ]
+        return decisive
+
     async def _verify_filler_alive(
         self, ctx: Context, filler_container: str, *, enforce: bool
     ) -> CheckResult:
@@ -280,8 +321,11 @@ class RentalVerificationCheck:
         # still starting mid-cycle) — re-check the live run state before penalizing, like the pod
         # flow does with get_pod_rental_active.
         filler_run_id: str = filler_container.removeprefix(FILLER_CONTAINER_PREFIX)
+        # container_missing carries the observation to the backend: this re-check only ever happens
+        # when the container is gone from the host, and the backend uses the accumulated reports to
+        # close zombie RUNNING runs (DAH-2471).
         filler_run: FillerRunActiveResponse | None = await ctx.services.backend.get_filler_run_active(
-            filler_run_id
+            filler_run_id, container_missing=True
         )
 
         if filler_run is None:

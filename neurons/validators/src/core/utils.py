@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from logging.config import dictConfig  # noqa
 from tenacity import retry, stop_after_attempt, wait_fixed
 import asyncssh
@@ -65,6 +66,16 @@ class JSONFormatter(logging.Formatter):
 
 
 logger = logging.getLogger(__name__)
+
+
+def widen_default_thread_pool(loop: asyncio.AbstractEventLoop) -> None:
+    # asyncio sizes its default executor from os.cpu_count(), which in a container reports the node's
+    # cores and ignores the cgroup limit — 8 threads here. DNS resolution and the blocking bittensor
+    # SDK calls share that pool, so it needs headroom. Docker SDK calls have their own pool, see
+    # services/rental_docker_sdk.py.
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=32, thread_name_prefix="asyncio-default")
+    )
 
 
 def wait_for_services_sync(timeout=30):

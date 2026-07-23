@@ -11,6 +11,17 @@ from ..messages import CachedTemplateMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 
+# DAH-2470 — the executor's cache-prefetch loop publishes its own state here, inside the
+# executor container. The validator's shell lands in that same container (run.sh starts
+# sshd there and compose maps ${SSH_PORT}:22 to it), so this is a plain read.
+PREFETCH_STATE_PATH = "/var/lib/lium/cache_prefetch_state.json"
+# The writer caps the document at 4 KB. Read a little more so a document from a newer
+# executor is still parseable, and refuse anything past that rather than bloat the log.
+_PREFETCH_READ_BYTES = 8192
+_PREFETCH_MAX_BYTES = 6144
+# Enough of a bad file to recognise it, not enough to matter in the log.
+_PREFETCH_ERROR_CHARS = 200
+
 
 def _repo_digest(stdout: str | None, repo: str) -> str | None:
     """Bare sha256 of the RepoDigests entry matching ``repo`` ("repo@sha256:…"), or None.
@@ -54,6 +65,10 @@ class CachedTemplateVerificationCheck:
 
     Fails open on every uncertainty (unknown GPU/driver, backend unreachable, empty
     recommendation, SSH error) by recording a skip and leaving score untouched.
+
+    DAH-2470: on the failure path only, the event also carries ``prefetch_state`` — the
+    executor's own record of what its cache-prefetch loop was doing — so the reason a node
+    holds a stale image is readable in Grafana without SSHing anywhere.
     """
 
     check_id = "executor.validate.cached_template"
@@ -61,6 +76,41 @@ class CachedTemplateVerificationCheck:
     # (NOT_CACHED / DIGEST_MISMATCH on/after CACHED_TEMPLATE_CUTOFF) halts the pipeline and the
     # executor scores 0. Every uncertainty still fails open inside run() (passed=True).
     fatal = True
+
+    async def _read_prefetch_state(self, ctx: Context) -> dict:
+        """Read the executor's prefetch-state document (DAH-2470).
+
+        Only ever called on the failure path. Returns a dict either way: every way the
+        read can fall short is reported as a distinguishable ``unavailable`` value,
+        because absence is itself a finding — an executor too old to write the file,
+        a loop that never started, or ``COMPUTE_REST_API_URL`` left unset.
+
+        Never raises, so it can never change ``passed``.
+        """
+        try:
+            result = await ctx.ssh.run(
+                f"head -c {_PREFETCH_READ_BYTES} {shlex.quote(PREFETCH_STATE_PATH)}",
+                check=False,
+            )
+        except Exception as exc:
+            return {"unavailable": "ssh_read_failed", "error": str(exc)[:_PREFETCH_ERROR_CHARS]}
+
+        if getattr(result, "exit_status", 1) != 0:
+            return {"unavailable": "missing"}
+
+        raw = (getattr(result, "stdout", None) or "").strip()
+        if not raw:
+            return {"unavailable": "empty"}
+        if len(raw.encode("utf-8", "replace")) > _PREFETCH_MAX_BYTES:
+            return {"unavailable": "oversized", "bytes": len(raw.encode("utf-8", "replace"))}
+
+        try:
+            state = json.loads(raw)
+        except Exception:
+            return {"unavailable": "unparseable", "raw_prefix": raw[:_PREFETCH_ERROR_CHARS]}
+        if not isinstance(state, dict):
+            return {"unavailable": "unparseable", "raw_prefix": raw[:_PREFETCH_ERROR_CHARS]}
+        return state
 
     async def run(self, ctx: Context) -> CheckResult:
         gpu_model = ctx.state.gpu_model
@@ -159,6 +209,24 @@ class CachedTemplateVerificationCheck:
         after_cutoff = datetime.utcnow() >= settings.CACHED_TEMPLATE_CUTOFF
         should_fail = after_cutoff and template in (Msg.NOT_CACHED, Msg.DIGEST_MISMATCH)
 
+        what = {
+            "recommended_image": image_ref,
+            "cached": cached,
+            "digest_match": digest_match,
+            "backend_digest": backend_digest,
+            "local_digest": local_digest,
+            "gpu_model": gpu_model,
+            "driver_version": driver_version,
+            "after_cutoff": after_cutoff,
+        }
+        # DAH-2470: when we are about to zero this node, also carry what the executor's
+        # own prefetch loop was doing at the time, so a reader can tell a provider-side
+        # cause (registry rate-limits, disk, network) from ours (loop gave up, never
+        # retried). Only on the failure path — a handful of nodes per cycle — so healthy
+        # nodes add neither an SSH round trip nor log volume.
+        if should_fail:
+            what["prefetch_state"] = await self._read_prefetch_state(ctx)
+
         event = render_message(
             template,
             ctx=ctx,
@@ -169,16 +237,7 @@ class CachedTemplateVerificationCheck:
                 if should_fail
                 else None
             ),
-            what={
-                "recommended_image": image_ref,
-                "cached": cached,
-                "digest_match": digest_match,
-                "backend_digest": backend_digest,
-                "local_digest": local_digest,
-                "gpu_model": gpu_model,
-                "driver_version": driver_version,
-                "after_cutoff": after_cutoff,
-            },
+            what=what,
         )
         return CheckResult(
             passed=not should_fail,
