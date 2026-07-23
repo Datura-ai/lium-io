@@ -7,7 +7,7 @@ from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
 from redis.backoff import ExponentialBackoff
-from redis.retry import Retry
+from redis.asyncio.retry import Retry  # NOT redis.retry.Retry: the sync one silently never retries
 from datura.requests.miner_requests import ExecutorSSHInfo
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
@@ -130,7 +130,13 @@ class RedisService:
         """Subscribe to a Redis channel. Caller MUST `await pubsub.aclose()` when it stops reading —
         the connection returns to the pool only then, and the pool is bounded."""
         pubsub = self.pubsub_redis.pubsub()
-        await pubsub.subscribe(*channel)
+        try:
+            await pubsub.subscribe(*channel)
+        except BaseException:
+            # SUBSCRIBE acquires the pooled connection before it sends, and the caller never receives
+            # this pubsub, so nothing else can return the connection to the bounded pool.
+            await pubsub.aclose()
+            raise
         return pubsub
 
     async def set(self, key: str, value: str):

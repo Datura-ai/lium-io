@@ -351,6 +351,14 @@ def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets
     for cache_volume in payload.cache_volumes:
         _validate_cache_volume(cache_volume)
         if cache_volume.target in occupied_targets:
+            # Silent here would mean every start re-downloads into the ephemeral volume while the
+            # named cache sits unmounted and unswept — indistinguishable from a working cache.
+            logger.warning(
+                _m(
+                    "Cache volume skipped: its target is already mounted",
+                    extra=get_extra_info({"volume": cache_volume.name, "target": cache_volume.target}),
+                )
+            )
             continue
         occupied_targets.add(cache_volume.target)
         mounts.append(VolumeMount(source=cache_volume.name, target=cache_volume.target))
@@ -1652,7 +1660,22 @@ class DockerService:
                 }),
             )
         )
-        await retry_ssh_command(ssh_client, DockerCommand.volume_remove(*stale_volumes), "sweep_stale_cache_volumes")
+        try:
+            await retry_ssh_command(
+                ssh_client, DockerCommand.volume_remove(*stale_volumes), "sweep_stale_cache_volumes"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Sweeping is never worth failing a launch: this runs inside create_container's try, so a
+            # raise here becomes a container-create failure and costs the node a backoff strike for
+            # housekeeping. The stale set survives until the next create or the disk-tight reclaim.
+            logger.warning(
+                _m(
+                    "Stale DPHN cache sweep failed; continuing with the launch",
+                    extra=get_extra_info({**default_extra, "stale_volumes": stale_volumes, "error": str(exc)}),
+                )
+            )
 
     async def capture_failed_container_diagnostics(
         self,

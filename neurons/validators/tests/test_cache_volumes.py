@@ -201,6 +201,26 @@ async def test_sweep_removes_the_previous_model_cache(docker_service):
 
 
 @pytest.mark.asyncio
+async def test_a_failing_sweep_never_fails_the_launch(docker_service):
+    # The sweep runs inside create_container's try. Housekeeping that raises would surface as a
+    # container-create failure, mark the filler FAILED and cost the node a backoff strike — the exact
+    # failure class DAH-2475 exists to remove. The rental-side reclaim already swallows its errors.
+    class BrokenSshClient(FakeSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command:
+                raise ConnectionResetError("ssh connection reset during housekeeping")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = BrokenSshClient(["dphn_cache_hf_old", "dphn_cache_hf_new"])
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[CacheVolume(name="dphn_cache_hf_new", target="/root/.cache")],
+    )
+
+    await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
+
+
+@pytest.mark.asyncio
 async def test_sweep_keeps_the_current_cache_and_unrelated_volumes(docker_service):
     ssh_client = FakeSshClient(["dphn_cache_hf_new", "dphn_cache_dp_new", "volume_pod"])
     payload = _make_payload(
