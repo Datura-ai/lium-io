@@ -1482,6 +1482,41 @@ class DockerService:
                 exc_info=True,
             )
 
+    async def _cache_rented_pod_best_effort(
+        self,
+        executor_info: ExecutorSSHInfo,
+        pod_id: str,
+        container_name: str,
+        default_extra: dict,
+    ) -> None:
+        """Record the new container in the rented-machine cache; never fail the create over it.
+
+        DAH-2475: this hash is a CACHE, not the source of truth — the backend rebuilds it wholesale
+        every ~10 min (RentedMachineRequest -> delete(RENTED_MACHINE_PREFIX) + re-add) and already
+        learns about this container from the ContainerCreated callback. Before this, a Redis blip at
+        this last step raised and tripped cleanup_failed_container_creation, destroying a container
+        that was already built and running: on 2026-07-22 a "Timeout connecting to server" here tore
+        down a finished DPHN container and threw away its ~40 min of model download, then marked the
+        run FAILED and put the node into launch backoff for a fault that was neither the node's nor
+        the container's.
+        """
+        try:
+            await self.redis_service.add_rented_pod(executor_info, pod_id, container_name)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Rented-pod cache write failed after the container was created; keeping the "
+                    "container, the backend re-syncs this cache",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": container_name,
+                        "pod_id": pod_id,
+                        "error": str(exc),
+                    }),
+                ),
+                exc_info=True,
+            )
+
     async def sweep_stale_cache_volumes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -3791,7 +3826,12 @@ class DockerService:
                     await self.finish_stream_logs()
 
                     current_step = "finalize"
-                    await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
+                    await self._cache_rented_pod_best_effort(
+                        executor_info=executor_info,
+                        pod_id=payload.pod_id,
+                        container_name=container_name,
+                        default_extra=default_extra,
+                    )
                     if settings.ENABLE_INSPECTOR:
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,

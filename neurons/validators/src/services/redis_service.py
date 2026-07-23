@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
 from datura.requests.miner_requests import ExecutorSSHInfo
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
@@ -35,12 +37,36 @@ INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
 EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (seconds)
 
+# DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
+# meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
+# connection, and the resulting thundering herd of new TCP connects timed out ("Timeout connecting to
+# server", 51/min at the 2026-07-22 08:35 wave). With no retry configured, every operation caught in
+# that window failed outright — which failed the creates and put healthy nodes into launch backoff.
+# Bounding the pool makes a burst QUEUE on an existing connection instead of opening a new one, and
+# the retry rides out a blip that lasts less than a second.
+REDIS_MAX_CONNECTIONS = 64
+REDIS_SOCKET_TIMEOUT_SECONDS = 10
+REDIS_CONNECT_TIMEOUT_SECONDS = 5
+REDIS_RETRY_ATTEMPTS = 3
+# Validate a pooled connection that has been idle this long, so a silently-dropped connection is
+# discovered by the health check rather than by failing a caller's operation.
+REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
+
 logger = logging.getLogger(__name__)
 
 
 class RedisService:
     def __init__(self):
-        self.redis = aioredis.from_url(settings.get_redis_connection_url())
+        self.redis = aioredis.from_url(
+            settings.get_redis_connection_url(),
+            max_connections=REDIS_MAX_CONNECTIONS,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+            socket_keepalive=True,
+            health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+            retry=Retry(ExponentialBackoff(cap=1.0, base=0.1), REDIS_RETRY_ATTEMPTS),
+            retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+        )
         self.lock = asyncio.Lock()
 
     @asynccontextmanager
