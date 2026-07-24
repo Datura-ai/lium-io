@@ -5,7 +5,7 @@
 groups = ["default", "dev"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:af83b9b4f8ade6ca68d0eaaadf1a6ebc678e704f24465a15774a7f71352ff13c"
+content_hash = "sha256:8ee9e62b9269e48f4d7b901bd7f92c568d55b76297e33c521776f1019c3e9c5f"
 
 [[metadata.targets]]
 requires_python = ">=3.11,<3.13"
@@ -1231,7 +1231,7 @@ files = [
 
 [[package]]
 name = "lium-core"
-version = "0.1.8rc1"
+version = "0.1.6"
 requires_python = ">=3.11"
 summary = "Shared core library for Lium platform"
 groups = ["default"]
@@ -1240,8 +1240,8 @@ dependencies = [
     "requests>=2.31.0",
 ]
 files = [
-    {file = "lium_core-0.1.8rc1-py3-none-any.whl", hash = "sha256:d4678f698559cdbc4372773d06a86f9407f169279144f78afbeab0f74626397b"},
-    {file = "lium_core-0.1.8rc1.tar.gz", hash = "sha256:aa567b89f8ddbbdca954a20918cf6ada5896c853455a7476eeb7a0248306e5e9"},
+    {file = "lium_core-0.1.6-py3-none-any.whl", hash = "sha256:80cb1e06d34c18c1152317259d0ca27487389b3c8cf08db3e3224721f63a96f7"},
+    {file = "lium_core-0.1.6.tar.gz", hash = "sha256:16efabf205e708c4d288cfda833faee5397fd4f8c8f2cb46041488789259f8d0"},
 ]
 
 [[package]]
