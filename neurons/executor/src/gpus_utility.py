@@ -219,19 +219,14 @@ async def manage_docker_images(
 # The executor image version is chosen by the miner, so a validator can be newer or older than the
 # script it launches — click aborts on an unknown option, and the abort is silent because the
 # launcher only backs the command into the background. Drop these once the fleet has rolled.
-@click.option("--program_id", required=False, hidden=True)
-@click.option("--signature", required=False, hidden=True)
-@click.option("--executor_id", required=False, hidden=True)
-@click.option("--validator_hotkey", required=False, hidden=True)
-@click.option("--interval", required=False, hidden=True, type=int)
-def main(
-    compute_rest_app_url: str,
-    program_id: str | None,
-    signature: str | None,
-    executor_id: str | None,
-    validator_hotkey: str | None,
-    interval: int | None,
-):
+# No type= on any of these: an ignored option must not be able to abort the script — click still
+# validates values it will never expose, and the abort would be invisible under the launcher's nohup.
+@click.option("--program_id", required=False, hidden=True, expose_value=False)
+@click.option("--signature", required=False, hidden=True, expose_value=False)
+@click.option("--executor_id", required=False, hidden=True, expose_value=False)
+@click.option("--validator_hotkey", required=False, hidden=True, expose_value=False)
+@click.option("--interval", required=False, hidden=True, expose_value=False)
+def main(compute_rest_app_url: str):
     asyncio.run(manage_docker_images(compute_rest_app_url))
 
 
