@@ -42,5 +42,5 @@ def _keys_used_for_the_encryption_key() -> list[str]:
     raise AssertionError("KEYS_FOR_ENCRYPTION_KEY_GENERATION not found")
 
 
-def test_encryption_key_order_mirrors_the_scrape_dict():
+def test_encryption_key_order_mirrors_the_scrape_dict() -> None:
     assert _keys_used_for_the_encryption_key() == _gpu_keys_emitted_by_the_scrape()
