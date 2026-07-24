@@ -18,6 +18,7 @@ from protocol.vc_protocol.compute_requests import (
     DefaultDockerImagesResponse,
     ExecutorHealthCheckResponse,
     FillerRunActiveResponse,
+    NvmlReportAckResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
 )
@@ -25,12 +26,6 @@ from protocol.vc_protocol.compute_requests import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
-
-
-class NvmlReportAckResponse(BaseModel):
-    """Ack for a reported unknown driver — the verdict arrives later via shared config."""
-
-    status: str | None = None
 
 
 class BackendClient:

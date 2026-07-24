@@ -200,3 +200,10 @@ class DefaultDockerImage(BaseModel, extra="allow"):
 class DefaultDockerImagesResponse(RootModel[list[DefaultDockerImage]]):
     """The backend returns a bare JSON list; wrap it so `BackendClient.get()`
     (which validates with a single model) can parse it."""
+
+
+class NvmlReportAckResponse(BaseModel):
+    """Ack for a reported unknown driver (DAH-2451) — the verdict arrives later via
+    shared config, so the body is intentionally empty."""
+
+    status: str | None = None
