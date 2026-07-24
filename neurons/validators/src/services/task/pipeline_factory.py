@@ -210,6 +210,7 @@ class PipelineFactory:
                 # is a row insert, not a validator redeploy. Falls back to the packaged
                 # constant when the backend is unreachable (shared config empty).
                 nvml_digest_map=shared_client.config.nvml_ml_digests or LIB_NVIDIA_ML_DIGESTS,
+                nvml_invalid_drivers=shared_client.config.nvml_invalid_drivers,
                 enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
                 verifyx_enabled=settings.ENABLE_VERIFYX,
                 inspector_enabled=settings.ENABLE_INSPECTOR,

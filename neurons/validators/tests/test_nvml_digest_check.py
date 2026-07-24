@@ -114,6 +114,34 @@ async def test_nvml_digest_check_allows_driver_595_71_05(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_unknown_driver_is_reported_to_backend(context_factory):
+    # An unknown driver (not in the map, not a known spoof) is reported for verification.
+    services = build_services()
+    config = build_context_config(nvml_digest_map={}, nvml_invalid_drivers=[])
+    state = build_state(specs={"gpu": {"driver": "999.99"}, "md5_checksums": {"libnvidia_ml": "abc"}})
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.DRIVER_UNKNOWN.reason
+    services.backend.report_unknown_driver.assert_awaited_once_with("999.99")
+
+
+@pytest.mark.asyncio
+async def test_known_spoof_driver_is_not_reported(context_factory):
+    # A driver already confirmed invalid is rejected but never re-reported to the backend.
+    services = build_services()
+    config = build_context_config(nvml_digest_map={}, nvml_invalid_drivers=["591.86"])
+    state = build_state(specs={"gpu": {"driver": "591.86"}, "md5_checksums": {"libnvidia_ml": "abc"}})
+    ctx = context_factory(services=services, config=config, state=state)
+
+    result = await NvmlDigestCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.DRIVER_UNKNOWN.reason
+    services.backend.report_unknown_driver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_nvml_digest_check_allows_driver_580_167_08(context_factory):
     specs = {
         "gpu": {"driver": "580.167.08"},
