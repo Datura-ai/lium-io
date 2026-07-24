@@ -43,11 +43,27 @@ sysbox_idmapped_report() {
         | tail -1 | awk '{print $NF}'
 }
 
-fail_old_kernel() {
-    fail "Kernel $(uname -r) cannot run sysbox with GPUs — it lacks ID-mapped mounts (need 5.19+, 6.x recommended)."
-    fail "Sysbox falls back to shiftfs and moves the container rootfs, so the NVIDIA hook fails with:"
+nvidia_hook_symptom() {
+    fail "Sysbox then falls back to shiftfs and runs the container rootfs from another path, so the NVIDIA hook fails with:"
     fail "  nvidia-container-cli: mount error: .../merged/proc/driver/nvidia: no such file or directory"
+}
+
+fail_old_kernel() {
+    fail "Kernel $(uname -r) is too old for sysbox with GPUs — overlayfs gained ID-mapped mounts in 5.19 (6.x recommended)."
+    nvidia_hook_symptom
     fail "Fix on Ubuntu 22.04: sudo apt-get install -y linux-generic-hwe-22.04 && sudo reboot"
+    fail "  Ubuntu 20.04 tops out at 5.15 even with HWE — upgrade the distro instead."
+    fail "Before rebooting: stop any rentals, and confirm the NVIDIA driver is DKMS-managed ('dkms status'),"
+    fail "otherwise a .run-installed driver will not load on the new kernel and the node comes back without GPUs."
+}
+
+fail_no_idmapped() {
+    fail "Sysbox reports it cannot use ID-mapped mounts, although kernel $(uname -r) supports them."
+    nvidia_hook_symptom
+    fail "Usual causes: Docker's data-root sits on a filesystem without ID-map support (ZFS, some btrfs setups),"
+    fail "or sysbox-mgr runs with ID-mapped mounts disabled. Check:"
+    fail "  docker info --format '{{.Driver}}'   (overlay2 expected)"
+    fail "  journalctl -u sysbox-mgr -b | grep -i id-mapped"
 }
 
 # ── 1. Pre-flight ────────────────────────────────────────
@@ -70,19 +86,33 @@ fi
 
 # ── 2. Already working? ─────────────────────────────────
 
-if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc \
-   && docker image inspect "$VERIFY_IMAGE" &>/dev/null \
-   && docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
-    ok "Sysbox is already working. Nothing to do."
-    exit 0
+if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbox-runc; then
+    # pull first: without the image the real test cannot run and the host would be judged on kernel version alone
+    if ! docker image inspect "$VERIFY_IMAGE" &>/dev/null; then
+        echo "  Pulling $VERIFY_IMAGE to test the current setup..."
+        docker pull "$VERIFY_IMAGE" &>/dev/null || true
+    fi
+    if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
+        ok "Sysbox is already working. Nothing to do."
+        exit 0
+    fi
 fi
 
-# Checked only after the "already working" exit above, so a working host is never rejected.
+# Reached only when the real GPU test above did not pass, so a working host is never rejected here.
 IDMAPPED=$(sysbox_idmapped_report)
-if [ "$IDMAPPED" = "no" ] || { [ -z "$IDMAPPED" ] && ! kernel_supports_idmapped; }; then
-    fail_old_kernel
-    exit 1
-fi
+case "$IDMAPPED" in
+    yes) ;;
+    no)
+        if kernel_supports_idmapped; then fail_no_idmapped; else fail_old_kernel; fi
+        exit 1
+        ;;
+    *)  # sysbox-mgr reported nothing this boot — fall back to the kernel version
+        if ! kernel_supports_idmapped; then
+            fail_old_kernel
+            exit 1
+        fi
+        ;;
+esac
 
 SKIP_INSTALL=false
 command -v sysbox-runc &>/dev/null && SKIP_INSTALL=true && warn "Sysbox installed but not working. Reconfiguring..."
