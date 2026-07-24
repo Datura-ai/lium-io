@@ -19,9 +19,11 @@ import asyncssh
 import bittensor
 import redis.exceptions
 from core.docker_utils import (
+    ALPINE_HELPER_IMAGE,
     ContainerDeathDiagnostics,
     DockerCommand,
     collect_container_death_diagnostics,
+    df_available_bytes,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
@@ -161,7 +163,8 @@ _VLOOPBACK_MOUNT_ERROR_PHRASES = (
     "file exists",
 )
 _VLOOPBACK_DRIVER_PREFIX = "vloopback"
-_VLOOPBACK_REPAIR_IMAGE = "docker.io/library/alpine:3.19"
+# Shared with core.docker_utils so exactly one helper image lands on nodes.
+_VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
@@ -1549,26 +1552,30 @@ class DockerService:
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
             return
         requested_gb: int | None = payload.volume_limit_gb
-        if not requested_gb:
-            return
         try:
             cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(ssh_client, set(), default_extra)
             if not cache_volumes:
                 return
 
-            docker_root_dir = await self.get_docker_root_dir(ssh_client)
-            free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-            free_gb = free_bytes / (1024**3)
-            if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
-                return
+            # The backend sends volume_limit_gb=None for every executor whose docker lacks
+            # --storage-opt support (calc_volume_storage_limit), so "no limit" does NOT mean "no disk
+            # needed" — it means the renter may use the whole disk and no fit check is possible. Err on
+            # the renter's side and give the cache back unconditionally; the filler re-downloads it
+            # after the rental, which is the filler's cost to pay, not the customer's.
+            if requested_gb:
+                docker_root_dir = await self.get_docker_root_dir(ssh_client)
+                free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+                free_gb = free_bytes / (1024**3)
+                if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
+                    return
 
             logger.info(
                 _m(
-                    "Reclaiming DPHN cache volumes so the rental's volume fits",
+                    "Reclaiming DPHN cache volumes for the customer rental",
                     extra=get_extra_info({
                         **default_extra,
                         "volumes": cache_volumes,
-                        "free_gb": round(free_gb, 1),
+                        "free_gb": round(free_gb, 1) if requested_gb else None,
                         "requested_gb": requested_gb,
                     }),
                 )
@@ -2459,24 +2466,10 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         docker_root_dir: str,
     ) -> int:
-        # The validator's SSH session lands inside the miner's executor container,
-        # where DockerRootDir (a host path) does not exist. Measure through the
-        # docker daemon instead: bind-mount the host path into a helper container
-        # and run df there. Alpine's busybox df has no --output, so use POSIX -P
-        # and parse the "Available" column (4th) of the data line.
-        result = await ssh_client.run(
-            f"/usr/bin/docker run --rm -v {shlex.quote(docker_root_dir)}:/hostfs:ro "
-            f"{_VLOOPBACK_REPAIR_IMAGE} df -P -B1 /hostfs"
-        )
-        if getattr(result, "exit_status", 0) != 0:
-            raise Exception(f"df via helper container failed: {getattr(result, 'stderr', '')}")
-        lines = (result.stdout or "").strip().splitlines()
-        if len(lines) < 2:
-            raise Exception(f"Unexpected df output: {result.stdout!r}")
-        columns = lines[1].split()
-        if len(columns) < 4 or not columns[3].isdigit():
-            raise Exception(f"Unexpected df output: {result.stdout!r}")
-        return int(columns[3])
+        # Delegates to the shared helper so the grant path (here) and the disk-tight reclaim
+        # (container_cleanup) can never disagree on how free disk is measured — a df fix landing in
+        # one copy only would make the validator grant a cache the backstop immediately reclaims.
+        return await df_available_bytes(ssh_client, docker_root_dir)
 
     async def _get_existing_vloopback_bytes(
         self,
@@ -3616,17 +3609,21 @@ class DockerService:
                     skip_volume_names=protected_volume_names,
                 )
 
-                # DAH-2475: the backend asks for the cache it wants; only the host knows whether those
-                # volumes already exist, and therefore whether mounting them costs a download at all.
-                # Narrowing the request here — BEFORE the sweep, so its keep-list matches what is
-                # actually mounted — is what keeps the decision idempotent across launches.
-                payload.cache_volumes = await self.select_affordable_cache_volumes(
+                # DAH-2475: sweep FIRST, against the names the backend REQUESTED. The stale old-version
+                # cache is dead weight (its names will never be requested again), and it is often the
+                # very thing that makes the node too tight to afford the new download — so removing it
+                # must happen before affordability is judged, or a renamed cache strands the node in a
+                # cold-start loop it can never leave. Sweeping requested-but-not-yet-granted names is
+                # safe: they either do not exist yet or are the current version worth keeping.
+                await self.sweep_stale_cache_volumes(
                     ssh_client=ssh_client,
                     payload=payload,
                     default_extra=default_extra,
                 )
 
-                await self.sweep_stale_cache_volumes(
+                # The backend asks for the cache it wants; only the host knows whether those volumes
+                # already exist, and therefore whether mounting them costs a download at all.
+                payload.cache_volumes = await self.select_affordable_cache_volumes(
                     ssh_client=ssh_client,
                     payload=payload,
                     default_extra=default_extra,
@@ -4130,22 +4127,23 @@ class DockerService:
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
             # Port release now handled by backend.
-            # DAH-2475: the FULL text (headline + the extra dict holding the actual error and the
-            # failure_step), not just the headline — this string becomes filler_run.failure_reason on
-            # the backend, and a bare "Failed create_container" told us nothing about why.
-            failure_msg = log_text.to_full_string()
+            # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
+            # the extra dict holding the actual error) — it becomes filler_run.failure_reason on the
+            # backend, where a bare "Failed create_container" told us nothing about why.
+            failure_detail = log_text.to_full_string()
             if (
                 current_step == "docker_sdk_ssh_host_key"
                 and isinstance(e, RentalDockerConnectionError)
             ):
-                failure_msg = f"{failure_msg}: {e}"
+                failure_detail = f"{failure_detail}: {e}"
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=failure_msg,
+                msg=str(log_text),
+                detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
                 failure_step=current_step,

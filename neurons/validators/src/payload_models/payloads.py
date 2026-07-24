@@ -617,7 +617,12 @@ class FailedContainerErrorTypes(enum.Enum):
 class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
+    # Renter-safe HEADLINE only. The backend surfaces this in customer-facing events, so it must never
+    # carry executor host details (IP, SSH port/username, hotkey) — those go in `detail`.
     msg: str
+    # DAH-2475: full structured text (headline + extra dict) for diagnosis — filler_run.failure_reason
+    # and ops logs on the backend, never customer events. Optional so old peers keep parsing.
+    detail: str | None = None
     error_code: FailedContainerErrorCodes | None = None
     failure_step: str | None = None
 

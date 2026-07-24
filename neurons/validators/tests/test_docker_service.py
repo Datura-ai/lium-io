@@ -2447,7 +2447,9 @@ async def test_create_container_missing_host_key_reports_sdk_host_key_failure_st
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerCreationFailed
     assert result.failure_step == "docker_sdk_ssh_host_key"
-    assert "missing ssh_host_key" in result.msg
+    # DAH-2475: the diagnosis rides in `detail` (ops-only); `msg` is the renter-safe headline.
+    assert "missing ssh_host_key" in result.detail
+    assert result.msg == "Failed create_container"
     docker_service.finish_stream_logs.assert_awaited_once()
     docker_service.redis_service.remove_pending_pod.assert_awaited_once_with(
         payload.miner_hotkey,
