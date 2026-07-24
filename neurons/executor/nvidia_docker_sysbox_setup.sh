@@ -28,6 +28,28 @@ docker_version_ge() {
     [ "$major" -gt "$1" ] 2>/dev/null || { [ "$major" -eq "$1" ] && [ "$minor" -ge "$2" ]; } 2>/dev/null
 }
 
+kernel_supports_idmapped() {
+    # overlayfs over ID-mapped mounts landed in 5.19; without it sysbox falls back to shiftfs
+    local ver major minor
+    ver=$(uname -r)
+    major=${ver%%.*} minor=${ver#*.} minor=${minor%%.*}
+    [ "$major" -gt 5 ] 2>/dev/null || { [ "$major" -eq 5 ] && [ "$minor" -ge 19 ]; } 2>/dev/null
+}
+
+sysbox_idmapped_report() {
+    # what sysbox-mgr itself decided this boot: "yes", "no", or empty when unavailable
+    journalctl -u sysbox-mgr -b --no-pager 2>/dev/null \
+        | grep -o 'Overlayfs on ID-mapped mounts supported by kernel: [a-z]*' \
+        | tail -1 | awk '{print $NF}'
+}
+
+fail_old_kernel() {
+    fail "Kernel $(uname -r) cannot run sysbox with GPUs — it lacks ID-mapped mounts (need 5.19+, 6.x recommended)."
+    fail "Sysbox falls back to shiftfs and moves the container rootfs, so the NVIDIA hook fails with:"
+    fail "  nvidia-container-cli: mount error: .../merged/proc/driver/nvidia: no such file or directory"
+    fail "Fix on Ubuntu 22.04: sudo apt-get install -y linux-generic-hwe-22.04 && sudo reboot"
+}
+
 # ── 1. Pre-flight ────────────────────────────────────────
 
 step 1 7 "Pre-flight checks"
@@ -53,6 +75,13 @@ if command -v sysbox-runc &>/dev/null && docker info 2>/dev/null | grep -q sysbo
    && docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
     ok "Sysbox is already working. Nothing to do."
     exit 0
+fi
+
+# Checked only after the "already working" exit above, so a working host is never rejected.
+IDMAPPED=$(sysbox_idmapped_report)
+if [ "$IDMAPPED" = "no" ] || { [ -z "$IDMAPPED" ] && ! kernel_supports_idmapped; }; then
+    fail_old_kernel
+    exit 1
 fi
 
 SKIP_INSTALL=false
@@ -228,6 +257,8 @@ else
     fail "Verification FAILED. Diagnostics:"
     echo ""
     echo "    Docker:              $(docker --version 2>/dev/null || echo unknown)"
+    echo "    Kernel:              $(uname -r)"
+    echo "    ID-mapped mounts:    $(sysbox_idmapped_report | grep . || echo 'not reported by sysbox-mgr')"
     echo "    NVIDIA driver:       $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo FAILED)"
     echo "    /proc/driver/nvidia: $(ls /proc/driver/nvidia &>/dev/null && echo exists || echo MISSING)"
     echo "    sysbox-runc:         $(sysbox-runc --version 2>/dev/null | head -1 || echo 'not found')"
