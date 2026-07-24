@@ -16,7 +16,7 @@ dependencies = [
     "celium-collateral==1.2.0",
     "databases>=0.9.0",
     "datura @ file:///${PROJECT_ROOT}/../../datura",
-    "lium-core==0.1.8rc1",
+    "lium-core>=0.1.6",
     "fastapi>=0.110.3",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
