@@ -53,6 +53,9 @@ class ContextConfig:
     max_gpu_count: Optional[int] = None
     gpu_model_rates: Optional[dict[str, Any]] = None
     nvml_digest_map: Optional[dict[str, str]] = None
+    # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
+    # rejects these without re-reporting them to the backend for verification.
+    nvml_invalid_drivers: Optional[list[str]] = None
     enable_no_collateral: bool = False
     verifyx_enabled: bool = False
     inspector_enabled: bool = False

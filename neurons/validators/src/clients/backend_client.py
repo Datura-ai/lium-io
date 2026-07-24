@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
+class NvmlReportAckResponse(BaseModel):
+    """Ack for a reported unknown driver — the verdict arrives later via shared config."""
+
+    status: str | None = None
+
+
 class BackendClient:
     """HTTP client with session pooling and validator signature headers."""
 
@@ -310,3 +316,21 @@ class BackendClient:
             add_signature=True,  # Use standard signature headers
             timeout=300,  # 5 minutes - backend needs time to SSH and verify container
         )
+
+    async def report_unknown_driver(self, driver_version: str) -> None:
+        """Ask the backend to verify an unknown NVIDIA driver (DAH-2451).
+
+        Fire-and-forget: the backend enqueues + resolves the driver against NVIDIA's
+        official installer, and the verdict reaches this validator later via shared
+        config. Never raises — a reporting failure must not disturb the pipeline.
+        """
+        try:
+            await self.post(
+                "/v1/nvml-driver/report-unknown",
+                NvmlReportAckResponse,
+                json_data={"driver_version": driver_version},
+                add_signature=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            logger.warning(_m("Failed to report unknown driver", extra={"driver": driver_version, "error": str(exc)}))

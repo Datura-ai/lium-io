@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from neurons.validators.src.services.task.pipeline import (
@@ -65,7 +67,7 @@ def build_services(**overrides) -> ContextServices:
         connectivity=None,
         shell=None,
         score_calculator=DummyScoreCalc(),
-        backend=None,
+        backend=AsyncMock(),
         container_cleanup=None,
     )
     base.update(overrides)
