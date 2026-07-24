@@ -319,6 +319,26 @@ async def test_sweep_removes_the_previous_model_cache(docker_service):
 
 
 @pytest.mark.asyncio
+async def test_sweep_removes_the_old_cache_even_when_no_requested_volume_exists_yet(docker_service):
+    # The strand scenario: a model+tag bump renames BOTH volumes on a tight node. The old set is dead
+    # weight that keeps the node under the affordability gate, so the sweep must run against the
+    # REQUESTED names before affordability is judged — narrowing first would empty the request and the
+    # sweep would misread it as "no cache wanted", leaving the dead 37GB in place forever.
+    ssh_client = FakeSshClient(["dphn_cache_hf_old", "dphn_cache_dp_old", "volume_pod"])
+    payload = _make_payload(
+        workload_kind=WorkloadKind.FILLER,
+        cache_volumes=[
+            CacheVolume(name="dphn_cache_hf_new", target="/root/.cache"),
+            CacheVolume(name="dphn_cache_dp_new", target="/opt/dolphinpod"),
+        ],
+    )
+
+    await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {})
+
+    assert _removed_volumes(ssh_client) == ["dphn_cache_dp_old", "dphn_cache_hf_old"]
+
+
+@pytest.mark.asyncio
 async def test_a_failing_sweep_never_fails_the_launch(docker_service):
     # The sweep runs inside create_container's try. Housekeeping that raises would surface as a
     # container-create failure, mark the filler FAILED and cost the node a backoff strike — the exact

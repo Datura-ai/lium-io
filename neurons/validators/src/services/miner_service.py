@@ -761,14 +761,15 @@ class MinerService:
         msg: str | _StructuredMessage,
         error_code: FailedContainerErrorCodes,
     ):
-        # DAH-2475: ship the FULL text — headline plus the `extra` dict — to the backend. Callers build
-        # a _StructuredMessage whose extra carries the actual exception, but str() on it returns only
-        # the headline, so a create failure reached the backend (and filler_run.failure_reason) as a
-        # bare "Resulted in an exception". Every such failure then cost a manual investigation, and the
-        # 12h launch backoff was applied without anyone knowing what had failed. Logging keeps the
-        # structured object so `extra` still lands in Loki as fields.
+        # DAH-2475: two texts with two audiences. `msg` is the HEADLINE — it feeds renter-visible
+        # events on the backend, so it must never carry host details. `detail` is the full structured
+        # text (headline + the `extra` dict with the actual exception, executor host, failure step);
+        # it exists because a bare "Resulted in an exception" cost a manual investigation per failure —
+        # the backend stores it in filler_run.failure_reason and logs, never in customer events.
+        # Logging keeps the structured object so `extra` still lands in Loki as fields.
         logger.error(msg)
-        detail: str = msg.to_full_string() if isinstance(msg, _StructuredMessage) else msg
+        headline: str = str(msg)
+        detail: str | None = msg.to_full_string() if isinstance(msg, _StructuredMessage) else None
 
         if isinstance(payload, ContainerCreateRequest):
             return FailedContainerRequest(
@@ -776,7 +777,8 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=detail,
+                msg=headline,
+                detail=detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=error_code,
             )
@@ -787,7 +789,8 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=detail,
+                msg=headline,
+                detail=detail,
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=error_code,
             )
@@ -797,7 +800,8 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=detail,
+                msg=headline,
+                detail=detail,
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=error_code,
             )
@@ -807,7 +811,7 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=detail,
+                msg=detail or headline,
             )
         else:
             return FailedContainerRequest(
@@ -815,7 +819,8 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=detail,
+                msg=headline,
+                detail=detail,
                 error_type=FailedContainerErrorTypes.UnknownRequest,
                 error_code=error_code,
             )

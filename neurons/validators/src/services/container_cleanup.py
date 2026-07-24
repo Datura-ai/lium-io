@@ -2,6 +2,8 @@ import logging
 import re
 from typing import Optional
 
+import asyncssh
+
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from core.docker_utils import DockerCommand, df_available_bytes
 from core.utils import _m
@@ -171,7 +173,7 @@ class ContainerCleanup:
 
     async def reclaim_dphn_cache_when_disk_is_tight(
         self,
-        ssh_client,
+        ssh_client: asyncssh.SSHClientConnection,
         executor_uuid: str,
     ) -> int:
         """Give the DPHN filler cache back when the node can no longer afford it.
@@ -242,7 +244,7 @@ class ContainerCleanup:
             logger.warning(_m("DPHN cache reclaim failed", extra=extra | {"error": str(e)}))
             return 0
 
-    async def _has_running_filler_container(self, ssh_client) -> bool:
+    async def _has_running_filler_container(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
         # A cache a live filler still mounts is in use; docker refuses to remove it anyway.
         result = await ssh_client.run(
             f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --format "{{{{.Names}}}}"'
@@ -251,7 +253,7 @@ class ContainerCleanup:
             return True  # cannot prove the node is idle -> do not reclaim
         return bool((result.stdout or "").strip())
 
-    async def _get_free_disk_gb(self, ssh_client) -> float | None:
+    async def _get_free_disk_gb(self, ssh_client: asyncssh.SSHClientConnection) -> float | None:
         # The root is DISCOVERED, not assumed: a node with docker moved to a dedicated disk would
         # otherwise be judged by its root filesystem, and the reclaim would either never fire while
         # docker's disk is full or fire and delete a healthy cache the node had room for.
@@ -266,7 +268,7 @@ class ContainerCleanup:
             # "leave the cache alone".
             return None
 
-    async def _get_dphn_cache_volumes(self, ssh_client) -> list[str]:
+    async def _get_dphn_cache_volumes(self, ssh_client: asyncssh.SSHClientConnection) -> list[str]:
         result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
         if getattr(result, "exit_status", 0) != 0:
             return []
