@@ -517,6 +517,11 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
     assert any(f"plugin set {alias} AWSACCESSKEYID=" in command for command in ssh_client.commands)
     assert any(f"plugin enable {alias}" in command for command in ssh_client.commands)
     assert f"volume create -d {alias} " in stream_logs.await_args.kwargs["command"]
+    # a handle left by the shared instance blocks the create as a duplicate name
+    assert any(
+        command == f"/usr/bin/docker volume rm {volume_info.name}"
+        for command in ssh_client.commands
+    )
     # nothing may touch the shared instance any more
     assert not any(
         " s3fs " in command or command.endswith(" s3fs") for command in ssh_client.commands
