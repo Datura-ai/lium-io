@@ -488,6 +488,71 @@ async def test_create_container_drops_sysbox_when_subuid_base_is_unusable(
 
 
 @pytest.mark.asyncio
+async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
+    docker_service,
+    monkeypatch,
+):
+    # DAH-2512: one shared plugin instance holds one credential pair and dies on
+    # `plugin disable`, taking every other pod's mount on the host with it.
+    ssh_client = RecordingSSHClient()
+    stream_logs = AsyncMock(return_value=(True, ""))
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", stream_logs)
+    volume_info = ExternalVolumeInfo(
+        name="celium-volume-safe",
+        plugin="s3fs",
+        iam_user_access_key="access-key",
+        iam_user_secret_key="secret-key",
+    )
+
+    await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=volume_info,
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    alias = "s3fs-celium-volume-safe"
+    assert any(f"--alias {alias} " in command for command in ssh_client.commands)
+    assert any(f"plugin set {alias} AWSACCESSKEYID=" in command for command in ssh_client.commands)
+    assert any(f"plugin enable {alias}" in command for command in ssh_client.commands)
+    assert f"volume create -d {alias} " in stream_logs.await_args.kwargs["command"]
+    # nothing may touch the shared instance any more
+    assert not any(
+        " s3fs " in command or command.endswith(" s3fs") for command in ssh_client.commands
+    )
+
+
+@pytest.mark.asyncio
+async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
+    docker_service,
+):
+    ssh_client = RecordingSSHClient()
+
+    await docker_service.remove_s3fs_volume_plugin(
+        ssh_client=ssh_client, volume_name="celium-volume-safe"
+    )
+
+    assert ssh_client.commands == [
+        "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
+        "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remove_s3fs_volume_plugin_ignores_unsafe_volume_name(
+    docker_service,
+):
+    ssh_client = RecordingSSHClient()
+
+    await docker_service.remove_s3fs_volume_plugin(
+        ssh_client=ssh_client, volume_name=HOSTILE_VOLUME_NAME
+    )
+
+    assert ssh_client.commands == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "sysbox_subuid_base,expected_options",
     [

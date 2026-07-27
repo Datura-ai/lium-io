@@ -150,6 +150,17 @@ DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
 }
 
+S3FS_PLUGIN_IMAGE = DOCKER_VOLUME_PLUGINS["s3fs"]
+
+
+def s3fs_plugin_alias(volume_name: str) -> str:
+    """DAH-2512: one plugin instance per volume.
+
+    A shared instance holds a single credential pair and dies on `plugin disable`,
+    so attaching or detaching one pod's volume breaks every other pod on the host.
+    """
+    return f"s3fs-{volume_name}"
+
 # DAH-2496: sysbox installers reserve one 65536-wide subuid slice per host and map
 # every container's root to its base. A wider range is handed out per container.
 SYSBOX_SUBUID_SLICE_SIZE = 65536
@@ -2245,16 +2256,21 @@ class DockerService:
         sysbox_subuid_base: int | None,
     ):
         responses = []
+        plugin_alias: str = s3fs_plugin_alias(volume_info.name)
+
         # install docker volume plugin
-        command = "/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
+        command = (
+            f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
+            f"--alias {plugin_alias} --grant-all-permissions --disable"
+        )
         responses.append(await ssh_client.run(command))
 
         # disable volume plugin
-        command = "/usr/bin/docker plugin disable s3fs -f"
+        command = f"/usr/bin/docker plugin disable {plugin_alias} -f"
         responses.append(await ssh_client.run(command))
 
         # set credentials
-        command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
+        command = f"/usr/bin/docker plugin set {plugin_alias} AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
         responses.append(await ssh_client.run(command))
 
         # DAH-2496: the kernel cannot ID-shift a FUSE mount, so under sysbox the
@@ -2263,15 +2279,15 @@ class DockerService:
         mount_options: str = "allow_other"
         if sysbox_subuid_base is not None:
             mount_options = f"allow_other,uid={sysbox_subuid_base},gid={sysbox_subuid_base}"
-        command = f'/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="{mount_options}"'
+        command = f'/usr/bin/docker plugin set {plugin_alias} DEFAULT_S3FSOPTS="{mount_options}"'
         responses.append(await ssh_client.run(command))
 
         # enable volume plugin
-        command = "/usr/bin/docker plugin enable s3fs"
+        command = f"/usr/bin/docker plugin enable {plugin_alias}"
         responses.append(await ssh_client.run(command))
 
         # create volume
-        command = f"/usr/bin/docker volume create -d s3fs {volume_info.name}"
+        command = f"/usr/bin/docker volume create -d {plugin_alias} {volume_info.name}"
         result = await self.execute_and_stream_logs(
             ssh_client=ssh_client,
             command=command,
@@ -2291,13 +2307,18 @@ class DockerService:
 
         return result
 
-    async def disable_s3fs_volume_plugin(
+    async def remove_s3fs_volume_plugin(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-    ):
-        # disable volume plugin
-        command = "/usr/bin/docker plugin disable s3fs -f"
-        await ssh_client.run(command)
+        volume_name: str,
+    ) -> None:
+        """Drop the plugin instance that served this volume, leaving the rest alone."""
+        if not _is_safe_docker_volume_name(volume_name):
+            return
+
+        plugin_alias: str = s3fs_plugin_alias(volume_name)
+        await ssh_client.run(f"/usr/bin/docker plugin disable {plugin_alias} -f")
+        await ssh_client.run(f"/usr/bin/docker plugin rm {plugin_alias}")
 
     async def run_jupyter(
         self,
@@ -4658,7 +4679,9 @@ class DockerService:
                             volume_name=payload.external_volume,
                             volume_role="external",
                         )
-                        await self.disable_s3fs_volume_plugin(ssh_client)
+                        await self.remove_s3fs_volume_plugin(
+                            ssh_client=ssh_client, volume_name=payload.external_volume
+                        )
 
                 log.info(
                     "Remove rented machine from redis",
