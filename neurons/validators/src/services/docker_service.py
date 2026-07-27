@@ -150,13 +150,13 @@ DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
 }
 
-S3FS_PLUGIN_IMAGE = DOCKER_VOLUME_PLUGINS["s3fs"]
+S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
 
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
 
 
-def s3fs_plugin_alias(volume_name: str) -> str:
+def _s3fs_plugin_alias(volume_name: str) -> str:
     """DAH-2512: one plugin instance per volume.
 
     A shared instance holds a single credential pair and dies on `plugin disable`,
@@ -2258,23 +2258,14 @@ class DockerService:
         log_tag: str,
         sysbox_subuid_base: int | None,
     ):
-        responses = []
-        plugin_alias: str = s3fs_plugin_alias(volume_info.name)
+        # The name arrives from the backend and lands in a plugin alias, a volume
+        # name and two shell commands — refuse it before any of that.
+        if not _is_safe_docker_volume_name(volume_info.name):
+            message = f"Unsafe external volume name: {volume_info.name!r}"
+            logger.warning(_m(f"s3fs_volume failed. {message}", extra=get_extra_info({**log_extra})))
+            return False, message
 
-        # install docker volume plugin
-        command = (
-            f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
-            f"--alias {plugin_alias} --grant-all-permissions --disable"
-        )
-        responses.append(await ssh_client.run(command))
-
-        # disable volume plugin
-        command = f"/usr/bin/docker plugin disable {plugin_alias} -f"
-        responses.append(await ssh_client.run(command))
-
-        # set credentials
-        command = f"/usr/bin/docker plugin set {plugin_alias} AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
-        responses.append(await ssh_client.run(command))
+        plugin_alias: str = _s3fs_plugin_alias(volume_info.name)
 
         # DAH-2496: the kernel cannot ID-shift a FUSE mount, so under sysbox the
         # pod's root would see the bucket as nobody. s3fs keeps owner in object
@@ -2282,43 +2273,89 @@ class DockerService:
         mount_options: str = "allow_other"
         if sysbox_subuid_base is not None:
             mount_options = f"allow_other,uid={sysbox_subuid_base},gid={sysbox_subuid_base}"
-        command = f'/usr/bin/docker plugin set {plugin_alias} DEFAULT_S3FSOPTS="{mount_options}"'
-        responses.append(await ssh_client.run(command))
 
-        # enable volume plugin
-        command = f"/usr/bin/docker plugin enable {plugin_alias}"
-        responses.append(await ssh_client.run(command))
-
-        # Hosts provisioned before DAH-2512 still hold a volume of this name under
-        # the shared `s3fs` instance, and docker refuses both create and rm of the
-        # name while that instance is disabled — it cannot query it. Enable it, drop
-        # the handle (the data lives in the bucket, not in the volume) and leave it
-        # enabled: pods still mounting through it keep working, new ones do not use it.
-        responses.append(
-            await ssh_client.run(f"/usr/bin/docker plugin enable {LEGACY_S3FS_PLUGIN_ALIAS}")
+        setup_results: list[asyncssh.SSHCompletedProcess] = (
+            await self._install_s3fs_plugin_instance(
+                ssh_client=ssh_client,
+                plugin_alias=plugin_alias,
+                volume_info=volume_info,
+                mount_options=mount_options,
+            )
         )
-        responses.append(await ssh_client.run(f"/usr/bin/docker volume rm {volume_info.name}"))
 
-        # create volume
-        command = f"/usr/bin/docker volume create -d {plugin_alias} {volume_info.name}"
+        create_command: str = (
+            f"/usr/bin/docker volume create -d {plugin_alias} {volume_info.name}"
+        )
         result = await self.execute_and_stream_logs(
             ssh_client=ssh_client,
-            command=command,
+            command=create_command,
             log_tag=log_tag,
             log_text="Creating docker volume",
             log_extra=log_extra,
             raise_exception=False,
         )
+        if not result[0]:
+            setup_results.extend(
+                await self._drop_legacy_shared_s3fs_volume(ssh_client, volume_info.name)
+            )
+            result = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=create_command,
+                log_tag=log_tag,
+                log_text="Creating docker volume",
+                log_extra=log_extra,
+                raise_exception=False,
+            )
+
         is_success, message = result
         if not is_success:
             responses_text = message
-            for i, r in enumerate(responses):
+            for i, r in enumerate(setup_results):
                 responses_text += f"|Step {i}: exit={r.exit_status}, stdout={r.stdout}, stderr={r.stderr}"
             logger.warning(_m(f"s3fs_volume failed. {responses_text}",extra=get_extra_info({**log_extra})))
         else:
             logger.info(_m("s3fs_volume success", extra=get_extra_info({**log_extra})))
 
         return result
+
+    async def _install_s3fs_plugin_instance(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        plugin_alias: str,
+        volume_info: ExternalVolumeInfo,
+        mount_options: str,
+    ) -> list[asyncssh.SSHCompletedProcess]:
+        """Install and configure the plugin instance that serves this one volume."""
+        commands: list[str] = [
+            f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
+            f"--alias {plugin_alias} --grant-all-permissions --disable",
+            f"/usr/bin/docker plugin disable {plugin_alias} -f",
+            f"/usr/bin/docker plugin set {plugin_alias} "
+            f"AWSACCESSKEYID={volume_info.iam_user_access_key} "
+            f"AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}",
+            f'/usr/bin/docker plugin set {plugin_alias} DEFAULT_S3FSOPTS="{mount_options}"',
+            f"/usr/bin/docker plugin enable {plugin_alias}",
+        ]
+        return [await ssh_client.run(command) for command in commands]
+
+    async def _drop_legacy_shared_s3fs_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        volume_name: str,
+    ) -> list[asyncssh.SSHCompletedProcess]:
+        """Free a volume name still held by the pre-DAH-2512 shared plugin instance.
+
+        Docker refuses both create and rm of the name while that instance is
+        disabled — it cannot query it — so enable it first and leave it enabled:
+        pods still mounting through it keep working. Dropping the handle is safe,
+        the data lives in the bucket.
+        """
+        return [
+            await ssh_client.run(
+                f"/usr/bin/docker plugin enable {LEGACY_S3FS_PLUGIN_ALIAS}"
+            ),
+            await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}"),
+        ]
 
     async def remove_s3fs_volume_plugin(
         self,
@@ -2329,7 +2366,7 @@ class DockerService:
         if not _is_safe_docker_volume_name(volume_name):
             return
 
-        plugin_alias: str = s3fs_plugin_alias(volume_name)
+        plugin_alias: str = _s3fs_plugin_alias(volume_name)
         await ssh_client.run(f"/usr/bin/docker plugin disable {plugin_alias} -f")
         await ssh_client.run(f"/usr/bin/docker plugin rm {plugin_alias}")
 
