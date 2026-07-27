@@ -2286,6 +2286,13 @@ class DockerService:
         command = f"/usr/bin/docker plugin enable {plugin_alias}"
         responses.append(await ssh_client.run(command))
 
+        # A volume of this name may still be registered against another driver —
+        # the shared `s3fs` instance used before DAH-2512, or a stale alias. Docker
+        # then refuses the create as a duplicate name. Dropping the handle is safe:
+        # the data lives in the bucket, not in the volume.
+        command = f"/usr/bin/docker volume rm {volume_info.name}"
+        responses.append(await ssh_client.run(command))
+
         # create volume
         command = f"/usr/bin/docker volume create -d {plugin_alias} {volume_info.name}"
         result = await self.execute_and_stream_logs(
