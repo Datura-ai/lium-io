@@ -2693,13 +2693,14 @@ class DockerService:
         environment: dict[str, str] | None,
         log_tag: str,
         log_extra: dict,
-    ) -> bool:
+    ) -> str | None:
+        # returns the failure cause, or None when the environment was applied
         exec_spec = build_environment_exec_spec(
             container_name=container_name,
             environment=environment,
         )
         if exec_spec is None:
-            return True
+            return None
 
         try:
             result = await exec_logged_rental_docker_sdk_operation(
@@ -2721,7 +2722,7 @@ class DockerService:
                 ),
                 exc_info=True,
             )
-            return False
+            return str(exc)
 
         if result.exit_status != 0:
             await self.stream_log(
@@ -2741,9 +2742,9 @@ class DockerService:
                     }),
                 )
             )
-            return False
+            return f"exit_status={result.exit_status}; stderr={result.stderr}; stdout={result.stdout}"
 
-        return True
+        return None
 
     async def resolve_sysbox_subuid_base(
         self,
@@ -4739,15 +4740,15 @@ class DockerService:
 
                     # add environment variables
                     current_step = "set_environment"
-                    environment_ok = await self.add_environment_variables_with_rental_docker(
+                    environment_error = await self.add_environment_variables_with_rental_docker(
                         docker_client=docker_client,
                         container_name=container_name,
                         environment=custom_options.environment if custom_options else None,
                         log_tag=log_tag,
                         log_extra=default_extra,
                     )
-                    if not environment_ok:
-                        raise RuntimeError("Failed to set environment variables")
+                    if environment_error:
+                        raise RuntimeError(f"Failed to set environment variables: {environment_error}")
 
                     # Historical name — key injection moved before the bootstrap
                     # (DAH-2341), so this step now times the environment setup.

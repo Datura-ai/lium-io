@@ -3423,6 +3423,7 @@ async def test_create_container_reports_docker_pull_failure_step(
 async def test_create_container_reports_set_environment_failure_step(
     docker_service,
     monkeypatch,
+    caplog,
 ):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
@@ -3469,7 +3470,7 @@ async def test_create_container_reports_set_environment_failure_step(
     monkeypatch.setattr(
         docker_service,
         "add_environment_variables_with_rental_docker",
-        AsyncMock(return_value=False),
+        AsyncMock(return_value="exit_status=1; stderr=cannot write /etc/environment; stdout="),
     )
     monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
     monkeypatch.setattr(docker_service, "finish_stream_logs", AsyncMock())
@@ -3503,15 +3504,21 @@ async def test_create_container_reports_set_environment_failure_step(
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
 
-    result = await docker_service.create_container(
-        payload=payload,
-        executor_info=executor_info,
-        keypair=Mock(ss58_address="validator-hotkey"),
-        private_key="encrypted",
-    )
+    with caplog.at_level(logging.ERROR, logger="services.docker_service"):
+        result = await docker_service.create_container(
+            payload=payload,
+            executor_info=executor_info,
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
 
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "set_environment"
+    # the logged cause is what lium-stats classifies, so the bare wrapper must not swallow it
+    failure_extra = next(
+        record.msg.extra for record in caplog.records if str(record.msg) == "Failed create_container"
+    )
+    assert "cannot write /etc/environment" in failure_extra["error"]
     docker_service.redis_service.add_rented_pod.assert_not_awaited()
     docker_service.redis_service.remove_pending_pod.assert_awaited_once_with(
         payload.miner_hotkey,
