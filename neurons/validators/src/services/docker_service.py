@@ -2208,9 +2208,18 @@ class DockerService:
 
         Only a single slice is usable: a wider range means sysbox hands out a
         different base per container, and one static s3fs uid cannot match them.
+
+        The SSH session lands inside the executor container, whose /etc/subuid is
+        its own — the host file is reachable only through dockerd, which resolves
+        -v paths on the host.
         """
-        result = await ssh_client.run("grep '^sysbox:' /etc/subuid")
-        entries: list[str] = (result.stdout or "").strip().splitlines()
+        command: str = (
+            "/usr/bin/docker run --rm -v /etc/subuid:/etc/subuid:ro "
+            "--entrypoint cat daturaai/compute-subnet-executor:latest /etc/subuid"
+        )
+        result = await ssh_client.run(command)
+        lines: list[str] = (result.stdout or "").splitlines()
+        entries: list[str] = [line for line in lines if line.startswith("sysbox:")]
         if not entries:
             return None
 

@@ -550,22 +550,28 @@ async def test_create_s3fs_volume_keeps_plain_options_without_sysbox(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "subuid_line,expected_base",
+    "subuid_file,expected_base",
     [
-        ("sysbox:231072:65536", 231072),
+        ("ubuntu:100000:65536\nsysbox:231072:65536", 231072),
         ("sysbox:231072:1048576", None),
+        ("liumuser:100000:65536", None),
         ("", None),
         ("sysbox:not-a-number:65536", None),
     ],
 )
-async def test_resolve_sysbox_uid_base(docker_service, subuid_line, expected_base):
-    ssh_client = RecordingSSHClient(stdout=subuid_line)
+async def test_resolve_sysbox_uid_base(docker_service, subuid_file, expected_base):
+    ssh_client = RecordingSSHClient(stdout=subuid_file)
 
     base = await docker_service.resolve_sysbox_uid_base(
         ssh_client=ssh_client, log_extra={}
     )
 
     assert base == expected_base
+    # /etc/subuid must be the HOST's file: the ssh session lands inside the
+    # executor container, so the read goes through dockerd's -v host mount.
+    assert any(
+        "-v /etc/subuid:/etc/subuid:ro" in command for command in ssh_client.commands
+    )
 
 
 @pytest.mark.asyncio
