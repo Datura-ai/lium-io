@@ -21,7 +21,7 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
-from services.docker_service import DockerService
+from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
 from services.rental_docker_sdk import (
     ContainerExecResult,
     RentalDockerOperationError,
@@ -517,15 +517,19 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
     assert any(f"plugin set {alias} AWSACCESSKEYID=" in command for command in ssh_client.commands)
     assert any(f"plugin enable {alias}" in command for command in ssh_client.commands)
     assert f"volume create -d {alias} " in stream_logs.await_args.kwargs["command"]
-    # a handle left by the shared instance blocks the create as a duplicate name
-    assert any(
-        command == f"/usr/bin/docker volume rm {volume_info.name}"
-        for command in ssh_client.commands
+    # a handle left by the shared instance blocks the create as a duplicate name,
+    # and docker cannot drop it while that instance is disabled
+    assert ssh_client.commands.index("/usr/bin/docker plugin enable s3fs") < ssh_client.commands.index(
+        f"/usr/bin/docker volume rm {volume_info.name}"
     )
-    # nothing may touch the shared instance any more
-    assert not any(
-        " s3fs " in command or command.endswith(" s3fs") for command in ssh_client.commands
+    # the shared instance is only ever enabled, never reconfigured or disabled —
+    # that is what used to break every other pod on the host
+    forbidden = (
+        f"/usr/bin/docker plugin disable {LEGACY_S3FS_PLUGIN_ALIAS} -f",
+        f"/usr/bin/docker plugin set {LEGACY_S3FS_PLUGIN_ALIAS} ",
+        f"/usr/bin/docker volume create -d {LEGACY_S3FS_PLUGIN_ALIAS} ",
     )
+    assert not any(command.startswith(forbidden) for command in ssh_client.commands)
 
 
 @pytest.mark.asyncio

@@ -153,6 +153,9 @@ DOCKER_VOLUME_PLUGINS = {
 S3FS_PLUGIN_IMAGE = DOCKER_VOLUME_PLUGINS["s3fs"]
 
 
+LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
+
+
 def s3fs_plugin_alias(volume_name: str) -> str:
     """DAH-2512: one plugin instance per volume.
 
@@ -2286,12 +2289,15 @@ class DockerService:
         command = f"/usr/bin/docker plugin enable {plugin_alias}"
         responses.append(await ssh_client.run(command))
 
-        # A volume of this name may still be registered against another driver —
-        # the shared `s3fs` instance used before DAH-2512, or a stale alias. Docker
-        # then refuses the create as a duplicate name. Dropping the handle is safe:
-        # the data lives in the bucket, not in the volume.
-        command = f"/usr/bin/docker volume rm {volume_info.name}"
-        responses.append(await ssh_client.run(command))
+        # Hosts provisioned before DAH-2512 still hold a volume of this name under
+        # the shared `s3fs` instance, and docker refuses both create and rm of the
+        # name while that instance is disabled — it cannot query it. Enable it, drop
+        # the handle (the data lives in the bucket, not in the volume) and leave it
+        # enabled: pods still mounting through it keep working, new ones do not use it.
+        responses.append(
+            await ssh_client.run(f"/usr/bin/docker plugin enable {LEGACY_S3FS_PLUGIN_ALIAS}")
+        )
+        responses.append(await ssh_client.run(f"/usr/bin/docker volume rm {volume_info.name}"))
 
         # create volume
         command = f"/usr/bin/docker volume create -d {plugin_alias} {volume_info.name}"
