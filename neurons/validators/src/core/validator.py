@@ -454,9 +454,19 @@ class Validator:
                     miners = await self.subtensor_client.get_miners()
                     last_mechanism_step_block = self.subtensor_client.get_last_mechansim_step_block()
 
+                    # Current subnet epoch (block // tempo) for the referral feed's staleness
+                    # guard. Defensive: any failure just disables the staleness check (the feed
+                    # client still fails closed on transport/parse/empty), never the cycle.
+                    try:
+                        _tempo = self.subtensor_client.get_tempo()
+                        current_epoch = self.subtensor_client.get_current_block() // _tempo if _tempo else None
+                    except Exception:
+                        current_epoch = None
+
                     cycle_scores = await incentive.calculate_final_weights(
                         miners=miners,
                         last_mechanism_step_block=last_mechanism_step_block,
+                        current_epoch=current_epoch,
                     )
 
                     # A cycle can run across wall-clock boundaries. Stamp every executor

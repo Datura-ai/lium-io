@@ -165,24 +165,29 @@ class Settings(BaseSettings):
     }
     ENABLE_NEW_BURN_LOGIC: bool = True
 
-    # DAH-2481 — referral incentive carve-out. A fixed fraction of the miner (non-burn)
-    # emission is redirected to a DEDICATED referral funding wallet: a separate hotkey
-    # registered on this subnet (SN51) under its own coldkey, distinct from the burn UID 47
-    # — so the referral emission is distinguishable on-chain from burn and can be
-    # reconciled independently. It complements the referral-incentive work on the backend.
+    # DAH-2481 — referral incentive paid via emission. A fixed fraction of the miner
+    # (non-burn) emission is redirected to referrer hotkeys directly, weighted by the
+    # backend's epoch-stable EMA feed — there is no single funding wallet, so unlike the
+    # earlier carve-out design this has no UID/coldkey knobs. It complements the
+    # referral-incentive work on the backend.
     #
-    # The redirect is gated on a fail-closed coldkey check: emission flows to
-    # REFERRAL_EMISSION_UID only when that UID's on-chain coldkey equals
-    # REFERRAL_EMISSION_COLDKEY. The coldkey is the real integrity control — a UID value
-    # alone can never misroute emission, because payout requires the configured coldkey to
-    # match on-chain.
-    #
-    # All three knobs are env-tunable and default to INERT (share 0.0, UID -1, empty
-    # coldkey): nothing is redirected until ops sets the registered wallet's UID + coldkey
-    # and a non-zero share at launch (coordinated with the backend referral rail).
-    REFERRAL_EMISSION_UID: int = Field(env="REFERRAL_EMISSION_UID", default=-1)
-    REFERRAL_EMISSION_COLDKEY: str = Field(env="REFERRAL_EMISSION_COLDKEY", default="")
+    # REFERRAL_EMISSION_SHARE is env-tunable and defaults to INERT (0.0): nothing is
+    # redirected until ops sets a non-zero share at launch (coordinated with the backend
+    # referral rail).
     REFERRAL_EMISSION_SHARE: float = Field(env="REFERRAL_EMISSION_SHARE", default=0.0)
+
+    # DAH-2481 — fail-closed feed of epoch-stable referral EMA weights, served by the
+    # backend at `<COMPUTE_REST_API_URL>/v1/referral-weights`. Defaults track the same
+    # base URL as COMPUTE_REST_API_URL; override independently via REFERRAL_FEED_URL if
+    # the feed is ever hosted elsewhere.
+    REFERRAL_FEED_URL: str = Field(
+        env="REFERRAL_FEED_URL", default="https://lium.io/api/v1/referral-weights"
+    )
+    # Max age (in epochs) a feed response may lag behind the validator's current epoch
+    # before it's treated as stale and rejected (fail-closed → no referral emission).
+    REFERRAL_FEED_MAX_STALENESS_EPOCHS: int = Field(
+        env="REFERRAL_FEED_MAX_STALENESS_EPOCHS", default=3
+    )
 
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
