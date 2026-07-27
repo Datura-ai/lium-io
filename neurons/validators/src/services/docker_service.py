@@ -2199,37 +2199,29 @@ class DockerService:
 
         return True
 
-    async def resolve_sysbox_uid_base(
+    async def resolve_sysbox_subuid_base(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         log_extra: dict,
     ) -> int | None:
-        """Host uid that sysbox maps container root to, or None when unusable.
+        """Read the host uid that sysbox maps container root to, None if unusable.
 
-        Only a single slice is usable: a wider range means sysbox hands out a
-        different base per container, and one static s3fs uid cannot match them.
-
-        The SSH session lands inside the executor container, whose /etc/subuid is
-        its own — the host file is reachable only through dockerd, which resolves
-        -v paths on the host.
+        The SSH session lands inside the executor container, whose own /etc/subuid
+        carries no sysbox entry; the executor shares the host PID namespace, so the
+        host copy is reachable through the host init's root.
         """
-        command: str = (
-            "/usr/bin/docker run --rm -v /etc/subuid:/etc/subuid:ro "
-            "--entrypoint cat daturaai/compute-subnet-executor:latest /etc/subuid"
-        )
-        result = await ssh_client.run(command)
-        lines: list[str] = (result.stdout or "").splitlines()
-        entries: list[str] = [line for line in lines if line.startswith("sysbox:")]
-        if not entries:
-            return None
-
-        fields: list[str] = entries[0].strip().split(":")
-        if len(fields) != 3:
+        result = await ssh_client.run("cat /proc/1/root/etc/subuid")
+        sysbox_entries: list[str] = [
+            line for line in (result.stdout or "").splitlines()
+            if line.startswith("sysbox:")
+        ]
+        if not sysbox_entries:
             return None
 
         try:
-            uid_base: int = int(fields[1])
-            slice_size: int = int(fields[2])
+            _, subuid_base_text, slice_size_text = sysbox_entries[0].strip().split(":")
+            subuid_base: int = int(subuid_base_text)
+            slice_size: int = int(slice_size_text)
         except ValueError:
             return None
 
@@ -2242,7 +2234,7 @@ class DockerService:
             )
             return None
 
-        return uid_base
+        return subuid_base
 
     async def create_s3fs_volume(
         self,
@@ -2250,7 +2242,7 @@ class DockerService:
         log_extra: dict,
         volume_info: ExternalVolumeInfo,
         log_tag: str,
-        sysbox_uid_base: int | None = None,
+        sysbox_subuid_base: int | None,
     ):
         responses = []
         # install docker volume plugin
@@ -2265,13 +2257,12 @@ class DockerService:
         command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
         responses.append(await ssh_client.run(command))
 
-        # DAH-2496: sysbox cannot ID-shift a FUSE mount, so under sysbox the pod's
-        # root sees the bucket as nobody and cannot write existing objects. s3fs
-        # keeps owner and mode in object metadata, so report the objects as owned
-        # by the uid sysbox maps container root to.
+        # DAH-2496: the kernel cannot ID-shift a FUSE mount, so under sysbox the
+        # pod's root would see the bucket as nobody. s3fs keeps owner in object
+        # metadata, so report the objects as owned by the pod's root instead.
         mount_options: str = "allow_other"
-        if sysbox_uid_base is not None:
-            mount_options = f"allow_other,uid={sysbox_uid_base},gid={sysbox_uid_base}"
+        if sysbox_subuid_base is not None:
+            mount_options = f"allow_other,uid={sysbox_subuid_base},gid={sysbox_subuid_base}"
         command = f'/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="{mount_options}"'
         responses.append(await ssh_client.run(command))
 
@@ -3743,34 +3734,32 @@ class DockerService:
                 external_volume_name = None
                 if external_volume_info:
                     current_step = "external_volume_creation"
-                    sysbox_uid_base: int | None = (
-                        await self.resolve_sysbox_uid_base(
+                    sysbox_subuid_base: int | None = None
+                    if payload.is_sysbox:
+                        sysbox_subuid_base = await self.resolve_sysbox_subuid_base(
                             ssh_client=ssh_client, log_extra=default_extra
-                        )
-                        if payload.is_sysbox
-                        else None
-                    )
-                    if payload.is_sysbox and sysbox_uid_base is None:
-                        # Without the base the pod would see /mnt owned by nobody;
-                        # runc keeps the volume writable, so trade isolation for it.
-                        payload.is_sysbox = False
-                        await self.stream_log(
-                            "Sysbox disabled: cannot align S3 volume owner with the executor's sysbox uid range",
-                            "warning",
-                            log_tag,
                         )
                     success, msg = await self.create_s3fs_volume(
                         ssh_client=ssh_client,
                         log_extra=default_extra,
                         volume_info=external_volume_info,
                         log_tag=log_tag,
-                        sysbox_uid_base=sysbox_uid_base,
+                        sysbox_subuid_base=sysbox_subuid_base,
                     )
                     if success:
                         # Add profiler for docker volume creation
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
                         prev_timestamp = now_ms()
                         external_volume_name = external_volume_info.name
+                        if payload.is_sysbox and sysbox_subuid_base is None:
+                            # Decided only once the volume is really attached: runc
+                            # keeps /mnt writable, sysbox without the base does not.
+                            payload.is_sysbox = False
+                            await self.stream_log(
+                                "Sysbox disabled: cannot align S3 volume owner with the executor's sysbox uid range",
+                                "warning",
+                                log_tag,
+                            )
                     else:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, prev_timestamp))
