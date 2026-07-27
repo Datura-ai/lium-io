@@ -517,10 +517,9 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
     assert any(f"plugin set {alias} AWSACCESSKEYID=" in command for command in ssh_client.commands)
     assert any(f"plugin enable {alias}" in command for command in ssh_client.commands)
     assert f"volume create -d {alias} " in stream_logs.await_args.kwargs["command"]
-    # a handle left by the shared instance blocks the create as a duplicate name,
-    # and docker cannot drop it while that instance is disabled
-    assert ssh_client.commands.index("/usr/bin/docker plugin enable s3fs") < ssh_client.commands.index(
-        f"/usr/bin/docker volume rm {volume_info.name}"
+    # the legacy instance is left alone entirely while the create succeeds
+    assert not any(
+        LEGACY_S3FS_PLUGIN_ALIAS == command.split()[-1] for command in ssh_client.commands
     )
     # the shared instance is only ever enabled, never reconfigured or disabled —
     # that is what used to break every other pod on the host
@@ -530,6 +529,66 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
         f"/usr/bin/docker volume create -d {LEGACY_S3FS_PLUGIN_ALIAS} ",
     )
     assert not any(command.startswith(forbidden) for command in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+async def test_create_s3fs_volume_frees_a_name_held_by_the_legacy_instance(
+    docker_service,
+    monkeypatch,
+):
+    # Hosts provisioned before DAH-2512 still hold the volume name under the shared
+    # instance, and docker cannot even drop that handle while it is disabled.
+    ssh_client = RecordingSSHClient()
+    stream_logs = AsyncMock(side_effect=[(False, "volume name must be unique"), (True, "")])
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", stream_logs)
+    volume_info = ExternalVolumeInfo(
+        name="celium-volume-safe",
+        plugin="s3fs",
+        iam_user_access_key="access-key",
+        iam_user_secret_key="secret-key",
+    )
+
+    is_success, _ = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=volume_info,
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is True
+    assert stream_logs.await_count == 2
+    assert ssh_client.commands.index(
+        f"/usr/bin/docker plugin enable {LEGACY_S3FS_PLUGIN_ALIAS}"
+    ) < ssh_client.commands.index(f"/usr/bin/docker volume rm {volume_info.name}")
+
+
+@pytest.mark.asyncio
+async def test_create_s3fs_volume_refuses_an_unsafe_volume_name(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    monkeypatch.setattr(
+        docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, ""))
+    )
+    volume_info = ExternalVolumeInfo(
+        name=HOSTILE_VOLUME_NAME,
+        plugin="s3fs",
+        iam_user_access_key="access-key",
+        iam_user_secret_key="secret-key",
+    )
+
+    is_success, _ = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=volume_info,
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is False
+    assert ssh_client.commands == []
 
 
 @pytest.mark.asyncio
