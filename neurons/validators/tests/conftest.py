@@ -19,6 +19,7 @@ os.environ.setdefault("BITTENSOR_WALLET_NAME", "test-wallet")
 os.environ.setdefault("BITTENSOR_WALLET_HOTKEY_NAME", "test-hotkey")
 os.environ.setdefault("SQLALCHEMY_DATABASE_URI", "sqlite:///:memory:")
 os.environ.setdefault("ASYNC_SQLALCHEMY_DATABASE_URI", "sqlite+aiosqlite:///:memory:")
+os.environ.setdefault("VOLUME_MASTER_SECRET", "test-master-secret-32-chars-long!!")
 
 # Prevent network calls during module-level SharedConfigClient instantiation.
 # core/config.py creates `shared_client = SharedConfigClient(...)` at import time, which
@@ -198,4 +199,3 @@ def port_mapping_dao(mock_async_session_maker):
     from daos.port_mapping_dao import PortMappingDao
 
     return PortMappingDao()
-

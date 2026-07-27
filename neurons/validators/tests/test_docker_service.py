@@ -46,6 +46,7 @@ from payload_models.payloads import (
     PayloadPortMapping,
     ProfilerStepName,
     RemoveSshPublicKeysRequest,
+    VolumeEncryptionStatus,
     WorkloadKind,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -4820,6 +4821,7 @@ def test_should_encrypt_local_volume_requires_local_sysbox_customer_volume(monke
         None,
         WorkloadKind.CUSTOMER_RENTAL,
         True,
+        True,
     )
     assert not _should_encrypt_local_volume(
         "volume_test",
@@ -4831,17 +4833,27 @@ def test_should_encrypt_local_volume_requires_local_sysbox_customer_volume(monke
         ),
         WorkloadKind.CUSTOMER_RENTAL,
         True,
+        True,
     )
     assert not _should_encrypt_local_volume(
         "volume_test",
         None,
         WorkloadKind.FILLER,
         True,
+        True,
     )
     assert not _should_encrypt_local_volume(
         "volume_test",
         None,
         WorkloadKind.CUSTOMER_RENTAL,
+        False,
+        True,
+    )
+    assert not _should_encrypt_local_volume(
+        "volume_test",
+        None,
+        WorkloadKind.CUSTOMER_RENTAL,
+        True,
         False,
     )
 
@@ -4896,6 +4908,7 @@ async def test_create_container_encrypted_local_volume_docker_run_flags(
         volume_limit_gb=2,
         storage_limit_gb=1,
         is_sysbox=True,
+        enable_volume_encryption=True,
         available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
         pod_mapping=[],
         active_container_names=[],
@@ -4931,6 +4944,7 @@ async def test_create_container_encrypted_local_volume_docker_run_flags(
         p for p in result.profilers if p.name == ProfilerStepName.ENCRYPTED_VOLUME_SETUP
     )
     assert encrypted_volume_step.skipped is False
+    assert result.volume_encryption_status == VolumeEncryptionStatus.ENABLED
 
 
 @pytest.mark.asyncio
@@ -4963,6 +4977,7 @@ async def test_create_container_uses_plain_volume_when_encrypted_label_missing(
         volume_limit_gb=2,
         storage_limit_gb=1,
         is_sysbox=True,
+        enable_volume_encryption=True,
         available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
         pod_mapping=[],
         active_container_names=[],
@@ -4994,6 +5009,68 @@ async def test_create_container_uses_plain_volume_when_encrypted_label_missing(
     assert not any(device.path_on_host == "/dev/fuse" for device in run_spec.devices)
     setup_spy.assert_not_awaited()
     assert not any(p.name == ProfilerStepName.ENCRYPTED_VOLUME_SETUP for p in result.profilers)
+    assert result.volume_encryption_status == VolumeEncryptionStatus.UNSUPPORTED_IMAGE
+
+
+@pytest.mark.asyncio
+async def test_create_container_volume_encryption_opt_out_skips_image_inspect(
+    docker_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    inspect_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", inspect_spy)
+    setup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
+
+    pod_id = str(uuid4())
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/pytorch:encrypted",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        is_sysbox=True,
+        enable_volume_encryption=False,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
+    volume_name = f"volume_{pod_id}"
+    assert any(volume.source == volume_name and volume.target == "/root" for volume in run_spec.volumes)
+    assert not any(volume.source == volume_name and volume.target == _LIUM_CIPHER_MOUNT for volume in run_spec.volumes)
+    assert not any(device.path_on_host == "/dev/fuse" for device in run_spec.devices)
+    inspect_spy.assert_not_awaited()
+    setup_spy.assert_not_awaited()
+    assert not any(p.name == ProfilerStepName.ENCRYPTED_VOLUME_SETUP for p in result.profilers)
+    assert result.volume_encryption_status == VolumeEncryptionStatus.DISABLED
 
 
 @pytest.mark.asyncio
@@ -5029,6 +5106,7 @@ async def test_create_container_fails_when_encrypted_label_inspect_raises(
         volume_limit_gb=2,
         storage_limit_gb=1,
         is_sysbox=True,
+        enable_volume_encryption=True,
         available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
         pod_mapping=[],
         active_container_names=[],
@@ -5056,6 +5134,7 @@ async def test_create_container_fails_when_encrypted_label_inspect_raises(
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerCreationFailed
     assert result.failure_step == "encrypted_volume_image_inspect"
+    assert result.volume_encryption_status == VolumeEncryptionStatus.FAILED
     setup_spy.assert_not_awaited()
     assert docker_service.rental_docker_client_factory.client.run_specs == []
 
@@ -5102,6 +5181,7 @@ async def test_create_container_encrypted_setup_runs_before_ssh_bootstrap(
         volume_limit_gb=2,
         storage_limit_gb=1,
         is_sysbox=True,
+        enable_volume_encryption=True,
         available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
         pod_mapping=[],
         active_container_names=[],
@@ -5163,6 +5243,7 @@ async def test_create_container_s3fs_external_volume_skips_encrypted_mount(
         volume_limit_gb=2,
         storage_limit_gb=1,
         is_sysbox=True,
+        enable_volume_encryption=True,
         external_volume_info=ExternalVolumeInfo(
             name="s3-external",
             plugin="s3fs",
@@ -5230,6 +5311,7 @@ async def test_create_container_filler_skips_encrypted_volume_setup(
         volume_limit_gb=2,
         storage_limit_gb=1,
         is_sysbox=True,
+        enable_volume_encryption=True,
         available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
         pod_mapping=[],
         active_container_names=[],

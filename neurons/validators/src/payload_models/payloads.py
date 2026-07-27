@@ -279,6 +279,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     backup_log_id: str | None = None
     restore_path: str | None = None
     enable_jupyter: bool | None = None
+    enable_volume_encryption: bool | None = None
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
@@ -434,6 +435,13 @@ class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
 
 
+class VolumeEncryptionStatus(str, enum.Enum):
+    ENABLED = "ENABLED"
+    UNSUPPORTED_IMAGE = "UNSUPPORTED_IMAGE"
+    DISABLED = "DISABLED"
+    FAILED = "FAILED"
+
+
 class ContainerBaseResponse(BaseValidatorResponse):
     pod_id: str
     workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
@@ -559,6 +567,7 @@ class ContainerCreated(ContainerBaseResponse):
     storage_limit_gb: int | None = None
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
+    volume_encryption_status: VolumeEncryptionStatus | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -627,6 +636,7 @@ class FailedContainerRequest(ContainerBaseResponse):
     detail: str | None = None
     error_code: FailedContainerErrorCodes | None = None
     failure_step: str | None = None
+    volume_encryption_status: VolumeEncryptionStatus | None = None
 
 
 class DuplicateExecutorsResponse(BaseModel):

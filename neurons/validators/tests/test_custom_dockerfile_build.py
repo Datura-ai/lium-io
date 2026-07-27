@@ -352,6 +352,7 @@ def test_A1_dockerfile_field_omitted_when_none():
     assert data["dockerfile_content"] is None
     # DAH-1524: the new optional flag follows the same convention (null by default).
     assert data["ships_sshd"] is None
+    assert data["enable_volume_encryption"] is None
 
 
 # ------------------------------------------------------------------

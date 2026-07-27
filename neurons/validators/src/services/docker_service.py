@@ -52,6 +52,7 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     SshPubKeyAdded,
     SshPubKeyRemoved,
+    VolumeEncryptionStatus,
     WorkloadKind,
     now_ms,
 )
@@ -421,12 +422,14 @@ def _should_encrypt_local_volume(
     external_volume_info: ExternalVolumeInfo | None,
     workload_kind: WorkloadKind,
     is_sysbox: bool | None,
+    enable_volume_encryption: bool | None,
 ) -> bool:
     return (
         bool(local_volume)
         and external_volume_info is None
         and workload_kind != WorkloadKind.FILLER
         and bool(is_sysbox)
+        and enable_volume_encryption
         and settings.ENABLE_VOLUME_ENCRYPTION
     )
 
@@ -3556,6 +3559,7 @@ class DockerService:
 
         log_tag = "container_creation"
         current_step = "start"
+        volume_encryption_status = VolumeEncryptionStatus.DISABLED
 
         # DAH-2211: a custom-build payload carries `dockerfile_content` (may be
         # `""`/whitespace if a broken caller bypassed the route XOR). Reject
@@ -4062,6 +4066,7 @@ class DockerService:
                     external_volume_info,
                     payload.workload_kind,
                     payload.is_sysbox,
+                    payload.enable_volume_encryption,
                 )
                 if use_encrypted_volume:
                     current_step = "encrypted_volume_image_inspect"
@@ -4070,6 +4075,7 @@ class DockerService:
                         payload.docker_image,
                     ):
                         use_encrypted_volume = False
+                        volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
                         await self.stream_log(
                             "Image missing lium.volume_encryption.enable=1; using plain local volume",
                             "warning",
@@ -4337,6 +4343,7 @@ class DockerService:
                         log_tag=log_tag,
                         log_extra=default_extra,
                     )
+                    volume_encryption_status = VolumeEncryptionStatus.ENABLED
                     profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
                     prev_timestamp = now_ms()
 
@@ -4542,6 +4549,7 @@ class DockerService:
                     storage_limit_gb=effective_storage_limit_gb,
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
+                    volume_encryption_status=volume_encryption_status,
                 )
         except Exception as e:
             log_text = _m(
@@ -4578,6 +4586,15 @@ class DockerService:
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
                 failure_step=current_step,
+                volume_encryption_status=(
+                    VolumeEncryptionStatus.FAILED
+                    if current_step
+                    in {
+                        "encrypted_volume_image_inspect",
+                        "encrypted_volume_setup",
+                    }
+                    else None
+                ),
             )
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):

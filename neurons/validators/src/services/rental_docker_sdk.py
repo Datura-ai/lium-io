@@ -286,7 +286,7 @@ class RentalDockerSdkClient:
         destination: str,
     ) -> str | None:
         try:
-            return await asyncio.to_thread(
+            return await _in_docker_thread(
                 self._mount_source_for_destination_sync,
                 container_name,
                 destination,
