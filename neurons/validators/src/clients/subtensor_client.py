@@ -285,10 +285,33 @@ class SubtensorClient:
 
             # Get miners that have opted in from portal BE
             miners_with_opt_in_status = await ValidatorPortalAPI.get_opted_in_miners()
+            if miners_with_opt_in_status is None:
+                # Without the central-miner axons the opt-in miners fall out of the
+                # is_serving filter below, so a stale miner list beats a truncated one.
+                # With no previous list at all, truncated still beats empty.
+                if self.miners:
+                    logger.error(
+                        _m(
+                            "[fetch_miners] Portal unavailable with no cached opt-in list"
+                            " - keeping the previous miner list",
+                            extra=get_extra_info({**self.default_extra, "miners": len(self.miners)}),
+                        ),
+                    )
+                    return
+
+                logger.error(
+                    _m(
+                        "[fetch_miners] Portal unavailable with no cached opt-in list and no"
+                        " previous miner list - opt-in miners will be MISSING this cycle",
+                        extra=get_extra_info(self.default_extra),
+                    ),
+                )
+                miners_with_opt_in_status = []
 
             logger.info(
                 _m(
-                    f"[fetch_miners] Found {len(miners_with_opt_in_status)} opted-in miners from portal",
+                    # not "from portal": the list may be the cached one served through an outage
+                    f"[fetch_miners] Applying opt-in routing for {len(miners_with_opt_in_status)} miners",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
