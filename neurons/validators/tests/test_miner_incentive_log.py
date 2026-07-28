@@ -90,6 +90,11 @@ def _job(**overrides) -> JobResult:
             "soft price limit",
         ),
         (
+            lambda job: MinerLogLine.no_payout_because_vram_exceeds_disk(job, 1128.0, 500.0),
+            "vram_exceeds_disk",
+            "GPU VRAM",
+        ),
+        (
             lambda job: MinerLogLine.no_payout_because_no_unrented_capacity_for_gpu_count(job, 8),
             "no_unrented_capacity_for_gpu_count",
             "no unrented-incentive capacity",
@@ -145,6 +150,17 @@ def test_soft_limit_reason_computes_threshold_and_fields():
     assert line.fields["machine_price_p90"] == 3.842
     assert "4.2262" in line.message
     assert "4.23" in line.message
+
+
+def test_vram_exceeds_disk_reason_keeps_the_two_numbers_apart():
+    # The builder takes both totals positionally; swapping them would advise the miner
+    # to add disk he already has, so the message has to name which number is which.
+    line = MinerLogLine.no_payout_because_vram_exceeds_disk(_job(), 1128.0, 500.0)
+
+    assert line.fields["total_vram_gb"] == 1128.0
+    assert line.fields["total_disk_gb"] == 500.0
+    assert "500.0 GB of total disk but 1128.0 GB of GPU VRAM" in line.message
+    assert "at least 1128.0 GB" in line.message
 
 
 def test_no_capacity_reason_carries_bucket_fields():

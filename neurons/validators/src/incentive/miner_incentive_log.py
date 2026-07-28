@@ -8,7 +8,8 @@ WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
 
 HOW A NODE PICKS A POOL:
   rented?                                              -> mining pool (always earns)
-  idle AND model in program AND price ok AND capacity? -> unrented pool (earns)
+  idle AND model in program AND price ok AND disk >= VRAM
+                               AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
 WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
@@ -21,6 +22,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
+     total GPU VRAM above total disk (add disk to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -232,10 +234,10 @@ class MinerLogLine(BaseModel):
             result,
             reason=ZeroIncentiveReason.VRAM_EXCEEDS_DISK,
             message=(
-                f"No unrented incentive: this machine has {total_disk_gb} GB of disk but "
-                f"{total_vram_gb} GB of GPU VRAM. A node with less disk than VRAM cannot hold "
-                f"the data its own GPUs work on, so it does not earn while idle. Give it more "
-                f"than {total_vram_gb} GB of disk to earn the unrented incentive."
+                f"No unrented incentive: this executor has {total_disk_gb} GB of total disk but "
+                f"{total_vram_gb} GB of GPU VRAM. An idle executor must have at least as much disk "
+                f"as GPU VRAM to earn the unrented incentive. Give it at least {total_vram_gb} GB "
+                f"of total disk, or rent it out to earn."
             ),
             extra_fields={"total_vram_gb": total_vram_gb, "total_disk_gb": total_disk_gb},
         )
