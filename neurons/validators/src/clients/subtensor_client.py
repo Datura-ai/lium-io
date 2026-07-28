@@ -284,11 +284,10 @@ class SubtensorClient:
             miners = metagraph.neurons
 
             # Get miners that have opted in from portal BE
-            miners_with_opt_in_status = await ValidatorPortalAPI.get_opted_in_miners()
-            if miners_with_opt_in_status is None:
-                # Without the central-miner axons the opt-in miners fall out of the
-                # is_serving filter below, so a stale miner list beats a truncated one.
-                # With no previous list at all, truncated still beats empty.
+            opted_in_miners = await ValidatorPortalAPI.get_opted_in_miners()
+            if opted_in_miners is None:
+                # without the central-miner axons the opt-in miners fall out of the
+                # is_serving filter below, so a stale miner list beats a truncated one
                 if self.miners:
                     logger.error(
                         _m(
@@ -306,25 +305,23 @@ class SubtensorClient:
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
-                miners_with_opt_in_status = []
+                opted_in_miners = []
 
             logger.info(
                 _m(
-                    # not "from portal": the list may be the cached one served through an outage
-                    f"[fetch_miners] Applying opt-in routing for {len(miners_with_opt_in_status)} miners",
+                    f"[fetch_miners] Applying opt-in routing for {len(opted_in_miners)} miners",
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            # Update miners in `miners` list based on miners_with_opt_in_status.
-            hotkey_to_opt_in = {
-                opt_in["miner_hotkey"]: opt_in for opt_in in miners_with_opt_in_status if opt_in.get("miner_hotkey", None)
+            opt_in_by_hotkey = {
+                opt_in.miner_hotkey: opt_in for opt_in in opted_in_miners if opt_in.miner_hotkey
             }
             for miner in miners:
-                opt_in = hotkey_to_opt_in.get(miner.hotkey)
+                opt_in = opt_in_by_hotkey.get(miner.hotkey)
                 if opt_in is not None:
-                    miner.axon_info.ip = opt_in.get("central_miner_ip")
-                    miner.axon_info.port = opt_in.get("central_miner_port")
-                    
+                    miner.axon_info.ip = opt_in.central_miner_ip
+                    miner.axon_info.port = opt_in.central_miner_port
+
             miners = [
                 neuron
                 for neuron in metagraph.neurons
