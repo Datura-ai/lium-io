@@ -12,14 +12,15 @@ logger = logging.getLogger(__name__)
 
 
 class OptedInMiner(BaseModel):
-    """One row of the portal's `/validators/opted-in` answer.
+    """The fields the validator needs from one row of the portal's `/validators/opted-in`.
 
-    Mirrors `OptInStatusResponse` in lium-miner-portal - all four fields are
-    required there, so a record missing one means the portal is misbehaving.
+    All three are required in `OptInStatusResponse` (lium-miner-portal `src/dtos/miner.py`),
+    so a record missing one means the portal is misbehaving. Nothing enforces that contract
+    across the two repos, and a failed row fails the whole fetch - hence only the fields
+    that are actually read, and `miner_coldkey` is left to the ignored extras.
     """
 
     miner_hotkey: str
-    miner_coldkey: str
     central_miner_ip: str
     central_miner_port: int
 
@@ -29,9 +30,12 @@ class ValidatorPortalAPI:
 
     Every failure used to return an empty list, indistinguishable from "nobody opted
     in": `SubtensorClient.fetch_miners` then skipped the central-miner axon override
-    and the opt-in miners dropped out of the validated fleet (372 -> 268 executors
-    during the 2026-07-28 portal outage). Mirrors the miner-side cache in
-    `MinerPortalAPI`.
+    and the opt-in miners dropped out of the validated fleet (DAH-2518).
+
+    Not a cache in the `MinerPortalAPI` sense - every call still hits the portal, and
+    the stored answer only serves failures. It has no expiry, so a long outage keeps
+    serving an arbitrarily old list; `cached_age_seconds` on the failure log is the
+    only signal of how old.
     """
 
     _last_good_opted_in_miners: list[OptedInMiner] | None = None
@@ -41,23 +45,36 @@ class ValidatorPortalAPI:
     async def get_opted_in_miners(cls) -> list[OptedInMiner] | None:
         """Fetch the opted-in miners, falling back to the last successful answer.
 
-        Returns None when the fetch failed and nothing was ever cached - callers
-        must not read that as "zero opted-in miners".
+        Returns None when the fetch failed and no populated answer was ever cached -
+        callers must not read that as "zero opted-in miners". An unconfigured portal
+        URL still returns an empty list: there is nothing to route to.
         """
         api_base = (settings.MINER_PORTAL_REST_API_URL or "").rstrip("/")
         if not api_base:
-            # a blank portal URL is a deliberate opt-out of portal routing, not an outage
+            # the setting defaults to the real portal, so an empty one is a broken deploy,
+            # and without this line it is the only way to lose the fleet without a trace
+            logger.warning(
+                _m(
+                    "MINER_PORTAL_REST_API_URL is empty - opt-in routing is off this cycle",
+                    extra=get_extra_info({}),
+                )
+            )
             return []
 
         url = f"{api_base}/validators/opted-in"
 
         try:
             miners = await cls._fetch_opted_in_miners(url)
-        except Exception as e:
-            cls._log_fetch_failure(url, e)
+        except Exception as error:
+            cls._log_fetch_failure(url, error)
             return cls._last_good_opted_in_miners
 
-        if not miners and cls._last_good_opted_in_miners:
+        if miners:
+            cls._last_good_opted_in_miners = miners
+            cls._last_good_fetched_at = time.monotonic()
+            return miners
+
+        if cls._last_good_opted_in_miners:
             # a sudden "nobody is opted in" is far more likely a portal bug than a real
             # mass opt-out, and accepting it would drop every opt-in miner at once
             logger.warning(
@@ -73,20 +90,20 @@ class ValidatorPortalAPI:
             )
             return cls._last_good_opted_in_miners
 
-        cls._last_good_opted_in_miners = miners
-        cls._last_good_fetched_at = time.monotonic()
-        return miners
+        # an empty answer is deliberately not stored: it would make every later failure
+        # return that empty list instead of None, which is exactly the "an outage looks
+        # like nobody opted in" confusion this class exists to remove
+        return []
 
     @classmethod
     def _log_fetch_failure(cls, url: str, error: Exception) -> None:
+        # the caller reports the consequence, so this stays neutral - both layers claiming
+        # "opt-in miners will be MISSING" double-counts one outage in the ERROR alerts
         has_cached_miners = cls._last_good_opted_in_miners is not None
         if has_cached_miners:
             message = "Failed to fetch opted-in miners from portal - serving the last good list"
         else:
-            message = (
-                "Failed to fetch opted-in miners from portal and nothing is cached"
-                " - opt-in miners will be MISSING this cycle"
-            )
+            message = "Failed to fetch opted-in miners from portal and nothing is cached"
         logger.error(
             _m(
                 message,

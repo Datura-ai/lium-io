@@ -286,22 +286,13 @@ class SubtensorClient:
             # Get miners that have opted in from portal BE
             opted_in_miners = await ValidatorPortalAPI.get_opted_in_miners()
             if opted_in_miners is None:
-                # without the central-miner axons the opt-in miners fall out of the
-                # is_serving filter below, so a stale miner list beats a truncated one
-                if self.miners:
-                    logger.error(
-                        _m(
-                            "[fetch_miners] Portal unavailable with no cached opt-in list"
-                            " - keeping the previous miner list",
-                            extra=get_extra_info({**self.default_extra, "miners": len(self.miners)}),
-                        ),
-                    )
-                    return
-
+                # the portal never answered once since startup, so there is no list to fall
+                # back on. bittensor's AxonInfo.is_serving is just `ip != "0.0.0.0"`, so the
+                # opt-in miners keep their on-chain 0.0.0.0 and drop out of the filter below.
                 logger.error(
                     _m(
-                        "[fetch_miners] Portal unavailable with no cached opt-in list and no"
-                        " previous miner list - opt-in miners will be MISSING this cycle",
+                        "[fetch_miners] Portal unavailable with no cached opt-in list"
+                        " - opt-in miners will be MISSING this cycle",
                         extra=get_extra_info(self.default_extra),
                     ),
                 )
@@ -313,9 +304,7 @@ class SubtensorClient:
                     extra=get_extra_info(self.default_extra),
                 ),
             )
-            opt_in_by_hotkey = {
-                opt_in.miner_hotkey: opt_in for opt_in in opted_in_miners if opt_in.miner_hotkey
-            }
+            opt_in_by_hotkey = {opt_in.miner_hotkey: opt_in for opt_in in opted_in_miners}
             for miner in miners:
                 opt_in = opt_in_by_hotkey.get(miner.hotkey)
                 if opt_in is not None:
