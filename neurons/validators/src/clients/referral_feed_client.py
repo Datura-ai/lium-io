@@ -11,18 +11,25 @@ emission that cycle rather than blocking or corrupting weight-setting.
 """
 from decimal import Decimal, InvalidOperation
 
-import requests
+import aiohttp
 
 from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 
 logger = get_logger(__name__)
 
+# Generous total timeout, matching ValidatorPortalAPI: aiohttp's timer is driven by the
+# event loop, which concurrent sync bittensor/subtensor calls in this process can stall,
+# so a tight cap fires spuriously. Waiting is cheaper than the alternative here -- a
+# spurious timeout fails closed, costing a whole cycle of referral emission, and the
+# caller runs once per weight-set cycle (~72 min), not on a hot path.
+_FEED_TIMEOUT_SECONDS = 60
+
 
 class ReferralFeedClient:
     """Fetches referrer hotkey -> EMA weight from the backend referral feed."""
 
-    def get_weights(self, current_epoch: int | None = None) -> dict[str, float]:
+    async def get_weights(self, current_epoch: int | None = None) -> dict[str, float]:
         """Fetch and parse the referral-weights feed.
 
         Returns ``{hotkey_ss58: ema_float}`` on success, or ``{}`` on any failure
@@ -31,9 +38,11 @@ class ReferralFeedClient:
         ``<= 0`` or fails to parse are dropped rather than failing the whole fetch.
         """
         try:
-            response = requests.get(settings.REFERRAL_FEED_URL, timeout=10)
-            response.raise_for_status()
-            body = response.json()
+            timeout = aiohttp.ClientTimeout(total=_FEED_TIMEOUT_SECONDS)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(settings.REFERRAL_FEED_URL) as response:
+                    response.raise_for_status()
+                    body = await response.json()
 
             weights = body.get("weights")
             if not weights:

@@ -250,11 +250,11 @@ class DefaultIncentive(BaseIncentive):
 
         # DAH-2481: fund referral rewards from the residual burn pool, split across the
         # miners who referred paying customers by their EMA (see _apply_referral_pool).
-        self._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch)
+        await self._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch)
 
         return cycle_scores
 
-    def _apply_referral_pool(
+    async def _apply_referral_pool(
         self,
         cycle_scores: dict[str, float],
         burn_scores: dict[str, float],
@@ -284,7 +284,7 @@ class DefaultIncentive(BaseIncentive):
         if not (share > 0):  # also rejects NaN, which the clamp preserves
             return
 
-        ema = self.referral_feed.get_weights(current_epoch=current_epoch)
+        ema = await self.referral_feed.get_weights(current_epoch=current_epoch)
         if not ema:
             return
 

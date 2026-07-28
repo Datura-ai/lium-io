@@ -38,7 +38,7 @@ class _StubReferralFeed:
     def __init__(self, weights: dict[str, float] | None = None):
         self._weights = weights or {}
 
-    def get_weights(self, current_epoch=None):
+    async def get_weights(self, current_epoch=None):
         return dict(self._weights)
 
 
@@ -182,7 +182,8 @@ async def test_fail_closed_non_positive_or_nan_share(incentive, miners, monkeypa
     assert scores["referrer_2"] == pytest.approx(0.0)
 
 
-def test_eligibility_filters_drop_ineligible_referrers(incentive, miners, monkeypatch):
+@pytest.mark.asyncio
+async def test_eligibility_filters_drop_ineligible_referrers(incentive, miners, monkeypatch):
     """A feed hotkey not in this cycle's miners, with non-positive EMA, or that is a
     burn hotkey contributes nothing to the pool — verified directly on
     ``_apply_referral_pool`` with a hand-built feed exercising all three cases."""
@@ -203,13 +204,14 @@ def test_eligibility_filters_drop_ineligible_referrers(incentive, miners, monkey
     )
 
     before = dict(cycle_scores)
-    incentive._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch=None)
+    await incentive._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch=None)
 
     # No eligible referrer -> total_ema <= 0 -> the whole step is a no-op.
     assert cycle_scores == before
 
 
-def test_eligibility_filters_only_eligible_referrer_gets_pool(incentive, miners, monkeypatch):
+@pytest.mark.asyncio
+async def test_eligibility_filters_only_eligible_referrer_gets_pool(incentive, miners, monkeypatch):
     """When the feed mixes eligible and ineligible hotkeys, only the eligible one
     (registered this cycle, positive EMA, not a burn hotkey) receives the pool."""
     monkeypatch.setattr(settings, "REFERRAL_EMISSION_SHARE", 0.1)
@@ -229,7 +231,7 @@ def test_eligibility_filters_only_eligible_referrer_gets_pool(incentive, miners,
         }
     )
 
-    incentive._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch=None)
+    await incentive._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch=None)
 
     expected_pool = min(0.1 * total_before, TOTAL_BURN_EMISSION)
     assert cycle_scores["referrer_1"] == pytest.approx(expected_pool, abs=1e-9)
@@ -240,7 +242,8 @@ def test_eligibility_filters_only_eligible_referrer_gets_pool(incentive, miners,
     assert cycle_scores[BURN_HOTKEY] == pytest.approx(TOTAL_BURN_EMISSION - expected_pool, abs=1e-9)
 
 
-def test_no_op_when_burn_total_is_zero(incentive, miners, monkeypatch):
+@pytest.mark.asyncio
+async def test_no_op_when_burn_total_is_zero(incentive, miners, monkeypatch):
     """No residual burn to draw from -> the referral step is a no-op even with a
     positive share and eligible referrers (miners are never touched, and there is
     nothing to redirect since the pool is capped at burn_total == 0)."""
@@ -251,7 +254,7 @@ def test_no_op_when_burn_total_is_zero(incentive, miners, monkeypatch):
     before = dict(cycle_scores)
 
     incentive.referral_feed = _StubReferralFeed({"referrer_1": 2.0})
-    incentive._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch=None)
+    await incentive._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch=None)
 
     assert cycle_scores == before
     assert "referrer_1" not in cycle_scores
