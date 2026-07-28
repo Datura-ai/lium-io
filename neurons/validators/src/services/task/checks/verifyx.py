@@ -112,11 +112,16 @@ class VerifyXCheck:
                 upload_speed if upload_speed is not None else 0.0,
             )
 
-            # Update storage specs if storage is present
+            # Update storage specs if storage is present. Merged rather than replaced: VerifyX
+            # measures only its own df-derived fields, so overwriting the dict wholesale would drop
+            # the scrape's docker usage breakdown on every node where VerifyX runs.
             if "hard_disk" in sanitized:
-                updated_specs.update({
-                    "hard_disk": sanitized.get("hard_disk", updated_specs.get("hard_disk")),
-                })
+                verifyx_hard_disk = sanitized.get("hard_disk")
+                scraped_hard_disk = updated_specs.get("hard_disk")
+                if isinstance(verifyx_hard_disk, dict) and isinstance(scraped_hard_disk, dict):
+                    updated_specs["hard_disk"] = {**scraped_hard_disk, **verifyx_hard_disk}
+                else:
+                    updated_specs["hard_disk"] = verifyx_hard_disk
 
             event = render_message(
                 Msg.VERIFY_SUCCESS,
