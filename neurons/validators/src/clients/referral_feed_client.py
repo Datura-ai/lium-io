@@ -1,4 +1,4 @@
-"""Fail-closed client for the backend's epoch-stable referral-weights feed (DAH-2481).
+"""Fail-closed client for the backend's epoch-stable referral-weights feed (DAH-2251).
 
 The backend serves ``<COMPUTE_REST_API_URL>/v1/referral-weights`` shaped like::
 
@@ -37,10 +37,13 @@ class ReferralFeedClient:
         staleness violation against ``current_epoch``). Entries whose EMA value is
         ``<= 0`` or fails to parse are dropped rather than failing the whole fetch.
         """
+        # Derived from COMPUTE_REST_API_URL unless REFERRAL_FEED_URL overrides it, so the
+        # feed follows the deployment instead of always resolving to prod.
+        url = settings.get_referral_feed_url()
         try:
             timeout = aiohttp.ClientTimeout(total=_FEED_TIMEOUT_SECONDS)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(settings.REFERRAL_FEED_URL) as response:
+                async with session.get(url) as response:
                     response.raise_for_status()
                     body = await response.json()
 
@@ -49,7 +52,7 @@ class ReferralFeedClient:
                 logger.warning(
                     _m(
                         "[get_weights] Referral feed returned no weights",
-                        extra=get_extra_info({"url": settings.REFERRAL_FEED_URL}),
+                        extra=get_extra_info({"url": url}),
                     ),
                 )
                 return {}
@@ -94,7 +97,7 @@ class ReferralFeedClient:
             logger.warning(
                 _m(
                     "[get_weights] Failed to fetch referral feed, failing closed",
-                    extra=get_extra_info({"url": settings.REFERRAL_FEED_URL, "error": str(e)}),
+                    extra=get_extra_info({"url": url, "error": str(e)}),
                 ),
             )
             return {}

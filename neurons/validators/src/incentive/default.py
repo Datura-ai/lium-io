@@ -248,7 +248,7 @@ class DefaultIncentive(BaseIncentive):
                 continue
             cycle_scores[miner.hotkey] = self.miner_incentives.get(miner.hotkey, 0.0)
 
-        # DAH-2481: fund referral rewards from the residual burn pool, split across the
+        # DAH-2251: fund referral rewards from the residual burn pool, split across the
         # miners who referred paying customers by their EMA (see _apply_referral_pool).
         await self._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch)
 
@@ -261,7 +261,7 @@ class DefaultIncentive(BaseIncentive):
         miners: list[bittensor.NeuronInfo],
         current_epoch: int | None,
     ) -> None:
-        """DAH-2481 — fund referral rewards from RESIDUAL BURN, split across referrers by EMA.
+        """DAH-2251 — fund referral rewards from RESIDUAL BURN, split across referrers by EMA.
 
         A fixed share (``settings.REFERRAL_EMISSION_SHARE``, default 0.0 = inert) of the
         cycle's total emission is redirected from the residual burn pool to the miners who
@@ -288,12 +288,30 @@ class DefaultIncentive(BaseIncentive):
         if not ema:
             return
 
-        # Eligible referrers: registered on the subnet THIS cycle, positive EMA, and never a
-        # burn slot (a burner must not also collect referral emission).
+        # Eligible referrers: present in THIS cycle's miner list, positive EMA, and never a
+        # burn slot (a burner must not also collect referral emission). Note `miners` is
+        # already filtered by SubtensorClient.fetch_miners to serving axons plus burners,
+        # so a referrer whose axon is not serving is not eligible -- same bar as mining.
         cycle_hotkeys = {miner.hotkey for miner in miners}
-        ema = {hk: e for hk, e in ema.items() if hk in cycle_hotkeys and hk not in burn_scores and e > 0}
-        total_ema = sum(ema.values())
+        eligible = {hk: e for hk, e in ema.items() if hk in cycle_hotkeys and hk not in burn_scores and e > 0}
+        total_ema = sum(eligible.values())
         if total_ema <= 0:
+            # The feed named referrers but none cleared the bar. Silent here would hide a
+            # real misconfiguration (e.g. the backend publishing deregistered hotkeys), so
+            # log it -- unlike the inert-share and empty-feed paths above, which are either
+            # the default state or already logged by the client.
+            logger.warning(
+                _m(
+                    "[_apply_referral_pool] Referral feed had weights but no eligible referrer",
+                    extra=get_extra_info(
+                        {
+                            "feed_hotkeys": len(ema),
+                            "cycle_miners": len(cycle_hotkeys),
+                            "burn_hotkeys": len(burn_scores),
+                        }
+                    ),
+                ),
+            )
             return
 
         burn_total = sum(burn_scores.values())
@@ -311,7 +329,7 @@ class DefaultIncentive(BaseIncentive):
             cycle_scores[hotkey] = cycle_scores.get(hotkey, 0.0) - referral_pool * (burn_score / burn_total)
 
         # Distribute the pool across referrers by EMA — stacks on their mining/rental score.
-        for hotkey, ema_value in ema.items():
+        for hotkey, ema_value in eligible.items():
             cycle_scores[hotkey] = cycle_scores.get(hotkey, 0.0) + referral_pool * (ema_value / total_ema)
 
         logger.info(
@@ -320,7 +338,7 @@ class DefaultIncentive(BaseIncentive):
                 extra={
                     "referral_share": share,
                     "referral_pool": referral_pool,
-                    "referrer_count": len(ema),
+                    "referrer_count": len(eligible),
                     "burn_before": burn_total,
                     "pool": "referral",
                 },

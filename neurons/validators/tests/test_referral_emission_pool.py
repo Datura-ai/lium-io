@@ -1,4 +1,4 @@
-"""DAH-2481 (spec pivot) — burn-sourced referral emission pool.
+"""DAH-2251 (spec pivot) — burn-sourced referral emission pool.
 
 ``DefaultIncentive._apply_referral_pool`` redirects a configurable share of the
 cycle's total emission from the RESIDUAL BURN pool to miners who referred paying
@@ -14,6 +14,7 @@ closed). These tests prove the invariants that make the mechanism safe:
   hotkey) all leave scores exactly as the no-referral baseline.
 """
 
+import logging
 import math
 from unittest.mock import AsyncMock
 
@@ -183,7 +184,7 @@ async def test_fail_closed_non_positive_or_nan_share(incentive, miners, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_eligibility_filters_drop_ineligible_referrers(incentive, miners, monkeypatch):
+async def test_eligibility_filters_drop_ineligible_referrers(incentive, miners, monkeypatch, caplog):
     """A feed hotkey not in this cycle's miners, with non-positive EMA, or that is a
     burn hotkey contributes nothing to the pool — verified directly on
     ``_apply_referral_pool`` with a hand-built feed exercising all three cases."""
@@ -204,10 +205,14 @@ async def test_eligibility_filters_drop_ineligible_referrers(incentive, miners, 
     )
 
     before = dict(cycle_scores)
-    await incentive._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch=None)
+    with caplog.at_level(logging.WARNING):
+        await incentive._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch=None)
 
     # No eligible referrer -> total_ema <= 0 -> the whole step is a no-op.
     assert cycle_scores == before
+    # ...but not a SILENT one: the feed named 4 referrers and every one was dropped, which
+    # is a backend/validator disagreement an operator needs to see.
+    assert "no eligible referrer" in caplog.text
 
 
 @pytest.mark.asyncio
