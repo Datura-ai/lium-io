@@ -6,6 +6,7 @@ gated by ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT; while the flag is off the breach
 is only logged (shadow mode) and the payout is unchanged.
 """
 
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,8 +19,8 @@ from services.task_service import JobResult
 
 H200 = "NVIDIA H200"  # base model H200 is rental-eligible by default
 
-GB_IN_MB = 1024
-GB_IN_KB = 1024 ** 2
+MB_PER_GB = 1024
+KB_PER_GB = 1024 ** 2
 
 
 def _build_incentive() -> RentalPriceIncentive:
@@ -32,14 +33,16 @@ def _make_job(
     gpu_count: int = 8,
     disk_gb: float | None = 500.0,
     is_rented: bool = False,
+    spec: dict | None = None,
 ) -> JobResult:
-    spec: dict = {}
-    if vram_gb_per_gpu is not None:
-        spec["gpu"] = {
-            "details": [{"capacity": vram_gb_per_gpu * GB_IN_MB} for _ in range(gpu_count)]
-        }
-    if disk_gb is not None:
-        spec["hard_disk"] = {"total": disk_gb * GB_IN_KB}
+    if spec is None:
+        spec = {}
+        if vram_gb_per_gpu is not None:
+            spec["gpu"] = {
+                "details": [{"capacity": vram_gb_per_gpu * MB_PER_GB} for _ in range(gpu_count)]
+            }
+        if disk_gb is not None:
+            spec["hard_disk"] = {"total": disk_gb * KB_PER_GB}
 
     return JobResult(
         spec=spec,
@@ -104,9 +107,11 @@ def test_vram_over_disk_equal_is_not_flagged():
 @pytest.mark.parametrize(
     "job_kwargs",
     [
-        {"disk_gb": None},          # scrape has no hard_disk block
-        {"vram_gb_per_gpu": None},  # scrape has no gpu details
-        {"disk_gb": 0.0},           # unreadable disk reported as 0
+        {"disk_gb": None},                          # scrape has no hard_disk block
+        {"vram_gb_per_gpu": None},                  # scrape has no gpu details
+        {"disk_gb": 0.0},                           # unreadable disk reported as 0
+        {"spec": {"hard_disk": {"total": 1}, "gpu": {"details": []}}},  # gpu list came back empty
+        {"vram_gb_per_gpu": None, "disk_gb": None},  # no scrape at all
     ],
 )
 def test_vram_over_disk_partial_scrape_is_never_flagged(job_kwargs):
@@ -114,6 +119,77 @@ def test_vram_over_disk_partial_scrape_is_never_flagged(job_kwargs):
     incentive = _build_incentive()
 
     measured = incentive._vram_over_disk(_make_job(**job_kwargs))
+
+    assert measured is None
+
+
+def _logged_reasons(caplog) -> list[str]:
+    # the reason codes of the structured lines captured so far; _m keeps them off the message
+    return [r.msg.extra.get("reason") for r in caplog.records if hasattr(r.msg, "extra")]
+
+
+def test_estimated_job_result_is_not_logged_as_unmeasured(caplog):
+    # estimate_executor builds a spec-less JobResult for every GPU model every cycle;
+    # warning on those would drown the shadow measurement this log exists to feed.
+    incentive = _build_incentive()
+
+    with caplog.at_level(logging.WARNING):
+        incentive._vram_over_disk(_make_job(vram_gb_per_gpu=None, disk_gb=None))
+
+    assert "vram_over_disk_unmeasured" not in _logged_reasons(caplog)
+
+
+def test_unreadable_scrape_is_logged_as_unmeasured(caplog):
+    # A machine that reports no disk must be distinguishable from one that passed the gate.
+    incentive = _build_incentive()
+
+    with caplog.at_level(logging.WARNING):
+        incentive._vram_over_disk(_make_job(disk_gb=None))
+
+    assert "vram_over_disk_unmeasured" in _logged_reasons(caplog)
+
+
+MALFORMED_SPECS: list[dict] = [
+    {"gpu": {"details": [{"capacity": "141 GB"}]}, "hard_disk": {"total": 1}},  # unparsable number
+    {"gpu": {"details": [{"capacity": {"total": 1}}]}, "hard_disk": {"total": 1}},  # nested object
+    {"gpu": ["details"], "hard_disk": {"total": 1}},                            # gpu is a list
+    {"gpu": {"details": 8}, "hard_disk": {"total": 1}},                         # details not iterable
+    {"gpu": {"details": ["141"]}, "hard_disk": {"total": 1}},                   # entry is not a dict
+    {"gpu": {"details": [{"capacity": 1}]}, "hard_disk": "500"},                # hard_disk is a string
+]
+
+
+@pytest.mark.parametrize("spec", MALFORMED_SPECS)
+def test_vram_over_disk_survives_a_malformed_scrape(spec):
+    # The scrape is produced on the miner's machine and calculate_mining_scores has no
+    # per-result guard, so a malformed value must fail open instead of raising.
+    incentive = _build_incentive()
+
+    measured = incentive._vram_over_disk(_make_job(spec=spec))
+
+    assert measured is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", MALFORMED_SPECS)
+async def test_malformed_scrape_never_breaks_scoring(monkeypatch, spec):
+    # Raising out of calculate_executor_score would cost EVERY miner this cycle's weights.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", True)
+    incentive = _build_incentive()
+
+    result = await incentive.calculate_executor_score(_make_job(spec=spec))
+
+    assert result.eligible_for_rental_share is True
+
+
+def test_vram_over_disk_reports_the_numbers_it_compared():
+    # Rounding happens before the comparison, so the miner is never told to add disk
+    # he already has: 500.04 GB VRAM against 500.0 GB disk both render as 500.0.
+    incentive = _build_incentive()
+
+    measured = incentive._vram_over_disk(
+        _make_job(vram_gb_per_gpu=500.04, gpu_count=1, disk_gb=500.0)
+    )
 
     assert measured is None
 
@@ -138,6 +214,24 @@ async def test_shadow_mode_keeps_rental_eligibility(monkeypatch):
     # Assert — still eligible for the unrented rental pool, nothing told to the miner
     assert result.eligible_for_rental_share is True
     assert "vram_exceeds_disk" not in "\n".join(result.incentive_logs)
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_emits_the_measurement_log(monkeypatch, caplog):
+    # The shadow log is the whole deliverable of the first deploy: the rollout decision
+    # is made from these fields, so they are a dashboard contract.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", False)
+    incentive = _build_incentive()
+
+    with caplog.at_level(logging.INFO):
+        await incentive.calculate_executor_score(_make_job())
+
+    breach = next(r.msg for r in caplog.records if r.msg.extra.get("reason") == "vram_exceeds_disk")
+    assert "shadow only - flag off" in breach.message
+    assert breach.extra["total_vram_gb"] == 1128.0
+    assert breach.extra["total_disk_gb"] == 500.0
+    assert breach.extra["enforced"] is False
+    assert breach.extra["pool"] == "rental_kept_shadow"
 
 
 @pytest.mark.asyncio
