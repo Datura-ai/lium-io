@@ -39,6 +39,13 @@ logger = get_logger(__name__)
 SOFT_LIMIT_PRICE_RATE = 1.1
 
 
+class VramOverDisk(BaseModel):
+    """Measured totals of a machine whose GPU VRAM exceeds its disk (both in GB)."""
+
+    vram_gb: float
+    disk_gb: float
+
+
 # ── Snapshot models ──────────────────────────────────────────────────────────
 
 class GpuBucketRentalState(BaseModel):
@@ -209,6 +216,39 @@ class RentalPriceIncentive(DefaultIncentive):
                     "soft_limit_threshold": p90 * SOFT_LIMIT_PRICE_RATE if p90 else None,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _vram_over_disk(self, result: JobResult) -> VramOverDisk | None:
+        # machine carrying more GPU VRAM than it has disk; None when it fits or the scrape is partial
+        spec = result.spec or {}
+        gpu_details = (spec.get("gpu") or {}).get("details") or []
+        vram_gb = sum(float(gpu.get("capacity") or 0) for gpu in gpu_details) / 1024  # capacity is MB
+        # total disk of the machine, not free space: free is distorted by preallocated volumes
+        disk_gb = float((spec.get("hard_disk") or {}).get("total") or 0) / 1024 ** 2  # total is kB
+        if vram_gb <= 0 or disk_gb <= 0:
+            return None  # a scrape missing either number keeps the full incentive
+        if vram_gb <= disk_gb:
+            return None
+        return VramOverDisk(vram_gb=round(vram_gb, 1), disk_gb=round(disk_gb, 1))
+
+    def _log_vram_over_disk(self, result: JobResult, measured: VramOverDisk) -> None:
+        # structured log for every unrented executor whose total VRAM exceeds its total disk
+        enforced = settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT
+        logger.info(
+            _m(
+                "Unrented executor carries more GPU VRAM than total disk"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "total_vram_gb": measured.vram_gb,
+                    "total_disk_gb": measured.disk_gb,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.VRAM_EXCEEDS_DISK,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -484,6 +524,21 @@ class RentalPriceIncentive(DefaultIncentive):
                 p90: float | None = shared_client.config.machine_prices_p90.get(job_result.gpu_model)
                 reason: MinerLogLine = MinerLogLine.no_payout_because_price_above_market_soft_limit(
                     job_result, p90, SOFT_LIMIT_PRICE_RATE
+                )
+                job_result.incentive_logs.append(reason.to_log_line())
+
+        # DAH-2520 VRAM/disk gate: an idle machine with less disk than GPU VRAM cannot hold
+        # the data its own GPUs work on, so it forfeits the unrented incentive (node stays
+        # active). While the flag is off we only log the would-be exclusion (shadow).
+        vram_over_disk: VramOverDisk | None = (
+            self._vram_over_disk(job_result) if eligible_for_rental_share else None
+        )
+        if vram_over_disk is not None:
+            self._log_vram_over_disk(job_result, vram_over_disk)
+            if settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_vram_exceeds_disk(
+                    job_result, vram_over_disk.vram_gb, vram_over_disk.disk_gb
                 )
                 job_result.incentive_logs.append(reason.to_log_line())
 

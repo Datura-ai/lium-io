@@ -64,6 +64,7 @@ class ZeroIncentiveReason(StrEnum):
     PRICE_ABOVE_MARKET_P90_SOFT_LIMIT = "price_above_market_p90_soft_limit"
     NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
+    VRAM_EXCEEDS_DISK = "vram_exceeds_disk"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
 
 
@@ -221,6 +222,22 @@ class MinerLogLine(BaseModel):
                 "soft_limit_rate": rate,
                 "soft_limit_threshold": soft_limit,
             },
+        )
+
+    @staticmethod
+    def no_payout_because_vram_exceeds_disk(
+        result: JobResult, total_vram_gb: float, total_disk_gb: float
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.VRAM_EXCEEDS_DISK,
+            message=(
+                f"No unrented incentive: this machine has {total_disk_gb} GB of disk but "
+                f"{total_vram_gb} GB of GPU VRAM. A node with less disk than VRAM cannot hold "
+                f"the data its own GPUs work on, so it does not earn while idle. Give it more "
+                f"than {total_vram_gb} GB of disk to earn the unrented incentive."
+            ),
+            extra_fields={"total_vram_gb": total_vram_gb, "total_disk_gb": total_disk_gb},
         )
 
     @staticmethod
