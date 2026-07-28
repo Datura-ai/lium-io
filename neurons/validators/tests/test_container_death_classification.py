@@ -21,11 +21,16 @@ def test_removed_container_classifies_as_removed():
     assert classify_container_death(diagnostics) is ContainerDeathKind.REMOVED
 
 
-def test_removed_via_logs_tail_only_classifies_as_removed():
+def test_removed_marker_in_logs_tail_only_does_not_classify_as_removed():
+    # The container still exists (a real stop, exit 137) but its own logs printed the docker
+    # "no such container" string — must NOT be read as an external removal and punished.
     diagnostics = ContainerDeathDiagnostics(
-        logs_tail="Error response from daemon: No such container: filler_x",
+        status="exited",
+        exit_code=137,
+        oom_killed=False,
+        logs_tail="Error response from daemon: No such container: some-other-name",
     )
-    assert classify_container_death(diagnostics) is ContainerDeathKind.REMOVED
+    assert classify_container_death(diagnostics) is ContainerDeathKind.STOPPED
 
 
 def test_sigkill_exit_137_classifies_as_stopped():
@@ -118,4 +123,26 @@ def test_sigterm_with_old_executor_start_is_targeted_stop():
 
 def test_sigterm_without_host_context_is_stopped():
     diagnostics = ContainerDeathDiagnostics(status="exited", exit_code=143, oom_killed=False)
+    assert classify_container_death(diagnostics) is ContainerDeathKind.STOPPED
+
+
+def test_sigterm_with_executor_started_before_kill_is_targeted_stop():
+    # Executor came up 5 min BEFORE the filler died: not a reboot (a reboot restarts the executor
+    # after shutdown killed the filler). A miner must not launder a `docker stop` this way.
+    diagnostics = ContainerDeathDiagnostics(
+        status="exited", exit_code=143, oom_killed=False,
+        finished_at="2026-07-20T09:00:00Z",
+        host_context={"executor_container_started_at": "2026-07-20T08:55:00Z"},
+    )
+    assert classify_container_death(diagnostics) is ContainerDeathKind.STOPPED
+
+
+def test_sigterm_with_executor_restart_long_after_kill_is_targeted_stop():
+    # Executor restarted 20 min AFTER the kill: the stop already happened, the late restart does
+    # not excuse it.
+    diagnostics = ContainerDeathDiagnostics(
+        status="exited", exit_code=143, oom_killed=False,
+        finished_at="2026-07-20T09:00:00Z",
+        host_context={"executor_container_started_at": "2026-07-20T09:20:00Z"},
+    )
     assert classify_container_death(diagnostics) is ContainerDeathKind.STOPPED

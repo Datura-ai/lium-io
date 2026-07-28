@@ -526,12 +526,15 @@ async def test_rental_verification_filler_running_passes():
 class FakeStrikeRedis:
     """Fake RedisService for the kill-strike path."""
 
-    def __init__(self, strikes_to_return: int):
+    def __init__(self, strikes_to_return: int, raises: bool = False):
         self.strikes_to_return = strikes_to_return
+        self.raises = raises
         self.calls: list[tuple[str, str, int]] = []
 
     async def register_filler_kill_strike(self, executor_uuid: str, filler_run_id: str, ttl_seconds: int) -> int:
         self.calls.append((executor_uuid, filler_run_id, ttl_seconds))
+        if self.raises:
+            raise ConnectionError("redis down")
         return self.strikes_to_return
 
 
@@ -576,26 +579,47 @@ async def test_rental_verification_filler_removed_shadow_mode_passes_but_logs(mo
     result = await _run_filler_check(ctx, enforcement=False)
 
     assert result.passed is True
-    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+    # A removed container is "missing" with no reliable one-shot kill signal (prod shadow: every
+    # removed case was a single unreconciled zombie run), so it is strike-gated like STOPPED.
+    assert result.event.reason_code == Msg.FILLER_KILL_SUSPECTED.reason
     assert result.event.what_we_saw["enforced"] is False
     assert result.event.what_we_saw["death_kind"] == "removed"
+    assert result.event.what_we_saw["kill_strikes"] is None
     assert backend_client.filler_run_active_calls == ["11111111-2222-3333-4444-555555555555"]
 
 
 @pytest.mark.asyncio
-async def test_rental_verification_filler_removed_enforcement_fails(monkeypatch):
-    """Enforcement: a REMOVED filler fails the fatal check outright -> no unrented incentive."""
+async def test_rental_verification_filler_removed_first_strike_is_suspected_not_punished(monkeypatch):
+    """A single removal is usually a zombie run (host reboot / watchtower recreation): strike 1, passed."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(running=False)
-    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+    strike_redis = FakeStrikeRedis(strikes_to_return=1)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client, redis_service=strike_redis)
+    _patch_diagnostics(monkeypatch, REMOVED_DIAGNOSTICS)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_KILL_SUSPECTED.reason
+    assert result.event.what_we_saw["death_kind"] == "removed"
+    assert result.event.what_we_saw["kill_strikes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_removed_second_strike_is_punished(monkeypatch):
+    """A repeat removal within the window -> treated as a targeted kill, incentive withheld."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    strike_redis = FakeStrikeRedis(strikes_to_return=2)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client, redis_service=strike_redis)
     _patch_diagnostics(monkeypatch, REMOVED_DIAGNOSTICS)
 
     result = await _run_filler_check(ctx, enforcement=True)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
-    assert result.event.what_we_saw["enforced"] is True
-    assert backend_client.called_with is None
+    assert result.event.what_we_saw["death_kind"] == "removed"
+    assert result.event.what_we_saw["kill_strikes"] == 2
 
 
 @pytest.mark.asyncio
@@ -612,6 +636,7 @@ async def test_rental_verification_filler_stopped_first_strike_is_suspected_not_
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_KILL_SUSPECTED.reason
     assert result.event.what_we_saw["kill_strikes"] == 1
+    assert result.event.what_we_saw["enforced"] is True
     assert strike_redis.calls[0][1] == "11111111-2222-3333-4444-555555555555"
 
 
@@ -664,12 +689,13 @@ async def test_rental_verification_host_reboot_never_punished(monkeypatch):
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_CRASHED.reason
     assert result.event.what_we_saw["death_kind"] == "host_reboot"
+    assert result.event.what_we_saw["enforced"] is True
     assert strike_redis.calls == []
 
 
 @pytest.mark.asyncio
-async def test_rental_verification_filler_stopped_without_redis_falls_back_to_strict(monkeypatch):
-    """No strike storage -> the ambiguous stop takes the strict verdict, not a free pass forever."""
+async def test_rental_verification_filler_stopped_without_redis_fails_open(monkeypatch):
+    """No strike storage is not evidence of a repeat kill: fail open, never penalize on our outage."""
     backend_client = _killed_filler_backend()
     ssh_client = FillerSSHClient(running=False)
     ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
@@ -677,8 +703,26 @@ async def test_rental_verification_filler_stopped_without_redis_falls_back_to_st
 
     result = await _run_filler_check(ctx, enforcement=True)
 
-    assert result.passed is False
-    assert result.event.reason_code == Msg.FILLER_KILLED.reason
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_KILL_SUSPECTED.reason
+    assert result.event.what_we_saw["kill_strikes"] is None
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_filler_stopped_redis_error_fails_open(monkeypatch):
+    """Redis raising mid-strike is treated the same as no store: no penalty, suspected only."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False)
+    strike_redis = FakeStrikeRedis(strikes_to_return=99, raises=True)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client, redis_service=strike_redis)
+    _patch_diagnostics(monkeypatch, STOPPED_DIAGNOSTICS)
+
+    result = await _run_filler_check(ctx, enforcement=True)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_KILL_SUSPECTED.reason
+    assert result.event.what_we_saw["kill_strikes"] is None
+    assert strike_redis.calls != []  # the strike attempt was made before Redis failed
 
 
 @pytest.mark.parametrize(
@@ -789,6 +833,7 @@ async def test_rental_verification_filler_ssh_transport_error_never_punished_eve
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_TRANSPORT_UNREACHABLE.reason
+    assert result.event.what_we_saw["enforced"] is True
     assert backend_client.filler_run_active_calls == []
 
 

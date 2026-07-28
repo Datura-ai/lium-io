@@ -255,6 +255,7 @@ class RentalVerificationCheck:
             return self._filler_state_unknown_result(
                 ctx,
                 filler_container,
+                enforce=enforce,
                 reason="ssh transport unreachable",
                 details={"transport_error": repr(exc)},
                 template=Msg.FILLER_TRANSPORT_UNREACHABLE,
@@ -265,6 +266,7 @@ class RentalVerificationCheck:
             return self._filler_state_unknown_result(
                 ctx,
                 filler_container,
+                enforce=enforce,
                 reason="docker ps failed on host",
                 details={"exit_status": ps_result.exit_status},
             )
@@ -293,7 +295,7 @@ class RentalVerificationCheck:
 
         if filler_run is None:
             return self._filler_state_unknown_result(
-                ctx, filler_container, reason="filler-run re-check API unavailable"
+                ctx, filler_container, enforce=enforce, reason="filler-run re-check API unavailable"
             )
 
         if not filler_run.active:
@@ -303,6 +305,7 @@ class RentalVerificationCheck:
             return self._filler_state_unknown_result(
                 ctx,
                 filler_container,
+                enforce=enforce,
                 reason="filler run is not in RUNNING state",
                 details={"filler_run_status": filler_run.status},
             )
@@ -314,6 +317,7 @@ class RentalVerificationCheck:
             return self._filler_state_unknown_result(
                 ctx,
                 filler_container,
+                enforce=enforce,
                 reason="filler run within startup grace window",
                 details={"run_age_seconds": run_age.total_seconds() if run_age else None},
             )
@@ -335,16 +339,18 @@ class RentalVerificationCheck:
         run_age: timedelta,
         enforce: bool,
     ) -> CheckResult:
-        """Classify WHY the container is dead; only an external kill may cost incentive.
+        """Classify WHY the container is dead; only a repeated targeted kill may cost incentive.
 
-        REMOVED (container gone) is punishable outright — nothing legitimate deletes a
-        RUNNING run's container. STOPPED (SIGTERM/SIGKILL) could in theory be the worker
-        exiting 143 itself, so the first incident per executor is a logged strike and only
-        repeat incidents within the strike window are punished. Strikes are only counted
-        under enforcement, so an executor always gets its grace incident once enforcement
-        begins, never a strike carried over from the shadow period. HOST_REBOOT and every
-        self-death kind (self-crash, OOM, never started, clean exit, unknown) are self-heal
-        territory and never punished.
+        REMOVED (container gone) and STOPPED (SIGTERM/SIGKILL) are both "container missing"
+        with no reliable one-shot kill signal, so both are strike-gated: the first incident
+        per executor is a logged strike and only repeat incidents within the strike window are
+        punished. Prod shadow proved this necessary — every removed case was a single
+        unreconciled zombie run (backend filler_run stuck RUNNING after a host reboot or a
+        watchtower executor recreation), not a fresh kill; punishing REMOVED outright would
+        have hit honest providers. Strikes are only counted under enforcement, so an executor
+        always gets its grace incident once enforcement begins, never a strike carried over
+        from the shadow period. HOST_REBOOT and every self-death kind (self-crash, OOM, never
+        started, clean exit, unknown) are self-heal territory and never punished.
         """
         try:
             diagnostics = await collect_container_death_diagnostics(ctx.ssh, filler_container)
@@ -369,13 +375,11 @@ class RentalVerificationCheck:
             "death_kind": death_kind.value,
             "container_uptime_seconds": uptime_seconds,
             "kill_timing": kill_timing,
+            "enforced": enforce,
             **death_fields,
         }
 
-        if death_kind is ContainerDeathKind.REMOVED:
-            return self._external_kill_result(ctx, enforce=enforce, what=common_what)
-
-        if death_kind is ContainerDeathKind.STOPPED:
+        if death_kind in (ContainerDeathKind.REMOVED, ContainerDeathKind.STOPPED):
             return await self._ambiguous_stop_result(
                 ctx, filler_container, enforce=enforce, what=common_what
             )
@@ -406,15 +410,19 @@ class RentalVerificationCheck:
 
         strikes = await self._register_kill_strike(ctx, filler_container)
         what["kill_strikes"] = strikes
-        if strikes is None or strikes >= settings.FILLER_KILL_STRIKE_THRESHOLD:
+        # strikes is None => the strike store is unreachable (Redis down). A lost store is not
+        # evidence of a repeat kill, so fail open like every other unknown in this check rather
+        # than punish a provider for our own outage — a real repeat killer resurfaces as REMOVED
+        # or another stop once Redis is back.
+        if strikes is not None and strikes >= settings.FILLER_KILL_STRIKE_THRESHOLD:
             return self._external_kill_result(ctx, enforce=enforce, what=what)
         return self._passthrough_result(ctx, Msg.FILLER_KILL_SUSPECTED, what)
 
     async def _register_kill_strike(self, ctx: Context, filler_container: str) -> int | None:
         """One strike per filler run (deduped in Redis); None when Redis is unavailable.
 
-        None is treated as strikes-reached by the caller: an ambiguous stop with no working
-        strike storage falls back to the strict verdict rather than a free pass forever.
+        None means the strike store is unreachable, and the caller fails open (no penalty) —
+        a provider is never punished because our own Redis was down.
         """
         filler_run_id: str = filler_container.removeprefix(FILLER_CONTAINER_PREFIX)
         redis_service = ctx.services.redis
@@ -430,13 +438,14 @@ class RentalVerificationCheck:
     def _external_kill_result(
         self, ctx: Context, *, enforce: bool, what: dict[str, object]
     ) -> CheckResult:
+        # `enforced` already rides in via `what` (common_what); only `verified` is added here.
         event = render_message(
             Msg.FILLER_KILLED,
             ctx=ctx,
             check_id=self.check_id,
             severity=None if enforce else "warning",
             impact=None if enforce else "Shadow observation only: incentive was NOT withheld",
-            what={"verified": False, "enforced": enforce, **what},
+            what={"verified": False, **what},
         )
         return CheckResult(passed=not enforce, event=event, updates={})
 
@@ -445,6 +454,7 @@ class RentalVerificationCheck:
         ctx: Context,
         filler_container: str,
         *,
+        enforce: bool,
         reason: str,
         details: dict[str, object] | None = None,
         template: MessageTemplate = Msg.FILLER_STATE_UNKNOWN,
@@ -457,6 +467,7 @@ class RentalVerificationCheck:
                 "filler_container": filler_container,
                 "executor_uuid": ctx.executor.uuid,
                 "reason": reason,
+                "enforced": enforce,
                 **(details or {}),
             },
         )

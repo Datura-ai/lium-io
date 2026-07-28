@@ -79,11 +79,10 @@ class RedisService:
         single strike no matter how many cycles see it. Returns the executor's current strike
         count inside the TTL window.
         """
+        seen_key = f"filler_kill_seen:{filler_run_id}"
+        strikes_key = f"filler_kill_strikes:{executor_uuid}"
         async with self.lock:
-            is_new_incident = await self.redis.set(
-                f"filler_kill_seen:{filler_run_id}", "1", nx=True, ex=ttl_seconds
-            )
-            strikes_key = f"filler_kill_strikes:{executor_uuid}"
+            is_new_incident = await self.redis.set(seen_key, "1", nx=True, ex=ttl_seconds)
             if is_new_incident:
                 # INCR + EXPIRE in one MULTI so a crash between them can't orphan the key
                 # without a TTL (which would pin the executor above threshold forever).
@@ -92,13 +91,17 @@ class RedisService:
                     pipe.expire(strikes_key, ttl_seconds)
                     strikes, _ = await pipe.execute()
                 return int(strikes)
-            # Already-counted incident (same run seen again this window). Refresh the TTL so a
-            # persistent killer keeps its strikes alive; an honest node stops being observed and
-            # the key expires ttl_seconds after its last incident.
+            # Already-counted incident (same run seen again this window). Refresh BOTH keys so a
+            # persistent killer keeps its strikes alive AND this one dead run never re-counts as a
+            # fresh incident: without refreshing the seen key, a run stuck RUNNING past the TTL would
+            # let its seen marker expire mid-observation and be double-charged as a second strike.
             current_strikes = await self.redis.get(strikes_key)
             if current_strikes is None:
                 return 1
-            await self.redis.expire(strikes_key, ttl_seconds)
+            async with self.redis.pipeline(transaction=True) as pipe:
+                pipe.expire(seen_key, ttl_seconds)
+                pipe.expire(strikes_key, ttl_seconds)
+                await pipe.execute()
             return int(current_strikes)
 
     async def publish(self, channel: str, message: dict):

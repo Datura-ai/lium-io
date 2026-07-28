@@ -281,6 +281,14 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Proceed; Lium lowered the limit for its own idle filler, node stays rentable",
     )
+    RECAPPED_DRIFTED_FILLER = MessageTemplate(
+        event="Re-applied Lium filler GPU power cap that had drifted back up",
+        reason="GPU_POWER_LIMIT_RECAPPED_DRIFTED_FILLER",
+        severity="warning",
+        category="policy",
+        impact="Proceed; the idle filler's power cap reverted on the host and was re-applied to target",
+        remediation="If this recurs on the same node, its host may reset the power limit externally.",
+    )
     RESTORED_STALE_CAP = MessageTemplate(
         event="Below-floor GPU power limits are Lium's own filler caps",
         reason="GPU_POWER_LIMIT_RESTORED_STALE_CAP",
@@ -1021,11 +1029,11 @@ class RentalVerificationMessages:
         remediation="Do not stop Lium default-job (filler_*) containers; repeated stops cost unrented incentive.",
     )
     FILLER_CRASHED = MessageTemplate(
-        event="Lium default job died on its own",
+        event="Lium default job ended without an external kill",
         reason="FILLER_CRASHED",
         severity="warning",
         category="runtime",
-        impact="No penalty: the filler crashed, hit OOM or failed to start — self-heal territory, not an external kill",
+        impact="No penalty: not an external kill (self-crash, OOM, host reboot, clean exit, or undiagnosed) — self-heal territory. See death_kind for which.",
     )
     FILLER_STATE_UNKNOWN = MessageTemplate(
         event="Lium default job state could not be verified",

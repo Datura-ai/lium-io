@@ -158,10 +158,14 @@ class ContainerDeathKind(str, Enum):
 _ZERO_DOCKER_TIMESTAMP_PREFIX = "0001-01-01"
 _KILL_SIGNAL_EXIT_CODES = (137, 143)  # 128+SIGKILL, 128+SIGTERM
 _REMOVED_MARKERS = ("no such object", "no such container")  # docker casing varies; match lowercased
-# A reboot/compose-restart SIGTERMs every container at once, so the executor stack restarts around
-# the same time. If it (re)started no earlier than this many seconds before the filler died, the
-# SIGTERM was collateral of that restart, not a filler-targeted `docker stop`.
+# A reboot SIGTERMs every container at shutdown and brings the executor stack back up on boot, so
+# the executor's StartedAt lands at or shortly AFTER the filler's death. The restart must bracket
+# the death to count as collateral: up to this long after (slow boot), with only a small skew
+# tolerance before (clocks). A filler-targeted `docker stop` leaves the executor started hours/days
+# earlier (far-negative delta); an executor that restarts long after the kill (far-positive delta)
+# does not excuse a kill that already happened.
 _HOST_RESTART_WINDOW_SECONDS = 600
+_HOST_RESTART_CLOCK_SKEW_SECONDS = 120
 
 
 def _never_started(diagnostics: ContainerDeathDiagnostics) -> bool:
@@ -183,13 +187,17 @@ def _stop_coincided_with_host_restart(diagnostics: ContainerDeathDiagnostics) ->
     finished = _parse_docker_timestamp(diagnostics.finished_at)
     if executor_started is None or finished is None:
         return False
-    return (executor_started - finished).total_seconds() > -_HOST_RESTART_WINDOW_SECONDS
+    delta_seconds = (executor_started - finished).total_seconds()
+    return -_HOST_RESTART_CLOCK_SKEW_SECONDS <= delta_seconds <= _HOST_RESTART_WINDOW_SECONDS
 
 
 def classify_container_death(diagnostics: ContainerDeathDiagnostics) -> ContainerDeathKind:
+    # Match the "no such object/container" marker only in OUR inspect error, never in the
+    # container's own logs_tail: a genuinely removed container fails inspect and lands the
+    # marker in capture_error, while a still-existing stopped container whose workload merely
+    # printed that string would otherwise be misread as removed and punished outright.
     capture_error = (diagnostics.capture_error or "").lower()
-    logs_tail = (diagnostics.logs_tail or "").lower()
-    if any(marker in capture_error or marker in logs_tail for marker in _REMOVED_MARKERS):
+    if any(marker in capture_error for marker in _REMOVED_MARKERS):
         return ContainerDeathKind.REMOVED
     if diagnostics.oom_killed:
         return ContainerDeathKind.OOM_KILLED
