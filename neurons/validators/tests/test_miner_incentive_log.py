@@ -25,6 +25,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "no_unrented_capacity_for_gpu_count",
         "nvidia_driver_below_minimum",
         "sysbox_not_enabled",
+        "vram_exceeds_disk",
     }
 
 
