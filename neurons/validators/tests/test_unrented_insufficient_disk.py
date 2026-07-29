@@ -274,6 +274,7 @@ async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
     assert "insufficient_disk_for_vram" in log
     assert "1128.0" in log  # total VRAM
     assert "500.0" in log   # total disk
+    assert [reason.reason for reason in result.zero_incentive_reasons] == ["insufficient_disk_for_vram"]
 
 
 @pytest.mark.asyncio

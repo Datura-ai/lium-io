@@ -83,7 +83,7 @@ class JobResult(BaseModel):
     # Delivery buffers with dedicated export paths (full_log_text, direct publish);
     # excluded so no model_dump ever serializes them raw.
     incentive_logs: list[str] = Field(default_factory=list, exclude=True)
-    # DAH-2340 wire reasons for the backend; [] when the executor earns normally
+    # DAH-2340 wire reasons for the backend; [] when no catalogued reason was recorded.
     zero_incentive_reasons: list[IncentiveReason] = Field(default_factory=list, exclude=True)
 
     def record_incentive_log(self, line: "MinerLogLine") -> None:

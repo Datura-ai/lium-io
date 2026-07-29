@@ -578,7 +578,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
                     job_result, insufficient_disk
                 )
-                job_result.incentive_logs.append(reason.to_log_line())
+                job_result.record_incentive_log(reason)
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
