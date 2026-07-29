@@ -179,6 +179,22 @@ def test_vloopback_volume_missing_its_backing_file_is_skipped(scrape: dict, monk
     assert total == 0
 
 
+def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, monkeypatch) -> None:
+    # Arrange — the glob finds no plugin rootfs at all, so every volume would be counted as 0.
+    # That is a structural miss, not a single unmaterialised volume: reporting 0 TB of volumes
+    # reads as "the disk is free", so it has to surface as an error key instead.
+    _stub_docker_api(scrape, {"/volumes": {"Volumes": [{"Name": "volume_full", "Driver": "vloopback"}]}})
+    monkeypatch.setitem(
+        scrape,
+        "glob",
+        type("_Glob", (), {"glob": staticmethod(lambda pattern: [])}),
+    )
+
+    # Act / Assert
+    with pytest.raises(RuntimeError):
+        scrape["get_vloopback_volume_bytes"]("/var/lib/docker")
+
+
 def _obfuscation_tables() -> tuple[set[str], set[str]]:
     """The two independent registries a scrape key has to appear in.
 
