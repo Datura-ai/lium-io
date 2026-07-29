@@ -419,14 +419,12 @@ def _should_repair_stale_mountpoint(
 
 def _should_encrypt_local_volume(
     local_volume: str | None,
-    external_volume_info: ExternalVolumeInfo | None,
     workload_kind: WorkloadKind,
     is_sysbox: bool | None,
     enable_volume_encryption: bool | None,
 ) -> bool:
     return (
         bool(local_volume)
-        and external_volume_info is None
         and workload_kind != WorkloadKind.FILLER
         and bool(is_sysbox)
         and enable_volume_encryption
@@ -434,24 +432,59 @@ def _should_encrypt_local_volume(
     )
 
 
-def _build_gocryptfs_setup_and_mount_script(plaintext_path: str) -> str:
+def _opaque_shell_name() -> str:
+    return f"_{secrets.token_hex(2)}"
+
+
+def _xor_wrap_passphrase(passphrase: str) -> tuple[str, str]:
+    raw = passphrase.encode("ascii")
+    pad = secrets.token_bytes(len(raw))
+    wrapped = bytes(a ^ b for a, b in zip(raw, pad, strict=True))
+    return pad.hex(), wrapped.hex()
+
+
+def _build_gocryptfs_setup_and_mount_script(
+    plaintext_path: str,
+    *,
+    pad_hex: str,
+    wrapped_hex: str,
+    pad_var: str,
+    wrapped_var: str,
+    passfile_path: str,
+) -> str:
     plaintext = shlex.quote(plaintext_path)
+    passfile = shlex.quote(passfile_path)
     mount_check = (
         f"awk -v target={plaintext} "
         "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
     )
+    # Random pad XOR'd into the script as hex. Opaque names. No stdin.
+    # ${v%${v#??}} / ${v#??} is portable sh for take/drop first two hex chars.
     return f"""set -e
-IFS= read -r LIUM_VOL_KEY || true
-export LIUM_VOL_KEY
+{pad_var}={pad_hex}
+{wrapped_var}={wrapped_hex}
+_pf={passfile}
+_d() {{ rm -f "$0" "$_pf" 2>/dev/null || true; unset {pad_var} {wrapped_var} _esc _x _y _pf; }}
+trap _d EXIT
 export PATH="/usr/local/bin:/usr/bin:/bin"
+_esc=
+while [ -n "${{{pad_var}}}" ]; do
+  _x=${{{pad_var}%${{{pad_var}#??}}}}
+  _y=${{{wrapped_var}%${{{wrapped_var}#??}}}}
+  {pad_var}=${{{pad_var}#??}}
+  {wrapped_var}=${{{wrapped_var}#??}}
+  _esc=$_esc$(printf '\\\\%03o' $((0x$_x ^ 0x$_y)))
+done
+printf '%b' "$_esc" > "$_pf"
+chmod 600 "$_pf"
+unset _esc _x _y {pad_var} {wrapped_var}
 mkdir -p {_LIUM_CIPHER_MOUNT} {plaintext}
 if [ ! -f {_LIUM_CIPHER_MOUNT}/gocryptfs.conf ]; then
-  gocryptfs -init {_LIUM_CIPHER_MOUNT} --extpass 'printf %s "$LIUM_VOL_KEY"'
+  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"
 fi
 if ! {mount_check}; then
-  gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} --extpass 'printf %s "$LIUM_VOL_KEY"' -o allow_other -nonempty
+  gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
 fi
-unset LIUM_VOL_KEY
 """
 
 
@@ -1853,7 +1886,6 @@ class DockerService:
         container_name: str,
         volume_name: str | None = None,
         remove_volume: bool = False,
-        teardown_encrypted_volume: bool = False,
     ) -> None:
         try:
             # DAH-2395: read the death evidence before `rm -fv` destroys it —
@@ -1864,8 +1896,6 @@ class DockerService:
                 default_extra=default_extra,
                 container_name=container_name,
             )
-            if teardown_encrypted_volume:
-                await self.teardown_encrypted_local_volume(ssh_client, container_name)
 
             container = shlex.quote(container_name)
             await retry_ssh_command(
@@ -1918,28 +1948,6 @@ class DockerService:
             )
         return (result.stdout or "").strip() == "1"
 
-    async def teardown_encrypted_local_volume(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        container_name: str,
-        plaintext_path: str = "/root",
-    ) -> None:
-        container_q = shlex.quote(container_name)
-        path_q = shlex.quote(plaintext_path)
-        cleanup_script = (
-            f"fusermount3 -u {path_q} 2>/dev/null || "
-            f"fusermount -u {path_q} 2>/dev/null || true; "
-            "pkill -f gocryptfs || true"
-        )
-        try:
-            await ssh_client.run(
-                f"/usr/bin/docker exec {container_q} sh -c "
-                f"{shlex.quote(cleanup_script)} 2>/dev/null || true",
-                check=False,
-            )
-        except Exception:
-            pass
-
     async def _encrypted_local_volume_name(
         self,
         docker_client: RentalDockerSdkClient,
@@ -1966,14 +1974,27 @@ class DockerService:
         passphrase = VolumeKeyDeriver.from_settings(settings).material(pod_id).passphrase
 
         container_q = shlex.quote(container_name)
-        setup_script_path = f"/tmp/.gcs-{uuid4().hex[:8]}.sh"
+        setup_script_path = f"/tmp/.x{uuid4().hex[:8]}"
+        passfile_path = f"/tmp/.x{uuid4().hex[:8]}"
+        pad_hex, wrapped_hex = _xor_wrap_passphrase(passphrase)
+        pad_var = _opaque_shell_name()
+        wrapped_var = _opaque_shell_name()
+        while wrapped_var == pad_var:
+            wrapped_var = _opaque_shell_name()
+
+        async def wipe_tmp_files() -> None:
+            await ssh_client.run(
+                f"/usr/bin/docker exec {container_q} rm -f "
+                f"{shlex.quote(passfile_path)} {shlex.quote(setup_script_path)}",
+                check=False,
+            )
 
         async def fail_step(step: str, message: str, result: Any | None = None) -> None:
             exit_status = getattr(result, "exit_status", None)
             stdout = (getattr(result, "stdout", "") or "")[-2000:] if result else ""
             stderr = (getattr(result, "stderr", "") or "")[-2000:] if result else ""
             await self.stream_log(
-                f"{message} (step={step}, exit_status={exit_status}, stderr={stderr or '<empty>'})",
+                f"Encrypted volume setup failed ({step})",
                 "error",
                 log_tag,
             )
@@ -1999,38 +2020,65 @@ class DockerService:
             )
 
         await self.stream_log("Setting up encrypted local volume", "info", log_tag)
+        logger.info(
+            _m(
+                "Encrypted volume setup started",
+                extra=get_extra_info({
+                    **log_extra,
+                    "container_name": container_name,
+                    "plaintext_path": plaintext_path,
+                    "cipher_mount": _LIUM_CIPHER_MOUNT,
+                    "volume_name": volume_name,
+                    "pod_id": pod_id,
+                }),
+            )
+        )
 
-        setup_script = _build_gocryptfs_setup_and_mount_script(plaintext_path)
-        setup_heredoc = f"__LIUM_GOCRYPTFS_SETUP_{uuid4().hex}__"
+        setup_script = _build_gocryptfs_setup_and_mount_script(
+            plaintext_path,
+            pad_hex=pad_hex,
+            wrapped_hex=wrapped_hex,
+            pad_var=pad_var,
+            wrapped_var=wrapped_var,
+            passfile_path=passfile_path,
+        )
+        setup_heredoc = f"__SETUP_{uuid4().hex}__"
         upload_cmd = (
             f"/usr/bin/docker exec -i {container_q} sh -c "
-            f"\"cat > {setup_script_path} && chmod +x {setup_script_path}\" "
+            f"\"cat > {setup_script_path}\" "
             f"<< '{setup_heredoc}'\n"
             f"{setup_script}\n"
             f"{setup_heredoc}"
         )
-        await self.stream_log("Uploading gocryptfs setup script into container", "info", log_tag)
+        logger.info(
+            _m(
+                "Uploading encrypted-volume setup script",
+                extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
+            )
+        )
         upload_result = await ssh_client.run(upload_cmd)
         if upload_result.exit_status != 0:
+            await wipe_tmp_files()
             await fail_step(
                 "upload_setup_script",
                 "Failed to upload gocryptfs setup script into container",
                 upload_result,
             )
 
-        await self.stream_log("Installing, initializing, or mounting gocryptfs inside container", "info", log_tag)
+        logger.info(
+            _m(
+                "Running gocryptfs init/mount",
+                extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
+            )
+        )
         mount_result = await ssh_client.run(
-            f"/usr/bin/docker exec -i {container_q} sh {shlex.quote(setup_script_path)}",
-            input=passphrase,
+            f"/usr/bin/docker exec {container_q} sh {shlex.quote(setup_script_path)}",
         )
-        await ssh_client.run(
-            f"/usr/bin/docker exec {container_q} rm -f {shlex.quote(setup_script_path)}",
-            check=False,
-        )
+        await wipe_tmp_files()
         if mount_result.exit_status != 0:
             await fail_step(
                 "setup_or_mount",
-                "Failed to install, initialize, or mount gocryptfs inside container",
+                "Failed to initialize or mount gocryptfs inside container",
                 mount_result,
             )
 
@@ -2038,7 +2086,17 @@ class DockerService:
             f"awk -v target={shlex.quote(plaintext_path)} "
             "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
         )
-        await self.stream_log("Verifying gocryptfs mount inside container", "info", log_tag)
+        logger.info(
+            _m(
+                "Verifying gocryptfs mount",
+                extra=get_extra_info({
+                    **log_extra,
+                    "container_name": container_name,
+                    "plaintext_path": plaintext_path,
+                    "pod_id": pod_id,
+                }),
+            )
+        )
         verify_result = await ssh_client.run(
             f"/usr/bin/docker exec {container_q} sh -lc {shlex.quote(verify_mount_script)}"
         )
@@ -2669,10 +2727,13 @@ class DockerService:
                 raise_exception=False,
             )
         else:
+            # docker cp cannot write into a gocryptfs FUSE mount. Stage in /tmp, then exec.
             target_path = local_volume_path if encrypted_local_volume else "/root"
+            container_q = shlex.quote(container_name)
+            target_q = shlex.quote(target_path)
             command = (
-                f"/usr/bin/docker exec {shlex.quote(container_name)} "
-                f"sh -c {shlex.quote(f'mkdir -p {shlex.quote(target_path)}')}"
+                f"/usr/bin/docker exec {container_q} "
+                f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2684,7 +2745,7 @@ class DockerService:
             )
             command = (
                 f"/usr/bin/docker cp /root/app/run_jupyter.sh "
-                f"{shlex.quote(container_name)}:{shlex.quote(target_path)}/run_jupyter.sh"
+                f"{container_q}:/tmp/run_jupyter.sh"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2692,23 +2753,23 @@ class DockerService:
                 log_tag=log_tag,
                 log_text="Copying run_jupyter.sh to container",
                 log_extra=log_extra,
-                raise_exception=True
+                raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec {shlex.quote(container_name)} "
-                f"sh -c {shlex.quote(f'chmod +x {shlex.quote(target_path)}/run_jupyter.sh')}"
+                f"/usr/bin/docker exec {container_q} "
+                f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
                 log_tag=log_tag,
-                log_text="chmod +x run_jupyter.sh",
+                log_text="Installing run_jupyter.sh",
                 log_extra=log_extra,
-                raise_exception=True
+                raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec {shlex.quote(container_name)} sh -c "
-                f"{shlex.quote(f'{shlex.quote(target_path)}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}')}"
+                f"/usr/bin/docker exec {container_q} sh -c "
+                f"{shlex.quote(f'{target_q}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2716,7 +2777,7 @@ class DockerService:
                 log_tag=log_tag,
                 log_text="Running jupyter",
                 log_extra=log_extra,
-                raise_exception=False
+                raise_exception=False,
             )
 
         # Only raise exception for actual errors, not warnings or info messages
@@ -4063,7 +4124,6 @@ class DockerService:
                 external_volume_name = None
                 use_encrypted_volume = _should_encrypt_local_volume(
                     local_volume,
-                    external_volume_info,
                     payload.workload_kind,
                     payload.is_sysbox,
                     payload.enable_volume_encryption,
@@ -4308,7 +4368,6 @@ class DockerService:
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
-                        teardown_encrypted_volume=use_encrypted_volume,
                     )
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure.
                     if is_custom_build:
@@ -4332,22 +4391,22 @@ class DockerService:
 
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
-                if use_encrypted_volume:
-                    current_step = "encrypted_volume_setup"
-                    await self.setup_encrypted_local_volume(
-                        ssh_client=ssh_client,
-                        container_name=container_name,
-                        plaintext_path=local_volume_path,
-                        volume_name=local_volume,
-                        pod_id=payload.pod_id,
-                        log_tag=log_tag,
-                        log_extra=default_extra,
-                    )
-                    volume_encryption_status = VolumeEncryptionStatus.ENABLED
-                    profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
-                    prev_timestamp = now_ms()
-
                 try:
+                    if use_encrypted_volume:
+                        current_step = "encrypted_volume_setup"
+                        await self.setup_encrypted_local_volume(
+                            ssh_client=ssh_client,
+                            container_name=container_name,
+                            plaintext_path=local_volume_path,
+                            volume_name=local_volume,
+                            pod_id=payload.pod_id,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                        volume_encryption_status = VolumeEncryptionStatus.ENABLED
+                        profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
+                        prev_timestamp = now_ms()
+
                     # DAH-2341: inject the customer's public keys before the sshd
                     # bootstrap. The keys are plain data (mkdir + append) with no
                     # dependency on a running sshd, and the bootstrap may now spend
@@ -4468,7 +4527,6 @@ class DockerService:
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
-                        teardown_encrypted_volume=use_encrypted_volume,
                     )
                     # DAH-2211: inline cleanup of custom-build artifacts on post-run failure.
                     if is_custom_build:
@@ -4802,7 +4860,7 @@ class DockerService:
                         await self.setup_encrypted_local_volume(
                             ssh_client=ssh_client,
                             container_name=payload.container_name,
-                            plaintext_path="/root",
+                            plaintext_path=payload.local_volume_path,
                             volume_name=encrypted_volume_name,
                             pod_id=payload.pod_id,
                             log_tag=f"start_container_{payload.pod_id}",
@@ -5022,16 +5080,6 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
-                encrypted_volume_name = await self._encrypted_local_volume_name(
-                    docker_client,
-                    payload.container_name,
-                )
-                if encrypted_volume_name:
-                    await self.teardown_encrypted_local_volume(
-                        ssh_client,
-                        payload.container_name,
-                    )
-
                 await self._stop_container_gracefully(docker_client, payload, log)
 
                 # Fatal boundary: the forced removal is the only step whose failure fails the

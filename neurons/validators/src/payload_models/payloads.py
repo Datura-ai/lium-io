@@ -339,6 +339,7 @@ class ExecutorRentFinishedRequest(ContainerBaseRequest):
 class ContainerStartRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStartRequest
     container_name: str
+    local_volume_path: str
 
 
 class AddSshPublicKeyRequest(ContainerBaseRequest):
@@ -392,6 +393,8 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_target_path: str
     auth_token: str  # JWT for progress updates
     backup_log_id: str
+    volume_encrypted: bool = False
+    container_name: str | None = None
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -403,6 +406,8 @@ class RestoreContainerRequest(ContainerBaseRequest):
     auth_token: str  # JWT for progress updates
     restore_log_id: str
     restore_path: str
+    volume_encrypted: bool = False
+    container_name: str | None = None
 
 
 ##############################################################

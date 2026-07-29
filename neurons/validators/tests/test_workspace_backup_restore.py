@@ -202,11 +202,17 @@ def _docker_run_side_effect(
     ps_output: str,
     inspect_outputs: dict[str, str],
     running: dict[str, bool] | None = None,
+    ps_all_output: str | None = None,
+    gocryptfs_conf_returncode: int = 1,
 ):
     running = running or {}
+    if ps_all_output is None:
+        ps_all_output = ps_output
 
     def fake_run(command, **kwargs):
         if command[:2] == ["/usr/bin/docker", "ps"]:
+            if "-a" in command:
+                return SimpleNamespace(returncode=0, stdout=ps_all_output, stderr="")
             return SimpleNamespace(returncode=0, stdout=ps_output, stderr="")
         if command[:3] == ["/usr/bin/docker", "inspect", "-f"]:
             if command[3] == "{{.State.Running}}":
@@ -219,6 +225,13 @@ def _docker_run_side_effect(
                 stdout=inspect_outputs.get(container_name, ""),
                 stderr="",
             )
+        if (
+            command[:3] == ["/usr/bin/docker", "run", "--rm"]
+            and "--entrypoint" in command
+            and command[command.index("--entrypoint") + 1] == "test"
+            and command[-2:] == ["-f", "/probe/gocryptfs.conf"]
+        ):
+            return SimpleNamespace(returncode=gocryptfs_conf_returncode, stdout="", stderr="")
         raise AssertionError(f"unexpected docker command: {command}")
 
     return fake_run
@@ -230,6 +243,7 @@ def test_detect_volume_access_plain_when_no_cipher_mount(monkeypatch):
         _docker_run_side_effect(
             ps_output="other-pod\n",
             inspect_outputs={"other-pod": "source-volume\t/root\n"},
+            gocryptfs_conf_returncode=1,
         ),
     )
 
@@ -282,6 +296,52 @@ def test_detect_volume_access_encrypted_requires_running_container(monkeypatch):
 
     with pytest.raises(RuntimeError, match="not running"):
         detect_volume_access("source-volume", "/root")
+
+
+def test_detect_volume_access_raises_when_stopped_container_has_cipher_mount(monkeypatch):
+    monkeypatch.setattr(
+        "workspace_mount.subprocess.run",
+        _docker_run_side_effect(
+            ps_output="",
+            ps_all_output="stopped-pod\n",
+            inspect_outputs={"stopped-pod": "source-volume\t/lium-cipher\n"},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="encrypted.*no running container.*/lium-cipher"):
+        detect_volume_access("source-volume", "/root")
+
+
+def test_detect_volume_access_raises_when_gocryptfs_conf_present(monkeypatch):
+    monkeypatch.setattr(
+        "workspace_mount.subprocess.run",
+        _docker_run_side_effect(
+            ps_output="",
+            ps_all_output="",
+            inspect_outputs={},
+            gocryptfs_conf_returncode=0,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="gocryptfs.conf.*no running container.*/lium-cipher"):
+        detect_volume_access("source-volume", "/root")
+
+
+def test_detect_volume_access_plain_when_gocryptfs_conf_absent(monkeypatch):
+    monkeypatch.setattr(
+        "workspace_mount.subprocess.run",
+        _docker_run_side_effect(
+            ps_output="",
+            ps_all_output="",
+            inspect_outputs={},
+            gocryptfs_conf_returncode=1,
+        ),
+    )
+
+    access = detect_volume_access("source-volume", "/root")
+
+    assert access.encrypted is False
+    assert access.container_name is None
 
 
 class _FakeSftpContext:

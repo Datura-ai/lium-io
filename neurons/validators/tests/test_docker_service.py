@@ -2303,6 +2303,7 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
         executor_id=str(uuid4()),
         pod_id="pod-id",
         container_name="pod_test",
+        local_volume_path="/root",
     )
     executor_info = ExecutorSSHInfo(
         uuid=str(uuid4()),
@@ -2360,6 +2361,7 @@ async def test_start_container_logs_ssh_bootstrap_failure_and_keeps_starting(doc
         executor_id=str(uuid4()),
         pod_id="pod-id",
         container_name="pod_test",
+        local_volume_path="/root",
     )
     executor_info = ExecutorSSHInfo(
         uuid=str(uuid4()),
@@ -2405,6 +2407,7 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
         executor_id=str(uuid4()),
         pod_id="pod-id",
         container_name="pod_test",
+        local_volume_path="/root",
     )
     executor_info = ExecutorSSHInfo(
         uuid=str(uuid4()),
@@ -2456,6 +2459,7 @@ async def test_start_container_remounts_when_container_state_is_encrypted(docker
         executor_id=str(uuid4()),
         pod_id="pod-id",
         container_name="pod_test",
+        local_volume_path="/workspace",
     )
     executor_info = ExecutorSSHInfo(
         uuid=str(uuid4()),
@@ -2474,10 +2478,10 @@ async def test_start_container_remounts_when_container_state_is_encrypted(docker
     docker_service.setup_encrypted_local_volume.assert_awaited_once_with(
         ssh_client=ssh_client,
         container_name="pod_test",
-        plaintext_path="/root",
+        plaintext_path="/workspace",
         volume_name="volume_test",
-        pod_id="pod-id",
         log_tag="start_container_pod-id",
+        pod_id="pod-id",
         log_extra={
             "miner_hotkey": "miner-hotkey",
             "executor_uuid": payload.executor_id,
@@ -2487,6 +2491,56 @@ async def test_start_container_remounts_when_container_state_is_encrypted(docker
             "executor_ssh_port": 2200,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_start_container_fails_when_encrypted_setup_fails(docker_service, monkeypatch):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=""))
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = (
+        AsyncMock(return_value=True)
+    )
+    docker_service.setup_encrypted_local_volume = AsyncMock(side_effect=RuntimeError("mount failed"))
+    monkeypatch.setattr(docker_service, "_encrypted_local_volume_name", AsyncMock(return_value="volume_test"))
+
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+        local_volume_path="/workspace",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.start_container(
+        payload,
+        executor_info,
+        Mock(ss58_address="validator-hotkey"),
+        "encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
+    assert docker_service.rental_docker_client_factory.client.stopped_containers == []
 
 
 @pytest.mark.asyncio
@@ -2561,6 +2615,7 @@ async def test_stop_container_sdk_failure_returns_failed_request_without_shell_f
                 executor_id=str(uuid4()),
                 pod_id="pod-id",
                 container_name="pod_test",
+                local_volume_path="/root",
             ),
             FailedContainerErrorTypes.ContainerStartFailed,
         ),
@@ -4818,40 +4873,24 @@ def test_should_encrypt_local_volume_requires_local_sysbox_customer_volume(monke
 
     assert _should_encrypt_local_volume(
         "volume_test",
-        None,
         WorkloadKind.CUSTOMER_RENTAL,
         True,
         True,
     )
     assert not _should_encrypt_local_volume(
         "volume_test",
-        ExternalVolumeInfo(
-            name="s3vol",
-            plugin="s3fs",
-            iam_user_access_key="key",
-            iam_user_secret_key="secret",
-        ),
-        WorkloadKind.CUSTOMER_RENTAL,
-        True,
-        True,
-    )
-    assert not _should_encrypt_local_volume(
-        "volume_test",
-        None,
         WorkloadKind.FILLER,
         True,
         True,
     )
     assert not _should_encrypt_local_volume(
         "volume_test",
-        None,
         WorkloadKind.CUSTOMER_RENTAL,
         False,
         True,
     )
     assert not _should_encrypt_local_volume(
         "volume_test",
-        None,
         WorkloadKind.CUSTOMER_RENTAL,
         True,
         False,
@@ -5210,7 +5249,77 @@ async def test_create_container_encrypted_setup_runs_before_ssh_bootstrap(
 
 
 @pytest.mark.asyncio
-async def test_create_container_s3fs_external_volume_skips_encrypted_mount(
+async def test_create_container_encrypted_setup_failure_cleans_up(
+    docker_service,
+    monkeypatch,
+):
+    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
+    setup_spy = AsyncMock(side_effect=RuntimeError("mount failed"))
+    monkeypatch.setattr(
+        docker_service,
+        "setup_encrypted_local_volume",
+        setup_spy,
+    )
+    cleanup_spy = AsyncMock()
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup_spy)
+
+    pod_id = str(uuid4())
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=pod_id,
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="custom/with-label:1",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        is_sysbox=True,
+        enable_volume_encryption=True,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    setup_spy.assert_awaited_once()
+    cleanup_spy.assert_awaited_once()
+    cleanup_kwargs = cleanup_spy.await_args.kwargs
+    assert cleanup_kwargs["ssh_client"] is ssh_client
+    assert cleanup_kwargs["container_name"] == f"pod_{pod_id}"
+    assert cleanup_kwargs["volume_name"] == f"volume_{pod_id}"
+    assert cleanup_kwargs["remove_volume"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_container_s3fs_external_volume_keeps_encrypted_local_mount(
     docker_service,
     monkeypatch,
 ):
@@ -5226,6 +5335,7 @@ async def test_create_container_s3fs_external_volume_skips_encrypted_mount(
         "create_s3fs_volume",
         AsyncMock(return_value=(True, "ok")),
     )
+    monkeypatch.setattr(docker_service, "_image_has_encrypted_volume_label", AsyncMock(return_value=True))
     setup_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "setup_encrypted_local_volume", setup_spy)
 
@@ -5267,7 +5377,7 @@ async def test_create_container_s3fs_external_volume_skips_encrypted_mount(
     )
     keypair = Mock(ss58_address="validator-hotkey")
 
-    await docker_service.create_container(
+    result = await docker_service.create_container(
         payload=payload,
         executor_info=executor_info,
         keypair=keypair,
@@ -5276,10 +5386,12 @@ async def test_create_container_s3fs_external_volume_skips_encrypted_mount(
 
     run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
     volume_name = f"volume_{pod_id}"
-    assert not any(volume.source == volume_name and volume.target == _LIUM_CIPHER_MOUNT for volume in run_spec.volumes)
-    assert any(volume.source == volume_name and volume.target == "/root" for volume in run_spec.volumes)
-    assert not any(device.path_on_host == "/dev/fuse" for device in run_spec.devices)
-    setup_spy.assert_not_awaited()
+    assert any(volume.source == volume_name and volume.target == _LIUM_CIPHER_MOUNT for volume in run_spec.volumes)
+    assert not any(volume.source == volume_name and volume.target == "/root" for volume in run_spec.volumes)
+    assert any(volume.source == "s3-external" and volume.target == "/mnt" for volume in run_spec.volumes)
+    assert any(device.path_on_host == "/dev/fuse" for device in run_spec.devices)
+    setup_spy.assert_awaited_once()
+    assert result.volume_encryption_status == VolumeEncryptionStatus.ENABLED
 
 
 @pytest.mark.asyncio
@@ -5343,68 +5455,6 @@ async def test_create_container_filler_skips_encrypted_volume_setup(
 
 
 @pytest.mark.asyncio
-async def test_delete_container_teardowns_gocryptfs_before_remove(
-    docker_service,
-    retry_ssh_mock,
-    monkeypatch,
-):
-    monkeypatch.setattr(docker_service_module.settings, "ENABLE_VOLUME_ENCRYPTION", True)
-    monkeypatch.setattr(
-        docker_service_module.settings,
-        "VOLUME_MASTER_SECRET",
-        "test-master-secret-32-chars-long!!",
-    )
-    ssh_client = _patch_delete_container_connect(docker_service, monkeypatch, retry_ssh_mock)
-    teardown_spy = AsyncMock()
-    monkeypatch.setattr(docker_service, "teardown_encrypted_local_volume", teardown_spy)
-    monkeypatch.setattr(docker_service, "_encrypted_local_volume_name", AsyncMock(return_value="volume_test"))
-
-    payload = ContainerDeleteRequest(
-        miner_hotkey="miner",
-        executor_id=str(uuid4()),
-        pod_id=str(uuid4()),
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        container_name="pod_test",
-        local_volume="volume_test",
-    )
-    executor_info = ExecutorSSHInfo(
-        uuid=payload.executor_id,
-        address="127.0.0.1",
-        port=8080,
-        ssh_username="root",
-        ssh_port=2200,
-        python_path="/usr/bin/python",
-        root_dir="/root/app",
-        ssh_host_key=FAKE_SSH_HOST_KEY,
-    )
-    keypair = Mock(ss58_address="validator-hotkey")
-
-    await docker_service.delete_container(
-        payload=payload,
-        executor_info=executor_info,
-        keypair=keypair,
-        private_key="encrypted",
-    )
-
-    teardown_spy.assert_awaited_once_with(ssh_client, "pod_test")
-
-
-@pytest.mark.asyncio
-async def test_teardown_encrypted_local_volume_unmounts_before_killing_gocryptfs(docker_service):
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock()
-
-    await docker_service.teardown_encrypted_local_volume(ssh_client, "pod_test")
-
-    command = ssh_client.run.await_args.args[0]
-    assert "/usr/bin/docker exec pod_test sh -c" in command
-    assert "fusermount3 -u /root" in command
-    assert "fusermount -u /root" in command
-    assert command.index("fusermount3 -u /root") < command.index("pkill -f gocryptfs")
-    ssh_client.run.assert_awaited_once_with(command, check=False)
-
-
-@pytest.mark.asyncio
 async def test_run_jupyter_with_encrypted_volume_copies_to_plaintext_mount(
     docker_service,
 ):
@@ -5429,7 +5479,9 @@ async def test_run_jupyter_with_encrypted_volume_copies_to_plaintext_mount(
         call.kwargs["command"]
         for call in docker_service.execute_and_stream_logs.await_args_list
     ]
-    assert any("docker cp /root/app/run_jupyter.sh pod_test:/root/run_jupyter.sh" in command for command in commands)
+    assert any("docker cp /root/app/run_jupyter.sh pod_test:/tmp/run_jupyter.sh" in command for command in commands)
+    assert any("cp /tmp/run_jupyter.sh /root/run_jupyter.sh" in command for command in commands)
+    assert all("pod_test:/root/run_jupyter.sh" not in command for command in commands)
     assert all("volume_test:/mnt" not in command for command in commands)
     assert all(_LIUM_CIPHER_MOUNT not in command for command in commands)
 
@@ -5469,26 +5521,33 @@ async def test_setup_encrypted_local_volume_does_not_log_key(docker_service, cap
     assert all("docker cp" not in command for command in commands)
     assert all(master_secret not in command for command in commands)
     assert all(passphrase not in command for command in commands)
-    mount_inputs = [
-        call.kwargs.get("input")
-        for call in ssh_client.run.await_args_list
-        if call.kwargs.get("input")
-    ]
-    assert passphrase in mount_inputs
+    assert all(call.kwargs.get("input") is None for call in ssh_client.run.await_args_list)
+    upload_cmds = [cmd for cmd in commands if "cat >" in cmd and "/tmp/.x" in cmd]
+    assert upload_cmds
+    assert passphrase not in upload_cmds[0]
+    assert passphrase.encode("ascii").hex() not in upload_cmds[0]
 
 
-def _run_gocryptfs_setup_script_in_sandbox(script: str, passphrase_input: str) -> int:
+def _run_gocryptfs_setup_script_in_sandbox(script: str) -> tuple[int, str, str]:
     workdir = tempfile.mkdtemp()
     stub_bin = os.path.join(workdir, "stub_bin")
     os.makedirs(stub_bin)
     gocryptfs_stub = os.path.join(stub_bin, "gocryptfs")
     with open(gocryptfs_stub, "w") as handle:
-        handle.write("#!/bin/sh\nexit 0\n")
+        handle.write(
+            "#!/bin/sh\n"
+            'for arg in "$@"; do\n'
+            '  [ "$arg" = "-passfile" ] && exit 0\n'
+            "done\n"
+            "exit 1\n"
+        )
     os.chmod(gocryptfs_stub, os.stat(gocryptfs_stub).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    script_path = os.path.join(workdir, "setup.sh")
-    with open(script_path, "w") as handle:
+    sandbox_script_path = f"/tmp/.x{uuid4().hex[:8]}"
+    host_script = os.path.join(workdir, "setup.sh")
+    with open(host_script, "w") as handle:
         handle.write(script)
 
+    bootstrap = f"cp /seed/setup.sh {sandbox_script_path} && exec /bin/sh {sandbox_script_path}"
     bwrap_cmd = [
         "bwrap",
         "--ro-bind", "/usr", "/usr",
@@ -5499,25 +5558,63 @@ def _run_gocryptfs_setup_script_in_sandbox(script: str, passphrase_input: str) -
         bwrap_cmd += ["--ro-bind", "/lib64", "/lib64"]
     bwrap_cmd += [
         "--ro-bind", stub_bin, "/usr/local/bin",
-        "--ro-bind", script_path, "/setup.sh",
+        "--ro-bind", workdir, "/seed",
         "--tmpfs", "/tmp",
         "--tmpfs", _LIUM_CIPHER_MOUNT,
         "--tmpfs", "/root",
         "--tmpfs", "/etc",
         "--proc", "/proc",
         "--dev", "/dev",
-        "--", "/bin/sh", "/setup.sh",
+        "--", "/bin/sh", "-c", bootstrap,
     ]
-    result = subprocess.run(bwrap_cmd, input=passphrase_input, capture_output=True, text=True)
-    return result.returncode
+    result = subprocess.run(bwrap_cmd, capture_output=True, text=True)
+    return result.returncode, result.stdout, result.stderr
+
+
+def test_xor_wrap_roundtrip_in_sh():
+    from services.docker_service import _xor_wrap_passphrase
+
+    passphrase = "derived-pass"
+    pad_hex, wrapped_hex = _xor_wrap_passphrase(passphrase)
+    assert passphrase.encode("ascii").hex() not in (pad_hex, wrapped_hex)
+    recover = """
+set -e
+_a=PAD
+_b=WRAP
+_esc=
+while [ -n "$_a" ]; do
+  _x=${_a%${_a#??}}
+  _y=${_b%${_b#??}}
+  _a=${_a#??}
+  _b=${_b#??}
+  _esc=$_esc$(printf '\\\\%03o' $((0x$_x ^ 0x$_y)))
+done
+printf '%b' "$_esc"
+""".replace("PAD", pad_hex).replace("WRAP", wrapped_hex)
+    result = subprocess.run(["sh", "-c", recover], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == passphrase
 
 
 @pytest.mark.skipif(shutil.which("bwrap") is None, reason="bwrap required to sandbox the real setup script")
-def test_gocryptfs_setup_script_survives_passphrase_without_trailing_newline():
-    script = _build_gocryptfs_setup_and_mount_script("/root")
+def test_gocryptfs_setup_script_xor_material_no_stdin():
+    from services.docker_service import _xor_wrap_passphrase
 
-    assert _run_gocryptfs_setup_script_in_sandbox(script, "derived-pass") == 0
-
-    pre_fix_script = script.replace("IFS= read -r LIUM_VOL_KEY || true", "read -r LIUM_VOL_KEY")
-    assert pre_fix_script != script
-    assert _run_gocryptfs_setup_script_in_sandbox(pre_fix_script, "derived-pass") == 1
+    passphrase = "derived-pass"
+    pad_hex, wrapped_hex = _xor_wrap_passphrase(passphrase)
+    script = _build_gocryptfs_setup_and_mount_script(
+        "/root",
+        pad_hex=pad_hex,
+        wrapped_hex=wrapped_hex,
+        pad_var="_a9f2",
+        wrapped_var="_c0e7",
+        passfile_path=f"/tmp/.x{uuid4().hex[:8]}",
+    )
+    assert "LIUM_VOL_KEY" not in script
+    assert "read -r" not in script
+    assert passphrase not in script
+    assert pad_hex in script
+    assert wrapped_hex in script
+    assert "-passfile" in script
+    rc, stdout, stderr = _run_gocryptfs_setup_script_in_sandbox(script)
+    assert rc == 0, f"stdout={stdout!r} stderr={stderr!r}"

@@ -56,18 +56,18 @@ def require_container_running(container_name: str) -> None:
         raise RuntimeError(f"Container {container_name} is not running; backup and restore require a running pod")
 
 
-def _running_containers_for_volume(volume_name: str) -> list[str]:
-    result = subprocess.run(
+def _running_containers_for_volume(volume_name: str, *, all_containers: bool = False) -> list[str]:
+    command = ["/usr/bin/docker", "ps"]
+    if all_containers:
+        command.append("-a")
+    command.extend(
         [
-            "/usr/bin/docker",
-            "ps",
             f"--filter=volume={volume_name}",
             "--format",
             "{{.Names}}",
-        ],
-        capture_output=True,
-        text=True,
+        ]
     )
+    result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         return []
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
@@ -88,6 +88,25 @@ def _container_volume_mount_destination(container_name: str, volume_name: str) -
             return parts[1]
     return None
 
+
+def _volume_has_gocryptfs_conf(volume_name: str) -> bool:
+    result = subprocess.run(
+        [
+            "/usr/bin/docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{volume_name}:/probe:ro",
+            "--entrypoint",
+            "test",
+            "daturaai/aws-cli",
+            "-f",
+            "/probe/gocryptfs.conf",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 @dataclass(frozen=True)
 class VolumeAccess:
@@ -139,4 +158,20 @@ def detect_volume_access(volume_name: str, volume_path: str) -> VolumeAccess:
             encrypted=True,
             container_name=container_name,
         )
+
+    for container_name in _running_containers_for_volume(volume_name, all_containers=True):
+        destination = _container_volume_mount_destination(container_name, volume_name)
+        if destination == LIUM_CIPHER_MOUNT:
+            raise RuntimeError(
+                f"Volume {volume_name} is encrypted (gocryptfs mount at {LIUM_CIPHER_MOUNT} "
+                f"on container {container_name}) but no running container mounts it at "
+                f"{LIUM_CIPHER_MOUNT}; refusing plain backup/restore of ciphertext"
+            )
+
+    if _volume_has_gocryptfs_conf(volume_name):
+        raise RuntimeError(
+            f"Volume {volume_name} contains gocryptfs.conf but no running container "
+            f"mounts it at {LIUM_CIPHER_MOUNT}; refusing plain backup/restore of ciphertext"
+        )
+
     return VolumeAccess(volume_name=volume_name, volume_path=volume_path, encrypted=False)
