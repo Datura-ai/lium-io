@@ -204,13 +204,18 @@ class FallbackVerifier:
 
 
 class SemiBatchVerifier:
-    """Verifies ports by publishing a whole batch in ONE container via -p.
+    """Verifies ports by publishing them via -p, in one container per chunk.
 
     Middle tier of the cascade: published ports are reached through the nat/DOCKER
     DNAT chain, so they survive a ufw default-deny INPUT policy — the same policy
     that silently drops BatchVerifier's --network=host listeners. Returns nothing
-    verified if the container cannot start, letting the caller fall through.
+    verified if every chunk fails to start, letting the caller fall through.
     """
+
+    # docker refuses the whole `run` when a single published port is already allocated, so the
+    # chunk size is the blast radius of one busy port (DAH-2527: idle fillers take the same low
+    # ports this tier probes). Ten matches the sequential tier's cap.
+    CHUNK_SIZE = 10
 
     def __init__(self, port_tester: PortTester, runner: ContainerRunner):
         self.port_tester = port_tester
@@ -225,21 +230,46 @@ class SemiBatchVerifier:
         max_ports: int = 50,
         log_ctx: dict | None = None,
     ) -> tuple[list[PortPair], list[PortPair]]:
-        """Publish up to max_ports in one container, then probe them concurrently."""
+        """Publish up to max_ports in chunked containers, then probe them concurrently."""
         log_ctx = log_ctx or {}
         ports_to_test = ports[:max_ports]
-        token = uuid.uuid4().hex
-        container_name = f"port_test_pub_{token[:8]}"
-        script = NetcatScript.batch(ports_to_test, token, 0)
-        # external differs from internal when the miner advertises port_mappings
-        publish_flags = " ".join(f"-p {port.external}:{port.internal}" for port in ports_to_test)
+        chunks = [
+            ports_to_test[start : start + self.CHUNK_SIZE]
+            for start in range(0, len(ports_to_test), self.CHUNK_SIZE)
+        ]
 
         logger.info(
             _m(
-                f"semi-batch: publishing {len(ports_to_test)} ports in one container",
+                f"semi-batch: publishing {len(ports_to_test)} ports in {len(chunks)} containers",
                 extra=get_extra_info(log_ctx),
             )
         )
+
+        chunk_results = await asyncio.gather(
+            *(self._verify_chunk(chunk, ssh_client=ssh_client, host=host, log_ctx=log_ctx) for chunk in chunks)
+        )
+        successful = [port for chunk_successful, _ in chunk_results for port in chunk_successful]
+        failed = [port for _, chunk_failed in chunk_results for port in chunk_failed]
+
+        logger.info(
+            _m(f"semi-batch: {len(successful)}/{len(ports_to_test)} verified", extra=get_extra_info(log_ctx))
+        )
+        return successful, failed
+
+    async def _verify_chunk(
+        self,
+        ports: list[PortPair],
+        *,
+        ssh_client: SSHClientConnection,
+        host: str,
+        log_ctx: dict,
+    ) -> tuple[list[PortPair], list[PortPair]]:
+        """Publish one chunk in one container; a chunk that cannot start fails only its own ports."""
+        token = uuid.uuid4().hex
+        container_name = f"port_test_pub_{token[:8]}"
+        script = NetcatScript.batch(ports, token, 0)
+        # external differs from internal when the miner advertises port_mappings
+        publish_flags = " ".join(f"-p {port.external}:{port.internal}" for port in ports)
 
         # any error below must not escape: an exception here would zero the whole
         # verification (fatal PortCountCheck) instead of falling through to the
@@ -252,21 +282,22 @@ class SemiBatchVerifier:
             if not start_result.ok:
                 logger.warning(
                     _m(
-                        f"semi-batch start failed: status={start_result.status} logs={start_result.logs}",
+                        f"semi-batch start failed for {len(ports)} ports: "
+                        f"status={start_result.status} logs={start_result.logs}",
                         extra=get_extra_info(log_ctx),
                     )
                 )
-                return [], ports_to_test
+                return [], ports
 
             started = True
             async with aiohttp.ClientSession() as session:
-                successful, failed = await self.port_tester.test_many(session, host, ports_to_test, token)
+                return await self.port_tester.test_many(session, host, ports, token)
 
         except Exception as e:
             logger.error(
                 _m(f"semi-batch: error: {str(e)[:100]}", extra=get_extra_info(log_ctx))
             )
-            return [], ports_to_test
+            return [], ports
 
         finally:
             if started:
@@ -276,8 +307,3 @@ class SemiBatchVerifier:
                     logger.warning(
                         _m(f"semi-batch: cleanup failed: {str(e)[:50]}", extra=get_extra_info(log_ctx))
                     )
-
-        logger.info(
-            _m(f"semi-batch: {len(successful)}/{len(ports_to_test)} verified", extra=get_extra_info(log_ctx))
-        )
-        return successful, failed

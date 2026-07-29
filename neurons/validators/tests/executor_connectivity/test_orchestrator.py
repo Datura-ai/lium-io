@@ -54,6 +54,30 @@ async def test_orchestrator_success(sample_executor_info, mock_ssh_client, mocke
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_excludes_rented_and_filler_ports(sample_executor_info, mock_ssh_client, mocker):
+    # DAH-2527: filler ports arrive separately from rented ones, but the selector must see one set
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = []
+
+    orchestrator = ConnectivityOrchestrator(
+        port_selector,
+        mocker.Mock(spec=PortProbe),
+        mocker.Mock(spec=DindProbe),
+    )
+
+    await orchestrator.verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=False,
+        rented_ports=[40100],
+        excluded_ports=[40001, 40003],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert port_selector.select.call_args.args[2] == {40001, 40003, 40100}
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_no_ports(sample_executor_info, mock_ssh_client, mocker):
     port_selector = mocker.Mock(spec=PortSelector)
     port_selector.select.return_value = []

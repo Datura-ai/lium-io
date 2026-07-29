@@ -1,6 +1,7 @@
 import pytest
 from dataclasses import dataclass, field
 
+from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from neurons.validators.src.services.executor_connectivity.models import PortPair, PortVerificationResult
 from neurons.validators.src.services.task.checks.port_connectivity import PortConnectivityCheck
 from neurons.validators.src.services.task.messages import PortConnectivityMessages as Msg
@@ -60,6 +61,7 @@ class DummyConnectivityService:
         sysbox_runtime: bool,
         rented_ports: list[int] | None = None,
         rented_pod_names: list[str] | None = None,
+        excluded_ports: list[int] | None = None,
         log_ctx: dict | None = None,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
@@ -68,6 +70,8 @@ class DummyConnectivityService:
             "miner_hotkey": miner_hotkey,
             "executor_uuid": executor_info.uuid,
             "sysbox_runtime": sysbox_runtime,
+            "rented_ports": rented_ports,
+            "excluded_ports": excluded_ports,
         }
 
         if self.verified_port_count:
@@ -185,6 +189,35 @@ async def test_port_connectivity_check(
                 assert result.updates["state"].verified_port_count == 100
             else:
                 assert result.updates["state"].verified_port_count == 0
+
+
+@pytest.mark.asyncio
+async def test_port_connectivity_passes_filler_ports_as_exclusions(context_factory):
+    """DAH-2527: an idle filler holds ports without creating a pod, so this executor has no entry
+    in rented_data.executors at all. Its ports must still reach verification as exclusions, and
+    must not arrive as rented_ports — a non-empty rented_ports means "has a rental" downstream."""
+    connectivity_service = DummyConnectivityService(success=True, verified_port_count=3)
+    services = build_services(
+        redis=DummyRedis(),
+        backend=DummyBackendService(),
+        connectivity=connectivity_service,
+    )
+    state = build_state(
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            filler_ports_by_executor={"executor-123": [40001, 40003]},
+        )
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=state,
+    )
+
+    await PortConnectivityCheck().run(ctx)
+
+    assert connectivity_service.called_with["excluded_ports"] == [40001, 40003]
+    assert connectivity_service.called_with["rented_ports"] == []
 
 
 @pytest.mark.asyncio

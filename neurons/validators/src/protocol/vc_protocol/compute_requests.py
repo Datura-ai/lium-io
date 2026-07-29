@@ -92,6 +92,10 @@ class RentedExecutorsResponse(BaseModel):
     # processes are tolerated. Additive over the legacy map above so backend/validator deploy in any
     # order — an older backend leaves this empty and get_filler_containers falls back to the one.
     all_filler_containers_by_executor: dict[str, list[str]] = {}
+    # executor_id -> external ports its active fillers hold (DAH-2527). A filler creates no pod, so
+    # these ports never show up in executors[].pods and port verification used to probe them and
+    # collide. Empty for a backend that predates the field — the collision simply stays.
+    filler_ports_by_executor: dict[str, list[int]] = {}
     banned_guids: list[str] = []
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
@@ -139,6 +143,10 @@ class RentedExecutorsResponse(BaseModel):
         # (skip-checks, logging). Container protection and GPU-usage tolerance use get_filler_containers.
         containers = self.get_filler_containers(executor_uuid)
         return containers[0] if containers else None
+
+    def get_filler_ports(self, executor_uuid: str) -> list[int]:
+        """External ports held by this executor's fillers, to be excluded from port verification."""
+        return self.filler_ports_by_executor.get(str(executor_uuid), [])
 
     def get_default_job_owner(self, executor_uuid: str) -> str | None:
         return self.default_job_owner_by_executor.get(str(executor_uuid))

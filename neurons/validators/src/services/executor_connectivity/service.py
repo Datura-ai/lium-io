@@ -31,6 +31,7 @@ class ExecutorConnectivityService:
         sysbox_runtime: bool = False,
         rented_ports: list[int] | None = None,
         rented_pod_names: list[str] | None = None,
+        excluded_ports: list[int] | None = None,
         log_ctx: dict | None = None,
     ) -> PortVerificationResult:
         """Verify executor port connectivity and DinD capability."""
@@ -44,6 +45,7 @@ class ExecutorConnectivityService:
                 miner_hotkey=miner_hotkey,
                 sysbox_runtime=sysbox_runtime,
                 rented_ports=rented_ports,
+                excluded_ports=excluded_ports,
                 log_ctx=log_ctx,
             )
             sysbox_result = verification.sysbox_runtime

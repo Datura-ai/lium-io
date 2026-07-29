@@ -33,6 +33,7 @@ class ConnectivityOrchestrator:
         sysbox_runtime: bool,
         rented_ports: list[int] | None,
         ssh_client,
+        excluded_ports: list[int] | None = None,
         log_ctx: dict | None = None,
     ) -> PortVerificationResult:
         log_ctx = {
@@ -40,8 +41,10 @@ class ConnectivityOrchestrator:
             "executor_uuid": executor_info.uuid,
             "executor_ip": executor_info.address,
         }
-        rented = set(rented_ports) if rented_ports else set()
-        ports = self.port_selector.select(executor_info, BATCH_PORT_VERIFICATION_SIZE, rented)
+        # rented ports come from pods, excluded ones from idle fillers (DAH-2527) — different
+        # sources, same meaning here: the port is taken and probing it would only collide
+        unavailable = set(rented_ports or []) | set(excluded_ports or [])
+        ports = self.port_selector.select(executor_info, BATCH_PORT_VERIFICATION_SIZE, unavailable)
 
         if not ports:
             return PortVerificationResult(

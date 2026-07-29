@@ -25,7 +25,7 @@ def test_port_selector_from_mappings_excludes_ssh_and_rented():
     info = _executor_info(port_mappings=mappings)
 
     selector = PortSelector()
-    result = selector.select(info, size=5, rented={9001})
+    result = selector.select(info, size=5, unavailable={9001})
 
     ports = {(p.internal, p.external) for p in result}
     assert (22, 2200) not in ports
@@ -38,7 +38,7 @@ def test_port_selector_from_range_uses_range_list():
     info = _executor_info(port_range="9000,9001,9002")
 
     selector = PortSelector()
-    result = selector.select(info, size=2, rented=set())
+    result = selector.select(info, size=2, unavailable=set())
 
     assert len(result) == 2
     for port in result:
@@ -50,7 +50,7 @@ def test_port_selector_from_range_excludes_ssh_port():
     info = _executor_info(port_range="22,9000,9001")
 
     selector = PortSelector()
-    result = selector.select(info, size=2, rented=set())
+    result = selector.select(info, size=2, unavailable=set())
 
     assert all(p.internal != 22 for p in result)
 
@@ -59,7 +59,7 @@ def test_port_selector_default_range_when_missing():
     info = _executor_info(port_range=None)
 
     selector = PortSelector()
-    result = selector.select(info, size=3, rented=set())
+    result = selector.select(info, size=3, unavailable=set())
 
     assert len(result) == 3
     for port in result:
@@ -71,6 +71,6 @@ def test_port_selector_empty_when_all_rented():
     info = _executor_info(port_range="9000-9001")
 
     selector = PortSelector()
-    result = selector.select(info, size=2, rented={9000, 9001})
+    result = selector.select(info, size=2, unavailable={9000, 9001})
 
     assert result == []
