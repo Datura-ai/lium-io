@@ -228,18 +228,24 @@ class MinerLogLine(BaseModel):
 
     @staticmethod
     def no_payout_because_vram_exceeds_disk(
-        result: JobResult, total_vram_gb: float, total_disk_gb: float
+        result: JobResult, total_vram_gb: float, total_disk_gb: float, rate: float
     ) -> MinerLogLine:
+        required_disk_gb: float = round(total_vram_gb * rate, 1)
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.VRAM_EXCEEDS_DISK,
             message=(
                 f"No unrented incentive: this executor has {total_disk_gb} GB of total disk but "
-                f"{total_vram_gb} GB of GPU VRAM. An idle executor must have at least as much disk "
-                f"as GPU VRAM to earn the unrented incentive. Give it at least {total_vram_gb} GB "
-                f"of total disk, or rent it out to earn."
+                f"{total_vram_gb} GB of GPU VRAM. An idle executor must have at least "
+                f"{rate}x its GPU VRAM in disk to earn the unrented incentive. Give it at least "
+                f"{required_disk_gb} GB of total disk, or rent it out to earn."
             ),
-            extra_fields={"total_vram_gb": total_vram_gb, "total_disk_gb": total_disk_gb},
+            extra_fields={
+                "total_vram_gb": total_vram_gb,
+                "total_disk_gb": total_disk_gb,
+                "vram_over_disk_rate": rate,
+                "required_disk_gb": required_disk_gb,
+            },
         )
 
     @staticmethod

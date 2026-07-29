@@ -1,9 +1,9 @@
 """DAH-2520 — unrented incentive VRAM/disk gate.
 
-An unrented executor whose total GPU VRAM exceeds the machine's total disk
-forfeits the unrented rental incentive while staying active. Enforcement is
-gated by ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT; while the flag is off the breach
-is only logged (shadow mode) and the payout is unchanged.
+An unrented executor whose total GPU VRAM times VRAM_OVER_DISK_RATE exceeds the
+machine's total disk forfeits the unrented rental incentive while staying active.
+Enforcement is gated by ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT; while the flag is
+off the breach is only logged (shadow mode) and the payout is unchanged.
 """
 
 import logging
@@ -93,15 +93,28 @@ def test_vram_over_disk_ignores_machine_with_enough_disk():
     assert measured is None
 
 
-def test_vram_over_disk_equal_is_not_flagged():
-    # Arrange — disk exactly equals VRAM; only strictly more VRAM is flagged
+def test_vram_over_disk_at_ratio_threshold_is_not_flagged():
+    # Arrange — disk exactly equals VRAM * VRAM_OVER_DISK_RATE; only strictly more is flagged
+    incentive = _build_incentive()
+
+    # Act
+    measured = incentive._vram_over_disk(_make_job(vram_gb_per_gpu=100.0, gpu_count=2, disk_gb=300.0))
+
+    # Assert
+    assert measured is None
+
+
+def test_vram_over_disk_equal_totals_is_flagged():
+    # Arrange — equal VRAM and disk no longer clears the 1.5x margin
     incentive = _build_incentive()
 
     # Act
     measured = incentive._vram_over_disk(_make_job(vram_gb_per_gpu=100.0, gpu_count=2, disk_gb=200.0))
 
     # Assert
-    assert measured is None
+    assert measured is not None
+    assert measured.vram_gb == 200.0
+    assert measured.disk_gb == 200.0
 
 
 @pytest.mark.parametrize(
@@ -183,12 +196,12 @@ async def test_malformed_scrape_never_breaks_scoring(monkeypatch, spec):
 
 
 def test_vram_over_disk_reports_the_numbers_it_compared():
-    # Rounding happens before the comparison, so the miner is never told to add disk
-    # he already has: 500.04 GB VRAM against 500.0 GB disk both render as 500.0.
+    # Rounding happens before the comparison: raw 200.03 * 1.5 = 300.045 GB would exceed
+    # 300.0 GB disk, but rounded to 200.0 GB VRAM it clears the 1.5x margin exactly.
     incentive = _build_incentive()
 
     measured = incentive._vram_over_disk(
-        _make_job(vram_gb_per_gpu=500.04, gpu_count=1, disk_gb=500.0)
+        _make_job(vram_gb_per_gpu=200.03, gpu_count=1, disk_gb=300.0)
     )
 
     assert measured is None
