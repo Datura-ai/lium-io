@@ -1,7 +1,7 @@
-"""DAH-2520 — unrented incentive VRAM/disk gate.
+"""DAH-2520 — unrented incentive disk/VRAM gate.
 
-An unrented executor whose total GPU VRAM times VRAM_OVER_DISK_RATE exceeds the
-machine's total disk forfeits the unrented rental incentive while staying active.
+An unrented executor whose total disk is below its total GPU VRAM times
+MIN_DISK_TO_VRAM_RATE forfeits the unrented rental incentive while staying active.
 Enforcement is gated by ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT; while the flag is
 off the breach is only logged (shadow mode) and the payout is unchanged.
 """
@@ -69,12 +69,12 @@ def _make_job(
     )
 
 
-def test_vram_over_disk_detects_machine_short_on_disk():
+def test_insufficient_disk_detects_machine_short_on_disk():
     # Arrange — 8 x 141 GB = 1128 GB VRAM on a 500 GB disk
     incentive = _build_incentive()
 
     # Act
-    measured = incentive._vram_over_disk(_make_job())
+    measured = incentive._insufficient_disk(_make_job())
 
     # Assert
     assert measured is not None
@@ -82,34 +82,34 @@ def test_vram_over_disk_detects_machine_short_on_disk():
     assert measured.disk_gb == 500.0
 
 
-def test_vram_over_disk_ignores_machine_with_enough_disk():
+def test_insufficient_disk_ignores_machine_with_enough_disk():
     # Arrange — same VRAM, 2 TB disk
     incentive = _build_incentive()
 
     # Act
-    measured = incentive._vram_over_disk(_make_job(disk_gb=2048.0))
+    measured = incentive._insufficient_disk(_make_job(disk_gb=2048.0))
 
     # Assert
     assert measured is None
 
 
-def test_vram_over_disk_at_ratio_threshold_is_not_flagged():
-    # Arrange — disk exactly equals VRAM * VRAM_OVER_DISK_RATE; only strictly more is flagged
+def test_insufficient_disk_at_ratio_threshold_is_not_flagged():
+    # Arrange — disk exactly equals VRAM * MIN_DISK_TO_VRAM_RATE; only strictly more is flagged
     incentive = _build_incentive()
 
     # Act
-    measured = incentive._vram_over_disk(_make_job(vram_gb_per_gpu=100.0, gpu_count=2, disk_gb=300.0))
+    measured = incentive._insufficient_disk(_make_job(vram_gb_per_gpu=100.0, gpu_count=2, disk_gb=300.0))
 
     # Assert
     assert measured is None
 
 
-def test_vram_over_disk_equal_totals_is_flagged():
+def test_insufficient_disk_equal_totals_is_flagged():
     # Arrange — equal VRAM and disk no longer clears the 1.5x margin
     incentive = _build_incentive()
 
     # Act
-    measured = incentive._vram_over_disk(_make_job(vram_gb_per_gpu=100.0, gpu_count=2, disk_gb=200.0))
+    measured = incentive._insufficient_disk(_make_job(vram_gb_per_gpu=100.0, gpu_count=2, disk_gb=200.0))
 
     # Assert
     assert measured is not None
@@ -127,11 +127,11 @@ def test_vram_over_disk_equal_totals_is_flagged():
         {"vram_gb_per_gpu": None, "disk_gb": None},  # no scrape at all
     ],
 )
-def test_vram_over_disk_partial_scrape_is_never_flagged(job_kwargs):
+def test_insufficient_disk_partial_scrape_is_never_flagged(job_kwargs):
     # A missing number must not cost a miner the incentive — fail open.
     incentive = _build_incentive()
 
-    measured = incentive._vram_over_disk(_make_job(**job_kwargs))
+    measured = incentive._insufficient_disk(_make_job(**job_kwargs))
 
     assert measured is None
 
@@ -147,9 +147,9 @@ def test_estimated_job_result_is_not_logged_as_unmeasured(caplog):
     incentive = _build_incentive()
 
     with caplog.at_level(logging.WARNING):
-        incentive._vram_over_disk(_make_job(vram_gb_per_gpu=None, disk_gb=None))
+        incentive._insufficient_disk(_make_job(vram_gb_per_gpu=None, disk_gb=None))
 
-    assert "vram_over_disk_unmeasured" not in _logged_reasons(caplog)
+    assert "insufficient_disk_unmeasured" not in _logged_reasons(caplog)
 
 
 def test_unreadable_scrape_is_logged_as_unmeasured(caplog):
@@ -157,9 +157,9 @@ def test_unreadable_scrape_is_logged_as_unmeasured(caplog):
     incentive = _build_incentive()
 
     with caplog.at_level(logging.WARNING):
-        incentive._vram_over_disk(_make_job(disk_gb=None))
+        incentive._insufficient_disk(_make_job(disk_gb=None))
 
-    assert "vram_over_disk_unmeasured" in _logged_reasons(caplog)
+    assert "insufficient_disk_unmeasured" in _logged_reasons(caplog)
 
 
 MALFORMED_SPECS: list[dict] = [
@@ -173,12 +173,12 @@ MALFORMED_SPECS: list[dict] = [
 
 
 @pytest.mark.parametrize("spec", MALFORMED_SPECS)
-def test_vram_over_disk_survives_a_malformed_scrape(spec):
+def test_insufficient_disk_survives_a_malformed_scrape(spec):
     # The scrape is produced on the miner's machine and calculate_mining_scores has no
     # per-result guard, so a malformed value must fail open instead of raising.
     incentive = _build_incentive()
 
-    measured = incentive._vram_over_disk(_make_job(spec=spec))
+    measured = incentive._insufficient_disk(_make_job(spec=spec))
 
     assert measured is None
 
@@ -195,12 +195,12 @@ async def test_malformed_scrape_never_breaks_scoring(monkeypatch, spec):
     assert result.eligible_for_rental_share is True
 
 
-def test_vram_over_disk_reports_the_numbers_it_compared():
+def test_insufficient_disk_reports_the_numbers_it_compared():
     # Rounding happens before the comparison: raw 200.03 * 1.5 = 300.045 GB would exceed
     # 300.0 GB disk, but rounded to 200.0 GB VRAM it clears the 1.5x margin exactly.
     incentive = _build_incentive()
 
-    measured = incentive._vram_over_disk(
+    measured = incentive._insufficient_disk(
         _make_job(vram_gb_per_gpu=200.03, gpu_count=1, disk_gb=300.0)
     )
 
@@ -226,7 +226,7 @@ async def test_shadow_mode_keeps_rental_eligibility(monkeypatch):
 
     # Assert — still eligible for the unrented rental pool, nothing told to the miner
     assert result.eligible_for_rental_share is True
-    assert "vram_exceeds_disk" not in "\n".join(result.incentive_logs)
+    assert "insufficient_disk_for_vram" not in "\n".join(result.incentive_logs)
 
 
 @pytest.mark.asyncio
@@ -239,7 +239,7 @@ async def test_shadow_mode_emits_the_measurement_log(monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         await incentive.calculate_executor_score(_make_job())
 
-    breach = next(r.msg for r in caplog.records if r.msg.extra.get("reason") == "vram_exceeds_disk")
+    breach = next(r.msg for r in caplog.records if r.msg.extra.get("reason") == "insufficient_disk_for_vram")
     assert "shadow only - flag off" in breach.message
     assert breach.extra["total_vram_gb"] == 1128.0
     assert breach.extra["total_disk_gb"] == 500.0
@@ -271,7 +271,7 @@ async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
     result = await incentive.calculate_executor_score(_make_job())
 
     log = "\n".join(result.incentive_logs)
-    assert "vram_exceeds_disk" in log
+    assert "insufficient_disk_for_vram" in log
     assert "1128.0" in log  # total VRAM
     assert "500.0" in log   # total disk
 
@@ -297,4 +297,4 @@ async def test_rented_executor_is_not_gated(monkeypatch):
 
     result = await incentive.calculate_executor_score(_make_job(is_rented=True))
 
-    assert "vram_exceeds_disk" not in "\n".join(result.incentive_logs)
+    assert "insufficient_disk_for_vram" not in "\n".join(result.incentive_logs)

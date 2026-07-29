@@ -8,7 +8,7 @@ WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
 
 HOW A NODE PICKS A POOL:
   rented?                                              -> mining pool (always earns)
-  idle AND model in program AND price ok AND disk >= VRAM
+  idle AND model in program AND price ok AND disk >= 1.5x VRAM
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
@@ -22,7 +22,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
-     total GPU VRAM above total disk (add disk to earn),
+     total disk below 1.5x total GPU VRAM (add disk to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -46,6 +46,7 @@ from pydantic import BaseModel, Field
 from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
+    from incentive.rental_price import InsufficientDisk
     from services.task_service import JobResult
 
 
@@ -66,7 +67,7 @@ class ZeroIncentiveReason(StrEnum):
     PRICE_ABOVE_MARKET_P90_SOFT_LIMIT = "price_above_market_p90_soft_limit"
     NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
-    VRAM_EXCEEDS_DISK = "vram_exceeds_disk"
+    INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
 
 
@@ -227,23 +228,25 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_vram_exceeds_disk(
-        result: JobResult, total_vram_gb: float, total_disk_gb: float, rate: float
+    def no_payout_because_insufficient_disk_for_vram(
+        result: JobResult, measured: InsufficientDisk
     ) -> MinerLogLine:
-        required_disk_gb: float = round(total_vram_gb * rate, 1)
+        # takes the measurement whole: the two totals are interchangeable floats, and swapping
+        # them would quietly tell the miner to add disk he already has
+        required_disk_gb: float = round(measured.vram_gb * measured.rate, 1)
         return MinerLogLine._no_payout(
             result,
-            reason=ZeroIncentiveReason.VRAM_EXCEEDS_DISK,
+            reason=ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
             message=(
-                f"No unrented incentive: this executor has {total_disk_gb} GB of total disk but "
-                f"{total_vram_gb} GB of GPU VRAM. An idle executor must have at least "
-                f"{rate}x its GPU VRAM in disk to earn the unrented incentive. Give it at least "
-                f"{required_disk_gb} GB of total disk, or rent it out to earn."
+                f"No unrented incentive: this executor has {measured.disk_gb} GB of total disk but "
+                f"{measured.vram_gb} GB of GPU VRAM. An idle executor must have at least "
+                f"{measured.rate}x its GPU VRAM in disk to earn the unrented incentive. Give it at "
+                f"least {required_disk_gb} GB of total disk, or rent it out to earn."
             ),
             extra_fields={
-                "total_vram_gb": total_vram_gb,
-                "total_disk_gb": total_disk_gb,
-                "vram_over_disk_rate": rate,
+                "total_vram_gb": measured.vram_gb,
+                "total_disk_gb": measured.disk_gb,
+                "min_disk_to_vram_rate": measured.rate,
                 "required_disk_gb": required_disk_gb,
             },
         )

@@ -38,19 +38,20 @@ logger = get_logger(__name__)
 # this multiplier forfeits the unrented rental incentive but stays active.
 SOFT_LIMIT_PRICE_RATE = 1.1
 
-# DAH-2520 — unrented incentive VRAM/disk gate. An unrented executor whose summed
-# GPU VRAM times this multiplier exceeds total disk forfeits the unrented rental
+# DAH-2520 — unrented incentive disk/VRAM gate. An unrented executor whose total disk
+# is below its summed GPU VRAM times this multiplier forfeits the unrented rental
 # incentive but stays active.
-VRAM_OVER_DISK_RATE = 1.5
+MIN_DISK_TO_VRAM_RATE = 1.5
 
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
-class VramOverDisk(BaseModel):
-    """Measured totals of a machine whose GPU VRAM exceeds its disk (both in GB)."""
+class InsufficientDisk(BaseModel):
+    """Measured totals of a machine whose disk is below the required margin over its GPU VRAM."""
 
     vram_gb: float
     disk_gb: float
+    rate: float  # required disk-to-VRAM margin the machine failed to clear
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -228,8 +229,9 @@ class RentalPriceIncentive(DefaultIncentive):
             )
         )
 
-    def _vram_over_disk(self, result: JobResult) -> VramOverDisk | None:
-        # machine carrying more GPU VRAM than it has disk; None when it fits or the scrape is unusable
+    def _insufficient_disk(self, result: JobResult) -> InsufficientDisk | None:
+        # machine whose disk is below the required margin over its GPU VRAM; None when it
+        # clears the margin or the scrape is unusable
         spec = result.spec
         if not spec:
             # no scrape at all: a synthetic or estimated job result, nothing to measure
@@ -243,40 +245,40 @@ class RentalPriceIncentive(DefaultIncentive):
         except (AttributeError, TypeError, ValueError) as exc:
             # the scrape is produced on the miner's machine, and calculate_mining_scores has no
             # per-result guard: raising here would cost EVERY miner this cycle's weights
-            self._log_vram_over_disk_unmeasured(result, f"unreadable scrape: {exc!r}")
+            self._log_insufficient_disk_unmeasured(result, f"unreadable scrape: {exc!r}")
             return None
         if vram_gb <= 0 or disk_gb <= 0:
             # either number missing or zeroed: fail open, nobody loses incentive over telemetry
-            self._log_vram_over_disk_unmeasured(result, "vram or disk missing from the scrape")
+            self._log_insufficient_disk_unmeasured(result, "vram or disk missing from the scrape")
             return None
         # round before comparing, so the numbers the miner is shown are the ones that were compared
         vram_gb = round(vram_gb, 1)
         disk_gb = round(disk_gb, 1)
-        if vram_gb * VRAM_OVER_DISK_RATE <= disk_gb:
+        if vram_gb * MIN_DISK_TO_VRAM_RATE <= disk_gb:
             return None
-        return VramOverDisk(vram_gb=vram_gb, disk_gb=disk_gb)
+        return InsufficientDisk(vram_gb=vram_gb, disk_gb=disk_gb, rate=MIN_DISK_TO_VRAM_RATE)
 
-    def _log_vram_over_disk_unmeasured(self, result: JobResult, cause: str) -> None:
+    def _log_insufficient_disk_unmeasured(self, result: JobResult, cause: str) -> None:
         # gate could not run: a shadow report must not read this executor as "disk is fine"
         logger.warning(
             _m(
-                "Cannot measure GPU VRAM against total disk; unrented incentive kept",
+                "Cannot measure total disk against GPU VRAM; unrented incentive kept",
                 extra={
                     "executor_id": str(result.executor_info.uuid),
                     "gpu_model": result.gpu_model,
                     "gpu_count": result.gpu_count,
                     "cause": cause,
-                    "reason": "vram_over_disk_unmeasured",
+                    "reason": "insufficient_disk_unmeasured",
                 },
             )
         )
 
-    def _log_vram_over_disk(self, result: JobResult, measured: VramOverDisk) -> None:
-        # structured log for every rental-eligible unrented executor whose VRAM exceeds its disk
+    def _log_insufficient_disk(self, result: JobResult, measured: InsufficientDisk) -> None:
+        # structured log for every rental-eligible unrented executor short on disk for its VRAM
         enforced = settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT
         logger.info(
             _m(
-                "Unrented executor carries more GPU VRAM than total disk"
+                "Unrented executor has less total disk than its GPU VRAM requires"
                 + ("" if enforced else " (shadow only - flag off)"),
                 extra={
                     "executor_id": str(result.executor_info.uuid),
@@ -284,8 +286,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     "gpu_count": result.gpu_count,
                     "total_vram_gb": measured.vram_gb,
                     "total_disk_gb": measured.disk_gb,
+                    "min_disk_to_vram_rate": measured.rate,
                     "enforced": enforced,
-                    "reason": ZeroIncentiveReason.VRAM_EXCEEDS_DISK,
+                    "reason": ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -564,16 +567,16 @@ class RentalPriceIncentive(DefaultIncentive):
                 )
                 job_result.incentive_logs.append(reason.to_log_line())
 
-        # DAH-2520 VRAM/disk gate: an idle machine with less disk than GPU VRAM is not
-        # realistically rentable, so it forfeits the unrented incentive (node stays active).
-        # While the flag is off we only log the would-be exclusion (shadow).
-        vram_over_disk = self._vram_over_disk(job_result) if eligible_for_rental_share else None
-        if vram_over_disk is not None:
-            self._log_vram_over_disk(job_result, vram_over_disk)
+        # DAH-2520 disk/VRAM gate: an idle machine without the required disk margin over its
+        # GPU VRAM is not realistically rentable, so it forfeits the unrented incentive (node
+        # stays active). While the flag is off we only log the would-be exclusion (shadow).
+        insufficient_disk = self._insufficient_disk(job_result) if eligible_for_rental_share else None
+        if insufficient_disk is not None:
+            self._log_insufficient_disk(job_result, insufficient_disk)
             if settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT:
                 eligible_for_rental_share = False
-                reason: MinerLogLine = MinerLogLine.no_payout_because_vram_exceeds_disk(
-                    job_result, vram_over_disk.vram_gb, vram_over_disk.disk_gb, VRAM_OVER_DISK_RATE
+                reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
+                    job_result, insufficient_disk
                 )
                 job_result.incentive_logs.append(reason.to_log_line())
 

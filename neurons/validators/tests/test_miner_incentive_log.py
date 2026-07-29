@@ -7,6 +7,7 @@ fields, and that a line actually lands in JobResult.incentive_logs.
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
+from incentive.rental_price import InsufficientDisk
 from services.task_service import JobResult
 
 H200 = "NVIDIA H200"
@@ -25,7 +26,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "no_unrented_capacity_for_gpu_count",
         "nvidia_driver_below_minimum",
         "sysbox_not_enabled",
-        "vram_exceeds_disk",
+        "insufficient_disk_for_vram",
     }
 
 
@@ -90,8 +91,10 @@ def _job(**overrides) -> JobResult:
             "soft price limit",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_vram_exceeds_disk(job, 1128.0, 500.0, 1.5),
-            "vram_exceeds_disk",
+            lambda job: MinerLogLine.no_payout_because_insufficient_disk_for_vram(
+                job, InsufficientDisk(vram_gb=1128.0, disk_gb=500.0, rate=1.5)
+            ),
+            "insufficient_disk_for_vram",
             "GPU VRAM",
         ),
         (
@@ -152,10 +155,12 @@ def test_soft_limit_reason_computes_threshold_and_fields():
     assert "4.23" in line.message
 
 
-def test_vram_exceeds_disk_reason_keeps_the_two_numbers_apart():
-    # The builder takes both totals positionally; swapping them would advise the miner
-    # to add disk he already has, so the message has to name which number is which.
-    line = MinerLogLine.no_payout_because_vram_exceeds_disk(_job(), 1128.0, 500.0, 1.5)
+def test_insufficient_disk_reason_keeps_the_two_numbers_apart():
+    # The builder takes the measurement whole, but the message still has to name which
+    # number is which: reading them the wrong way advises the miner to add disk he has.
+    line = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
+        _job(), InsufficientDisk(vram_gb=1128.0, disk_gb=500.0, rate=1.5)
+    )
 
     assert line.fields["total_vram_gb"] == 1128.0
     assert line.fields["total_disk_gb"] == 500.0
