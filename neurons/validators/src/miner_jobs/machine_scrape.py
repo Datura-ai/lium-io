@@ -807,6 +807,10 @@ def get_vloopback_volume_bytes(docker_root_dir):
     data_dirs = glob.glob(
         f"/proc/1/root{docker_root_dir}/plugins/*/rootfs{docker_root_dir}/loopback"
     )
+    if not data_dirs:
+        # every volume would be counted as 0 and the breakdown would silently under-report by
+        # terabytes; fail like the rest of the docker half so the miss lands in an error key
+        raise RuntimeError(f"no vloopback plugin data dir under {docker_root_dir} for {len(names)} volumes")
 
     total = 0
     for name in names:
@@ -824,10 +828,12 @@ def get_vloopback_volume_bytes(docker_root_dir):
 def get_docker_disk_usage():
     # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
     df = docker_api_get("/system/df")
-    containers = sum(max(int(each.get("SizeRw") or 0), 0) for each in df.get("Containers") or [])
+    containers = sum(
+        max(int(container.get("SizeRw") or 0), 0) for container in df.get("Containers") or []
+    )
     volumes = sum(
-        max(int((each.get("UsageData") or {}).get("Size") or 0), 0)
-        for each in df.get("Volumes") or []
+        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+        for volume in df.get("Volumes") or []
     )
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     volumes += get_vloopback_volume_bytes(docker_root_dir)
