@@ -28,7 +28,9 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 
 2. CALCULATION REPORTS — the per-cycle score/incentive lines every scored node gets:
      mining_score_calculated, mining_incentive_calculated,
-     rental_incentive_calculated, mining_score_missing (internal-error case)
+     rental_incentive_calculated, mining_score_missing (internal-error case),
+     unrented_bucket_reassigned (DAH-2528: node rated against its split tier
+     because its own GPU-count tier was over capacity)
 
 The scoring code (rental_price.py / default.py) detects each condition where its
 data naturally lives (some per-executor upfront, some only after cohort aggregation),
@@ -373,6 +375,29 @@ class MinerLogLine(BaseModel):
                 "burn_share": result.burn_share,
                 "incentive": result.incentive,
                 "total_rental_cost": result.total_rental_cost,
+            },
+        )
+
+    @staticmethod
+    def unrented_bucket_reassigned(result: JobResult) -> MinerLogLine:
+        # DAH-2528 report line, not a zero reason: the node is paid, in a better bucket.
+        return MinerLogLine(
+            message=(
+                f"Unrented incentive: the {result.bucket_reassigned_from}x "
+                f"{result.gpu_model} tier was over its capacity when this executor "
+                f"was placed, so it is rated against its {result.count_bucket}x "
+                f"split tier, which had free capacity and pays a better rate."
+            ),
+            fields={
+                "executor_id": str(result.executor_info.uuid),
+                "gpu_model": result.gpu_model,
+                "gpu_count": result.gpu_count,
+                "event": "unrented_bucket_reassigned",
+                "bucket_reassigned_from": result.bucket_reassigned_from,
+                "bucket_reassigned_from_multiplier": result.bucket_reassigned_from_multiplier,
+                "count_bucket": result.count_bucket,
+                "max_cap": result.max_cap,
+                "unrented_cap_multiplier": result.unrented_cap_multiplier,
             },
         )
 

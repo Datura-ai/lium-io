@@ -473,3 +473,45 @@ async def test_precompute_all_estimates_returns_both_rented_and_unrented_without
         (1, True),
         (8, False),
     ]
+
+
+# ── DAH-2528: estimate follows the occupancy-aware bucket fallback ───────────
+
+@pytest.mark.asyncio
+async def test_estimate_executor_split_fallback_when_bucket_over_cap(
+    rental_config, mock_redis, mock_price_provider, monkeypatch
+):
+    """A split-capable hypothetical node whose gpu_count bucket is over cap in the
+    snapshot is estimated against its min-count tier — the same reassignment the
+    real cycle would apply — while a non-splitting twin stays diluted in place.
+    """
+    # Arrange — two real idle 8×H200 rigs put the 8× bucket at 16/8 (over cap).
+    job_results = {
+        "miner_a": [_make_job("exec-a", "H200", 8, is_rented=False)],
+        "miner_b": [_make_job("exec-b", "H200", 8, is_rented=False)],
+    }
+    incentive = _make_incentive(rental_config, mock_redis, mock_price_provider, job_results, monkeypatch)
+    await incentive.calculate_mining_scores()
+    snapshot = incentive.get_snapshot()
+
+    # Act — estimate the same hypothetical node with and without splitting.
+    estimator_split = RentalPriceIncentive(
+        rental_config, mock_redis, jobs_results={}, total_gpu_model_count_map={}, snapshot=snapshot,
+    )
+    result_split = await estimator_split.estimate_executor(
+        ExecutorEstimateParams(gpu_model="H200", gpu_count=8, is_rented=False, gpu_splitting=True, gpu_splitting_min_count=1)
+    )
+    estimator_no_split = RentalPriceIncentive(
+        rental_config, mock_redis, jobs_results={}, total_gpu_model_count_map={}, snapshot=snapshot,
+    )
+    result_no_split = await estimator_no_split.estimate_executor(
+        ExecutorEstimateParams(gpu_model="H200", gpu_count=8, is_rented=False)
+    )
+
+    # Assert — the split node is rated in the empty 1× tier at full weight...
+    assert result_split.count_bucket == 1
+    assert result_split.unrented_cap_multiplier == pytest.approx(1.0)
+    # ...while the non-splitting twin lands in the over-cap 8× bucket, diluted (8/24).
+    assert result_no_split.count_bucket == 8
+    assert result_no_split.unrented_cap_multiplier == pytest.approx(8 / 24)
+    assert result_split.usd_per_epoch > result_no_split.usd_per_epoch > 0

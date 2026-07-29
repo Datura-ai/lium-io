@@ -136,9 +136,11 @@ class RentalPriceIncentive(DefaultIncentive):
     - Phase 2: Calculate dynamic emission splits based on rental costs
     - Phase 3: Distribute weights across burn/mining/rental pools
 
-    Cap dilution is applied per `(base_model, gpu_count_bucket)`. Buckets are
-    derived from each executor's `gpu_splitting_min_count` (when GPU splitting
-    is enabled) or its `gpu_count`.
+    Cap dilution is applied per `(base_model, gpu_count_bucket)`. An executor is
+    rated against its `gpu_count` bucket; a split-capable executor falls back to
+    its `gpu_splitting_min_count` tier when the `gpu_count` bucket has no cap
+    configured, or (DAH-2528) when that bucket is over cap and the whole node
+    fits under the split tier's cap.
     """
 
     price_provider: PriceProvider = PriceProvider()
@@ -160,6 +162,9 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unrented_count_by_bucket: dict[tuple[str, int], int] = {}
         self._weighted_rate_sum_by_bucket: dict[tuple[str, int], float] = {}
         self.cap_multiplier_by_bucket: dict[tuple[str, int], float] = {}
+        # DAH-2528: split-capable idle executors pinned to their gpu_count bucket,
+        # revisited once per-bucket fill is known. Items: (base_model, result).
+        self._split_fallback_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
         self.rental_share = 0.0
         self.rental_share_raw = 0.0
@@ -331,9 +336,12 @@ class RentalPriceIncentive(DefaultIncentive):
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:
         """Aggregate per-`(base_model, bucket)` metrics for the rental-share
-        algorithm. Bucket resolution is symmetric with the rate-resolution path
-        so split-capable executors land in the bucket of their
-        `gpu_splitting_min_count`.
+        algorithm. A split-capable executor lands in its `gpu_count` bucket when
+        that bucket has a configured cap (falling back to its
+        `gpu_splitting_min_count` tier only when it has none); its rate is the
+        best of the bundle rate and the min-count rate. Occupancy-aware
+        reassignment happens later in `_reassign_split_candidates`, once every
+        bucket's fill is known.
         """
         if not result.is_successful:
             return
@@ -386,11 +394,80 @@ class RentalPriceIncentive(DefaultIncentive):
                     * result.driver_multiplier
                 )
 
+                # DAH-2528: a split-capable node pinned to its gpu_count bucket may
+                # still be moved to its split tier if the bucket turns out over cap.
+                if (
+                    result.supports_gpu_splitting
+                    and result.gpu_splitting_min_count
+                    and bucket == result.gpu_count
+                    and bucket != result.gpu_splitting_min_count
+                ):
+                    self._split_fallback_candidates.append((base_model, result))
+
+    def _reassign_split_candidates(self) -> None:
+        """DAH-2528: occupancy-aware bucket fallback for split-capable idle executors.
+
+        `_resolve_bucket` pins a split-capable executor to its `gpu_count` bucket
+        whenever that bucket has a configured cap, no matter how crowded it is. This
+        second pass runs once every bucket's fill is known: it moves a node out of an
+        over-cap `gpu_count` bucket into its `gpu_splitting_min_count` tier, but only
+        when the whole node fits under the target cap — a move never pushes the target
+        over cap, so nodes already rated there are never diluted by a newcomer. Greedy
+        in ascending executor-uuid order, so an unchanged fleet reproduces identical
+        assignments every cycle.
+        """
+        candidates = sorted(
+            self._split_fallback_candidates,
+            key=lambda item: str(item[1].executor_info.uuid),
+        )
+        for base_model, result in candidates:
+            src_bucket = result.count_bucket
+            tgt_bucket = result.gpu_splitting_min_count
+            cap_spec = self.config.max_unrented_gpus.get(base_model, {})
+            src_cap = cap_spec.get(src_bucket, 0)
+            tgt_cap = cap_spec.get(tgt_bucket, 0)
+            if tgt_cap <= 0:
+                continue
+            src_key = (base_model, src_bucket)
+            tgt_key = (base_model, tgt_bucket)
+            src_count = self.unrented_count_by_bucket.get(src_key, 0)
+            if src_count <= src_cap:
+                # source bucket pays full weight already (or emptied by earlier moves)
+                continue
+            tgt_count = self.unrented_count_by_bucket.get(tgt_key, 0)
+            if tgt_count + result.gpu_count > tgt_cap:
+                # the whole node must fit: never over-fill the target
+                continue
+            # Admission implies the move pays strictly better: the target ends at or
+            # under cap (multiplier exactly 1.0) while the source is strictly over
+            # cap (multiplier < 1.0).
+            src_multiplier = min(src_count, src_cap) / src_count
+
+            weighted_rate = (
+                result.gpu_count
+                * result.hourly_rate
+                * result.sysbox_multiplier
+                * result.driver_multiplier
+            )
+            self.unrented_count_by_bucket[src_key] = src_count - result.gpu_count
+            self._weighted_rate_sum_by_bucket[src_key] -= weighted_rate
+            self.unrented_count_by_bucket[tgt_key] = tgt_count + result.gpu_count
+            self._weighted_rate_sum_by_bucket[tgt_key] = (
+                self._weighted_rate_sum_by_bucket.get(tgt_key, 0.0) + weighted_rate
+            )
+            result.bucket_reassigned_from = src_bucket
+            result.bucket_reassigned_from_multiplier = src_multiplier
+            result.count_bucket = tgt_bucket
+            result.max_cap = tgt_cap
+
     async def _on_finish_pre_process(self) -> None:
         """Callback after pre-processing all job results.
 
         - Calculate rental share
         """
+        # DAH-2528: rebalance split-capable nodes before multipliers are computed.
+        self._reassign_split_candidates()
+
         # Step 1: cap multiplier per (base_model, bucket).
         for (base_model, bucket), unrented_count in self.unrented_count_by_bucket.items():
             max_cap = self.config.max_unrented_gpus.get(base_model, {}).get(bucket, 0)
@@ -482,6 +559,11 @@ class RentalPriceIncentive(DefaultIncentive):
         # update incentive logs
         report: MinerLogLine = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
         result.incentive_logs.append(report.to_log_line())
+
+        # DAH-2528: tell the miner why the node was rated against its split tier
+        if result.bucket_reassigned_from is not None:
+            reassigned: MinerLogLine = MinerLogLine.unrented_bucket_reassigned(result)
+            result.incentive_logs.append(reassigned.to_log_line())
 
         self._explain_zero_effective_rate(result, bucket)
 
