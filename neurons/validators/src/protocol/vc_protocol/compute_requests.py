@@ -145,7 +145,6 @@ class RentedExecutorsResponse(BaseModel):
         return containers[0] if containers else None
 
     def get_filler_ports(self, executor_uuid: str) -> list[int]:
-        """External ports held by this executor's fillers, to be excluded from port verification."""
         return self.filler_ports_by_executor.get(str(executor_uuid), [])
 
     def get_default_job_owner(self, executor_uuid: str) -> str | None:

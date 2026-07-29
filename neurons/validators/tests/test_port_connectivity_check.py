@@ -61,7 +61,7 @@ class DummyConnectivityService:
         sysbox_runtime: bool,
         rented_ports: list[int] | None = None,
         rented_pod_names: list[str] | None = None,
-        excluded_ports: list[int] | None = None,
+        filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
     ) -> PortVerificationResult:
         """Mock method that mimics the real connectivity service."""
@@ -71,7 +71,7 @@ class DummyConnectivityService:
             "executor_uuid": executor_info.uuid,
             "sysbox_runtime": sysbox_runtime,
             "rented_ports": rented_ports,
-            "excluded_ports": excluded_ports,
+            "filler_ports": filler_ports,
         }
 
         if self.verified_port_count:
@@ -216,7 +216,7 @@ async def test_port_connectivity_passes_filler_ports_as_exclusions(context_facto
 
     await PortConnectivityCheck().run(ctx)
 
-    assert connectivity_service.called_with["excluded_ports"] == [40001, 40003]
+    assert connectivity_service.called_with["filler_ports"] == [40001, 40003]
     assert connectivity_service.called_with["rented_ports"] == []
 
 

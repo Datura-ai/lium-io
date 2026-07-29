@@ -31,7 +31,7 @@ class ExecutorConnectivityService:
         sysbox_runtime: bool = False,
         rented_ports: list[int] | None = None,
         rented_pod_names: list[str] | None = None,
-        excluded_ports: list[int] | None = None,
+        filler_ports: list[int] | None = None,
         log_ctx: dict | None = None,
     ) -> PortVerificationResult:
         """Verify executor port connectivity and DinD capability."""
@@ -44,8 +44,9 @@ class ExecutorConnectivityService:
                 executor_info=executor_info,
                 miner_hotkey=miner_hotkey,
                 sysbox_runtime=sysbox_runtime,
-                rented_ports=rented_ports,
-                excluded_ports=excluded_ports,
+                # both sets are already taken on the executor, but only rented_ports means a
+                # customer rental — the sysbox fallback below reads it that way (DAH-2527)
+                unavailable_ports=(rented_ports or []) + (filler_ports or []),
                 log_ctx=log_ctx,
             )
             sysbox_result = verification.sysbox_runtime
