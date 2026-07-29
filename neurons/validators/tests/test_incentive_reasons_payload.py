@@ -3,10 +3,14 @@ zero-incentive reasons as DATA, and the validator ExecutorSpecRequest that goes
 over the WebSocket validates them into typed IncentiveReason objects — the reason
 never has to be parsed back out of log_text downstream.
 """
+import asyncio
+import json
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from clients.compute_client import ComputeClient
 from incentive.miner_incentive_log import MinerLogLine
 from protocol.vc_protocol.validator_requests import ExecutorSpecRequest, IncentiveReason
 from services.miner_service import MinerService
@@ -37,12 +41,39 @@ def _spec(reasons: list[dict[str, Any]] | None = None) -> ExecutorSpecRequest:
     return ExecutorSpecRequest(**request_kwargs)
 
 
+async def _bridge_machine_spec(payload: dict[str, Any]) -> ExecutorSpecRequest:
+    async def listen():
+        yield {
+            "channel": MACHINE_SPEC_CHANNEL.encode(),
+            "data": json.dumps(payload).encode(),
+        }
+        raise asyncio.CancelledError
+
+    pubsub = MagicMock(listen=listen, aclose=AsyncMock())
+    client = ComputeClient.__new__(ComputeClient)
+    client.keypair = MagicMock(ss58_address="validator-hotkey")
+    client.lock = asyncio.Lock()
+    client.message_queue = []
+    client.logging_extra = {"validator_hotkey": "validator-hotkey"}
+    client.miner_service = MagicMock()
+    client.miner_service.redis_service.subscribe = AsyncMock(return_value=pubsub)
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.subscribe_mesages_from_redis()
+
+    pubsub.aclose.assert_awaited_once()
+    return client.message_queue[0]
+
+
 @pytest.mark.asyncio
 async def test_publisher_carries_reason_codes_as_data_not_just_log_text(
     create_job_result, mock_settings
 ) -> None:
     job = create_job_result()
     job.record_incentive_log(MinerLogLine.no_payout_because_spot_tier(job))
+    job.zero_incentive_reasons[0].context["observed_at"] = datetime(
+        2026, 7, 29, 12, 30, tzinfo=timezone.utc
+    )
     redis_service = MagicMock()
     redis_service.publish = AsyncMock()
     service = MinerService(
@@ -56,11 +87,12 @@ async def test_publisher_carries_reason_codes_as_data_not_just_log_text(
 
     channel, payload = redis_service.publish.await_args.args
     assert channel == MACHINE_SPEC_CHANNEL
-    spec = _spec(payload["incentive_reasons"])
+    spec = await _bridge_machine_spec(payload)
 
     assert [reason.reason for reason in spec.incentive_reasons] == ["spot_tier"]
     assert isinstance(spec.incentive_reasons[0], IncentiveReason)
     assert spec.incentive_reasons[0].message_for_miner  # miner-facing text present
+    assert spec.incentive_reasons[0].context["observed_at"] == "2026-07-29T12:30:00Z"
 
 
 @pytest.mark.asyncio
