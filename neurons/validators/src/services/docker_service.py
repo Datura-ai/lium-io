@@ -1953,13 +1953,10 @@ class DockerService:
         docker_client: RentalDockerSdkClient,
         container_name: str,
     ) -> str | None:
-        try:
-            return await docker_client.mount_source_for_destination(
-                container_name=container_name,
-                destination=_LIUM_CIPHER_MOUNT,
-            )
-        except Exception:
-            return None
+        return await docker_client.mount_source_for_destination(
+            container_name=container_name,
+            destination=_LIUM_CIPHER_MOUNT,
+        )
 
     async def setup_encrypted_local_volume(
         self,
@@ -2727,7 +2724,6 @@ class DockerService:
                 raise_exception=False,
             )
         else:
-            # docker cp cannot write into a gocryptfs FUSE mount. Stage in /tmp, then exec.
             target_path = local_volume_path if encrypted_local_volume else "/root"
             container_q = shlex.quote(container_name)
             target_q = shlex.quote(target_path)

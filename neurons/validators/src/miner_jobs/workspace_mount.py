@@ -106,7 +106,17 @@ def _volume_has_gocryptfs_conf(volume_name: str) -> bool:
         capture_output=True,
         text=True,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    raise RuntimeError(
+        f"Failed to probe gocryptfs.conf on volume {volume_name} "
+        f"(exit={result.returncode}, stderr={stderr!r}, stdout={stdout!r})"
+    )
+
 
 @dataclass(frozen=True)
 class VolumeAccess:

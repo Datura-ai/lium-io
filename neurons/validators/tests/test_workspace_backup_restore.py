@@ -344,6 +344,21 @@ def test_detect_volume_access_plain_when_gocryptfs_conf_absent(monkeypatch):
     assert access.container_name is None
 
 
+def test_detect_volume_access_raises_when_gocryptfs_conf_probe_fails(monkeypatch):
+    monkeypatch.setattr(
+        "workspace_mount.subprocess.run",
+        _docker_run_side_effect(
+            ps_output="",
+            ps_all_output="",
+            inspect_outputs={},
+            gocryptfs_conf_returncode=125,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to probe gocryptfs.conf"):
+        detect_volume_access("source-volume", "/root")
+
+
 class _FakeSftpContext:
     def __init__(self):
         self.put = AsyncMock()

@@ -2544,6 +2544,60 @@ async def test_start_container_fails_when_encrypted_setup_fails(docker_service, 
 
 
 @pytest.mark.asyncio
+async def test_start_container_fails_when_encrypted_volume_inspect_fails(docker_service, monkeypatch):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=""))
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = (
+        AsyncMock(return_value=True)
+    )
+    docker_service.setup_encrypted_local_volume = AsyncMock()
+    monkeypatch.setattr(
+        docker_service,
+        "_encrypted_local_volume_name",
+        AsyncMock(side_effect=RuntimeError("docker inspect failed")),
+    )
+
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+        local_volume_path="/workspace",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.start_container(
+        payload,
+        executor_info,
+        Mock(ss58_address="validator-hotkey"),
+        "encrypted-private-key",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    docker_service.setup_encrypted_local_volume.assert_not_awaited()
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stop_container_sdk_failure_returns_failed_request_without_shell_fallback(
     docker_service,
     monkeypatch,
