@@ -31,7 +31,7 @@ class ConnectivityOrchestrator:
         executor_info: ExecutorSSHInfo,
         miner_hotkey: str,
         sysbox_runtime: bool,
-        rented_ports: list[int] | None,
+        unavailable_ports: list[int] | None,
         ssh_client,
         log_ctx: dict | None = None,
     ) -> PortVerificationResult:
@@ -40,8 +40,9 @@ class ConnectivityOrchestrator:
             "executor_uuid": executor_info.uuid,
             "executor_ip": executor_info.address,
         }
-        rented = set(rented_ports) if rented_ports else set()
-        ports = self.port_selector.select(executor_info, BATCH_PORT_VERIFICATION_SIZE, rented)
+        ports = self.port_selector.select(
+            executor_info, BATCH_PORT_VERIFICATION_SIZE, set(unavailable_ports or [])
+        )
 
         if not ports:
             return PortVerificationResult(
