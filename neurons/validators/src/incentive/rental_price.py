@@ -38,6 +38,11 @@ logger = get_logger(__name__)
 # this multiplier forfeits the unrented rental incentive but stays active.
 SOFT_LIMIT_PRICE_RATE = 1.1
 
+# DAH-2520 — unrented incentive VRAM/disk gate. An unrented executor whose summed
+# GPU VRAM times this multiplier exceeds total disk forfeits the unrented rental
+# incentive but stays active.
+VRAM_OVER_DISK_RATE = 1.5
+
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
@@ -247,7 +252,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # round before comparing, so the numbers the miner is shown are the ones that were compared
         vram_gb = round(vram_gb, 1)
         disk_gb = round(disk_gb, 1)
-        if vram_gb <= disk_gb:
+        if vram_gb * VRAM_OVER_DISK_RATE <= disk_gb:
             return None
         return VramOverDisk(vram_gb=vram_gb, disk_gb=disk_gb)
 
@@ -568,7 +573,7 @@ class RentalPriceIncentive(DefaultIncentive):
             if settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT:
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_vram_exceeds_disk(
-                    job_result, vram_over_disk.vram_gb, vram_over_disk.disk_gb
+                    job_result, vram_over_disk.vram_gb, vram_over_disk.disk_gb, VRAM_OVER_DISK_RATE
                 )
                 job_result.incentive_logs.append(reason.to_log_line())
 
