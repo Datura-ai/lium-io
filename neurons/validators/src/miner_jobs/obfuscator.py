@@ -1,4 +1,5 @@
 import ast
+import builtins
 from ast import Name, FunctionDef
 import random
 import string
@@ -26,7 +27,8 @@ python_keywords = [
     'NVML_ERROR_MEMORY', 'NVML_ERROR_UNKNOWN', 'Exception', 'wrapper', 'args', 'kwargs', 'wraps', 'sys',
     'c_char_p', 'AttributeError', '_nvmlLib_refcount', 'nvmlLib', 'CDLL', 'os', 'tempfile', 'NVMLError',
     'OSError', 'c_uint', 'byref', 'create_string_buffer', 'c_int',  'setattr', 'subprocess', 'RuntimeError', 'hashlib',
-    'iter', 'next', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'machine_specs', 'hasattr', 'bool'
+    'iter', 'next', 'repr', 'exc', 'e', 're', 'psutil', 'shutil', 'b64encode', 'Fernet', 'json', 'machine_specs', 'hasattr', 'bool',
+    'glob', 'socket', 'http'
 ]
 
 
@@ -91,8 +93,12 @@ class FunctionContentObfuscator(ast.NodeTransformer):
         self.name_mapping = {**args_mapping}
 
     def visit_Name(self, node: Name):
+        # rename a name only when it is ours to rename: renaming a builtin or an untouched
+        # import leaves the usage pointing at a name nothing ever assigns
         if not node.id.startswith('__') and node.id not in python_keywords:
             if node.id not in self.name_mapping:
+                if hasattr(builtins, node.id):
+                    return node
                 self.name_mapping[node.id] = generate_random_name()
             node.id = self.name_mapping[node.id]
 
