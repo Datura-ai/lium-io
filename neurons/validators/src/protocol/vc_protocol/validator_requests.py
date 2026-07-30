@@ -8,6 +8,8 @@ import bittensor
 import pydantic
 from datura.requests.base import BaseRequest
 
+from incentive.miner_incentive_log import IncentiveReason
+
 
 class RequestType(enum.Enum):
     AuthenticateRequest = "AuthenticateRequest"
@@ -87,6 +89,8 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     attestation_digest: str | None = None
     tdx_attestation_passed: bool | None = None
     gpu_attestation_passed: bool | None = None
+    # None = publisher did not report the field; [] = no catalogued reason was recorded.
+    incentive_reasons: list[IncentiveReason] | None = None
 
 
 class RentedMachineRequest(BaseValidatorRequest):

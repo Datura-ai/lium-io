@@ -481,7 +481,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
         # update incentive logs
         report: MinerLogLine = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
-        result.incentive_logs.append(report.to_log_line())
+        result.record_incentive_log(report)
 
         self._explain_zero_effective_rate(result, bucket)
 
@@ -508,13 +508,13 @@ class RentalPriceIncentive(DefaultIncentive):
         incentive 0 with no reason."""
         if result.unrented_cap_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_no_unrented_capacity_for_gpu_count(result, bucket)
-            result.incentive_logs.append(reason.to_log_line())
+            result.record_incentive_log(reason)
         elif result.driver_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_nvidia_driver_below_minimum(result)
-            result.incentive_logs.append(reason.to_log_line())
+            result.record_incentive_log(reason)
         elif result.sysbox_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_sysbox_not_enabled(result)
-            result.incentive_logs.append(reason.to_log_line())
+            result.record_incentive_log(reason)
 
     async def calculate_executor_score(
         self,
@@ -543,7 +543,7 @@ class RentalPriceIncentive(DefaultIncentive):
             logger.info(exclusion.to_internal_log())
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
-            job_result.incentive_logs.append(exclusion.to_log_line())
+            job_result.record_incentive_log(exclusion)
             return job_result
 
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
@@ -565,7 +565,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 reason: MinerLogLine = MinerLogLine.no_payout_because_price_above_market_soft_limit(
                     job_result, p90, SOFT_LIMIT_PRICE_RATE
                 )
-                job_result.incentive_logs.append(reason.to_log_line())
+                job_result.record_incentive_log(reason)
 
         # DAH-2520 disk/VRAM gate: an idle machine without the required disk margin over its
         # GPU VRAM is not realistically rentable, so it forfeits the unrented incentive (node
@@ -578,7 +578,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
                     job_result, insufficient_disk
                 )
-                job_result.incentive_logs.append(reason.to_log_line())
+                job_result.record_incentive_log(reason)
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
@@ -613,7 +613,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 job_result.score > 0 or job_result.job_score > 0
             ):
                 reason: MinerLogLine = MinerLogLine.no_payout_because_gpu_model_not_in_unrented_program(job_result)
-                job_result.incentive_logs.append(reason.to_log_line())
+                job_result.record_incentive_log(reason)
             return job_result
 
         # For rented or non-eligible GPUs, use parent's default scoring logic

@@ -225,3 +225,38 @@ def test_report_line_renders_string_and_builds_internal_log():
 
     # The same content is also available as an `_m` object for the internal logger.
     assert "Mining score is calculated" in line.as_internal_log().to_full_string()
+
+
+# ── DAH-2340: structured zero-incentive reasons travel as data ────────────────
+
+def test_to_incentive_reason_is_clean_subset_without_internal_fields() -> None:
+    line = MinerLogLine.no_payout_because_discord_not_connected(_job(provider_discord_connected=False))
+    reason = line.to_incentive_reason()
+
+    assert reason.reason == "provider_discord_not_connected"
+    assert reason.message_for_miner == line.message
+    assert reason.context["executor_id"] == "exec-1"        # miner_log_fields ride along
+    assert reason.context["incentive"] == 0.0
+    # never leak internal-only observability data or duplicate the top-level code
+    assert "internal_message" not in reason.context
+    assert "pool" not in reason.context
+    assert "reason" not in reason.context
+
+
+def test_record_incentive_log_keeps_zero_reason_as_text_and_data() -> None:
+    job = _job()
+    job.record_incentive_log(MinerLogLine.no_payout_because_spot_tier(job))
+
+    # human text path (unchanged, backward compatible)
+    assert any("spot tier" in entry for entry in job.incentive_logs)
+    # structured data path (new)
+    assert [reason.reason for reason in job.zero_incentive_reasons] == [ZeroIncentiveReason.SPOT_TIER]
+
+
+def test_record_incentive_log_ignores_calculation_reports_for_the_data_path() -> None:
+    # A calc report has reason=None: it belongs in the log text but is NOT a zero-incentive reason.
+    job = _job(mining_score=1.0)
+    job.record_incentive_log(MinerLogLine.mining_score_calculated(job, is_rented_after_cutoff=False))
+
+    assert job.incentive_logs                      # still logged as text
+    assert job.zero_incentive_reasons == []        # but not surfaced as a structured reason

@@ -747,6 +747,10 @@ class MinerService:
                         "incentive_formula_inputs": result.incentive_formula_inputs,
                         "log_status": result.log_status,
                         "log_text": result.full_log_text,
+                        # [] means this cycle reported no catalogued zero-incentive reason.
+                        "incentive_reasons": [
+                            reason.model_dump(mode="json") for reason in result.zero_incentive_reasons
+                        ],
                         "collateral_deposited": result.collateral_deposited,
                         "ssh_pub_keys": result.ssh_pub_keys,
                         "attestation_digest": result.attestation_digest,
