@@ -498,11 +498,16 @@ class RentalDockerSdkClient:
 
     def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
         stdin_data = _encode_exec_stdin(spec.stdin)
+        # Without an explicit user, docker exec inherits the image's USER. Every
+        # spec routed here is rental bootstrap writing to /root or /etc, so an
+        # image built with `USER <non-root>` failed all of them (DAH-2534). The
+        # renter's own workload still runs as the image's USER.
         exec_create_result = self._api_client.exec_create(
             container=spec.container_name,
             cmd=list(spec.argv),
             stdin=stdin_data is not None,
             environment=spec.environment or None,
+            user="root",
         )
         exec_id = exec_create_result["Id"]
 

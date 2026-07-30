@@ -95,8 +95,13 @@ class DockerCommand:
 
     @staticmethod
     def exec_command(container_name: str, command: str) -> str:
-        """Build docker exec command."""
-        return f"/usr/bin/docker exec -i {container_name} sh -c '{command}'"
+        """Build docker exec command.
+
+        `-u root` mirrors the injection side (DAH-2534): without it the exec
+        inherits the image's USER, so on a non-root image this read a different
+        home directory than the one the keys were written to.
+        """
+        return f"/usr/bin/docker exec -u root -i {container_name} sh -c '{command}'"
 
 
 @dataclass
