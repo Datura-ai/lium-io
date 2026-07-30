@@ -165,6 +165,31 @@ class Settings(BaseSettings):
     }
     ENABLE_NEW_BURN_LOGIC: bool = True
 
+    # DAH-2251 — referral incentive paid via emission, to referrer hotkeys weighted by
+    # the backend's epoch-stable EMA feed. There is no funding wallet, so unlike the
+    # earlier carve-out design this has no UID/coldkey knobs.
+    #
+    # The pool is `min(share * cycle total, residual burn)` and is drawn ONLY from burn
+    # hotkeys — a share OF the total, but never taken FROM the miners. Every non-burn
+    # miner's score is left exactly as it was, so referral emission moves value from
+    # burn to referrers and never dilutes mining. See `_apply_referral_pool`.
+    #
+    # REFERRAL_EMISSION_SHARE is env-tunable and defaults to INERT (0.0): nothing is
+    # redirected until ops sets a non-zero share at launch (coordinated with the backend
+    # referral rail).
+    REFERRAL_EMISSION_SHARE: float = Field(env="REFERRAL_EMISSION_SHARE", default=0.0)
+
+    # DAH-2251 — fail-closed feed of epoch-stable referral EMA weights, served by the
+    # backend at `<COMPUTE_REST_API_URL>/v1/referral-weights`. Left unset it is DERIVED
+    # from COMPUTE_REST_API_URL (see `get_referral_feed_url`) so a staging validator
+    # reads the staging feed; set REFERRAL_FEED_URL only to host the feed elsewhere.
+    REFERRAL_FEED_URL: str | None = Field(env="REFERRAL_FEED_URL", default=None)
+    # Max age (in epochs) a feed response may lag behind the validator's current epoch
+    # before it's treated as stale and rejected (fail-closed → no referral emission).
+    REFERRAL_FEED_MAX_STALENESS_EPOCHS: int = Field(
+        env="REFERRAL_FEED_MAX_STALENESS_EPOCHS", default=3
+    )
+
     ENABLE_NO_COLLATERAL: bool = True
     ENABLE_VERIFYX: bool = True
     ENABLE_INSPECTOR: bool = True
@@ -375,6 +400,20 @@ class Settings(BaseSettings):
 
     def get_latest_contract_version(self) -> str:
         return max(self.CONTRACT_VERSIONS.keys())
+
+    def get_referral_feed_url(self) -> str:
+        """Referral-weights feed URL, derived from COMPUTE_REST_API_URL unless overridden.
+
+        Derived rather than defaulted to a literal so the feed follows the deployment:
+        a hardcoded prod URL silently pointed staging validators at prod referral data.
+        Returns "" when neither is set, which the fail-closed client turns into no
+        referral emission for the cycle (DAH-2251).
+        """
+        if self.REFERRAL_FEED_URL:
+            return self.REFERRAL_FEED_URL
+        if not self.COMPUTE_REST_API_URL:
+            return ""
+        return f"{self.COMPUTE_REST_API_URL.rstrip('/')}/v1/referral-weights"
 
     def get_bittensor_config(self) -> bittensor.Config:
         # bittensor >=10.3.2 ignores argparse defaults (BT_NO_PARSE_CLI_ARGS is on by

@@ -454,9 +454,29 @@ class Validator:
                     miners = await self.subtensor_client.get_miners()
                     last_mechanism_step_block = self.subtensor_client.get_last_mechansim_step_block()
 
+                    # Current subnet epoch for the referral feed's staleness guard. This MUST use
+                    # the SAME numbering as the backend feed's epoch_index — see
+                    # lium-io-backend services/subtensor.py::get_current_epoch_index:
+                    #   epoch_index = (block + netuid + 1) // (tempo + 1)
+                    # A plain block // tempo diverges from it and the gap grows without bound, so
+                    # the feed would read as permanently stale once REFERRAL_EMISSION_SHARE > 0.
+                    # Defensive: any failure just disables the staleness check (the client still
+                    # fails closed on transport/parse/empty), never the cycle.
+                    try:
+                        _tempo = self.subtensor_client.get_tempo()
+                        _netuid = self.subtensor_client.netuid
+                        current_epoch = (
+                            (self.subtensor_client.get_current_block() + _netuid + 1) // (_tempo + 1)
+                            if _tempo
+                            else None
+                        )
+                    except Exception:
+                        current_epoch = None
+
                     cycle_scores = await incentive.calculate_final_weights(
                         miners=miners,
                         last_mechanism_step_block=last_mechanism_step_block,
+                        current_epoch=current_epoch,
                     )
 
                     # A cycle can run across wall-clock boundaries. Stamp every executor

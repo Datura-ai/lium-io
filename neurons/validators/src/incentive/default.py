@@ -7,12 +7,13 @@ logic to maintain backward compatibility with the existing system.
 from datetime import UTC, datetime
 
 import bittensor
+from clients.referral_feed_client import ReferralFeedClient
+from services.task_service import JobResult
 
 from core.config import get_total_burn_emission, settings
 from core.utils import _m, get_extra_info, get_logger
-from incentive.miner_incentive_log import MinerLogLine
 from incentive.base import BaseIncentive
-from services.task_service import JobResult
+from incentive.miner_incentive_log import MinerLogLine
 
 logger = get_logger(__name__)
 
@@ -75,6 +76,7 @@ class DefaultIncentive(BaseIncentive):
         super().__init__(*args, **kwargs)
 
         self.burn_share = get_total_burn_emission()
+        self.referral_feed = ReferralFeedClient()
 
         # Metrics
         self.total_executors = 0
@@ -218,6 +220,7 @@ class DefaultIncentive(BaseIncentive):
         self,
         miners: list[bittensor.NeuronInfo],
         last_mechanism_step_block: int | None,
+        current_epoch: int | None = None,
     ) -> dict[str, float]:
         """Calculate scores with burning logic for this cycle.
 
@@ -233,15 +236,111 @@ class DefaultIncentive(BaseIncentive):
             dict[str, float]: Scores with burning applied for each miner
         """
         # Calculate burn scores using BurnService
-        cycle_scores = self.burn_service.calculate_burn_scores(
+        burn_scores = self.burn_service.calculate_burn_scores(
             miners=miners,
             burn_share=self.burn_share,  # burn-emission share sourced from shared config (DAH-2274)
             last_mechanism_step_block=last_mechanism_step_block,
         )
+        cycle_scores = dict(burn_scores)
         for miner in miners:
             # Check if miner is a burner
             if miner.hotkey in cycle_scores:
                 continue
             cycle_scores[miner.hotkey] = self.miner_incentives.get(miner.hotkey, 0.0)
 
+        # DAH-2251: fund referral rewards from the residual burn pool, split across the
+        # miners who referred paying customers by their EMA (see _apply_referral_pool).
+        await self._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch)
+
         return cycle_scores
+
+    async def _apply_referral_pool(
+        self,
+        cycle_scores: dict[str, float],
+        burn_scores: dict[str, float],
+        miners: list[bittensor.NeuronInfo],
+        current_epoch: int | None,
+    ) -> None:
+        """DAH-2251 — fund referral rewards from RESIDUAL BURN, split across referrers by EMA.
+
+        A fixed share (``settings.REFERRAL_EMISSION_SHARE``, default 0.0 = inert) of the
+        cycle's total emission is redirected from the residual burn pool to the miners who
+        referred paying customers, in proportion to each referrer's EMA of referred revenue
+        (read from the backend feed via ``ReferralFeedClient``, fail-closed).
+
+        Invariants (why this is safe):
+        - **Miners are never diluted.** The pool is drawn ONLY from ``burn_scores``; every
+          non-burn miner's score is left untouched. Value simply moves from burn hotkeys to
+          referrer hotkeys, so the total is unchanged and — after ``set_weights`` normalizes
+          the accumulated scores — each miner keeps its exact share while only burn shrinks.
+        - **Rental-share keeps first claim.** ``burn_scores`` is already the burn left AFTER
+          the rental-share (idle) pool took its cut, and the pool is capped at that residual,
+          so a short burn shrinks referral — never the rental-share and never the miners.
+        - **Fail closed.** An unset/zero/NaN share, an unreachable/stale/empty feed, no
+          residual burn, or no eligible referrer all leave the weight vector exactly as it
+          was — no referral emission that cycle.
+        """
+        share = min(max(settings.REFERRAL_EMISSION_SHARE, 0.0), 1.0)
+        if not (share > 0):  # also rejects NaN, which the clamp preserves
+            return
+
+        ema = await self.referral_feed.get_weights(current_epoch=current_epoch)
+        if not ema:
+            return
+
+        # Eligible referrers: present in THIS cycle's miner list, positive EMA, and never a
+        # burn slot (a burner must not also collect referral emission). Note `miners` is
+        # already filtered by SubtensorClient.fetch_miners to serving axons plus burners,
+        # so a referrer whose axon is not serving is not eligible -- same bar as mining.
+        cycle_hotkeys = {miner.hotkey for miner in miners}
+        eligible = {hk: e for hk, e in ema.items() if hk in cycle_hotkeys and hk not in burn_scores and e > 0}
+        total_ema = sum(eligible.values())
+        if total_ema <= 0:
+            # The feed named referrers but none cleared the bar. Silent here would hide a
+            # real misconfiguration (e.g. the backend publishing deregistered hotkeys), so
+            # log it -- unlike the inert-share and empty-feed paths above, which are either
+            # the default state or already logged by the client.
+            logger.warning(
+                _m(
+                    "[_apply_referral_pool] Referral feed had weights but no eligible referrer",
+                    extra=get_extra_info(
+                        {
+                            "feed_hotkeys": len(ema),
+                            "cycle_miners": len(cycle_hotkeys),
+                            "burn_hotkeys": len(burn_scores),
+                        }
+                    ),
+                ),
+            )
+            return
+
+        burn_total = sum(burn_scores.values())
+        if burn_total <= 0:
+            return  # no residual burn to draw from — miners are never touched
+
+        total_score = sum(cycle_scores.values())
+        referral_pool = min(share * total_score, burn_total)
+        if referral_pool <= 0:
+            return
+
+        # Take the pool out of burn, proportionally across burn hotkeys. Each burner's cut is
+        # its own fraction of a pool capped at burn_total, so no burn score can go negative.
+        for hotkey, burn_score in burn_scores.items():
+            cycle_scores[hotkey] = cycle_scores.get(hotkey, 0.0) - referral_pool * (burn_score / burn_total)
+
+        # Distribute the pool across referrers by EMA — stacks on their mining/rental score.
+        for hotkey, ema_value in eligible.items():
+            cycle_scores[hotkey] = cycle_scores.get(hotkey, 0.0) + referral_pool * (ema_value / total_ema)
+
+        logger.info(
+            _m(
+                "Referral emission pool applied",
+                extra={
+                    "referral_share": share,
+                    "referral_pool": referral_pool,
+                    "referrer_count": len(eligible),
+                    "burn_before": burn_total,
+                    "pool": "referral",
+                },
+            )
+        )
