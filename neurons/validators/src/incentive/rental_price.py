@@ -370,6 +370,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 free_portion.rental_created_at = None
                 free_portion.rented_gpu_count = None
                 free_portion.incentive_logs = []
+                free_portion.zero_incentive_reasons = []
                 result.gpu_count = rented_gpu_count
                 sibling_results.append(free_portion)
                 split_portions.append(_PartiallyRentedSplitPortions(sibling_results, result, free_portion))
@@ -405,6 +406,9 @@ class RentalPriceIncentive(DefaultIncentive):
                 portions.free_portion.incentive or 0.0
             )
             portions.rented_portion.incentive_logs.extend(portions.free_portion.incentive_logs)
+            # DAH-2340 reasons ride a separate list — the unrented portion's zero reasons would
+            # otherwise never reach the backend.
+            portions.rented_portion.zero_incentive_reasons.extend(portions.free_portion.zero_incentive_reasons)
             portions.sibling_results.remove(portions.free_portion)
 
     async def _pre_process_job_result(self, hotkey: str, result: JobResult) -> None:
