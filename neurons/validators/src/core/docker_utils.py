@@ -135,6 +135,35 @@ class ContainerDeathDiagnostics:
         }
 
 
+ALPINE_HELPER_IMAGE = "docker.io/library/alpine:3.19"
+
+
+async def df_available_bytes(ssh_client: asyncssh.SSHClientConnection, host_path: str) -> int:
+    """Free bytes on the filesystem holding `host_path`, measured THROUGH the docker daemon.
+
+    Three facts make this non-obvious enough to keep in one place. The validator's SSH session lands
+    inside the miner's executor container, so a host path like the docker data root does not exist
+    there and a plain df would measure the wrong filesystem — hence the bind-mounted helper container.
+    Busybox df has no `--output`, so the request is POSIX `-P`, whose contract is one unwrapped line
+    per filesystem. Available is then column 4 of the data line.
+
+    Raises on anything unexpected; callers decide whether that is fatal.
+    """
+    result = await ssh_client.run(
+        f"/usr/bin/docker run --rm -v {shlex.quote(host_path)}:/hostfs:ro "
+        f"{ALPINE_HELPER_IMAGE} df -P -B1 /hostfs"
+    )
+    if getattr(result, "exit_status", 0) != 0:
+        raise Exception(f"df via helper container failed: {getattr(result, 'stderr', '')}")
+    lines = (result.stdout or "").strip().splitlines()
+    if len(lines) < 2:
+        raise Exception(f"Unexpected df output: {result.stdout!r}")
+    columns = lines[1].split()
+    if len(columns) < 4 or not columns[3].isdigit():
+        raise Exception(f"Unexpected df output: {result.stdout!r}")
+    return int(columns[3])
+
+
 async def collect_container_death_diagnostics(
     ssh_client: asyncssh.SSHClientConnection,
     container_name: str,

@@ -207,6 +207,7 @@ LIB_NVIDIA_ML_DIGESTS = {
     "595.45.04": "1dbe78234657c5522cb8fe9c9cfde141:f7d1d0eb39f16e8e88a77e9c5127e9a2a93e4b5b1344be1f18faedcfb67bc58f",
     "595.58.03": "af7923894f6ad89eafb78c03daf422a9:9a0ef13c817030b07f931cbe6115a70f7674ecbd3bee6047417ffc7ae699ed1b",
     "595.71.05": "020cd1156cbce5ebbf12963d0c70496e:9eb4358b7fea76556657670a6ae6b0017eaa4256b56c421a36626bf8c2b5f3f5",
+    "595.84": "4de0188efc8bb6c7485e599fcc718978:6d8a58eb15a1c2e6067ec977e9de57b42a3d632b4073818ab648370fecfc82b1",
     "610.43.02": "5ad6c02411f730682597558ae8f3a9f8:2dc828b3f5027f98e05c7607c1d8129d11bd28de4c2091c5cd7e32dbc21ec172",
 }
 
@@ -223,6 +224,18 @@ PREFERRED_POD_PORTS = [20000, 20001, 20002, 20003, 20004, 20005, 20006, 20007, 2
 
 POD_CONTAINER_PREFIX = "pod_"
 FILLER_CONTAINER_PREFIX = "filler_"
+# DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
+# name with the model + runtime version baked in; the validator only needs the prefix, to recognise
+# which volumes belong to the cache when sweeping or reclaiming them.
+DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
+# DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
+# downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
+# of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom
+# above that floor. Duplicated here on purpose: only the host knows whether the cache already exists,
+# so the affordability decision has to live next to that fact. Keep in step with the backend.
+DPHN_CACHE_SIZE_GB = 40
+DPHN_CACHE_LISTING_FLOOR_GB = 100
+DPHN_CACHE_FREE_MARGIN_GB = 50
 FILLER_CONTAINER_GRACE_MINUTES = 15
 # ISSUE-050: a filler run younger than this is not penalized for a missing container —
 # it may still be finishing its create/stop race with the backend snapshot.

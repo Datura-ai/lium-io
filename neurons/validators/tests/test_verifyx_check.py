@@ -422,6 +422,35 @@ async def test_verifyx_success_null_network_repeated_decays_below_threshold(cont
 
 
 @pytest.mark.asyncio
+async def test_verifyx_keeps_the_scrapes_disk_breakdown(context_factory):
+    """VerifyX measures only total/used/free, so its dict must not evict the scrape's own
+    docker usage fields (DAH-2514) — they would be dropped on every node where VerifyX runs."""
+    # Arrange
+    verifyx_service = DummyVerifyXService(
+        success=True,
+        updated_specs={"hard_disk": {"total": 1000, "used": 400, "free": 600}, "network": {}},
+    )
+    services = build_services(verifyx=verifyx_service)
+    config = build_context_config(verifyx_enabled=True)
+    state = build_state(
+        specs={
+            "gpu": {"count": 1},
+            "hard_disk": {"total": 999, "used": 399, "free": 600, "images": 120, "volumes": 250},
+        }
+    )
+    ctx = context_factory(services=services, config=config, state=state)
+
+    # Act
+    result = await VerifyXCheck().run(ctx)
+
+    # Assert — VerifyX wins on the fields it measures, the breakdown survives
+    hard_disk = result.updates["state"].specs["hard_disk"]
+    assert hard_disk["total"] == 1000
+    assert hard_disk["images"] == 120
+    assert hard_disk["volumes"] == 250
+
+
+@pytest.mark.asyncio
 async def test_verifyx_success_path_emits_no_verifyx_failed_log(
     context_factory, caplog
 ):

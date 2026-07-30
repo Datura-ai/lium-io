@@ -8,11 +8,14 @@ from ..pipeline import CheckResult, Context
 
 
 class StartGPUMonitorCheck:
-    """Ensure the GPU monitor agent is running so validators receive live telemetry.
+    """Ensure `gpus_utility.py` is running on the executor, where it keeps the Docker template
+    images synced and pruned.
 
-    This mirrors legacy logic that boots `gpus_utility.py` on the executor. Without it we
-    lose visibility into runtime utilisation, so the remainder of the pipeline may produce
-    misleading scores when GPUs are already busy.
+    The name is historical: the script also used to push GPU telemetry to the backend, but that
+    path was disabled on both ends long ago and deleted in DAH-2419. Runtime GPU utilisation now
+    reaches the backend through the machine-spec scrape instead. The metrics-push arguments below
+    are still sent so that executors running an older image (the miner picks the image version)
+    keep starting — the script accepts and ignores them, and they go once the fleet has rolled.
     """
 
     check_id = "prep.start_gpu_monitor"

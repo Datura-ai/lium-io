@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 import redis.asyncio as aioredis
 import redis.exceptions
+from redis.backoff import ExponentialBackoff
+from redis.asyncio.retry import Retry  # NOT redis.retry.Retry: the sync one silently never retries
 from datura.requests.miner_requests import ExecutorSSHInfo
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from core.config import settings
@@ -35,12 +37,62 @@ INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
 EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (seconds)
 
+# DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
+# meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
+# connection, and the resulting thundering herd of new TCP connects timed out ("Timeout connecting to
+# server", 51/min at the 2026-07-22 08:35 wave). With no retry configured, every operation caught in
+# that window failed outright — which failed the creates and put healthy nodes into launch backoff.
+# Bounding the pool makes a burst QUEUE on an existing connection instead of opening a new one, and
+# the retry rides out a blip that lasts less than a second.
+REDIS_MAX_CONNECTIONS = 64
+# Subscriptions get their own small pool. `pubsub.listen()` is a BLOCKING read on channels that are
+# idle most of the time, and redis-py falls back to the connection's socket_timeout when the caller
+# passes no deadline — so a subscription sharing the command pool is torn down after
+# REDIS_SOCKET_TIMEOUT_SECONDS of silence, which for these channels is normal. Separate pool, no
+# socket_timeout: commands still fail fast, subscriptions are allowed to wait.
+REDIS_PUBSUB_MAX_CONNECTIONS = 8
+# Seconds a caller waits for a pooled connection once all of them are busy. The pool MUST be a
+# BlockingConnectionPool for this: the default pool raises MaxConnectionsError instead of waiting,
+# and it raises from get_connection() BEFORE the retry wrapper is reached, so a bounded default pool
+# would convert an overload burst into exactly the hard failures this hardening exists to remove.
+REDIS_POOL_WAIT_TIMEOUT_SECONDS = 10
+REDIS_SOCKET_TIMEOUT_SECONDS = 10
+REDIS_CONNECT_TIMEOUT_SECONDS = 5
+REDIS_RETRY_ATTEMPTS = 3
+# Validate a pooled connection that has been idle this long, so a silently-dropped connection is
+# discovered by the health check rather than by failing a caller's operation.
+REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
+
 logger = logging.getLogger(__name__)
 
 
 class RedisService:
     def __init__(self):
-        self.redis = aioredis.from_url(settings.get_redis_connection_url())
+        self.redis = aioredis.Redis(
+            connection_pool=aioredis.BlockingConnectionPool.from_url(
+                settings.get_redis_connection_url(),
+                max_connections=REDIS_MAX_CONNECTIONS,
+                timeout=REDIS_POOL_WAIT_TIMEOUT_SECONDS,
+                socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+                socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+                socket_keepalive=True,
+                health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+                retry=Retry(ExponentialBackoff(cap=1.0, base=0.1), REDIS_RETRY_ATTEMPTS),
+                retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+            )
+        )
+        self.pubsub_redis = aioredis.Redis(
+            connection_pool=aioredis.BlockingConnectionPool.from_url(
+                settings.get_redis_connection_url(),
+                max_connections=REDIS_PUBSUB_MAX_CONNECTIONS,
+                timeout=REDIS_POOL_WAIT_TIMEOUT_SECONDS,
+                # No socket_timeout on purpose — see REDIS_PUBSUB_MAX_CONNECTIONS.
+                socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+                socket_keepalive=True,
+                retry=Retry(ExponentialBackoff(cap=1.0, base=0.1), REDIS_RETRY_ATTEMPTS),
+                retry_on_error=[redis.exceptions.ConnectionError, redis.exceptions.TimeoutError],
+            )
+        )
         self.lock = asyncio.Lock()
 
     @asynccontextmanager
@@ -75,9 +127,16 @@ class RedisService:
         await self.redis.publish(channel, json.dumps(message))
 
     async def subscribe(self, *channel: str):
-        """Subscribe to a Redis channel."""
-        pubsub = self.redis.pubsub()
-        await pubsub.subscribe(*channel)
+        """Subscribe to a Redis channel. Caller MUST `await pubsub.aclose()` when it stops reading —
+        the connection returns to the pool only then, and the pool is bounded."""
+        pubsub = self.pubsub_redis.pubsub()
+        try:
+            await pubsub.subscribe(*channel)
+        except BaseException:
+            # SUBSCRIBE acquires the pooled connection before it sends, and the caller never receives
+            # this pubsub, so nothing else can return the connection to the bounded pool.
+            await pubsub.aclose()
+            raise
         return pubsub
 
     async def set(self, key: str, value: str):

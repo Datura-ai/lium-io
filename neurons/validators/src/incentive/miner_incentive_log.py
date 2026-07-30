@@ -8,7 +8,8 @@ WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
 
 HOW A NODE PICKS A POOL:
   rented?                                              -> mining pool (always earns)
-  idle AND model in program AND price ok AND capacity? -> unrented pool (earns)
+  idle AND model in program AND price ok AND disk >= 1.5x VRAM
+                               AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
 WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
@@ -21,6 +22,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
    Group B — idle but does not qualify for the unrented pool:
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
+     total disk below 1.5x total GPU VRAM (add disk to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -30,7 +32,9 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
 
 The scoring code (rental_price.py / default.py) detects each condition where its
 data naturally lives (some per-executor upfront, some only after cohort aggregation),
-builds the matching line and appends `line.to_log_line()` to result.incentive_logs.
+builds the matching line and records it via `result.record_incentive_log(line)` —
+which appends the text to incentive_logs AND, for zero-incentive lines, ships the
+structured reason to the backend (DAH-2340). Never append to incentive_logs directly.
 Open THIS file to see everything a miner can be told and exactly how each message reads.
 """
 
@@ -44,6 +48,7 @@ from pydantic import BaseModel, Field
 from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
+    from incentive.rental_price import InsufficientDisk
     from services.task_service import JobResult
 
 
@@ -64,17 +69,33 @@ class ZeroIncentiveReason(StrEnum):
     PRICE_ABOVE_MARKET_P90_SOFT_LIMIT = "price_above_market_p90_soft_limit"
     NO_UNRENTED_CAPACITY_FOR_GPU_COUNT = "no_unrented_capacity_for_gpu_count"
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
+    INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
+
+
+class IncentiveReason(BaseModel):
+    """One structured zero-incentive reason as it travels on the wire (DAH-2340).
+
+    Single definition for the whole validator: built here by the catalog
+    (`MinerLogLine.to_incentive_reason`) and reused by `ExecutorSpecRequest`.
+    The contract stays additive by growing `context` keys, never by renaming.
+    """
+
+    reason: str               # stable, APPEND-ONLY machine-readable code the backend keys off
+    message_for_miner: str    # free text, may change any time
+    # per-reason details shown next to the message, e.g. soft_limit_threshold,
+    # gpu_model, gpu_count, executor_id, incentive
+    context: dict[str, Any] = Field(default_factory=dict)
 
 
 class MinerLogLine(BaseModel):
     """One line of the miner-facing incentive log.
 
     Built ONLY via the named constructors below (the catalog). The constructor bakes
-    every field in; rendering takes no arguments:
+    every field in; recording takes no arguments:
 
         line: MinerLogLine = MinerLogLine.no_payout_because_spot_tier(result)
-        result.incentive_logs.append(line.to_log_line())
+        result.record_incentive_log(line)
     """
 
     message: str                                                   # plain-English, shown to the miner
@@ -86,6 +107,12 @@ class MinerLogLine(BaseModel):
     def to_log_line(self) -> str:
         """Render as one string; the caller appends it to result.incentive_logs."""
         return self.as_internal_log().to_full_string()
+
+    def to_incentive_reason(self) -> IncentiveReason:
+        """Typed wire reason for MACHINE_SPEC_CHANNEL (DAH-2340): zero-incentive lines only, never internal_* fields."""
+        # fields carries "reason" for the Loki extra; in the wire model the code already sits top-level.
+        context: dict[str, Any] = {key: value for key, value in self.fields.items() if key != "reason"}
+        return IncentiveReason(reason=self.reason.value, message_for_miner=self.message, context=context)
 
     def as_internal_log(self) -> _StructuredMessage:
         """The same line as an `_m` object, for mirroring into the internal logger."""
@@ -220,6 +247,30 @@ class MinerLogLine(BaseModel):
                 "machine_price_p90": market_p90,
                 "soft_limit_rate": rate,
                 "soft_limit_threshold": soft_limit,
+            },
+        )
+
+    @staticmethod
+    def no_payout_because_insufficient_disk_for_vram(
+        result: JobResult, measured: InsufficientDisk
+    ) -> MinerLogLine:
+        # takes the measurement whole: the two totals are interchangeable floats, and swapping
+        # them would quietly tell the miner to add disk he already has
+        required_disk_gb: float = round(measured.vram_gb * measured.rate, 1)
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
+            message=(
+                f"No unrented incentive: this executor has {measured.disk_gb} GB of total disk but "
+                f"{measured.vram_gb} GB of GPU VRAM. An idle executor must have at least "
+                f"{measured.rate}x its GPU VRAM in disk to earn the unrented incentive. Give it at "
+                f"least {required_disk_gb} GB of total disk, or rent it out to earn."
+            ),
+            extra_fields={
+                "total_vram_gb": measured.vram_gb,
+                "total_disk_gb": measured.disk_gb,
+                "min_disk_to_vram_rate": measured.rate,
+                "required_disk_gb": required_disk_gb,
             },
         )
 

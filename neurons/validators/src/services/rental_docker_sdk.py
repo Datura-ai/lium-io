@@ -6,8 +6,10 @@ import socket as socket_module
 import tempfile
 import threading
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 from core.utils import _m, get_extra_info
@@ -19,7 +21,22 @@ _DOCKER_EXEC_READY_TIMEOUT_SECONDS = 15
 _DOCKER_EXEC_READY_POLL_INTERVAL_SECONDS = 0.5
 _DOCKER_EXEC_TRANSIENT_RETRY_DELAYS_SECONDS = (1, 2, 4, 8)
 _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
+# DAH-2475: the Docker SDK is synchronous, so every call below has to run in a thread. It must not be
+# the event loop's default executor: asyncio resolves DNS there too (loop.getaddrinfo runs in it), and
+# a wave of filler creates fills that pool with minutes-long pulls. Name resolution then queues behind
+# them and every new Redis/WebSocket connection times out before it ever reaches the socket. A thread
+# pool is FIFO, so a bigger default pool does not help — the queue has to be a separate one.
+_DOCKER_EXECUTOR_MAX_WORKERS = 32
+_DOCKER_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_DOCKER_EXECUTOR_MAX_WORKERS, thread_name_prefix="docker-sdk"
+)
 logger = logging.getLogger(__name__)
+
+
+async def _in_docker_thread(func: Callable, /, *args, **kwargs):
+    # runs a blocking Docker SDK call in the dedicated pool instead of the loop's default executor
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_DOCKER_EXECUTOR, partial(func, *args, **kwargs))
 
 
 class RentalDockerConnectionError(RuntimeError):
@@ -141,7 +158,7 @@ class RentalDockerSdkClient:
     async def pull(self, *, image: str) -> None:
         timeout_seconds = self._normalized_pull_timeout_seconds()
         try:
-            pull_call = asyncio.to_thread(self._pull_sync, image)
+            pull_call = _in_docker_thread(self._pull_sync, image)
             if timeout_seconds is not None:
                 await asyncio.wait_for(
                     pull_call,
@@ -162,7 +179,7 @@ class RentalDockerSdkClient:
 
     async def image_exists(self, *, image: str) -> bool:
         try:
-            await asyncio.to_thread(self._api_client.inspect_image, image)
+            await _in_docker_thread(self._api_client.inspect_image, image)
         except Exception as exc:
             if _is_docker_not_found_error(exc):
                 return False
@@ -173,7 +190,7 @@ class RentalDockerSdkClient:
 
     async def run_container(self, spec: ContainerRunSpec) -> None:
         try:
-            await asyncio.to_thread(self._run_container_sync, spec)
+            await _in_docker_thread(self._run_container_sync, spec)
         except Exception as exc:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK run container failed", exc)
@@ -189,7 +206,7 @@ class RentalDockerSdkClient:
             # for the remaining inspect-vs-exec race.
             await self._wait_for_container_exec_ready(spec.container_name)
             try:
-                result = await asyncio.to_thread(self._exec_in_container_sync, spec)
+                result = await _in_docker_thread(self._exec_in_container_sync, spec)
             except Exception as exc:
                 if not _is_docker_container_restarting_error(exc):
                     raise RentalDockerOperationError(
@@ -262,6 +279,23 @@ class RentalDockerSdkClient:
             v=remove_volumes,
         )
 
+    async def mount_source_for_destination(
+        self,
+        *,
+        container_name: str,
+        destination: str,
+    ) -> str | None:
+        try:
+            return await _in_docker_thread(
+                self._mount_source_for_destination_sync,
+                container_name,
+                destination,
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+
     async def create_volume(
         self,
         *,
@@ -271,7 +305,7 @@ class RentalDockerSdkClient:
         timeout: int | None = None,
     ) -> None:
         try:
-            await asyncio.to_thread(
+            await _in_docker_thread(
                 self._create_volume_sync,
                 volume_name=volume_name,
                 driver=driver,
@@ -300,11 +334,11 @@ class RentalDockerSdkClient:
     async def aclose(self) -> None:
         close = getattr(self._api_client, "close", None)
         if close is not None:
-            await asyncio.to_thread(close)
+            await _in_docker_thread(close)
 
     async def _call_api(self, *args, operation_label: str, api_method, **kwargs) -> None:
         try:
-            await asyncio.to_thread(api_method, *args, **kwargs)
+            await _in_docker_thread(api_method, *args, **kwargs)
         except Exception as exc:
             raise RentalDockerOperationError(
                 _wrap_error_message(f"Docker SDK {operation_label} failed", exc)
@@ -322,7 +356,7 @@ class RentalDockerSdkClient:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
         while True:
-            readiness = await asyncio.to_thread(
+            readiness = await _in_docker_thread(
                 self._inspect_container_exec_readiness,
                 container_name,
             )
@@ -384,6 +418,15 @@ class RentalDockerSdkClient:
             terminal=terminal,
             detail=_format_container_state_detail(state),
         )
+
+    def _mount_source_for_destination_sync(
+        self, container_name: str, destination: str
+    ) -> str | None:
+        info = self._api_client.inspect_container(container_name)
+        for mount in info.get("Mounts", []) or ():
+            if mount.get("Destination") == destination:
+                return mount.get("Name") or mount.get("Source") or None
+        return None
 
     def _run_container_sync(self, spec: ContainerRunSpec) -> None:
         host_config = self._api_client.create_host_config(
@@ -514,7 +557,7 @@ class RentalDockerSdkClientFactory:
             _validate_paramiko_known_hosts(known_hosts_path)
 
             try:
-                api_client = await asyncio.to_thread(
+                api_client = await _in_docker_thread(
                     self._create_api_client,
                     _build_docker_ssh_base_url(executor_info),
                     key_path,

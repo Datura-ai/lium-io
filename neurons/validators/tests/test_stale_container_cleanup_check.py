@@ -24,9 +24,11 @@ from protocol.vc_protocol.compute_requests import (
 class RecordingContainerCleanup:
     """Records cleanup() calls and returns a configurable (count, names) result."""
 
-    def __init__(self, result=(0, [])):
+    def __init__(self, result=(0, []), reclaimed=0):
         self._result = result
+        self._reclaimed = reclaimed
         self.calls = []
+        self.reclaim_calls = []
 
     async def cleanup(self, ssh_client, rented_data, executor_uuid):
         self.calls.append(
@@ -37,6 +39,10 @@ class RecordingContainerCleanup:
             }
         )
         return self._result
+
+    async def reclaim_dphn_cache_when_disk_is_tight(self, ssh_client, executor_uuid):
+        self.reclaim_calls.append({"ssh_client": ssh_client, "executor_uuid": executor_uuid})
+        return self._reclaimed
 
 
 def _make_ctx(cleanup, rented_data=None):
@@ -117,3 +123,17 @@ def test_cleanup_runs_before_port_checks_in_production_pipeline():
     idx_tenant = check_ids.index("TenantEnforcementCheck")
 
     assert idx_cleanup < idx_conn < idx_count < idx_tenant
+
+
+@pytest.mark.asyncio
+async def test_also_reclaims_the_dphn_cache_when_disk_is_tight():
+    # DAH-2475: this check is the ONLY caller of the reclaim backstop — the create-time sweep
+    # deliberately never reclaims, so a node stranded under the listing floor is rescued here.
+    cleanup = RecordingContainerCleanup(result=(0, []), reclaimed=2)
+    ctx = _make_ctx(cleanup)
+
+    result = await StaleContainerCleanupCheck().run(ctx)
+
+    assert cleanup.reclaim_calls == [{"ssh_client": "ssh-conn-sentinel", "executor_uuid": ctx.executor.uuid}]
+    assert result.passed
+    assert result.event.what_we_saw["reclaimed_cache_volumes"] == 2

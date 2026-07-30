@@ -1,9 +1,12 @@
 from ctypes import *
 import sys
 import os
+import glob
+import http.client
 import json
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import psutil
@@ -751,6 +754,97 @@ def benchmark_network_speed():
         "measurements": measurements,
     }
 
+DOCKER_SOCKET_PATH = "/var/run/docker.sock"
+# /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
+# let a scrape round hang on it.
+DOCKER_API_TIMEOUT_SECONDS = 20
+VLOOPBACK_DRIVER_PREFIX = "vloopback"
+
+
+class UnixSocketHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, socket_path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def docker_api_get(path):
+    # read one docker daemon endpoint over its unix socket; the scrape runs inside the privileged
+    # executor container, where the host socket is bind-mounted. The CLI reports these sizes as
+    # human strings ("45.08GB"); the API returns exact integers.
+    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, DOCKER_API_TIMEOUT_SECONDS)
+    try:
+        conn.request("GET", path)
+        response = conn.getresponse()
+        body = response.read()
+        if response.status != 200:
+            raise RuntimeError(f"docker api {path} returned HTTP {response.status}")
+        return json.loads(body)
+    finally:
+        conn.close()
+
+
+def get_vloopback_volume_bytes(docker_root_dir):
+    # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
+    # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
+    volumes = (docker_api_get("/volumes") or {}).get("Volumes") or []
+    names = [
+        volume.get("Name")
+        for volume in volumes
+        if (volume.get("Driver") or "").startswith(VLOOPBACK_DRIVER_PREFIX)
+        and volume.get("Name")
+        and "/" not in volume.get("Name")
+    ]
+    if not names:
+        return 0
+
+    # DATA_DIR is set to <DockerRootDir>/loopback at install time, but the plugin writes it inside
+    # its own rootfs; reachable here because the executor container shares the host PID namespace.
+    data_dirs = glob.glob(
+        f"/proc/1/root{docker_root_dir}/plugins/*/rootfs{docker_root_dir}/loopback"
+    )
+    if not data_dirs:
+        # every volume would be counted as 0 and the breakdown would silently under-report by
+        # terabytes; fail like the rest of the docker half so the miss lands in an error key
+        raise RuntimeError(f"no vloopback plugin data dir under {docker_root_dir} for {len(names)} volumes")
+
+    total = 0
+    for name in names:
+        for data_dir in data_dirs:
+            try:
+                # st_blocks, not st_size: a preallocated volume takes its whole declared size on
+                # disk while holding nothing, a sparse one takes only what it wrote.
+                total += os.stat(os.path.join(data_dir, name)).st_blocks * 512
+                break
+            except OSError:
+                continue
+    return total
+
+
+def get_docker_disk_usage():
+    # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
+    df = docker_api_get("/system/df")
+    containers = sum(
+        max(int(container.get("SizeRw") or 0), 0) for container in df.get("Containers") or []
+    )
+    volumes = sum(
+        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
+        for volume in df.get("Volumes") or []
+    )
+    docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    volumes += get_vloopback_volume_bytes(docker_root_dir)
+
+    return {
+        "hard_disk_images": int(df.get("LayersSize") or 0) // 1024,
+        "hard_disk_containers": containers // 1024,
+        "hard_disk_volumes": volumes // 1024,
+    }
+
+
 def get_docker_info(content: bytes):
     data = {
         "docker_version": "",
@@ -988,12 +1082,18 @@ def get_machine_specs():
 
             # Get GPU utilization rates
             utilization = nvmlDeviceGetUtilizationRates(handle)
+            memory_info = nvmlDeviceGetMemoryInfo(handle)
 
             data["data_gpu"]["gpu_details"].append(
                 {
                     "gpu.name": nvmlDeviceGetName(handle),
                     "gpu.uuid": nvmlDeviceGetUUID(handle),
-                    "gpu.capacity": nvmlDeviceGetMemoryInfo(handle).c_nvmlMemory_t_total / (1024 ** 2),  # in MB
+                    "gpu.capacity": memory_info.c_nvmlMemory_t_total / (1024 ** 2),  # in MB
+                    # Not interchangeable with gpu.memory_utilization below: that one is NVML's
+                    # memory-BUS duty cycle, which drops to 0 on a loaded-but-idle GPU.
+                    # Reads a few hundred MB above `nvidia-smi memory.used` because NVML v1 counts the
+                    # driver-reserved block (measured: 386 MB on an A4000, 728 MB on a B200).
+                    "gpu.memory_used_mb": memory_info.c_nvmlMemory_t_used / (1024 ** 2),  # in MB
                     "gpu.cuda": f"{major}.{minor}",
                     "gpu.power_limit": nvmlDeviceGetPowerManagementLimit(handle) / 1000,
                     "gpu.power_default_limit": safeNvmlValue(
@@ -1099,6 +1199,13 @@ def get_machine_specs():
     except Exception as exc:
         # print(f"Error getting disk_usage from shutil: {exc}", file=sys.stderr)
         data["hard_disk_scrape_error"] = repr(exc)
+
+    try:
+        data["data_hard_disk"].update(get_docker_disk_usage())
+    except Exception as exc:
+        # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
+        # node that loses only the breakdown must keep reporting total/used/free.
+        data["hard_disk_docker_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:

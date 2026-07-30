@@ -85,3 +85,39 @@ async def test_verify_ports_non_ok_status_skips_persist(
     assert result.elapsed_sec is not None
 
     orchestrator.verify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_verify_ports_merges_rented_and_filler_ports(
+    mock_ssh_client,
+    sample_executor_info,
+    mocker,
+):
+    # DAH-2527: filler ports arrive separately so rented_ports keeps meaning "has a rental",
+    # but the orchestrator below must receive them as one set of taken ports
+    orchestrator = mocker.Mock()
+    orchestrator.verify = mocker.AsyncMock(
+        return_value=PortVerificationResult(
+            selected_ports=tuple(),
+            successful_ports=tuple(),
+            failed_ports=tuple(),
+            dind_port=None,
+            dind_ok=False,
+            sysbox_runtime=False,
+            status="no_ports",
+        )
+    )
+
+    executor_service = ExecutorConnectivityService(orchestrator=orchestrator)
+
+    await executor_service.verify_ports(
+        mock_ssh_client,
+        "test_miner",
+        sample_executor_info,
+        rented_ports=[40100],
+        filler_ports=[40001, 40003],
+    )
+
+    passed = orchestrator.verify.call_args.kwargs
+    assert set(passed["unavailable_ports"]) == {40001, 40003, 40100}
+    assert "rented_ports" not in passed

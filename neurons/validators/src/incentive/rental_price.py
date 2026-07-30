@@ -39,6 +39,21 @@ logger = get_logger(__name__)
 # this multiplier forfeits the unrented rental incentive but stays active.
 SOFT_LIMIT_PRICE_RATE = 1.1
 
+# DAH-2520 — unrented incentive disk/VRAM gate. An unrented executor whose total disk
+# is below its summed GPU VRAM times this multiplier forfeits the unrented rental
+# incentive but stays active.
+MIN_DISK_TO_VRAM_RATE = 1.5
+
+
+# ── Spec measurements ────────────────────────────────────────────────────────
+
+class InsufficientDisk(BaseModel):
+    """Measured totals of a machine whose disk is below the required margin over its GPU VRAM."""
+
+    vram_gb: float
+    disk_gb: float
+    rate: float  # required disk-to-VRAM margin the machine failed to clear
+
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
 
@@ -223,6 +238,71 @@ class RentalPriceIncentive(DefaultIncentive):
                     "soft_limit_threshold": p90 * SOFT_LIMIT_PRICE_RATE if p90 else None,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.PRICE_ABOVE_MARKET_P90_SOFT_LIMIT,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _insufficient_disk(self, result: JobResult) -> InsufficientDisk | None:
+        # machine whose disk is below the required margin over its GPU VRAM; None when it
+        # clears the margin or the scrape is unusable
+        spec = result.spec
+        if not spec:
+            # no scrape at all: a synthetic or estimated job result, nothing to measure
+            return None
+        try:
+            gpu_details = (spec.get("gpu") or {}).get("details") or []
+            vram_gb = sum(float(gpu.get("capacity") or 0) for gpu in gpu_details) / 1024  # capacity is MB
+            # total size of the filesystem the scrape reports, not free space: free is
+            # distorted by preallocated volumes
+            disk_gb = float((spec.get("hard_disk") or {}).get("total") or 0) / 1024 ** 2  # total is kB
+        except (AttributeError, TypeError, ValueError) as exc:
+            # the scrape is produced on the miner's machine, and calculate_mining_scores has no
+            # per-result guard: raising here would cost EVERY miner this cycle's weights
+            self._log_insufficient_disk_unmeasured(result, f"unreadable scrape: {exc!r}")
+            return None
+        if vram_gb <= 0 or disk_gb <= 0:
+            # either number missing or zeroed: fail open, nobody loses incentive over telemetry
+            self._log_insufficient_disk_unmeasured(result, "vram or disk missing from the scrape")
+            return None
+        # round before comparing, so the numbers the miner is shown are the ones that were compared
+        vram_gb = round(vram_gb, 1)
+        disk_gb = round(disk_gb, 1)
+        if vram_gb * MIN_DISK_TO_VRAM_RATE <= disk_gb:
+            return None
+        return InsufficientDisk(vram_gb=vram_gb, disk_gb=disk_gb, rate=MIN_DISK_TO_VRAM_RATE)
+
+    def _log_insufficient_disk_unmeasured(self, result: JobResult, cause: str) -> None:
+        # gate could not run: a shadow report must not read this executor as "disk is fine"
+        logger.warning(
+            _m(
+                "Cannot measure total disk against GPU VRAM; unrented incentive kept",
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "cause": cause,
+                    "reason": "insufficient_disk_unmeasured",
+                },
+            )
+        )
+
+    def _log_insufficient_disk(self, result: JobResult, measured: InsufficientDisk) -> None:
+        # structured log for every rental-eligible unrented executor short on disk for its VRAM
+        enforced = settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT
+        logger.info(
+            _m(
+                "Unrented executor has less total disk than its GPU VRAM requires"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "total_vram_gb": measured.vram_gb,
+                    "total_disk_gb": measured.disk_gb,
+                    "min_disk_to_vram_rate": measured.rate,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -479,7 +559,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
         # update incentive logs
         report: MinerLogLine = MinerLogLine.rental_incentive_calculated(hotkey, result, bucket)
-        result.incentive_logs.append(report.to_log_line())
+        result.record_incentive_log(report)
 
         self._explain_zero_effective_rate(result, bucket)
 
@@ -506,13 +586,13 @@ class RentalPriceIncentive(DefaultIncentive):
         incentive 0 with no reason."""
         if result.unrented_cap_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_no_unrented_capacity_for_gpu_count(result, bucket)
-            result.incentive_logs.append(reason.to_log_line())
+            result.record_incentive_log(reason)
         elif result.driver_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_nvidia_driver_below_minimum(result)
-            result.incentive_logs.append(reason.to_log_line())
+            result.record_incentive_log(reason)
         elif result.sysbox_multiplier == 0:
             reason: MinerLogLine = MinerLogLine.no_payout_because_sysbox_not_enabled(result)
-            result.incentive_logs.append(reason.to_log_line())
+            result.record_incentive_log(reason)
 
     async def calculate_executor_score(
         self,
@@ -541,7 +621,7 @@ class RentalPriceIncentive(DefaultIncentive):
             logger.info(exclusion.to_internal_log())
             job_result.mining_score = 0
             job_result.eligible_for_rental_share = False
-            job_result.incentive_logs.append(exclusion.to_log_line())
+            job_result.record_incentive_log(exclusion)
             return job_result
 
         # Check if GPU is unrented and eligible (has positive cap in max_unrented_gpus)
@@ -563,7 +643,20 @@ class RentalPriceIncentive(DefaultIncentive):
                 reason: MinerLogLine = MinerLogLine.no_payout_because_price_above_market_soft_limit(
                     job_result, p90, SOFT_LIMIT_PRICE_RATE
                 )
-                job_result.incentive_logs.append(reason.to_log_line())
+                job_result.record_incentive_log(reason)
+
+        # DAH-2520 disk/VRAM gate: an idle machine without the required disk margin over its
+        # GPU VRAM is not realistically rentable, so it forfeits the unrented incentive (node
+        # stays active). While the flag is off we only log the would-be exclusion (shadow).
+        insufficient_disk = self._insufficient_disk(job_result) if eligible_for_rental_share else None
+        if insufficient_disk is not None:
+            self._log_insufficient_disk(job_result, insufficient_disk)
+            if settings.ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
+                    job_result, insufficient_disk
+                )
+                job_result.record_incentive_log(reason)
 
         job_result.eligible_for_rental_share = eligible_for_rental_share
         if job_result.eligible_for_rental_share:
@@ -598,7 +691,7 @@ class RentalPriceIncentive(DefaultIncentive):
                 job_result.score > 0 or job_result.job_score > 0
             ):
                 reason: MinerLogLine = MinerLogLine.no_payout_because_gpu_model_not_in_unrented_program(job_result)
-                job_result.incentive_logs.append(reason.to_log_line())
+                job_result.record_incentive_log(reason)
             return job_result
 
         # For rented or non-eligible GPUs, use parent's default scoring logic

@@ -21,7 +21,7 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     WorkloadKind,
 )
-from services.docker_service import DockerService
+from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService
 from services.rental_docker_sdk import (
     ContainerExecResult,
     RentalDockerOperationError,
@@ -148,6 +148,11 @@ class RecordingRentalDockerClient:
             {"volume_name": volume_name, "force": force}
         )
 
+    async def mount_source_for_destination(
+        self, *, container_name: str, destination: str
+    ) -> str | None:
+        return None
+
     async def prune_images(self) -> None:
         self.pruned_images += 1
 
@@ -243,13 +248,16 @@ def _base_create_payload(**overrides) -> ContainerCreateRequest:
 
 
 def _lifecycle_payload(payload_cls, *, container_name: str):
-    return payload_cls(
-        miner_hotkey="miner-hotkey",
-        executor_id=str(uuid4()),
-        pod_id="pod-id",
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        container_name=container_name,
-    )
+    values = {
+        "miner_hotkey": "miner-hotkey",
+        "executor_id": str(uuid4()),
+        "pod_id": "pod-id",
+        "workload_kind": WorkloadKind.CUSTOMER_RENTAL,
+        "container_name": container_name,
+    }
+    if payload_cls is ContainerStartRequest:
+        values["local_volume_path"] = "/root"
+    return payload_cls(**values)
 
 
 def _patch_common(monkeypatch, docker_service, ssh_client):
@@ -417,13 +425,50 @@ async def test_create_container_keeps_hostile_fields_out_of_host_shell_commands(
 
 
 @pytest.mark.asyncio
-async def test_create_container_disables_sysbox_runtime_for_s3fs_external_volume(
+async def test_create_container_keeps_sysbox_runtime_for_s3fs_external_volume(
     docker_service,
     executor_info,
     keypair,
     monkeypatch,
 ):
-    ssh_client = RecordingSSHClient()
+    ssh_client = RecordingSSHClient(stdout="sysbox:231072:65536")
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    payload = _base_create_payload(
+        is_sysbox=True,
+        external_volume_info=ExternalVolumeInfo(
+            name="celium-volume-safe",
+            plugin="s3fs",
+            iam_user_access_key="access-key",
+            iam_user_secret_key="secret-key",
+        ),
+    )
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
+    assert run_spec.runtime == "sysbox-runc"
+    assert any(
+        volume.source == "celium-volume-safe" and volume.target == "/mnt"
+        for volume in run_spec.volumes
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_container_drops_sysbox_when_subuid_base_is_unusable(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+):
+    # A range wider than one slice means sysbox picks a different base per
+    # container, so the mount owner cannot be aligned — the volume stays usable
+    # only under runc.
+    ssh_client = RecordingSSHClient(stdout="sysbox:231072:1048576")
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
     payload = _base_create_payload(
         is_sysbox=True,
@@ -444,10 +489,208 @@ async def test_create_container_disables_sysbox_runtime_for_s3fs_external_volume
 
     run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
     assert run_spec.runtime is None
-    assert any(
-        volume.source == "celium-volume-safe" and volume.target == "/mnt"
-        for volume in run_spec.volumes
+    streamed_messages = [
+        call.args[0] for call in docker_service.stream_log.await_args_list
+    ]
+    assert any("Sysbox disabled" in message for message in streamed_messages)
+
+
+@pytest.mark.asyncio
+async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
+    docker_service,
+    monkeypatch,
+):
+    # DAH-2512: one shared plugin instance holds one credential pair and dies on
+    # `plugin disable`, taking every other pod's mount on the host with it.
+    ssh_client = RecordingSSHClient()
+    stream_logs = AsyncMock(return_value=(True, ""))
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", stream_logs)
+    volume_info = ExternalVolumeInfo(
+        name="celium-volume-safe",
+        plugin="s3fs",
+        iam_user_access_key="access-key",
+        iam_user_secret_key="secret-key",
     )
+
+    await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=volume_info,
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    alias = "s3fs-celium-volume-safe"
+    assert any(f"--alias {alias} " in command for command in ssh_client.commands)
+    assert any(f"plugin set {alias} AWSACCESSKEYID=" in command for command in ssh_client.commands)
+    assert any(f"plugin enable {alias}" in command for command in ssh_client.commands)
+    assert f"volume create -d {alias} " in stream_logs.await_args.kwargs["command"]
+    # the legacy instance is left alone entirely while the create succeeds
+    assert not any(
+        LEGACY_S3FS_PLUGIN_ALIAS == command.split()[-1] for command in ssh_client.commands
+    )
+    # the shared instance is only ever enabled, never reconfigured or disabled —
+    # that is what used to break every other pod on the host
+    forbidden = (
+        f"/usr/bin/docker plugin disable {LEGACY_S3FS_PLUGIN_ALIAS} -f",
+        f"/usr/bin/docker plugin set {LEGACY_S3FS_PLUGIN_ALIAS} ",
+        f"/usr/bin/docker volume create -d {LEGACY_S3FS_PLUGIN_ALIAS} ",
+    )
+    assert not any(command.startswith(forbidden) for command in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+async def test_create_s3fs_volume_frees_a_name_held_by_the_legacy_instance(
+    docker_service,
+    monkeypatch,
+):
+    # Hosts provisioned before DAH-2512 still hold the volume name under the shared
+    # instance, and docker cannot even drop that handle while it is disabled.
+    ssh_client = RecordingSSHClient()
+    stream_logs = AsyncMock(side_effect=[(False, "volume name must be unique"), (True, "")])
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", stream_logs)
+    volume_info = ExternalVolumeInfo(
+        name="celium-volume-safe",
+        plugin="s3fs",
+        iam_user_access_key="access-key",
+        iam_user_secret_key="secret-key",
+    )
+
+    is_success, _ = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=volume_info,
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is True
+    assert stream_logs.await_count == 2
+    assert ssh_client.commands.index(
+        f"/usr/bin/docker plugin enable {LEGACY_S3FS_PLUGIN_ALIAS}"
+    ) < ssh_client.commands.index(f"/usr/bin/docker volume rm {volume_info.name}")
+
+
+@pytest.mark.asyncio
+async def test_create_s3fs_volume_refuses_an_unsafe_volume_name(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = RecordingSSHClient()
+    monkeypatch.setattr(
+        docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, ""))
+    )
+    volume_info = ExternalVolumeInfo(
+        name=HOSTILE_VOLUME_NAME,
+        plugin="s3fs",
+        iam_user_access_key="access-key",
+        iam_user_secret_key="secret-key",
+    )
+
+    is_success, _ = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=volume_info,
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert is_success is False
+    assert ssh_client.commands == []
+
+
+@pytest.mark.asyncio
+async def test_remove_s3fs_volume_plugin_removes_only_its_own_instance(
+    docker_service,
+):
+    ssh_client = RecordingSSHClient()
+
+    await docker_service.remove_s3fs_volume_plugin(
+        ssh_client=ssh_client, volume_name="celium-volume-safe"
+    )
+
+    assert ssh_client.commands == [
+        "/usr/bin/docker plugin disable s3fs-celium-volume-safe -f",
+        "/usr/bin/docker plugin rm s3fs-celium-volume-safe",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remove_s3fs_volume_plugin_ignores_unsafe_volume_name(
+    docker_service,
+):
+    ssh_client = RecordingSSHClient()
+
+    await docker_service.remove_s3fs_volume_plugin(
+        ssh_client=ssh_client, volume_name=HOSTILE_VOLUME_NAME
+    )
+
+    assert ssh_client.commands == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sysbox_subuid_base,expected_options",
+    [
+        # Sysbox cannot ID-shift a FUSE mount, so s3fs must report the objects as
+        # owned by the host uid sysbox maps container root to.
+        (231072, "allow_other,uid=231072,gid=231072"),
+        (None, "allow_other"),
+    ],
+)
+async def test_create_s3fs_volume_mount_options(
+    docker_service,
+    monkeypatch,
+    sysbox_subuid_base,
+    expected_options,
+):
+    ssh_client = RecordingSSHClient()
+    monkeypatch.setattr(
+        docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, ""))
+    )
+    volume_info = ExternalVolumeInfo(
+        name="celium-volume-safe",
+        plugin="s3fs",
+        iam_user_access_key="access-key",
+        iam_user_secret_key="secret-key",
+    )
+
+    await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=volume_info,
+        log_tag="tag",
+        sysbox_subuid_base=sysbox_subuid_base,
+    )
+
+    assert any(
+        f'DEFAULT_S3FSOPTS="{expected_options}"' in command
+        for command in ssh_client.commands
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "subuid_file,expected_base",
+    [
+        ("ubuntu:100000:65536\nsysbox:231072:65536", 231072),
+        ("sysbox:231072:1048576", None),
+        ("liumuser:100000:65536", None),
+        ("", None),
+        ("sysbox:not-a-number:65536", None),
+    ],
+)
+async def test_resolve_sysbox_subuid_base(docker_service, subuid_file, expected_base):
+    ssh_client = RecordingSSHClient(stdout=subuid_file)
+
+    base = await docker_service.resolve_sysbox_subuid_base(
+        ssh_client=ssh_client, log_extra={}
+    )
+
+    assert base == expected_base
+    # Must read the HOST's file: the ssh session lands inside the executor
+    # container, whose own /etc/subuid carries no sysbox entry.
+    assert ssh_client.commands == ["cat /proc/1/root/etc/subuid"]
 
 
 @pytest.mark.asyncio

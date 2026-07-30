@@ -26,6 +26,7 @@ services:
       - /etc/docker/daemon.json:/etc/docker/daemon.json
       - /var/run/dstack.sock:/var/run/dstack.sock
       - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
+      - reserve_data:/var/lium-reserve
     pid: host
     privileged: true
     environment:
@@ -74,3 +75,4 @@ services:
 
 volumes:
   db_data:
+  reserve_data:

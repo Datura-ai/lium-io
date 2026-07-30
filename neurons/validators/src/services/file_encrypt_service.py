@@ -14,10 +14,13 @@ from payload_models.payloads import MinerJobEnryptedFiles
 
 from services.ssh_service import SSHService
 
+# ORDER IS LOAD-BEARING: machine_scrape derives its encryption key from the literal key order of
+# gpu_details[0], so this list must stay an exact mirror of that dict — same members, same order.
 KEYS_FOR_ENCRYPTION_KEY_GENERATION = [
     "gpu.name",
     "gpu.uuid",
     "gpu.capacity",
+    "gpu.memory_used_mb",
     "gpu.cuda",
     "gpu.power_limit",
     "gpu.power_default_limit",
@@ -44,6 +47,7 @@ ORIGINAL_KEYS = {
     "gpu.speed_pcie": "pcie_speed",
     "gpu.utilization": "gpu_utilization",
     "gpu.memory_utilization": "memory_utilization",
+    "gpu.memory_used_mb": "memory_used_mb",
     '<default>': "<default>",
     'c_nvmlMemory_t_total': "total",
     'c_nvmlMemory_t_free': "free",
@@ -87,7 +91,11 @@ ORIGINAL_KEYS = {
     'hard_disk_used': "used",
     'hard_disk_free': "free",
     'hard_disk_utilization': "utilization",
+    'hard_disk_images': "images",
+    'hard_disk_containers': "containers",
+    'hard_disk_volumes': "volumes",
     'hard_disk_scrape_error': "hard_disk_scrape_error",
+    'hard_disk_docker_scrape_error': "hard_disk_docker_scrape_error",
     'data_os': "os",
     'data_ram': "ram",
     'data_hard_disk': "hard_disk",
@@ -190,6 +198,7 @@ class FileEncryptService:
             "gpu.speed_pcie": "",
             "gpu.utilization": "",
             "gpu.memory_utilization": "",
+            "gpu.memory_used_mb": "",
             "gpu_count": "",
             "gpu_driver": "",
             "gpu_cuda_driver": "",
@@ -229,7 +238,11 @@ class FileEncryptService:
             'hard_disk_used': "",
             'hard_disk_free': "",
             'hard_disk_utilization': "",
+            'hard_disk_images': "",
+            'hard_disk_containers': "",
+            'hard_disk_volumes': "",
             'hard_disk_scrape_error': "",
+            'hard_disk_docker_scrape_error': "",
             'data_os': "",
             'os_scrape_error': "",
             'data_network': "",

@@ -3,7 +3,7 @@ from datetime import datetime
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import BaseModel, Field, field_validator, model_serializer
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
 
 class CustomOptions(BaseModel):
@@ -232,6 +232,16 @@ class GpuPowerLimit(BaseModel):
     watts: int = Field(gt=0)
 
 
+class CacheVolume(BaseModel):
+    # One persistent, stable-named docker volume mounted into a FILLER container so its model/runtime
+    # cache survives container teardown (a DPHN cold start otherwise re-downloads ~37 GB per start).
+    # Honored by the validator ONLY for workload_kind == FILLER; the delete request never names these,
+    # so they persist across stops. `name` must be a safe docker volume name and must NOT use the
+    # ephemeral `volume_` prefix (that prefix marks the run volumes every GC path deletes).
+    name: str
+    target: str
+
+
 class ContainerCreateRequest(ContainerBaseRequest):
     """Container creation request from the backend.
 
@@ -261,9 +271,15 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # when edit pod, docker_password is required
     docker_password: str | None = Field(default=None, repr=False)
     timestamp: int | None = None
+    # DAH-2458: backend-measured pre-dispatch profiler spans (e.g. filler preemption, rent prep),
+    # as wire dicts {name, duration}. create_container seeds the deploy profile with these so the
+    # persisted profile is one ordered backend -> subnet -> backend timeline. Optional/defaulted so
+    # an older backend that omits it degrades gracefully to the subnet-only profile.
+    pre_dispatch_profilers: list[dict] = []
     backup_log_id: str | None = None
     restore_path: str | None = None
     enable_jupyter: bool | None = None
+    enable_volume_encryption: bool | None = None
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
@@ -308,6 +324,12 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # miner default jobs). MUST be declared here or pydantic drops it on deserialization of the
     # backend's request.
     gpu_power_limits: list[GpuPowerLimit] | None = None
+    # Extra persistent named volumes mounted into a FILLER container (DPHN model/runtime cache, so a
+    # restart reuses the warm cache instead of re-downloading ~37 GB). FILLER-only: the validator
+    # appends these mounts only for workload_kind == FILLER and never for a customer rental. None ->
+    # no cache volumes (customer rentals, PEARL, miner default jobs). MUST be declared here or pydantic
+    # drops it on deserialization of the backend's request.
+    cache_volumes: list[CacheVolume] | None = None
 
 
 class ExecutorRentFinishedRequest(ContainerBaseRequest):
@@ -317,6 +339,7 @@ class ExecutorRentFinishedRequest(ContainerBaseRequest):
 class ContainerStartRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStartRequest
     container_name: str
+    local_volume_path: str
 
 
 class AddSshPublicKeyRequest(ContainerBaseRequest):
@@ -370,6 +393,8 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_target_path: str
     auth_token: str  # JWT for progress updates
     backup_log_id: str
+    volume_encrypted: bool = False
+    container_name: str | None = None
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -381,6 +406,8 @@ class RestoreContainerRequest(ContainerBaseRequest):
     auth_token: str  # JWT for progress updates
     restore_log_id: str
     restore_path: str
+    volume_encrypted: bool = False
+    container_name: str | None = None
 
 
 ##############################################################
@@ -413,6 +440,13 @@ class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
 
 
+class VolumeEncryptionStatus(str, enum.Enum):
+    ENABLED = "ENABLED"
+    UNSUPPORTED_IMAGE = "UNSUPPORTED_IMAGE"
+    DISABLED = "DISABLED"
+    FAILED = "FAILED"
+
+
 class ContainerBaseResponse(BaseValidatorResponse):
     pod_id: str
     workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
@@ -439,10 +473,20 @@ class ProfilerStepName(str, enum.Enum):
     PORT_CHECK_WAIT = "Port-check wait step finished"
     DOCKER_RUN = "Docker run step finished"
     CONTAINER_RUNNING_CHECK = "Container running check step finished"
+    ENCRYPTED_VOLUME_SETUP = "Encrypted volume setup step finished"
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
     FINISHED_IN_SUBNET = "Finished in subnet."
+    # DAH-2458: backend-measured spans that happen OUTSIDE the subnet window. The backend
+    # appends these to its own profiler and passes the pre-dispatch ones in
+    # ContainerCreateRequest.pre_dispatch_profilers; the subnet seeds its profile from them so the
+    # persisted list is one ordered backend -> subnet -> backend timeline. FILLER_PREEMPTION and
+    # BACKEND_PREP precede REQUESTED_FROM_BACKEND; BACKEND_FINALIZE is appended backend-side on
+    # container-creation success.
+    FILLER_PREEMPTION = "Filler preemption"
+    BACKEND_PREP = "Backend rent prep"
+    BACKEND_FINALIZE = "Backend finalize"
 
 
 def now_ms() -> int:
@@ -478,6 +522,31 @@ class ProfilerStep(BaseModel):
         """
         return cls(name=name, duration=now_ms() - prev_ms, skipped=skipped)
 
+    @classmethod
+    def from_wire(cls, data: dict) -> "ProfilerStep | None":
+        """Rebuild a step from its wire dict (DAH-2458 backend pre-dispatch pass-through).
+
+        Used by ``create_container`` to seed the subnet profile with the backend's own
+        pre-dispatch spans. Returns ``None`` for any step this validator version can't rebuild —
+        an unknown or missing name, a non-dict payload, OR a known name carrying a bad-typed
+        ``duration``/``timestamp`` — so a backend that emits something unexpected can never break
+        the deploy; the step is simply dropped.
+
+        The model construction stays INSIDE the guard: the seeding loop runs on the
+        container-creation path, so a ``ValidationError`` escaping here would abort a real
+        deploy. ``ValidationError`` subclasses ``ValueError``, but it is listed explicitly so
+        that guarantee stays visible if the model's field types are ever refactored.
+        """
+        try:
+            return cls(
+                name=ProfilerStepName(data["name"]),
+                duration=data.get("duration"),
+                timestamp=data.get("timestamp"),
+                skipped=bool(data.get("skipped", False)),
+            )
+        except (KeyError, TypeError, ValueError, ValidationError):
+            return None
+
     @model_serializer
     def _serialize(self) -> dict:
         data: dict = {"name": self.name.value}
@@ -503,6 +572,7 @@ class ContainerCreated(ContainerBaseResponse):
     storage_limit_gb: int | None = None
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
+    volume_encryption_status: VolumeEncryptionStatus | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -541,6 +611,7 @@ class FailedContainerErrorCodes(enum.Enum):
     UnknownError = "UnknownError"
     NoSshKeys = "NoSshKeys"
     ContainerNotRunning = "ContainerNotRunning"
+    DeletionInProgress = "DeletionInProgress"
     NoPortMappings = "NoPortMappings"
     InvalidExecutorId = "InvalidExecutorId"
     ExceptionError = "ExceptionError"
@@ -562,9 +633,15 @@ class FailedContainerErrorTypes(enum.Enum):
 class FailedContainerRequest(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.FailedRequest
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
+    # Renter-safe HEADLINE only. The backend surfaces this in customer-facing events, so it must never
+    # carry executor host details (IP, SSH port/username, hotkey) — those go in `detail`.
     msg: str
+    # DAH-2475: full structured text (headline + extra dict) for diagnosis — filler_run.failure_reason
+    # and ops logs on the backend, never customer events. Optional so old peers keep parsing.
+    detail: str | None = None
     error_code: FailedContainerErrorCodes | None = None
     failure_step: str | None = None
+    volume_encryption_status: VolumeEncryptionStatus | None = None
 
 
 class DuplicateExecutorsResponse(BaseModel):

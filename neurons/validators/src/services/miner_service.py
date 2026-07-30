@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import time
 from typing import Annotated
 
@@ -56,7 +57,7 @@ from payload_models.payloads import (
 from tenacity import RetryError
 
 from core.config import settings
-from core.utils import _m, get_extra_info
+from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
 from services.docker_service import DockerService
@@ -66,6 +67,14 @@ from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 
 logger = logging.getLogger(__name__)
+
+
+def _miner_job_script_path(script_name: str) -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "miner_jobs", script_name)
+
+
+def _nohup_command(argv: list[str], log_path: str) -> str:
+    return f"{shlex.join(argv)} > {shlex.quote(log_path)} 2>&1 &"
 
 
 def _get_error_details(error: Exception) -> str:
@@ -738,6 +747,10 @@ class MinerService:
                         "incentive_formula_inputs": result.incentive_formula_inputs,
                         "log_status": result.log_status,
                         "log_text": result.full_log_text,
+                        # [] means this cycle reported no catalogued zero-incentive reason.
+                        "incentive_reasons": [
+                            reason.model_dump(mode="json") for reason in result.zero_incentive_reasons
+                        ],
                         "collateral_deposited": result.collateral_deposited,
                         "ssh_pub_keys": result.ssh_pub_keys,
                         "attestation_digest": result.attestation_digest,
@@ -755,8 +768,21 @@ class MinerService:
                     exc_info=True,
                 )
 
-    def _handle_container_error(self, payload: ContainerBaseRequest, msg: str, error_code: FailedContainerErrorCodes):
+    def _handle_container_error(
+        self,
+        payload: ContainerBaseRequest,
+        msg: str | _StructuredMessage,
+        error_code: FailedContainerErrorCodes,
+    ):
+        # DAH-2475: two texts with two audiences. `msg` is the HEADLINE — it feeds renter-visible
+        # events on the backend, so it must never carry host details. `detail` is the full structured
+        # text (headline + the `extra` dict with the actual exception, executor host, failure step);
+        # it exists because a bare "Resulted in an exception" cost a manual investigation per failure —
+        # the backend stores it in filler_run.failure_reason and logs, never in customer events.
+        # Logging keeps the structured object so `extra` still lands in Loki as fields.
         logger.error(msg)
+        headline: str = str(msg)
+        detail: str | None = msg.to_full_string() if isinstance(msg, _StructuredMessage) else None
 
         if isinstance(payload, ContainerCreateRequest):
             return FailedContainerRequest(
@@ -764,7 +790,8 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=headline,
+                detail=detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=error_code,
             )
@@ -775,7 +802,8 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=headline,
+                detail=detail,
                 error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
                 error_code=error_code,
             )
@@ -785,7 +813,8 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=headline,
+                detail=detail,
                 error_type=FailedContainerErrorTypes.AddSSkeyFailed,
                 error_code=error_code,
             )
@@ -795,7 +824,7 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=detail or headline,
             )
         else:
             return FailedContainerRequest(
@@ -803,7 +832,8 @@ class MinerService:
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=msg,
+                msg=headline,
+                detail=detail,
                 error_type=FailedContainerErrorTypes.UnknownRequest,
                 error_code=error_code,
             )
@@ -924,7 +954,7 @@ class MinerService:
 
                         return self._handle_container_error(
                             payload=payload,
-                            msg=str(log_text),
+                            msg=log_text,
                             error_code=FailedContainerErrorCodes.InvalidExecutorId
                         )
 
@@ -946,7 +976,7 @@ class MinerService:
 
                         return self._handle_container_error(
                             payload=payload,
-                            msg=str(log_text),
+                            msg=log_text,
                             error_code=FailedContainerErrorCodes.RentingInProgress,
                         )
 
@@ -1103,7 +1133,7 @@ class MinerService:
 
                         return self._handle_container_error(
                             payload=payload,
-                            msg=str(log_text),
+                            msg=log_text,
                             error_code=FailedContainerErrorCodes.UnknownError,
                         )
 
@@ -1115,7 +1145,7 @@ class MinerService:
 
                     return self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.FailedMsgFromMiner,
                     )
                 else:
@@ -1126,7 +1156,7 @@ class MinerService:
 
                     return self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.UnknownError,
                     )
         except Exception as e:
@@ -1136,7 +1166,7 @@ class MinerService:
             )
             return self._handle_container_error(
                 payload=payload,
-                msg=str(log_text),
+                msg=log_text,
                 error_code=FailedContainerErrorCodes.ExceptionError,
             )
 
@@ -1235,7 +1265,7 @@ class MinerService:
                         pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
-                        msg=str(log_text),
+                        msg=log_text.to_full_string(),
                     )
 
                 else:
@@ -1250,7 +1280,7 @@ class MinerService:
                         pod_id=payload.pod_id,
                         executor_id=payload.executor_id,
                         container_name=payload.container_name,
-                        msg=str(log_text),
+                        msg=log_text.to_full_string(),
                     )
 
         except Exception as e:
@@ -1264,7 +1294,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
-                msg=str(log_text),
+                msg=log_text.to_full_string(),
             )
 
     async def add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
@@ -1363,7 +1393,7 @@ class MinerService:
                         return FailedAddDebugSshKey(
                             miner_hotkey=payload.miner_hotkey,
                             executor_id=payload.executor_id,
-                            msg=str(log_text),
+                            msg=log_text.to_full_string(),
                         )
 
                     logger.info(
@@ -1392,7 +1422,7 @@ class MinerService:
                     return FailedAddDebugSshKey(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=str(log_text),
+                        msg=log_text.to_full_string(),
                     )
 
         except Exception as e:
@@ -1405,7 +1435,7 @@ class MinerService:
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=str(log_text),
+                msg=log_text.to_full_string(),
             )
 
     async def handle_backup_container_req(self, executor_info: ExecutorSSHInfo, payload: BackupContainerRequest, pkey: SSHKey):
@@ -1418,15 +1448,10 @@ class MinerService:
             known_hosts=None,
         ) as ssh_client:
 
-            # Upload the backup_storage.py script to the remote server before running it
-            # Assume the local script is at './scripts/backup_storage.py'
             remote_script_path = "/root/app/backup_storage.py"
-            local_script_path = os.path.join(
-                os.path.dirname(__file__), 
-                "..",
-                "miner_jobs", 
-                "backup_storage.py"
-            )
+            remote_helper_path = "/root/app/workspace_mount.py"
+            local_script_path = _miner_job_script_path("backup_storage.py")
+            local_helper_path = _miner_job_script_path("workspace_mount.py")
 
             logger.info(
                 _m(
@@ -1437,9 +1462,9 @@ class MinerService:
 
             async with ssh_client.start_sftp_client() as sftp:
                 await sftp.put(local_script_path, remote_script_path)
+                await sftp.put(local_helper_path, remote_helper_path)
 
-            commands = [
-                "nohup",
+            argv = [
                 executor_info.python_path,
                 "/root/app/backup_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
@@ -1452,9 +1477,12 @@ class MinerService:
                 "--backup-volume-iam_user_secret_key", payload.backup_volume_info.iam_user_secret_key,
                 "--source-volume-path", payload.source_volume_path,
                 "--backup-target-path", payload.backup_target_path,
-                "> /root/app/backup_storage.log 2>&1 &"
             ]
-            await ssh_client.run(" ".join(commands), timeout=50, check=True)
+            await ssh_client.run(
+                _nohup_command(["nohup", *argv], "/root/app/backup_storage.log"),
+                timeout=50,
+                check=True,
+            )
 
     async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey):
         """Handle restore container request."""
@@ -1466,14 +1494,10 @@ class MinerService:
             known_hosts=None,
         ) as ssh_client:
 
-            # Upload the restore_storage.py script to the remote server before running it
             remote_script_path = "/root/app/restore_storage.py"
-            local_script_path = os.path.join(
-                os.path.dirname(__file__), 
-                "..",
-                "miner_jobs", 
-                "restore_storage.py"
-            )
+            remote_helper_path = "/root/app/workspace_mount.py"
+            local_script_path = _miner_job_script_path("restore_storage.py")
+            local_helper_path = _miner_job_script_path("workspace_mount.py")
 
             logger.info(
                 _m(
@@ -1484,9 +1508,9 @@ class MinerService:
 
             async with ssh_client.start_sftp_client() as sftp:
                 await sftp.put(local_script_path, remote_script_path)
+                await sftp.put(local_helper_path, remote_helper_path)
 
-            commands = [
-                "nohup",
+            argv = [
                 executor_info.python_path,
                 "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
@@ -1499,9 +1523,12 @@ class MinerService:
                 "--backup-volume-iam_user_access_key", payload.backup_volume_info.iam_user_access_key,
                 "--backup-volume-iam_user_secret_key", payload.backup_volume_info.iam_user_secret_key,
                 "--target-volume-path", payload.target_volume_path,
-                "> /root/app/restore_storage.log 2>&1 &"
             ]
-            await ssh_client.run(" ".join(commands), timeout=50, check=True)
+            await ssh_client.run(
+                _nohup_command(["nohup", *argv], "/root/app/restore_storage.log"),
+                timeout=50,
+                check=True,
+            )
 
     def _generate_auth_headers(self, my_key: bittensor.Keypair, miner_hotkey: str) -> dict:
         """Generate authentication headers for REST API requests.
@@ -1969,7 +1996,7 @@ class MinerService:
 
                     return self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.InvalidExecutorId
                     )
 
@@ -1993,7 +2020,7 @@ class MinerService:
 
                     return self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.RentingInProgress,
                     )
 
@@ -2075,7 +2102,7 @@ class MinerService:
                     )
                     result = self._handle_container_error(
                         payload=payload,
-                        msg=str(log_text),
+                        msg=log_text,
                         error_code=FailedContainerErrorCodes.UnknownError,
                     )
 
@@ -2100,7 +2127,7 @@ class MinerService:
 
                 return self._handle_container_error(
                     payload=payload,
-                    msg=str(log_text),
+                    msg=log_text,
                     error_code=FailedContainerErrorCodes.FailedMsgFromMiner,
                 )
             else:
@@ -2111,7 +2138,7 @@ class MinerService:
 
                 return self._handle_container_error(
                     payload=payload,
-                    msg=str(log_text),
+                    msg=log_text,
                     error_code=FailedContainerErrorCodes.UnknownError,
                 )
         except Exception as e:
@@ -2121,7 +2148,7 @@ class MinerService:
             )
             return self._handle_container_error(
                 payload=payload,
-                msg=str(log_text),
+                msg=log_text,
                 error_code=FailedContainerErrorCodes.ExceptionError,
             )
 
@@ -2177,7 +2204,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=str(log_text),
+                    msg=log_text.to_full_string(),
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2209,7 +2236,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=str(log_text),
+                    msg=log_text.to_full_string(),
                 )
 
             else:
@@ -2224,7 +2251,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=str(log_text),
+                    msg=log_text.to_full_string(),
                 )
 
         except Exception as e:
@@ -2238,7 +2265,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
-                msg=str(log_text),
+                msg=log_text.to_full_string(),
             )
 
     async def _add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
@@ -2290,7 +2317,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=str(log_text),
+                    msg=log_text.to_full_string(),
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2330,7 +2357,7 @@ class MinerService:
                     return FailedAddDebugSshKey(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=str(log_text),
+                        msg=log_text.to_full_string(),
                     )
 
                 logger.info(
@@ -2359,7 +2386,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=str(log_text),
+                    msg=log_text.to_full_string(),
                 )
 
         except Exception as e:
@@ -2372,7 +2399,7 @@ class MinerService:
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=str(log_text),
+                msg=log_text.to_full_string(),
             )
 
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]

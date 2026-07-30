@@ -19,13 +19,17 @@ import asyncssh
 import bittensor
 import redis.exceptions
 from core.docker_utils import (
+    ALPINE_HELPER_IMAGE,
     ContainerDeathDiagnostics,
+    DockerCommand,
     collect_container_death_diagnostics,
+    df_available_bytes,
 )
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    CacheVolume,
     ContainerBaseRequest,
     ContainerCreated,
     ContainerCreateRequest,
@@ -48,11 +52,16 @@ from payload_models.payloads import (
     RemoveSshPublicKeysRequest,
     SshPubKeyAdded,
     SshPubKeyRemoved,
+    VolumeEncryptionStatus,
     WorkloadKind,
     now_ms,
 )
 from services.attestation_service import AttestationError, AttestationService
 from services.const import (
+    DPHN_CACHE_FREE_MARGIN_GB,
+    DPHN_CACHE_LISTING_FLOOR_GB,
+    DPHN_CACHE_SIZE_GB,
+    DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_PREFIX,
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
     MIN_PORT_COUNT,
@@ -100,6 +109,7 @@ from tenacity import RetryError
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info, retry_ssh_command
 from services.ssh_service import SSHService
+from services.volume_keys import VolumeKeyDeriver
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +152,24 @@ DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
 }
 
+S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
+
+
+LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
+
+
+def _s3fs_plugin_alias(volume_name: str) -> str:
+    """DAH-2512: one plugin instance per volume.
+
+    A shared instance holds a single credential pair and dies on `plugin disable`,
+    so attaching or detaching one pod's volume breaks every other pod on the host.
+    """
+    return f"s3fs-{volume_name}"
+
+# DAH-2496: sysbox installers reserve one 65536-wide subuid slice per host and map
+# every container's root to its base. A wider range is handed out per container.
+SYSBOX_SUBUID_SLICE_SIZE = 65536
+
 # DAH-1991: tolerate concurrent health_check_* / container_* on the executor.
 # Probe TTL is short (~30s); same-command retry within a 90s budget covers the
 # documented race without regenerating port mappings.
@@ -155,15 +183,22 @@ _VLOOPBACK_MOUNT_ERROR_PHRASES = (
     "file exists",
 )
 _VLOOPBACK_DRIVER_PREFIX = "vloopback"
-_VLOOPBACK_REPAIR_IMAGE = "docker.io/library/alpine:3.19"
+# Shared with core.docker_utils so exactly one helper image lands on nodes.
+_VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+# DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
+# has to go. Covers the image layers and scratch the pod needs beyond its own volume.
+RENTAL_DISK_HEADROOM_GB = 20
 _LOCAL_VOLUME_TIMEOUT_THRESHOLD_GB = 100
 _LOCAL_VOLUME_TIMEOUT_BASE_SEC = 30
 _LOCAL_VOLUME_TIMEOUT_GB_PER_SEC = 10
 _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
+_LIUM_CIPHER_MOUNT = "/lium-cipher"
+_ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
+_DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
 HOST_KEY_REQUIRED_EXTRA = {
     "ssh_host_key_missing": True,
     "docker_sdk_host_key_required": True,
@@ -291,16 +326,24 @@ def _parse_volume_size_to_bytes(value: str | None) -> int | None:
     return int(float(number) * _VOLUME_SIZE_SUFFIX_MULTIPLIERS[suffix.lower()])
 
 
-def _is_missing_docker_container_error(exc: Exception) -> bool:
-    if _DOCKER_NO_SUCH_CONTAINER_PHRASE in str(exc):
-        return True
+def _exception_texts(exc: Exception) -> list[str]:
+    texts = [str(exc)]
     if isinstance(exc, RetryError):
         last_exception = exc.last_attempt.exception()
-        return (
-            last_exception is not None
-            and _DOCKER_NO_SUCH_CONTAINER_PHRASE in str(last_exception)
-        )
-    return False
+        if last_exception is not None:
+            texts.append(str(last_exception))
+    return texts
+
+
+def _is_missing_docker_container_error(exc: Exception) -> bool:
+    return any(_DOCKER_NO_SUCH_CONTAINER_PHRASE in text for text in _exception_texts(exc))
+
+
+def _is_docker_container_removal_in_progress_error(exc: Exception) -> bool:
+    return any(
+        all(phrase in text.lower() for phrase in _DOCKER_REMOVAL_IN_PROGRESS_PHRASES)
+        for text in _exception_texts(exc)
+    )
 
 
 def _is_stale_vloopback_mountpoint_error(exc: Exception) -> bool:
@@ -318,6 +361,47 @@ def _quote_safe_docker_volume_name(volume_name: str, *, field_name: str) -> str:
     return shlex.quote(volume_name)
 
 
+def _validate_cache_volume(cache_volume: CacheVolume) -> None:
+    # raise ValueError on an unsafe FILLER cache volume. These mounts come from the backend, but a
+    # `/`-prefixed source would be a HOST bind-mount and a `:` would corrupt the `src:target:rw` bind
+    # spec — the name regex is the only guard, so validate defensively before it reaches the SDK.
+    name = cache_volume.name
+    if not _is_safe_docker_volume_name(name):
+        raise ValueError(f"Unsafe cache volume name: {name!r}")
+    # `volume_` marks the ephemeral run volumes every GC path deletes (clean_existing_containers,
+    # clean_stale_vloopback_volumes); a persistent cache volume must never wear that prefix.
+    if name.startswith("volume_"):
+        raise ValueError(f"Cache volume name must not use the ephemeral 'volume_' prefix: {name!r}")
+    target = cache_volume.target
+    if not target.startswith("/") or target == "/" or ":" in target or ".." in target.split("/"):
+        raise ValueError(f"Unsafe cache volume target: {target!r}")
+
+
+def _build_cache_volume_mounts(payload: ContainerCreateRequest, occupied_targets: set[str]) -> list[VolumeMount]:
+    # Persistent named cache volumes for a FILLER container (DPHN model/runtime cache). Empty for any
+    # non-FILLER workload even when the field is set — a customer rental must never receive these
+    # mounts. A cache entry whose target collides with an already-mounted path (the run's own volume or
+    # /mnt) is skipped, since dockerd rejects a duplicate mount target and would fail the whole create.
+    if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+        return []
+    mounts: list[VolumeMount] = []
+    for cache_volume in payload.cache_volumes:
+        _validate_cache_volume(cache_volume)
+        if cache_volume.target in occupied_targets:
+            # Silent here would mean every start re-downloads into the ephemeral volume while the
+            # named cache sits unmounted and unswept — indistinguishable from a working cache.
+            logger.warning(
+                _m(
+                    "Cache volume skipped: its target is already mounted",
+                    extra=get_extra_info({"volume": cache_volume.name, "target": cache_volume.target}),
+                )
+            )
+            continue
+        occupied_targets.add(cache_volume.target)
+        mounts.append(VolumeMount(source=cache_volume.name, target=cache_volume.target))
+    return mounts
+
+
 def _is_vloopback_driver(driver: str) -> bool:
     return driver == _VLOOPBACK_DRIVER_PREFIX or driver.startswith(f"{_VLOOPBACK_DRIVER_PREFIX}:")
 
@@ -332,6 +416,76 @@ def _should_repair_stale_mountpoint(
         and not already_repaired
         and _is_stale_vloopback_mountpoint_error(exc)
     )
+
+def _should_encrypt_local_volume(
+    local_volume: str | None,
+    workload_kind: WorkloadKind,
+    is_sysbox: bool | None,
+    enable_volume_encryption: bool | None,
+) -> bool:
+    return (
+        bool(local_volume)
+        and workload_kind != WorkloadKind.FILLER
+        and bool(is_sysbox)
+        and enable_volume_encryption
+        and settings.ENABLE_VOLUME_ENCRYPTION
+    )
+
+
+def _opaque_shell_name() -> str:
+    return f"_{secrets.token_hex(2)}"
+
+
+def _xor_wrap_passphrase(passphrase: str) -> tuple[str, str]:
+    raw = passphrase.encode("ascii")
+    pad = secrets.token_bytes(len(raw))
+    wrapped = bytes(a ^ b for a, b in zip(raw, pad, strict=True))
+    return pad.hex(), wrapped.hex()
+
+
+def _build_gocryptfs_setup_and_mount_script(
+    plaintext_path: str,
+    *,
+    pad_hex: str,
+    wrapped_hex: str,
+    pad_var: str,
+    wrapped_var: str,
+    passfile_path: str,
+) -> str:
+    plaintext = shlex.quote(plaintext_path)
+    passfile = shlex.quote(passfile_path)
+    mount_check = (
+        f"awk -v target={plaintext} "
+        "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
+    )
+    # Random pad XOR'd into the script as hex. Opaque names. No stdin.
+    # ${v%${v#??}} / ${v#??} is portable sh for take/drop first two hex chars.
+    return f"""set -e
+{pad_var}={pad_hex}
+{wrapped_var}={wrapped_hex}
+_pf={passfile}
+_d() {{ rm -f "$0" "$_pf" 2>/dev/null || true; unset {pad_var} {wrapped_var} _esc _x _y _pf; }}
+trap _d EXIT
+export PATH="/usr/local/bin:/usr/bin:/bin"
+_esc=
+while [ -n "${{{pad_var}}}" ]; do
+  _x=${{{pad_var}%${{{pad_var}#??}}}}
+  _y=${{{wrapped_var}%${{{wrapped_var}#??}}}}
+  {pad_var}=${{{pad_var}#??}}
+  {wrapped_var}=${{{wrapped_var}#??}}
+  _esc=$_esc$(printf '\\\\%03o' $((0x$_x ^ 0x$_y)))
+done
+printf '%b' "$_esc" > "$_pf"
+chmod 600 "$_pf"
+unset _esc _x _y {pad_var} {wrapped_var}
+mkdir -p {_LIUM_CIPHER_MOUNT} {plaintext}
+if [ ! -f {_LIUM_CIPHER_MOUNT}/gocryptfs.conf ]; then
+  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"
+fi
+if ! {mount_check}; then
+  gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
+fi
+"""
 
 
 def build_startup_command_args(startup_commands: str | None) -> str:
@@ -675,6 +829,7 @@ class DockerService:
         port_maps: list[tuple[int, int, int]],
         local_volume: str,
         local_volume_path: str,
+        encrypted_local_volume: bool,
         external_volume_name: str | None,
         gpu_devices,
         effective_storage_limit_gb: int | None,
@@ -687,14 +842,20 @@ class DockerService:
         }
         environment["NVIDIA_DRIVER_CAPABILITIES"] = "all"
 
-        volumes = [VolumeMount(source=local_volume, target=local_volume_path)]
+        volume_target = _LIUM_CIPHER_MOUNT if encrypted_local_volume else local_volume_path
+        volumes = [VolumeMount(source=local_volume, target=volume_target)]
+        occupied_targets = {volume_target}
         if external_volume_name:
             volumes.append(VolumeMount(source=external_volume_name, target="/mnt"))
+            occupied_targets.add("/mnt")
+        # FILLER-only persistent cache volumes (DPHN model/runtime cache). No-op for customer rentals.
+        volumes.extend(_build_cache_volume_mounts(payload, occupied_targets))
 
-        devices = (
-            DeviceMount(path_on_host="/dev/net/tun", path_in_container="/dev/net/tun"),
-            *gpu_devices.device_mounts,
-        )
+        device_mounts = [DeviceMount(path_on_host="/dev/net/tun", path_in_container="/dev/net/tun")]
+        if encrypted_local_volume:
+            device_mounts.append(DeviceMount(path_on_host="/dev/fuse", path_in_container="/dev/fuse"))
+        device_mounts.extend(gpu_devices.device_mounts)
+        devices = tuple(device_mounts)
 
         return ContainerRunSpec(
             image=payload.docker_image,
@@ -1440,6 +1601,252 @@ class DockerService:
                 exc_info=True,
             )
 
+    async def _cache_rented_pod_best_effort(
+        self,
+        executor_info: ExecutorSSHInfo,
+        pod_id: str,
+        container_name: str,
+        default_extra: dict,
+    ) -> None:
+        """Record the new container in the rented-machine cache; never fail the create over it.
+
+        DAH-2475: this hash is a CACHE, not the source of truth — the backend rebuilds it wholesale
+        every ~10 min (RentedMachineRequest -> delete(RENTED_MACHINE_PREFIX) + re-add) and already
+        learns about this container from the ContainerCreated callback. Before this, a Redis blip at
+        this last step raised and tripped cleanup_failed_container_creation, destroying a container
+        that was already built and running: on 2026-07-22 a "Timeout connecting to server" here tore
+        down a finished DPHN container and threw away its ~40 min of model download, then marked the
+        run FAILED and put the node into launch backoff for a fault that was neither the node's nor
+        the container's.
+        """
+        try:
+            await self.redis_service.add_rented_pod(executor_info, pod_id, container_name)
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Rented-pod cache write failed after the container was created; keeping the "
+                    "container, the backend re-syncs this cache",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": container_name,
+                        "pod_id": pod_id,
+                        "error": str(exc),
+                    }),
+                ),
+                exc_info=True,
+            )
+
+    async def reclaim_dphn_cache_for_rental(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+    ) -> None:
+        """Free the DPHN filler cache when a customer rental needs the disk it occupies.
+
+        DAH-2475: the cache is filler property worth ~37 GB. Once a customer rents the node the disk
+        belongs to the renter, so if what they asked for does not fit next to the cache, the cache
+        goes — reclaiming here rather than at filler-stop is what stops the node re-downloading it
+        every cycle (see sweep_stale_cache_volumes). Runs before volume sizing so the freed space is
+        already visible when the pod's volume is measured and created.
+
+        Only for CUSTOMER_RENTAL, only when the rental actually needs the room, and best-effort — a
+        failure here must never break the rent.
+        """
+        if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+            return
+        requested_gb: int | None = payload.volume_limit_gb
+        try:
+            cache_volumes: list[str] = await self._find_cache_volumes_to_sweep(ssh_client, set(), default_extra)
+            if not cache_volumes:
+                return
+
+            # The backend sends volume_limit_gb=None for every executor whose docker lacks
+            # --storage-opt support (calc_volume_storage_limit), so "no limit" does NOT mean "no disk
+            # needed" — it means the renter may use the whole disk and no fit check is possible. Err on
+            # the renter's side and give the cache back unconditionally; the filler re-downloads it
+            # after the rental, which is the filler's cost to pay, not the customer's.
+            if requested_gb:
+                docker_root_dir = await self.get_docker_root_dir(ssh_client)
+                free_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+                free_gb = free_bytes / (1024**3)
+                if free_gb >= requested_gb + RENTAL_DISK_HEADROOM_GB:
+                    return
+
+            logger.info(
+                _m(
+                    "Reclaiming DPHN cache volumes for the customer rental",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "volumes": cache_volumes,
+                        "free_gb": round(free_gb, 1) if requested_gb else None,
+                        "requested_gb": requested_gb,
+                    }),
+                )
+            )
+            await retry_ssh_command(
+                ssh_client, DockerCommand.volume_remove(*cache_volumes), "reclaim_dphn_cache_for_rental"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "DPHN cache reclaim for rental failed; continuing with the rent",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+
+    async def select_affordable_cache_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+    ) -> list[CacheVolume]:
+        """Which of the requested cache volumes this node can actually take.
+
+        DAH-2475: the backend asks for the cache it WANTS and cannot know whether the host already has
+        it — it only sees ~15-min-old telemetry. Deciding there meant charging the download on every
+        launch, so a node granted the cache once dropped below the threshold by exactly that download
+        and was refused it forever after: ~40 GB parked unmounted while every start re-downloaded it.
+
+        Here the answer is a fact, not a projection. A volume that already exists costs nothing to
+        mount, so it needs no check at all — that is what makes the decision idempotent. Only a volume
+        that must be downloaded is measured, against live free space, so the node keeps enough room to
+        stay in the rental listing (a delisted node is reachable by neither renters nor fillers).
+        """
+        if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+            return []
+        existing: set[str] = set(await self._find_cache_volumes_to_sweep(ssh_client, set(), default_extra))
+        present: list[CacheVolume] = [volume for volume in payload.cache_volumes if volume.name in existing]
+        if len(present) == len(payload.cache_volumes):
+            return list(payload.cache_volumes)
+
+        try:
+            docker_root_dir: str = await self.get_docker_root_dir(ssh_client)
+            free_gb: float = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Fail closed on the download, not on the launch: without a reading we cannot promise the
+            # new volume fits, but what is already on the host is free to mount either way.
+            logger.warning(
+                _m(
+                    "Could not measure free disk for the DPHN cache; granting only what already exists",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+            )
+            return present
+
+        floor_gb: int = DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
+        if free_gb - DPHN_CACHE_SIZE_GB <= floor_gb:
+            logger.info(
+                _m(
+                    "Node cannot afford the DPHN cache download; keeping only the volumes it already has",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "free_gb": round(free_gb, 1),
+                        "kept_volumes": [volume.name for volume in present],
+                    }),
+                )
+            )
+            return present
+        return list(payload.cache_volumes)
+
+    async def _find_cache_volumes_to_sweep(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        keep_names: set[str],
+        default_extra: dict,
+    ) -> list[str]:
+        # Cache volumes present on the host that this create no longer names, i.e. left by an older
+        # model or runtime. Empty on any listing failure — sweeping is never worth failing a launch.
+        try:
+            listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "Failed to list DPHN cache volumes",
+                    extra=get_extra_info({**default_extra, "error": str(exc)}),
+                ),
+                exc_info=True,
+            )
+            return []
+        if listed.exit_status != 0:
+            return []
+        return sorted(
+            name
+            for name in (line.strip() for line in (listed.stdout or "").splitlines())
+            if name.startswith(DPHN_CACHE_VOLUME_PREFIX) and name not in keep_names
+        )
+
+    async def sweep_stale_cache_volumes(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        payload: ContainerCreateRequest,
+        default_extra: dict,
+    ) -> None:
+        """Remove every DPHN cache volume on the host except the ones THIS create asks for.
+
+        The cache volume name carries the model + runtime version, so a Dolphin model update makes the
+        backend ask for a different name. Without this sweep the previous ~37 GB set would sit on the
+        host forever (a named volume outside the `volume_` prefix is untouched by every other GC path)
+        and each update would leak another set — the invariant is at most ONE model's cache per host.
+        """
+        if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
+            # No cache requested -> this is version GC with nothing to compare against, NOT a reclaim.
+            # Deleting here would thrash: the backend denies the cache to a node whose free disk sits
+            # under its threshold, but a node's free disk is LOWER precisely because the cache is
+            # already downloaded — so deny would delete it, free disk would rise back over the
+            # threshold, the next cycle would grant it again, and the node would re-download ~37 GB
+            # every cycle. Reclaiming a cache the node can no longer afford is the rental/disk-pressure
+            # path's job, where the decision is made against real free space.
+            return
+        # A live filler SIBLING holds this node's cache and docker cannot remove an in-use volume, so
+        # the listing round-trip would be a no-op. The run being created is already STARTING in the
+        # backend by the time it builds this request, so its OWN container name is in the list too —
+        # counting it made this guard always true and the sweep never ran (caught on staging).
+        own_container_name: str = f"{FILLER_CONTAINER_PREFIX}{payload.pod_id}"
+        if any(
+            name.startswith(FILLER_CONTAINER_PREFIX) and name != own_container_name
+            for name in payload.active_container_names or []
+        ):
+            return
+
+        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
+        stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(ssh_client, keep_names, default_extra)
+        if not stale_volumes:
+            return
+        logger.info(
+            _m(
+                "Sweeping stale DPHN cache volumes",
+                extra=get_extra_info({
+                    **default_extra,
+                    "stale_volumes": stale_volumes,
+                    "kept_volumes": sorted(keep_names),
+                }),
+            )
+        )
+        try:
+            await retry_ssh_command(
+                ssh_client, DockerCommand.volume_remove(*stale_volumes), "sweep_stale_cache_volumes"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Sweeping is never worth failing a launch: this runs inside create_container's try, so a
+            # raise here becomes a container-create failure and costs the node a backoff strike for
+            # housekeeping. The stale set survives until the next create or the disk-tight reclaim.
+            logger.warning(
+                _m(
+                    "Stale DPHN cache sweep failed; continuing with the launch",
+                    extra=get_extra_info({**default_extra, "stale_volumes": stale_volumes, "error": str(exc)}),
+                )
+            )
+
     async def capture_failed_container_diagnostics(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -1520,6 +1927,209 @@ class DockerService:
                 ),
                 exc_info=True,
             )
+
+    async def _image_has_encrypted_volume_label(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        docker_image: str,
+    ) -> bool:
+        result = await ssh_client.run(
+            "/usr/bin/docker image inspect "
+            f"--format '{{{{index .Config.Labels \"{_ENCRYPTED_VOLUME_IMAGE_LABEL}\"}}}}' "
+            f"{shlex.quote(docker_image)}",
+            check=False,
+        )
+        if result.exit_status != 0:
+            stderr = (result.stderr or "")[:200]
+            stdout = (result.stdout or "")[:200]
+            raise RuntimeError(
+                "docker image inspect failed for volume-encryption label "
+                f"(exit_status={result.exit_status}): stderr={stderr!r} stdout={stdout!r}"
+            )
+        return (result.stdout or "").strip() == "1"
+
+    async def _encrypted_local_volume_name(
+        self,
+        docker_client: RentalDockerSdkClient,
+        container_name: str,
+    ) -> str | None:
+        return await docker_client.mount_source_for_destination(
+            container_name=container_name,
+            destination=_LIUM_CIPHER_MOUNT,
+        )
+
+    async def setup_encrypted_local_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        plaintext_path: str,
+        volume_name: str,
+        pod_id: str,
+        log_tag: str,
+        log_extra: dict,
+    ) -> None:
+        passphrase = VolumeKeyDeriver.from_settings(settings).material(pod_id).passphrase
+
+        container_q = shlex.quote(container_name)
+        setup_script_path = f"/tmp/.x{uuid4().hex[:8]}"
+        passfile_path = f"/tmp/.x{uuid4().hex[:8]}"
+        pad_hex, wrapped_hex = _xor_wrap_passphrase(passphrase)
+        pad_var = _opaque_shell_name()
+        wrapped_var = _opaque_shell_name()
+        while wrapped_var == pad_var:
+            wrapped_var = _opaque_shell_name()
+
+        async def wipe_tmp_files() -> None:
+            await ssh_client.run(
+                f"/usr/bin/docker exec {container_q} rm -f "
+                f"{shlex.quote(passfile_path)} {shlex.quote(setup_script_path)}",
+                check=False,
+            )
+
+        async def fail_step(step: str, message: str, result: Any | None = None) -> None:
+            exit_status = getattr(result, "exit_status", None)
+            stdout = (getattr(result, "stdout", "") or "")[-2000:] if result else ""
+            stderr = (getattr(result, "stderr", "") or "")[-2000:] if result else ""
+            await self.stream_log(
+                f"Encrypted volume setup failed ({step})",
+                "error",
+                log_tag,
+            )
+            logger.error(
+                _m(
+                    message,
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_name": container_name,
+                        "plaintext_path": plaintext_path,
+                        "cipher_mount": _LIUM_CIPHER_MOUNT,
+                        "volume_name": volume_name,
+                        "pod_id": pod_id,
+                        "step": step,
+                        "exit_status": exit_status,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    }),
+                )
+            )
+            raise RuntimeError(
+                f"{message} (step={step}, exit_status={exit_status}, stderr={stderr or '<empty>'})"
+            )
+
+        await self.stream_log("Setting up encrypted local volume", "info", log_tag)
+        logger.info(
+            _m(
+                "Encrypted volume setup started",
+                extra=get_extra_info({
+                    **log_extra,
+                    "container_name": container_name,
+                    "plaintext_path": plaintext_path,
+                    "cipher_mount": _LIUM_CIPHER_MOUNT,
+                    "volume_name": volume_name,
+                    "pod_id": pod_id,
+                }),
+            )
+        )
+
+        setup_script = _build_gocryptfs_setup_and_mount_script(
+            plaintext_path,
+            pad_hex=pad_hex,
+            wrapped_hex=wrapped_hex,
+            pad_var=pad_var,
+            wrapped_var=wrapped_var,
+            passfile_path=passfile_path,
+        )
+        setup_heredoc = f"__SETUP_{uuid4().hex}__"
+        upload_cmd = (
+            f"/usr/bin/docker exec -i {container_q} sh -c "
+            f"\"cat > {setup_script_path}\" "
+            f"<< '{setup_heredoc}'\n"
+            f"{setup_script}\n"
+            f"{setup_heredoc}"
+        )
+        logger.info(
+            _m(
+                "Uploading encrypted-volume setup script",
+                extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
+            )
+        )
+        upload_result = await ssh_client.run(upload_cmd)
+        if upload_result.exit_status != 0:
+            await wipe_tmp_files()
+            await fail_step(
+                "upload_setup_script",
+                "Failed to upload gocryptfs setup script into container",
+                upload_result,
+            )
+
+        logger.info(
+            _m(
+                "Running gocryptfs init/mount",
+                extra=get_extra_info({**log_extra, "container_name": container_name, "pod_id": pod_id}),
+            )
+        )
+        mount_result = await ssh_client.run(
+            f"/usr/bin/docker exec {container_q} sh {shlex.quote(setup_script_path)}",
+        )
+        await wipe_tmp_files()
+        if mount_result.exit_status != 0:
+            await fail_step(
+                "setup_or_mount",
+                "Failed to initialize or mount gocryptfs inside container",
+                mount_result,
+            )
+
+        verify_mount_script = (
+            f"awk -v target={shlex.quote(plaintext_path)} "
+            "'$2 == target && $3 == \"fuse.gocryptfs\" {found=1} END {exit !found}' /proc/mounts"
+        )
+        logger.info(
+            _m(
+                "Verifying gocryptfs mount",
+                extra=get_extra_info({
+                    **log_extra,
+                    "container_name": container_name,
+                    "plaintext_path": plaintext_path,
+                    "pod_id": pod_id,
+                }),
+            )
+        )
+        verify_result = await ssh_client.run(
+            f"/usr/bin/docker exec {container_q} sh -lc {shlex.quote(verify_mount_script)}"
+        )
+        if verify_result.exit_status != 0:
+            diagnostic_script = (
+                'printf "%s\\n" "--- /proc/mounts ---"; '
+                'cat /proc/mounts; '
+                'printf "%s\\n" "--- gocryptfs ps ---"; '
+                'ps aux | grep [g]ocryptfs || true'
+            )
+            diagnostic_result = await ssh_client.run(
+                f"/usr/bin/docker exec {container_q} sh -lc "
+                f"{shlex.quote(diagnostic_script)}",
+                check=False,
+            )
+            await fail_step(
+                "verify_mount",
+                "gocryptfs mount did not become visible inside container",
+                diagnostic_result,
+            )
+
+        await self.stream_log("Encrypted local volume mounted", "success", log_tag)
+
+        logger.info(
+            _m(
+                "Encrypted local volume setup finished",
+                extra=get_extra_info({
+                    **log_extra,
+                    "container_name": container_name,
+                    "plaintext_path": plaintext_path,
+                    "cipher_mount": _LIUM_CIPHER_MOUNT,
+                    "volume_name": volume_name,
+                    "pod_id": pod_id,
+                }),
+            ),
+        )
 
     async def install_open_ssh_server_and_start_ssh_service(
         self,
@@ -1892,48 +2502,104 @@ class DockerService:
 
         return True
 
+    async def resolve_sysbox_subuid_base(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        log_extra: dict,
+    ) -> int | None:
+        """Read the host uid that sysbox maps container root to, None if unusable.
+
+        The SSH session lands inside the executor container, whose own /etc/subuid
+        carries no sysbox entry; the executor shares the host PID namespace, so the
+        host copy is reachable through the host init's root.
+        """
+        result = await ssh_client.run("cat /proc/1/root/etc/subuid")
+        sysbox_entries: list[str] = [
+            line for line in (result.stdout or "").splitlines()
+            if line.startswith("sysbox:")
+        ]
+        if not sysbox_entries:
+            return None
+
+        try:
+            _, subuid_base_text, slice_size_text = sysbox_entries[0].strip().split(":")
+            subuid_base: int = int(subuid_base_text)
+            slice_size: int = int(slice_size_text)
+        except ValueError:
+            return None
+
+        if slice_size != SYSBOX_SUBUID_SLICE_SIZE:
+            logger.warning(
+                _m(
+                    "sysbox subuid range is not a single slice; cannot align s3fs owner",
+                    extra=get_extra_info({**log_extra, "slice_size": slice_size}),
+                )
+            )
+            return None
+
+        return subuid_base
+
     async def create_s3fs_volume(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         log_extra: dict,
         volume_info: ExternalVolumeInfo,
         log_tag: str,
+        sysbox_subuid_base: int | None,
     ):
-        responses = []
-        # install docker volume plugin
-        command = "/usr/bin/docker plugin install mochoa/s3fs-volume-plugin --alias s3fs --grant-all-permissions --disable"
-        responses.append(await ssh_client.run(command))
+        # The name arrives from the backend and lands in a plugin alias, a volume
+        # name and two shell commands — refuse it before any of that.
+        if not _is_safe_docker_volume_name(volume_info.name):
+            message = f"Unsafe external volume name: {volume_info.name!r}"
+            logger.warning(_m(f"s3fs_volume failed. {message}", extra=get_extra_info({**log_extra})))
+            return False, message
 
-        # disable volume plugin
-        command = "/usr/bin/docker plugin disable s3fs -f"
-        responses.append(await ssh_client.run(command))
+        plugin_alias: str = _s3fs_plugin_alias(volume_info.name)
 
-        # set credentials
-        command = f"/usr/bin/docker plugin set s3fs AWSACCESSKEYID={volume_info.iam_user_access_key} AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}"
-        responses.append(await ssh_client.run(command))
+        # DAH-2496: the kernel cannot ID-shift a FUSE mount, so under sysbox the
+        # pod's root would see the bucket as nobody. s3fs keeps owner in object
+        # metadata, so report the objects as owned by the pod's root instead.
+        mount_options: str = "allow_other"
+        if sysbox_subuid_base is not None:
+            mount_options = f"allow_other,uid={sysbox_subuid_base},gid={sysbox_subuid_base}"
 
-        # set allow_other option
-        command = '/usr/bin/docker plugin set s3fs DEFAULT_S3FSOPTS="allow_other"'
-        responses.append(await ssh_client.run(command))
+        setup_results: list[asyncssh.SSHCompletedProcess] = (
+            await self._install_s3fs_plugin_instance(
+                ssh_client=ssh_client,
+                plugin_alias=plugin_alias,
+                volume_info=volume_info,
+                mount_options=mount_options,
+            )
+        )
 
-        # enable volume plugin
-        command = "/usr/bin/docker plugin enable s3fs"
-        responses.append(await ssh_client.run(command))
-
-        # create volume
-        command = f"/usr/bin/docker volume create -d s3fs {volume_info.name}"
+        create_command: str = (
+            f"/usr/bin/docker volume create -d {plugin_alias} {volume_info.name}"
+        )
         result = await self.execute_and_stream_logs(
             ssh_client=ssh_client,
-            command=command,
+            command=create_command,
             log_tag=log_tag,
             log_text="Creating docker volume",
             log_extra=log_extra,
             raise_exception=False,
         )
+        if not result[0]:
+            setup_results.extend(
+                await self._drop_legacy_shared_s3fs_volume(ssh_client, volume_info.name)
+            )
+            result = await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=create_command,
+                log_tag=log_tag,
+                log_text="Creating docker volume",
+                log_extra=log_extra,
+                raise_exception=False,
+            )
+
         is_success, message = result
         if not is_success:
             responses_text = message
-            for i, r in enumerate(responses):
+            for i, r in enumerate(setup_results):
                 responses_text += f"|Step {i}: exit={r.exit_status}, stdout={r.stdout}, stderr={r.stderr}"
             logger.warning(_m(f"s3fs_volume failed. {responses_text}",extra=get_extra_info({**log_extra})))
         else:
@@ -1941,13 +2607,57 @@ class DockerService:
 
         return result
 
-    async def disable_s3fs_volume_plugin(
+    async def _install_s3fs_plugin_instance(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-    ):
-        # disable volume plugin
-        command = "/usr/bin/docker plugin disable s3fs -f"
-        await ssh_client.run(command)
+        plugin_alias: str,
+        volume_info: ExternalVolumeInfo,
+        mount_options: str,
+    ) -> list[asyncssh.SSHCompletedProcess]:
+        """Install and configure the plugin instance that serves this one volume."""
+        commands: list[str] = [
+            f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
+            f"--alias {plugin_alias} --grant-all-permissions --disable",
+            f"/usr/bin/docker plugin disable {plugin_alias} -f",
+            f"/usr/bin/docker plugin set {plugin_alias} "
+            f"AWSACCESSKEYID={volume_info.iam_user_access_key} "
+            f"AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}",
+            f'/usr/bin/docker plugin set {plugin_alias} DEFAULT_S3FSOPTS="{mount_options}"',
+            f"/usr/bin/docker plugin enable {plugin_alias}",
+        ]
+        return [await ssh_client.run(command) for command in commands]
+
+    async def _drop_legacy_shared_s3fs_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        volume_name: str,
+    ) -> list[asyncssh.SSHCompletedProcess]:
+        """Free a volume name still held by the pre-DAH-2512 shared plugin instance.
+
+        Docker refuses both create and rm of the name while that instance is
+        disabled — it cannot query it — so enable it first and leave it enabled:
+        pods still mounting through it keep working. Dropping the handle is safe,
+        the data lives in the bucket.
+        """
+        return [
+            await ssh_client.run(
+                f"/usr/bin/docker plugin enable {LEGACY_S3FS_PLUGIN_ALIAS}"
+            ),
+            await ssh_client.run(f"/usr/bin/docker volume rm {volume_name}"),
+        ]
+
+    async def remove_s3fs_volume_plugin(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        volume_name: str,
+    ) -> None:
+        """Drop the plugin instance that served this volume, leaving the rest alone."""
+        if not _is_safe_docker_volume_name(volume_name):
+            return
+
+        plugin_alias: str = _s3fs_plugin_alias(volume_name)
+        await ssh_client.run(f"/usr/bin/docker plugin disable {plugin_alias} -f")
+        await ssh_client.run(f"/usr/bin/docker plugin rm {plugin_alias}")
 
     async def run_jupyter(
         self,
@@ -1959,8 +2669,9 @@ class DockerService:
         log_extra: dict,
         local_volume: str | None = None,
         local_volume_path: str = '/root',
+        encrypted_local_volume: bool = False,
     ):
-        if local_volume:
+        if local_volume and not encrypted_local_volume:
             temp_container_name = f"temp_jupyter_copy_{uuid4()}"
             try:
                 command = (
@@ -2013,32 +2724,56 @@ class DockerService:
                 raise_exception=False,
             )
         else:
-            command = f"/usr/bin/docker cp /root/app/run_jupyter.sh {container_name}:/root/run_jupyter.sh"
+            target_path = local_volume_path if encrypted_local_volume else "/root"
+            container_q = shlex.quote(container_name)
+            target_q = shlex.quote(target_path)
+            command = (
+                f"/usr/bin/docker exec {container_q} "
+                f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
+            )
+            await self.execute_and_stream_logs(
+                ssh_client=ssh_client,
+                command=command,
+                log_tag=log_tag,
+                log_text="Preparing Jupyter script directory",
+                log_extra=log_extra,
+                raise_exception=True,
+            )
+            command = (
+                f"/usr/bin/docker cp /root/app/run_jupyter.sh "
+                f"{container_q}:/tmp/run_jupyter.sh"
+            )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
                 log_tag=log_tag,
                 log_text="Copying run_jupyter.sh to container",
                 log_extra=log_extra,
-                raise_exception=True
+                raise_exception=True,
             )
-            command = f"/usr/bin/docker exec {container_name} sh -c 'chmod +x /root/run_jupyter.sh'"
+            command = (
+                f"/usr/bin/docker exec {container_q} "
+                f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
+            )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
                 log_tag=log_tag,
-                log_text="chmod +x /root/run_jupyter.sh",
+                log_text="Installing run_jupyter.sh",
                 log_extra=log_extra,
-                raise_exception=True
+                raise_exception=True,
             )
-            command = f"/usr/bin/docker exec {container_name} sh -c '/root/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+            command = (
+                f"/usr/bin/docker exec {container_q} sh -c "
+                f"{shlex.quote(f'{target_q}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}')}"
+            )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
                 command=command,
                 log_tag=log_tag,
                 log_text="Running jupyter",
                 log_extra=log_extra,
-                raise_exception=False
+                raise_exception=False,
             )
 
         # Only raise exception for actual errors, not warnings or info messages
@@ -2163,24 +2898,10 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         docker_root_dir: str,
     ) -> int:
-        # The validator's SSH session lands inside the miner's executor container,
-        # where DockerRootDir (a host path) does not exist. Measure through the
-        # docker daemon instead: bind-mount the host path into a helper container
-        # and run df there. Alpine's busybox df has no --output, so use POSIX -P
-        # and parse the "Available" column (4th) of the data line.
-        result = await ssh_client.run(
-            f"/usr/bin/docker run --rm -v {shlex.quote(docker_root_dir)}:/hostfs:ro "
-            f"{_VLOOPBACK_REPAIR_IMAGE} df -P -B1 /hostfs"
-        )
-        if getattr(result, "exit_status", 0) != 0:
-            raise Exception(f"df via helper container failed: {getattr(result, 'stderr', '')}")
-        lines = (result.stdout or "").strip().splitlines()
-        if len(lines) < 2:
-            raise Exception(f"Unexpected df output: {result.stdout!r}")
-        columns = lines[1].split()
-        if len(columns) < 4 or not columns[3].isdigit():
-            raise Exception(f"Unexpected df output: {result.stdout!r}")
-        return int(columns[3])
+        # Delegates to the shared helper so the grant path (here) and the disk-tight reclaim
+        # (container_cleanup) can never disagree on how free disk is measured — a df fix landing in
+        # one copy only would make the validator grant a cache the backstop immediately reclaims.
+        return await df_available_bytes(ssh_client, docker_root_dir)
 
     async def _get_existing_vloopback_bytes(
         self,
@@ -2871,6 +3592,13 @@ class DockerService:
 
         # Deploy container profiler
         profilers = []
+        # DAH-2458: seed with the backend's own pre-dispatch spans (measured before this request
+        # reached the subnet, e.g. the filler-preemption wait) so the persisted profile is one
+        # ordered backend -> subnet -> backend timeline. Unknown step names are dropped, never fatal.
+        for wire_step in payload.pre_dispatch_profilers or []:
+            seeded = ProfilerStep.from_wire(wire_step)
+            if seeded is not None:
+                profilers.append(seeded)
         if payload.timestamp:
             profilers.append(ProfilerStep(name=ProfilerStepName.REQUESTED_FROM_BACKEND, timestamp=payload.timestamp))
             prev_timestamp = payload.timestamp
@@ -2888,6 +3616,7 @@ class DockerService:
 
         log_tag = "container_creation"
         current_step = "start"
+        volume_encryption_status = VolumeEncryptionStatus.DISABLED
 
         # DAH-2211: a custom-build payload carries `dockerfile_content` (may be
         # `""`/whitespace if a broken caller bypassed the route XOR). Reject
@@ -3313,6 +4042,32 @@ class DockerService:
                     skip_volume_names=protected_volume_names,
                 )
 
+                # DAH-2475: sweep FIRST, against the names the backend REQUESTED. The stale old-version
+                # cache is dead weight (its names will never be requested again), and it is often the
+                # very thing that makes the node too tight to afford the new download — so removing it
+                # must happen before affordability is judged, or a renamed cache strands the node in a
+                # cold-start loop it can never leave. Sweeping requested-but-not-yet-granted names is
+                # safe: they either do not exist yet or are the current version worth keeping.
+                await self.sweep_stale_cache_volumes(
+                    ssh_client=ssh_client,
+                    payload=payload,
+                    default_extra=default_extra,
+                )
+
+                # The backend asks for the cache it wants; only the host knows whether those volumes
+                # already exist, and therefore whether mounting them costs a download at all.
+                payload.cache_volumes = await self.select_affordable_cache_volumes(
+                    ssh_client=ssh_client,
+                    payload=payload,
+                    default_extra=default_extra,
+                )
+
+                await self.reclaim_dphn_cache_for_rental(
+                    ssh_client=ssh_client,
+                    payload=payload,
+                    default_extra=default_extra,
+                )
+
                 # Add profiler for docker volume creation
                 profilers.append(ProfilerStep.since(ProfilerStepName.CONTAINER_CLEANING, prev_timestamp))
                 prev_timestamp = now_ms()
@@ -3363,22 +4118,64 @@ class DockerService:
                     prev_timestamp = now_ms()
 
                 external_volume_name = None
+                use_encrypted_volume = _should_encrypt_local_volume(
+                    local_volume,
+                    payload.workload_kind,
+                    payload.is_sysbox,
+                    payload.enable_volume_encryption,
+                )
+                if use_encrypted_volume:
+                    current_step = "encrypted_volume_image_inspect"
+                    if not await self._image_has_encrypted_volume_label(
+                        ssh_client,
+                        payload.docker_image,
+                    ):
+                        use_encrypted_volume = False
+                        volume_encryption_status = VolumeEncryptionStatus.UNSUPPORTED_IMAGE
+                        await self.stream_log(
+                            "Image missing lium.volume_encryption.enable=1; using plain local volume",
+                            "warning",
+                            log_tag,
+                        )
+                        logger.warning(
+                            _m(
+                                "Image missing volume-encryption label; falling back to plain volume",
+                                extra=get_extra_info({
+                                    **default_extra,
+                                    "container_name": container_name,
+                                    "docker_image": payload.docker_image,
+                                    "image_label": _ENCRYPTED_VOLUME_IMAGE_LABEL,
+                                }),
+                            ),
+                        )
                 if external_volume_info:
                     current_step = "external_volume_creation"
+                    sysbox_subuid_base: int | None = None
+                    if payload.is_sysbox:
+                        sysbox_subuid_base = await self.resolve_sysbox_subuid_base(
+                            ssh_client=ssh_client, log_extra=default_extra
+                        )
                     success, msg = await self.create_s3fs_volume(
                         ssh_client=ssh_client,
                         log_extra=default_extra,
                         volume_info=external_volume_info,
                         log_tag=log_tag,
+                        sysbox_subuid_base=sysbox_subuid_base,
                     )
                     if success:
                         # Add profiler for docker volume creation
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
                         prev_timestamp = now_ms()
-                        # Important: disable sysbox when using s3fs volume because s3fs volume is not supported by sysbox
-                        payload.is_sysbox = False
-
                         external_volume_name = external_volume_info.name
+                        if payload.is_sysbox and sysbox_subuid_base is None:
+                            # Decided only once the volume is really attached: runc
+                            # keeps /mnt writable, sysbox without the base does not.
+                            payload.is_sysbox = False
+                            await self.stream_log(
+                                "Sysbox disabled: cannot align S3 volume owner with the executor's sysbox uid range",
+                                "warning",
+                                log_tag,
+                            )
                     else:
                         warnings.append(ContainerWarningCode.ExternalVolumeFailed)
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION_FAILED, prev_timestamp))
@@ -3449,6 +4246,7 @@ class DockerService:
                     port_maps=port_maps,
                     local_volume=local_volume,
                     local_volume_path=local_volume_path,
+                    encrypted_local_volume=use_encrypted_volume,
                     external_volume_name=external_volume_name,
                     gpu_devices=gpu_config,
                     effective_storage_limit_gb=effective_storage_limit_gb,
@@ -3590,6 +4388,21 @@ class DockerService:
                 await self.stream_log("Created Docker Container", "success", log_tag)
 
                 try:
+                    if use_encrypted_volume:
+                        current_step = "encrypted_volume_setup"
+                        await self.setup_encrypted_local_volume(
+                            ssh_client=ssh_client,
+                            container_name=container_name,
+                            plaintext_path=local_volume_path,
+                            volume_name=local_volume,
+                            pod_id=payload.pod_id,
+                            log_tag=log_tag,
+                            log_extra=default_extra,
+                        )
+                        volume_encryption_status = VolumeEncryptionStatus.ENABLED
+                        profilers.append(ProfilerStep.since(ProfilerStepName.ENCRYPTED_VOLUME_SETUP, prev_timestamp))
+                        prev_timestamp = now_ms()
+
                     # DAH-2341: inject the customer's public keys before the sshd
                     # bootstrap. The keys are plain data (mkdir + append) with no
                     # dependency on a running sshd, and the bootstrap may now spend
@@ -3650,6 +4463,7 @@ class DockerService:
                                 log_extra=default_extra,
                                 local_volume=local_volume,
                                 local_volume_path=local_volume_path,
+                                encrypted_local_volume=use_encrypted_volume,
                             )
                         jupyter_url = f"http://{executor_info.address}:{jupyter_port_map[1]}/lab?token={jupyter_token}"
 
@@ -3678,7 +4492,12 @@ class DockerService:
                     await self.finish_stream_logs()
 
                     current_step = "finalize"
-                    await self.redis_service.add_rented_pod(executor_info, payload.pod_id, container_name)
+                    await self._cache_rented_pod_best_effort(
+                        executor_info=executor_info,
+                        pod_id=payload.pod_id,
+                        container_name=container_name,
+                        default_extra=default_extra,
+                    )
                     if settings.ENABLE_INSPECTOR:
                         await self._run_inspector_collector_lifecycle(
                             ssh_client=ssh_client,
@@ -3714,8 +4533,18 @@ class DockerService:
                         )
                     raise
 
-                # Add profiler for ssh service installation
-                profilers.append(ProfilerStep.since(ProfilerStepName.FINISHED_IN_SUBNET, prev_timestamp))
+                # DAH-2458: final step. Stamp the subnet's wall-clock finish time onto it (in
+                # addition to its duration) so the backend derives its finalize span directly as
+                # pending_finished_at - this timestamp, instead of reconstructing the subnet's
+                # finish moment from the sum of every step's duration.
+                finished_ms = now_ms()
+                profilers.append(
+                    ProfilerStep(
+                        name=ProfilerStepName.FINISHED_IN_SUBNET,
+                        duration=finished_ms - prev_timestamp,
+                        timestamp=finished_ms,
+                    )
+                )
 
                 if payload.workload_kind == WorkloadKind.FILLER:
                     await self.redis_service.remove_pending_pod(
@@ -3774,6 +4603,7 @@ class DockerService:
                     storage_limit_gb=effective_storage_limit_gb,
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
+                    volume_encryption_status=volume_encryption_status,
                 )
         except Exception as e:
             log_text = _m(
@@ -3789,23 +4619,36 @@ class DockerService:
             await self.finish_stream_logs()
             await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
 
-            # Port release now handled by backend
-            failure_msg = str(log_text)
+            # Port release now handled by backend.
+            # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
+            # the extra dict holding the actual error) — it becomes filler_run.failure_reason on the
+            # backend, where a bare "Failed create_container" told us nothing about why.
+            failure_detail = log_text.to_full_string()
             if (
                 current_step == "docker_sdk_ssh_host_key"
                 and isinstance(e, RentalDockerConnectionError)
             ):
-                failure_msg = f"{failure_msg}: {e}"
+                failure_detail = f"{failure_detail}: {e}"
 
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_id=payload.pod_id,
                 workload_kind=payload.workload_kind,
-                msg=failure_msg,
+                msg=str(log_text),
+                detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
                 failure_step=current_step,
+                volume_encryption_status=(
+                    VolumeEncryptionStatus.FAILED
+                    if current_step
+                    in {
+                        "encrypted_volume_image_inspect",
+                        "encrypted_volume_setup",
+                    }
+                    else None
+                ),
             )
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
@@ -3841,9 +4684,11 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
 
+        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            await self._prepare_known_hosts_policy(
+            known_hosts_policy = await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
@@ -3945,9 +4790,11 @@ class DockerService:
         )
 
         private_key = self.ssh_service.decrypt_payload(keypair.ss58_address, private_key)
+        pkey = asyncssh.import_private_key(private_key)
 
+        known_hosts_policy: asyncssh.SSHKnownHosts | None = None
         try:
-            await self._prepare_known_hosts_policy(
+            known_hosts_policy = await self._prepare_known_hosts_policy(
                 executor_info,
                 payload.miner_hotkey,
                 default_extra,
@@ -3994,6 +4841,27 @@ class DockerService:
                     call=lambda: docker_client.start(container_name=payload.container_name),
                     container_name=payload.container_name,
                 )
+                async with asyncssh.connect(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=known_hosts_policy,
+                ) as ssh_client:
+                    encrypted_volume_name = await self._encrypted_local_volume_name(
+                        docker_client,
+                        payload.container_name,
+                    )
+                    if encrypted_volume_name:
+                        await self.setup_encrypted_local_volume(
+                            ssh_client=ssh_client,
+                            container_name=payload.container_name,
+                            plaintext_path=payload.local_volume_path,
+                            volume_name=encrypted_volume_name,
+                            pod_id=payload.pod_id,
+                            log_tag=f"start_container_{payload.pod_id}",
+                            log_extra=default_extra,
+                        )
                 ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                     docker_client=docker_client,
                     container_name=payload.container_name,
@@ -4109,10 +4977,7 @@ class DockerService:
         docker_client: RentalDockerSdkClient,
         payload: ContainerDeleteRequest,
         log: _BoundLog,
-    ) -> None:
-        # DAH-2345: deletion is idempotent for every workload kind — a container that is already
-        # gone (e.g. removed by failed-create cleanup) must not fail the delete, or the backend
-        # retries a doomed request until force-removal and penalizes the miner.
+    ) -> FailedContainerRequest | None:
         try:
             await run_logged_rental_docker_sdk_operation(
                 operation="remove_container",
@@ -4127,6 +4992,29 @@ class DockerService:
                 remove_volumes=True,
             )
         except Exception as exc:
+            if _is_docker_container_removal_in_progress_error(exc):
+                # Docker is still processing the original force-remove request;
+                # let the backend keep polling without treating this as terminal.
+                error_msg = str(exc)
+                log.info(
+                    "Container deletion is still in progress",
+                    container_name=payload.container_name,
+                    error=error_msg,
+                )
+                return FailedContainerRequest(
+                    miner_hotkey=payload.miner_hotkey,
+                    executor_id=payload.executor_id,
+                    pod_id=payload.pod_id,
+                    workload_kind=payload.workload_kind,
+                    msg=error_msg,
+                    error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
+                    error_code=FailedContainerErrorCodes.DeletionInProgress,
+                )
+
+            # DAH-2345: deletion is idempotent for every workload kind — a container
+            # that is already gone (e.g. removed by failed-create cleanup) must not
+            # fail the delete, or the backend retries a doomed request until
+            # force-removal and penalizes the miner.
             if not _is_missing_docker_container_error(exc):
                 raise
             log.info(
@@ -4134,6 +5022,7 @@ class DockerService:
                 container_name=payload.container_name,
                 error=str(exc),
             )
+        return None
 
     async def delete_container(
         self,
@@ -4192,7 +5081,9 @@ class DockerService:
                 # Fatal boundary: the forced removal is the only step whose failure fails the
                 # undeploy. Every step below runs after the container is gone and is best-effort.
                 try:
-                    await self._force_remove_container(docker_client, payload, log)
+                    removal_failure = await self._force_remove_container(docker_client, payload, log)
+                    if removal_failure is not None:
+                        return removal_failure
                 except Exception:
                     # DAH-2427: a failed force-remove (backend FAILED / STOP_FAILED) is the
                     # classic wedge path — sweep before propagating so a wedged card does not
@@ -4258,7 +5149,9 @@ class DockerService:
                             volume_name=payload.external_volume,
                             volume_role="external",
                         )
-                        await self.disable_s3fs_volume_plugin(ssh_client)
+                        await self.remove_s3fs_volume_plugin(
+                            ssh_client=ssh_client, volume_name=payload.external_volume
+                        )
 
                 log.info(
                     "Remove rented machine from redis",

@@ -2,11 +2,16 @@ import logging
 import re
 from typing import Optional
 
+import asyncssh
+
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from core.docker_utils import DockerCommand
+from core.docker_utils import DockerCommand, df_available_bytes
 from core.utils import _m
 from services.const import (
+    DPHN_CACHE_LISTING_FLOOR_GB,
+    DPHN_CACHE_VOLUME_PREFIX,
     FILLER_CONTAINER_GRACE_MINUTES,
+    FILLER_CONTAINER_PREFIX,
     POD_CONTAINER_PREFIX,
     RENTAL_CONTAINER_PREFIXES,
 )
@@ -15,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 # Anonymous docker volumes are named with a 64-char hex hash.
 ANON_VOLUME_NAME_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+# DAH-2475: a node whose free disk has fallen below the rental listing floor must give the filler
+# cache back — it is worth ~37 GB and a delisted node earns nothing, so the cache is the first thing
+# to sacrifice. This is the SAME floor the affordability gate keeps a node above, so they share one
+# constant: split them and a node could be granted a cache it is immediately reclaimed for.
+DPHN_CACHE_RECLAIM_FREE_FLOOR_GB = DPHN_CACHE_LISTING_FLOOR_GB
 
 # Remove at most this many per pass; GC runs each cycle, so a backlog drains
 # over a few passes without a huge `docker volume rm` command.
@@ -160,6 +171,113 @@ class ContainerCleanup:
             )
             return 0
 
+    async def reclaim_dphn_cache_when_disk_is_tight(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_uuid: str,
+    ) -> int:
+        """Give the DPHN filler cache back when the node can no longer afford it.
+
+        DAH-2475: the create-time sweep only ever removes STALE cache versions — it deliberately never
+        reclaims, because a node's free disk is low precisely BECAUSE the cache is downloaded, so
+        reclaiming there would make the backend grant it again next cycle and the node would
+        re-download ~37 GB forever. This backstop is the one place that reclaims, and it decides on
+        real free space rather than on a request: below the rental listing floor the node earns
+        nothing, so the cache is the first thing to sacrifice.
+
+        Gated on NO live filler container: a cache a sibling still mounts is in use (docker refuses to
+        remove it anyway), and a node still filling bundles is not the node this is meant to rescue.
+        Returns how many volumes were removed.
+        """
+        extra = {"executor_uuid": executor_uuid}
+        try:
+            # Cheapest and most selective guard first. Most executors hold no DPHN cache at all — PEARL
+            # nodes, miner-assigned nodes, nodes that never ran Dolphin — and this check runs on every
+            # node every cycle. Measuring the disk before knowing there is anything to reclaim made all
+            # of them start a throwaway container just to learn there was nothing to do.
+            cache_volumes = await self._get_dphn_cache_volumes(ssh_client)
+            if not cache_volumes:
+                return 0
+
+            # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
+            # filler_* would make "no live filler" false forever and the reclaim would never fire.
+            if await self._has_running_filler_container(ssh_client):
+                return 0
+
+            free_gb = await self._get_free_disk_gb(ssh_client)
+            if free_gb is None or free_gb >= DPHN_CACHE_RECLAIM_FREE_FLOOR_GB:
+                return 0
+
+            if self.dry_run:
+                logger.info(
+                    _m(
+                        f"[DRY RUN] Would reclaim {len(cache_volumes)} DPHN cache volume(s)",
+                        extra=extra | {"volumes": cache_volumes, "free_gb": free_gb, "dry_run": True},
+                    )
+                )
+                return 0
+
+            await ssh_client.run(DockerCommand.volume_remove(*cache_volumes))
+            # `volume_remove` ends in `|| true`, so its exit status cannot tell a removal from a
+            # refusal — and dockerd refuses any volume a container still references, in ANY state.
+            # Re-list instead: reporting a rescue that did not happen leaves the node delisted while
+            # the check event says it was saved.
+            surviving: set[str] = set(await self._get_dphn_cache_volumes(ssh_client))
+            reclaimed: list[str] = [name for name in cache_volumes if name not in surviving]
+            if not reclaimed:
+                logger.warning(
+                    _m(
+                        "DPHN cache reclaim removed nothing; dockerd still holds the volumes",
+                        extra=extra | {"volumes": cache_volumes, "free_gb": free_gb},
+                    )
+                )
+                return 0
+            logger.info(
+                _m(
+                    f"Reclaimed {len(reclaimed)} DPHN cache volume(s) to get the node back over "
+                    "the rental listing floor",
+                    extra=extra | {"volumes": reclaimed, "kept_volumes": sorted(surviving), "free_gb": free_gb},
+                )
+            )
+            return len(reclaimed)
+        except Exception as e:
+            logger.warning(_m("DPHN cache reclaim failed", extra=extra | {"error": str(e)}))
+            return 0
+
+    async def _has_running_filler_container(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
+        # A cache a live filler still mounts is in use; docker refuses to remove it anyway.
+        result = await ssh_client.run(
+            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --format "{{{{.Names}}}}"'
+        )
+        if getattr(result, "exit_status", 0) != 0:
+            return True  # cannot prove the node is idle -> do not reclaim
+        return bool((result.stdout or "").strip())
+
+    async def _get_free_disk_gb(self, ssh_client: asyncssh.SSHClientConnection) -> float | None:
+        # The root is DISCOVERED, not assumed: a node with docker moved to a dedicated disk would
+        # otherwise be judged by its root filesystem, and the reclaim would either never fire while
+        # docker's disk is full or fire and delete a healthy cache the node had room for.
+        info = await ssh_client.run("/usr/bin/docker info --format '{{.DockerRootDir}}'")
+        if getattr(info, "exit_status", 0) != 0:
+            return None
+        docker_root: str = (info.stdout or "").strip() or "/var/lib/docker"
+        try:
+            return await df_available_bytes(ssh_client, docker_root) / (1024**3)
+        except Exception:
+            # A backstop that cannot measure declines rather than guesses; the caller treats None as
+            # "leave the cache alone".
+            return None
+
+    async def _get_dphn_cache_volumes(self, ssh_client: asyncssh.SSHClientConnection) -> list[str]:
+        result = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+        if getattr(result, "exit_status", 0) != 0:
+            return []
+        return sorted(
+            name
+            for name in (line.strip() for line in (result.stdout or "").splitlines())
+            if name.startswith(DPHN_CACHE_VOLUME_PREFIX)
+        )
+
     async def get_dangling_anonymous_volumes(self, ssh_client) -> Optional[list[str]]:
         # anonymous (64-hex) volumes referenced by no container; None if listing failed
         result = await ssh_client.run(DockerCommand.volume_ls_dangling())
@@ -254,9 +372,9 @@ class ContainerCleanup:
         if executor:
             rented_containers.update(pod.container_name for pod in executor.pods)
 
-        filler_container = rented_data.get_filler_container(executor_uuid)
-        if filler_container:
-            rented_containers.add(filler_container)
+        # Every filler container on the node is protected — a GPU-split node runs one per VRAM
+        # bundle (DAH-2465), and reaping a sibling kills a live worker mid-cycle.
+        rented_containers.update(rented_data.get_filler_containers(executor_uuid))
 
         return rented_containers
 

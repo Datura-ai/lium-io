@@ -29,6 +29,12 @@ class NvmlDigestCheck:
         if driver_version and expected_digest != lib_digest:
             # Check if driver version is unknown (not in our map)
             if expected_digest is None:
+                # Reactive verification (DAH-2451): ask the backend to resolve a driver we
+                # have never seen against NVIDIA's official installer. Skip versions already
+                # confirmed as spoofs so we don't re-report a known-invalid driver.
+                invalid_drivers = ctx.config.nvml_invalid_drivers or []
+                if driver_version not in invalid_drivers:
+                    await ctx.services.backend.report_unknown_driver(driver_version)
                 event = render_message(
                     Msg.DRIVER_UNKNOWN,
                     ctx=ctx,

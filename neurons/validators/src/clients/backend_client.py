@@ -18,6 +18,7 @@ from protocol.vc_protocol.compute_requests import (
     DefaultDockerImagesResponse,
     ExecutorHealthCheckResponse,
     FillerRunActiveResponse,
+    NvmlReportAckResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
 )
@@ -250,13 +251,20 @@ class BackendClient:
             timeout=10,
         )
 
-    async def get_filler_run_active(self, filler_run_id: str) -> FillerRunActiveResponse | None:
-        """Fetch whether the backend still considers a Lium filler run active."""
-        return await self.get(
-            f"/internal/filler-runs/{filler_run_id}/active",
-            FillerRunActiveResponse,
-            timeout=10,
-        )
+    async def get_filler_run_active(
+        self, filler_run_id: str, *, container_missing: bool = False
+    ) -> FillerRunActiveResponse | None:
+        """Fetch whether the backend still considers a Lium filler run active.
+
+        container_missing=True tells the backend this re-check was triggered by the filler
+        container being ABSENT on the host: the backend accumulates those reports and closes a
+        run the validator keeps seeing containerless (DAH-2471 zombie reconciliation). Older
+        backends simply ignore the query param.
+        """
+        path = f"/internal/filler-runs/{filler_run_id}/active"
+        if container_missing:
+            path += "?container_missing=true"
+        return await self.get(path, FillerRunActiveResponse, timeout=10)
 
     async def check_executor_health(
         self,
@@ -303,3 +311,21 @@ class BackendClient:
             add_signature=True,  # Use standard signature headers
             timeout=300,  # 5 minutes - backend needs time to SSH and verify container
         )
+
+    async def report_unknown_driver(self, driver_version: str) -> None:
+        """Ask the backend to verify an unknown NVIDIA driver (DAH-2451).
+
+        Fire-and-forget: the backend enqueues + resolves the driver against NVIDIA's
+        official installer, and the verdict reaches this validator later via shared
+        config. Never raises — a reporting failure must not disturb the pipeline.
+        """
+        try:
+            await self.post(
+                "/v1/nvml-driver/report-unknown",
+                NvmlReportAckResponse,
+                json_data={"driver_version": driver_version},
+                add_signature=True,
+                timeout=10,
+            )
+        except Exception as exc:
+            logger.warning(_m("Failed to report unknown driver", extra={"driver": driver_version, "error": str(exc)}))

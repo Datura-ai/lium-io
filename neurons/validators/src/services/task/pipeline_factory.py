@@ -23,7 +23,7 @@ from services.matrix_validation_service import ValidationService
 from services.redis_service import RENTAL_SUCCEED_MACHINE_SET, RedisService
 from services.verifyx_validation_service import VerifyXValidationService
 
-from core.config import settings
+from core.config import settings, shared_client
 from services.ssh_service import SSHService
 
 from .checks import (
@@ -206,7 +206,11 @@ class PipelineFactory:
                 validator_keypair=keypair,
                 max_gpu_count=MAX_GPU_COUNT,
                 gpu_model_rates=GPU_MODEL_RATES,
-                nvml_digest_map=LIB_NVIDIA_ML_DIGESTS,
+                # DB-backed allowlist served via shared config (DAH-2451): a new driver
+                # is a row insert, not a validator redeploy. Falls back to the packaged
+                # constant when the backend is unreachable (shared config empty).
+                nvml_digest_map=shared_client.config.nvml_ml_digests or LIB_NVIDIA_ML_DIGESTS,
+                nvml_invalid_drivers=shared_client.config.nvml_invalid_drivers,
                 enable_no_collateral=settings.ENABLE_NO_COLLATERAL,
                 verifyx_enabled=settings.ENABLE_VERIFYX,
                 inspector_enabled=settings.ENABLE_INSPECTOR,

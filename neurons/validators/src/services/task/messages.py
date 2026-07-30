@@ -656,7 +656,7 @@ class TenantEnforcementMessages:
         ),
     )
     GPU_OUTSIDE_TENANT = MessageTemplate(
-        event="Tenant container does not own GPU",
+        event="Provider is using the GPU",
         reason="GPU_USAGE_OUTSIDE_TENANT",
         severity="warning",
         category="runtime",

@@ -33,6 +33,9 @@ class PortConnectivityCheck:
         rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
         rented_ports = rented_executor.get_rented_ports() if rented_executor else []
         rented_pod_names = [p.container_name for p in rented_executor.pods] if rented_executor else []
+        # DAH-2527: an idle filler holds ports without creating a pod, so an executor running only
+        # fillers has no rented_executor entry at all — hence the separate lookup.
+        filler_ports = rented_data.get_filler_ports(ctx.executor.uuid) if rented_data else []
 
         connectivity_service = ctx.services.connectivity
         result = await connectivity_service.verify_ports(
@@ -42,6 +45,14 @@ class PortConnectivityCheck:
             ctx.state.sysbox_runtime,
             rented_ports=rented_ports,
             rented_pod_names=rented_pod_names,
+            filler_ports=filler_ports,
+            log_ctx={
+                "pipeline_id": ctx.pipeline_id,
+                "job_batch_id": ctx.config.job_batch_id,
+                "miner_hotkey": ctx.miner_hotkey,
+                "executor_uuid": ctx.executor.uuid,
+                "executor_ip": ctx.executor.address,
+            },
         )
         verified_port_count = len(result.successful_ports)
         extra_info = {

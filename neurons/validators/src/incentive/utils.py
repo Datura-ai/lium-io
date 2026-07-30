@@ -138,6 +138,6 @@ def log_for_monitoring(
 
         for job_list in job_results.values():
             for job_result in job_list:
-                logger.info(_m("", extra=job_result.model_dump(exclude={"incentive_logs"})))
+                logger.info(_m("", extra=job_result.model_dump()))
     except Exception as e:
         logger.error(f"Error logging for monitoring: {e}", exc_info=True)

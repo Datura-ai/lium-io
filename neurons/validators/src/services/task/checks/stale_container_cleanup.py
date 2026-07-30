@@ -40,6 +40,16 @@ class StaleContainerCleanupCheck:
             executor_uuid=ctx.executor.uuid,
         )
 
+        # DAH-2475: give the DPHN filler cache back when the node can no longer afford it. This is
+        # the ONLY caller — the create-time sweep deliberately never reclaims (it would raise free
+        # disk, the backend would grant the cache again next cycle, and the node would re-download
+        # ~37 GB forever), so a node that has fallen under the rental listing floor is rescued from
+        # here, where the decision is made on real free space and outside any launch.
+        reclaimed_cache_volumes = await ctx.services.container_cleanup.reclaim_dphn_cache_when_disk_is_tight(
+            ssh_client=ctx.ssh,
+            executor_uuid=ctx.executor.uuid,
+        )
+
         event = render_message(
             Msg.CLEANED,
             ctx=ctx,
@@ -47,6 +57,7 @@ class StaleContainerCleanupCheck:
             what={
                 "removed_count": removed_count,
                 "removed_containers": removed_names,
+                "reclaimed_cache_volumes": reclaimed_cache_volumes,
             },
         )
         return CheckResult(passed=True, event=event)

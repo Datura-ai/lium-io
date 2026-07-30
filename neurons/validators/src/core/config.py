@@ -4,7 +4,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 import bittensor
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
@@ -202,6 +202,12 @@ class Settings(BaseSettings):
     # (shadow mode) so prod impact can be observed before enforcing.
     ENABLE_UNRENTED_SOFT_PRICE_LIMIT: bool = Field(env="ENABLE_UNRENTED_SOFT_PRICE_LIMIT", default=False)
 
+    # DAH-2520 — unrented VRAM/disk sanity gate. When True, an unrented executor whose
+    # total GPU VRAM exceeds the machine's total disk loses the unrented rental incentive
+    # while staying active. When False, the breach is only logged (shadow mode) so prod
+    # impact can be observed before enforcing.
+    ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT: bool = Field(env="ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", default=False)
+
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )
@@ -330,12 +336,26 @@ class Settings(BaseSettings):
             "container IP. Build still has full public-internet egress."
         ),
     )
+    
+    ENABLE_VOLUME_ENCRYPTION: bool = Field(env="ENABLE_VOLUME_ENCRYPTION", default=True)
+    VOLUME_MASTER_SECRET: str | None = Field(env="VOLUME_MASTER_SECRET", default=None)
 
     DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 
     debug: DebugSettings = Field(default_factory=DebugSettings)
     verifyx: VerifyXSettings = Field(default_factory=VerifyXSettings)
     incentive: IncentiveConfig = Field(default_factory=IncentiveConfig)
+
+    @model_validator(mode="after")
+    def validate_volume_encryption_secret(self) -> "Settings":
+        if self.ENABLE_VOLUME_ENCRYPTION:
+            secret = self.VOLUME_MASTER_SECRET
+            if secret is None or len(secret) < 32:
+                raise ValueError(
+                    "ENABLE_VOLUME_ENCRYPTION requires VOLUME_MASTER_SECRET "
+                    "of at least 32 characters"
+                )
+        return self
 
     def get_bittensor_wallet(self) -> "Wallet":
         if not self.BITTENSOR_WALLET_NAME or not self.BITTENSOR_WALLET_HOTKEY_NAME:

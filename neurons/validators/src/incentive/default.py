@@ -111,7 +111,7 @@ class DefaultIncentive(BaseIncentive):
         result.total_mining_score = self.total_mining_score
         if result.mining_score is None:
             error_report: MinerLogLine = MinerLogLine.mining_score_missing(hotkey, result)
-            result.incentive_logs.append(error_report.to_log_line())
+            result.record_incentive_log(error_report)
             return result
 
         result.incentive = (self.mining_share * result.mining_score / self.total_mining_score) if self.total_mining_score > 0 else 0.0
@@ -119,7 +119,7 @@ class DefaultIncentive(BaseIncentive):
         report: MinerLogLine = MinerLogLine.mining_incentive_calculated(
             hotkey, result, self.total_mining_score, self.mining_share
         )
-        result.incentive_logs.append(report.to_log_line())
+        result.record_incentive_log(report)
         return result
 
     async def calculate_executor_score(
@@ -210,7 +210,7 @@ class DefaultIncentive(BaseIncentive):
             job_result.sysbox_multiplier * job_result.uptime_multiplier * job_result.driver_multiplier
         )
         line: MinerLogLine = MinerLogLine.mining_score_calculated(job_result, is_rented_after_cutoff)
-        job_result.incentive_logs.append(line.to_log_line())
+        job_result.record_incentive_log(line)
         logger.info(line.as_internal_log())
         return job_result
 

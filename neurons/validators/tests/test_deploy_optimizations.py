@@ -620,6 +620,25 @@ async def test_summary_not_emitted_on_failure(svc, monkeypatch):
     assert _summary_calls(mock_logger) == []
 
 
+@pytest.mark.asyncio
+async def test_finished_in_subnet_step_carries_wall_clock_timestamp(svc, monkeypatch):
+    """DAH-2458: the final 'Finished in subnet.' step stamps the subnet's wall-clock finish time
+    (in addition to its duration), so the backend derives its finalize span with one subtraction
+    (pending_finished_at - this timestamp) rather than re-summing every step's duration."""
+    ssh_client = _ssh_client(inspect_exit=0)
+    _patch_happy(svc, monkeypatch, ssh_client)
+
+    result = await _run(svc, _payload(timestamp=1_700_000_000_000))
+
+    assert isinstance(result, ContainerCreated)
+    finished = next(p for p in result.profilers if p.name is ProfilerStepName.FINISHED_IN_SUBNET)
+    assert finished.timestamp is not None
+    assert finished.duration is not None
+    # Both keys reach the backend on the wire (duration for the ETL pivot, timestamp for finalize).
+    dumped = finished.model_dump()
+    assert "timestamp" in dumped and "duration" in dumped
+
+
 # ------------------------------------------------------------------
 # Backward compatibility
 # ------------------------------------------------------------------
@@ -636,6 +655,7 @@ def test_payload_without_ships_sshd_deserializes():
     )
     req = ContainerCreateRequest(**legacy)
     assert req.ships_sshd is None
+    assert req.enable_volume_encryption is None
 
 
 # ------------------------------------------------------------------
@@ -712,6 +732,40 @@ def test_profiler_step_serializes_to_historical_wire_shape():
         "duration": 127,
         "skipped": True,
     }
+
+
+def test_profiler_step_from_wire_round_trips_backend_span():
+    """DAH-2458: create_container seeds the profile from the backend's pre-dispatch spans, passed
+    as wire dicts in ContainerCreateRequest.pre_dispatch_profilers. from_wire rebuilds a typed step
+    that serializes back to the identical wire shape."""
+    step = ProfilerStep.from_wire({"name": "Filler preemption", "duration": 30_000})
+    assert step is not None
+    assert step.name is ProfilerStepName.FILLER_PREEMPTION
+    assert step.duration == 30_000
+    assert step.model_dump() == {"name": "Filler preemption", "duration": 30_000}
+
+
+def test_profiler_step_from_wire_drops_unknown_or_malformed_step():
+    """An unrecognized step name (a newer backend emitting a step this validator version doesn't
+    know) or a malformed dict is dropped — never fatal — so the deploy can't break on profiler drift."""
+    assert ProfilerStep.from_wire({"name": "Some future step", "duration": 5}) is None
+    assert ProfilerStep.from_wire({"duration": 5}) is None  # missing name
+    assert ProfilerStep.from_wire({}) is None
+    assert ProfilerStep.from_wire("not a dict") is None  # non-dict payload -> TypeError guarded
+
+
+def test_profiler_step_from_wire_drops_known_name_with_bad_typed_field():
+    """REVIEW FOLLOW-UP (#1149): a step whose name IS known but whose duration/timestamp is
+    bad-typed must be DROPPED, not raised. The seeding loop runs inside create_container, so a
+    ValidationError escaping from_wire would abort a real customer deploy — contradicting the
+    "never fatal" contract. Guards the model construction staying inside the try."""
+    assert ProfilerStep.from_wire({"name": "Filler preemption", "duration": "abc"}) is None
+    assert ProfilerStep.from_wire({"name": "Filler preemption", "timestamp": {"x": 1}}) is None
+    assert ProfilerStep.from_wire({"name": "Backend rent prep", "duration": [1, 2]}) is None
+
+    # A coercible numeric string is NOT a drop case — pydantic coerces it to int.
+    coerced = ProfilerStep.from_wire({"name": "Backend rent prep", "duration": "123"})
+    assert coerced is not None and coerced.duration == 123
 
 
 def test_container_created_profilers_round_trip():
