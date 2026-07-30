@@ -279,6 +279,7 @@ class ContainerCreateRequest(ContainerBaseRequest):
     backup_log_id: str | None = None
     restore_path: str | None = None
     enable_jupyter: bool | None = None
+    enable_volume_encryption: bool | None = None
     available_ports: list[PayloadPortMapping] | None = None
     pod_mapping: list[PayloadPortMapping] | None = None
     active_container_names: list[str] | None = None
@@ -338,6 +339,7 @@ class ExecutorRentFinishedRequest(ContainerBaseRequest):
 class ContainerStartRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.ContainerStartRequest
     container_name: str
+    local_volume_path: str
 
 
 class AddSshPublicKeyRequest(ContainerBaseRequest):
@@ -391,6 +393,8 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_target_path: str
     auth_token: str  # JWT for progress updates
     backup_log_id: str
+    volume_encrypted: bool = False
+    container_name: str | None = None
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -402,6 +406,8 @@ class RestoreContainerRequest(ContainerBaseRequest):
     auth_token: str  # JWT for progress updates
     restore_log_id: str
     restore_path: str
+    volume_encrypted: bool = False
+    container_name: str | None = None
 
 
 ##############################################################
@@ -434,6 +440,13 @@ class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
 
 
+class VolumeEncryptionStatus(str, enum.Enum):
+    ENABLED = "ENABLED"
+    UNSUPPORTED_IMAGE = "UNSUPPORTED_IMAGE"
+    DISABLED = "DISABLED"
+    FAILED = "FAILED"
+
+
 class ContainerBaseResponse(BaseValidatorResponse):
     pod_id: str
     workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL
@@ -460,6 +473,7 @@ class ProfilerStepName(str, enum.Enum):
     PORT_CHECK_WAIT = "Port-check wait step finished"
     DOCKER_RUN = "Docker run step finished"
     CONTAINER_RUNNING_CHECK = "Container running check step finished"
+    ENCRYPTED_VOLUME_SETUP = "Encrypted volume setup step finished"
     SSH_SERVICE_INSTALLATION = "SSH service installation step finished"
     ADDING_PUBLIC_KEYS = "Adding public keys step finished"
     INSPECTOR_START = "Inspector collector start step finished"
@@ -558,6 +572,7 @@ class ContainerCreated(ContainerBaseResponse):
     storage_limit_gb: int | None = None
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
+    volume_encryption_status: VolumeEncryptionStatus | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -626,6 +641,7 @@ class FailedContainerRequest(ContainerBaseResponse):
     detail: str | None = None
     error_code: FailedContainerErrorCodes | None = None
     failure_step: str | None = None
+    volume_encryption_status: VolumeEncryptionStatus | None = None
 
 
 class DuplicateExecutorsResponse(BaseModel):

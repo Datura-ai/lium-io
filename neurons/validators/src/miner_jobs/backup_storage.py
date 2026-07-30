@@ -5,6 +5,8 @@ import json
 import tempfile
 import re
 
+from workspace_mount import VolumeAccess, detect_volume_access
+
 # Setup logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backup_storage")
@@ -88,8 +90,15 @@ def run_command(command, command_label: str = "command"):
     return result
 
 
-def run_command_args(command: list[str], input_stream=None, stdout=None, command_label: str = "command"):
-    result = subprocess.run(command, stdin=input_stream, stdout=stdout, capture_output=stdout is None, text=True)
+def run_command_args(command: list[str], input_stream=None, stdout=None, input_data=None, command_label: str = "command"):
+    result = subprocess.run(
+        command,
+        stdin=input_stream,
+        stdout=stdout,
+        input=input_data,
+        capture_output=stdout is None,
+        text=True,
+    )
     if result.returncode != 0:
         logger.error(f"Command failed: {command_label}")
         raise RuntimeError(
@@ -233,12 +242,13 @@ def pull_aws_cli():
     run_command_args(["/usr/bin/docker", "pull", "daturaai/aws-cli"], command_label="docker pull daturaai/aws-cli")
 
 
-def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
+def docker_base_command(args, volumes=None, volume_args=None, entrypoint=None, interactive=False):
     command = ["/usr/bin/docker", "run", "--rm"]
     if interactive:
         command.append("-i")
     for volume in volumes or []:
         command.extend(["-v", volume])
+    command.extend(volume_args or [])
     if entrypoint:
         command.extend(["--entrypoint", entrypoint])
     command.extend(
@@ -252,21 +262,31 @@ def docker_base_command(args, volumes=None, entrypoint=None, interactive=False):
     return command
 
 
-def estimate_backup_sizes(args, backup_path) -> tuple[int, int]:
-    source_volume = f"{args.source_volume}:{args.source_volume_path}"
+def workspace_command(args, volume_access: VolumeAccess, entrypoint: str, interactive: bool = False) -> list[str]:
+    if volume_access.encrypted:
+        return volume_access.docker_exec_args(entrypoint, interactive=interactive)
+    return docker_base_command(
+        args,
+        volume_args=volume_access.docker_run_args(),
+        entrypoint=entrypoint,
+        interactive=interactive,
+    )
+
+
+def estimate_backup_sizes(args, volume_access: VolumeAccess, backup_path: str) -> tuple[int, int]:
     # Run du inside Docker with the workload volume mounted; the miner host may not have this path.
-    du_command = docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sb", backup_path]
+    du_command = workspace_command(args, volume_access, "du") + ["-sb", backup_path]
     try:
         result = run_command_args(du_command, command_label="docker run du -sb <backup_path>")
         source_bytes = int(result.stdout.split()[0])
     except Exception:
         result = run_command_args(
-            docker_base_command(args, volumes=[source_volume], entrypoint="du") + ["-sk", backup_path],
+            workspace_command(args, volume_access, "du") + ["-sk", backup_path],
             command_label="docker run du -sk <backup_path>",
         )
         source_bytes = int(result.stdout.split()[0]) * 1024
 
-    find_command = docker_base_command(args, volumes=[source_volume], entrypoint="find") + [backup_path, "-print"]
+    find_command = workspace_command(args, volume_access, "find") + [backup_path, "-print"]
     entry_count = count_command_output_lines(find_command, command_label="docker run find <backup_path> -print")
     entry_count = max(entry_count, 1)
 
@@ -277,8 +297,8 @@ def estimate_backup_sizes(args, backup_path) -> tuple[int, int]:
     return source_bytes, expected_upload_size
 
 
-def estimate_expected_size(args, backup_path):
-    _, expected_upload_size = estimate_backup_sizes(args, backup_path)
+def estimate_expected_size(args, volume_access: VolumeAccess, backup_path: str):
+    _, expected_upload_size = estimate_backup_sizes(args, volume_access, backup_path)
     return expected_upload_size
 
 
@@ -307,17 +327,15 @@ def count_command_output_lines(command: list[str], command_label: str = "command
     return count
 
 
-def aws_cp(args, expected_size: int | None = None):
-    backup_path = os.path.expanduser((args.backup_path or '').rstrip('/'))
+def aws_cp(args, volume_access: VolumeAccess, backup_path: str, expected_size: int | None = None):
     if not backup_path:
         raise ValueError("Backup path is required")
 
     backup_path_parent = os.path.dirname(backup_path) or "."
     backup_path_current = os.path.basename(backup_path)
-    source_volume = f"{args.source_volume}:{args.source_volume_path}"
 
     # tar runs inside Docker with the source volume mounted and writes the archive to stdout.
-    tar_command = docker_base_command(args, volumes=[source_volume], entrypoint="tar") + [
+    tar_command = workspace_command(args, volume_access, "tar") + [
         "--xattrs",
         "--acls",
         "-C",
@@ -388,6 +406,8 @@ def aws_head_object(args):
 def backup_storage(args):
     progress = 0
     try:
+        volume_access = detect_volume_access(args.source_volume, args.source_volume_path)
+
         logger.info("=" * 70)
         logger.info("Environment variables:")
         logger.info("=" * 70)
@@ -430,17 +450,17 @@ def backup_storage(args):
         # progress += 10 # 100
         # update_backup_log(args.api_url, "COMPLETED", [], "", progress, args.auth_token)
 
-        logger.info("Step 1: Pulling aws cli...")
+        logger.info("Step 1: Preparing workspace and pulling aws cli...")
         pull_aws_cli()
         logger.info("Aws cli pulled")
         progress = 10
         update_backup_log(args.api_url, args.backup_log_id, "IN_PROGRESS", ["Info: Aws cli pulled"], "", progress, args.auth_token)
 
-        backup_path = os.path.expanduser((args.backup_path or '').rstrip('/'))
+        backup_path = volume_access.normalized_path(args.backup_path)
         if not backup_path:
             raise ValueError("Backup path is required")
         logger.info("Step 2: Estimating backup size...")
-        estimated_backup_size_bytes, expected_upload_size = estimate_backup_sizes(args, backup_path)
+        estimated_backup_size_bytes, expected_upload_size = estimate_backup_sizes(args, volume_access, backup_path)
         progress = 20
         update_backup_log(
             args.api_url,
@@ -469,7 +489,7 @@ def backup_storage(args):
             progress,
             args.auth_token,
         )
-        aws_cp(args, expected_size=expected_size_arg)
+        aws_cp(args, volume_access, backup_path, expected_size=expected_size_arg)
         logger.info("Copying to aws s3 completed")
         progress = 90
         update_backup_log(

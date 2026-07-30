@@ -148,6 +148,11 @@ class RecordingRentalDockerClient:
             {"volume_name": volume_name, "force": force}
         )
 
+    async def mount_source_for_destination(
+        self, *, container_name: str, destination: str
+    ) -> str | None:
+        return None
+
     async def prune_images(self) -> None:
         self.pruned_images += 1
 
@@ -243,13 +248,16 @@ def _base_create_payload(**overrides) -> ContainerCreateRequest:
 
 
 def _lifecycle_payload(payload_cls, *, container_name: str):
-    return payload_cls(
-        miner_hotkey="miner-hotkey",
-        executor_id=str(uuid4()),
-        pod_id="pod-id",
-        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
-        container_name=container_name,
-    )
+    values = {
+        "miner_hotkey": "miner-hotkey",
+        "executor_id": str(uuid4()),
+        "pod_id": "pod-id",
+        "workload_kind": WorkloadKind.CUSTOMER_RENTAL,
+        "container_name": container_name,
+    }
+    if payload_cls is ContainerStartRequest:
+        values["local_volume_path"] = "/root"
+    return payload_cls(**values)
 
 
 def _patch_common(monkeypatch, docker_service, ssh_client):

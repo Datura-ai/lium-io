@@ -655,6 +655,7 @@ def test_payload_without_ships_sshd_deserializes():
     )
     req = ContainerCreateRequest(**legacy)
     assert req.ships_sshd is None
+    assert req.enable_volume_encryption is None
 
 
 # ------------------------------------------------------------------

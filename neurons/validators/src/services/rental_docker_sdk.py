@@ -279,6 +279,23 @@ class RentalDockerSdkClient:
             v=remove_volumes,
         )
 
+    async def mount_source_for_destination(
+        self,
+        *,
+        container_name: str,
+        destination: str,
+    ) -> str | None:
+        try:
+            return await _in_docker_thread(
+                self._mount_source_for_destination_sync,
+                container_name,
+                destination,
+            )
+        except Exception as exc:
+            raise RentalDockerOperationError(
+                _wrap_error_message("Docker SDK inspect container failed", exc)
+            ) from exc
+
     async def create_volume(
         self,
         *,
@@ -401,6 +418,15 @@ class RentalDockerSdkClient:
             terminal=terminal,
             detail=_format_container_state_detail(state),
         )
+
+    def _mount_source_for_destination_sync(
+        self, container_name: str, destination: str
+    ) -> str | None:
+        info = self._api_client.inspect_container(container_name)
+        for mount in info.get("Mounts", []) or ():
+            if mount.get("Destination") == destination:
+                return mount.get("Name") or mount.get("Source") or None
+        return None
 
     def _run_container_sync(self, spec: ContainerRunSpec) -> None:
         host_config = self._api_client.create_host_config(

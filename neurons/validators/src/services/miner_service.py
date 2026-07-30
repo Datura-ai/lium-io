@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import time
 from typing import Annotated
 
@@ -66,6 +67,14 @@ from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 
 logger = logging.getLogger(__name__)
+
+
+def _miner_job_script_path(script_name: str) -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "miner_jobs", script_name)
+
+
+def _nohup_command(argv: list[str], log_path: str) -> str:
+    return f"{shlex.join(argv)} > {shlex.quote(log_path)} 2>&1 &"
 
 
 def _get_error_details(error: Exception) -> str:
@@ -1435,15 +1444,10 @@ class MinerService:
             known_hosts=None,
         ) as ssh_client:
 
-            # Upload the backup_storage.py script to the remote server before running it
-            # Assume the local script is at './scripts/backup_storage.py'
             remote_script_path = "/root/app/backup_storage.py"
-            local_script_path = os.path.join(
-                os.path.dirname(__file__), 
-                "..",
-                "miner_jobs", 
-                "backup_storage.py"
-            )
+            remote_helper_path = "/root/app/workspace_mount.py"
+            local_script_path = _miner_job_script_path("backup_storage.py")
+            local_helper_path = _miner_job_script_path("workspace_mount.py")
 
             logger.info(
                 _m(
@@ -1454,9 +1458,9 @@ class MinerService:
 
             async with ssh_client.start_sftp_client() as sftp:
                 await sftp.put(local_script_path, remote_script_path)
+                await sftp.put(local_helper_path, remote_helper_path)
 
-            commands = [
-                "nohup",
+            argv = [
                 executor_info.python_path,
                 "/root/app/backup_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
@@ -1469,9 +1473,12 @@ class MinerService:
                 "--backup-volume-iam_user_secret_key", payload.backup_volume_info.iam_user_secret_key,
                 "--source-volume-path", payload.source_volume_path,
                 "--backup-target-path", payload.backup_target_path,
-                "> /root/app/backup_storage.log 2>&1 &"
             ]
-            await ssh_client.run(" ".join(commands), timeout=50, check=True)
+            await ssh_client.run(
+                _nohup_command(["nohup", *argv], "/root/app/backup_storage.log"),
+                timeout=50,
+                check=True,
+            )
 
     async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey):
         """Handle restore container request."""
@@ -1483,14 +1490,10 @@ class MinerService:
             known_hosts=None,
         ) as ssh_client:
 
-            # Upload the restore_storage.py script to the remote server before running it
             remote_script_path = "/root/app/restore_storage.py"
-            local_script_path = os.path.join(
-                os.path.dirname(__file__), 
-                "..",
-                "miner_jobs", 
-                "restore_storage.py"
-            )
+            remote_helper_path = "/root/app/workspace_mount.py"
+            local_script_path = _miner_job_script_path("restore_storage.py")
+            local_helper_path = _miner_job_script_path("workspace_mount.py")
 
             logger.info(
                 _m(
@@ -1501,9 +1504,9 @@ class MinerService:
 
             async with ssh_client.start_sftp_client() as sftp:
                 await sftp.put(local_script_path, remote_script_path)
+                await sftp.put(local_helper_path, remote_helper_path)
 
-            commands = [
-                "nohup",
+            argv = [
                 executor_info.python_path,
                 "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
@@ -1516,9 +1519,12 @@ class MinerService:
                 "--backup-volume-iam_user_access_key", payload.backup_volume_info.iam_user_access_key,
                 "--backup-volume-iam_user_secret_key", payload.backup_volume_info.iam_user_secret_key,
                 "--target-volume-path", payload.target_volume_path,
-                "> /root/app/restore_storage.log 2>&1 &"
             ]
-            await ssh_client.run(" ".join(commands), timeout=50, check=True)
+            await ssh_client.run(
+                _nohup_command(["nohup", *argv], "/root/app/restore_storage.log"),
+                timeout=50,
+                check=True,
+            )
 
     def _generate_auth_headers(self, my_key: bittensor.Keypair, miner_hotkey: str) -> dict:
         """Generate authentication headers for REST API requests.
