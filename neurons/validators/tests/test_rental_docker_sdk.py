@@ -538,28 +538,12 @@ async def test_exec_in_container_passes_argv_and_environment_as_data():
             "cmd": ["sh", "-c", "cat /tmp/file"],
             "stdin": False,
             "environment": {"A": "B"},
+            # DAH-2534: pinned so a non-root image USER cannot break /root writes.
             "user": "root",
         }
     ]
     assert api_client.exec_started == [("exec-id", {"demux": True})]
     assert api_client.containers_inspected == ["pod_exec"]
-
-
-@pytest.mark.asyncio
-async def test_exec_in_container_runs_as_root_regardless_of_image_user():
-    # DAH-2534: docker exec inherits the image's USER when none is given, so an
-    # image built with `USER <non-root>` made every /root write fail.
-    api_client = FakeApiClient()
-    client = RentalDockerSdkClient(api_client)
-
-    await client.exec_in_container(
-        ContainerExecSpec(
-            container_name="pod_exec",
-            argv=("sh", "-c", "mkdir -p /root/.ssh"),
-        )
-    )
-
-    assert api_client.exec_created[0]["user"] == "root"
 
 
 @pytest.mark.asyncio

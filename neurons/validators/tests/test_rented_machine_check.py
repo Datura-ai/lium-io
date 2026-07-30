@@ -350,7 +350,10 @@ async def test_tenant_enforcement_check(
 
         if pod_running:
             # Should check SSH keys
-            assert any("authorized_keys" in cmd for cmd in ssh_client.commands_called)
+            assert any(
+                "authorized_keys" in cmd and "-u root" in cmd
+                for cmd in ssh_client.commands_called
+            )
 
             # If passed and halted, verify score was calculated
             if expected_pass and expect_halt:

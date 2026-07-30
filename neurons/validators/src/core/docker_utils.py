@@ -97,9 +97,8 @@ class DockerCommand:
     def exec_command(container_name: str, command: str) -> str:
         """Build docker exec command.
 
-        `-u root` mirrors the injection side (DAH-2534): without it the exec
-        inherits the image's USER, so on a non-root image this read a different
-        home directory than the one the keys were written to.
+        `-u root` because the exec would otherwise inherit the image's USER and
+        lose access to the root-owned paths we write to (DAH-2534).
         """
         return f"/usr/bin/docker exec -u root -i {container_name} sh -c '{command}'"
 

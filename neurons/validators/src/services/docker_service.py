@@ -1981,7 +1981,7 @@ class DockerService:
 
         async def wipe_tmp_files() -> None:
             await ssh_client.run(
-                f"/usr/bin/docker exec {container_q} rm -f "
+                f"/usr/bin/docker exec -u root {container_q} rm -f "
                 f"{shlex.quote(passfile_path)} {shlex.quote(setup_script_path)}",
                 check=False,
             )
@@ -2041,7 +2041,7 @@ class DockerService:
         )
         setup_heredoc = f"__SETUP_{uuid4().hex}__"
         upload_cmd = (
-            f"/usr/bin/docker exec -i {container_q} sh -c "
+            f"/usr/bin/docker exec -u root -i {container_q} sh -c "
             f"\"cat > {setup_script_path}\" "
             f"<< '{setup_heredoc}'\n"
             f"{setup_script}\n"
@@ -2069,7 +2069,7 @@ class DockerService:
             )
         )
         mount_result = await ssh_client.run(
-            f"/usr/bin/docker exec {container_q} sh {shlex.quote(setup_script_path)}",
+            f"/usr/bin/docker exec -u root {container_q} sh {shlex.quote(setup_script_path)}",
         )
         await wipe_tmp_files()
         if mount_result.exit_status != 0:
@@ -2095,7 +2095,7 @@ class DockerService:
             )
         )
         verify_result = await ssh_client.run(
-            f"/usr/bin/docker exec {container_q} sh -lc {shlex.quote(verify_mount_script)}"
+            f"/usr/bin/docker exec -u root {container_q} sh -lc {shlex.quote(verify_mount_script)}"
         )
         if verify_result.exit_status != 0:
             diagnostic_script = (
@@ -2105,7 +2105,7 @@ class DockerService:
                 'ps aux | grep [g]ocryptfs || true'
             )
             diagnostic_result = await ssh_client.run(
-                f"/usr/bin/docker exec {container_q} sh -lc "
+                f"/usr/bin/docker exec -u root {container_q} sh -lc "
                 f"{shlex.quote(diagnostic_script)}",
                 check=False,
             )
@@ -2699,7 +2699,7 @@ class DockerService:
                 )
 
             command = (
-                f"/usr/bin/docker exec {container_name} "
+                f"/usr/bin/docker exec -u root {container_name} "
                 f"sh -c 'chmod +x {local_volume_path}/run_jupyter.sh'"
             )
             await self.execute_and_stream_logs(
@@ -2712,7 +2712,7 @@ class DockerService:
             )
 
             command = (
-                f"/usr/bin/docker exec {container_name} sh -c "
+                f"/usr/bin/docker exec -u root {container_name} sh -c "
                 f"'{local_volume_path}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
             )
             status, error = await self.execute_and_stream_logs(
@@ -2728,7 +2728,7 @@ class DockerService:
             container_q = shlex.quote(container_name)
             target_q = shlex.quote(target_path)
             command = (
-                f"/usr/bin/docker exec {container_q} "
+                f"/usr/bin/docker exec -u root {container_q} "
                 f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
             )
             await self.execute_and_stream_logs(
@@ -2752,7 +2752,7 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec {container_q} "
+                f"/usr/bin/docker exec -u root {container_q} "
                 f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
@@ -2764,7 +2764,7 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec {container_q} sh -c "
+                f"/usr/bin/docker exec -u root {container_q} sh -c "
                 f"{shlex.quote(f'{target_q}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
