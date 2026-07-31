@@ -976,3 +976,10 @@ async def test_tenant_enforcement_skips_recovery_without_private_key(context_fac
     assert result.passed is False
     assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
     docker.recover_pod_after_stale_vloopback_mount.assert_not_awaited()
+
+
+def test_context_annotations_resolve_at_runtime():
+    # Every test above builds Context with model_construct, which skips validation and hides an
+    # annotation pydantic cannot resolve. A ContextServices field typed only under TYPE_CHECKING
+    # leaves Context unbuildable, and then every real validation cycle raises instead of running.
+    assert Context.model_rebuild(force=True) is True

@@ -26,6 +26,11 @@ from .runner import SSHCommandRunner
 if TYPE_CHECKING:
     # Deferred: docker_service imports this package, so a runtime import here is a cycle.
     from services.docker_service import DockerService
+else:
+    # Context is a pydantic model, so the name still has to exist at runtime for it to
+    # resolve ContextServices.docker — a TYPE_CHECKING-only import leaves the model
+    # unbuildable and every validation cycle raises instead of running.
+    DockerService = Any
 
 
 @dataclass(frozen=True)
