@@ -2118,12 +2118,14 @@ class DockerService:
         # The mount is created by root, so on an image whose USER is not root the
         # renter's own workload would own nothing inside its workspace and could
         # not write there (allow_other grants traversal, not permission).
-        await self._grant_workspace_to_container_user(
+        unwritable_workspace_error: str | None = await self._grant_workspace_to_container_user(
             ssh_client=ssh_client,
             container_q=container_q,
             plaintext_path=plaintext_path,
             log_extra={**log_extra, "container_name": container_name, "pod_id": pod_id},
         )
+        if unwritable_workspace_error:
+            await fail_step("chown_workspace", unwritable_workspace_error)
 
         await self.stream_log("Encrypted local volume mounted", "success", log_tag)
 
@@ -2148,11 +2150,14 @@ class DockerService:
         container_q: str,
         plaintext_path: str,
         log_extra: dict,
-    ) -> None:
+    ) -> str | None:
         """Hand the freshly mounted workspace to the image's own user.
 
-        No-op for a root image. Best effort: a workspace the renter cannot write
-        to is worth a warning, not a failed rental.
+        No-op for a root image. Returns an error message when the workspace is
+        known to be unusable, so the caller fails the rental instead of billing
+        for a pod whose encrypted volume the renter cannot write to. An
+        unresolvable user is only a warning: without a uid we cannot tell whether
+        a chown was needed at all.
         """
         # No -u here on purpose: this exec runs as the image's declared USER.
         owner_result = await ssh_client.run(
@@ -2167,11 +2172,11 @@ class DockerService:
                     extra=get_extra_info({**log_extra, "stderr": (owner_result.stderr or "")[-500:]}),
                 )
             )
-            return
+            return None
 
         container_uid, container_gid = owner_lines
         if container_uid == "0":
-            return
+            return None
 
         plaintext_q: str = shlex.quote(plaintext_path)
         chown_result = await ssh_client.run(
@@ -2180,16 +2185,12 @@ class DockerService:
             check=False,
         )
         if chown_result.exit_status != 0:
-            logger.warning(
-                _m(
-                    "Failed to chown encrypted workspace to the container user",
-                    extra=get_extra_info({
-                        **log_extra,
-                        "container_uid": container_uid,
-                        "stderr": (chown_result.stderr or "")[-500:],
-                    }),
-                )
+            return (
+                f"encrypted workspace stays root-owned; the container user "
+                f"{container_uid}:{container_gid} cannot write to it "
+                f"(chown exit={chown_result.exit_status}, stderr={(chown_result.stderr or '')[-300:]!r})"
             )
+        return None
 
     async def install_open_ssh_server_and_start_ssh_service(
         self,

@@ -27,8 +27,8 @@ class _FakeSshClient:
         return result
 
 
-async def _grant(ssh_client, plaintext_path: str = "/workspace") -> None:
-    await DockerService._grant_workspace_to_container_user(
+async def _grant(ssh_client, plaintext_path: str = "/workspace") -> str | None:
+    return await DockerService._grant_workspace_to_container_user(
         DockerService.__new__(DockerService),
         ssh_client=ssh_client,
         container_q="pod_x",
@@ -58,12 +58,22 @@ async def test_root_image_needs_no_chown():
 
 
 @pytest.mark.asyncio
-async def test_unresolvable_user_does_not_fail_the_rental():
+async def test_failed_chown_is_reported_so_the_rental_fails():
+    # a known-non-root user whose chown failed means the workspace is unusable —
+    # billing a pod for that is worse than failing the deploy
+    ssh_client = _FakeSshClient([(0, "101\n101\n"), (1, "")])
+
+    error = await _grant(ssh_client)
+
+    assert error is not None and "cannot write" in error
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_user_is_only_a_warning():
+    # without a uid we cannot tell whether a chown was needed at all
     ssh_client = _FakeSshClient([(127, "")])
 
-    await _grant(ssh_client)
-
-    assert len(ssh_client.commands_called) == 1
+    assert await _grant(ssh_client) is None
 
 
 @pytest.mark.asyncio
