@@ -1,5 +1,6 @@
-"""DAH-2534: the encrypted workspace is mounted by root, so it has to be handed
-back to the image's own user or a non-root renter cannot write to it."""
+"""DAH-2534: the encrypted workspace is mounted by root, so it has to end up
+writable by the image's own user — and that is decided by a real write probe,
+not by assuming the chown was enough."""
 
 import pytest
 
@@ -38,51 +39,60 @@ async def _grant(ssh_client, plaintext_path: str = "/workspace") -> str | None:
 
 
 @pytest.mark.asyncio
-async def test_workspace_is_chowned_to_a_non_root_image_user():
-    ssh_client = _FakeSshClient([(0, "101\n101\n"), (0, "")])
+async def test_non_root_image_is_chowned_then_probed():
+    ssh_client = _FakeSshClient([(0, "prism\n"), (0, ""), (0, "")])
 
-    await _grant(ssh_client)
+    assert await _grant(ssh_client) is None
 
-    assert "chown 101:101" in ssh_client.commands_called[1]
-    # the probe must NOT force a user — it reads the image's own default
-    assert "-u 0" not in ssh_client.commands_called[0]
+    inspect_command, chown_command, probe_command = ssh_client.commands_called
+    assert "docker inspect" in inspect_command
+    assert "chown prism" in chown_command
+    assert "-u prism" in probe_command and ".lium-write-probe" in probe_command
 
 
 @pytest.mark.asyncio
-async def test_root_image_needs_no_chown():
-    ssh_client = _FakeSshClient([(0, "0\n0\n")])
+async def test_root_image_needs_no_chown_or_probe():
+    ssh_client = _FakeSshClient([(0, "\n")])
 
-    await _grant(ssh_client)
-
+    assert await _grant(ssh_client) is None
     assert len(ssh_client.commands_called) == 1
 
 
 @pytest.mark.asyncio
-async def test_failed_chown_is_reported_so_the_rental_fails():
-    # a known-non-root user whose chown failed means the workspace is unusable —
-    # billing a pod for that is worse than failing the deploy
-    ssh_client = _FakeSshClient([(0, "101\n101\n"), (1, "")])
+async def test_unreadable_image_user_fails_the_rental():
+    # a probe we cannot run must not be mistaken for a probe that passed
+    ssh_client = _FakeSshClient([(1, "")])
 
     error = await _grant(ssh_client)
 
-    assert error is not None and "cannot write" in error
+    assert error is not None and "could not read the image USER" in error
 
 
 @pytest.mark.asyncio
-async def test_unresolvable_user_is_only_a_warning():
-    # without a uid we cannot tell whether a chown was needed at all
-    ssh_client = _FakeSshClient([(127, "")])
+async def test_unwritable_workspace_fails_even_when_chown_succeeded():
+    # chown-ing the mountpoint says nothing about traversing its parents
+    ssh_client = _FakeSshClient([(0, "prism\n"), (0, ""), (1, "")])
+
+    error = await _grant(ssh_client)
+
+    assert error is not None and "not writable by the image user" in error
+
+
+@pytest.mark.asyncio
+async def test_failed_chown_still_passes_when_the_probe_succeeds():
+    # the probe is the verdict; the chown is only remediation
+    ssh_client = _FakeSshClient([(0, "prism\n"), (1, ""), (0, "")])
 
     assert await _grant(ssh_client) is None
 
 
 @pytest.mark.asyncio
 async def test_workspace_path_is_quoted_into_the_shell():
-    ssh_client = _FakeSshClient([(0, "101\n101\n"), (0, "")])
+    ssh_client = _FakeSshClient([(0, "prism\n"), (0, ""), (0, "")])
 
     await _grant(ssh_client, plaintext_path="/root'$(id)'x")
 
-    chown_command: str = ssh_client.commands_called[1]
-    assert "$(id)" in chown_command
-    # quoted twice (inner sh -c, outer host shell), so the host never expands it
-    assert "'\"'\"'" in chown_command or "\\'" in chown_command
+    for command in ssh_client.commands_called[1:]:
+        assert "$(id)" in command
+        # quoted twice (inner sh -c, outer host shell), so the host never expands it
+        assert "'\"'\"'" in command or "\\'" in command

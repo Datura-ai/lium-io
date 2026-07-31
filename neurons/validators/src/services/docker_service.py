@@ -2153,42 +2153,68 @@ class DockerService:
     ) -> str | None:
         """Hand the freshly mounted workspace to the image's own user.
 
-        No-op for a root image. Returns an error message when the workspace is
-        known to be unusable, so the caller fails the rental instead of billing
-        for a pod whose encrypted volume the renter cannot write to. An
-        unresolvable user is only a warning: without a uid we cannot tell whether
-        a chown was needed at all.
+        The mount is created by root, so on an image whose USER is not root the
+        renter would own nothing inside its own workspace. No-op for a root
+        image. Returns an error message when the workspace is still not writable,
+        so the caller fails the rental rather than billing for a pod whose
+        encrypted volume the renter cannot use.
+
+        The verdict is a real write probe run as the image's user, not a
+        permission calculation: chown-ing the mountpoint says nothing about
+        whether every parent directory on the way to it is traversable (a mount
+        at ``/root/workspace`` under a 0700 ``/root`` is chown-ed and still
+        unreachable).
         """
-        # No -u here on purpose: this exec runs as the image's declared USER.
-        owner_result = await ssh_client.run(
-            f"/usr/bin/docker exec {container_q} sh -c {shlex.quote('id -u; id -g')}",
+        # `docker inspect` on the host, not `id` in the container: a renter image
+        # is not guaranteed to ship coreutils, and a probe we cannot run must not
+        # be mistaken for a probe that passed.
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect -f '{{{{.Config.User}}}}' {container_q}",
             check=False,
         )
-        owner_lines: list[str] = (owner_result.stdout or "").split()
-        if owner_result.exit_status != 0 or len(owner_lines) != 2:
-            logger.warning(
-                _m(
-                    "Could not resolve container user; leaving workspace owned by root",
-                    extra=get_extra_info({**log_extra, "stderr": (owner_result.stderr or "")[-500:]}),
-                )
+        if inspect_result.exit_status != 0:
+            return (
+                f"could not read the image USER of the rental container "
+                f"(docker inspect exit={inspect_result.exit_status}, "
+                f"stderr={(inspect_result.stderr or '')[-300:]!r})"
             )
+
+        image_user: str = (inspect_result.stdout or "").strip()
+        if image_user in ("", "0", "root", "0:0", "root:root"):
             return None
 
-        container_uid, container_gid = owner_lines
-        if container_uid == "0":
-            return None
-
+        user_q: str = shlex.quote(image_user)
         plaintext_q: str = shlex.quote(plaintext_path)
         chown_result = await ssh_client.run(
             f"/usr/bin/docker exec -u 0 {container_q} "
-            f"sh -c {shlex.quote(f'chown {container_uid}:{container_gid} {plaintext_q}')}",
+            f"sh -c {shlex.quote(f'chown {user_q} {plaintext_q}')}",
             check=False,
         )
         if chown_result.exit_status != 0:
+            logger.warning(
+                _m(
+                    "Failed to chown encrypted workspace; probing writability anyway",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "image_user": image_user,
+                        "stderr": (chown_result.stderr or "")[-500:],
+                    }),
+                )
+            )
+
+        probe_script: str = (
+            f"probe={plaintext_q}/.lium-write-probe; "
+            f"touch \"$probe\" && rm -f \"$probe\""
+        )
+        probe_result = await ssh_client.run(
+            f"/usr/bin/docker exec -u {user_q} {container_q} sh -c {shlex.quote(probe_script)}",
+            check=False,
+        )
+        if probe_result.exit_status != 0:
             return (
-                f"encrypted workspace stays root-owned; the container user "
-                f"{container_uid}:{container_gid} cannot write to it "
-                f"(chown exit={chown_result.exit_status}, stderr={(chown_result.stderr or '')[-300:]!r})"
+                f"encrypted workspace at {plaintext_path} is not writable by the image user "
+                f"{image_user} (probe exit={probe_result.exit_status}, "
+                f"stderr={(probe_result.stderr or '')[-300:]!r})"
             )
         return None
 
