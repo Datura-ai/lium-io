@@ -47,7 +47,7 @@ async def test_non_root_image_is_chowned_then_probed():
     inspect_command, chown_command, probe_command = ssh_client.commands_called
     assert "docker inspect" in inspect_command
     assert "chown prism" in chown_command
-    assert "-u prism" in probe_command and ".lium-write-probe" in probe_command
+    assert "-u prism" in probe_command and ".lium-write-probe-" in probe_command
 
 
 @pytest.mark.asyncio
@@ -84,6 +84,18 @@ async def test_failed_chown_still_passes_when_the_probe_succeeds():
     ssh_client = _FakeSshClient([(0, "prism\n"), (1, ""), (0, "")])
 
     assert await _grant(ssh_client) is None
+
+
+@pytest.mark.asyncio
+async def test_probe_name_is_unique_so_it_cannot_delete_renter_data():
+    # the workspace may already hold renter files on a remount
+    probes: list[str] = []
+    for _ in range(2):
+        ssh_client = _FakeSshClient([(0, "prism\n"), (0, ""), (0, "")])
+        await _grant(ssh_client)
+        probes.append(ssh_client.commands_called[2])
+
+    assert probes[0] != probes[1]
 
 
 @pytest.mark.asyncio

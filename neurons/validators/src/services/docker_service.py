@@ -2202,10 +2202,10 @@ class DockerService:
                 )
             )
 
-        probe_script: str = (
-            f"probe={plaintext_q}/.lium-write-probe; "
-            f"touch \"$probe\" && rm -f \"$probe\""
-        )
+        # Unique name: the workspace may already hold renter data on a remount, and
+        # a fixed probe path would delete a same-named file of theirs.
+        probe_path_q: str = shlex.quote(f"{plaintext_path}/.lium-write-probe-{uuid4().hex}")
+        probe_script: str = f"touch {probe_path_q} && rm -f {probe_path_q}"
         probe_result = await ssh_client.run(
             f"/usr/bin/docker exec -u {user_q} {container_q} sh -c {shlex.quote(probe_script)}",
             check=False,
