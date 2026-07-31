@@ -1,5 +1,26 @@
 # Executor
 
+## Restic storage-runner proof of concept
+
+The executor image contains a checksum-verified restic binary and an operation-scoped runner at `src/storage_runner.py`. The runner is the proof-of-concept data path for direct restic backup and restore without sending archive bytes through Docker stdout.
+
+It accepts JSON from standard input or a mode-`0600` file:
+
+```bash
+pdm run python src/storage_runner.py --spec storage-operation.json
+```
+
+An example request is available in `storage-operation.example.json`. Repository locations are not accepted from the request: the runner derives the isolated prefix as `restic/v1/pods/<pod-id>/` inside the supplied user backup bucket.
+
+Supported PoC workspace modes:
+
+- `plain_volume`: starts a sibling helper from the current executor image, mounts the named volume read-only for backup or read-write for restore, disables Docker log persistence, and runs restic directly against S3.
+- `encrypted_running`: validates the expected rental container, `/lium-cipher` volume mount, process cgroup, and live `fuse.gocryptfs` plaintext mount before running executor-controlled restic through that container's `/proc/<pid>/root` view.
+
+For restore, set `action` to `restore`, provide the exact hexadecimal `snapshot_id`, and set `workspace.requested_path` to a new or empty destination. The runner rejects a non-empty destination.
+
+JSON lines on stdout contain normalized `restic`, `diagnostic`, and terminal `result` events. Restic exit code 3 is returned as `COMPLETED` with `result_quality=PARTIAL` only when the final JSON summary includes a snapshot ID.
+
 **[Executor Documentation](https://docs.lium.io/bittensor-subnet/executor)**
 
 ## Setup project
@@ -147,4 +168,3 @@ The above command should show the `nvidia-smi` result if sysbox is installed cor
 ```shell
 sudo systemctl restart docker
 ```
-
