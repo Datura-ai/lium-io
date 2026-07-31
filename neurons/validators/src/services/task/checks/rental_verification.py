@@ -16,10 +16,6 @@ from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import MessageTemplate, RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
-# How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
-# bundle but the pipeline emits a single event, so the node must be judged by its worst container:
-# a confirmed kill outranks an indeterminate probe, which outranks a healthy one. Anything
-# unlisted sorts as healthy.
 # Backend verdicts that quarantine the host: the GPU runtime is broken in a way no rental survives,
 # so the score is zeroed and the verified job cleared. The host returns on the next clean check.
 _GPU_RUNTIME_QUARANTINE: dict[str, tuple[MessageTemplate, str]] = {
@@ -33,6 +29,10 @@ _GPU_RUNTIME_QUARANTINE: dict[str, tuple[MessageTemplate, str]] = {
     ),
 }
 
+# How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
+# bundle but the pipeline emits a single event, so the node must be judged by its worst container:
+# a confirmed kill outranks an indeterminate probe, which outranks a healthy one. Anything
+# unlisted sorts as healthy.
 _FILLER_VERDICT_SEVERITY: dict[str, int] = {
     Msg.FILLER_KILLED.reason: 3,
     Msg.FILLER_TRANSPORT_UNREACHABLE.reason: 2,
