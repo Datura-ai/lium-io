@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
@@ -16,16 +17,22 @@ from ...const import FILLER_CONTAINER_PREFIX, FILLER_LIVENESS_GRACE_MINUTES
 from ..messages import MessageTemplate, RentalVerificationMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
+@dataclass(frozen=True)
+class GpuRuntimeQuarantine:
+    message: MessageTemplate
+    score_warning: str
+
+
 # Backend verdicts that quarantine the host: the GPU runtime is broken in a way no rental survives,
 # so the score is zeroed and the verified job cleared. The host returns on the next clean check.
-_GPU_RUNTIME_QUARANTINE: dict[str, tuple[MessageTemplate, str]] = {
-    GPU_RUNTIME_NVML_MISMATCH_REASON: (
-        Msg.GPU_RUNTIME_NVML_MISMATCH,
-        "GPU runtime NVML driver/library mismatch",
+_GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
+    GPU_RUNTIME_NVML_MISMATCH_REASON: GpuRuntimeQuarantine(
+        message=Msg.GPU_RUNTIME_NVML_MISMATCH,
+        score_warning="GPU runtime NVML driver/library mismatch",
     ),
-    GPU_RUNTIME_DEVICE_FAULT_REASON: (
-        Msg.GPU_RUNTIME_DEVICE_FAULT,
-        "GPU is not addressable and needs a host reset",
+    GPU_RUNTIME_DEVICE_FAULT_REASON: GpuRuntimeQuarantine(
+        message=Msg.GPU_RUNTIME_DEVICE_FAULT,
+        score_warning="GPU is not addressable and needs a host reset",
     ),
 }
 
@@ -184,11 +191,11 @@ class RentalVerificationCheck:
                     updates={},
                 )
             elif response.reason_code in _GPU_RUNTIME_QUARANTINE:
-                message, score_warning = _GPU_RUNTIME_QUARANTINE[response.reason_code]
+                quarantine = _GPU_RUNTIME_QUARANTINE[response.reason_code]
                 details = response.details or {}
                 stderr = details.get("docker_stderr") or response.error
                 event = render_message(
-                    message,
+                    quarantine.message,
                     ctx=ctx,
                     check_id=self.check_id,
                     what={
@@ -207,7 +214,7 @@ class RentalVerificationCheck:
                     updates={
                         "score": 0.0,
                         "job_score": 0.0,
-                        "score_warning": score_warning,
+                        "score_warning": quarantine.score_warning,
                         "clear_verified_job_info": True,
                     },
                 )
