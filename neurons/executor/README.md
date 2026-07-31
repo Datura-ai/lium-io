@@ -2,7 +2,7 @@
 
 ## Restic storage-runner proof of concept
 
-The executor image contains a checksum-verified restic binary and an operation-scoped runner at `src/storage_runner.py`. The runner is the proof-of-concept data path for direct restic backup and restore without sending archive bytes through Docker stdout.
+The executor image contains a checksum-verified restic binary and an operation-scoped runner at `src/storage_runner.py`. The runner is the proof-of-concept data path for backup and restore without staging a temporary archive on the customer's disk.
 
 It accepts JSON from standard input or a mode-`0600` file:
 
@@ -15,11 +15,11 @@ An example request is available in `storage-operation.example.json`. Repository 
 Supported PoC workspace modes:
 
 - `plain_volume`: starts a sibling helper from the current executor image, mounts the named volume read-only for backup or read-write for restore, disables Docker log persistence, and runs restic directly against S3.
-- `encrypted_running`: validates the expected rental container, `/lium-cipher` volume mount, process cgroup, and live `fuse.gocryptfs` plaintext mount before running executor-controlled restic through that container's `/proc/<pid>/root` view.
+- `encrypted_running`: validates the expected rental container, `/lium-cipher` volume mount, process cgroup, and live `fuse.gocryptfs` plaintext mount. A short-lived executor helper then enters only the rental's user namespace and accesses the verified plaintext path without copying tools or S3 credentials into the rental.
 
-For restore, set `action` to `restore`, provide the exact hexadecimal `snapshot_id`, and set `workspace.requested_path` to a new or empty destination. The runner rejects a non-empty destination.
+For restore, set `action` to `restore`, provide the exact hexadecimal `snapshot_id`, and set `workspace.requested_path` to a new or empty destination. The runner rejects a non-empty destination. Restore data is streamed from restic directly into tar extraction, with pipeline failure propagation and periodic byte progress; it is never materialized as a local tar file.
 
-JSON lines on stdout contain normalized `restic`, `diagnostic`, and terminal `result` events. Restic exit code 3 is returned as `COMPLETED` with `result_quality=PARTIAL` only when the final JSON summary includes a snapshot ID.
+JSON lines on stdout contain normalized `restic`, `diagnostic`, heartbeat, and terminal `result` events. Restic exit code 3 is returned as `COMPLETED` with `result_quality=PARTIAL` only when the final JSON summary includes a snapshot ID. S3 backend concurrency defaults to 64 based on staging measurements and can be set from 1 through 128 with `repository.s3_connections`.
 
 **[Executor Documentation](https://docs.lium.io/bittensor-subnet/executor)**
 

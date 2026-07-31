@@ -28,7 +28,17 @@ class DockerVolumeWorkspace:
     read_only: bool
 
 
-ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace
+@dataclass(frozen=True)
+class DockerUserNamespaceWorkspace:
+    image: str
+    container_name: str
+    container_id: str
+    pid: int
+    path: PurePosixPath
+    read_only: bool
+
+
+ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace
 
 
 @dataclass(frozen=True)
@@ -54,11 +64,8 @@ class WorkspaceResolver:
         return self._resolve_encrypted_running(operation)
 
     def _resolve_plain_volume(self, operation: StorageOperationSpec) -> DockerVolumeWorkspace:
-        image = self._environ.get("LIUM_STORAGE_HELPER_IMAGE")
-        if not image:
-            image = self._current_executor_image()
         workspace = DockerVolumeWorkspace(
-            image=image,
+            image=self._helper_image(),
             volume_name=operation.workspace.volume_name,
             path=_map_requested_path(
                 operation.workspace.requested_path,
@@ -71,7 +78,7 @@ class WorkspaceResolver:
             self._require_empty_plain_restore_target(workspace)
         return workspace
 
-    def _resolve_encrypted_running(self, operation: StorageOperationSpec) -> LocalWorkspace:
+    def _resolve_encrypted_running(self, operation: StorageOperationSpec) -> DockerUserNamespaceWorkspace:
         container_name = operation.workspace.container_name
         if not container_name:
             raise WorkspaceResolutionError("encrypted workspace is missing container_name")
@@ -85,30 +92,48 @@ class WorkspaceResolver:
             operation.workspace.requested_path,
             operation.workspace.volume_path,
         )
-        visible_path = self._proc_root / str(identity.pid) / "root" / str(requested_path).lstrip("/")
-        if operation.action is StorageAction.BACKUP:
-            if not visible_path.is_dir():
-                raise WorkspaceResolutionError(f"backup source is not a directory: {requested_path}")
-        else:
-            _require_new_or_empty_directory(visible_path, requested_path)
+        visible_path = (
+            PurePosixPath(str(self._proc_root))
+            / str(identity.pid)
+            / "root"
+            / requested_path.relative_to("/")
+        )
+        image = self._helper_image()
+        self._validate_encrypted_path(
+            image=image,
+            pid=identity.pid,
+            visible_path=visible_path,
+            requested_path=requested_path,
+            action=operation.action,
+        )
 
         confirmed_identity, _ = self._inspect_running_container(container_name)
         if confirmed_identity != identity:
             raise WorkspaceResolutionError("rental container changed while resolving encrypted workspace")
-        return LocalWorkspace(path=visible_path)
+        return DockerUserNamespaceWorkspace(
+            image=image,
+            container_name=container_name,
+            container_id=identity.container_id,
+            pid=identity.pid,
+            path=visible_path,
+            read_only=operation.action is StorageAction.BACKUP,
+        )
+
+    def _helper_image(self) -> str:
+        return self._environ.get("LIUM_STORAGE_HELPER_IMAGE") or self._current_executor_image()
 
     def _current_executor_image(self) -> str:
         container_id = self._environ.get("HOSTNAME")
         if not container_id:
             raise WorkspaceResolutionError(
-                "plain volume mode requires workspace.helper_image or LIUM_STORAGE_HELPER_IMAGE"
+                "storage helper requires LIUM_STORAGE_HELPER_IMAGE or the current executor image"
             )
         result = self._run_docker(
-            ["inspect", "-f", "{{.Config.Image}}", container_id],
+            ["inspect", "-f", "{{.Image}}", container_id],
             "resolve current executor image",
         )
         image = result.stdout.strip()
-        if not image:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
             raise WorkspaceResolutionError("current executor image could not be resolved")
         return image
 
@@ -141,6 +166,63 @@ class WorkspaceResolver:
         )
         if result.returncode != 0:
             raise WorkspaceResolutionError(f"restore target must be new or empty: {workspace.path}")
+
+    def _validate_encrypted_path(
+        self,
+        *,
+        image: str,
+        pid: int,
+        visible_path: PurePosixPath,
+        requested_path: PurePosixPath,
+        action: StorageAction,
+    ) -> None:
+        if action is StorageAction.BACKUP:
+            check_script = 'test -d "$1"'
+            error = f"backup source is not a directory: {requested_path}"
+        else:
+            check_script = (
+                'target="$1"; '
+                'if [ ! -e "$target" ]; then exit 0; fi; '
+                'if [ ! -d "$target" ]; then exit 20; fi; '
+                'if find "$target" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then exit 21; fi'
+            )
+            error = f"restore target must be new or empty: {requested_path}"
+
+        result = subprocess.run(
+            [
+                self._docker_binary,
+                "run",
+                "--rm",
+                "--log-driver",
+                "none",
+                "--pid",
+                "host",
+                "--privileged",
+                "--security-opt",
+                "label=disable",
+                "--read-only",
+                "--network",
+                "none",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,size=67108864",
+                "--entrypoint",
+                "/usr/bin/nsenter",
+                image,
+                "-t",
+                str(pid),
+                "-U",
+                "--",
+                "/bin/sh",
+                "-c",
+                check_script,
+                "sh",
+                str(visible_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise WorkspaceResolutionError(error)
 
     def _inspect_running_container(self, container_name: str) -> tuple[ContainerIdentity, Mapping[str, object]]:
         result = self._run_docker(["inspect", container_name], "inspect rental container")
@@ -232,18 +314,6 @@ def _path_within_volume(requested_path: PurePosixPath, volume_path: PurePosixPat
             f"requested path {requested_path} is outside volume path {volume_path}"
         ) from error
     return requested_path
-
-
-def _require_new_or_empty_directory(visible_path: Path, logical_path: PurePosixPath) -> None:
-    if not visible_path.exists():
-        return
-    if not visible_path.is_dir():
-        raise WorkspaceResolutionError(f"restore target is not a directory: {logical_path}")
-    try:
-        next(visible_path.iterdir())
-    except StopIteration:
-        return
-    raise WorkspaceResolutionError(f"restore target must be new or empty: {logical_path}")
 
 
 def _unescape_mountinfo(value: str) -> str:
