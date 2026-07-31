@@ -6,7 +6,7 @@ including context setup and check instantiation.
 
 import logging
 import uuid
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import bittensor
 from clients.backend_client import BackendClient
@@ -68,6 +68,10 @@ from .pipeline import (
 from .runner import SSHCommandRunner
 from .score_calculator import calculate_scores
 
+if TYPE_CHECKING:
+    # Deferred: docker_service imports this package, so a runtime import here is a cycle.
+    from services.docker_service import DockerService
+
 logger = logging.getLogger(__name__)
 
 JOB_LENGTH = 300
@@ -91,6 +95,7 @@ class PipelineFactory:
         collateral_contract_service: CollateralContractService,
         executor_connectivity_service: ExecutorConnectivityService,
         backend_client: BackendClient,
+        docker_service: "DockerService",
     ):
         """Initialize pipeline factory with required services.
 
@@ -102,6 +107,7 @@ class PipelineFactory:
             collateral_contract_service: Collateral contract service
             executor_connectivity_service: Executor connectivity service
             backend_client: Backend API client
+            docker_service: Docker service, for checks that repair container state
         """
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -111,6 +117,7 @@ class PipelineFactory:
         self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
         self.backend_client = backend_client
+        self.docker_service = docker_service
 
         dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
         logger.info(f"ContainerCleanup dry_run={dry_run}")
@@ -181,6 +188,7 @@ class PipelineFactory:
             verified=verified_job_info,
             settings={"version": settings.VERSION},
             encrypt_key=encrypted_files.encrypt_key,
+            executor_ssh_private_key=private_key,
             default_extra=default_extra,
             services=ContextServices(
                 ssh=self.ssh_service,
@@ -194,6 +202,7 @@ class PipelineFactory:
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
                 container_cleanup=self.container_cleanup,
+                docker=self.docker_service,
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,

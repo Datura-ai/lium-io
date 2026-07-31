@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Protocol, Tuple
 
 import asyncssh
 from pydantic import BaseModel, Field
@@ -23,6 +23,11 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
 
+if TYPE_CHECKING:
+    # Deferred: docker_service imports this package, so a runtime import here is a cycle.
+    from services.docker_service import DockerService
+
+
 @dataclass(frozen=True)
 class ContextServices:
     ssh: SSHService
@@ -36,6 +41,7 @@ class ContextServices:
     score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
     backend: BackendClient
     container_cleanup: ContainerCleanup
+    docker: "DockerService"
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,9 @@ class Context(BaseModel):
     verified: dict = {}
     settings: dict = {}
     encrypt_key: str | None = None
+    # Already decrypted: pod recovery re-runs the rental start path, which opens its own
+    # connection to the host rather than reusing `ssh`.
+    executor_ssh_private_key: str | None = None
     default_extra: dict[str, Any] = {}
     services: ContextServices
     config: ContextConfig

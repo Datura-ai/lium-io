@@ -5672,3 +5672,97 @@ def test_gocryptfs_setup_script_xor_material_no_stdin():
     assert "-passfile" in script
     rc, stdout, stderr = _run_gocryptfs_setup_script_in_sandbox(script)
     assert rc == 0, f"stdout={stdout!r} stderr={stderr!r}"
+
+
+_STALE_MOUNT_ERROR = (
+    "error while mounting volume '': VolumeDriver.Mount: cannot create mount point dir "
+    "'/mnt/volume_pod-1': mkdir /mnt/volume_pod-1: file exists"
+)
+
+
+async def _attempt_stale_mount_recovery(
+    docker_service: DockerService, container_error: str | None
+) -> bool:
+    return await docker_service.recover_pod_after_stale_vloopback_mount(
+        ssh_client=AsyncMock(),
+        executor_info=_executor_without_host_key("executor-1"),
+        miner_hotkey="miner-1",
+        private_key="key",
+        container_name="pod_pod-1",
+        pod_id="pod-1",
+        container_error=container_error,
+        default_extra={},
+    )
+
+
+@pytest.mark.parametrize(
+    "container_error",
+    [
+        pytest.param(None, id="stopped_on_purpose_leaves_no_error"),
+        pytest.param("OCI runtime create failed: exec: no such file", id="unrelated_error"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_declines_without_stale_mount_signature(
+    docker_service, monkeypatch, container_error
+):
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, container_error)
+
+    assert recovered is False
+    repair_mountpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_does_not_start_when_repair_fails(docker_service, monkeypatch):
+    monkeypatch.setattr(
+        docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=False)
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR)
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
+    docker_service, monkeypatch
+):
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR)
+
+    assert recovered is True
+    assert repair_mountpoint.await_args.args[1] == "volume_pod-1"
+    start_kwargs = start_existing_container.await_args.kwargs
+    assert start_kwargs["container_name"] == "pod_pod-1"
+    assert start_kwargs["pod_id"] == "pod-1"
+    assert start_kwargs["local_volume_path"] == "/root"
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_reports_failure_when_start_raises(docker_service, monkeypatch):
+    monkeypatch.setattr(
+        docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    monkeypatch.setattr(
+        docker_service,
+        "start_existing_container",
+        AsyncMock(side_effect=RuntimeError("start failed")),
+    )
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR)
+
+    assert recovered is False
