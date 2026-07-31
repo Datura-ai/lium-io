@@ -97,10 +97,11 @@ class DockerCommand:
     def exec_command(container_name: str, command: str) -> str:
         """Build docker exec command.
 
-        `-u root` because the exec would otherwise inherit the image's USER and
-        lose access to the root-owned paths we write to (DAH-2534).
+        `-u 0` because the exec would otherwise inherit the image's USER and lose
+        access to the root-owned paths we write to. Numeric, so it does not need a
+        root entry in the image's /etc/passwd (DAH-2534).
         """
-        return f"/usr/bin/docker exec -u root -i {container_name} sh -c '{command}'"
+        return f"/usr/bin/docker exec -u 0 -i {container_name} sh -c '{command}'"
 
 
 @dataclass

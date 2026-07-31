@@ -138,9 +138,9 @@ class VolumeAccess:
     def docker_exec_args(self, entrypoint: str, interactive: bool = False) -> list[str]:
         if not self.encrypted or not self.container_name:
             raise ValueError("docker exec requires an encrypted rental container_name")
-        # -u root: the exec would otherwise inherit the renter image's USER and
-        # lose write access to the plaintext mount (DAH-2534).
-        command = ["/usr/bin/docker", "exec", "-u", "root"]
+        # -u 0: the exec would otherwise inherit the renter image's USER and lose
+        # write access to the plaintext mount (DAH-2534).
+        command = ["/usr/bin/docker", "exec", "-u", "0"]
         if interactive:
             command.append("-i")
         command.extend([self.container_name, entrypoint])

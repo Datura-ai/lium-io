@@ -138,9 +138,9 @@ def test_encrypted_backup_commands_exec_inside_rental(monkeypatch):
     backup_storage.aws_cp(args, access, backup_path)
 
     assert backup_path == "/root/test"
-    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "root", "rental-pod", "du"] for command in run_commands)
-    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "root", "rental-pod", "find"] for command in popen_commands)
-    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "root", "rental-pod", "tar"] for command in popen_commands)
+    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "du"] for command in run_commands)
+    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "find"] for command in popen_commands)
+    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "tar"] for command in popen_commands)
 
 
 def test_encrypted_restore_commands_exec_inside_rental(monkeypatch):
@@ -171,8 +171,8 @@ def test_encrypted_restore_commands_exec_inside_rental(monkeypatch):
     restore_storage.aws_restore(args, access, restore_path)
 
     assert restore_path == "/root/test"
-    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "root", "rental-pod", "mkdir"] for command in run_commands)
-    assert any(command[:7] == ["/usr/bin/docker", "exec", "-u", "root", "-i", "rental-pod", "tar"] for command in popen_commands)
+    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "mkdir"] for command in run_commands)
+    assert any(command[:7] == ["/usr/bin/docker", "exec", "-u", "0", "-i", "rental-pod", "tar"] for command in popen_commands)
 
 
 def test_require_container_running_fails_when_stopped(monkeypatch):

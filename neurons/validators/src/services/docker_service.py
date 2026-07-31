@@ -1981,7 +1981,7 @@ class DockerService:
 
         async def wipe_tmp_files() -> None:
             await ssh_client.run(
-                f"/usr/bin/docker exec -u root {container_q} rm -f "
+                f"/usr/bin/docker exec -u 0 {container_q} rm -f "
                 f"{shlex.quote(passfile_path)} {shlex.quote(setup_script_path)}",
                 check=False,
             )
@@ -2041,7 +2041,7 @@ class DockerService:
         )
         setup_heredoc = f"__SETUP_{uuid4().hex}__"
         upload_cmd = (
-            f"/usr/bin/docker exec -u root -i {container_q} sh -c "
+            f"/usr/bin/docker exec -u 0 -i {container_q} sh -c "
             f"\"cat > {setup_script_path}\" "
             f"<< '{setup_heredoc}'\n"
             f"{setup_script}\n"
@@ -2069,7 +2069,7 @@ class DockerService:
             )
         )
         mount_result = await ssh_client.run(
-            f"/usr/bin/docker exec -u root {container_q} sh {shlex.quote(setup_script_path)}",
+            f"/usr/bin/docker exec -u 0 {container_q} sh {shlex.quote(setup_script_path)}",
         )
         await wipe_tmp_files()
         if mount_result.exit_status != 0:
@@ -2095,7 +2095,7 @@ class DockerService:
             )
         )
         verify_result = await ssh_client.run(
-            f"/usr/bin/docker exec -u root {container_q} sh -lc {shlex.quote(verify_mount_script)}"
+            f"/usr/bin/docker exec -u 0 {container_q} sh -lc {shlex.quote(verify_mount_script)}"
         )
         if verify_result.exit_status != 0:
             diagnostic_script = (
@@ -2105,7 +2105,7 @@ class DockerService:
                 'ps aux | grep [g]ocryptfs || true'
             )
             diagnostic_result = await ssh_client.run(
-                f"/usr/bin/docker exec -u root {container_q} sh -lc "
+                f"/usr/bin/docker exec -u 0 {container_q} sh -lc "
                 f"{shlex.quote(diagnostic_script)}",
                 check=False,
             )
@@ -2114,6 +2114,16 @@ class DockerService:
                 "gocryptfs mount did not become visible inside container",
                 diagnostic_result,
             )
+
+        # The mount is created by root, so on an image whose USER is not root the
+        # renter's own workload would own nothing inside its workspace and could
+        # not write there (allow_other grants traversal, not permission).
+        await self._grant_workspace_to_container_user(
+            ssh_client=ssh_client,
+            container_q=container_q,
+            plaintext_path=plaintext_path,
+            log_extra={**log_extra, "container_name": container_name, "pod_id": pod_id},
+        )
 
         await self.stream_log("Encrypted local volume mounted", "success", log_tag)
 
@@ -2130,6 +2140,56 @@ class DockerService:
                 }),
             ),
         )
+
+    async def _grant_workspace_to_container_user(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_q: str,
+        plaintext_path: str,
+        log_extra: dict,
+    ) -> None:
+        """Hand the freshly mounted workspace to the image's own user.
+
+        No-op for a root image. Best effort: a workspace the renter cannot write
+        to is worth a warning, not a failed rental.
+        """
+        # No -u here on purpose: this exec runs as the image's declared USER.
+        owner_result = await ssh_client.run(
+            f"/usr/bin/docker exec {container_q} sh -c {shlex.quote('id -u; id -g')}",
+            check=False,
+        )
+        owner_lines: list[str] = (owner_result.stdout or "").split()
+        if owner_result.exit_status != 0 or len(owner_lines) != 2:
+            logger.warning(
+                _m(
+                    "Could not resolve container user; leaving workspace owned by root",
+                    extra=get_extra_info({**log_extra, "stderr": (owner_result.stderr or "")[-500:]}),
+                )
+            )
+            return
+
+        container_uid, container_gid = owner_lines
+        if container_uid == "0":
+            return
+
+        plaintext_q: str = shlex.quote(plaintext_path)
+        chown_result = await ssh_client.run(
+            f"/usr/bin/docker exec -u 0 {container_q} "
+            f"sh -c {shlex.quote(f'chown {container_uid}:{container_gid} {plaintext_q}')}",
+            check=False,
+        )
+        if chown_result.exit_status != 0:
+            logger.warning(
+                _m(
+                    "Failed to chown encrypted workspace to the container user",
+                    extra=get_extra_info({
+                        **log_extra,
+                        "container_uid": container_uid,
+                        "stderr": (chown_result.stderr or "")[-500:],
+                    }),
+                )
+            )
 
     async def install_open_ssh_server_and_start_ssh_service(
         self,
@@ -2698,9 +2758,13 @@ class DockerService:
                     raise_exception=False,
                 )
 
+            # local_volume_path comes from the renter's template, so it reaches the
+            # host shell only through shlex.quote — same as the branch below.
+            container_q = shlex.quote(container_name)
+            script_q = shlex.quote(f"{local_volume_path}/run_jupyter.sh")
             command = (
-                f"/usr/bin/docker exec -u root {container_name} "
-                f"sh -c 'chmod +x {local_volume_path}/run_jupyter.sh'"
+                f"/usr/bin/docker exec -u 0 {container_q} "
+                f"sh -c {shlex.quote(f'chmod +x {script_q}')}"
             )
             await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2712,8 +2776,8 @@ class DockerService:
             )
 
             command = (
-                f"/usr/bin/docker exec -u root {container_name} sh -c "
-                f"'{local_volume_path}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}'"
+                f"/usr/bin/docker exec -u 0 {container_q} sh -c "
+                f"{shlex.quote(f'{script_q} --password={jupyter_token} --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
                 ssh_client=ssh_client,
@@ -2728,7 +2792,7 @@ class DockerService:
             container_q = shlex.quote(container_name)
             target_q = shlex.quote(target_path)
             command = (
-                f"/usr/bin/docker exec -u root {container_q} "
+                f"/usr/bin/docker exec -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'mkdir -p {target_q}')}"
             )
             await self.execute_and_stream_logs(
@@ -2752,7 +2816,7 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec -u root {container_q} "
+                f"/usr/bin/docker exec -u 0 {container_q} "
                 f"sh -c {shlex.quote(f'cp /tmp/run_jupyter.sh {target_q}/run_jupyter.sh && chmod +x {target_q}/run_jupyter.sh')}"
             )
             await self.execute_and_stream_logs(
@@ -2764,7 +2828,7 @@ class DockerService:
                 raise_exception=True,
             )
             command = (
-                f"/usr/bin/docker exec -u root {container_q} sh -c "
+                f"/usr/bin/docker exec -u 0 {container_q} sh -c "
                 f"{shlex.quote(f'{target_q}/run_jupyter.sh --password={jupyter_token} --port={jupyter_port}')}"
             )
             status, error = await self.execute_and_stream_logs(
