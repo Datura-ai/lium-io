@@ -9,6 +9,7 @@ WORKDIR /root/app
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
      build-essential \
+     bzip2 \
      ca-certificates \
      curl \
      e2fsprogs \
@@ -30,6 +31,16 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends docker-ce-cli \
   && rm -rf /var/lib/apt/lists/* \
   && docker --version
+
+ARG RESTIC_VERSION=0.19.1
+ARG RESTIC_LINUX_AMD64_SHA256=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
+RUN curl -fsSLo /tmp/restic.bz2 \
+      "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2" \
+  && echo "${RESTIC_LINUX_AMD64_SHA256}  /tmp/restic.bz2" | sha256sum -c - \
+  && bunzip2 /tmp/restic.bz2 \
+  && install -m 0755 /tmp/restic /usr/local/bin/restic \
+  && rm -f /tmp/restic \
+  && test "$(restic version | awk '{print $2}')" = "${RESTIC_VERSION}"
 
 RUN pip install -U pdm
 ENV PDM_CHECK_UPDATE=false
