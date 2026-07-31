@@ -234,10 +234,15 @@ fi
 
 step 4 7 "Configuring Docker"
 
-# time-namespaces: Docker >= 29.5 gives containers a private time namespace and puts it in the OCI
-# spec; sysbox-runc does not know that namespace type and rejects the whole spec. Older daemons
-# ignore the unknown feature key.
-CONFIG='{"runtimes":{"sysbox-runc":{"path":"/usr/bin/sysbox-runc"},"nvidia":{"path":"nvidia-container-runtime","runtimeArgs":[]}},"features":{"cdi":false,"time-namespaces":false}}'
+CONFIG='{"runtimes":{"sysbox-runc":{"path":"/usr/bin/sysbox-runc"},"nvidia":{"path":"nvidia-container-runtime","runtimeArgs":[]}},"features":{"cdi":false}}'
+
+# Docker >= 29.5 gives containers a private time namespace and puts it in the OCI spec; sysbox-runc
+# does not know that namespace type and rejects the whole spec. Set only on daemons that know the
+# flag — an unknown feature key on an older daemon is untested and would cost us the restart below.
+if docker_version_ge 29 5; then
+    CONFIG=$(echo "$CONFIG" | jq -c '.features["time-namespaces"] = false')
+    ok "Docker >= 29.5: disabling time namespaces for sysbox."
+fi
 
 mkdir -p /etc/docker
 if [ -f /etc/docker/daemon.json ]; then
@@ -298,7 +303,7 @@ else
     echo "    sysbox-runc:         $(sysbox-runc --version 2>/dev/null | head -1 || echo 'not found')"
     echo "    CDI specs:           $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo none)"
     echo "    daemon.json cdi:     $(jq -r '.features.cdi // "not set"' /etc/docker/daemon.json 2>/dev/null)"
-    echo "    daemon.json time-ns: $(jq -r '.features["time-namespaces"] // "not set"' /etc/docker/daemon.json 2>/dev/null)"
+    echo "    daemon.json time-ns: $(jq -r '.features["time-namespaces"]' /etc/docker/daemon.json 2>/dev/null)"
     echo ""
     if docker_version_ge 29 5; then
         fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
