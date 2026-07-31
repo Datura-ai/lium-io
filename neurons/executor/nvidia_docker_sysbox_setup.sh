@@ -22,8 +22,9 @@ cleanup() { [ -n "$DOWNLOADED_DEB" ] && rm -f "$DOWNLOADED_DEB"; }
 trap cleanup EXIT
 
 docker_version_ge() {
+    # the DAEMON version — it writes the OCI spec sysbox has to accept, and it can differ from the client
     local ver major minor
-    ver=$(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     major=${ver%%.*} minor=${ver#*.} minor=${minor%%.*}
     [ "$major" -gt "$1" ] 2>/dev/null || { [ "$major" -eq "$1" ] && [ "$minor" -ge "$2" ]; } 2>/dev/null
 }
@@ -233,7 +234,10 @@ fi
 
 step 4 7 "Configuring Docker"
 
-CONFIG='{"runtimes":{"sysbox-runc":{"path":"/usr/bin/sysbox-runc"},"nvidia":{"path":"nvidia-container-runtime","runtimeArgs":[]}},"features":{"cdi":false}}'
+# time-namespaces: Docker >= 29.5 gives containers a private time namespace and puts it in the OCI
+# spec; sysbox-runc does not know that namespace type and rejects the whole spec. Older daemons
+# ignore the unknown feature key.
+CONFIG='{"runtimes":{"sysbox-runc":{"path":"/usr/bin/sysbox-runc"},"nvidia":{"path":"nvidia-container-runtime","runtimeArgs":[]}},"features":{"cdi":false,"time-namespaces":false}}'
 
 mkdir -p /etc/docker
 if [ -f /etc/docker/daemon.json ]; then
@@ -286,7 +290,7 @@ else
     echo ""
     fail "Verification FAILED. Diagnostics:"
     echo ""
-    echo "    Docker:              $(docker --version 2>/dev/null || echo unknown)"
+    echo "    Docker daemon:       $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
     echo "    Kernel:              $(uname -r)"
     echo "    ID-mapped mounts:    $(sysbox_idmapped_report | grep . || echo 'not reported by sysbox-mgr')"
     echo "    NVIDIA driver:       $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo FAILED)"
@@ -294,7 +298,13 @@ else
     echo "    sysbox-runc:         $(sysbox-runc --version 2>/dev/null | head -1 || echo 'not found')"
     echo "    CDI specs:           $(ls /var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml 2>/dev/null || echo none)"
     echo "    daemon.json cdi:     $(jq -r '.features.cdi // "not set"' /etc/docker/daemon.json 2>/dev/null)"
+    echo "    daemon.json time-ns: $(jq -r '.features["time-namespaces"] // "not set"' /etc/docker/daemon.json 2>/dev/null)"
     echo ""
+    if docker_version_ge 29 5; then
+        fail "Docker >= 29.5 puts a time namespace in the OCI spec, which sysbox-runc rejects with"
+        fail "  'namespace {\"time\" \"\"} does not exist'. The time-namespaces feature above turns that off;"
+        fail "  if the error is still there, downgrade the daemon to Docker 28.x."
+    fi
     fail "Check: journalctl -u docker.service --no-pager -n 20"
     fail "Check: journalctl -u sysbox-mgr.service --no-pager -n 20"
     exit 1
