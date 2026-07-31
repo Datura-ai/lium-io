@@ -6,6 +6,9 @@ from pydantic import BaseModel, RootModel, field_validator
 from services.const import FILLER_CONTAINER_PREFIX
 
 GPU_RUNTIME_NVML_MISMATCH_REASON = "GPU_RUNTIME_NVML_MISMATCH"
+# The GPU itself is gone until a host reset (post-Xid): "gpu requires reset", "unknown device",
+# "NVML unknown". Same quarantine as the mismatch above — the host cannot serve a rental either way.
+GPU_RUNTIME_DEVICE_FAULT_REASON = "GPU_RUNTIME_DEVICE_FAULT"
 
 
 class Error(BaseModel, extra="allow"):

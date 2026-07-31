@@ -985,6 +985,17 @@ class RentalVerificationMessages:
             "Toolkit, and Docker runtime. Then reboot the host with `sudo reboot`."
         ),
     )
+    GPU_RUNTIME_DEVICE_FAULT = MessageTemplate(
+        event="GPU runtime health check failed",
+        reason="GPU_RUNTIME_DEVICE_FAULT",
+        severity="error",
+        category="runtime",
+        impact="New rentals are disabled because the GPU is not addressable on this host.",
+        remediation=(
+            "The GPU has entered a fatal state and needs a hard reset. Reboot the host with "
+            "`sudo reboot`, then check `nvidia-smi` and `dmesg` for Xid errors."
+        ),
+    )
     API_ERROR = MessageTemplate(
         event="Rental verification API error",
         reason="RENTAL_CHECK_API_ERROR",
