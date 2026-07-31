@@ -60,6 +60,10 @@ class VerifyXSettings(BaseSettings):
         default=50.0,
         description="Minimum required network download speed in Mbps"
     )
+    ENABLE_XET_CHALLENGE: bool = Field(
+        default=True,
+        description="Include HuggingFace Xet download challenge in VerifyX",
+    )
 
 
 class DebugSettings(BaseSettings):
