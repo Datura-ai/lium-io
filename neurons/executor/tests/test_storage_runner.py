@@ -9,8 +9,14 @@ from uuid import UUID
 import pytest
 
 from storage.models import OperationSpecError, OperationResultQuality, StorageOperationSpec
-from storage.restic import JsonEventWriter, ResticStorageRunner
-from storage.workspace import DockerVolumeWorkspace, LocalWorkspace, WorkspaceResolutionError, WorkspaceResolver
+from storage.restic import JsonEventWriter, ResticStorageRunner, RestoreStats
+from storage.workspace import (
+    DockerUserNamespaceWorkspace,
+    DockerVolumeWorkspace,
+    LocalWorkspace,
+    WorkspaceResolutionError,
+    WorkspaceResolver,
+)
 
 
 OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -45,6 +51,7 @@ def _operation_payload(
             "secret_access_key": "secret-key",
             "session_token": "session-token",
             "password": "repository-password",
+            "s3_connections": 64,
         },
         "workspace": workspace,
     }
@@ -63,6 +70,17 @@ def test_restore_requires_snapshot_id() -> None:
     payload["snapshot_id"] = None
 
     with pytest.raises(OperationSpecError, match="snapshot_id is required"):
+        StorageOperationSpec.from_mapping(payload)
+
+
+@pytest.mark.parametrize("value", [0, 129, 1.5, True])
+def test_s3_connections_must_be_a_bounded_integer(value: object) -> None:
+    payload = _operation_payload()
+    repository = payload["repository"]
+    assert isinstance(repository, dict)
+    repository["s3_connections"] = value
+
+    with pytest.raises(OperationSpecError, match="s3_connections"):
         StorageOperationSpec.from_mapping(payload)
 
 
@@ -127,14 +145,35 @@ def test_encrypted_workspace_resolves_verified_plaintext_view(
         ]
     )
 
-    monkeypatch.setattr(
-        "storage.workspace.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=inspection, stderr=""),
+    commands: list[list[str]] = []
+
+    def run_docker(command: list[str], **kwargs: object) -> SimpleNamespace:
+        commands.append(command)
+        stdout = inspection if command[1] == "inspect" else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", run_docker)
+
+    workspace = WorkspaceResolver(
+        docker_binary="docker",
+        proc_root=tmp_path,
+        environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"},
+    ).resolve(operation)
+
+    assert workspace == DockerUserNamespaceWorkspace(
+        image="executor:test",
+        container_name="rental-pod",
+        container_id=CONTAINER_ID,
+        pid=4321,
+        path=PurePosixPath(str(plaintext)),
+        read_only=True,
     )
-
-    workspace = WorkspaceResolver(docker_binary="docker", proc_root=tmp_path, environ={}).resolve(operation)
-
-    assert workspace == LocalWorkspace(plaintext)
+    preflight = next(command for command in commands if command[1] == "run")
+    assert preflight[preflight.index("--pid") + 1] == "host"
+    assert "--privileged" in preflight
+    assert preflight[preflight.index("--entrypoint") + 1] == "/usr/bin/nsenter"
+    assert "-U" in preflight
+    assert "-m" not in preflight
 
 
 def test_encrypted_workspace_fails_closed_without_gocryptfs_mount(
@@ -162,7 +201,11 @@ def test_encrypted_workspace_fails_closed_without_gocryptfs_mount(
     )
 
     with pytest.raises(WorkspaceResolutionError, match="not a live fuse.gocryptfs mount"):
-        WorkspaceResolver(docker_binary="docker", proc_root=tmp_path, environ={}).resolve(operation)
+        WorkspaceResolver(
+            docker_binary="docker",
+            proc_root=tmp_path,
+            environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"},
+        ).resolve(operation)
 
 
 def test_encrypted_workspace_fails_closed_when_pid_cgroup_does_not_match(
@@ -191,7 +234,11 @@ def test_encrypted_workspace_fails_closed_when_pid_cgroup_does_not_match(
     )
 
     with pytest.raises(WorkspaceResolutionError, match="PID cgroup does not match"):
-        WorkspaceResolver(docker_binary="docker", proc_root=tmp_path, environ={}).resolve(operation)
+        WorkspaceResolver(
+            docker_binary="docker",
+            proc_root=tmp_path,
+            environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"},
+        ).resolve(operation)
 
 
 def test_encrypted_workspace_fails_closed_when_container_restarts_during_resolution(
@@ -228,13 +275,20 @@ def test_encrypted_workspace_fails_closed_when_container_restarts_during_resolut
             ),
         ]
     )
-    monkeypatch.setattr(
-        "storage.workspace.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=next(inspections), stderr=""),
-    )
+
+    def run_docker(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=0, stdout=next(inspections), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("storage.workspace.subprocess.run", run_docker)
 
     with pytest.raises(WorkspaceResolutionError, match="container changed"):
-        WorkspaceResolver(docker_binary="docker", proc_root=tmp_path, environ={}).resolve(operation)
+        WorkspaceResolver(
+            docker_binary="docker",
+            proc_root=tmp_path,
+            environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"},
+        ).resolve(operation)
 
 
 class _FakePopen:
@@ -279,7 +333,7 @@ def test_exit_code_three_with_snapshot_is_completed_partial(
     assert '"result_quality":"PARTIAL"' in output.getvalue()
 
 
-def test_docker_restore_writes_to_requested_directory() -> None:
+def test_docker_restore_streams_directly_to_requested_directory() -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
     workspace = DockerVolumeWorkspace(
         image="executor:test",
@@ -289,11 +343,96 @@ def test_docker_restore_writes_to_requested_directory() -> None:
     )
     runner = ResticStorageRunner(operation, workspace)
 
-    command, _ = runner._execution_command(
-        ["restore", "--json", f"{SNAPSHOT_ID}:/", "--target", "/workspace/restored"],
-        working_directory=False,
-    )
+    command, _ = runner._restore_execution_command(SNAPSHOT_ID)
 
     assert "customer-volume:/workspace:rw" in command
     assert "--workdir" not in command
-    assert f"{SNAPSHOT_ID}:/" in command
+    assert SNAPSHOT_ID in command
+    assert "/workspace/restored" in command
+    assert "pipefail" in command
+    pipeline = command[command.index("-c") + 1]
+    assert "dump --archive tar" in pipeline
+    assert "LIUM_RESTORE_CHECKPOINT_%u" in pipeline
+    assert "--acls --xattrs" in pipeline
+
+
+def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(mode="encrypted_running"))
+    workspace = DockerUserNamespaceWorkspace(
+        image="executor:test",
+        container_name="rental-pod",
+        container_id=CONTAINER_ID,
+        pid=4321,
+        path=PurePosixPath("/proc/4321/root/root/checkpoints"),
+        read_only=True,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+
+    command, cwd = runner._execution_command(["backup", "--json", "."], working_directory=True)
+
+    assert cwd is None
+    assert command[command.index("--pid") + 1] == "host"
+    assert "--privileged" in command
+    assert command[command.index("--security-opt") + 1] == "label=disable"
+    assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
+    assert command[command.index("-t") + 1] == "4321"
+    assert "-U" in command
+    assert "-m" not in command
+    assert "/proc/4321/root/root/checkpoints" in command
+    assert "s3.connections=64" in command
+
+
+def test_encrypted_restore_uses_namespace_path_without_unsupported_acl_flags() -> None:
+    operation = StorageOperationSpec.from_mapping(
+        _operation_payload(action="restore", mode="encrypted_running")
+    )
+    workspace = DockerUserNamespaceWorkspace(
+        image="executor:test",
+        container_name="rental-pod",
+        container_id=CONTAINER_ID,
+        pid=4321,
+        path=PurePosixPath("/proc/4321/root/root/restored"),
+        read_only=False,
+    )
+    runner = ResticStorageRunner(operation, workspace)
+
+    command, cwd = runner._restore_execution_command(SNAPSHOT_ID)
+
+    assert cwd is None
+    assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
+    assert command[command.index("-t") + 1] == "4321"
+    assert "/proc/4321/root/root/restored" in command
+    pipeline = command[command.index("-c") + 1]
+    assert "dump --archive tar" in pipeline
+    assert "--acls" not in pipeline
+    assert "--xattrs" not in pipeline
+
+
+class _FakeRestorePopen:
+    def __init__(self, command: list[str], *args: object, **kwargs: object) -> None:
+        self.stdout = iter(["tar: LIUM_RESTORE_CHECKPOINT_1024\n"])
+
+    def wait(self) -> int:
+        return 0
+
+    def kill(self) -> None:
+        return None
+
+
+def test_restore_checkpoint_emits_bounded_progress(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
+    output = io.StringIO()
+    events = JsonEventWriter(str(OPERATION_ID), 0, output=output)
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path), event_writer=events)
+    monkeypatch.setattr("storage.restic.subprocess.Popen", _FakeRestorePopen)
+
+    exit_code, _ = runner._stream_command(
+        ["restore-test"],
+        None,
+        restore_stats=RestoreStats(total_size=20 * 1024 * 1024, total_file_count=3),
+    )
+
+    assert exit_code == 0
+    event = json.loads(output.getvalue())
+    assert event["payload"]["percent_done"] == 0.5
+    assert event["payload"]["bytes_restored"] == 10 * 1024 * 1024

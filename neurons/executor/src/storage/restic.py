@@ -11,7 +11,30 @@ from dataclasses import dataclass
 from typing import IO, Callable, Mapping
 
 from storage.models import OperationResultQuality, StorageAction, StorageOperationSpec
-from storage.workspace import DockerVolumeWorkspace, LocalWorkspace, ResolvedWorkspace
+from storage.workspace import (
+    DockerUserNamespaceWorkspace,
+    DockerVolumeWorkspace,
+    LocalWorkspace,
+    ResolvedWorkspace,
+)
+
+
+RESTORE_CHECKPOINT_PREFIX = "LIUM_RESTORE_CHECKPOINT_"
+TAR_RECORD_SIZE_BYTES = 20 * 512
+TAR_CHECKPOINT_RECORDS = 1024
+ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
+
+
+def _restore_pipeline_script(*, extended_metadata: bool) -> str:
+    metadata_options = '--acls --xattrs --xattrs-include="*" ' if extended_metadata else ""
+    return (
+        'mkdir -p -- "$4"; '
+        '"$1" --no-cache -o "$2" dump --archive tar "$3" / | '
+        'tar --extract --file - --directory "$4" --preserve-permissions '
+        f'--same-owner --numeric-owner {metadata_options}'
+        f'--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} '
+        f'--checkpoint-action=echo={RESTORE_CHECKPOINT_PREFIX}%u'
+    )
 
 
 class ResticOperationError(RuntimeError):
@@ -24,6 +47,12 @@ class ResticResult:
     result_quality: OperationResultQuality | None
     snapshot_id: str | None
     exit_code: int
+
+
+@dataclass(frozen=True)
+class RestoreStats:
+    total_size: int
+    total_file_count: int
 
 
 class JsonEventWriter:
@@ -118,7 +147,7 @@ class ResticStorageRunner:
 
     def _ensure_repository(self) -> None:
         probe = subprocess.run(
-            [self._restic_binary, "--no-cache", "snapshots", "--json"],
+            self._restic_command(["snapshots", "--json"]),
             env=self._environment,
             capture_output=True,
             text=True,
@@ -130,7 +159,7 @@ class ResticStorageRunner:
             raise ResticOperationError(f"restic repository probe failed with exit {probe.returncode}: {detail}")
 
         initialized = subprocess.run(
-            [self._restic_binary, "init", "--json"],
+            self._restic_command(["init", "--json"]),
             env=self._environment,
             capture_output=True,
             text=True,
@@ -139,7 +168,7 @@ class ResticStorageRunner:
             return
 
         retry_probe = subprocess.run(
-            [self._restic_binary, "--no-cache", "snapshots", "--json"],
+            self._restic_command(["snapshots", "--json"]),
             env=self._environment,
             capture_output=True,
             text=True,
@@ -173,11 +202,46 @@ class ResticStorageRunner:
         snapshot_id = self._operation.snapshot_id
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
-        command = ["restore", "--json", f"{snapshot_id}:/", "--target", self._workspace_path()]
-        exit_code, _ = self._stream(command, working_directory=False)
+        restore_stats = self._restore_stats(snapshot_id)
+        command, cwd = self._restore_execution_command(snapshot_id)
+        exit_code, _ = self._stream_command(command, cwd, restore_stats=restore_stats)
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
+        self._events.restic_event(
+            {
+                "message_type": "summary",
+                "percent_done": 1,
+                "total_files": restore_stats.total_file_count,
+                "files_restored": restore_stats.total_file_count,
+                "total_bytes": restore_stats.total_size,
+                "bytes_restored": restore_stats.total_size,
+            }
+        )
         return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
+
+    def _restore_stats(self, snapshot_id: str) -> RestoreStats:
+        result = subprocess.run(
+            self._restic_command(["stats", "--json", "--mode", "restore-size", snapshot_id]),
+            env=self._environment,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = _redact(result.stderr or result.stdout, self._secret_values())
+            raise ResticOperationError(
+                f"restic restore size lookup failed with exit {result.returncode}: {detail}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+            total_size = payload["total_size"]
+            total_file_count = payload["total_file_count"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ResticOperationError("restic restore size lookup returned invalid JSON") from error
+        if not isinstance(total_size, int) or total_size < 0:
+            raise ResticOperationError("restic restore size lookup returned an invalid total_size")
+        if not isinstance(total_file_count, int) or total_file_count < 0:
+            raise ResticOperationError("restic restore size lookup returned an invalid total_file_count")
+        return RestoreStats(total_size=total_size, total_file_count=total_file_count)
 
     def _stream(
         self,
@@ -185,6 +249,16 @@ class ResticStorageRunner:
         working_directory: bool,
     ) -> tuple[int, Mapping[str, object] | None]:
         command, cwd = self._execution_command(restic_arguments, working_directory)
+        return self._stream_command(command, cwd)
+
+    def _stream_command(
+        self,
+        command: list[str],
+        cwd: str | None,
+        *,
+        restore_stats: RestoreStats | None = None,
+    ) -> tuple[int, Mapping[str, object] | None]:
+        started_at = time.monotonic()
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -222,6 +296,13 @@ class ResticStorageRunner:
             line = raw_line.strip()
             if not line:
                 continue
+            checkpoint = _restore_checkpoint(line)
+            if checkpoint is not None and restore_stats is not None:
+                self._events.restic_event(
+                    _restore_progress(checkpoint, restore_stats, time.monotonic() - started_at)
+                )
+                self._events.heartbeat_if_due()
+                continue
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
@@ -244,23 +325,105 @@ class ResticStorageRunner:
         restic_arguments: list[str],
         working_directory: bool,
     ) -> tuple[list[str], str | None]:
+        restic_command = self._restic_command(restic_arguments)
         if isinstance(self._workspace, LocalWorkspace):
             cwd = str(self._workspace.path) if working_directory else None
-            return [self._restic_binary, "--no-cache", *restic_arguments], cwd
+            return restic_command, cwd
+
+        if isinstance(self._workspace, DockerUserNamespaceWorkspace):
+            if working_directory:
+                namespace_command = [
+                    "/bin/sh",
+                    "-c",
+                    ENCRYPTED_BACKUP_SCRIPT,
+                    "sh",
+                    str(self._workspace.path),
+                    *restic_command,
+                ]
+            else:
+                namespace_command = restic_command
+            return self._encrypted_helper_command(namespace_command), None
 
         volume_mode = "ro" if self._workspace.read_only else "rw"
-        container_name = f"lium-storage-{str(self._operation.operation_id)[:12]}"
         command = [
+            *self._docker_helper_base(),
+            "--security-opt",
+            "no-new-privileges",
+            "-v",
+            f"{self._workspace.volume_name}:/workspace:{volume_mode}",
+        ]
+        if working_directory:
+            command.extend(["--workdir", str(self._workspace.path)])
+        command.extend(
+            [
+                "--entrypoint",
+                self._restic_binary,
+                self._workspace.image,
+                *restic_command[1:],
+            ]
+        )
+        return command, None
+
+    def _restore_execution_command(self, snapshot_id: str) -> tuple[list[str], str | None]:
+        extended_metadata = not isinstance(self._workspace, DockerUserNamespaceWorkspace)
+        pipeline_command = [
+            "/bin/bash",
+            "-o",
+            "pipefail",
+            "-c",
+            _restore_pipeline_script(extended_metadata=extended_metadata),
+            "bash",
+            self._restic_binary,
+            self._s3_connection_option(),
+            snapshot_id,
+            self._workspace_path(),
+        ]
+        if isinstance(self._workspace, LocalWorkspace):
+            return pipeline_command, None
+        if isinstance(self._workspace, DockerUserNamespaceWorkspace):
+            return self._encrypted_helper_command(pipeline_command), None
+        return [
+            *self._docker_helper_base(),
+            "--security-opt",
+            "no-new-privileges",
+            "-v",
+            f"{self._workspace.volume_name}:/workspace:rw",
+            "--entrypoint",
+            "/bin/bash",
+            self._workspace.image,
+            *pipeline_command[1:],
+        ], None
+
+    def _encrypted_helper_command(self, namespace_command: list[str]) -> list[str]:
+        if not isinstance(self._workspace, DockerUserNamespaceWorkspace):
+            raise ResticOperationError("encrypted helper requested for a non-encrypted workspace")
+        return [
+            *self._docker_helper_base(),
+            "--pid",
+            "host",
+            "--privileged",
+            "--security-opt",
+            "label=disable",
+            "--entrypoint",
+            "/usr/bin/nsenter",
+            self._workspace.image,
+            "-t",
+            str(self._workspace.pid),
+            "-U",
+            "--",
+            *namespace_command,
+        ]
+
+    def _docker_helper_base(self) -> list[str]:
+        return [
             self._docker_binary,
             "run",
             "--rm",
             "--name",
-            container_name,
+            f"lium-storage-{str(self._operation.operation_id)[:12]}",
             "--log-driver",
             "none",
             "--read-only",
-            "--security-opt",
-            "no-new-privileges",
             "--tmpfs",
             "/tmp:rw,nosuid,nodev,size=268435456",
             "-e",
@@ -277,21 +440,19 @@ class ResticStorageRunner:
             "RESTIC_PASSWORD",
             "-e",
             "RESTIC_HOST",
-            "-v",
-            f"{self._workspace.volume_name}:/workspace:{volume_mode}",
         ]
-        if working_directory:
-            command.extend(["--workdir", str(self._workspace.path)])
-        command.extend(
-            [
-                "--entrypoint",
-                self._restic_binary,
-                self._workspace.image,
-                "--no-cache",
-                *restic_arguments,
-            ]
-        )
-        return command, None
+
+    def _restic_command(self, arguments: list[str]) -> list[str]:
+        return [
+            self._restic_binary,
+            "--no-cache",
+            "-o",
+            self._s3_connection_option(),
+            *arguments,
+        ]
+
+    def _s3_connection_option(self) -> str:
+        return f"s3.connections={self._operation.repository.s3_connections}"
 
     def _workspace_path(self) -> str:
         if isinstance(self._workspace, LocalWorkspace):
@@ -332,6 +493,40 @@ def _snapshot_id(summary: Mapping[str, object] | None) -> str | None:
         return None
     value = summary.get("snapshot_id")
     return value if isinstance(value, str) and value else None
+
+
+def _restore_checkpoint(line: str) -> int | None:
+    marker_index = line.find(RESTORE_CHECKPOINT_PREFIX)
+    if marker_index < 0:
+        return None
+    value = line[marker_index + len(RESTORE_CHECKPOINT_PREFIX) :].strip()
+    try:
+        checkpoint = int(value)
+    except ValueError:
+        return None
+    return checkpoint if checkpoint >= 0 else None
+
+
+def _restore_progress(
+    checkpoint: int,
+    stats: RestoreStats,
+    seconds_elapsed: float,
+) -> dict[str, object]:
+    archive_bytes = checkpoint * TAR_RECORD_SIZE_BYTES
+    if stats.total_size == 0:
+        percent_done = 0.99
+        bytes_restored = 0
+    else:
+        percent_done = min(archive_bytes / stats.total_size, 0.99)
+        bytes_restored = min(archive_bytes, stats.total_size)
+    return {
+        "message_type": "status",
+        "seconds_elapsed": int(seconds_elapsed),
+        "percent_done": percent_done,
+        "total_files": stats.total_file_count,
+        "total_bytes": stats.total_size,
+        "bytes_restored": bytes_restored,
+    }
 
 
 def _redact(value: str, secrets: tuple[str, ...]) -> str:

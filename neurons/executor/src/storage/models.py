@@ -36,6 +36,7 @@ class RepositorySpec:
     session_token: str | None = field(default=None, repr=False)
     region: str = "us-east-1"
     endpoint: str = "s3.amazonaws.com"
+    s3_connections: int = 64
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "RepositorySpec":
@@ -47,6 +48,13 @@ class RepositorySpec:
             session_token=_optional_nullable_string(value, "session_token"),
             region=_optional_string(value, "region", "us-east-1"),
             endpoint=_optional_string(value, "endpoint", "s3.amazonaws.com"),
+            s3_connections=_optional_bounded_integer(
+                value,
+                "s3_connections",
+                default=64,
+                minimum=1,
+                maximum=128,
+            ),
         )
 
     def url_for_pod(self, pod_id: UUID) -> str:
@@ -168,6 +176,22 @@ def _optional_nullable_string(value: Mapping[str, object], key: str) -> str | No
     if not isinstance(item, str) or not item.strip():
         raise OperationSpecError(f"{key} must be a non-empty string when provided")
     return item.strip()
+
+
+def _optional_bounded_integer(
+    value: Mapping[str, object],
+    key: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    item = value.get(key, default)
+    if not isinstance(item, int) or isinstance(item, bool):
+        raise OperationSpecError(f"{key} must be an integer")
+    if item < minimum or item > maximum:
+        raise OperationSpecError(f"{key} must be between {minimum} and {maximum}")
+    return item
 
 
 def _safe_identifier(value: str, key: str) -> str:

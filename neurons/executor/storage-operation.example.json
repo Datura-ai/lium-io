@@ -11,7 +11,8 @@
     "session_token": "optional-temporary-token",
     "password": "replace-at-runtime",
     "region": "us-east-1",
-    "endpoint": "s3.amazonaws.com"
+    "endpoint": "s3.amazonaws.com",
+    "s3_connections": 64
   },
   "workspace": {
     "mode": "plain_volume",
