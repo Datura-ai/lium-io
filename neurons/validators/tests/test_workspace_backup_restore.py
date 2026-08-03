@@ -200,6 +200,20 @@ def test_encrypted_restore_hands_the_target_dir_back_to_the_renter(monkeypatch):
     assert chown_commands[0][-2:] == ["renter", "/root/restored"]
 
 
+def test_unreadable_image_user_fails_the_restore_instead_of_skipping_chown(monkeypatch):
+    # returning None here would look exactly like a root image and silently skip
+    # the hand-back, leaving the renter with an unwritable restore target
+    monkeypatch.setattr(
+        workspace_mount_module.subprocess,
+        "run",
+        lambda command, **_: SimpleNamespace(returncode=1, stdout="", stderr="no such container"),
+    )
+    access = VolumeAccess("vol", "/root", encrypted=True, container_name="rental-pod")
+
+    with pytest.raises(RuntimeError, match="Could not read the image USER"):
+        access.container_image_user()
+
+
 def test_require_container_running_fails_when_stopped(monkeypatch):
     def fake_run(command, **kwargs):
         return SimpleNamespace(returncode=0, stdout="false\n", stderr="")

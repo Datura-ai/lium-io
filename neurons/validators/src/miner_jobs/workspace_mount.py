@@ -136,20 +136,27 @@ class VolumeAccess:
         return ["-v", f"{self.volume_name}:{WORKSPACE_PATH}"]
 
     def container_image_user(self) -> str | None:
-        """The USER the rental image declares, or None when it is root/unreadable.
+        """The USER the rental image declares, or None when that user is root.
 
         Anything this class creates inside the plaintext mount runs as uid 0, so
         callers need this to hand the result back to the renter (DAH-2534).
+
+        Raises when the user cannot be read: returning None there would be
+        indistinguishable from a root image and would silently skip the hand-back,
+        leaving the renter with a directory they cannot write to.
         """
         if not self.container_name:
-            return None
+            raise RuntimeError("container_image_user requires a rental container_name")
         result = subprocess.run(
             ["/usr/bin/docker", "inspect", "-f", "{{.Config.User}}", self.container_name],
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
-            return None
+            raise RuntimeError(
+                f"Could not read the image USER of {self.container_name} "
+                f"(exit={result.returncode}, stderr={(result.stderr or '').strip()!r})"
+            )
         image_user: str = result.stdout.strip()
         if image_user in ("", "0", "root", "0:0", "root:root"):
             return None
