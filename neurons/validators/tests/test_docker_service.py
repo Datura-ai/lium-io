@@ -5680,11 +5680,19 @@ _STALE_MOUNT_ERROR = (
 )
 
 
+def _recovery_ssh_client(volume_names: str = "volume_pod-1\n") -> AsyncMock:
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=volume_names))
+    return ssh_client
+
+
 async def _attempt_stale_mount_recovery(
-    docker_service: DockerService, container_error: str | None
+    docker_service: DockerService,
+    container_error: str | None,
+    ssh_client: AsyncMock | None = None,
 ) -> bool:
     return await docker_service.recover_pod_after_stale_vloopback_mount(
-        ssh_client=AsyncMock(),
+        ssh_client=ssh_client if ssh_client is not None else _recovery_ssh_client(),
         executor_info=_executor_without_host_key("executor-1"),
         miner_hotkey="miner-1",
         private_key="key",
@@ -5751,6 +5759,29 @@ async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
 
 
 @pytest.mark.asyncio
+async def test_recover_pod_repairs_the_volume_the_container_actually_mounts(
+    docker_service, monkeypatch
+):
+    # an edit-path pod carries a backend-supplied volume name that pod_id does not derive
+    repair_mountpoint = AsyncMock(side_effect=lambda _ssh, volume, _extra: volume == "custom-vol")
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    monkeypatch.setattr(docker_service, "start_existing_container", AsyncMock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    ssh_client = _recovery_ssh_client("some-other-vol\ncustom-vol\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client
+    )
+
+    assert recovered is True
+    assert [call.args[1] for call in repair_mountpoint.await_args_list] == [
+        "some-other-vol",
+        "custom-vol",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_recover_pod_reports_failure_when_start_raises(docker_service, monkeypatch):
     monkeypatch.setattr(
         docker_service, "repair_stale_vloopback_mountpoint", AsyncMock(return_value=True)
@@ -5762,7 +5793,13 @@ async def test_recover_pod_reports_failure_when_start_raises(docker_service, mon
         "start_existing_container",
         AsyncMock(side_effect=RuntimeError("start failed")),
     )
+    ssh_client = _recovery_ssh_client()
 
-    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR)
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client
+    )
 
     assert recovered is False
+    # the container may already be up with no plaintext mount, and no later cycle revisits a
+    # running pod — put it back down so POD_NOT_RUNNING keeps matching what the customer sees
+    assert "docker stop pod_pod-1" in ssh_client.run.await_args.args[0]

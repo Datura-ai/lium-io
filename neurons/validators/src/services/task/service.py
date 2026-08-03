@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Annotated
+from typing import Annotated
 
 import bittensor
 from clients.backend_client import BackendClient
@@ -20,12 +20,9 @@ from core.utils import _m, get_extra_info
 from services.ssh_service import SSHService
 
 from .models import JobResult
+from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
-
-if TYPE_CHECKING:
-    # Deferred: docker_service imports this package, so a runtime import here is a cycle.
-    from services.docker_service import DockerService
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +37,7 @@ class TaskService:
         executor_connectivity_service: Annotated[ExecutorConnectivityService, Depends(ExecutorConnectivityService)],
         backend_client: Annotated[BackendClient, Depends(BackendClient)],
         attestation_service: Annotated[AttestationService, Depends(AttestationService)],
-        docker_service: "DockerService",
+        pod_recovery: PodRecoverer,
     ):
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -56,7 +53,7 @@ class TaskService:
             collateral_contract_service=collateral_contract_service,
             executor_connectivity_service=executor_connectivity_service,
             backend_client=backend_client,
-            docker_service=docker_service,
+            pod_recovery=pod_recovery,
         )
 
     async def create_task(

@@ -335,7 +335,7 @@ async def _recover_pod_after_stale_vloopback_mount(
 
     container_error = diagnostics.get("container_error")
     try:
-        return await ctx.services.docker.recover_pod_after_stale_vloopback_mount(
+        return await ctx.services.pod_recovery.recover_pod_after_stale_vloopback_mount(
             ssh_client=ctx.ssh,
             executor_info=ctx.executor,
             miner_hotkey=ctx.miner_hotkey,

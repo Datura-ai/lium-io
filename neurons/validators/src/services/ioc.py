@@ -68,7 +68,7 @@ async def initiate_services():
         executor_connectivity_service=ioc["ExecutorConnectivityService"],
         backend_client=ioc["BackendClient"],
         attestation_service=ioc["AttestationService"],
-        docker_service=ioc["DockerService"],
+        pod_recovery=ioc["DockerService"],
     )
     ioc["MinerService"] = MinerService(
         ssh_service=ioc["SSHService"],

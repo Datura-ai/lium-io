@@ -102,7 +102,7 @@ class Validator:
             executor_connectivity_service=self.executor_connectivity_service,
             backend_client=self.backend_client,
             attestation_service=self.attestation_service,
-            docker_service=self.docker_service,
+            pod_recovery=self.docker_service,
         )
         self.miner_service = MinerService(
             ssh_service=ssh_service,

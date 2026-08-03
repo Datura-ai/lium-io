@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Protocol, Tuple
+from typing import Any, Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
 import asyncssh
 from pydantic import BaseModel, Field
@@ -23,14 +23,25 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from .models import ValidationEvent
 from .runner import SSHCommandRunner
 
-if TYPE_CHECKING:
-    # Deferred: docker_service imports this package, so a runtime import here is a cycle.
-    from services.docker_service import DockerService
-else:
-    # Context is a pydantic model, so the name still has to exist at runtime for it to
-    # resolve ContextServices.docker — a TYPE_CHECKING-only import leaves the model
-    # unbuildable and every validation cycle raises instead of running.
-    DockerService = Any
+@runtime_checkable
+class PodRecoverer(Protocol):
+    # The slice of DockerService the rented-machine check needs. Declared here because
+    # docker_service imports this package, so naming the class itself would be an import
+    # cycle — and Context is a pydantic model, so a TYPE_CHECKING-only name would leave it
+    # unbuildable and every validation cycle would raise instead of running.
+
+    async def recover_pod_after_stale_vloopback_mount(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        container_error: str | None,
+        default_extra: dict[str, Any],
+    ) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -46,7 +57,7 @@ class ContextServices:
     score_calculator: Callable[[str, bool, bool, str, bool, int], Tuple[float, float, str]]
     backend: BackendClient
     container_cleanup: ContainerCleanup
-    docker: "DockerService"
+    pod_recovery: PodRecoverer
 
 
 @dataclass(frozen=True)

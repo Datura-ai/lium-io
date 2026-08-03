@@ -4959,17 +4959,13 @@ class DockerService:
         if not container_error or not _is_stale_vloopback_mountpoint_error(container_error):
             return False
 
-        # Only the fresh-create naming convention is recovered. A pod created through the edit path
-        # keeps a backend-supplied `payload.local_volume` name that is not derivable from pod_id, so
-        # `docker volume inspect` misses, repair declines and the POD_NOT_RUNNING verdict stands.
-        local_volume = f"volume_{pod_id}"
-        log_extra = {
-            **default_extra,
-            "container_name": container_name,
-            "local_volume": local_volume,
-        }
-
-        if not await self.repair_stale_vloopback_mountpoint(ssh_client, local_volume, log_extra):
+        log_extra = {**default_extra, "container_name": container_name}
+        repaired_volume = await self._repair_stale_mountpoint_of_container_volume(
+            ssh_client,
+            container_name,
+            log_extra,
+        )
+        if not repaired_volume:
             logger.warning(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED",
@@ -4978,6 +4974,7 @@ class DockerService:
             )
             return False
 
+        log_extra = {**log_extra, "local_volume": repaired_volume}
         try:
             known_hosts_policy = await self._prepare_known_hosts_policy(
                 executor_info,
@@ -4997,10 +4994,17 @@ class DockerService:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning(
+            container_stopped = await self._stop_half_recovered_container(
+                ssh_client, container_name
+            )
+            logger.error(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_START_FAILED",
-                    extra=get_extra_info({**log_extra, "error": str(exc)}),
+                    extra=get_extra_info({
+                        **log_extra,
+                        "error": str(exc),
+                        "container_stopped": container_stopped,
+                    }),
                 )
             )
             return False
@@ -5009,6 +5013,57 @@ class DockerService:
             _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
         )
         return True
+
+    async def _repair_stale_mountpoint_of_container_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        default_extra: dict,
+    ) -> str | None:
+        # the volume whose stale mountpoint kept the container down, read off the container itself.
+        # `docker inspect` reports mounts of a stopped container, so the real name is taken from the
+        # host instead of guessed from pod_id — a pod created through the edit path carries a
+        # backend-supplied volume name that no convention derives. repair_stale_vloopback_mountpoint
+        # is what decides: it accepts a candidate only if the driver is vloopback and the stale
+        # mountpoint dir is present and empty.
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect {shlex.quote(container_name)} "
+            '--format \'{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}\'',
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        if getattr(inspect_result, "exit_status", 0) != 0:
+            return None
+
+        for candidate in (inspect_result.stdout or "").split():
+            repaired = await self.repair_stale_vloopback_mountpoint(
+                ssh_client,
+                candidate,
+                {**default_extra, "local_volume": candidate},
+            )
+            if repaired:
+                return candidate
+        return None
+
+    async def _stop_half_recovered_container(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+    ) -> bool:
+        # a start that brought the container up but failed afterwards — a gocryptfs remount that did
+        # not take — leaves the customer a running pod with an empty plaintext dir, and no later
+        # cycle revisits it because recovery only fires on a stopped container. Put it back down so
+        # the POD_NOT_RUNNING verdict keeps matching what the customer sees. A no-op when the start
+        # itself was what failed.
+        try:
+            result = await ssh_client.run(
+                f"/usr/bin/docker stop {shlex.quote(container_name)}",
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+            return getattr(result, "exit_status", 1) == 0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
 
     def _container_deleted(self, payload: ContainerDeleteRequest) -> ContainerDeleted:
         return ContainerDeleted(

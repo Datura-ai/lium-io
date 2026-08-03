@@ -840,7 +840,7 @@ def build_recovery_context(
         score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
         container_cleanup=MockContainerCleanup(),
         backend=DummyBackendClient(active=True),
-        docker=docker,
+        pod_recovery=docker,
     )
     return context_factory(
         services=services,
