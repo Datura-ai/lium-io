@@ -5018,13 +5018,13 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
-        default_extra: dict,
+        log_extra: dict[str, Any],
     ) -> str | None:
         # the volume whose stale mountpoint kept the container down, read off the container itself.
         # `docker inspect` reports mounts of a stopped container, so the real name is taken from the
         # host instead of guessed from pod_id — a pod created through the edit path carries a
-        # backend-supplied volume name that no convention derives. repair_stale_vloopback_mountpoint
-        # is what decides: it accepts a candidate only if the driver is vloopback and the stale
+        # backend-supplied volume name that no convention derives. Every mount can be offered
+        # blindly: repair_stale_vloopback_mountpoint accepts only a vloopback volume whose stale
         # mountpoint dir is present and empty.
         inspect_result = await ssh_client.run(
             f"/usr/bin/docker inspect {shlex.quote(container_name)} "
@@ -5034,14 +5034,14 @@ class DockerService:
         if getattr(inspect_result, "exit_status", 0) != 0:
             return None
 
-        for candidate in (inspect_result.stdout or "").split():
+        for candidate_volume in (inspect_result.stdout or "").split():
             repaired = await self.repair_stale_vloopback_mountpoint(
                 ssh_client,
-                candidate,
-                {**default_extra, "local_volume": candidate},
+                candidate_volume,
+                {**log_extra, "local_volume": candidate_volume},
             )
             if repaired:
-                return candidate
+                return candidate_volume
         return None
 
     async def _stop_half_recovered_container(
@@ -5055,11 +5055,11 @@ class DockerService:
         # the POD_NOT_RUNNING verdict keeps matching what the customer sees. A no-op when the start
         # itself was what failed.
         try:
-            result = await ssh_client.run(
+            stop_result = await ssh_client.run(
                 f"/usr/bin/docker stop {shlex.quote(container_name)}",
                 timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
             )
-            return getattr(result, "exit_status", 1) == 0
+            return getattr(stop_result, "exit_status", 1) == 0
         except asyncio.CancelledError:
             raise
         except Exception:
