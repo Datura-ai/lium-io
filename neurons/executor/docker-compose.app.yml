@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:14.0-alpine
+    restart: always
     healthcheck:
       test: pg_isready -U postgres || exit 1
     environment:
