@@ -1037,6 +1037,40 @@ def check_storage_limit_ability() -> tuple[bool, str]:
         return False, f"An unexpected error occurred: {e}"
 
 
+NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+
+
+def check_ncu_profiling_access() -> tuple[str, str]:
+    # Host driver flag RmProfilingAdminOnly (DAH-2182): 0 -> GPU performance counters open to every
+    # workload on the host ("unrestricted"), 1 -> admin-only ("restricted"). Anything unreadable is
+    # "unknown" and MUST stay so - the backend fails closed on it; never guess a value.
+    try:
+        with open(NVIDIA_PARAMS_PATH) as params_file:
+            params_content = params_file.read()
+    except Exception as e:
+        return "unknown", f"Cannot read {NVIDIA_PARAMS_PATH}: {e}"
+
+    match = re.search(r"^RmProfilingAdminOnly:\s*(\d+)\s*$", params_content, re.M)
+    if match is None:
+        return "unknown", "RmProfilingAdminOnly not present in nvidia driver params"
+    if match.group(1) == "0":
+        return "unrestricted", ""
+    if match.group(1) == "1":
+        return "restricted", ""
+    return "unknown", f"Unexpected RmProfilingAdminOnly value: {match.group(1)}"
+
+
+def get_host_boot_id() -> str:
+    # Reboot marker: the profiling flag only changes on a driver reload/reboot, so a changed
+    # boot_id tells the backend a stale observation may have flipped (DAH-2182).
+    try:
+        with open(BOOT_ID_PATH) as boot_id_file:
+            return boot_id_file.read().strip()
+    except Exception:
+        return ""
+
+
 def get_machine_specs():
     """Get Specs of miner machine."""
     data = {}
@@ -1151,6 +1185,12 @@ def get_machine_specs():
     data["data_storage_limit_supported"] = is_supported
     if not is_supported:
         data["data_storage_limit_scrape_error"] = log_text
+
+    profiling_access, log_text = check_ncu_profiling_access()
+    data["data_ncu_profiling_access"] = profiling_access
+    if log_text:
+        data["data_ncu_profiling_scrape_error"] = log_text
+    data["data_boot_id"] = get_host_boot_id()
 
     try:
         lscpu_output = run_cmd("lscpu")

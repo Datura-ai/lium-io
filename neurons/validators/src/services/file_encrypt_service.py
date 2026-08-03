@@ -123,6 +123,9 @@ ORIGINAL_KEYS = {
     'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
     'data_storage_limit_supported': "storage_limit_supported",
     'data_storage_limit_scrape_error': "storage_limit_scrape_error",
+    'data_ncu_profiling_access': "ncu_profiling_access",
+    'data_ncu_profiling_scrape_error': "ncu_profiling_scrape_error",
+    'data_boot_id': "boot_id",
 }
 
 
@@ -275,6 +278,11 @@ class FileEncryptService:
             'data_sysbox_runtime': "",
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
+            # DAH-2182: keep any longer key BEFORE its prefix — the replacement sweep is a naive
+            # sequential str.replace in dict order (none of these three prefix each other).
+            'data_ncu_profiling_scrape_error': "",
+            'data_ncu_profiling_access': "",
+            'data_boot_id': "",
         }
 
         # Generate dictionary key mapping on validator side
