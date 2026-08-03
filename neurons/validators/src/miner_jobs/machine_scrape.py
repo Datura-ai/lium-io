@@ -1041,24 +1041,38 @@ NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
 
-def check_ncu_profiling_access() -> tuple[str, str]:
-    # Host driver flag RmProfilingAdminOnly (DAH-2182): 0 -> GPU performance counters open to every
-    # workload on the host ("unrestricted"), 1 -> admin-only ("restricted"). Anything unreadable is
-    # "unknown" and MUST stay so - the backend fails closed on it; never guess a value.
+class NcuProfilingObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, access: str, scrape_error: str) -> None:
+        self.access = access
+        self.scrape_error = scrape_error
+
+
+def check_ncu_profiling_access() -> NcuProfilingObservation:
+    # Host driver flag RmProfilingAdminOnly: 0 -> GPU performance counters open to every workload
+    # on the host ("unrestricted"), 1 -> admin-only ("restricted"). Anything unreadable stays
+    # "unknown" - the backend fails closed on it; never guess a value.
     try:
         with open(NVIDIA_PARAMS_PATH) as params_file:
             params_content = params_file.read()
     except Exception as e:
-        return "unknown", f"Cannot read {NVIDIA_PARAMS_PATH}: {e}"
+        return NcuProfilingObservation("unknown", f"Cannot read {NVIDIA_PARAMS_PATH}: {e}")
 
     match = re.search(r"^RmProfilingAdminOnly:\s*(\d+)\s*$", params_content, re.M)
     if match is None:
-        return "unknown", "RmProfilingAdminOnly not present in nvidia driver params"
-    if match.group(1) == "0":
-        return "unrestricted", ""
-    if match.group(1) == "1":
-        return "restricted", ""
-    return "unknown", f"Unexpected RmProfilingAdminOnly value: {match.group(1)}"
+        return NcuProfilingObservation(
+            "unknown", "RmProfilingAdminOnly not present in nvidia driver params"
+        )
+
+    flag_value = match.group(1)
+    if flag_value == "0":
+        return NcuProfilingObservation("unrestricted", "")
+    if flag_value == "1":
+        return NcuProfilingObservation("restricted", "")
+    return NcuProfilingObservation(
+        "unknown", f"Unexpected RmProfilingAdminOnly value: {flag_value}"
+    )
 
 
 def get_host_boot_id() -> str:
@@ -1186,10 +1200,10 @@ def get_machine_specs():
     if not is_supported:
         data["data_storage_limit_scrape_error"] = log_text
 
-    profiling_access, log_text = check_ncu_profiling_access()
-    data["data_ncu_profiling_access"] = profiling_access
-    if log_text:
-        data["data_ncu_profiling_scrape_error"] = log_text
+    ncu_profiling = check_ncu_profiling_access()
+    data["data_ncu_profiling_access"] = ncu_profiling.access
+    if ncu_profiling.scrape_error:
+        data["data_ncu_profiling_scrape_error"] = ncu_profiling.scrape_error
     data["data_boot_id"] = get_host_boot_id()
 
     try:

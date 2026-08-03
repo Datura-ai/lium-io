@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 from datura.requests.miner_requests import ExecutorSSHInfo
-
 from neurons.validators.src.services.task.pipeline import (
     Context,
     ContextConfig,
@@ -12,6 +14,28 @@ from neurons.validators.src.services.task.pipeline import (
 )
 
 
+def _definition_name(node: ast.stmt) -> str:
+    if isinstance(node, ast.FunctionDef | ast.ClassDef):
+        return node.name
+    if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+        return node.targets[0].id
+    return ""
+
+
+def build_scrape_namespace(
+    source_path: Path, helper_names: set[str], seed_namespace: dict[str, Any]
+) -> dict[str, Any]:
+    # the named top-level definitions of a standalone script, executed in a namespace of their own
+    tree = ast.parse(source_path.read_text())
+    kept_definitions = [node for node in tree.body if _definition_name(node) in helper_names]
+    assert {_definition_name(node) for node in kept_definitions} == helper_names, (
+        f"{source_path.name} no longer defines all of {sorted(helper_names)} at module level"
+    )
+
+    namespace = dict(seed_namespace)
+    kept_module = ast.Module(body=kept_definitions, type_ignores=[])
+    exec(compile(kept_module, source_path.stem, "exec"), namespace)
+    return namespace
 
 
 class DummyScoreCalc:
