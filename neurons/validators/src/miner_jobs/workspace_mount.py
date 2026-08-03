@@ -135,6 +135,26 @@ class VolumeAccess:
             raise ValueError("Encrypted workspace commands must run inside the rental container")
         return ["-v", f"{self.volume_name}:{WORKSPACE_PATH}"]
 
+    def container_image_user(self) -> str | None:
+        """The USER the rental image declares, or None when it is root/unreadable.
+
+        Anything this class creates inside the plaintext mount runs as uid 0, so
+        callers need this to hand the result back to the renter (DAH-2534).
+        """
+        if not self.container_name:
+            return None
+        result = subprocess.run(
+            ["/usr/bin/docker", "inspect", "-f", "{{.Config.User}}", self.container_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        image_user: str = result.stdout.strip()
+        if image_user in ("", "0", "root", "0:0", "root:root"):
+            return None
+        return image_user
+
     def docker_exec_args(self, entrypoint: str, interactive: bool = False) -> list[str]:
         if not self.encrypted or not self.container_name:
             raise ValueError("docker exec requires an encrypted rental container_name")
