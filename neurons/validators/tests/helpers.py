@@ -57,6 +57,9 @@ def build_context_config(**overrides) -> ContextConfig:
 
 
 def build_services(**overrides) -> ContextServices:
+    pod_recovery = AsyncMock()
+    # A bare AsyncMock would report every pod as recovered; opt in per test instead.
+    pod_recovery.recover_pod_after_stale_vloopback_mount.return_value = False
     base = dict(
         ssh=None,
         redis=None,
@@ -69,6 +72,7 @@ def build_services(**overrides) -> ContextServices:
         score_calculator=DummyScoreCalc(),
         backend=AsyncMock(),
         container_cleanup=None,
+        pod_recovery=pod_recovery,
     )
     base.update(overrides)
     return ContextServices(**base)

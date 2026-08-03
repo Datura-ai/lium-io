@@ -54,6 +54,11 @@ async def initiate_services():
             DindProbe(DindVerifier(ioc["SSHService"])),
         ),
     )
+    ioc["DockerService"] = DockerService(
+        ssh_service=ioc["SSHService"],
+        redis_service=ioc["RedisService"],
+        attestation_service=ioc["AttestationService"],
+    )
     ioc["TaskService"] = TaskService(
         ssh_service=ioc["SSHService"],
         redis_service=ioc["RedisService"],
@@ -63,11 +68,7 @@ async def initiate_services():
         executor_connectivity_service=ioc["ExecutorConnectivityService"],
         backend_client=ioc["BackendClient"],
         attestation_service=ioc["AttestationService"],
-    )
-    ioc["DockerService"] = DockerService(
-        ssh_service=ioc["SSHService"],
-        redis_service=ioc["RedisService"],
-        attestation_service=ioc["AttestationService"],
+        pod_recovery=ioc["DockerService"],
     )
     ioc["MinerService"] = MinerService(
         ssh_service=ioc["SSHService"],

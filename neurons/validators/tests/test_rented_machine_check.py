@@ -1,5 +1,5 @@
 import json
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import asyncssh
 import pytest
@@ -10,6 +10,8 @@ from neurons.validators.src.services.task.checks.rented_machine import (
     _collect_pod_diagnostics,
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
+from neurons.validators.src.services.task.pipeline import Context
+from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
@@ -822,3 +824,188 @@ async def test_tenant_enforcement_allows_mapped_filler_with_customer_rental(cont
     assert result.event.reason_code == Msg.ALREADY_RENTED.reason
     assert result.updates["rented"] is True
     assert score_calculator.called_with["rented"] is True
+
+
+def build_recovery_context(
+    context_factory,
+    ssh: DummySSHClient,
+    docker: AsyncMock,
+    *,
+    private_key: str | None = "ssh-key",
+) -> Context:
+    rented_data = build_rented_data(
+        "executor-123",
+        {"containers": [{"name": "pod_pod-1", "pod_id": "pod-1"}], "owner_flag": False},
+    )
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=DummyBackendClient(active=True),
+        pod_recovery=docker,
+    )
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(
+            gpu_processes=[],
+            gpu_details=[],
+            gpu_model="NVIDIA RTX 4090",
+            rented_data=rented_data,
+        ),
+        ssh=ssh,
+        executor_ssh_private_key=private_key,
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_passes_when_pod_recovered_from_stale_mount(context_factory):
+    ssh = DummySSHClient(pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    docker = AsyncMock()
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.pod_running = True
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    ctx = build_recovery_context(context_factory, ssh, docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+    assert "clear_verified_job_info" not in result.updates
+    assert result.updates["ssh_pub_keys"] == ["ssh-rsa recovered"]
+    assert result.updates["default_extra"]["recovered_pods"] == ["pod_pod-1"]
+    assert docker.recover_pod_after_stale_vloopback_mount.await_args.kwargs["pod_id"] == "pod-1"
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_penalises_when_recovery_declines(context_factory):
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.return_value = False
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=False), docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_penalises_when_pod_stays_down_after_recovery(context_factory):
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.return_value = True
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=False), docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_penalises_when_recovery_raises(context_factory):
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = RuntimeError("ssh died")
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=False), docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_emits_transport_unreachable_when_recheck_loses_ssh(
+    context_factory,
+):
+    """DAH-2055 still holds on the recovery path: if the SSH transport dies during the
+    post-recovery re-check, pod state is unknown, so the miner must get
+    EXECUTOR_TRANSPORT_UNREACHABLE rather than a penalty or an uncaught exception."""
+    ssh = DummySSHClient(pod_running=False)
+    docker = AsyncMock()
+
+    async def start_pod_then_lose_transport(**kwargs):
+        ssh.raise_on_run = asyncssh.ConnectionLost("host rebooted again")
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = start_pod_then_lose_transport
+    ctx = build_recovery_context(context_factory, ssh, docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert "clear_verified_job_info" not in result.updates
+    assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_emits_transport_unreachable_when_repair_loses_ssh(
+    context_factory,
+):
+    """The vloopback repair runs over the same ctx.ssh session, so a transport death there is
+    DAH-2055 territory too: pod state is unknown and the miner must not be penalised."""
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = asyncssh.ConnectionLost(
+        "host went away mid-repair"
+    )
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=False), docker)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert "clear_verified_job_info" not in result.updates
+    assert "clear_verified_job_reason" not in result.updates
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_skips_recovery_without_private_key(context_factory):
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.return_value = True
+    ctx = build_recovery_context(
+        context_factory, DummySSHClient(pod_running=False), docker, private_key=None
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    docker.recover_pod_after_stale_vloopback_mount.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_skips_recovery_in_dry_run(context_factory):
+    # the dry run pipeline runs against live executors alongside production validation, so it must
+    # report the pod as down without rmdir'ing a host path or starting a customer's container
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.return_value = True
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=False), docker)
+
+    result = await TenantEnforcementCheck(recover_stale_pods=False).run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    docker.recover_pod_after_stale_vloopback_mount.assert_not_awaited()
+
+
+def test_dry_run_pipeline_does_not_recover_pods():
+    recovery_flags = [
+        check.recover_stale_pods
+        for check in PipelineFactory.build_dry_run_checks()
+        if type(check).__name__ == "TenantEnforcementCheck"
+    ]
+
+    assert recovery_flags == [False]
+
+
+def test_context_annotations_resolve_at_runtime():
+    # Every test above builds Context with model_construct, which skips validation and hides an
+    # annotation pydantic cannot resolve. A ContextServices field typed only under TYPE_CHECKING
+    # leaves Context unbuildable, and then every real validation cycle raises instead of running.
+    assert Context.model_rebuild(force=True) is True

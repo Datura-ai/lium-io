@@ -88,6 +88,11 @@ class Validator:
             ),
         )
 
+        self.docker_service = DockerService(
+            ssh_service=ssh_service,
+            redis_service=self.redis_service,
+            attestation_service=self.attestation_service,
+        )
         task_service = TaskService(
             ssh_service=ssh_service,
             redis_service=self.redis_service,
@@ -97,11 +102,7 @@ class Validator:
             executor_connectivity_service=self.executor_connectivity_service,
             backend_client=self.backend_client,
             attestation_service=self.attestation_service,
-        )
-        self.docker_service = DockerService(
-            ssh_service=ssh_service,
-            redis_service=self.redis_service,
-            attestation_service=self.attestation_service,
+            pod_recovery=self.docker_service,
         )
         self.miner_service = MinerService(
             ssh_service=ssh_service,

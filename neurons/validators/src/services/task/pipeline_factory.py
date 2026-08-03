@@ -64,6 +64,7 @@ from .pipeline import (
     ContextState,
     LoggerSink,
     Pipeline,
+    PodRecoverer,
 )
 from .runner import SSHCommandRunner
 from .score_calculator import calculate_scores
@@ -91,6 +92,7 @@ class PipelineFactory:
         collateral_contract_service: CollateralContractService,
         executor_connectivity_service: ExecutorConnectivityService,
         backend_client: BackendClient,
+        pod_recovery: PodRecoverer,
     ):
         """Initialize pipeline factory with required services.
 
@@ -102,6 +104,7 @@ class PipelineFactory:
             collateral_contract_service: Collateral contract service
             executor_connectivity_service: Executor connectivity service
             backend_client: Backend API client
+            pod_recovery: Docker service, for checks that repair container state
         """
         self.ssh_service = ssh_service
         self.redis_service = redis_service
@@ -111,6 +114,7 @@ class PipelineFactory:
         self.collateral_contract_service = collateral_contract_service
         self.executor_connectivity_service = executor_connectivity_service
         self.backend_client = backend_client
+        self.pod_recovery = pod_recovery
 
         dry_run = settings.DRY_RUN or settings.CONTAINER_CLEANUP_DRY_RUN
         logger.info(f"ContainerCleanup dry_run={dry_run}")
@@ -181,6 +185,7 @@ class PipelineFactory:
             verified=verified_job_info,
             settings={"version": settings.VERSION},
             encrypt_key=encrypted_files.encrypt_key,
+            executor_ssh_private_key=private_key,
             default_extra=default_extra,
             services=ContextServices(
                 ssh=self.ssh_service,
@@ -194,6 +199,7 @@ class PipelineFactory:
                 score_calculator=calculate_scores,
                 backend=self.backend_client,
                 container_cleanup=self.container_cleanup,
+                pod_recovery=self.pod_recovery,
             ),
             config=ContextConfig(
                 executor_root=executor_info.root_dir,
@@ -328,7 +334,9 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
-                TenantEnforcementCheck(),
+                # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
+                # a stale mountpoint on the host or start a customer's container (DAH-2306).
+                TenantEnforcementCheck(recover_stale_pods=False),
                 # dry_run=True: reports a ghost GPU but runs no pkill + nvidia-smi reset on the
                 # executor and leaves the shared wedge timers the production pipeline relies on.
                 GpuUsageCheck(dry_run=True),
