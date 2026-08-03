@@ -186,12 +186,6 @@ _VLOOPBACK_DRIVER_PREFIX = "vloopback"
 # Shared with core.docker_utils so exactly one helper image lands on nodes.
 _VLOOPBACK_REPAIR_IMAGE = ALPINE_HELPER_IMAGE
 _VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC = 30
-# DAH-2306: plaintext path an encrypted rental volume is remounted at when a pod is recovered after
-# a reboot. The backend's own path is recorded nowhere on the host — an encrypted volume is mounted
-# at /lium-cipher, not at its plaintext path — so recovery falls back to the same default the create
-# path uses. A rental that both encrypts its volume and asks for a non-default path comes back with
-# its data under /root.
-_RECOVERED_POD_LOCAL_VOLUME_PATH = "/root"
 _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # DAH-2475: slack kept free above a rental's requested volume before we decide the DPHN filler cache
 # has to go. Covers the image layers and scratch the pod needs beyond its own volume.
@@ -4875,7 +4869,7 @@ class DockerService:
         private_key: str,
         known_hosts_policy: asyncssh.SSHKnownHosts | None,
         container_name: str,
-        local_volume_path: str,
+        local_volume_path: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
     ) -> None:
@@ -4883,6 +4877,9 @@ class DockerService:
         # drops: the gocryptfs plaintext mount of an encrypted rental volume, and the sshd the
         # customer connects through. A failed remount raises and the caller decides how to report
         # it; a failed sshd bootstrap only warns, because the pod itself is up either way.
+        # local_volume_path=None means the caller does not know the plaintext path, which is only
+        # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
+        # leave the customer's real path an ordinary container dir, writing plaintext to the host.
         pkey = asyncssh.import_private_key(private_key)
         async with self.rental_docker_client_factory.connect(
             executor_info=executor_info,
@@ -4906,6 +4903,11 @@ class DockerService:
                     container_name,
                 )
                 if encrypted_volume_name:
+                    if local_volume_path is None:
+                        raise RuntimeError(
+                            f"{container_name} holds an encrypted volume but no plaintext path "
+                            "was supplied; refusing to remount it at a guessed path"
+                        )
                     await self.setup_encrypted_local_volume(
                         ssh_client=ssh_client,
                         container_name=container_name,
@@ -4960,11 +4962,31 @@ class DockerService:
             return False
 
         log_extra = {**default_extra, "container_name": container_name}
-        repaired_volume = await self._repair_stale_mountpoint_of_container_volume(
-            ssh_client,
-            container_name,
-            log_extra,
-        )
+        try:
+            if await self._holds_encrypted_local_volume(ssh_client, container_name):
+                logger.warning(
+                    _m(
+                        "POD_STALE_MOUNT_RECOVERY_SKIPPED_ENCRYPTED_VOLUME",
+                        extra=get_extra_info(log_extra),
+                    )
+                )
+                return False
+            repaired_volume = await self._repair_stale_mountpoint_of_container_volume(
+                ssh_client,
+                container_name,
+                log_extra,
+            )
+        except TimeoutError:
+            # a command that did not finish in time is not a dead SSH transport: report it here so
+            # the check keeps its POD_NOT_RUNNING verdict instead of turning it into
+            # EXECUTOR_TRANSPORT_UNREACHABLE and dropping the penalty.
+            logger.warning(
+                _m(
+                    "POD_STALE_MOUNT_RECOVERY_TIMED_OUT",
+                    extra=get_extra_info(log_extra),
+                )
+            )
+            return False
         if not repaired_volume:
             logger.warning(
                 _m(
@@ -4987,7 +5009,7 @@ class DockerService:
                 private_key=private_key,
                 known_hosts_policy=known_hosts_policy,
                 container_name=container_name,
-                local_volume_path=_RECOVERED_POD_LOCAL_VOLUME_PATH,
+                local_volume_path=None,
                 pod_id=pod_id,
                 default_extra=log_extra,
             )
@@ -5013,6 +5035,27 @@ class DockerService:
             _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
         )
         return True
+
+    async def _holds_encrypted_local_volume(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+    ) -> bool:
+        # whether the pod's rental volume is gocryptfs-encrypted, which recovery has to refuse.
+        # An encrypted volume is mounted as the ciphertext at /lium-cipher and the plaintext path
+        # the customer actually uses comes from the create request, which is recorded nowhere on
+        # the host and is not in the backend's rental-active response either. Remounting at the
+        # /root default would silently turn a custom path into an ordinary container dir, so
+        # writes to it would land unencrypted on the miner's disk. Fails closed: an inspect that
+        # does not answer counts as encrypted, and the miner keeps the POD_NOT_RUNNING verdict.
+        inspect_result = await ssh_client.run(
+            f"/usr/bin/docker inspect {shlex.quote(container_name)} "
+            '--format \'{{range .Mounts}}{{println .Destination}}{{end}}\'',
+            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+        )
+        if getattr(inspect_result, "exit_status", 0) != 0:
+            return True
+        return _LIUM_CIPHER_MOUNT in (inspect_result.stdout or "").split()
 
     async def _repair_stale_mountpoint_of_container_volume(
         self,

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from uuid import uuid4, UUID
 from datetime import datetime
 
+import asyncssh
 from docker.errors import APIError
 import pytest
 import pytest_asyncio
@@ -5680,9 +5681,24 @@ _STALE_MOUNT_ERROR = (
 )
 
 
-def _recovery_ssh_client(volume_names: str = "volume_pod-1\n") -> AsyncMock:
+def _asyncssh_timeout_error() -> asyncssh.TimeoutError:
+    # what ssh_client.run(timeout=...) raises: it subclasses both asyncssh.Error and OSError, so
+    # every caller that treats those two as "transport died" also swallows a plain command timeout.
+    return asyncssh.TimeoutError(None, None, None, None, None, None, "", "")
+
+
+def _recovery_ssh_client(
+    volume_names: str = "volume_pod-1\n",
+    mount_destinations: str = "/root\n",
+) -> AsyncMock:
+    # the recovery path inspects the container twice: once for where its volumes are mounted
+    # (an encrypted pod shows /lium-cipher) and once for their names.
+    async def run(command, *_args, **_kwargs):
+        stdout = mount_destinations if ".Destination" in command else volume_names
+        return _make_ssh_command_result(stdout=stdout)
+
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=volume_names))
+    ssh_client.run = AsyncMock(side_effect=run)
     return ssh_client
 
 
@@ -5755,7 +5771,61 @@ async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
     start_kwargs = start_existing_container.await_args.kwargs
     assert start_kwargs["container_name"] == "pod_pod-1"
     assert start_kwargs["pod_id"] == "pod-1"
-    assert start_kwargs["local_volume_path"] == "/root"
+    # recovery does not know the pod's plaintext path, and an unencrypted pod does not need one
+    assert start_kwargs["local_volume_path"] is None
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_an_encrypted_volume(docker_service, monkeypatch):
+    # the plaintext path of an encrypted volume is recorded nowhere on the host, and remounting
+    # gocryptfs at the /root default would write a custom path out in the clear
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client
+    )
+
+    assert recovered is False
+    repair_mountpoint.assert_not_awaited()
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_when_the_container_inspect_fails(docker_service, monkeypatch):
+    # an inspect that does not answer cannot rule out an encrypted volume, so recovery stands down
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout="", exit_status=1))
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client
+    )
+
+    assert recovered is False
+    repair_mountpoint.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_when_a_repair_command_times_out(docker_service, monkeypatch):
+    # a timed-out command must not surface as a dead SSH transport: the check has to keep its
+    # POD_NOT_RUNNING verdict instead of turning it into EXECUTOR_TRANSPORT_UNREACHABLE
+    monkeypatch.setattr(
+        docker_service,
+        "repair_stale_vloopback_mountpoint",
+        AsyncMock(side_effect=_asyncssh_timeout_error()),
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    recovered = await _attempt_stale_mount_recovery(docker_service, _STALE_MOUNT_ERROR)
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
 
 
 @pytest.mark.asyncio

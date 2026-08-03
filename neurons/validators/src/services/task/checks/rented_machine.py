@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import asyncssh
@@ -83,6 +84,16 @@ def _gpu_usage_violation_details(
     }
 
 
+@dataclass
+class _DownedPodOutcome:
+    """What the check does with a rented pod that was found not running."""
+
+    # None means the pod is up again and the loop moves on to the next pod.
+    failure: CheckResult | None
+    # keys of the recovered container, reported instead of the ones read before it went down.
+    ssh_pub_keys: list[str]
+
+
 class TenantEnforcementCheck:
     """Handle the specialised flow when the executor is already rented to a tenant.
 
@@ -93,6 +104,11 @@ class TenantEnforcementCheck:
 
     check_id = "executor.validate.rented_state"
     fatal = True
+
+    def __init__(self, recover_stale_pods: bool = True):
+        # A dry run reports a pod as down but must not touch the executor: the DAH-2306 recovery
+        # rmdirs a host path and starts a customer's container.
+        self.recover_stale_pods = recover_stale_pods
 
     async def run(self, ctx: Context) -> CheckResult:
         # NOTE: stale-container cleanup now runs earlier, in StaleContainerCleanupCheck
@@ -181,52 +197,17 @@ class TenantEnforcementCheck:
                         },
                     )
 
-                try:
-                    if await _recover_pod_after_stale_vloopback_mount(
-                        ctx, pod_container_name, pod_id, diagnostics
-                    ):
-                        # Re-read the pod, so the recovered container's own SSH keys are what gets
-                        # reported and a start that did not stick still lands on POD_NOT_RUNNING.
-                        pod_running, ssh_pub_keys = await _check_pod_running(
-                            ctx.ssh, pod_container_name
-                        )
-                except (asyncssh.Error, OSError) as exc:
-                    # Recovery adds SSH round-trips to the executor inside the DAH-2055 window, so
-                    # losing the transport here means pod state is unknown, not "pod down".
-                    return _executor_transport_unreachable_result(
-                        ctx=ctx,
-                        check_id=self.check_id,
-                        container_name=pod_container_name,
-                        pod_id=pod_id,
-                        transport_error=exc,
-                        extra=extra,
-                    )
-                if pod_running:
-                    extra.setdefault("recovered_pods", []).append(pod_container_name)
-                    continue
-
-                event = render_message(
-                    Msg.POD_NOT_RUNNING,
+                outcome = await self._recover_downed_pod(
                     ctx=ctx,
-                    check_id=self.check_id,
-                    remediation=f"Start container {pod_container_name} and ensure it stays healthy.",
-                    what={
-                        "pod_id": pod_id,
-                        "container_name": pod_container_name,
-                        "executor_uuid": ctx.executor.uuid,
-                        "diagnostics": diagnostics,
-                    },
+                    container_name=pod_container_name,
+                    pod_id=pod_id,
+                    diagnostics=diagnostics,
                     extra=extra,
                 )
-                return CheckResult(
-                    passed=False,
-                    event=event,
-                    updates={
-                        "default_extra": extra,
-                        "clear_verified_job_info": True,
-                        "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
-                    },
-                )
+                if outcome.failure:
+                    return outcome.failure
+                ssh_pub_keys = outcome.ssh_pub_keys
+                continue
 
         container_names = [pod.container_name for pod in rented_pods]
         if filler_container:
@@ -290,6 +271,72 @@ class TenantEnforcementCheck:
                 "success": True,
             },
             halt=True,
+        )
+
+    async def _recover_downed_pod(
+        self,
+        *,
+        ctx: Context,
+        container_name: str,
+        pod_id: str,
+        diagnostics: dict[str, object],
+        extra: dict[str, Any],
+    ) -> _DownedPodOutcome:
+        # a rented pod found not running: heal it when it carries the DAH-2306 reboot signature,
+        # and report POD_NOT_RUNNING only if it is still down afterwards.
+        pod_running = False
+        ssh_pub_keys: list[str] = []
+        if self.recover_stale_pods:
+            try:
+                if await _recover_pod_after_stale_vloopback_mount(
+                    ctx, container_name, pod_id, diagnostics
+                ):
+                    # Re-read the pod, so the recovered container's own SSH keys are what gets
+                    # reported and a start that did not stick still lands on POD_NOT_RUNNING.
+                    pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
+            except (asyncssh.Error, OSError) as exc:
+                # Recovery adds SSH round-trips to the executor inside the DAH-2055 window, so
+                # losing the transport here means pod state is unknown, not "pod down".
+                return _DownedPodOutcome(
+                    failure=_executor_transport_unreachable_result(
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        container_name=container_name,
+                        pod_id=pod_id,
+                        transport_error=exc,
+                        extra=extra,
+                    ),
+                    ssh_pub_keys=[],
+                )
+
+        if pod_running:
+            extra.setdefault("recovered_pods", []).append(container_name)
+            return _DownedPodOutcome(failure=None, ssh_pub_keys=ssh_pub_keys)
+
+        event = render_message(
+            Msg.POD_NOT_RUNNING,
+            ctx=ctx,
+            check_id=self.check_id,
+            remediation=f"Start container {container_name} and ensure it stays healthy.",
+            what={
+                "pod_id": pod_id,
+                "container_name": container_name,
+                "executor_uuid": ctx.executor.uuid,
+                "diagnostics": diagnostics,
+            },
+            extra=extra,
+        )
+        return _DownedPodOutcome(
+            failure=CheckResult(
+                passed=False,
+                event=event,
+                updates={
+                    "default_extra": extra,
+                    "clear_verified_job_info": True,
+                    "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
+                },
+            ),
+            ssh_pub_keys=[],
         )
 
 

@@ -11,6 +11,7 @@ from neurons.validators.src.services.task.checks.rented_machine import (
 )
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from neurons.validators.src.services.task.pipeline import Context
+from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
@@ -976,6 +977,31 @@ async def test_tenant_enforcement_skips_recovery_without_private_key(context_fac
     assert result.passed is False
     assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
     docker.recover_pod_after_stale_vloopback_mount.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_skips_recovery_in_dry_run(context_factory):
+    # the dry run pipeline runs against live executors alongside production validation, so it must
+    # report the pod as down without rmdir'ing a host path or starting a customer's container
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.return_value = True
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=False), docker)
+
+    result = await TenantEnforcementCheck(recover_stale_pods=False).run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    docker.recover_pod_after_stale_vloopback_mount.assert_not_awaited()
+
+
+def test_dry_run_pipeline_does_not_recover_pods():
+    recovery_flags = [
+        check.recover_stale_pods
+        for check in PipelineFactory.build_dry_run_checks()
+        if type(check).__name__ == "TenantEnforcementCheck"
+    ]
+
+    assert recovery_flags == [False]
 
 
 def test_context_annotations_resolve_at_runtime():

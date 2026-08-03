@@ -334,7 +334,9 @@ class PipelineFactory:
                 # Runs after PortConnectivityCheck, which overwrites ctx.state.sysbox_runtime with
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
-                TenantEnforcementCheck(),
+                # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
+                # a stale mountpoint on the host or start a customer's container (DAH-2306).
+                TenantEnforcementCheck(recover_stale_pods=False),
                 # dry_run=True: reports a ghost GPU but runs no pkill + nvidia-smi reset on the
                 # executor and leaves the shared wedge timers the production pipeline relies on.
                 GpuUsageCheck(dry_run=True),
