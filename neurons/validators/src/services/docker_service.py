@@ -30,6 +30,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    BootstrapRestoreSpec,
     CacheVolume,
     ContainerBaseRequest,
     ContainerCreated,
@@ -105,6 +106,7 @@ from services.rental_docker_sdk import (
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
+from services.storage_operations import start_storage_operation, wait_for_storage_operation
 from services.task.runner import SSHCommandRunner
 from tenacity import RetryError
 
@@ -4316,6 +4318,18 @@ class DockerService:
                                 }),
                             ),
                         )
+
+                if payload.bootstrap_restore:
+                    current_step = "bootstrap_restore"
+                    await self._run_bootstrap_restore(
+                        ssh_client=ssh_client,
+                        executor_info=executor_info,
+                        payload=payload,
+                        restore=payload.bootstrap_restore,
+                        local_volume=local_volume,
+                        local_volume_path=local_volume_path,
+                        encrypted=use_encrypted_volume,
+                    )
                 if external_volume_info:
                     current_step = "external_volume_creation"
                     sysbox_subuid_base: int | None = None
@@ -4766,6 +4780,7 @@ class DockerService:
                     profilers=profilers,
                     backup_log_id=payload.backup_log_id,
                     restore_path=payload.restore_path,
+                    restore_log_id=payload.bootstrap_restore.restore_log_id if payload.bootstrap_restore else None,
                     jupyter_url=jupyter_url,
                     warnings=warnings,
                     storage_limit_gb=effective_storage_limit_gb,
@@ -4818,6 +4833,61 @@ class DockerService:
                     else None
                 ),
             )
+
+    async def _run_bootstrap_restore(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        payload: ContainerCreateRequest,
+        restore: BootstrapRestoreSpec,
+        local_volume: str,
+        local_volume_path: str,
+        encrypted: bool,
+    ) -> None:
+        operation_id = UUID(restore.restore_log_id)
+        workspace: dict[str, object] = {
+            "mode": "encrypted_bootstrap" if encrypted else "plain_volume",
+            "volume_name": local_volume,
+            "volume_path": local_volume_path,
+            "requested_path": restore.restore_path or local_volume_path,
+        }
+        if encrypted:
+            workspace["volume_passphrase"] = VolumeKeyDeriver.from_settings(settings).material(
+                payload.pod_id
+            ).passphrase
+
+        repository: dict[str, object] = {
+            "bucket": restore.backup_volume_info.name,
+            "access_key_id": restore.backup_volume_info.iam_user_access_key,
+            "secret_access_key": restore.backup_volume_info.iam_user_secret_key,
+            "session_token": restore.backup_volume_info.session_token,
+            "password": restore.repository_password,
+        }
+        spec: dict[str, object] = {
+            "operation_id": restore.restore_log_id,
+            "pod_id": payload.pod_id,
+            "repository_pod_id": restore.repository_pod_id,
+            "action": "restore",
+            "engine": restore.backup_engine,
+            "repository": repository,
+            "workspace": workspace,
+            "snapshot_id": restore.snapshot_id,
+            "legacy_object_key": restore.legacy_object_key,
+            "legacy_object_size_bytes": restore.legacy_object_size_bytes,
+            "reporter": {
+                "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,
+                "auth_token": restore.auth_token,
+                "resource": "restore",
+            },
+        }
+        files = await start_storage_operation(
+            ssh_client,
+            executor_info.python_path,
+            operation_id,
+            spec,
+        )
+        await wait_for_storage_operation(ssh_client, files)
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
         async with self.lock:

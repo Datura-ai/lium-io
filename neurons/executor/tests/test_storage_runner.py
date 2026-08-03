@@ -7,8 +7,15 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
-
-from storage.models import OperationSpecError, OperationResultQuality, StorageOperationSpec
+from storage.models import (
+    OperationResultQuality,
+    OperationSpecError,
+    ReporterResource,
+    ReporterSpec,
+    StorageAction,
+    StorageOperationSpec,
+)
+from storage.reporting import StorageEventReporter
 from storage.restic import JsonEventWriter, ResticStorageRunner, RestoreStats
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
@@ -17,7 +24,6 @@ from storage.workspace import (
     WorkspaceResolutionError,
     WorkspaceResolver,
 )
-
 
 OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
 POD_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -436,3 +442,58 @@ def test_restore_checkpoint_emits_bounded_progress(monkeypatch: pytest.MonkeyPat
     event = json.loads(output.getvalue())
     assert event["payload"]["percent_done"] == 0.5
     assert event["payload"]["bytes_restored"] == 10 * 1024 * 1024
+
+
+class _ReporterResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, bool]:
+        return {"cancel_requested": True}
+
+
+class _ReporterSession:
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def put(self, url: str, **kwargs: object) -> _ReporterResponse:
+        self.requests.append({"url": url, **kwargs})
+        return _ReporterResponse()
+
+
+def test_reporter_preserves_zero_counters_and_receives_cancellation() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.BACKUP,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.BACKUP,
+        ),
+        session=session,
+    )
+
+    reporter.send(
+        {
+            "event": "restic",
+            "payload": {
+                "message_type": "status",
+                "percent_done": 0,
+                "total_files": 0,
+                "files_done": 0,
+                "total_bytes": 0,
+                "bytes_done": 0,
+            },
+        }
+    )
+
+    assert reporter.cancel_requested is True
+    request = session.requests[0]
+    assert request["url"] == f"https://api.example/backup-logs/{OPERATION_ID}/progress"
+    payload = request["json"]
+    assert isinstance(payload, dict)
+    assert payload["total_files"] == 0
+    assert payload["processed_files"] == 0
+    assert payload["total_bytes"] == 0
+    assert payload["processed_bytes"] == 0

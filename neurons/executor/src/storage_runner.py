@@ -4,11 +4,18 @@ import argparse
 import json
 import stat
 import sys
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 from storage.models import OperationSpecError, StorageOperationSpec
-from storage.restic import JsonEventWriter, ResticOperationError, ResticResult, ResticStorageRunner
+from storage.reporting import StorageEventReporter
+from storage.restic import (
+    JsonEventWriter,
+    ResticOperationError,
+    ResticResult,
+    ResticStorageRunner,
+    StorageOperationCancelled,
+)
 from storage.workspace import WorkspaceResolutionError, WorkspaceResolver
 
 
@@ -18,14 +25,25 @@ def main() -> int:
     try:
         payload = _load_operation(arguments.spec)
         operation = StorageOperationSpec.from_mapping(payload)
+        reporter = (
+            StorageEventReporter(operation.operation_id, operation.action, operation.reporter)
+            if operation.reporter
+            else None
+        )
         event_writer = JsonEventWriter(
             str(operation.operation_id),
             operation.progress_interval_seconds,
             operation.heartbeat_interval_seconds,
+            reporter=reporter,
         )
         workspace = WorkspaceResolver().resolve(operation)
         ResticStorageRunner(operation, workspace, event_writer=event_writer).run()
         return 0
+    except StorageOperationCancelled as error:
+        if event_writer:
+            event_writer.diagnostic(str(error))
+            event_writer.result(ResticResult("CANCELLED", None, None, 130))
+        return 130
     except (OperationSpecError, WorkspaceResolutionError, ResticOperationError, OSError) as error:
         if event_writer:
             event_writer.diagnostic(str(error))

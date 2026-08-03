@@ -3,26 +3,49 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import IO, Callable, Mapping
+from typing import IO
 
-from storage.models import OperationResultQuality, StorageAction, StorageOperationSpec
+from storage.models import (
+    OperationResultQuality,
+    StorageAction,
+    StorageEngine,
+    StorageOperationSpec,
+)
+from storage.reporting import StorageEventReporter
 from storage.workspace import (
+    DockerEncryptedVolumeWorkspace,
     DockerUserNamespaceWorkspace,
-    DockerVolumeWorkspace,
     LocalWorkspace,
     ResolvedWorkspace,
 )
-
 
 RESTORE_CHECKPOINT_PREFIX = "LIUM_RESTORE_CHECKPOINT_"
 TAR_RECORD_SIZE_BYTES = 20 * 512
 TAR_CHECKPOINT_RECORDS = 1024
 ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
+ENCRYPTED_BOOTSTRAP_SCRIPT = r'''
+set -eu
+passfile=/tmp/.lium-volume-passphrase
+umask 077
+printf '%s' "$LIUM_VOLUME_PASSPHRASE" > "$passfile"
+if [ ! -f /lium-cipher/gocryptfs.conf ]; then
+  /usr/local/bin/gocryptfs -init /lium-cipher -passfile "$passfile"
+fi
+/usr/local/bin/gocryptfs /lium-cipher /workspace -passfile "$passfile" -o allow_other -nonempty
+cleanup() {
+  /bin/fusermount3 -u /workspace >/dev/null 2>&1 || true
+  rm -f "$passfile"
+}
+trap cleanup EXIT INT TERM
+"$@"
+'''
 
 
 def _restore_pipeline_script(*, extended_metadata: bool) -> str:
@@ -38,6 +61,10 @@ def _restore_pipeline_script(*, extended_metadata: bool) -> str:
 
 
 class ResticOperationError(RuntimeError):
+    pass
+
+
+class StorageOperationCancelled(RuntimeError):
     pass
 
 
@@ -63,6 +90,7 @@ class JsonEventWriter:
         heartbeat_interval_seconds: float = 30.0,
         output: IO[str] = sys.stdout,
         clock: Callable[[], float] = time.monotonic,
+        reporter: StorageEventReporter | None = None,
     ) -> None:
         self._operation_id = operation_id
         self._progress_interval_seconds = progress_interval_seconds
@@ -71,6 +99,7 @@ class JsonEventWriter:
         self._clock = clock
         self._last_progress_at: float | None = None
         self._last_heartbeat_at = self._clock()
+        self._reporter = reporter
 
     def restic_event(self, payload: Mapping[str, object]) -> None:
         message_type = payload.get("message_type")
@@ -91,6 +120,10 @@ class JsonEventWriter:
     @property
     def heartbeat_interval_seconds(self) -> float:
         return self._heartbeat_interval_seconds
+
+    @property
+    def cancellation_requested(self) -> bool:
+        return bool(self._reporter and self._reporter.cancel_requested)
 
     def result(self, result: ResticResult) -> None:
         self._write(
@@ -114,6 +147,8 @@ class JsonEventWriter:
     def _write(self, payload: Mapping[str, object]) -> None:
         self._output.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
         self._output.flush()
+        if self._reporter:
+            self._reporter.send(payload)
 
 
 class ResticStorageRunner:
@@ -137,7 +172,8 @@ class ResticStorageRunner:
         self._environment = self._build_environment()
 
     def run(self) -> ResticResult:
-        self._ensure_repository()
+        if self._operation.engine is StorageEngine.RESTIC:
+            self._ensure_repository()
         if self._operation.action is StorageAction.BACKUP:
             result = self._backup()
         else:
@@ -178,6 +214,8 @@ class ResticStorageRunner:
             raise ResticOperationError(f"restic repository initialization failed: {detail}")
 
     def _backup(self) -> ResticResult:
+        if self._operation.engine is not StorageEngine.RESTIC:
+            raise ResticOperationError("new backups require the restic engine")
         command = [
             "backup",
             "--json",
@@ -199,6 +237,8 @@ class ResticStorageRunner:
         )
 
     def _restore(self) -> ResticResult:
+        if self._operation.engine is StorageEngine.TAR_AWS_CLI:
+            return self._restore_legacy_archive()
         snapshot_id = self._operation.snapshot_id
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
@@ -218,6 +258,30 @@ class ResticStorageRunner:
             }
         )
         return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
+
+    def _restore_legacy_archive(self) -> ResticResult:
+        object_key = self._operation.legacy_object_key
+        if not object_key:
+            raise ResticOperationError("legacy restore requires an object key")
+        restore_stats = RestoreStats(
+            total_size=self._operation.legacy_object_size_bytes or 0,
+            total_file_count=0,
+        )
+        command, cwd = self._legacy_restore_execution_command(object_key)
+        exit_code, _ = self._stream_command(command, cwd, restore_stats=restore_stats)
+        if exit_code != 0:
+            raise ResticOperationError(f"legacy restore failed with exit {exit_code}")
+        self._events.restic_event(
+            {
+                "message_type": "summary",
+                "percent_done": 1,
+                "total_files": 0,
+                "files_restored": 0,
+                "total_bytes": restore_stats.total_size,
+                "bytes_restored": restore_stats.total_size,
+            }
+        )
+        return ResticResult("COMPLETED", OperationResultQuality.FULL, None, exit_code)
 
     def _restore_stats(self, snapshot_id: str) -> RestoreStats:
         result = subprocess.run(
@@ -267,6 +331,7 @@ class ResticStorageRunner:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
         summary: Mapping[str, object] | None = None
         if process.stdout is None:
@@ -290,6 +355,7 @@ class ResticStorageRunner:
                 raw_line = output_lines.get(timeout=self._events.heartbeat_interval_seconds)
             except queue.Empty:
                 self._events.heartbeat_if_due()
+                self._cancel_if_requested(process)
                 continue
             if raw_line is None:
                 break
@@ -302,6 +368,7 @@ class ResticStorageRunner:
                     _restore_progress(checkpoint, restore_stats, time.monotonic() - started_at)
                 )
                 self._events.heartbeat_if_due()
+                self._cancel_if_requested(process)
                 continue
             try:
                 payload = json.loads(line)
@@ -313,12 +380,34 @@ class ResticStorageRunner:
                 continue
             self._events.restic_event(payload)
             self._events.heartbeat_if_due()
+            self._cancel_if_requested(process)
             if payload.get("message_type") == "summary":
                 summary = payload
 
         exit_code = process.wait()
         output_reader.join(timeout=1)
         return exit_code, summary
+
+    def _cancel_if_requested(self, process: subprocess.Popen[str]) -> None:
+        if not self._events.cancellation_requested:
+            return
+        self._stop_helper_container()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=10)
+        except ProcessLookupError:
+            pass
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        raise StorageOperationCancelled("storage operation cancellation requested")
+
+    def _stop_helper_container(self) -> None:
+        subprocess.run(
+            [self._docker_binary, "stop", "--time", "5", self._helper_container_name()],
+            capture_output=True,
+            text=True,
+        )
 
     def _execution_command(
         self,
@@ -343,6 +432,9 @@ class ResticStorageRunner:
             else:
                 namespace_command = restic_command
             return self._encrypted_helper_command(namespace_command), None
+
+        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
+            return self._encrypted_volume_helper_command(restic_command, working_directory), None
 
         volume_mode = "ro" if self._workspace.read_only else "rw"
         command = [
@@ -382,6 +474,47 @@ class ResticStorageRunner:
             return pipeline_command, None
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
             return self._encrypted_helper_command(pipeline_command), None
+        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
+            return self._encrypted_volume_helper_command(pipeline_command, False), None
+        return [
+            *self._docker_helper_base(),
+            "--security-opt",
+            "no-new-privileges",
+            "-v",
+            f"{self._workspace.volume_name}:/workspace:rw",
+            "--entrypoint",
+            "/bin/bash",
+            self._workspace.image,
+            *pipeline_command[1:],
+        ], None
+
+    def _legacy_restore_execution_command(self, object_key: str) -> tuple[list[str], str | None]:
+        pipeline_script = (
+            'mkdir -p -- "$4"; '
+            '"$1" s3 cp "s3://$2/$3" - --no-progress | '
+            'tar --extract --gzip --file - --directory "$4" --strip-components=1 '
+            '--preserve-permissions --same-owner --numeric-owner '
+            f'--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} '
+            f'--checkpoint-action=echo={RESTORE_CHECKPOINT_PREFIX}%u'
+        )
+        pipeline_command = [
+            "/bin/bash",
+            "-o",
+            "pipefail",
+            "-c",
+            pipeline_script,
+            "bash",
+            "/usr/bin/aws",
+            self._operation.repository.bucket,
+            object_key,
+            self._workspace_path(),
+        ]
+        if isinstance(self._workspace, LocalWorkspace):
+            return pipeline_command, None
+        if isinstance(self._workspace, DockerUserNamespaceWorkspace):
+            return self._encrypted_helper_command(pipeline_command), None
+        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
+            return self._encrypted_volume_helper_command(pipeline_command, False), None
         return [
             *self._docker_helper_base(),
             "--security-opt",
@@ -414,13 +547,50 @@ class ResticStorageRunner:
             *namespace_command,
         ]
 
+    def _encrypted_volume_helper_command(
+        self,
+        command: list[str],
+        working_directory: bool,
+    ) -> list[str]:
+        if not isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
+            raise ResticOperationError("encrypted volume helper requested for a different workspace")
+        wrapped_command = command
+        if working_directory:
+            wrapped_command = [
+                "/bin/sh",
+                "-c",
+                ENCRYPTED_BACKUP_SCRIPT,
+                "sh",
+                str(self._workspace.path),
+                *command,
+            ]
+        return [
+            *self._docker_helper_base(),
+            "--privileged",
+            "--security-opt",
+            "label=disable",
+            "--device",
+            "/dev/fuse:/dev/fuse",
+            "--tmpfs",
+            "/workspace:rw,nosuid,nodev,size=67108864",
+            "-v",
+            f"{self._workspace.volume_name}:/lium-cipher:rw",
+            "--entrypoint",
+            "/bin/bash",
+            self._workspace.image,
+            "-c",
+            ENCRYPTED_BOOTSTRAP_SCRIPT,
+            "bash",
+            *wrapped_command,
+        ]
+
     def _docker_helper_base(self) -> list[str]:
         return [
             self._docker_binary,
             "run",
             "--rm",
             "--name",
-            f"lium-storage-{str(self._operation.operation_id)[:12]}",
+            self._helper_container_name(),
             "--log-driver",
             "none",
             "--read-only",
@@ -440,7 +610,12 @@ class ResticStorageRunner:
             "RESTIC_PASSWORD",
             "-e",
             "RESTIC_HOST",
+            "-e",
+            "LIUM_VOLUME_PASSPHRASE",
         ]
+
+    def _helper_container_name(self) -> str:
+        return f"lium-storage-{str(self._operation.operation_id)[:12]}"
 
     def _restic_command(self, arguments: list[str]) -> list[str]:
         return [
@@ -467,11 +642,18 @@ class ResticStorageRunner:
                 "AWS_ACCESS_KEY_ID": repository.access_key_id,
                 "AWS_SECRET_ACCESS_KEY": repository.secret_access_key,
                 "AWS_DEFAULT_REGION": repository.region,
-                "RESTIC_REPOSITORY": repository.url_for_pod(self._operation.pod_id),
-                "RESTIC_PASSWORD": repository.password,
+                "RESTIC_REPOSITORY": repository.url_for_pod(self._operation.repository_pod_id),
                 "RESTIC_HOST": f"lium-pod-{self._operation.pod_id}",
             }
         )
+        if repository.password:
+            environment["RESTIC_PASSWORD"] = repository.password
+        else:
+            environment.pop("RESTIC_PASSWORD", None)
+        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
+            environment["LIUM_VOLUME_PASSPHRASE"] = self._workspace.volume_passphrase
+        else:
+            environment.pop("LIUM_VOLUME_PASSPHRASE", None)
         if repository.session_token:
             environment["AWS_SESSION_TOKEN"] = repository.session_token
         else:
@@ -484,7 +666,10 @@ class ResticStorageRunner:
             repository.access_key_id,
             repository.secret_access_key,
             repository.session_token or "",
-            repository.password,
+            repository.password or "",
+            self._workspace.volume_passphrase
+            if isinstance(self._workspace, DockerEncryptedVolumeWorkspace)
+            else "",
         )
 
 

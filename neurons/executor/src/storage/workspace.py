@@ -4,9 +4,9 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Mapping, Sequence
 
 from storage.models import StorageAction, StorageOperationSpec, WorkspaceMode
 
@@ -38,7 +38,20 @@ class DockerUserNamespaceWorkspace:
     read_only: bool
 
 
-ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace
+@dataclass(frozen=True)
+class DockerEncryptedVolumeWorkspace:
+    image: str
+    volume_name: str
+    path: PurePosixPath
+    volume_passphrase: str
+
+
+ResolvedWorkspace = (
+    LocalWorkspace
+    | DockerVolumeWorkspace
+    | DockerUserNamespaceWorkspace
+    | DockerEncryptedVolumeWorkspace
+)
 
 
 @dataclass(frozen=True)
@@ -61,7 +74,9 @@ class WorkspaceResolver:
     def resolve(self, operation: StorageOperationSpec) -> ResolvedWorkspace:
         if operation.workspace.mode is WorkspaceMode.PLAIN_VOLUME:
             return self._resolve_plain_volume(operation)
-        return self._resolve_encrypted_running(operation)
+        if operation.workspace.mode is WorkspaceMode.ENCRYPTED_RUNNING:
+            return self._resolve_encrypted_running(operation)
+        return self._resolve_encrypted_bootstrap(operation)
 
     def _resolve_plain_volume(self, operation: StorageOperationSpec) -> DockerVolumeWorkspace:
         workspace = DockerVolumeWorkspace(
@@ -117,6 +132,21 @@ class WorkspaceResolver:
             pid=identity.pid,
             path=visible_path,
             read_only=operation.action is StorageAction.BACKUP,
+        )
+
+    def _resolve_encrypted_bootstrap(self, operation: StorageOperationSpec) -> DockerEncryptedVolumeWorkspace:
+        passphrase = operation.workspace.volume_passphrase
+        if not passphrase:
+            raise WorkspaceResolutionError("encrypted bootstrap workspace is missing volume passphrase")
+        return DockerEncryptedVolumeWorkspace(
+            image=self._helper_image(),
+            volume_name=operation.workspace.volume_name,
+            path=_map_requested_path(
+                operation.workspace.requested_path,
+                operation.workspace.volume_path,
+                PurePosixPath("/workspace"),
+            ),
+            volume_passphrase=passphrase,
         )
 
     def _helper_image(self) -> str:

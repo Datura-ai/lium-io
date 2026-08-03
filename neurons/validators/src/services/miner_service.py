@@ -5,6 +5,7 @@ import os
 import shlex
 import time
 from typing import Annotated
+from uuid import UUID
 
 import aiohttp
 from asyncssh import SSHKey
@@ -32,6 +33,7 @@ from fastapi import Depends
 from clients.validator_portal_api import ValidatorPortalAPI
 from payload_models.payloads import (
     BackupContainerRequest,
+    CancelStorageOperationRequest,
     RestoreContainerRequest,
     ContainerBaseRequest,
     ContainerCreateRequest,
@@ -65,6 +67,7 @@ from services.redis_service import MACHINE_SPEC_CHANNEL, RedisService
 from services.ssh_service import SSHService
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
+from services.storage_operations import cancel_storage_operation, start_storage_operation
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,16 @@ def _get_error_details(error: Exception) -> str:
         if last_exc:
             return f"RetryError, {type(last_exc).__name__}: {str(last_exc)}"
     return f"{type(error).__name__}: {str(error)}"
+
+
+def _storage_repository_spec(volume_info, password: str | None) -> dict[str, object]:
+    return {
+        "bucket": volume_info.name,
+        "access_key_id": volume_info.iam_user_access_key,
+        "secret_access_key": volume_info.iam_user_secret_key,
+        "session_token": volume_info.session_token,
+        "password": password,
+    }
 
 
 def _parse_miner_response(response_data: dict) -> AcceptSSHKeyRequest | FailedRequest | PodLogsResponse:
@@ -1114,6 +1127,8 @@ class MinerService:
                         return await self.handle_backup_container_req(executor, payload, ssh_pkey)
                     elif isinstance(payload, RestoreContainerRequest):
                         return await self.handle_restore_container_req(executor, payload, ssh_pkey)
+                    elif isinstance(payload, CancelStorageOperationRequest):
+                        return await self.handle_cancel_storage_operation_req(executor, payload, ssh_pkey)
                     else:
                         log_text = _m(
                             "Unexpected request",
@@ -1448,6 +1463,16 @@ class MinerService:
             known_hosts=None,
         ) as ssh_client:
 
+            if payload.backup_engine == "restic":
+                operation_id = UUID(payload.backup_log_id)
+                await start_storage_operation(
+                    ssh_client,
+                    executor_info.python_path,
+                    operation_id,
+                    self._restic_backup_operation_spec(payload),
+                )
+                return
+
             remote_script_path = "/root/app/backup_storage.py"
             remote_helper_path = "/root/app/workspace_mount.py"
             local_script_path = _miner_job_script_path("backup_storage.py")
@@ -1494,6 +1519,16 @@ class MinerService:
             known_hosts=None,
         ) as ssh_client:
 
+            if payload.backup_engine == "restic":
+                operation_id = UUID(payload.restore_log_id)
+                await start_storage_operation(
+                    ssh_client,
+                    executor_info.python_path,
+                    operation_id,
+                    self._restic_restore_operation_spec(payload),
+                )
+                return
+
             remote_script_path = "/root/app/restore_storage.py"
             remote_helper_path = "/root/app/workspace_mount.py"
             local_script_path = _miner_job_script_path("restore_storage.py")
@@ -1529,6 +1564,68 @@ class MinerService:
                 timeout=50,
                 check=True,
             )
+
+    async def handle_cancel_storage_operation_req(
+        self,
+        executor_info: ExecutorSSHInfo,
+        payload: CancelStorageOperationRequest,
+        pkey: SSHKey,
+    ) -> None:
+        async with asyncssh.connect(
+            host=executor_info.address,
+            port=executor_info.ssh_port,
+            username=executor_info.ssh_username,
+            client_keys=[pkey],
+            known_hosts=None,
+        ) as ssh_client:
+            await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
+
+    @staticmethod
+    def _restic_backup_operation_spec(payload: BackupContainerRequest) -> dict[str, object]:
+        return {
+            "operation_id": payload.backup_log_id,
+            "pod_id": payload.pod_id,
+            "repository_pod_id": payload.repository_pod_id or payload.pod_id,
+            "action": "backup",
+            "engine": "restic",
+            "repository": _storage_repository_spec(payload.backup_volume_info, payload.repository_password),
+            "workspace": {
+                "mode": "encrypted_running" if payload.volume_encrypted else "plain_volume",
+                "volume_name": payload.source_volume,
+                "volume_path": payload.source_volume_path,
+                "requested_path": payload.backup_path or payload.source_volume_path,
+                "container_name": payload.container_name,
+            },
+            "reporter": {
+                "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,
+                "auth_token": payload.auth_token,
+                "resource": "backup",
+            },
+        }
+
+    @staticmethod
+    def _restic_restore_operation_spec(payload: RestoreContainerRequest) -> dict[str, object]:
+        return {
+            "operation_id": payload.restore_log_id,
+            "pod_id": payload.pod_id,
+            "repository_pod_id": payload.repository_pod_id or payload.pod_id,
+            "action": "restore",
+            "engine": "restic",
+            "snapshot_id": payload.snapshot_id,
+            "repository": _storage_repository_spec(payload.backup_volume_info, payload.repository_password),
+            "workspace": {
+                "mode": "encrypted_running" if payload.volume_encrypted else "plain_volume",
+                "volume_name": payload.target_volume,
+                "volume_path": payload.target_volume_path,
+                "requested_path": payload.restore_path or payload.target_volume_path,
+                "container_name": payload.container_name,
+            },
+            "reporter": {
+                "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,
+                "auth_token": payload.auth_token,
+                "resource": "restore",
+            },
+        }
 
     def _generate_auth_headers(self, my_key: bittensor.Keypair, miner_hotkey: str) -> dict:
         """Generate authentication headers for REST API requests.
@@ -2093,6 +2190,8 @@ class MinerService:
                     result = await self.handle_backup_container_req(executor, payload, ssh_pkey)
                 elif isinstance(payload, RestoreContainerRequest):
                     result = await self.handle_restore_container_req(executor, payload, ssh_pkey)
+                elif isinstance(payload, CancelStorageOperationRequest):
+                    result = await self.handle_cancel_storage_operation_req(executor, payload, ssh_pkey)
                 else:
                     log_text = _m(
                         "Unexpected request",

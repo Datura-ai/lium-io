@@ -1,7 +1,7 @@
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-from pathlib import Path
-import sys
 
 import pytest
 
@@ -508,3 +508,26 @@ async def test_miner_service_restore_argv_excludes_encryption_flags(monkeypatch)
     assert "--target-volume-encrypted" not in command
     assert "--container-name" not in command
     assert "--target-volume target-volume" in command
+
+
+def test_restic_backup_empty_path_targets_the_whole_volume():
+    payload = _backup_payload()
+    payload.backup_engine = "restic"
+    payload.repository_password = "repository-password"
+    payload.backup_path = ""
+
+    spec = MinerService._restic_backup_operation_spec(payload)
+
+    assert spec["workspace"]["requested_path"] == payload.source_volume_path
+
+
+def test_restic_online_restore_empty_path_targets_the_whole_volume():
+    payload = _restore_payload()
+    payload.backup_engine = "restic"
+    payload.repository_password = "repository-password"
+    payload.snapshot_id = "a" * 64
+    payload.restore_path = ""
+
+    spec = MinerService._restic_restore_operation_spec(payload)
+
+    assert spec["workspace"]["requested_path"] == payload.target_volume_path

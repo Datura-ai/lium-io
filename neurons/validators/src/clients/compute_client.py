@@ -12,6 +12,7 @@ import websockets
 from datura.requests.base import BaseRequest
 from payload_models.payloads import (
     BackupContainerRequest,
+    CancelStorageOperationRequest,
     RestoreContainerRequest,
     BaseServerRequest,
     ContainerCreateRequest,
@@ -921,3 +922,5 @@ class ComputeClient:
             await self.backup_handler.handle_backup_container_req(job_request)
         elif isinstance(job_request, RestoreContainerRequest):
             await self.backup_handler.handle_restore_container_req(job_request)
+        elif isinstance(job_request, CancelStorageOperationRequest):
+            await self.backup_handler.handle_cancel_storage_operation_req(job_request)
