@@ -498,11 +498,16 @@ class RentalDockerSdkClient:
 
     def _exec_in_container_sync(self, spec: ContainerExecSpec) -> ContainerExecResult:
         stdin_data = _encode_exec_stdin(spec.stdin)
+        # Every spec routed here is rental bootstrap writing to /root or /etc, so
+        # it must not inherit a non-root image USER (DAH-2534). Numeric uid, so no
+        # root entry in the image's /etc/passwd is required. The renter's own
+        # workload still runs as the image's USER — only these execs are pinned.
         exec_create_result = self._api_client.exec_create(
             container=spec.container_name,
             cmd=list(spec.argv),
             stdin=stdin_data is not None,
             environment=spec.environment or None,
+            user="0",
         )
         exec_id = exec_create_result["Id"]
 

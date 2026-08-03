@@ -11,6 +11,7 @@ sys.path.insert(0, str(MINER_JOBS_PATH))
 import backup_storage
 from datura.requests.miner_requests import ExecutorSSHInfo
 import restore_storage
+import workspace_mount as workspace_mount_module
 from workspace_mount import (
     VolumeAccess,
     detect_volume_access,
@@ -138,9 +139,9 @@ def test_encrypted_backup_commands_exec_inside_rental(monkeypatch):
     backup_storage.aws_cp(args, access, backup_path)
 
     assert backup_path == "/root/test"
-    assert any(command[:4] == ["/usr/bin/docker", "exec", "rental-pod", "du"] for command in run_commands)
-    assert any(command[:4] == ["/usr/bin/docker", "exec", "rental-pod", "find"] for command in popen_commands)
-    assert any(command[:4] == ["/usr/bin/docker", "exec", "rental-pod", "tar"] for command in popen_commands)
+    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "du"] for command in run_commands)
+    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "find"] for command in popen_commands)
+    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "tar"] for command in popen_commands)
 
 
 def test_encrypted_restore_commands_exec_inside_rental(monkeypatch):
@@ -171,8 +172,46 @@ def test_encrypted_restore_commands_exec_inside_rental(monkeypatch):
     restore_storage.aws_restore(args, access, restore_path)
 
     assert restore_path == "/root/test"
-    assert any(command[:4] == ["/usr/bin/docker", "exec", "rental-pod", "mkdir"] for command in run_commands)
-    assert any(command[:5] == ["/usr/bin/docker", "exec", "-i", "rental-pod", "tar"] for command in popen_commands)
+    assert any(command[:6] == ["/usr/bin/docker", "exec", "-u", "0", "rental-pod", "mkdir"] for command in run_commands)
+    assert any(command[:7] == ["/usr/bin/docker", "exec", "-u", "0", "-i", "rental-pod", "tar"] for command in popen_commands)
+
+
+def test_encrypted_restore_hands_the_target_dir_back_to_the_renter(monkeypatch):
+    # mkdir runs as uid 0 and tar --strip-components=1 drops the archive's top
+    # entry, so without an explicit chown the renter cannot write there
+    run_commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        restore_storage,
+        "run_command_args",
+        lambda command, command_label=None: run_commands.append(command),
+    )
+    monkeypatch.setattr(
+        workspace_mount_module.subprocess,
+        "run",
+        lambda command, **_: SimpleNamespace(returncode=0, stdout="renter\n", stderr=""),
+    )
+    access = VolumeAccess("vol", "/root", encrypted=True, container_name="rental-pod")
+
+    restore_storage.ensure_restore_path(_restore_args(), access, "/root/restored")
+
+    chown_commands = [command for command in run_commands if "chown" in command]
+    assert chown_commands, f"no chown issued: {run_commands}"
+    assert chown_commands[0][-2:] == ["renter", "/root/restored"]
+
+
+def test_unreadable_image_user_fails_the_restore_instead_of_skipping_chown(monkeypatch):
+    # returning None here would look exactly like a root image and silently skip
+    # the hand-back, leaving the renter with an unwritable restore target
+    monkeypatch.setattr(
+        workspace_mount_module.subprocess,
+        "run",
+        lambda command, **_: SimpleNamespace(returncode=1, stdout="", stderr="no such container"),
+    )
+    access = VolumeAccess("vol", "/root", encrypted=True, container_name="rental-pod")
+
+    with pytest.raises(RuntimeError, match="Could not read the image USER"):
+        access.container_image_user()
 
 
 def test_require_container_running_fails_when_stopped(monkeypatch):

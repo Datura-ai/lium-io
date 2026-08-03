@@ -192,6 +192,17 @@ def ensure_restore_path(args, volume_access: VolumeAccess, restore_path: str):
     ]
     run_command_args(command, command_label="docker run mkdir restore target")
 
+    # The mkdir above runs as uid 0, and `tar --strip-components=1` drops the
+    # archive's top-level entry, so nothing else ever gives this directory back
+    # to a non-root renter (DAH-2534). Not recursive: the extracted members keep
+    # the ownership tar restored for them.
+    image_user: str | None = volume_access.container_image_user() if volume_access.encrypted else None
+    if image_user:
+        run_command_args(
+            workspace_command(args, volume_access, "chown") + [image_user, restore_path],
+            command_label="docker exec chown restore target",
+        )
+
 
 def aws_restore(args, volume_access: VolumeAccess, restore_path: str):
     # aws s3 cp s3://$BUCKET_NAME/backups/my-folder-2025-09-02.tar.gz - \

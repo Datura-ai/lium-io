@@ -422,8 +422,9 @@ async def _check_pod_running(ssh_client, container_name: str) -> tuple[bool, lis
         pod_running = False
 
     try:
+        # Literal path, not ~: injection writes this exact file (DAH-2534).
         keys_result = await ssh_client.run(
-            DockerCommand.exec_command(container_name, 'cat ~/.ssh/authorized_keys')
+            DockerCommand.exec_command(container_name, "cat /root/.ssh/authorized_keys")
         )
         ssh_keys = keys_result.stdout.strip().split("\n") if keys_result.stdout else []
     except (asyncssh.Error, OSError):
