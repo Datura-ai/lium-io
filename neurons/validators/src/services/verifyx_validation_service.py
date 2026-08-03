@@ -181,6 +181,7 @@ class VerifyXValidationService:
                     "storage_min_available_gb": settings.verifyx.STORAGE_MIN_AVAILABLE_GB,
                     "storage_throughput_test_gb": settings.verifyx.STORAGE_THROUGHPUT_TEST_GB,
                     "network_timeout_seconds": settings.verifyx.NETWORK_TIMEOUT_SECONDS,
+                    "enable_xet_challenge": settings.verifyx.ENABLE_XET_CHALLENGE,
                 },
             }
 
@@ -406,6 +407,61 @@ def _verify_storage_test(challenge_data: dict, response_data: dict) -> Tuple[dic
     return stats, errors
 
 
+def _verify_xet_test(challenge_data: dict, response_data: dict) -> Tuple[dict, List[str]]:
+    xet_challenge = challenge_data.get("xet_challenge") or {}
+    xet_execution = response_data.get("xet_execution") or {}
+    expected_download = xet_challenge.get("download") or {}
+
+    if not expected_download.get("url"):
+        return {
+            "status": "skipped",
+            "success": True,
+            "bytes_downloaded": 0,
+            "speed_mbps": 0.0,
+            "elapsed_ms": 0,
+            "token_fetch_ms": 0,
+            "hash": "",
+        }, []
+
+    status = xet_execution.get("status", "failed")
+    success = bool(xet_execution.get("success"))
+    speed_mbps = xet_execution.get("speed_mbps", 0.0)
+    errors: List[str] = []
+
+    if status == "failed":
+        errors.append(f"Xet execution failed: {xet_execution.get('error', 'Unknown error')}")
+        success = False
+    elif speed_mbps < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
+        errors.append(
+            f"Xet download speed inadequate: {speed_mbps:.2f} Mbps achieved, "
+            f"{settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:.0f} Mbps required"
+        )
+        success = False
+
+    if xet_execution.get("pkg") != expected_download.get("pkg"):
+        errors.append(f"Resource validation failed: {xet_execution.get('pkg', '')}")
+        success = False
+
+    if xet_execution.get("bytes_downloaded", 0) != expected_download.get("size", 0):
+        errors.append(f"Size validation failed for {xet_execution.get('pkg', '')}")
+        success = False
+
+    if xet_execution.get("hash") != expected_download.get("hash"):
+        errors.append(f"Integrity check failed for {xet_execution.get('pkg', '')}")
+        success = False
+
+    return {
+        "status": status,
+        "success": success,
+        "bytes_downloaded": xet_execution.get("bytes_downloaded", 0),
+        "speed_mbps": speed_mbps,
+        "elapsed_ms": xet_execution.get("elapsed_ms", 0),
+        "token_fetch_ms": xet_execution.get("token_fetch_ms", 0),
+        "hash": xet_execution.get("hash", ""),
+        "error": xet_execution.get("error"),
+    }, errors
+
+
 def _perform_verification_checks(payload: dict) -> Dict[str, Any]:
     challenge_data = payload["challenge_data"]
     response_data = payload["response_data"]
@@ -415,24 +471,41 @@ def _perform_verification_checks(payload: dict) -> Dict[str, Any]:
     storage_stats, storage_errors = _verify_storage_test(challenge_data, response_data)
     all_errors = network_errors + memory_errors + storage_errors
 
-    # Determine which checks are required
     required_checks = [
         memory_stats["success"],
     ]
 
-    # Conditionally include network validation based on feature flag
     if settings.FEATURE_FLAGS.get(FeatureFlag.VERIFYX_NETWORK_VALIDATION, False):
         required_checks.append(network_stats["success"])
 
     if not settings.debug.SKIP_STORAGE_CHECK:
         required_checks.append(storage_stats["success"])
 
-    success = all(required_checks)
-
-    return {
-        "success": success,
+    result = {
+        "success": all(required_checks),
         "network": network_stats,
         "hard_disk": storage_stats,
         "ram": memory_stats,
         "errors": all_errors,
     }
+
+    if "xet_execution" in response_data:
+        xet_stats, xet_errors = _verify_xet_test(challenge_data, response_data)
+        log_extra = {
+            "xet_status": xet_stats.get("status"),
+            "xet_success": xet_stats.get("success"),
+            "xet_bytes_downloaded": xet_stats.get("bytes_downloaded"),
+            "xet_speed_mbps": xet_stats.get("speed_mbps"),
+            "xet_elapsed_ms": xet_stats.get("elapsed_ms"),
+            "xet_token_fetch_ms": xet_stats.get("token_fetch_ms"),
+            "xet_hash": xet_stats.get("hash"),
+            "xet_error": xet_stats.get("error"),
+            "xet_errors": xet_errors,
+        }
+        if xet_stats.get("success"):
+            logger.info(_m("VerifyX Xet execution passed", extra=get_extra_info(log_extra)))
+        else:
+            logger.warning(_m("VerifyX Xet execution failed", extra=get_extra_info(log_extra)))
+        result["xet"] = xet_stats
+
+    return result
