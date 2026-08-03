@@ -17,6 +17,7 @@ import socket
 from pathlib import Path
 
 import pytest
+from neurons.validators.tests.helpers import build_scrape_namespace
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -31,26 +32,14 @@ DISK_HELPERS = {
 }
 
 
-def _definition_name(node: ast.stmt) -> str:
-    if isinstance(node, ast.FunctionDef | ast.ClassDef):
-        return node.name
-    if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
-        return node.targets[0].id
-    return ""
-
-
 @pytest.fixture
 def scrape() -> dict:
     """The disk helpers, executed in a namespace of their own."""
-    tree = ast.parse((SRC / "miner_jobs" / "machine_scrape.py").read_text())
-    kept = [node for node in tree.body if _definition_name(node) in DISK_HELPERS]
-    assert {_definition_name(node) for node in kept} == DISK_HELPERS, (
-        f"machine_scrape.py no longer defines all of {sorted(DISK_HELPERS)} at module level"
+    return build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        DISK_HELPERS,
+        {"glob": glob, "http": http, "json": json, "os": os, "socket": socket},
     )
-
-    namespace = {"glob": glob, "http": http, "json": json, "os": os, "socket": socket}
-    exec(compile(ast.Module(body=kept, type_ignores=[]), "machine_scrape_disk", "exec"), namespace)
-    return namespace
 
 
 def _stub_docker_api(scrape: dict, responses: dict) -> None:

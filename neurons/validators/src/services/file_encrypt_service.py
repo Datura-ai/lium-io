@@ -123,6 +123,9 @@ ORIGINAL_KEYS = {
     'data_sysbox_runtime_scrape_error': "sysbox_runtime_scrape_error",
     'data_storage_limit_supported': "storage_limit_supported",
     'data_storage_limit_scrape_error': "storage_limit_scrape_error",
+    'data_ncu_profiling_access': "ncu_profiling_access",
+    'data_ncu_profiling_scrape_error': "ncu_profiling_scrape_error",
+    'data_boot_id': "boot_id",
 }
 
 
@@ -184,6 +187,8 @@ class FileEncryptService:
         return "_" + "".join(random.choices(string.ascii_letters, k=length))
 
     def generate_key_mappings(self):
+        # Order is load-bearing: ecrypt_miner_job_files() substitutes these keys with a sequential
+        # str.replace in dict order, so no key may be a strict prefix of a LATER one.
         all_keys = {
             "gpu.name": "",
             "gpu.uuid": "",
@@ -275,6 +280,9 @@ class FileEncryptService:
             'data_sysbox_runtime': "",
             'data_storage_limit_scrape_error': "",
             'data_storage_limit_supported': "",
+            'data_ncu_profiling_scrape_error': "",
+            'data_ncu_profiling_access': "",
+            'data_boot_id': "",
         }
 
         # Generate dictionary key mapping on validator side
