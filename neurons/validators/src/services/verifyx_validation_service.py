@@ -366,8 +366,12 @@ def _verify_network_test(challenge_data: dict, response_data: dict) -> Tuple[dic
         errors.append(f"Integrity check failed for {download_result['pkg']}")
         success = False
 
-    download_speed = network_execution["download"]["speed_mbps"]
-    upload_speed = network_execution.get("speedtest", {}).get("upload_mbps")
+    speedtest: dict = network_execution.get("speedtest", {})
+    # The package download exists to check integrity and runs on one connection; the speedtest
+    # goes parallel above a gigabit, so it is the honest number for a fast link. Keep the
+    # package speed as the fallback for executors still on an older verifyx.
+    download_speed: float = speedtest.get("download_mbps") or network_execution["download"]["speed_mbps"]
+    upload_speed: float | None = speedtest.get("upload_mbps")
 
     if download_speed < settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS:
         errors.append(
