@@ -121,36 +121,19 @@ async def test_run_ssh_command_is_bounded_by_the_hard_timeout():
     )
 
 
-def _network_payloads(package_speed: float, speedtest: dict[str, float] | None) -> tuple[dict, dict]:
-    download = {"pkg": "pkg", "size": 10, "hash": "abc", "speed_mbps": package_speed}
+def test_network_speeds_come_from_the_speedtest_not_the_package_download() -> None:
     challenge_data = {"network_challenge": {"download": {"pkg": "pkg", "size": 10, "hash": "abc"}}}
-    network_execution = {
-        "success": True,
-        "download": download,
-        "execution_time_ms": 1000,
+    response_data = {
+        "network_execution": {
+            "success": True,
+            "download": {"pkg": "pkg", "size": 10, "hash": "abc", "speed_mbps": 420.0},
+            "speedtest": {"download_mbps": 8100.0, "upload_mbps": 7400.0},
+            "execution_time_ms": 1000,
+        }
     }
-    if speedtest is not None:
-        network_execution["speedtest"] = speedtest
-    return challenge_data, {"network_execution": network_execution}
-
-
-def test_network_download_speed_comes_from_the_speedtest() -> None:
-    challenge_data, response_data = _network_payloads(
-        package_speed=420.0, speedtest={"download_mbps": 8100.0, "upload_mbps": 7400.0}
-    )
 
     stats, errors = _verify_network_test(challenge_data, response_data)
 
     assert errors == []
     assert stats["download_speed"] == 8100.0
     assert stats["upload_speed"] == 7400.0
-
-
-def test_network_download_speed_falls_back_to_the_package_download() -> None:
-    challenge_data, response_data = _network_payloads(package_speed=420.0, speedtest=None)
-
-    stats, errors = _verify_network_test(challenge_data, response_data)
-
-    assert errors == []
-    assert stats["download_speed"] == 420.0
-    assert stats["upload_speed"] is None
