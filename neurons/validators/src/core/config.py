@@ -368,10 +368,13 @@ class Settings(BaseSettings):
     
     ENABLE_VOLUME_ENCRYPTION: bool = Field(env="ENABLE_VOLUME_ENCRYPTION", default=True)
     VOLUME_MASTER_SECRET: str | None = Field(env="VOLUME_MASTER_SECRET", default=None)
-    # DAH-2545 kill switch: reviving a pod whose volume is encrypted touches customer data on an
-    # untrusted host, so it has to be switchable without waiting for a rollout. Off means encrypted
-    # pods keep the pre-DAH-2545 behaviour — skipped, and the miner keeps the POD_NOT_RUNNING verdict.
-    RECOVER_ENCRYPTED_VOLUMES: bool = Field(env="RECOVER_ENCRYPTED_VOLUMES", default=True)
+    # DAH-2545 switch, off until the plaintext window is closed. A restarted container runs its own
+    # entrypoint and startup_commands before gocryptfs can be mounted into it, so writes to the
+    # plaintext path in that window land unencrypted in the container's upper layer on the miner's
+    # disk. The same window exists on the pod-creation path today; until it is closed for both,
+    # encrypted pods keep the pre-DAH-2545 behaviour — skipped, and the miner keeps the
+    # POD_NOT_RUNNING verdict.
+    RECOVER_ENCRYPTED_VOLUMES: bool = Field(env="RECOVER_ENCRYPTED_VOLUMES", default=False)
 
     DEPLOY_ENV: Literal["PROD", "LOCAL", "STAGE"] = Field(env="DEPLOY_ENV", default="PROD")
 

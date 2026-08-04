@@ -198,9 +198,10 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
-# a plaintext mount path we are willing to act on: absolute, normalised, not the root itself and
-# never the ciphertext mount. Anything else is refused rather than chmod-ed or mounted over.
-_PLAINTEXT_PATH_RE = re.compile(r"^(/[A-Za-z0-9._-]+)+$")
+# a plaintext mount path we are willing to act on: absolute, no "." or ".." segment, not the root
+# itself and never the ciphertext mount. The path comes from a customer-authored template, where
+# the backend only requires a leading slash, so it is refused here rather than mounted over.
+_PLAINTEXT_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
 
 
 class _VolumeEncryptionState(enum.Enum):
@@ -5101,11 +5102,6 @@ class DockerService:
                         )
                     )
                     return False
-                # local_volume_path is validated by _can_remount_encrypted_volume above
-                if not await self._seal_plaintext_dir_before_start(
-                    ssh_client, container_name, local_volume_path or "", log_extra
-                ):
-                    return False
             repaired_volume = await self._repair_stale_mountpoint_of_container_volume(
                 ssh_client,
                 container_name,
@@ -5149,6 +5145,15 @@ class DockerService:
                 default_extra=log_extra,
             )
         except asyncio.CancelledError:
+            # the whole check runs under an outer timeout, so a cancellation can land between
+            # `docker start` and the gocryptfs remount and leave the container up with its
+            # plaintext path unmounted — exactly the state the Exception branch below stops. The
+            # stop is shielded because an unshielded await in a cancelled task never runs; the
+            # cancellation itself still propagates.
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(
+                    self._stop_half_recovered_container(ssh_client, container_name)
+                )
             raise
         except Exception as exc:
             container_stopped = await self._stop_half_recovered_container(
@@ -5169,53 +5174,6 @@ class DockerService:
         logger.info(
             _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
         )
-        return True
-
-    async def _seal_plaintext_dir_before_start(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        container_name: str,
-        plaintext_path: str,
-        log_extra: dict[str, Any],
-    ) -> bool:
-        # make the plaintext dir unwritable on the host BEFORE the container starts, so nothing the
-        # pod runs on its own — startup_commands, an image that brings up its own sshd, a customer
-        # session — can write there in the window between `docker start` and the gocryptfs mount.
-        # Those writes would land in the container's upper layer, which is the miner's disk, and
-        # gocryptfs mounts with -nonempty, so they would then be shadowed: invisible to the
-        # customer, readable by the miner, forever. The mount lands on top and the mode of the
-        # directory underneath stops mattering; if the mount never happens, the dir stays sealed,
-        # which is the safe end state.
-        upper_dir_result = await ssh_client.run(
-            f"/usr/bin/docker inspect {shlex.quote(container_name)} "
-            "--format '{{.GraphDriver.Data.UpperDir}}'",
-            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
-        )
-        upper_dir = (upper_dir_result.stdout or "").strip()
-        if getattr(upper_dir_result, "exit_status", 0) != 0 or not _PLAINTEXT_PATH_RE.fullmatch(
-            upper_dir
-        ):
-            logger.warning(
-                _m(
-                    "POD_STALE_MOUNT_RECOVERY_SEAL_FAILED",
-                    extra=get_extra_info({**log_extra, "reason": "upper_dir_unavailable"}),
-                )
-            )
-            return False
-
-        sealed_dir = f"{upper_dir}{plaintext_path}"
-        seal_result = await ssh_client.run(
-            f"mkdir -p {shlex.quote(sealed_dir)} && chmod 000 {shlex.quote(sealed_dir)}",
-            timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
-        )
-        if getattr(seal_result, "exit_status", 0) != 0:
-            logger.warning(
-                _m(
-                    "POD_STALE_MOUNT_RECOVERY_SEAL_FAILED",
-                    extra=get_extra_info({**log_extra, "reason": "chmod_failed"}),
-                )
-            )
-            return False
         return True
 
     def _can_remount_encrypted_volume(self, local_volume_path: str | None) -> bool:
