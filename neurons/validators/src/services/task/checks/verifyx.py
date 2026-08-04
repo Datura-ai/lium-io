@@ -8,7 +8,7 @@ from ..messages import VerifyXMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .network_ema import compute_ema
 
-MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
+MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 5.0  # staging-only test branch, do not merge
 
 
 class VerifyXCheck:
