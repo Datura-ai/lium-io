@@ -50,7 +50,7 @@ from pydantic import BaseModel, Field
 from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
-    from incentive.rental_price import InsufficientDisk
+    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability
     from services.task_service import JobResult
 
 
@@ -326,19 +326,23 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_flagship_without_ncu_or_split(result: JobResult) -> MinerLogLine:
+    def no_payout_because_flagship_without_ncu_or_split(
+        result: JobResult, missing: MissingFlagshipCapability
+    ) -> MinerLogLine:
         return MinerLogLine._no_payout(
             result,
             reason=ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
             message=(
                 f"No unrented incentive: an idle {result.gpu_count}x {result.gpu_model} must offer "
-                "NCU profiling or GPU splitting. Open the host profiling counters "
-                "(NVreg_RestrictProfilingToAdminUsers=0, then reboot) or enable GPU splitting "
-                "with a minimum GPU count below the full node in the Miner Portal, "
+                "NCU profiling or GPU splitting. Either open the host profiling counters "
+                "(NVreg_RestrictProfilingToAdminUsers=0, then reboot), which also makes the node "
+                "rentable only as a whole host, or set a minimum GPU count below the full node in "
+                "the Miner Portal on a host that supports docker storage limits, "
                 "or rent it out to earn."
             ),
             extra_fields={
-                "ncu_profiling_access": (result.spec or {}).get("ncu_profiling_access"),
+                "ncu_profiling_access": missing.ncu_profiling_access,
+                "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
                 "supports_gpu_splitting": result.supports_gpu_splitting,
                 "gpu_splitting_min_count": result.gpu_splitting_min_count,
             },

@@ -8,6 +8,7 @@ ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT; while the flag is off the breach is
 only logged (shadow mode) and the payout is unchanged.
 """
 
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -23,6 +24,9 @@ B200 = "NVIDIA B200"
 B300 = "NVIDIA B300 SXM6 AC"
 H100 = "NVIDIA H100 80GB HBM3"
 
+# a scrape carrying no NCU observation at all: a machine not re-scraped since DAH-2182 shipped
+SCRAPE_WITHOUT_NCU: dict[str, str] = {}
+
 
 def _build_incentive() -> RentalPriceIncentive:
     return RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
@@ -32,20 +36,12 @@ def _make_job(
     *,
     gpu_model: str = H200,
     gpu_count: int = 8,
-    ncu_profiling_access: str | None = None,
+    # spec=None models the spec-less synthetic JobResult the estimate path builds
+    spec: dict[str, str] | None = SCRAPE_WITHOUT_NCU,
     supports_gpu_splitting: bool = False,
     gpu_splitting_min_count: int | None = None,
     is_rented: bool = False,
-    no_scrape: bool = False,
 ) -> JobResult:
-    # ncu_profiling_access=None models a scrape without the key (machine not re-scraped yet);
-    # no_scrape=True models the spec-less synthetic JobResult the estimate path builds
-    if no_scrape:
-        spec = None
-    elif ncu_profiling_access is None:
-        spec = {}
-    else:
-        spec = {"ncu_profiling_access": ncu_profiling_access}
     return JobResult(
         executor_info=ExecutorSSHInfo(
             uuid="exec-1",
@@ -74,13 +70,13 @@ def _make_job(
 
 
 @pytest.mark.parametrize(
-    "job_kwargs, lacks",
+    "job_kwargs, is_missing",
     [
         ({}, True),  # neither capability
-        ({"no_scrape": True}, False),  # spec-less synthetic/estimate result: fail open
-        ({"ncu_profiling_access": "unrestricted"}, False),
-        ({"ncu_profiling_access": "restricted"}, True),
-        ({"ncu_profiling_access": "unknown"}, True),
+        ({"spec": None}, False),  # spec-less synthetic/estimate result: fail open
+        ({"spec": {"ncu_profiling_access": "unrestricted"}}, False),
+        ({"spec": {"ncu_profiling_access": "restricted"}}, True),
+        ({"spec": {"ncu_profiling_access": "unknown"}}, True),
         ({"supports_gpu_splitting": True, "gpu_splitting_min_count": 1}, False),
         # min equal to the node size is whole-host-only in practice, not real splitting
         ({"supports_gpu_splitting": True, "gpu_splitting_min_count": 8}, True),
@@ -93,17 +89,17 @@ def _make_job(
         ({"gpu_count": 4}, False),  # only full 8x nodes are gated
     ],
 )
-def test_lacks_flagship_capability(job_kwargs, lacks):
+def test_missing_flagship_capability(job_kwargs, is_missing):
     # Arrange
     incentive = _build_incentive()
     job = _make_job(**job_kwargs)
     base_model = incentive.get_base_model_for_gpu(job.gpu_model)
 
     # Act
-    result = incentive._lacks_flagship_capability(job, base_model)
+    missing = incentive._missing_flagship_capability(job, base_model)
 
     # Assert
-    assert result is lacks
+    assert (missing is not None) is is_missing
 
 
 def test_enforcement_defaults_to_shadow_mode():
@@ -127,6 +123,36 @@ async def test_shadow_mode_keeps_rental_eligibility(monkeypatch):
     # Assert — still eligible for the unrented rental pool, nothing told to the miner
     assert result.eligible_for_rental_share is True
     assert "flagship_without_ncu_or_split" not in "\n".join(result.incentive_logs)
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_emits_the_capability_log(monkeypatch, caplog):
+    # The shadow log is the whole deliverable of the first deploy: the rollout decision is
+    # made from these fields, and the scrape error is what separates a failed probe from a
+    # provider who deliberately left the counters closed.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", False)
+    incentive = _build_incentive()
+
+    with caplog.at_level(logging.INFO):
+        await incentive.calculate_executor_score(
+            _make_job(
+                spec={
+                    "ncu_profiling_access": "unknown",
+                    "ncu_profiling_scrape_error": "Cannot read /proc/driver/nvidia/params",
+                }
+            )
+        )
+
+    breach = next(
+        record.msg
+        for record in caplog.records
+        if record.msg.extra.get("reason") == "flagship_without_ncu_or_split"
+    )
+    assert "shadow only - flag off" in breach.message
+    assert breach.extra["ncu_profiling_access"] == "unknown"
+    assert breach.extra["ncu_profiling_scrape_error"] == "Cannot read /proc/driver/nvidia/params"
+    assert breach.extra["enforced"] is False
+    assert breach.extra["pool"] == "rental_kept_shadow"
 
 
 @pytest.mark.asyncio
@@ -156,19 +182,20 @@ async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
     assert "flagship_without_ncu_or_split" in log
     assert "NCU profiling" in log
     assert "GPU splitting" in log
+    assert [reason.reason for reason in result.zero_incentive_reasons] == [
+        "flagship_without_ncu_or_split"
+    ]
 
 
 @pytest.mark.parametrize(
     "job_kwargs, expect_eligible",
     [
-        ({"ncu_profiling_access": "unrestricted"}, True),
-        ({"supports_gpu_splitting": True, "gpu_splitting_min_count": 1}, True),
+        ({"spec": {"ncu_profiling_access": "unrestricted"}}, True),
         # min equal to the node size (a live prod case: a B200 at min=8) is whole-host-only
         ({"supports_gpu_splitting": True, "gpu_splitting_min_count": 8}, False),
-        ({"gpu_model": H100}, True),  # not a flagship model
         # estimate_executor feeds spec-less synthetic results through the same scoring
         # path every cycle; the gate must fail open on those (DAH-2520 precedent)
-        ({"no_scrape": True}, True),
+        ({"spec": None}, True),
     ],
 )
 @pytest.mark.asyncio

@@ -7,7 +7,7 @@ fields, and that a line actually lands in JobResult.incentive_logs.
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
-from incentive.rental_price import InsufficientDisk
+from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability
 from services.task_service import JobResult
 
 H200 = "NVIDIA H200"
@@ -114,7 +114,12 @@ def _job(**overrides) -> JobResult:
             "sysbox",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(job),
+            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+                job,
+                MissingFlagshipCapability(
+                    ncu_profiling_access="restricted", ncu_profiling_scrape_error=None
+                ),
+            ),
             "flagship_without_ncu_or_split",
             "NCU profiling",
         ),
