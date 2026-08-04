@@ -43,6 +43,14 @@ SOFT_LIMIT_PRICE_RATE = 1.1
 # incentive but stays active.
 MIN_DISK_TO_VRAM_RATE = 1.5
 
+# DAH-2546 — flagship capability gate. An unrented 8x machine of these base models must
+# have NCU profiling counters open on the host or real GPU splitting enabled to earn the
+# unrented incentive; with neither it forfeits the incentive but stays active.
+FLAGSHIP_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300"})
+FLAGSHIP_CAPABILITY_GPU_COUNT = 8
+# Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
+NCU_PROFILING_UNRESTRICTED = "unrestricted"
+
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
@@ -52,6 +60,14 @@ class InsufficientDisk(BaseModel):
     vram_gb: float
     disk_gb: float
     rate: float  # required disk-to-VRAM margin the machine failed to clear
+
+
+class MissingFlagshipCapability(BaseModel):
+    """What the scrape reported about NCU profiling on a flagship machine that offers neither
+    open profiling counters nor real GPU splitting. Sole owner of these scrape keys."""
+
+    ncu_profiling_access: str | None  # None = the scrape carries no observation at all
+    ncu_profiling_scrape_error: str | None  # set when the probe could not read the driver params
 
 
 # ── Snapshot models ──────────────────────────────────────────────────────────
@@ -289,6 +305,57 @@ class RentalPriceIncentive(DefaultIncentive):
                     "min_disk_to_vram_rate": measured.rate,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _missing_flagship_capability(
+        self, result: JobResult, base_model: str
+    ) -> MissingFlagshipCapability | None:
+        # None also when the machine is out of the gate's scope: not an 8x flagship, or unscraped
+        if result.gpu_count != FLAGSHIP_CAPABILITY_GPU_COUNT:
+            return None
+        if base_model not in FLAGSHIP_CAPABILITY_BASE_MODELS:
+            return None
+        if result.spec is None:
+            # no scrape at all: a synthetic or estimated job result, nothing to measure
+            return None
+        ncu_profiling_access = result.spec.get("ncu_profiling_access")
+        # min_gpu_count equal to the node size is whole-host-only in practice (rent_executor
+        # rejects smaller requests), so it does not count as splitting
+        has_real_splitting: bool = bool(
+            result.supports_gpu_splitting
+            and result.gpu_splitting_min_count
+            and result.gpu_splitting_min_count < result.gpu_count
+        )
+        if ncu_profiling_access == NCU_PROFILING_UNRESTRICTED or has_real_splitting:
+            return None
+        return MissingFlagshipCapability(
+            ncu_profiling_access=ncu_profiling_access,
+            ncu_profiling_scrape_error=result.spec.get("ncu_profiling_scrape_error"),
+        )
+
+    def _log_flagship_capability_limit(
+        self, result: JobResult, missing: MissingFlagshipCapability
+    ) -> None:
+        # structured log for every rental-eligible 8x flagship executor lacking both capabilities
+        enforced = settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT
+        logger.info(
+            _m(
+                "Unrented flagship executor has neither NCU profiling nor GPU splitting"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "ncu_profiling_access": missing.ncu_profiling_access,
+                    # tells a shadow report apart: probe failed vs provider left counters closed
+                    "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
+                    "supports_gpu_splitting": result.supports_gpu_splitting,
+                    "gpu_splitting_min_count": result.gpu_splitting_min_count,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -577,6 +644,21 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
                     job_result, insufficient_disk
+                )
+                job_result.record_incentive_log(reason)
+
+        # DAH-2546 flagship capability gate; shadow-only while the flag is off
+        missing_capability = (
+            self._missing_flagship_capability(job_result, base_model)
+            if eligible_for_rental_share
+            else None
+        )
+        if missing_capability is not None:
+            self._log_flagship_capability_limit(job_result, missing_capability)
+            if settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+                    job_result, missing_capability
                 )
                 job_result.record_incentive_log(reason)
 

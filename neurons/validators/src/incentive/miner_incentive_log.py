@@ -9,6 +9,7 @@ WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
 HOW A NODE PICKS A POOL:
   rented?                                              -> mining pool (always earns)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
+       AND (not flagship-8x OR NCU/split offered)
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
@@ -23,6 +24,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
      total disk below 1.5x total GPU VRAM (add disk to earn),
+     8x H200/B200/B300 with neither NCU profiling nor GPU splitting (offer either to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
@@ -48,7 +50,7 @@ from pydantic import BaseModel, Field
 from core.utils import _m, _StructuredMessage, get_extra_info
 
 if TYPE_CHECKING:
-    from incentive.rental_price import InsufficientDisk
+    from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability
     from services.task_service import JobResult
 
 
@@ -71,6 +73,7 @@ class ZeroIncentiveReason(StrEnum):
     NVIDIA_DRIVER_BELOW_MINIMUM = "nvidia_driver_below_minimum"
     INSUFFICIENT_DISK_FOR_VRAM = "insufficient_disk_for_vram"
     SYSBOX_NOT_ENABLED = "sysbox_not_enabled"
+    FLAGSHIP_WITHOUT_NCU_OR_SPLIT = "flagship_without_ncu_or_split"
 
 
 class IncentiveReason(BaseModel):
@@ -320,6 +323,29 @@ class MinerLogLine(BaseModel):
                 "required for unrented incentive. Enable sysbox on this executor to earn."
             ),
             extra_fields={"sysbox_runtime": result.sysbox_runtime},
+        )
+
+    @staticmethod
+    def no_payout_because_flagship_without_ncu_or_split(
+        result: JobResult, missing: MissingFlagshipCapability
+    ) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
+            message=(
+                f"No unrented incentive: an idle {result.gpu_count}x {result.gpu_model} must offer "
+                "NCU profiling or GPU splitting. Either open the host profiling counters "
+                "(NVreg_RestrictProfilingToAdminUsers=0, then reboot), which also makes the node "
+                "rentable only as a whole host, or set a minimum GPU count below the full node in "
+                "the Miner Portal on a host that supports docker storage limits, "
+                "or rent it out to earn."
+            ),
+            extra_fields={
+                "ncu_profiling_access": missing.ncu_profiling_access,
+                "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
+                "supports_gpu_splitting": result.supports_gpu_splitting,
+                "gpu_splitting_min_count": result.gpu_splitting_min_count,
+            },
         )
 
     # ── Calculation reports: the per-cycle lines every scored node gets ───────
