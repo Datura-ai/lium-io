@@ -2491,6 +2491,9 @@ async def test_start_container_remounts_when_container_state_is_encrypted(docker
             "executor_ssh_username": "root",
             "executor_ssh_port": 2200,
         },
+        # an existing container's volume was initialised at create time: a missing gocryptfs.conf
+        # here means the ciphertext is gone, and re-initialising would hide that
+        allow_init=False,
     )
 
 
@@ -5690,11 +5693,20 @@ def _asyncssh_timeout_error() -> asyncssh.TimeoutError:
 def _recovery_ssh_client(
     volume_names: str = "volume_pod-1\n",
     mount_destinations: str = "/root\n",
+    upper_dir: str = "/var/lib/docker/overlay2/abc123/diff",
 ) -> AsyncMock:
-    # the recovery path inspects the container twice: once for where its volumes are mounted
-    # (an encrypted pod shows /lium-cipher) and once for their names.
+    # the recovery path inspects the container for where its volumes are mounted (an encrypted pod
+    # shows /lium-cipher), for their names, and — for an encrypted pod — for the upper layer whose
+    # plaintext dir is sealed before the start.
     async def run(command, *_args, **_kwargs):
-        stdout = mount_destinations if ".Destination" in command else volume_names
+        if ".Destination" in command:
+            stdout = mount_destinations
+        elif ".GraphDriver.Data.UpperDir" in command:
+            stdout = f"{upper_dir}\n"
+        elif command.startswith("mkdir -p"):
+            stdout = ""
+        else:
+            stdout = volume_names
         return _make_ssh_command_result(stdout=stdout)
 
     ssh_client = AsyncMock()
@@ -5840,11 +5852,25 @@ async def test_recover_pod_remounts_an_encrypted_volume_at_the_path_the_backend_
     )
     repair_mountpoint = AsyncMock(return_value=True)
     monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
-    start_existing_container = AsyncMock()
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    def seal_commands() -> list[str]:
+        return [
+            call.args[0]
+            for call in ssh_client.run.await_args_list
+            if call.args[0].startswith("mkdir -p")
+        ]
+
+    sealed_before_start = False
+
+    async def record_seal_state(**_kwargs):
+        nonlocal sealed_before_start
+        sealed_before_start = bool(seal_commands())
+
+    start_existing_container = AsyncMock(side_effect=record_seal_state)
     monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
     monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
-    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
 
     recovered = await _attempt_stale_mount_recovery(
         docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
@@ -5852,6 +5878,153 @@ async def test_recover_pod_remounts_an_encrypted_volume_at_the_path_the_backend_
 
     assert recovered is True
     assert start_existing_container.await_args.kwargs["local_volume_path"] == "/workspace"
+    # the plaintext dir is sealed on the host BEFORE the container is started, so nothing the pod
+    # runs on its own can write there in the window before gocryptfs is mounted
+    assert sealed_before_start is True
+    assert seal_commands() == [
+        "mkdir -p /var/lib/docker/overlay2/abc123/diff/workspace "
+        "&& chmod 000 /var/lib/docker/overlay2/abc123/diff/workspace"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_an_encrypted_volume_when_the_kill_switch_is_off(
+    docker_service, monkeypatch
+):
+    monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", False)
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "local_volume_path",
+    [
+        pytest.param("/lium-cipher", id="the_ciphertext_mount_itself"),
+        pytest.param("/workspace/../../etc", id="path_escaping_upwards"),
+        pytest.param("relative/path", id="not_absolute"),
+        pytest.param("/", id="root"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recover_pod_declines_an_unusable_plaintext_path(
+    docker_service, monkeypatch, local_volume_path
+):
+    # the path is chmod-ed on the host and then mounted over; a path that is not a plain absolute
+    # directory under the container's upper layer must never reach either operation
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, local_volume_path
+    )
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_when_the_volume_state_cannot_be_read(
+    docker_service, monkeypatch
+):
+    # an inspect that does not answer leaves us unable to tell an encrypted pod from a plain one:
+    # starting it on the strength of a path we cannot match to a volume is not safe
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout="", exit_status=1))
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_does_not_start_when_the_plaintext_dir_cannot_be_sealed(
+    docker_service, monkeypatch
+):
+    # without the seal there is an unguarded window between start and mount, so a failed seal has
+    # to stop the recovery rather than proceed without it
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+
+    async def run(command, *_args, **_kwargs):
+        if ".Destination" in command:
+            return _make_ssh_command_result(stdout="/lium-cipher\n")
+        if ".GraphDriver.Data.UpperDir" in command:
+            return _make_ssh_command_result(stdout="", exit_status=1)
+        return _make_ssh_command_result(stdout="volume_pod-1\n")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is False
+    start_existing_container.assert_not_awaited()
+
+
+def test_gocryptfs_script_refuses_to_reinitialise_on_recovery():
+    # a missing gocryptfs.conf on an existing rental means the ciphertext is gone; re-initialising
+    # would hand the customer an empty volume and log the recovery as a success
+    script = docker_service_module._build_gocryptfs_setup_and_mount_script(
+        "/workspace",
+        pad_hex="00",
+        wrapped_hex="00",
+        pad_var="_a",
+        wrapped_var="_b",
+        passfile_path="/tmp/pf",
+        allow_init=False,
+    )
+
+    assert "gocryptfs -init" not in script
+    assert "exit 1" in script
+
+
+def test_gocryptfs_script_still_initialises_at_create_time():
+    script = docker_service_module._build_gocryptfs_setup_and_mount_script(
+        "/workspace",
+        pad_hex="00",
+        wrapped_hex="00",
+        pad_var="_a",
+        wrapped_var="_b",
+        passfile_path="/tmp/pf",
+    )
+
+    assert "gocryptfs -init /lium-cipher" in script
 
 
 @pytest.mark.asyncio
