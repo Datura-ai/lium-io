@@ -296,8 +296,9 @@ class TenantEnforcementCheck:
                     # Re-read the pod, so the recovered container's own SSH keys are what gets
                     # reported and a start that did not stick still lands on POD_NOT_RUNNING.
                     pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
-                    if pod_running:
-                        await _report_host_reboot_recovery(ctx, pod_id, diagnostics)
+                    container_finished_at = diagnostics.get("container_finished_at")
+                    if pod_running and isinstance(container_finished_at, str):
+                        await _report_host_reboot_recovery(ctx, pod_id, container_finished_at)
             except (asyncssh.Error, OSError) as exc:
                 # Recovery adds SSH round-trips to the executor inside the DAH-2055 window, so
                 # losing the transport here means pod state is unknown, not "pod down".
@@ -374,13 +375,13 @@ def _executor_transport_unreachable_result(
 async def _report_host_reboot_recovery(
     ctx: Context,
     pod_id: str,
-    diagnostics: dict[str, object],
+    container_finished_at: str | None,
 ) -> None:
     # DAH-2545: tell the backend the pod is back, so the renter can be told their pod went down
     # because the provider's host restarted. Never fatal: the rental has already been saved by the
     # time this runs, and a backend that is down or too old must not turn that into a failure.
-    container_finished_at = diagnostics.get("container_finished_at")
-    if not isinstance(container_finished_at, str) or not container_finished_at:
+    # An unknown exit time is nothing to report: it is the key the backend deduplicates on.
+    if not container_finished_at:
         return
     try:
         await ctx.services.backend.report_pod_host_reboot_recovered(

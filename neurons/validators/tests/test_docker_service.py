@@ -5915,7 +5915,7 @@ async def test_recover_pod_declines_an_unusable_plaintext_path(
     monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
     ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
 
-    assert docker_service._can_remount_encrypted_volume(local_volume_path) is False
+    assert docker_service_module._can_remount_encrypted_volume(local_volume_path) is False
 
     recovered = await _attempt_stale_mount_recovery(
         docker_service, _STALE_MOUNT_ERROR, ssh_client, local_volume_path
@@ -5933,9 +5933,7 @@ async def test_recover_pod_declines_an_unusable_plaintext_path(
         pytest.param("/data.v2/my-vol_1", id="punctuation_that_is_still_a_plain_name"),
     ],
 )
-def test_a_plain_absolute_plaintext_path_is_accepted(
-    docker_service, monkeypatch, local_volume_path
-):
+def test_a_plain_absolute_plaintext_path_is_accepted(monkeypatch, local_volume_path):
     monkeypatch.setattr(docker_service_module.settings, "RECOVER_ENCRYPTED_VOLUMES", True)
     monkeypatch.setattr(
         docker_service_module.settings,
@@ -5943,7 +5941,7 @@ def test_a_plain_absolute_plaintext_path_is_accepted(
         "test-master-secret-32-chars-long!!",
     )
 
-    assert docker_service._can_remount_encrypted_volume(local_volume_path) is True
+    assert docker_service_module._can_remount_encrypted_volume(local_volume_path) is True
 
 
 @pytest.mark.asyncio

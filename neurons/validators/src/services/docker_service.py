@@ -198,9 +198,8 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
-# a plaintext mount path we are willing to act on: absolute, no "." or ".." segment, not the root
-# itself and never the ciphertext mount. The path comes from a customer-authored template, where
-# the backend only requires a leading slash, so it is refused here rather than mounted over.
+# the path comes from a customer-authored template and the backend only requires a leading slash,
+# so anything that is not a plain absolute path is refused here rather than mounted over
 _PLAINTEXT_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
 
 
@@ -208,6 +207,8 @@ class _VolumeEncryptionState(enum.Enum):
     ENCRYPTED = "encrypted"
     PLAIN = "plain"
     UNKNOWN = "unknown"
+
+
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
 HOST_KEY_REQUIRED_EXTRA = {
@@ -455,14 +456,28 @@ def _xor_wrap_passphrase(passphrase: str) -> tuple[str, str]:
     return pad.hex(), wrapped.hex()
 
 
-def _is_under_cipher_mount(path: str) -> bool:
-    # whether a plaintext path collides with the ciphertext mount. A descendant is as unusable as
-    # the mount itself: mounting the plaintext view inside the ciphertext it is decrypting is not
-    # something recovery should attempt on customer data.
-    return path == _LIUM_CIPHER_MOUNT or path.startswith(f"{_LIUM_CIPHER_MOUNT}/")
+def _can_remount_encrypted_volume(local_volume_path: str | None) -> bool:
+    # whether recovery has everything it needs to put a gocryptfs volume back the way the customer
+    # had it. Checked before the container is started, because the remount only happens after
+    # `docker start`: a missing piece would leave the pod flapping up and down once a cycle.
+    # VOLUME_MASTER_SECRET must be the one the volume was created with — another validator's secret
+    # derives a passphrase that simply will not mount. A plaintext path at or under the ciphertext
+    # mount is refused as well: mounting the plaintext view inside the ciphertext it is decrypting
+    # is not something recovery should attempt on customer data.
+    if not (
+        settings.RECOVER_ENCRYPTED_VOLUMES
+        and settings.VOLUME_MASTER_SECRET
+        and local_volume_path
+    ):
+        return False
+    if local_volume_path == _LIUM_CIPHER_MOUNT or local_volume_path.startswith(
+        f"{_LIUM_CIPHER_MOUNT}/"
+    ):
+        return False
+    return _PLAINTEXT_PATH_RE.fullmatch(local_volume_path) is not None
 
 
-def _gocryptfs_missing_config_branch(allow_init: bool) -> str:
+def _shell_branch_when_gocryptfs_config_missing(allow_init: bool) -> str:
     if allow_init:
         return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"'
     return (
@@ -482,10 +497,11 @@ def _build_gocryptfs_setup_and_mount_script(
     passfile_path: str,
     allow_init: bool = True,
 ) -> str:
-    # allow_init=False belongs to recovery: a pod that is being revived already had its volume
-    # initialised, so a missing gocryptfs.conf means the ciphertext is gone. Re-initialising it
-    # there would hand the customer an empty volume, log the recovery as a success and spare the
-    # miner the penalty for data they destroyed.
+    # allow_init=False belongs to every start of a container that already exists — stale-mount
+    # recovery and the backend's own start_container alike: such a volume was initialised at create
+    # time, so a missing gocryptfs.conf means the ciphertext is gone. Re-initialising it there would
+    # hand the customer an empty volume, report the start as a success and spare the miner the
+    # penalty for data they destroyed. Only pod creation initialises.
     plaintext = shlex.quote(plaintext_path)
     passfile = shlex.quote(passfile_path)
     mount_check = (
@@ -514,7 +530,7 @@ chmod 600 "$_pf"
 unset _esc _x _y {pad_var} {wrapped_var}
 mkdir -p {_LIUM_CIPHER_MOUNT} {plaintext}
 if [ ! -f {_LIUM_CIPHER_MOUNT}/gocryptfs.conf ]; then
-{_gocryptfs_missing_config_branch(allow_init)}
+{_shell_branch_when_gocryptfs_config_missing(allow_init)}
 fi
 if ! {mount_check}; then
   gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
@@ -5006,7 +5022,6 @@ class DockerService:
         # A falsy local_volume_path means the caller does not know the plaintext path, which is only
         # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
         # leave the customer's real path an ordinary container dir, writing plaintext to the host.
-        # An empty string counts as unknown for the same reason a missing value does.
         pkey = asyncssh.import_private_key(private_key)
         async with self.rental_docker_client_factory.connect(
             executor_info=executor_info,
@@ -5095,20 +5110,20 @@ class DockerService:
             encryption_state = await self._local_volume_encryption_state(
                 ssh_client, container_name
             )
-            if encryption_state is not _VolumeEncryptionState.PLAIN:
-                if encryption_state is _VolumeEncryptionState.UNKNOWN or not (
-                    self._can_remount_encrypted_volume(local_volume_path)
-                ):
-                    logger.warning(
-                        _m(
-                            "POD_STALE_MOUNT_RECOVERY_SKIPPED_ENCRYPTED_VOLUME",
-                            extra=get_extra_info({
-                                **log_extra,
-                                "volume_encryption_state": encryption_state.value,
-                            }),
-                        )
+            if encryption_state is _VolumeEncryptionState.UNKNOWN or (
+                encryption_state is _VolumeEncryptionState.ENCRYPTED
+                and not _can_remount_encrypted_volume(local_volume_path)
+            ):
+                logger.warning(
+                    _m(
+                        "POD_STALE_MOUNT_RECOVERY_SKIPPED_ENCRYPTED_VOLUME",
+                        extra=get_extra_info({
+                            **log_extra,
+                            "volume_encryption_state": encryption_state.value,
+                        }),
                     )
-                    return False
+                )
+                return False
             repaired_volume = await self._repair_stale_mountpoint_of_container_volume(
                 ssh_client,
                 container_name,
@@ -5182,20 +5197,6 @@ class DockerService:
             _m("POD_STALE_MOUNT_RECOVERED", extra=get_extra_info(log_extra))
         )
         return True
-
-    def _can_remount_encrypted_volume(self, local_volume_path: str | None) -> bool:
-        # whether recovery has everything it needs to put a gocryptfs volume back the way the
-        # customer had it. All three are checked before the container is started, because the
-        # remount only happens after `docker start`: a missing one would leave the pod flapping
-        # up and down once a cycle. VOLUME_MASTER_SECRET must be the one the volume was created
-        # with — another validator's secret derives a passphrase that simply will not mount.
-        return (
-            settings.RECOVER_ENCRYPTED_VOLUMES
-            and bool(local_volume_path)
-            and bool(_PLAINTEXT_PATH_RE.fullmatch(local_volume_path or ""))
-            and not _is_under_cipher_mount(local_volume_path or "")
-            and bool(settings.VOLUME_MASTER_SECRET)
-        )
 
     async def _local_volume_encryption_state(
         self,
