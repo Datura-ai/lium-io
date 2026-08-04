@@ -64,6 +64,8 @@ class JobResult(BaseModel):
     hourly_rate: float | None = None                  # Hourly rate for the executor in this cycle for scoring logic
     max_cap: int | None = None                        # Max cap for GPU counts in this cycle for scoring logic
     count_bucket: int | None = None                    # gpu_count_bucket the executor is accounted against; 0 = aggregate-cap path
+    bucket_reassigned_from: int | None = None          # DAH-2528: gpu_count bucket the executor left because it was over cap
+    bucket_reassigned_from_multiplier: float | None = None  # source bucket's cap multiplier at reassignment time
     total_unrented_by_gpu_type: float | None = None          # Weighted GPU count for the executor in this cycle for scoring logic
     cap_dilution_applied: bool | None = None           # Whether the cap dilution is applied for the executor in this cycle for scoring logic
     eligible_for_rental_share: bool = False
@@ -128,6 +130,8 @@ class JobResult(BaseModel):
                 "effective_rate": self.effective_rate,
                 "total_rental_cost": self.total_rental_cost,
                 "count_bucket": self.count_bucket,
+                "bucket_reassigned_from": self.bucket_reassigned_from,
+                "bucket_reassigned_from_multiplier": self.bucket_reassigned_from_multiplier,
                 "max_cap": self.max_cap,
                 "total_unrented_by_gpu_type": self.total_unrented_by_gpu_type,
                 "cap_dilution_applied": self.cap_dilution_applied,

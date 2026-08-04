@@ -2457,8 +2457,12 @@ async def test_pcc_case5_single_8xB200_full_payout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pcc_8xB200_split_prefers_8_bucket(monkeypatch):
-    """8×B200 splitting + min_count=1 should land in the 8× bucket (configured)
-    instead of being forced into the 1× bucket and diluting its subsidy.
+    """8×B200 splitting + min_count=1 lands in the 8× bucket when it has a cap.
+
+    With the default caps the solo node fills the 8× bucket exactly to cap
+    (multiplier 1.0), so the DAH-2528 occupancy-aware fallback must NOT move it
+    either — reassignment only triggers when the source bucket is strictly over
+    cap (see the test_pcc_2528_* cases).
     """
     config = _make_pcc_config()
     jobs = {
@@ -2908,3 +2912,239 @@ async def test_rental_price_miner_default_job_unrented_earns_nothing(
     # The miner's own job must not dilute the legitimate unrented bucket (only plain + lium_job count)
     assert lium_job.total_unrented_by_gpu_type == 16
     assert plain.total_unrented_by_gpu_type == 16
+
+
+# ── DAH-2528: occupancy-aware bucket fallback for split-capable idle nodes ────
+
+PCC_2528_CAPS = {**PCC_PER_COUNT_CAPS, "B200": {1: 10, 8: 8}}
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_split_node_falls_back_when_8_bucket_over_cap(monkeypatch):
+    """The 8× bucket is over cap and the 1× tier is empty: the split-capable node
+    moves whole into the 1× tier at full multiplier; non-splitting siblings stay
+    diluted, and the source bucket's multiplier improves by the freed GPUs.
+    """
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+        "miner_c": [_make_pcc_job("exec-c", "NVIDIA B200", 8)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    # Mover: whole node (8 GPUs) rated against the 1× tier at full weight.
+    mover = jobs["miner_a"][0]
+    assert mover.count_bucket == 1
+    assert mover.max_cap == 10
+    assert mover.bucket_reassigned_from == 8
+    assert mover.bucket_reassigned_from_multiplier == pytest.approx(8 / 24)
+    assert mover.unrented_cap_multiplier == pytest.approx(1.0)
+    assert mover.effective_rate == pytest.approx(PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+    assert mover.cap_dilution_applied is False
+    assert any("unrented_bucket_reassigned" in line for line in mover.incentive_logs)
+
+    # Bucket fills after the move: 1× holds the mover, 8× keeps the two others.
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 8
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 16
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    assert incentive.cap_multiplier_by_bucket[("B200", 8)] == pytest.approx(0.5)
+
+    # Non-splitting siblings stay in the 8× bucket, diluted, and are never reassigned.
+    for hk in ("miner_b", "miner_c"):
+        stayer = jobs[hk][0]
+        assert stayer.count_bucket == 8
+        assert stayer.bucket_reassigned_from is None
+        assert stayer.effective_rate == pytest.approx(0.5 * PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+        assert not any("unrented_bucket_reassigned" in line for line in stayer.incentive_logs)
+
+    # Snapshot persists the post-move fills, so estimates see the same state.
+    by_bucket = incentive.get_snapshot().rental.by_bucket
+    assert by_bucket["B200·1"].unrented_count == 8
+    assert by_bucket["B200·1"].cap_multiplier == pytest.approx(1.0)
+    assert by_bucket["B200·8"].unrented_count == 16
+    assert by_bucket["B200·8"].cap_multiplier == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_no_move_when_whole_node_does_not_fit_target(monkeypatch):
+    """Strict admission: the whole node must fit under the target cap. With 3 native
+    1× nodes already in the tier (cap 10), an 8-GPU candidate would make 11 — it
+    stays in its over-cap 8× bucket and the 1× incumbents keep full weight.
+    """
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+        "miner_c": [
+            _make_pcc_job("exec-c1", "NVIDIA B200", 1),
+            _make_pcc_job("exec-c2", "NVIDIA B200", 1),
+            _make_pcc_job("exec-c3", "NVIDIA B200", 1),
+        ],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    candidate = jobs["miner_a"][0]
+    assert candidate.count_bucket == 8
+    assert candidate.bucket_reassigned_from is None
+    assert candidate.effective_rate == pytest.approx(0.5 * PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+    assert not any("unrented_bucket_reassigned" in line for line in candidate.incentive_logs)
+
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 3
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 16
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    assert incentive.cap_multiplier_by_bucket[("B200", 8)] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_greedy_stops_when_source_no_longer_over_cap(monkeypatch):
+    """Two split-capable 8× nodes over an 8-GPU cap: the lowest-uuid one moves,
+    which brings the source back to cap, so the second stays — and both end at
+    full multiplier. Rerunning an identical fleet reproduces the same assignment.
+    """
+    def make_jobs():
+        return {
+            "miner_a": [_make_pcc_job(
+                "exec-a", "NVIDIA B200", 8,
+                supports_gpu_splitting=True, gpu_splitting_min_count=1,
+            )],
+            "miner_b": [_make_pcc_job(
+                "exec-b", "NVIDIA B200", 8,
+                supports_gpu_splitting=True, gpu_splitting_min_count=1,
+            )],
+        }
+
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = make_jobs()
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    mover, stayer = jobs["miner_a"][0], jobs["miner_b"][0]
+    assert mover.count_bucket == 1
+    assert mover.bucket_reassigned_from == 8
+    assert stayer.count_bucket == 8
+    assert stayer.bucket_reassigned_from is None
+    # After the move both buckets sit exactly at (or under) cap: nobody is diluted.
+    assert mover.unrented_cap_multiplier == pytest.approx(1.0)
+    assert stayer.unrented_cap_multiplier == pytest.approx(1.0)
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 8
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 8
+
+    # Determinism: an identical fleet produces identical bucket assignments.
+    jobs_rerun = make_jobs()
+    await _run_pcc_incentive(config, jobs_rerun, monkeypatch)
+    for hk in jobs:
+        assert jobs_rerun[hk][0].count_bucket == jobs[hk][0].count_bucket
+        assert jobs_rerun[hk][0].bucket_reassigned_from == jobs[hk][0].bucket_reassigned_from
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_no_move_when_source_at_cap(monkeypatch):
+    """Reassignment needs a strictly over-cap source: a bucket exactly at cap pays
+    full weight already, so the split-capable node stays put.
+    """
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    result = jobs["miner_a"][0]
+    assert result.count_bucket == 8
+    assert result.bucket_reassigned_from is None
+    assert result.unrented_cap_multiplier == pytest.approx(1.0)
+    assert ("B200", 1) not in incentive.unrented_count_by_bucket
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_move_lands_exactly_at_target_cap_with_incumbents(monkeypatch):
+    """A move that fills the target exactly to cap is admitted, and the native 1×
+    incumbents keep full weight — the newcomer never dilutes them.
+    """
+    config = _make_pcc_config(caps=PCC_2528_CAPS)
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+        "miner_c": [
+            _make_pcc_job("exec-c1", "NVIDIA B200", 1),
+            _make_pcc_job("exec-c2", "NVIDIA B200", 1),
+        ],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    mover = jobs["miner_a"][0]
+    assert mover.count_bucket == 1
+    assert mover.bucket_reassigned_from == 8
+    # 2 incumbents + 8 = 10 == cap: admitted, everyone in the tier at full weight.
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 10
+    assert incentive.cap_multiplier_by_bucket[("B200", 1)] == pytest.approx(1.0)
+    for native in jobs["miner_c"]:
+        assert native.effective_rate == pytest.approx(PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_source_bucket_emptied_by_move(monkeypatch):
+    """With cap 8×=4, a single split-capable 8× node over-fills its own bucket and
+    moves out entirely, leaving the source at 0 GPUs — no division error, and the
+    snapshot and total_rental_cost stay consistent.
+    """
+    config = _make_pcc_config(caps={**PCC_PER_COUNT_CAPS, "B200": {1: 10, 8: 4}})
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    mover = jobs["miner_a"][0]
+    assert mover.count_bucket == 1
+    assert mover.bucket_reassigned_from == 8
+    assert mover.bucket_reassigned_from_multiplier == pytest.approx(4 / 8)
+    assert mover.unrented_cap_multiplier == pytest.approx(1.0)
+    assert incentive.unrented_count_by_bucket[("B200", 8)] == 0
+    assert incentive.unrented_count_by_bucket[("B200", 1)] == 8
+    # The emptied source contributes nothing; the whole cost is the mover at full rate.
+    assert incentive.total_rental_cost == pytest.approx(8 * PCC_HOURLY_RATE * PCC_SYSBOX_MULTIPLIER)
+    by_bucket = incentive.get_snapshot().rental.by_bucket
+    assert by_bucket["B200·8"].unrented_count == 0
+    assert by_bucket["B200·1"].unrented_count == 8
+
+
+@pytest.mark.asyncio
+async def test_pcc_2528_no_move_when_split_tier_has_no_cap(monkeypatch):
+    """A min-count tier with no configured cap can never receive a fallback move:
+    the candidate stays in its over-cap gpu_count bucket, diluted.
+    """
+    config = _make_pcc_config(caps={**PCC_PER_COUNT_CAPS, "B200": {8: 8}})
+    jobs = {
+        "miner_a": [_make_pcc_job(
+            "exec-a", "NVIDIA B200", 8,
+            supports_gpu_splitting=True, gpu_splitting_min_count=1,
+        )],
+        "miner_b": [_make_pcc_job("exec-b", "NVIDIA B200", 8)],
+    }
+
+    incentive = await _run_pcc_incentive(config, jobs, monkeypatch)
+
+    candidate = jobs["miner_a"][0]
+    assert candidate.count_bucket == 8
+    assert candidate.bucket_reassigned_from is None
+    assert candidate.unrented_cap_multiplier == pytest.approx(0.5)
+    assert ("B200", 1) not in incentive.unrented_count_by_bucket
