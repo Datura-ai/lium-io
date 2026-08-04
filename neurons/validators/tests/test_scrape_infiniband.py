@@ -97,6 +97,35 @@ def test_every_device_and_port_is_listed(scrape: dict[str, Any], tmp_path: Path)
     ]
 
 
+def test_roce_port_is_reported_as_ethernet_without_lids(scrape: dict[str, Any], tmp_path: Path) -> None:
+    # Arrange - a ConnectX-6 Dx in Ethernet mode, as measured on a rented box on 2026-08-04.
+    # LIDs are an InfiniBand concept, so the driver reports 0x0 on an Ethernet port.
+    write_port(
+        tmp_path,
+        "mlx5_0",
+        "1",
+        {
+            "link_layer": "Ethernet",
+            "state": "4: ACTIVE",
+            "phys_state": "5: LinkUp",
+            "rate": "100 Gb/sec (4X EDR)",
+            "lid": "0x0",
+            "sm_lid": "0x0",
+            "gids/0": "fe80:0000:0000:0000:0ac0:ebff:fed4:1a4e",
+        },
+    )
+    scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
+
+    # Act
+    ports = scrape["get_infiniband_ports"]()
+
+    # Assert - RoCE hardware still lands; pairing such ports cannot lean on LIDs
+    assert ports[0]["ib_link_layer"] == "Ethernet"
+    assert ports[0]["ib_state"] == "4: ACTIVE"
+    assert ports[0]["ib_rate"] == "100 Gb/sec (4X EDR)"
+    assert ports[0]["ib_lid"] == "0x0"
+
+
 def test_host_without_rdma_hardware_reports_no_ports(scrape: dict[str, Any], tmp_path: Path) -> None:
     # Arrange — the usual case: no /sys/class/infiniband at all
     scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path / "does-not-exist")
