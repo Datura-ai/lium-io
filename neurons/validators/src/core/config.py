@@ -237,6 +237,12 @@ class Settings(BaseSettings):
     # impact can be observed before enforcing.
     ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT: bool = Field(env="ENABLE_UNRENTED_VRAM_OVER_DISK_LIMIT", default=False)
 
+    # DAH-2546 — flagship capability gate. When True, an unrented 8x H200/B200/B300 executor
+    # with neither NCU profiling counters open nor real GPU splitting enabled loses the
+    # unrented rental incentive while staying active. When False, the breach is only logged
+    # (shadow mode) so prod impact can be observed before enforcing.
+    ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT: bool = Field(env="ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", default=False)
+
     COLLATERAL_CONTRACT_ADDRESS: str = Field(
         env='COLLATERAL_CONTRACT_ADDRESS', default='0x8A4023FdD1eaA7b242F3723a7d096B6CC693c7C6'
     )

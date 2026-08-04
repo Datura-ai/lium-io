@@ -43,6 +43,14 @@ SOFT_LIMIT_PRICE_RATE = 1.1
 # incentive but stays active.
 MIN_DISK_TO_VRAM_RATE = 1.5
 
+# DAH-2546 — flagship capability gate. An unrented 8x machine of these base models must
+# have NCU profiling counters open on the host or real GPU splitting enabled to earn the
+# unrented incentive; with neither it forfeits the incentive but stays active.
+FLAGSHIP_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300"})
+FLAGSHIP_CAPABILITY_GPU_COUNT = 8
+# Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
+NCU_PROFILING_UNRESTRICTED = "unrestricted"
+
 
 # ── Spec measurements ────────────────────────────────────────────────────────
 
@@ -289,6 +297,47 @@ class RentalPriceIncentive(DefaultIncentive):
                     "min_disk_to_vram_rate": measured.rate,
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.INSUFFICIENT_DISK_FOR_VRAM,
+                    "pool": "rental_excluded" if enforced else "rental_kept_shadow",
+                },
+            )
+        )
+
+    def _lacks_flagship_capability(self, result: JobResult, base_model: str) -> bool:
+        # unrented 8x flagship machine offering neither open NCU counters nor real splitting
+        if result.gpu_count != FLAGSHIP_CAPABILITY_GPU_COUNT:
+            return False
+        if base_model not in FLAGSHIP_CAPABILITY_BASE_MODELS:
+            return False
+        if result.spec is None:
+            # no scrape at all: a synthetic or estimated job result, nothing to measure
+            return False
+        ncu_access = result.spec.get("ncu_profiling_access")
+        has_open_ncu_counters = ncu_access == NCU_PROFILING_UNRESTRICTED
+        # min_gpu_count equal to the node size is whole-host-only in practice (rent_executor
+        # rejects smaller requests), so it does not count as splitting
+        has_real_splitting = bool(
+            result.supports_gpu_splitting
+            and result.gpu_splitting_min_count
+            and result.gpu_splitting_min_count < result.gpu_count
+        )
+        return not (has_open_ncu_counters or has_real_splitting)
+
+    def _log_flagship_capability_limit(self, result: JobResult) -> None:
+        # structured log for every rental-eligible 8x flagship executor lacking both capabilities
+        enforced = settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT
+        logger.info(
+            _m(
+                "Unrented flagship executor has neither NCU profiling nor GPU splitting"
+                + ("" if enforced else " (shadow only - flag off)"),
+                extra={
+                    "executor_id": str(result.executor_info.uuid),
+                    "gpu_model": result.gpu_model,
+                    "gpu_count": result.gpu_count,
+                    "ncu_profiling_access": (result.spec or {}).get("ncu_profiling_access"),
+                    "supports_gpu_splitting": result.supports_gpu_splitting,
+                    "gpu_splitting_min_count": result.gpu_splitting_min_count,
+                    "enforced": enforced,
+                    "reason": ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
                 },
             )
@@ -577,6 +626,18 @@ class RentalPriceIncentive(DefaultIncentive):
                 eligible_for_rental_share = False
                 reason: MinerLogLine = MinerLogLine.no_payout_because_insufficient_disk_for_vram(
                     job_result, insufficient_disk
+                )
+                job_result.record_incentive_log(reason)
+
+        # DAH-2546 flagship capability gate: an idle 8x H200/B200/B300 must offer NCU profiling
+        # (open counters) or real GPU splitting to earn the unrented incentive (node stays
+        # active). While the flag is off we only log the would-be exclusion (shadow).
+        if eligible_for_rental_share and self._lacks_flagship_capability(job_result, base_model):
+            self._log_flagship_capability_limit(job_result)
+            if settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT:
+                eligible_for_rental_share = False
+                reason: MinerLogLine = MinerLogLine.no_payout_because_flagship_without_ncu_or_split(
+                    job_result
                 )
                 job_result.record_incentive_log(reason)
 

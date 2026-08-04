@@ -27,6 +27,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "nvidia_driver_below_minimum",
         "sysbox_not_enabled",
         "insufficient_disk_for_vram",
+        "flagship_without_ncu_or_split",
     }
 
 
@@ -111,6 +112,11 @@ def _job(**overrides) -> JobResult:
             lambda job: MinerLogLine.no_payout_because_sysbox_not_enabled(job),
             "sysbox_not_enabled",
             "sysbox",
+        ),
+        (
+            lambda job: MinerLogLine.no_payout_because_flagship_without_ncu_or_split(job),
+            "flagship_without_ncu_or_split",
+            "NCU profiling",
         ),
     ],
 )
