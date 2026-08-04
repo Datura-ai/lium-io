@@ -324,7 +324,7 @@ class RentalPriceIncentive(DefaultIncentive):
         ncu_profiling_access = result.spec.get("ncu_profiling_access")
         # min_gpu_count equal to the node size is whole-host-only in practice (rent_executor
         # rejects smaller requests), so it does not count as splitting
-        has_real_splitting = (
+        has_real_splitting: bool = bool(
             result.supports_gpu_splitting
             and result.gpu_splitting_min_count
             and result.gpu_splitting_min_count < result.gpu_count
