@@ -5888,6 +5888,7 @@ async def test_recover_pod_declines_an_encrypted_volume_when_the_kill_switch_is_
     "local_volume_path",
     [
         pytest.param("/lium-cipher", id="the_ciphertext_mount_itself"),
+        pytest.param("/lium-cipher/data", id="inside_the_ciphertext_mount"),
         pytest.param("/workspace/../../etc", id="path_escaping_upwards"),
         pytest.param("/..", id="nothing_but_a_parent_segment"),
         pytest.param("/workspace/./data", id="unnormalised"),

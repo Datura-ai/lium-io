@@ -455,6 +455,13 @@ def _xor_wrap_passphrase(passphrase: str) -> tuple[str, str]:
     return pad.hex(), wrapped.hex()
 
 
+def _is_under_cipher_mount(path: str) -> bool:
+    # whether a plaintext path collides with the ciphertext mount. A descendant is as unusable as
+    # the mount itself: mounting the plaintext view inside the ciphertext it is decrypting is not
+    # something recovery should attempt on customer data.
+    return path == _LIUM_CIPHER_MOUNT or path.startswith(f"{_LIUM_CIPHER_MOUNT}/")
+
+
 def _gocryptfs_missing_config_branch(allow_init: bool) -> str:
     if allow_init:
         return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"'
@@ -5186,7 +5193,7 @@ class DockerService:
             settings.RECOVER_ENCRYPTED_VOLUMES
             and bool(local_volume_path)
             and bool(_PLAINTEXT_PATH_RE.fullmatch(local_volume_path or ""))
-            and local_volume_path != _LIUM_CIPHER_MOUNT
+            and not _is_under_cipher_mount(local_volume_path or "")
             and bool(settings.VOLUME_MASTER_SECRET)
         )
 
