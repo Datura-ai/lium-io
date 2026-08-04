@@ -5706,6 +5706,7 @@ async def _attempt_stale_mount_recovery(
     docker_service: DockerService,
     container_error: str | None,
     ssh_client: AsyncMock | None = None,
+    local_volume_path: str | None = None,
 ) -> bool:
     return await docker_service.recover_pod_after_stale_vloopback_mount(
         ssh_client=ssh_client if ssh_client is not None else _recovery_ssh_client(),
@@ -5715,6 +5716,7 @@ async def _attempt_stale_mount_recovery(
         container_name="pod_pod-1",
         pod_id="pod-1",
         container_error=container_error,
+        local_volume_path=local_volume_path,
         default_extra={},
     )
 
@@ -5775,8 +5777,17 @@ async def test_recover_pod_repairs_then_starts_through_the_full_start_path(
     assert start_kwargs["local_volume_path"] is None
 
 
+@pytest.mark.parametrize(
+    "local_volume_path",
+    [
+        pytest.param(None, id="path_absent"),
+        pytest.param("", id="path_empty_string"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_recover_pod_declines_an_encrypted_volume(docker_service, monkeypatch):
+async def test_recover_pod_declines_an_encrypted_volume_without_a_plaintext_path(
+    docker_service, monkeypatch, local_volume_path
+):
     # the plaintext path of an encrypted volume is recorded nowhere on the host, and remounting
     # gocryptfs at the /root default would write a custom path out in the clear
     repair_mountpoint = AsyncMock(return_value=True)
@@ -5786,12 +5797,61 @@ async def test_recover_pod_declines_an_encrypted_volume(docker_service, monkeypa
     ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
 
     recovered = await _attempt_stale_mount_recovery(
-        docker_service, _STALE_MOUNT_ERROR, ssh_client
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, local_volume_path
     )
 
     assert recovered is False
     repair_mountpoint.assert_not_awaited()
     start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_declines_an_encrypted_volume_without_the_master_secret(
+    docker_service, monkeypatch
+):
+    # the passphrase is derived from VOLUME_MASTER_SECRET; without it the remount can only fail
+    # after the container is already up, leaving the pod flapping once a cycle
+    monkeypatch.setattr(docker_service_module.settings, "VOLUME_MASTER_SECRET", None)
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is False
+    repair_mountpoint.assert_not_awaited()
+    start_existing_container.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recover_pod_remounts_an_encrypted_volume_at_the_path_the_backend_supplied(
+    docker_service, monkeypatch
+):
+    # DAH-2545: with the plaintext path in hand the encrypted pod is recoverable, and the path is
+    # handed on untouched — a guessed one would write the customer's data out in the clear
+    monkeypatch.setattr(
+        docker_service_module.settings,
+        "VOLUME_MASTER_SECRET",
+        "test-master-secret-32-chars-long!!",
+    )
+    repair_mountpoint = AsyncMock(return_value=True)
+    monkeypatch.setattr(docker_service, "repair_stale_vloopback_mountpoint", repair_mountpoint)
+    start_existing_container = AsyncMock()
+    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
+    ssh_client = _recovery_ssh_client(mount_destinations="/lium-cipher\n/mnt\n")
+
+    recovered = await _attempt_stale_mount_recovery(
+        docker_service, _STALE_MOUNT_ERROR, ssh_client, "/workspace"
+    )
+
+    assert recovered is True
+    assert start_existing_container.await_args.kwargs["local_volume_path"] == "/workspace"
 
 
 @pytest.mark.asyncio

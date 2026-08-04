@@ -202,6 +202,7 @@ class TenantEnforcementCheck:
                     container_name=pod_container_name,
                     pod_id=pod_id,
                     diagnostics=diagnostics,
+                    local_volume_path=rental_active.local_volume_path if rental_active else None,
                     extra=extra,
                 )
                 if outcome.failure:
@@ -280,6 +281,7 @@ class TenantEnforcementCheck:
         container_name: str,
         pod_id: str,
         diagnostics: dict[str, object],
+        local_volume_path: str | None,
         extra: dict[str, Any],
     ) -> _DownedPodOutcome:
         # a rented pod found not running: heal it when it carries the DAH-2306 reboot signature,
@@ -289,11 +291,13 @@ class TenantEnforcementCheck:
         if self.recover_stale_pods:
             try:
                 if await _recover_pod_after_stale_vloopback_mount(
-                    ctx, container_name, pod_id, diagnostics
+                    ctx, container_name, pod_id, diagnostics, local_volume_path
                 ):
                     # Re-read the pod, so the recovered container's own SSH keys are what gets
                     # reported and a start that did not stick still lands on POD_NOT_RUNNING.
                     pod_running, ssh_pub_keys = await _check_pod_running(ctx.ssh, container_name)
+                    if pod_running:
+                        await _report_host_reboot_recovery(ctx, pod_id, diagnostics)
             except (asyncssh.Error, OSError) as exc:
                 # Recovery adds SSH round-trips to the executor inside the DAH-2055 window, so
                 # losing the transport here means pod state is unknown, not "pod down".
@@ -367,11 +371,37 @@ def _executor_transport_unreachable_result(
     return CheckResult(passed=False, event=event, updates={"default_extra": extra})
 
 
+async def _report_host_reboot_recovery(
+    ctx: Context,
+    pod_id: str,
+    diagnostics: dict[str, object],
+) -> None:
+    # DAH-2545: tell the backend the pod is back, so the renter can be told their pod went down
+    # because the provider's host restarted. Never fatal: the rental has already been saved by the
+    # time this runs, and a backend that is down or too old must not turn that into a failure.
+    container_finished_at = diagnostics.get("container_finished_at")
+    if not isinstance(container_finished_at, str) or not container_finished_at:
+        return
+    try:
+        await ctx.services.backend.report_pod_host_reboot_recovered(
+            pod_id, container_finished_at
+        )
+    except Exception:
+        logger.warning(
+            _m(
+                "POD_STALE_MOUNT_RECOVERY_REPORT_FAILED",
+                extra=get_extra_info({**ctx.default_extra, "pod_id": pod_id}),
+            ),
+            exc_info=True,
+        )
+
+
 async def _recover_pod_after_stale_vloopback_mount(
     ctx: Context,
     container_name: str,
     pod_id: str,
     diagnostics: dict[str, object],
+    local_volume_path: str | None,
 ) -> bool:
     # DAH-2306: heal a still-rented pod the host could not auto-restart after a reboot, before the
     # miner is penalised for it. Best effort in every direction — a recovery that cannot run, or
@@ -390,6 +420,7 @@ async def _recover_pod_after_stale_vloopback_mount(
             container_name=container_name,
             pod_id=pod_id,
             container_error=container_error if isinstance(container_error, str) else None,
+            local_volume_path=local_volume_path,
             default_extra=ctx.default_extra,
         )
     except (asyncssh.Error, OSError):

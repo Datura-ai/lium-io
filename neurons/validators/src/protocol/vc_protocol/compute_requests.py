@@ -158,6 +158,15 @@ class RentedExecutorsResponse(BaseModel):
 class PodRentalActiveResponse(BaseModel):
     active: bool
     rental_closed_at: datetime | None = None
+    # DAH-2545: where an encrypted rental volume is mounted in plaintext inside the container.
+    # Nothing on the host records it, so without this the validator cannot remount gocryptfs when
+    # it revives a pod. Absent — an older backend, or a pod it does not know — means recovery of an
+    # encrypted volume must stand down rather than guess a path.
+    local_volume_path: str | None = None
+
+
+class PodHostRebootRecoveredResponse(BaseModel):
+    recorded: bool
 
 
 class FillerRunActiveResponse(BaseModel):
