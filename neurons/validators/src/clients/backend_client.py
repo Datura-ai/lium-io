@@ -19,6 +19,7 @@ from protocol.vc_protocol.compute_requests import (
     ExecutorHealthCheckResponse,
     FillerRunActiveResponse,
     NvmlReportAckResponse,
+    PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
 )
@@ -248,6 +249,22 @@ class BackendClient:
         return await self.get(
             f"/internal/pods/{pod_id}/rental-active",
             PodRentalActiveResponse,
+            timeout=10,
+        )
+
+    async def report_pod_host_reboot_recovered(
+        self, pod_id: str, container_finished_at: str
+    ) -> PodHostRebootRecoveredResponse | None:
+        """Tell the backend a pod was revived after its host rebooted, so the renter can be told.
+
+        container_finished_at is the container's exit time, which the backend uses to recognise
+        the same downtime reported by a later cycle while keeping a genuine second reboot of the
+        same pod a separate event. Older backends 404 and the caller treats that as nothing to do.
+        """
+        return await self.post(
+            f"/internal/pods/{pod_id}/host-reboot-recovered",
+            PodHostRebootRecoveredResponse,
+            json_data={"container_finished_at": container_finished_at},
             timeout=10,
         )
 

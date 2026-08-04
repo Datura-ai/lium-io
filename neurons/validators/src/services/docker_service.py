@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import enum
 import ipaddress
 import logging
 import math
@@ -197,6 +198,17 @@ _LOCAL_VOLUME_TIMEOUT_MAX_SEC = 180
 _FILLER_EXTERNAL_PORT_OFFSET = 20
 _LIUM_CIPHER_MOUNT = "/lium-cipher"
 _ENCRYPTED_VOLUME_IMAGE_LABEL = "lium.volume_encryption.enable"
+# the path comes from a customer-authored template and the backend only requires a leading slash,
+# so anything that is not a plain absolute path is refused here rather than mounted over
+_PLAINTEXT_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
+
+
+class _VolumeEncryptionState(enum.Enum):
+    ENCRYPTED = "encrypted"
+    PLAIN = "plain"
+    UNKNOWN = "unknown"
+
+
 _DOCKER_NO_SUCH_CONTAINER_PHRASE = "No such container"
 _DOCKER_REMOVAL_IN_PROGRESS_PHRASES = ("409", "removal", "already in progress")
 HOST_KEY_REQUIRED_EXTRA = {
@@ -444,6 +456,37 @@ def _xor_wrap_passphrase(passphrase: str) -> tuple[str, str]:
     return pad.hex(), wrapped.hex()
 
 
+def _can_remount_encrypted_volume(local_volume_path: str | None) -> bool:
+    # whether recovery has everything it needs to put a gocryptfs volume back the way the customer
+    # had it. Checked before the container is started, because the remount only happens after
+    # `docker start`: a missing piece would leave the pod flapping up and down once a cycle.
+    # VOLUME_MASTER_SECRET must be the one the volume was created with — another validator's secret
+    # derives a passphrase that simply will not mount. A plaintext path at or under the ciphertext
+    # mount is refused as well: mounting the plaintext view inside the ciphertext it is decrypting
+    # is not something recovery should attempt on customer data.
+    if not (
+        settings.RECOVER_ENCRYPTED_VOLUMES
+        and settings.VOLUME_MASTER_SECRET
+        and local_volume_path
+    ):
+        return False
+    if local_volume_path == _LIUM_CIPHER_MOUNT or local_volume_path.startswith(
+        f"{_LIUM_CIPHER_MOUNT}/"
+    ):
+        return False
+    return _PLAINTEXT_PATH_RE.fullmatch(local_volume_path) is not None
+
+
+def _shell_branch_when_gocryptfs_config_missing(allow_init: bool) -> str:
+    if allow_init:
+        return f'  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"'
+    return (
+        f'  echo "gocryptfs.conf missing under {_LIUM_CIPHER_MOUNT};'
+        ' refusing to re-initialise an existing rental volume" >&2\n'
+        "  exit 1"
+    )
+
+
 def _build_gocryptfs_setup_and_mount_script(
     plaintext_path: str,
     *,
@@ -452,7 +495,13 @@ def _build_gocryptfs_setup_and_mount_script(
     pad_var: str,
     wrapped_var: str,
     passfile_path: str,
+    allow_init: bool = True,
 ) -> str:
+    # allow_init=False belongs to every start of a container that already exists — stale-mount
+    # recovery and the backend's own start_container alike: such a volume was initialised at create
+    # time, so a missing gocryptfs.conf means the ciphertext is gone. Re-initialising it there would
+    # hand the customer an empty volume, report the start as a success and spare the miner the
+    # penalty for data they destroyed. Only pod creation initialises.
     plaintext = shlex.quote(plaintext_path)
     passfile = shlex.quote(passfile_path)
     mount_check = (
@@ -481,7 +530,7 @@ chmod 600 "$_pf"
 unset _esc _x _y {pad_var} {wrapped_var}
 mkdir -p {_LIUM_CIPHER_MOUNT} {plaintext}
 if [ ! -f {_LIUM_CIPHER_MOUNT}/gocryptfs.conf ]; then
-  gocryptfs -init {_LIUM_CIPHER_MOUNT} -passfile "$_pf"
+{_shell_branch_when_gocryptfs_config_missing(allow_init)}
 fi
 if ! {mount_check}; then
   gocryptfs {_LIUM_CIPHER_MOUNT} {plaintext} -passfile "$_pf" -o allow_other -nonempty
@@ -1968,6 +2017,7 @@ class DockerService:
         pod_id: str,
         log_tag: str,
         log_extra: dict,
+        allow_init: bool = True,
     ) -> None:
         passphrase = VolumeKeyDeriver.from_settings(settings).material(pod_id).passphrase
 
@@ -2039,6 +2089,7 @@ class DockerService:
             pad_var=pad_var,
             wrapped_var=wrapped_var,
             passfile_path=passfile_path,
+            allow_init=allow_init,
         )
         setup_heredoc = f"__SETUP_{uuid4().hex}__"
         upload_cmd = (
@@ -4968,7 +5019,7 @@ class DockerService:
         # drops: the gocryptfs plaintext mount of an encrypted rental volume, and the sshd the
         # customer connects through. A failed remount raises and the caller decides how to report
         # it; a failed sshd bootstrap only warns, because the pod itself is up either way.
-        # local_volume_path=None means the caller does not know the plaintext path, which is only
+        # A falsy local_volume_path means the caller does not know the plaintext path, which is only
         # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
         # leave the customer's real path an ordinary container dir, writing plaintext to the host.
         pkey = asyncssh.import_private_key(private_key)
@@ -4994,7 +5045,7 @@ class DockerService:
                     container_name,
                 )
                 if encrypted_volume_name:
-                    if local_volume_path is None:
+                    if not local_volume_path:
                         raise RuntimeError(
                             f"{container_name} holds an encrypted volume but no plaintext path "
                             "was supplied; refusing to remount it at a guessed path"
@@ -5007,6 +5058,7 @@ class DockerService:
                         pod_id=pod_id,
                         log_tag=f"start_container_{pod_id}",
                         log_extra=default_extra,
+                        allow_init=False,
                     )
             ssh_bootstrap_ok = await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                 docker_client=docker_client,
@@ -5042,6 +5094,7 @@ class DockerService:
         container_name: str,
         pod_id: str,
         container_error: str | None,
+        local_volume_path: str | None,
         default_extra: dict[str, Any],
     ) -> bool:
         # DAH-2306: bring back a still-rented pod the host could not auto-restart after a reboot.
@@ -5054,11 +5107,20 @@ class DockerService:
 
         log_extra = {**default_extra, "container_name": container_name}
         try:
-            if await self._holds_encrypted_local_volume(ssh_client, container_name):
+            encryption_state = await self._local_volume_encryption_state(
+                ssh_client, container_name
+            )
+            if encryption_state is _VolumeEncryptionState.UNKNOWN or (
+                encryption_state is _VolumeEncryptionState.ENCRYPTED
+                and not _can_remount_encrypted_volume(local_volume_path)
+            ):
                 logger.warning(
                     _m(
                         "POD_STALE_MOUNT_RECOVERY_SKIPPED_ENCRYPTED_VOLUME",
-                        extra=get_extra_info(log_extra),
+                        extra=get_extra_info({
+                            **log_extra,
+                            "volume_encryption_state": encryption_state.value,
+                        }),
                     )
                 )
                 return False
@@ -5100,11 +5162,20 @@ class DockerService:
                 private_key=private_key,
                 known_hosts_policy=known_hosts_policy,
                 container_name=container_name,
-                local_volume_path=None,
+                local_volume_path=local_volume_path,
                 pod_id=pod_id,
                 default_extra=log_extra,
             )
         except asyncio.CancelledError:
+            # the whole check runs under an outer timeout, so a cancellation can land between
+            # `docker start` and the gocryptfs remount and leave the container up with its
+            # plaintext path unmounted — exactly the state the Exception branch below stops. The
+            # stop is shielded because an unshielded await in a cancelled task never runs; the
+            # cancellation itself still propagates.
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(
+                    self._stop_half_recovered_container(ssh_client, container_name)
+                )
             raise
         except Exception as exc:
             container_stopped = await self._stop_half_recovered_container(
@@ -5127,26 +5198,29 @@ class DockerService:
         )
         return True
 
-    async def _holds_encrypted_local_volume(
+    async def _local_volume_encryption_state(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
-    ) -> bool:
-        # whether the pod's rental volume is gocryptfs-encrypted, which recovery has to refuse.
-        # An encrypted volume is mounted as the ciphertext at /lium-cipher and the plaintext path
-        # the customer actually uses comes from the create request, which is recorded nowhere on
-        # the host and is not in the backend's rental-active response either. Remounting at the
+    ) -> _VolumeEncryptionState:
+        # whether the pod's rental volume is gocryptfs-encrypted, which recovery may only touch
+        # when it knows the plaintext path. An encrypted volume is mounted as the ciphertext at
+        # /lium-cipher and the plaintext path the customer actually uses is recorded nowhere on the
+        # host; DAH-2545 carries it in the backend's rental-active response. Remounting at the
         # /root default would silently turn a custom path into an ordinary container dir, so
-        # writes to it would land unencrypted on the miner's disk. Fails closed: an inspect that
-        # does not answer counts as encrypted, and the miner keeps the POD_NOT_RUNNING verdict.
+        # writes to it would land unencrypted on the miner's disk. An inspect that does not answer
+        # is UNKNOWN rather than ENCRYPTED: recovery stands down either way, but a pod we could not
+        # even look at must not be started on the strength of a path we cannot match to a volume.
         inspect_result = await ssh_client.run(
             f"/usr/bin/docker inspect {shlex.quote(container_name)} "
             '--format \'{{range .Mounts}}{{println .Destination}}{{end}}\'',
             timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
         )
         if getattr(inspect_result, "exit_status", 0) != 0:
-            return True
-        return _LIUM_CIPHER_MOUNT in (inspect_result.stdout or "").split()
+            return _VolumeEncryptionState.UNKNOWN
+        if _LIUM_CIPHER_MOUNT in (inspect_result.stdout or "").split():
+            return _VolumeEncryptionState.ENCRYPTED
+        return _VolumeEncryptionState.PLAIN
 
     async def _repair_stale_mountpoint_of_container_volume(
         self,

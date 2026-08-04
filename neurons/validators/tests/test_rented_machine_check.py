@@ -128,6 +128,7 @@ class DummySSHClient:
         self.should_raise = should_raise
         self.raise_on_run = raise_on_run
         self.commands_called: list[str] = []
+        self.container_finished_at = "2026-08-03T16:59:21.514042646Z"
 
     async def run(self, command: str):
         """Mock SSH run command."""
@@ -144,6 +145,14 @@ class DummySSHClient:
             result.stdout = "container_id_123" if self.pod_running else ""
         elif "authorized_keys" in command:
             result.stdout = "\n".join(self.ssh_keys) if self.ssh_keys else ""
+        elif "docker inspect" in command:
+            result.stdout = json.dumps(
+                {
+                    "Status": "exited",
+                    "ExitCode": 255,
+                    "FinishedAt": self.container_finished_at,
+                }
+            )
         else:
             result.stdout = ""
 
@@ -168,15 +177,25 @@ class DummyScoreCalculator:
 
 
 class DummyBackendClient:
-    def __init__(self, *, active: bool | None = True):
+    def __init__(self, *, active: bool | None = True, local_volume_path: str | None = None):
         self.active = active
+        self.local_volume_path = local_volume_path
         self.called_with: list[str] = []
+        self.host_reboot_recoveries: list[tuple[str, str]] = []
 
     async def get_pod_rental_active(self, pod_id: str):
         self.called_with.append(pod_id)
         if self.active is None:
             return None
-        return Mock(active=self.active, rental_closed_at=None)
+        return Mock(
+            active=self.active,
+            rental_closed_at=None,
+            local_volume_path=self.local_volume_path,
+        )
+
+    async def report_pod_host_reboot_recovered(self, pod_id: str, container_finished_at: str):
+        self.host_reboot_recoveries.append((pod_id, container_finished_at))
+        return Mock(recorded=True)
 
 
 @pytest.mark.parametrize(
@@ -835,6 +854,7 @@ def build_recovery_context(
     docker: AsyncMock,
     *,
     private_key: str | None = "ssh-key",
+    backend: DummyBackendClient | None = None,
 ) -> Context:
     rented_data = build_rented_data(
         "executor-123",
@@ -843,7 +863,7 @@ def build_recovery_context(
     services = build_services(
         score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
         container_cleanup=MockContainerCleanup(),
-        backend=DummyBackendClient(active=True),
+        backend=backend if backend is not None else DummyBackendClient(active=True),
         pod_recovery=docker,
     )
     return context_factory(
@@ -883,6 +903,69 @@ async def test_tenant_enforcement_passes_when_pod_recovered_from_stale_mount(con
     assert result.updates["ssh_pub_keys"] == ["ssh-rsa recovered"]
     assert result.updates["default_extra"]["recovered_pods"] == ["pod_pod-1"]
     assert docker.recover_pod_after_stale_vloopback_mount.await_args.kwargs["pod_id"] == "pod-1"
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_hands_recovery_the_backend_plaintext_path(context_factory):
+    # DAH-2545: an encrypted pod can only be revived at the path the backend recorded at create
+    # time, so whatever rental-active returns has to reach the recovery untouched
+    ssh = DummySSHClient(pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    docker = AsyncMock()
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.pod_running = True
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    backend = DummyBackendClient(active=True, local_volume_path="/workspace")
+    ctx = build_recovery_context(context_factory, ssh, docker, backend=backend)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    recovery_kwargs = docker.recover_pod_after_stale_vloopback_mount.await_args.kwargs
+    assert recovery_kwargs["local_volume_path"] == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_reports_recovery_to_the_backend(context_factory):
+    # the renter has to learn their pod went down because the provider's host restarted
+    ssh = DummySSHClient(pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    docker = AsyncMock()
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.pod_running = True
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    backend = DummyBackendClient(active=True)
+    ctx = build_recovery_context(context_factory, ssh, docker, backend=backend)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert backend.host_reboot_recoveries == [("pod-1", ssh.container_finished_at)]
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_survives_a_failed_recovery_report(context_factory):
+    # the rental is already saved by then; a backend that is down must not undo that
+    ssh = DummySSHClient(pod_running=False, ssh_keys=["ssh-rsa recovered"])
+    docker = AsyncMock()
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.pod_running = True
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    backend = DummyBackendClient(active=True)
+    backend.report_pod_host_reboot_recovered = AsyncMock(side_effect=RuntimeError("backend down"))
+    ctx = build_recovery_context(context_factory, ssh, docker, backend=backend)
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
 
 
 @pytest.mark.asyncio
