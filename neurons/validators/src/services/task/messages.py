@@ -386,6 +386,24 @@ class BannedGpuMessages:
     )
 
 
+class BannedProviderMessages:
+    PROVIDER_BANNED = MessageTemplate(
+        event="Provider banned for network abuse",
+        reason="PROVIDER_BANNED",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0; verification and active rentals retained",
+        remediation="Contact Lium support to appeal the provider ban.",
+    )
+    PROVIDER_ALLOWED = MessageTemplate(
+        event="Provider allowed",
+        reason="PROVIDER_BANNED_CHECK_OK",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+
+
 class SysboxRequiredMessages:
     SYSBOX_MISSING = MessageTemplate(
         event="Sysbox required for unrented executor",

@@ -7,7 +7,7 @@ fields, and that a line actually lands in JobResult.incentive_logs.
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
-from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability
+from incentive.rental_price import InsufficientDisk, MissingFlagshipCapability, RentalPriceIncentive
 from services.task_service import JobResult
 
 H200 = "NVIDIA H200"
@@ -17,6 +17,7 @@ def test_reason_enum_pins_the_stable_code_contract():
     # Append-only contract: dashboards and the backend (DAH-2340) key off these
     # exact strings. Renaming any value is a breaking change.
     assert {r.value for r in ZeroIncentiveReason} == {
+        "banned_network_abuse",
         "spot_tier",
         "provider_discord_not_connected",
         "new_rentals_paused",
@@ -65,6 +66,11 @@ def _job(**overrides) -> JobResult:
 @pytest.mark.parametrize(
     "build, expected_code, message_fragment",
     [
+        (
+            lambda job: MinerLogLine.no_payout_because_banned_network_abuse(job),
+            "banned_network_abuse",
+            "network abuse",
+        ),
         (lambda job: MinerLogLine.no_payout_because_spot_tier(job), "spot_tier", "spot tier"),
         (
             lambda job: MinerLogLine.no_payout_because_discord_not_connected(job),
@@ -131,6 +137,24 @@ def test_zero_reason_constructor_code_and_message(build, expected_code, message_
     assert message_fragment.lower() in line.message.lower()
     assert line.fields["reason"] == expected_code
     assert line.fields["incentive"] == 0.0
+
+
+def test_banned_network_abuse_message():
+    line = MinerLogLine.no_payout_because_banned_network_abuse(_job())
+
+    assert (
+        line.message
+        == "Banned for network abuse. Ineligible for scoring and rentals"
+    )
+
+
+def test_provider_ban_is_excluded_from_both_pools():
+    incentive = object.__new__(RentalPriceIncentive)
+
+    line = incentive._reason_excluded_from_both_pools(_job(is_provider_banned=True))
+
+    assert line is not None
+    assert line.reason is ZeroIncentiveReason.BANNED_NETWORK_ABUSE
 
 
 def test_spot_tier_carries_internal_log_message():

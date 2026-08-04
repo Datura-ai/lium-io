@@ -58,6 +58,9 @@ class RentedMachine(BaseModel):
 class RentedMachineResponse(BaseModel):
     machines: list[RentedMachine]
     banned_guids: list[str] = []
+    banned_hotkeys: list[str] = []
+    banned_coldkeys: list[str] = []
+    banned_provider_guids: list[str] = []
 
 
 class NetworkEMA(BaseModel):
@@ -97,6 +100,9 @@ class RentedExecutorsResponse(BaseModel):
     # collide. Empty for a backend that predates the field — the collision simply stays.
     filler_ports_by_executor: dict[str, list[int]] = {}
     banned_guids: list[str] = []
+    banned_hotkeys: list[str] = []
+    banned_coldkeys: list[str] = []
+    banned_provider_guids: list[str] = []
     gpu_splitting_config: dict[str, int] = {}  # executor_id → min_gpu_count_for_rental
     network_ema: dict[str, NetworkEMA] = {}  # executor_id → EMA network speeds, all active executors
     spot_executor_ids: list[str] = []  # executor_ids in spot tier (no incentive, no penalty)
@@ -109,6 +115,19 @@ class RentedExecutorsResponse(BaseModel):
     # as a special manual (bare-metal) rental. Defaults to empty so an older backend that omits the
     # field force-passes nobody (fail-closed) rather than everybody.
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
+
+    def is_provider_banned(
+        self,
+        *,
+        miner_hotkey: str,
+        miner_coldkey: str | None = None,
+        gpu_uuids: list[str] | None = None,
+    ) -> bool:
+        if miner_hotkey in self.banned_hotkeys:
+            return True
+        if miner_coldkey and miner_coldkey in self.banned_coldkeys:
+            return True
+        return any(gpu_uuid in self.banned_provider_guids for gpu_uuid in (gpu_uuids or []))
 
     @field_validator("filler_containers_by_executor")
     @classmethod

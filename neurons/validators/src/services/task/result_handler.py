@@ -182,6 +182,7 @@ class ResultHandler:
             is_rented=context.rented,
             is_spot=is_spot,
             is_new_rentals_paused=is_new_rentals_paused,
+            is_provider_banned=context.is_provider_banned,
             provider_discord_connected=provider_discord_connected,
             rental_created_at=self._get_rental_created_at(context),
             default_job_owner=default_job_owner,

@@ -128,6 +128,7 @@ class Context(BaseModel):
     pipeline_id: str
     executor: ExecutorSSHInfo
     miner_hotkey: str
+    miner_coldkey: str | None = None
     miner_address: str
     miner_port: int
     ssh: asyncssh.SSHClientConnection
@@ -158,6 +159,7 @@ class Context(BaseModel):
     log_status: str = "info"
     log_text: str | None = None
     success: bool = False
+    is_provider_banned: bool = False
     tdx_attestation_passed: bool = False
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
