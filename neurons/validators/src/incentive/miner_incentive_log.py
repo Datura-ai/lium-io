@@ -62,6 +62,7 @@ class ZeroIncentiveReason(StrEnum):
     """
 
     # Group A: excluded from BOTH pools
+    BANNED_NETWORK_ABUSE = "banned_network_abuse"
     SPOT_TIER = "spot_tier"
     PROVIDER_DISCORD_NOT_CONNECTED = "provider_discord_not_connected"
     NEW_RENTALS_PAUSED = "new_rentals_paused"
@@ -167,6 +168,15 @@ class MinerLogLine(BaseModel):
         )
 
     # ── Group A: excluded from BOTH pools (mining + unrented) — earns nothing ─
+
+    @staticmethod
+    def no_payout_because_banned_network_abuse(result: JobResult) -> MinerLogLine:
+        return MinerLogLine._no_payout(
+            result,
+            reason=ZeroIncentiveReason.BANNED_NETWORK_ABUSE,
+            message="Banned for network abuse. Ineligible for scoring and rentals",
+            internal_message="Executor excluded from both pools - banned for network abuse",
+        )
 
     @staticmethod
     def no_payout_because_spot_tier(result: JobResult) -> MinerLogLine:

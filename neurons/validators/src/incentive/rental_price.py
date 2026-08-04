@@ -368,6 +368,8 @@ class RentalPriceIncentive(DefaultIncentive):
         checks. Returns None when no hard exclusion applies (executor may still be
         gated later by the rental-pool-only soft price limit).
         """
+        if job_result.is_provider_banned:
+            return MinerLogLine.no_payout_because_banned_network_abuse(job_result)
         if job_result.is_spot:
             return MinerLogLine.no_payout_because_spot_tier(job_result)
         if is_missing_discord_after_cutoff(job_result):

@@ -28,6 +28,7 @@ from services.ssh_service import SSHService
 
 from .checks import (
     BannedGpuCheck,
+    BannedProviderCheck,
     CachedTemplateVerificationCheck,
     CapabilityCheck,
     CollateralCheck,
@@ -178,6 +179,7 @@ class PipelineFactory:
             pipeline_id=pipeline_id,
             executor=executor_info,
             miner_hotkey=miner_info.miner_hotkey,
+            miner_coldkey=miner_info.miner_coldkey,
             miner_address=miner_info.miner_address,
             miner_port=miner_info.miner_port,
             ssh=shell.ssh_client,
@@ -256,6 +258,7 @@ class PipelineFactory:
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
+                BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
@@ -324,6 +327,7 @@ class PipelineFactory:
                 NvmlDigestCheck(),
                 SpecChangeCheck(),
                 GpuFingerprintCheck(),
+                BannedProviderCheck(),
                 BannedGpuCheck(),
                 DuplicateExecutorCheck(),
                 CollateralCheck(),
