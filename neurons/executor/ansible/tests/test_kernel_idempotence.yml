@@ -1,0 +1,145 @@
+---
+# Merge-gate box 5, CI half.
+#
+# Real idempotence, not a tautology. The earlier claim that "the docker role
+# skips because Docker is preinstalled, therefore the playbook is idempotent"
+# proved nothing: a role that ALWAYS skips cannot demonstrate convergence.
+#
+# This runs the kernel role's non-reboot half TWICE against the same work tree
+# and asserts pass 2 changes nothing. Pass 1 must change something, or the test
+# would pass trivially on a role that does nothing at all.
+
+- name: Kernel role idempotence
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    kern_work: /tmp/lium-kernel-idem
+    lium_state_dir: /tmp/lium-kernel-idem/state
+    lium_log_dir: /tmp/lium-kernel-idem/log
+    lium_hda_search_roots: ["/tmp/lium-kernel-idem/no-such-root"]
+    lium_repo_path: /tmp/lium-kernel-idem/no-such-repo
+    lium_lspci_output: "{{ playbook_dir }}/fixtures/lspci/h200_8gpu_4nvswitch.txt"
+    lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+
+
+  pre_tasks:
+    - name: Provide an empty proc root
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/fixtures/emptyproc"
+        state: directory
+        mode: "0755"
+
+    - name: Start from a clean work tree
+      ansible.builtin.file:
+        path: "{{ kern_work }}"
+        state: absent
+
+    - name: Create the work tree
+      ansible.builtin.file:
+        path: "{{ kern_work }}/etc/default/grub.d"
+        state: directory
+        mode: "0755"
+
+    - name: Seed it with a realistic provider GRUB file
+      ansible.builtin.copy:
+        src: fixtures/grub/split/etc/default/grub
+        dest: "{{ kern_work }}/etc/default/grub"
+        mode: "0644"
+
+  roles:
+    - common
+
+  tasks:
+    # After the first pass the running kernel still lacks the tokens (the
+    # /proc/cmdline fixture is deliberately behind), so drift is non-empty. The
+    # reboot half is disabled, which is what makes running this on a CI runner
+    # safe.
+    - name: Pass 1 — converge
+      ansible.builtin.include_role:
+        name: kernel
+      vars:
+        lium_kernel_fixture_mode: true
+        lium_kernel_reboot_enabled: false
+        lium_grub_default_path: /tmp/lium-kernel-idem/etc/default/grub
+        lium_grub_dropin_path: /tmp/lium-kernel-idem/etc/default/grub.d/99-lium-cvm.cfg
+        lium_grubcfg_path: /tmp/lium-kernel-idem/boot/grub/grub.cfg
+        lium_modprobe_conf_path: /tmp/lium-kernel-idem/etc/modprobe.d/vfio-dma.conf
+        lium_modules_load_path: /tmp/lium-kernel-idem/etc/modules-load.d/vfio.conf
+        lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/cmdline_missing_tdx"
+        lium_update_grub_cmd: >-
+          {{ playbook_dir }}/fake-update-grub.sh
+          {{ kern_work }}/etc/default/grub
+          {{ kern_work }}/etc/default/grub.d
+          {{ kern_work }}/boot/grub/grub.cfg
+
+    - name: Record the state after pass 1
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      register: after_pass1
+      loop:
+        - "{{ kern_work }}/etc/default/grub.d/99-lium-cvm.cfg"
+        - "{{ kern_work }}/etc/modprobe.d/vfio-dma.conf"
+        - "{{ kern_work }}/etc/modules-load.d/vfio.conf"
+        - "{{ kern_work }}/boot/grub/grub.cfg"
+
+    - name: Pass 1 must actually have done something
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: >-
+          {{ item.item }} does not exist after pass 1. A role that changes
+          nothing would make the idempotence assertion below vacuous.
+        quiet: true
+      loop: "{{ after_pass1.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Pass 2 — converge again
+      ansible.builtin.include_role:
+        name: kernel
+      vars:
+        lium_kernel_fixture_mode: true
+        lium_kernel_reboot_enabled: false
+        lium_grub_default_path: /tmp/lium-kernel-idem/etc/default/grub
+        lium_grub_dropin_path: /tmp/lium-kernel-idem/etc/default/grub.d/99-lium-cvm.cfg
+        lium_grubcfg_path: /tmp/lium-kernel-idem/boot/grub/grub.cfg
+        lium_modprobe_conf_path: /tmp/lium-kernel-idem/etc/modprobe.d/vfio-dma.conf
+        lium_modules_load_path: /tmp/lium-kernel-idem/etc/modules-load.d/vfio.conf
+        lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/cmdline_missing_tdx"
+        lium_update_grub_cmd: >-
+          {{ playbook_dir }}/fake-update-grub.sh
+          {{ kern_work }}/etc/default/grub
+          {{ kern_work }}/etc/default/grub.d
+          {{ kern_work }}/boot/grub/grub.cfg
+
+    - name: Record the state after pass 2
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        checksum_algorithm: sha256
+      register: after_pass2
+      loop:
+        - "{{ kern_work }}/etc/default/grub.d/99-lium-cvm.cfg"
+        - "{{ kern_work }}/etc/modprobe.d/vfio-dma.conf"
+        - "{{ kern_work }}/etc/modules-load.d/vfio.conf"
+        - "{{ kern_work }}/boot/grub/grub.cfg"
+
+    - name: Pass 2 changed nothing on disk
+      ansible.builtin.assert:
+        that:
+          - after_pass1.results[idx].stat.checksum == after_pass2.results[idx].stat.checksum
+        fail_msg: >-
+          {{ after_pass1.results[idx].item }} changed between pass 1 and pass 2.
+          The role is not idempotent: re-running it rewrites configuration it
+          already converged, which on a real host means an unnecessary
+          update-grub and an unnecessary reboot.
+        quiet: true
+      loop: "{{ range(0, after_pass1.results | length) | list }}"
+      loop_control:
+        loop_var: idx
+        label: "{{ after_pass1.results[idx].item }}"
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: "PASS kernel idempotence — pass 2 left all 4 managed files byte-identical."

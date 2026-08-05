@@ -1,0 +1,17 @@
+---
+# Helper for tests/test_seam_gate.sh. It lives here rather than in a temp
+# directory so that the tests/group_vars symlink applies — a playbook outside
+# this directory does not see group_vars at all, and would then fail for the
+# wrong reason, which is exactly what the test asserts against.
+- name: Seam gate probe
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # A seam pointed somewhere that is not the real host.
+    lium_proc_cmdline_path: /tmp/definitely-not-proc-cmdline
+    lium_state_dir: /tmp/lium-seam-probe/state
+    lium_log_dir: /tmp/lium-seam-probe/log
+    lium_hda_search_roots: ["/tmp/lium-seam-probe/no-such-root"]
+    lium_repo_path: /tmp/lium-seam-probe/no-such-repo
+  roles:
+    - common

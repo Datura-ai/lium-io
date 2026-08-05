@@ -1,0 +1,3 @@
+This path is named by tests/test_guard.sh but deliberately does NOT exist:
+fixtures/guard/this_root_does_not_exist
+An absent root is a benign skip, never UNKNOWN.

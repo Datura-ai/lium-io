@@ -1,0 +1,80 @@
+---
+# Merge-gate box 3.
+#
+# Four fixture shapes, each driven end to end through the write-side seams:
+#   render -> union -> write drop-in -> regenerate -> grub.cfg assertion -> drift
+#
+# `update-grub` is replaced by tests/fake-update-grub.sh, which reproduces
+# 10_linux's emission order (LINUX first, DEFAULT last) — the one behaviour the
+# whole append-only safety argument rests on.
+
+- name: GRUB fixtures
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Both gates. The job-level env supplies ANSIBLE_LIUM_TEST=1; this supplies
+    # the other half. A test that sets only one fails closed, which is correct
+    # but confusing if you have not read tests/README.md.
+    lium_test_mode: true
+    grub_work: /tmp/lium-grub-fixture
+    lium_state_dir: /tmp/lium-grub-fixture/state
+    lium_log_dir: /tmp/lium-grub-fixture/log
+    lium_hda_search_roots: ["/tmp/lium-grub-fixture/no-such-root"]
+    lium_repo_path: /tmp/lium-grub-fixture/no-such-repo
+    lium_lspci_output: "{{ playbook_dir }}/fixtures/lspci/h200_8gpu_4nvswitch.txt"
+    lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+
+    grub_cases:
+      - name: default_only
+        proc: cmdline_complete
+        must_survive: ["quiet", "splash"]
+        expect_drift: ["vfio-pci.ids"]
+        expect_conflicting: []
+        expect_only_in_linux: false
+
+      # The au2 shape. A naive edit of the wrong variable silently drops
+      # kvm_intel.tdx and the host comes back looking healthy.
+      - name: linux_only
+        proc: cmdline_missing_tdx
+        must_survive: ["kvm_intel.tdx=on"]
+        expect_drift: ["kvm_intel.tdx=on"]
+        expect_conflicting: []
+        expect_only_in_linux: true
+
+      - name: split
+        proc: cmdline_complete
+        must_survive: ["quiet", "kvm_intel.tdx=on"]
+        expect_drift: ["vfio-pci.ids"]
+        expect_conflicting: []
+        expect_only_in_linux: true
+
+      # A stale dma_entry_limit=65535 AND a narrower pre-existing vfio-pci.ids.
+      # Set membership would call both a pass.
+      - name: conflicting
+        proc: cmdline_narrower_vfio_ids
+        must_survive: ["kvm_intel.tdx=on"]
+        expect_drift: ["vfio-pci.ids"]
+        expect_conflicting: ["vfio_iommu_type1.dma_entry_limit", "vfio-pci.ids"]
+        expect_only_in_linux: true
+
+  pre_tasks:
+    - name: Provide an empty proc root so no real QEMU can confuse the guard
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/fixtures/emptyproc"
+        state: directory
+        mode: "0755"
+
+  roles:
+    - common
+
+  tasks:
+    - name: Run each GRUB fixture
+      ansible.builtin.include_tasks: _grub_case.yml
+      loop: "{{ grub_cases }}"
+      loop_control:
+        loop_var: grub_case
+        label: "{{ grub_case.name }}"
+
+    - name: All GRUB fixtures passed
+      ansible.builtin.debug:
+        msg: "{{ grub_cases | length }} GRUB fixtures passed."

@@ -1,0 +1,6 @@
+# Fixture: the au2 shape — the TDX arguments live in GRUB_CMDLINE_LINUX and
+# GRUB_CMDLINE_LINUX_DEFAULT is empty. A naive sed on the wrong variable
+# silently drops kvm_intel.tdx (traps.md#7).
+GRUB_DEFAULT=0
+GRUB_CMDLINE_LINUX="kvm_intel.tdx=on intel_iommu=on iommu=pt nohibernate"
+GRUB_CMDLINE_LINUX_DEFAULT=""

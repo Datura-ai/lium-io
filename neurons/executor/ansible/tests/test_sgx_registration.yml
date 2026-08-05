@@ -1,0 +1,85 @@
+---
+# The 17950-byte assertion, against both shapes.
+#
+# The raw efivar, after stripping only its 4-byte efivarfs attribute header, is
+# 17954 bytes: a 4-byte version+size header PLUS the 17950-byte body. POSTing the
+# version-prefixed 17954-byte blob returns
+#     400 Error-Code: InvalidPlatformManifest
+# Intel wants exactly the retrieval tool's field-6 bytes. This cost one host a
+# 400 and a round of debugging.
+#
+# Both directions are tested. A length assertion that only ever sees the correct
+# input proves nothing about whether it would reject the wrong one.
+
+- name: SGX platform manifest length
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+
+  tasks:
+    - name: Measure both manifest fixtures
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/fixtures/manifest/{{ item }}"
+      register: sgx_manifests
+      loop:
+        - field6_17950.bin
+        - field6_17954.bin
+
+    - name: The good fixture is exactly the length Intel accepts
+      ansible.builtin.assert:
+        that:
+          - sgx_manifests.results[0].stat.size == (lium_platform_manifest_len | int)
+        fail_msg: >-
+          fixtures/manifest/field6_17950.bin is
+          {{ sgx_manifests.results[0].stat.size }} bytes, not
+          {{ lium_platform_manifest_len }}. The fixture itself is wrong, so this
+          test would prove nothing.
+        quiet: true
+
+    - name: The version-prefixed fixture is the shape Intel rejects
+      ansible.builtin.assert:
+        that:
+          - sgx_manifests.results[1].stat.size == ((lium_platform_manifest_len | int) + 4)
+        fail_msg: >-
+          fixtures/manifest/field6_17954.bin should be exactly 4 bytes longer than
+          the body — that 4-byte version+size header is the whole difference
+          between a 201 and a 400.
+        quiet: true
+
+    # The assertion the role makes, reproduced here against both inputs so its
+    # behaviour is pinned rather than assumed.
+    - name: The role's length rule accepts the body
+      ansible.builtin.assert:
+        that:
+          - sgx_manifests.results[0].stat.size == (lium_platform_manifest_len | int)
+        quiet: true
+
+    - name: The role's length rule rejects the version-prefixed blob
+      ansible.builtin.assert:
+        that:
+          - sgx_manifests.results[1].stat.size != (lium_platform_manifest_len | int)
+        fail_msg: >-
+          The length rule would have accepted the 17954-byte version-prefixed
+          blob, which Intel answers with 400 InvalidPlatformManifest.
+        quiet: true
+
+    # Registration is IRREVERSIBLE, so it must never run off an unknown count.
+    # "0 certificates" means register; "cannot read the database" means we cannot
+    # tell, and the efivar flip cannot be undone.
+    - name: Registration never runs off an unreadable certificate count
+      ansible.builtin.assert:
+        that:
+          - not sgx_would_register
+        fail_msg: >-
+          registration.yml would run with pck_cert_count unreadable. The
+          retrieval tool flips an efivar that cannot be un-flipped.
+        quiet: true
+      vars:
+        sgx_fake_unknown: {"value": null, "readable": false, "reason": "cannot read pckcache.db"}
+        sgx_would_register: >-
+          {{ (sgx_fake_unknown.readable | bool) and ((sgx_fake_unknown.value | default(0) | int) == 0) }}
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: "PASS SGX manifest length rule — accepts 17950, rejects 17954."
