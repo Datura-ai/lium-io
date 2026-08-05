@@ -1094,35 +1094,78 @@ def read_sysfs_value(path: str) -> str:
         return ""
 
 
-def get_infiniband_ports() -> list[dict[str, str]]:
+class InfinibandPort:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(
+        self,
+        device: str,
+        port: str,
+        node_guid: str,
+        link_layer: str,
+        state: str,
+        phys_state: str,
+        rate: str,
+        lid: str,
+        sm_lid: str,
+        subnet_prefix: str,
+    ) -> None:
+        self.device = device
+        self.port = port
+        self.node_guid = node_guid
+        self.link_layer = link_layer
+        self.state = state
+        self.phys_state = phys_state
+        self.rate = rate
+        self.lid = lid
+        self.sm_lid = sm_lid
+        self.subnet_prefix = subnet_prefix
+
+    def as_payload(self) -> dict[str, str]:
+        return {
+            "ib_device": self.device,
+            "ib_port": self.port,
+            "ib_node_guid": self.node_guid,
+            "ib_link_layer": self.link_layer,
+            "ib_state": self.state,
+            "ib_phys_state": self.phys_state,
+            "ib_rate": self.rate,
+            "ib_lid": self.lid,
+            "ib_sm_lid": self.sm_lid,
+            "ib_subnet_prefix": self.subnet_prefix,
+        }
+
+
+def read_infiniband_port(device_path: str, node_guid: str, port_path: str) -> InfinibandPort:
+    # gids/0 is the port's default GID; its first four groups are the subnet prefix, the identifier
+    # every port on one fabric shares.
+    default_gid = read_sysfs_value(f"{port_path}/gids/0")
+    return InfinibandPort(
+        device=os.path.basename(device_path),
+        port=os.path.basename(port_path),
+        node_guid=node_guid,
+        link_layer=read_sysfs_value(f"{port_path}/link_layer"),
+        state=read_sysfs_value(f"{port_path}/state"),
+        phys_state=read_sysfs_value(f"{port_path}/phys_state"),
+        rate=read_sysfs_value(f"{port_path}/rate"),
+        lid=read_sysfs_value(f"{port_path}/lid"),
+        sm_lid=read_sysfs_value(f"{port_path}/sm_lid"),
+        subnet_prefix=":".join(default_gid.split(":")[:4]),
+    )
+
+
+def get_infiniband_ports() -> list[InfinibandPort]:
     """Every RDMA port the host exposes, as reported by the kernel (DAH-2571).
 
     Facts only - which ports are usable and which fabric each one sits on. Deciding whether two
     machines are on the same fabric is the backend's job: it needs both hosts, this sees one.
     """
-    ports: list[dict[str, str]] = []
+    ports: list[InfinibandPort] = []
     try:
         for device_path in sorted(glob.glob(f"{INFINIBAND_SYSFS_PATH}/*")):
-            device_name = os.path.basename(device_path)
             node_guid = read_sysfs_value(f"{device_path}/node_guid")
             for port_path in sorted(glob.glob(f"{device_path}/ports/*")):
-                # gids/0 is the port's default GID; its first four groups are the subnet prefix,
-                # the identifier every port on one fabric shares.
-                default_gid = read_sysfs_value(f"{port_path}/gids/0")
-                ports.append(
-                    {
-                        "ib_device": device_name,
-                        "ib_port": os.path.basename(port_path),
-                        "ib_node_guid": node_guid,
-                        "ib_link_layer": read_sysfs_value(f"{port_path}/link_layer"),
-                        "ib_state": read_sysfs_value(f"{port_path}/state"),
-                        "ib_phys_state": read_sysfs_value(f"{port_path}/phys_state"),
-                        "ib_rate": read_sysfs_value(f"{port_path}/rate"),
-                        "ib_lid": read_sysfs_value(f"{port_path}/lid"),
-                        "ib_sm_lid": read_sysfs_value(f"{port_path}/sm_lid"),
-                        "ib_subnet_prefix": ":".join(default_gid.split(":")[:4]),
-                    }
-                )
+                ports.append(read_infiniband_port(device_path, node_guid, port_path))
     except Exception:
         # Every other probe in this file swallows its own failure - an interconnect reading is
         # never worth failing the whole machine scrape over.
@@ -1250,7 +1293,7 @@ def get_machine_specs():
     if ncu_profiling.scrape_error:
         data["data_ncu_profiling_scrape_error"] = ncu_profiling.scrape_error
     data["data_boot_id"] = get_host_boot_id()
-    data["data_infiniband_ports"] = get_infiniband_ports()
+    data["data_infiniband_ports"] = [port.as_payload() for port in get_infiniband_ports()]
 
     try:
         lscpu_output = run_cmd("lscpu")

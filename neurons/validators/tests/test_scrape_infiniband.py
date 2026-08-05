@@ -19,6 +19,8 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 INFINIBAND_HELPERS = {
     "INFINIBAND_SYSFS_PATH",
     "read_sysfs_value",
+    "InfinibandPort",
+    "read_infiniband_port",
     "get_infiniband_ports",
 }
 
@@ -63,7 +65,7 @@ def test_active_port_is_reported_with_its_fabric_identity(
     ports = scrape["get_infiniband_ports"]()
 
     # Assert — the subnet prefix is the first four GID groups, the join key for one fabric
-    assert ports == [
+    assert [port.as_payload() for port in ports] == [
         {
             "ib_device": "mlx5_2",
             "ib_port": "1",
@@ -90,7 +92,7 @@ def test_every_device_and_port_is_listed(scrape: dict[str, Any], tmp_path: Path)
     ports = scrape["get_infiniband_ports"]()
 
     # Assert
-    assert [(port["ib_device"], port["ib_port"]) for port in ports] == [
+    assert [(port.device, port.port) for port in ports] == [
         ("mlx5_2", "1"),
         ("mlx5_9", "1"),
         ("mlx5_9", "2"),
@@ -120,10 +122,10 @@ def test_roce_port_is_reported_as_ethernet_without_lids(scrape: dict[str, Any], 
     ports = scrape["get_infiniband_ports"]()
 
     # Assert - RoCE hardware still lands; pairing such ports cannot lean on LIDs
-    assert ports[0]["ib_link_layer"] == "Ethernet"
-    assert ports[0]["ib_state"] == "4: ACTIVE"
-    assert ports[0]["ib_rate"] == "100 Gb/sec (4X EDR)"
-    assert ports[0]["ib_lid"] == "0x0"
+    assert ports[0].link_layer == "Ethernet"
+    assert ports[0].state == "4: ACTIVE"
+    assert ports[0].rate == "100 Gb/sec (4X EDR)"
+    assert ports[0].lid == "0x0"
 
 
 def test_host_without_rdma_hardware_reports_no_ports(scrape: dict[str, Any], tmp_path: Path) -> None:
@@ -143,8 +145,8 @@ def test_unreadable_attribute_leaves_an_empty_field(scrape: dict[str, Any], tmp_
     ports = scrape["get_infiniband_ports"]()
 
     # Assert — the port still lands, only the missing attribute is empty
-    assert ports[0]["ib_sm_lid"] == ""
-    assert ports[0]["ib_state"] == "4: ACTIVE"
+    assert ports[0].sm_lid == ""
+    assert ports[0].state == "4: ACTIVE"
 
 
 def _dict_literal_keys(module: ast.Module, dict_name: str) -> list[str]:
