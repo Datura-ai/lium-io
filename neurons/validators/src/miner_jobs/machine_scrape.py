@@ -1040,6 +1040,8 @@ def check_storage_limit_ability() -> tuple[bool, str]:
 NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
+# 0-1 are the link-local GIDs, 2-3 the IPv4-mapped ones a RoCE port is reachable on.
+GID_TABLE_ENTRIES_READ = 4
 
 
 class NcuProfilingObservation:
@@ -1102,55 +1104,64 @@ class InfinibandPort:
         device: str,
         port: str,
         node_guid: str,
+        sys_image_guid: str,
         link_layer: str,
         state: str,
         phys_state: str,
         rate: str,
         lid: str,
         sm_lid: str,
-        subnet_prefix: str,
+        pkey: str,
+        gids: list[str],
     ) -> None:
         self.device = device
         self.port = port
         self.node_guid = node_guid
+        self.sys_image_guid = sys_image_guid
         self.link_layer = link_layer
         self.state = state
         self.phys_state = phys_state
         self.rate = rate
         self.lid = lid
         self.sm_lid = sm_lid
-        self.subnet_prefix = subnet_prefix
+        self.pkey = pkey
+        self.gids = gids
 
-    def as_payload(self) -> dict[str, str]:
+    def as_payload(self) -> dict[str, str | list[str]]:
         return {
             "ib_device": self.device,
             "ib_port": self.port,
             "ib_node_guid": self.node_guid,
+            "ib_sys_image_guid": self.sys_image_guid,
             "ib_link_layer": self.link_layer,
             "ib_state": self.state,
             "ib_phys_state": self.phys_state,
             "ib_rate": self.rate,
             "ib_lid": self.lid,
             "ib_sm_lid": self.sm_lid,
-            "ib_subnet_prefix": self.subnet_prefix,
+            "ib_pkey": self.pkey,
+            "ib_gids": self.gids,
         }
 
 
 def read_infiniband_port(device_path: str, node_guid: str, port_path: str) -> InfinibandPort:
-    # gids/0 is the port's default GID; its first four groups are the subnet prefix, the identifier
-    # every port on one fabric shares.
-    default_gid = read_sysfs_value(f"{port_path}/gids/0")
+    # Whole GID table, not just gids/0: every prod port carries the default fe80:: prefix, so the
+    # prefix alone identifies nothing. The IPv4-mapped entries further down (indices 2-3 on RoCE)
+    # are what tells two Ethernet ports they share a segment.
+    gids = [read_sysfs_value(f"{port_path}/gids/{index}") for index in range(GID_TABLE_ENTRIES_READ)]
     return InfinibandPort(
         device=os.path.basename(device_path),
         port=os.path.basename(port_path),
         node_guid=node_guid,
+        sys_image_guid=read_sysfs_value(f"{device_path}/sys_image_guid"),
         link_layer=read_sysfs_value(f"{port_path}/link_layer"),
         state=read_sysfs_value(f"{port_path}/state"),
         phys_state=read_sysfs_value(f"{port_path}/phys_state"),
         rate=read_sysfs_value(f"{port_path}/rate"),
         lid=read_sysfs_value(f"{port_path}/lid"),
         sm_lid=read_sysfs_value(f"{port_path}/sm_lid"),
-        subnet_prefix=":".join(default_gid.split(":")[:4]),
+        pkey=read_sysfs_value(f"{port_path}/pkeys/0"),
+        gids=[gid for gid in gids if gid],
     )
 
 

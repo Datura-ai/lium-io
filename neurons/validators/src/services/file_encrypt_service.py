@@ -135,7 +135,9 @@ ORIGINAL_KEYS = {
     'ib_rate': "rate",
     'ib_lid': "lid",
     'ib_sm_lid': "sm_lid",
-    'ib_subnet_prefix': "subnet_prefix",
+    'ib_sys_image_guid': "sys_image_guid",
+    'ib_pkey': "pkey",
+    'ib_gids': "gids",
     'data_boot_id': "boot_id",
 }
 
@@ -303,7 +305,9 @@ class FileEncryptService:
             'ib_rate': "",
             'ib_lid': "",
             'ib_sm_lid': "",
-            'ib_subnet_prefix': "",
+            'ib_sys_image_guid': "",
+            'ib_pkey': "",
+            'ib_gids': "",
             'data_boot_id': "",
         }
 
