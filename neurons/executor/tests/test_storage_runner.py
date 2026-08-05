@@ -358,7 +358,7 @@ def test_exit_code_three_with_snapshot_is_completed_partial(
     assert '"result_quality":"PARTIAL"' in output.getvalue()
 
 
-def test_docker_restore_streams_directly_to_requested_directory() -> None:
+def test_docker_restore_uses_native_json_restore_to_requested_directory() -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
     workspace = DockerVolumeWorkspace(
         image="executor:test",
@@ -374,11 +374,10 @@ def test_docker_restore_streams_directly_to_requested_directory() -> None:
     assert "--workdir" not in command
     assert SNAPSHOT_ID in command
     assert "/workspace/restored" in command
-    assert "pipefail" in command
-    pipeline = command[command.index("-c") + 1]
-    assert "dump --archive tar" in pipeline
-    assert "LIUM_RESTORE_CHECKPOINT_%u" in pipeline
-    assert "--acls --xattrs" in pipeline
+    assert "restore" in command
+    assert "--json" in command
+    assert "--sparse" in command
+    assert "dump" not in command
 
 
 def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
@@ -407,7 +406,7 @@ def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
     assert "s3.connections=64" in command
 
 
-def test_encrypted_restore_uses_namespace_path_without_unsupported_acl_flags() -> None:
+def test_encrypted_restore_uses_namespace_path_without_xattrs() -> None:
     operation = StorageOperationSpec.from_mapping(
         _operation_payload(action="restore", mode="encrypted_running")
     )
@@ -427,10 +426,9 @@ def test_encrypted_restore_uses_namespace_path_without_unsupported_acl_flags() -
     assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
     assert command[command.index("-t") + 1] == "4321"
     assert "/proc/4321/root/root/restored" in command
-    pipeline = command[command.index("-c") + 1]
-    assert "dump --archive tar" in pipeline
-    assert "--acls" not in pipeline
-    assert "--xattrs" not in pipeline
+    assert "restore" in command
+    assert "--json" in command
+    assert command[command.index("--exclude-xattr") + 1] == "*"
 
 
 class _FakeRestorePopen:
@@ -548,3 +546,38 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
     assert terminal_payload["error_message"] == (
         "failed to save model.bin: no space left on device"
     )
+
+
+def test_reporter_full_completion_finishes_known_counters() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.BACKUP,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.BACKUP,
+        ),
+        session=session,
+    )
+
+    reporter.send(
+        {
+            "event": "restic",
+            "payload": {
+                "message_type": "status",
+                "total_files": 7,
+                "files_done": 2,
+                "total_bytes": 100,
+                "bytes_done": 25,
+            },
+        }
+    )
+    reporter.send(
+        {"event": "result", "status": "COMPLETED", "result_quality": "FULL", "exit_code": 0}
+    )
+
+    terminal_payload = session.requests[-1]["json"]
+    assert isinstance(terminal_payload, dict)
+    assert terminal_payload["processed_files"] == 7
+    assert terminal_payload["processed_bytes"] == 100

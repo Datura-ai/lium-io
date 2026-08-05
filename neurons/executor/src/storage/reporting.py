@@ -66,12 +66,16 @@ class StorageEventReporter:
             status = event.get("status")
             if not isinstance(status, str):
                 return
+            result_quality = _optional_string(event.get("result_quality"))
             if status == "COMPLETED":
                 self._state.progress = 100.0
+                if result_quality == "FULL":
+                    self._state.processed_files = self._state.total_files
+                    self._state.processed_bytes = self._state.total_bytes
             self._put(
                 self._progress_payload(
                     status=status,
-                    result_quality=_optional_string(event.get("result_quality")),
+                    result_quality=result_quality,
                     snapshot_id=_optional_string(event.get("snapshot_id")),
                     exit_code=_optional_integer(event.get("exit_code")),
                     error_message=self._failure_detail if status != "COMPLETED" else None,

@@ -52,19 +52,6 @@ trap cleanup EXIT INT TERM
 "$@"
 '''
 
-
-def _restore_pipeline_script(*, extended_metadata: bool) -> str:
-    metadata_options = '--acls --xattrs --xattrs-include="*" ' if extended_metadata else ""
-    return (
-        'mkdir -p -- "$4"; '
-        '"$1" --no-cache -o "$2" dump --archive tar "$3" / | '
-        'tar --extract --file - --directory "$4" --preserve-permissions '
-        f'--same-owner --numeric-owner {metadata_options}'
-        f'--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} '
-        f'--checkpoint-action=echo={RESTORE_CHECKPOINT_PREFIX}%u'
-    )
-
-
 class ResticOperationError(RuntimeError):
     pass
 
@@ -247,21 +234,10 @@ class ResticStorageRunner:
         snapshot_id = self._operation.snapshot_id
         if not snapshot_id:
             raise ResticOperationError("restore requires a snapshot ID")
-        restore_stats = self._restore_stats(snapshot_id)
         command, cwd = self._restore_execution_command(snapshot_id)
-        exit_code, _ = self._stream_command(command, cwd, restore_stats=restore_stats)
+        exit_code, _ = self._stream_command(command, cwd)
         if exit_code != 0:
             raise ResticOperationError(f"restic restore failed with exit {exit_code}")
-        self._events.restic_event(
-            {
-                "message_type": "summary",
-                "percent_done": 1,
-                "total_files": restore_stats.total_file_count,
-                "files_restored": restore_stats.total_file_count,
-                "total_bytes": restore_stats.total_size,
-                "bytes_restored": restore_stats.total_size,
-            }
-        )
         return ResticResult("COMPLETED", OperationResultQuality.FULL, snapshot_id, exit_code)
 
     def _restore_legacy_archive(self) -> ResticResult:
@@ -287,30 +263,6 @@ class ResticStorageRunner:
             }
         )
         return ResticResult("COMPLETED", OperationResultQuality.FULL, None, exit_code)
-
-    def _restore_stats(self, snapshot_id: str) -> RestoreStats:
-        result = subprocess.run(
-            self._restic_command(["stats", "--json", "--mode", "restore-size", snapshot_id]),
-            env=self._environment,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            detail = _redact(result.stderr or result.stdout, self._secret_values())
-            raise ResticOperationError(
-                f"restic restore size lookup failed with exit {result.returncode}: {detail}"
-            )
-        try:
-            payload = json.loads(result.stdout)
-            total_size = payload["total_size"]
-            total_file_count = payload["total_file_count"]
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
-            raise ResticOperationError("restic restore size lookup returned invalid JSON") from error
-        if not isinstance(total_size, int) or total_size < 0:
-            raise ResticOperationError("restic restore size lookup returned an invalid total_size")
-        if not isinstance(total_file_count, int) or total_file_count < 0:
-            raise ResticOperationError("restic restore size lookup returned an invalid total_file_count")
-        return RestoreStats(total_size=total_size, total_file_count=total_file_count)
 
     def _stream(
         self,
@@ -462,36 +414,17 @@ class ResticStorageRunner:
         return command, None
 
     def _restore_execution_command(self, snapshot_id: str) -> tuple[list[str], str | None]:
-        extended_metadata = not isinstance(self._workspace, DockerUserNamespaceWorkspace)
-        pipeline_command = [
-            "/bin/bash",
-            "-o",
-            "pipefail",
-            "-c",
-            _restore_pipeline_script(extended_metadata=extended_metadata),
-            "bash",
-            self._restic_binary,
-            self._s3_connection_option(),
-            snapshot_id,
+        arguments = [
+            "restore",
+            "--json",
+            "--target",
             self._workspace_path(),
+            "--sparse",
         ]
-        if isinstance(self._workspace, LocalWorkspace):
-            return pipeline_command, None
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
-            return self._encrypted_helper_command(pipeline_command), None
-        if isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            return self._encrypted_volume_helper_command(pipeline_command, False), None
-        return [
-            *self._docker_helper_base(),
-            "--security-opt",
-            "no-new-privileges",
-            "-v",
-            f"{self._workspace.volume_name}:/workspace:rw",
-            "--entrypoint",
-            "/bin/bash",
-            self._workspace.image,
-            *pipeline_command[1:],
-        ], None
+            arguments.extend(["--exclude-xattr", "*"])
+        arguments.append(snapshot_id)
+        return self._execution_command(arguments, working_directory=False)
 
     def _legacy_restore_execution_command(self, object_key: str) -> tuple[list[str], str | None]:
         pipeline_script = (
