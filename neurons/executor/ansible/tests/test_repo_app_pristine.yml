@@ -1,0 +1,164 @@
+---
+# The measured surface must be unmodified, and the role must REFUSE when it is.
+#
+# Everything under neurons/executor/dstacktee/app/ — docker-compose*.yml,
+# pre_launch_script.sh, init_script.sh — is hashed into the compose the
+# validator whitelists. Any local edit, however small, produces a hash nobody
+# has whitelisted, and every attestation fails.
+#
+# Both directions are tested. An assertion that only ever sees a clean tree
+# proves nothing about whether it would catch a dirty one.
+
+- name: Repo role refuses a modified measured surface
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    repo_work: /tmp/lium-repo-fixture
+    lium_state_dir: /tmp/lium-repo-fixture/state
+    lium_log_dir: /tmp/lium-repo-fixture/log
+    lium_hda_search_roots: ["/tmp/lium-repo-fixture/no-such-root"]
+    lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    lium_repo_path: /tmp/lium-repo-fixture/repo
+    lium_repo_clone: false
+
+  pre_tasks:
+    - name: Provide an empty proc root
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/fixtures/emptyproc"
+        state: directory
+        mode: "0755"
+
+    - name: Start from a clean work tree
+      ansible.builtin.file:
+        path: "{{ repo_work }}"
+        state: absent
+
+    - name: Lay out the fixture checkout
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ lium_repo_path }}/neurons/executor/dstacktee/app"
+        - "{{ lium_repo_path }}/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11"
+
+    # Satisfies the real precondition of the image-download task rather than
+    # gating it behind another variable: with a digest present there is nothing
+    # to download, which is exactly the state this test wants to be in.
+    - name: Pretend the CVM OS image is already downloaded
+      ansible.builtin.copy:
+        dest: "{{ lium_repo_path }}/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11/digest.txt"
+        content: "sha256:0000000000000000000000000000000000000000000000000000000000000000
+"
+        mode: "0644"
+
+    # A real git repository, because the fact collector asks git — not the
+    # filesystem — what is dirty.
+    - name: Commit a pristine measured surface
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          cd {{ lium_repo_path }}
+          git init -q -b main
+          git config user.email fixture@example.invalid
+          git config user.name Fixture
+          cp {{ playbook_dir }}/fixtures/repo_dirty_app/neurons/executor/dstacktee/app/docker-compose.yml \
+             neurons/executor/dstacktee/app/docker-compose.yml
+          git add -A
+          git commit -q -m "fixture: pristine measured surface"
+        executable: /bin/bash
+      changed_when: true
+
+  tasks:
+    # --- clean tree: the role must NOT refuse --------------------------------
+    - name: Collect facts against the clean fixture
+      ansible.builtin.include_role:
+        name: common
+
+    - name: The clean fixture reports nothing dirty
+      ansible.builtin.assert:
+        that:
+          - lium.app_dirty_files | length == 0
+        fail_msg: >-
+          The fixture checkout was committed clean but reports
+          {{ lium.app_dirty_files }} as modified. The fixture is wrong, so the
+          negative case below would prove nothing.
+        quiet: true
+
+    - name: Accept a pristine measured surface
+      block:
+        - name: Run repo against the clean fixture
+          ansible.builtin.include_role:
+            name: repo
+
+        - name: Record that repo accepted it
+          ansible.builtin.set_fact:
+            repo_clean_refused: false
+      rescue:
+        - name: Record that repo refused a clean tree
+          ansible.builtin.set_fact:
+            repo_clean_refused: true
+            repo_clean_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: A pristine tree must not be refused
+      ansible.builtin.assert:
+        that:
+          - not (repo_clean_refused | bool)
+        fail_msg: >-
+          repo refused a CLEAN measured surface: {{ repo_clean_msg | default('') }}
+        quiet: true
+
+    # --- dirty tree: the role MUST refuse ------------------------------------
+    - name: Modify the measured surface
+      ansible.builtin.lineinfile:
+        path: "{{ lium_repo_path }}/neurons/executor/dstacktee/app/docker-compose.yml"
+        line: "# a local edit that changes the compose hash"
+        create: false
+
+    - name: Re-collect facts against the dirty fixture
+      ansible.builtin.include_role:
+        name: common
+
+    - name: The dirty fixture is detected
+      ansible.builtin.assert:
+        that:
+          - lium.app_dirty_files | length > 0
+        fail_msg: >-
+          app/docker-compose.yml was modified but git reports nothing dirty, so
+          the refusal below cannot be attributed to the edit.
+        quiet: true
+
+    - name: Refuse a modified measured surface
+      block:
+        - name: Run repo against the dirty fixture
+          ansible.builtin.include_role:
+            name: repo
+
+        - name: Record that repo accepted a dirty tree
+          ansible.builtin.set_fact:
+            repo_dirty_refused: false
+            repo_dirty_msg: ""
+      rescue:
+        - name: Record the refusal
+          ansible.builtin.set_fact:
+            repo_dirty_refused: true
+            repo_dirty_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: The refusal happens, names the file, and gives the exact fix
+      ansible.builtin.assert:
+        that:
+          - repo_dirty_refused | bool
+          - "'docker-compose.yml' in repo_dirty_msg"
+          - "'checkout -- neurons/executor/dstacktee/app' in repo_dirty_msg"
+        fail_msg: >-
+          repo must REFUSE a modified measured surface, list the dirty files, and
+          print the exact restore command. refused={{ repo_dirty_refused }}
+          msg={{ repo_dirty_msg }}
+        quiet: true
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: >-
+          PASS repo accepts a pristine measured surface and refuses a modified
+          one, naming the file and the restore command.

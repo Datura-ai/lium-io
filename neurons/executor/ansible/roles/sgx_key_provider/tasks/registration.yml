@@ -38,6 +38,7 @@
         exit 1
       fi
     creates: "{{ lium_state_dir }}/efivar-backup/.complete"
+    executable: /bin/bash
   register: lium_efivar_backup
 
 - name: Mark the efivar backup complete
@@ -79,6 +80,7 @@
       tail -n +2 {{ lium_state_dir }}/pckid.csv | head -1 | cut -d, -f6 \
         | tr -d ' "' | xxd -r -p > {{ lium_state_dir }}/platform_manifest.bin
       stat -c %s {{ lium_state_dir }}/platform_manifest.bin
+    executable: /bin/bash
   register: lium_manifest_decode
   changed_when: true
 

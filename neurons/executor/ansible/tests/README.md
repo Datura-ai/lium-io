@@ -38,6 +38,7 @@ ansible-playbook -i inventory/localhost.yml tests/test_grub_fixtures.yml
 ansible-playbook -i inventory/localhost.yml tests/test_kernel_idempotence.yml
 ansible-playbook -i inventory/localhost.yml tests/test_sgx_registration.yml
 ansible-playbook -i inventory/localhost.yml tests/test_stubs.yml
+ansible-playbook -i inventory/localhost.yml tests/test_repo_app_pristine.yml
 ansible-playbook -i inventory/localhost.yml tests/test_maintenance_profile.yml
 ```
 
@@ -118,6 +119,7 @@ below play vars, which is what lets each test override cleanly.
 | `test_kernel_idempotence.yml` | Pass 2 leaves every managed file byte-identical — and pass 1 must have changed something, or the assertion would be vacuous. | CI-runner |
 | `test_sgx_registration.yml` | The manifest length rule accepts 17950 and rejects 17954. | CI-runner |
 | `test_stubs.yml` | Both stubs are loud when unset **and** when set. | CI-runner |
+| `test_repo_app_pristine.yml` | `repo` accepts a pristine measured surface and **refuses** a modified one, naming the file and the restore command. | CI-runner |
 | `test_maintenance_profile.yml` | `--skip-tags destructive` on a host with a CVM **reaches verify** instead of aborting. | CI-runner |
 | `test_preflight_messages.yml` | Preflight names each missing BIOS knob, and the OS gate did *not* fire. | CI-container |
 
