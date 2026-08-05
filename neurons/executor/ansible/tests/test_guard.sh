@@ -65,11 +65,36 @@ make_proc "$PROC" 1002 "bash" S "/bin/bash -c ansible-playbook --repo /opt/lium-
 expect_state "(b) argv-only decoy does not block" CLEAN \
   env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent LIUM_REPO_PATH=/nonexistent
 
+# (b2) The QEMU SOURCE BUILD shape: a non-qemu process whose argv mentions
+#      qemu-system. Case (b) only covers argv containing `run/vms/`, so a
+#      regression to matching comm+argv against `qemu-system` — which is what
+#      `pgrep -f qemu-system` would do — slips straight past it. That regression
+#      refuses to converge for the whole 10-40 minutes of a QEMU build, on a
+#      host with no CVM at all.
+rm -rf "${PROC:?}"/*
+make_proc "$PROC" 1006 "make" S "make -j32 qemu-system-x86_64"
+expect_state "(b2) a build whose argv mentions qemu-system does not block" CLEAN \
+  env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent LIUM_REPO_PATH=/nonexistent
+
 # (c) THE CASE A PROCESS-ONLY GUARD WOULD WAVE THROUGH.
 #     A stopped CVM: hda.img on disk, zero processes. stop_cvm() never removes
 #     the VM directory, so this is a normal, reachable, common state.
 expect_state "(c) hda.img with no processes blocks as DORMANT" DORMANT \
   env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$FIX/dormant_hda" LIUM_REPO_PATH=/nonexistent
+
+# (c2) A checkout deeper than /opt/lium-io.
+#
+#      /home/<user>/lium-io puts hda.img at depth 9 below the search root, and
+#      the find budget was 8 — so /home, which is in the root list precisely to
+#      catch a home-directory checkout, could not reach one. The guard answered
+#      CLEAN on a host holding a renter's encrypted disk, and the converge would
+#      have rebuilt QEMU under it.
+DEEP="$(mktemp -d)"
+mkdir -p "$DEEP/ubuntu/lium-io/neurons/executor/dstacktee/run/vms/demo"
+: >"$DEEP/ubuntu/lium-io/neurons/executor/dstacktee/run/vms/demo/hda.img"
+expect_state "(c2) a checkout one level deeper than /opt still blocks" DORMANT \
+  env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$DEEP" LIUM_REPO_PATH=/nonexistent
+rm -rf "$DEEP"
 
 # (d) Unreadable vs absent. An absent root is the NORMAL fresh-host shape before
 #     the clone and must never read as a permissions failure.

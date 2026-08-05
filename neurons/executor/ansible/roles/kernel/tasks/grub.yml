@@ -4,31 +4,6 @@
 # Every step here is driven through a seam so the whole chain runs end to end in
 # CI against a fixture root, without a real bootloader.
 
-# `vfio-pci.ids=` MAY ONLY WIDEN.
-#
-# If a device is hot-removed or wedged it disappears from lspci, the freshly
-# discovered set gets shorter, and writing that shorter list unbinds a GPU on the
-# next boot. Refuse and name the missing ids instead.
-- name: Refuse to narrow vfio-pci.ids
-  ansible.builtin.fail:
-    msg: |
-      REFUSING: the vfio-pci id list would get SHORTER.
-
-      Already on the kernel command line or in GRUB : {{ lium.grub_existing_vfio_ids | join(', ') }}
-      Discovered on this host right now             : {{ lium.present_pci_ids | join(', ') }}
-      Would be dropped                              : {{ lium_vfio_ids_dropped | join(', ') }}
-
-      A device that is hot-removed or wedged disappears from lspci. Writing the
-      shorter list would unbind it on the next boot. Bring it back first:
-
-          echo 1 | sudo tee /sys/bus/pci/rescan
-
-      then re-run. If the device is genuinely gone for good, remove its id from
-      GRUB by hand so the two agree.
-  vars:
-    lium_vfio_ids_dropped: "{{ lium.grub_existing_vfio_ids | difference(lium.present_pci_ids) }}"
-  when: lium_vfio_ids_dropped | length > 0
-
 - name: Build the required token set
   ansible.builtin.set_fact:
     lium_required_tokens: >-
@@ -56,6 +31,7 @@
       --grub-default {{ lium_grub_default_path | quote }}
       --grub-dropin-dir {{ lium_grub_dropin_path | dirname | quote }}
       --exclude-dropin {{ lium_grub_dropin_path | quote }}
+      --proc-cmdline {{ lium_proc_cmdline_path | quote }}
   register: lium_cmdline_before_raw
   changed_when: false
   check_mode: false
@@ -63,6 +39,38 @@
 - name: Publish the provider's own configuration
   ansible.builtin.set_fact:
     lium_cmdline_before: "{{ lium_cmdline_before_raw.stdout | from_json }}"
+
+# `vfio-pci.ids=` MAY ONLY WIDEN.
+#
+# If a device is hot-removed or wedged it disappears from lspci, the freshly
+# discovered set gets shorter, and writing that shorter list unbinds a GPU on
+# the next boot. Refuse and name the missing ids instead.
+#
+# The comparison uses the analysis above, NOT the collected facts, because that
+# analysis reads /proc/cmdline as well as both GRUB variables. A host booted
+# with ids that were later cleaned out of the GRUB files would otherwise show an
+# empty "existing" set, the difference would be empty, and the shorter list
+# would be written — the exact outcome this rule exists to prevent.
+- name: Refuse to narrow vfio-pci.ids
+  ansible.builtin.fail:
+    msg: |
+      REFUSING: the vfio-pci id list would get SHORTER.
+
+      Already on the kernel command line or in GRUB : {{ lium_cmdline_before.existing_vfio_ids | join(', ') }}
+      Discovered on this host right now             : {{ lium.present_pci_ids | join(', ') }}
+      Would be dropped                              : {{ lium_vfio_ids_dropped | join(', ') }}
+
+      A device that is hot-removed or wedged disappears from lspci. Writing the
+      shorter list would unbind it on the next boot. Bring it back first:
+
+          echo 1 | sudo tee /sys/bus/pci/rescan
+
+      then re-run. If the device is genuinely gone for good, remove its id from
+      GRUB by hand so the two agree.
+  vars:
+    lium_vfio_ids_dropped: >-
+      {{ lium_cmdline_before.existing_vfio_ids | difference(lium.present_pci_ids) }}
+  when: lium_vfio_ids_dropped | length > 0
 
 # Once, and never overwritten: the point of a backup is the state BEFORE the
 # first change, not before the most recent one.
@@ -87,12 +95,20 @@
     mode: "0644"
   register: lium_grub_dropin
 
+- name: Check whether a bootloader configuration exists at all
+  ansible.builtin.stat:
+    path: "{{ lium_grubcfg_path }}"
+  register: lium_grubcfg_stat
+
 - name: Regenerate the bootloader configuration
   ansible.builtin.command:
     cmd: "{{ lium_update_grub_cmd }}"
   register: lium_update_grub_result
   changed_when: lium_update_grub_result.rc == 0
-  when: lium_grub_dropin.changed
+  # Also when grub.cfg is absent: on a re-run where the drop-in is byte-identical
+  # but a previous regeneration never succeeded, gating on `changed` alone would
+  # never retry, and the assertion below would then have nothing to read.
+  when: lium_grub_dropin.changed or not (lium_grubcfg_stat.stat.exists | default(false))
 
 # THE DECISIVE CHECK, and it runs before a reboot is even offered.
 #
@@ -119,11 +135,18 @@
 - name: Assert every required token wins in the generated grub.cfg
   ansible.builtin.assert:
     that:
+      # Presence is part of the assertion, NOT a condition on it. Gating on
+      # grubcfg_present made this fail OPEN in the one case it exists for: a
+      # full /boot, where update-grub writes nothing, no linux line can be
+      # parsed, the check is skipped, drift is still non-empty — and the host
+      # reboots into a configuration nobody verified.
+      - lium_cmdline.grubcfg_present | bool
       - lium_cmdline.grubcfg_missing_tokens | length == 0
     fail_msg: |
-      The generated bootloader configuration does NOT resolve every required token.
-      Refusing to reboot into it.
+      The generated bootloader configuration does NOT resolve every required token,
+      or could not be read at all. Refusing to reboot into it.
 
+      grub.cfg readable     : {{ lium_cmdline.grubcfg_present }}
       Missing or overridden : {{ lium_cmdline.grubcfg_missing_tokens | join(', ') }}
       grub.cfg linux line   : {{ lium_cmdline.grubcfg_linux_line }}
       GRUB_CMDLINE_LINUX    : {{ lium_cmdline.grub_cmdline_linux }}
@@ -133,7 +156,6 @@
           sudo cp {{ lium_grub_default_path }}.bak.pre-lium-cvm {{ lium_grub_default_path }}
     success_msg: "Every required token resolves correctly in the generated grub.cfg."
     quiet: true
-  when: lium_cmdline.grubcfg_present | bool
 
 - name: Record the running kernel's drift
   ansible.builtin.set_fact:

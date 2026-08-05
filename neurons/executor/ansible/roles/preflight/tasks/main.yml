@@ -108,8 +108,11 @@
       {{ lium_preflight_failed + [{
         'id': 'boot.grub_present',
         'msg': 'this host does not boot via GRUB (systemd-boot or a vendor bootloader).
-                Automated kernel command-line changes are not supported here; apply the
-                section 2 parameters by hand and re-run with --skip-tags kernel'
+                Automated kernel command-line changes are not supported here. Add these
+                parameters to your bootloader by hand: kvm_intel.tdx=on intel_iommu=on
+                iommu=pt nohibernate vfio-pci.ids=<your GPU and NVSwitch ids>
+                vfio_iommu_type1.dma_entry_limit=16777216 -- then re-run with
+                --skip-tags kernel'
       }] }}
   when: >-
     not (lium.boot_grub_present | default(false) | bool)

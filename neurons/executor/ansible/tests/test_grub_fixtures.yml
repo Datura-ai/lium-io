@@ -88,6 +88,27 @@
       vars:
         grub_work: "{{ grub_root }}/{{ grub_case.name }}"
 
+    # The superset rule had NO coverage: every other fixture leaves the
+    # existing id set empty, so "Refuse to narrow vfio-pci.ids" was skipped in
+    # all of them. Both halves are exercised here — an id only GRUB knows about,
+    # and an id only /proc/cmdline knows about. The second is the one that
+    # motivated reading /proc/cmdline at all: a host booted with ids that were
+    # later cleaned out of the GRUB files.
+    - name: Run each narrowing case
+      ansible.builtin.include_tasks: _grub_narrowing_case.yml
+      loop:
+        - name: grub_has_extra_id
+          fixture: narrowing
+          proc: cmdline_complete
+          dropped: "10de:dead"
+        - name: proc_has_extra_id
+          fixture: narrowing_proc_only
+          proc: cmdline_booted_extra_vfio_id
+          dropped: "10de:beef"
+      loop_control:
+        loop_var: narrow_case
+        label: "{{ narrow_case.name }}"
+
     - name: All GRUB fixtures passed
       ansible.builtin.debug:
-        msg: "{{ grub_cases | length }} GRUB fixtures passed."
+        msg: "{{ grub_cases | length }} GRUB fixtures and 2 narrowing cases passed."

@@ -21,8 +21,8 @@
     - lium-resume.sh
 
 - name: Install the resume unit
-  ansible.builtin.copy:
-    src: lium-cvm-resume.service
+  ansible.builtin.template:
+    src: lium-cvm-resume.service.j2
     dest: /etc/systemd/system/lium-cvm-resume.service
     mode: "0644"
 

@@ -9,6 +9,18 @@
 # There is deliberately no `! grep` anywhere — under `bash -e` a command
 # preceded by `!` does not trigger the errexit trap, so such an "assertion"
 # silently always passes.
+#
+# MATCHING IS PER FILE, ON RAW LINES.
+#
+# An earlier version piped every file through a comment stripper that prefixed
+# each line with "path:lineno:" and then grepped THAT. Two of the rules are
+# anchored with `^` — and those are precisely the two `!`-inverted rules the
+# whole exercise exists to enforce — so the anchor bound to the file path and
+# they could never fire. The rules that mattered most were the ones that were
+# inert.
+#
+# grep is therefore run against each file directly, where `^` means what it
+# says, and comments are filtered out of the MATCHES afterwards.
 
 set -Eeuo pipefail
 
@@ -16,6 +28,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 PATTERN_FILE="tests/forbidden-patterns.txt"
 WORKFLOWS_DIR="../../../.github/workflows"
+REQUIRED_WORKFLOWS=(test.yml qemu-2604-compile.yml)
 
 FAILURES=0
 
@@ -30,44 +43,102 @@ fail() {
 tree_files() {
   find roles -type d \( -name tasks -o -name files -o -name templates \) -exec find {} -type f \; 2>/dev/null
   find group_vars -type f 2>/dev/null
-  printf '%s\n' bootstrap.sh site.yml
+  printf '%s\n' site.yml
+}
+
+bootstrap_files() {
+  printf '%s\n' bootstrap.sh
+}
+
+# The command catalogue and the variable file, named separately so a `require`
+# rule can insist a value lives WHERE IT IS USED. Scoped at `tree` these rules
+# were satisfied by any non-comment mention anywhere — including a runtime error
+# message that happens to quote the flag — which made them decorative.
+commands_file() {
+  printf '%s\n' group_vars/all/commands.yml
+}
+
+groupvars_files() {
+  find group_vars -type f 2>/dev/null
 }
 
 ci_files() {
-  for f in "$WORKFLOWS_DIR/test.yml" "$WORKFLOWS_DIR/qemu-2604-compile.yml"; do
-    [ -f "$f" ] && printf '%s\n' "$f"
-  done
-}
-
-# Emit `path:lineno:content` for every line that is not a whole-line comment.
-#
-# Whole-line only, on purpose. A trailing-comment stripper would have to know
-# where a `#` is quoted, and getting that wrong in the permissive direction is
-# how a real command hides behind a fake comment.
-strip_comments() {
-  local file
-  for file in "$@"; do
-    [ -f "$file" ] || continue
-    awk -v f="$file" '
-      { line = $0
-        sub(/^[[:space:]]+/, "", line)
-        if (line ~ /^#/) next          # shell and YAML comment
-        if (line ~ /^\{#/) next        # Jinja comment opener
-        if (line ~ /^-#\}/) next       # Jinja comment closer
-        print f ":" NR ":" $0
-      }' "$file"
+  local f
+  for f in "${REQUIRED_WORKFLOWS[@]}"; do
+    printf '%s\n' "${WORKFLOWS_DIR}/${f}"
   done
 }
 
 files_for_scope() {
   case "$1" in
-    tree) tree_files ;;
+    tree) tree_files; bootstrap_files ;;
+    bootstrap) bootstrap_files ;;
+    commands) commands_file ;;
+    groupvars) groupvars_files ;;
     ci) ci_files ;;
-    all) tree_files; ci_files ;;
+    all) tree_files; bootstrap_files; ci_files ;;
   esac
 }
 
+# Is this line a whole-line comment?
+#
+# Whole-line only, on purpose. A trailing-comment stripper would have to know
+# where a `#` is quoted, and getting that wrong in the permissive direction is
+# how a real command hides behind a fake comment.
+is_comment_line() {
+  local line="${1#"${1%%[![:space:]]*}"}"   # strip leading whitespace
+  case "$line" in
+    '#'*) return 0 ;;      # shell and YAML comment
+    '{#'*) return 0 ;;     # Jinja comment opener
+    '-#}'*) return 0 ;;    # Jinja comment closer
+    *) return 1 ;;
+  esac
+}
+
+# Every match of PATTERN in FILE that is not on a comment line.
+# Prints "file:lineno:content". grep is given the file directly, so an anchored
+# pattern anchors on the CODE.
+matches_in_file() {
+  local kind="$1" pattern="$2" file="$3" rc=0 out lineno content
+  [ -f "$file" ] || return 0
+
+  case "$kind" in
+    fixed) out="$(grep -F -n -- "$pattern" "$file")" || rc=$? ;;
+    regex) out="$(grep -E -n -- "$pattern" "$file")" || rc=$? ;;
+  esac
+
+  # grep exits 0 on a match, 1 on none, and >=2 on an ERROR — a malformed
+  # pattern, say. Treating an error as "no match" would silently disable the
+  # rule, which is the failure mode this whole file exists to prevent.
+  if [ "$rc" -ge 2 ]; then
+    fail "grep failed (rc=$rc) applying '$pattern' to $file — the rule is not being enforced"
+    return 0
+  fi
+  [ "$rc" -eq 0 ] || return 0
+
+  while IFS= read -r hit; do
+    [ -n "$hit" ] || continue
+    lineno="${hit%%:*}"
+    content="${hit#*:}"
+    if is_comment_line "$content"; then
+      continue
+    fi
+    printf '%s:%s:%s\n' "$file" "$lineno" "$content"
+  done <<<"$out"
+}
+
 [ -r "$PATTERN_FILE" ] || { printf 'FAIL: %s is missing\n' "$PATTERN_FILE" >&2; exit 1; }
+
+# The CI-scoped rules exist because the workflow files sit OUTSIDE this job's
+# working directory, and an earlier version of this rule was unenforced against
+# exactly the files that had the defect. A missing workflow file is a failure,
+# never a skip — and each is checked individually, so renaming one cannot
+# silently shrink the scope to the other.
+for wf in "${REQUIRED_WORKFLOWS[@]}"; do
+  if [ ! -f "${WORKFLOWS_DIR}/${wf}" ]; then
+    fail "workflow ${wf} not found at ${WORKFLOWS_DIR} — every CI-scoped rule is unenforced"
+  fi
+done
 
 RULES=0
 
@@ -79,43 +150,40 @@ while IFS=$'\t' read -r sense kind scope pattern why; do
   RULES=$((RULES + 1))
 
   mapfile -t targets < <(files_for_scope "$scope" | sort -u)
-  # A scope with no files is a failure, never a skip. The CI-scoped rules exist
-  # because the workflow files sit OUTSIDE this job's working directory, and an
-  # earlier version of this rule was unenforced against exactly the files that
-  # had the defect. Silently passing when they cannot be found would recreate
-  # that hole the first time somebody moved or renamed one.
   if [ "${#targets[@]}" -eq 0 ]; then
     fail "no files found for scope '$scope' — rule for '$pattern' is unenforced"
     continue
   fi
 
   case "$kind" in
-    fixed) GREP_ARGS=(-F) ;;
-    regex) GREP_ARGS=(-E) ;;
+    fixed|regex) ;;
     *) fail "unknown pattern kind '$kind' for '$pattern'"; continue ;;
   esac
 
   if [ "$sense" = "deny" ]; then
-    # Deny rules match EFFECTIVE content only: comment lines are stripped first.
-    #
-    # The thing being prevented is the playbook DOING one of these, not a
-    # comment saying "never do this" — and those comments are exactly where the
-    # field evidence for each ban is recorded, right next to the code it
-    # constrains. Stripping them removes no protection: every command this tree
-    # runs is built in group_vars/all/commands.yml or in a task's `cmd:`, none
-    # of which is a comment.
-    #
-    # `require` rules deliberately do NOT strip comments — see below.
-    if hits="$(strip_comments "${targets[@]}" | grep "${GREP_ARGS[@]}" -n -- "$pattern" 2>/dev/null)"; then
+    hits=""
+    for target in "${targets[@]}"; do
+      found="$(matches_in_file "$kind" "$pattern" "$target")"
+      [ -n "$found" ] && hits="${hits}${found}"$'\n'
+    done
+    if [ -n "${hits// /}" ] && [ -n "$(printf '%s' "$hits" | tr -d '[:space:]')" ]; then
       fail "banned pattern '$pattern' found in effective (non-comment) content:"
-      printf '%s\n' "$hits" | sed 's/^/    /' >&2
+      printf '%s' "$hits" | sed 's/^/    /' >&2
       printf '  why: %s\n' "$why" >&2
     fi
   else
-    if grep "${GREP_ARGS[@]}" -q -- "$pattern" "${targets[@]}" 2>/dev/null; then
-      : # present, as required
-    else
-      fail "required pattern '$pattern' is MISSING from scope '$scope'"
+    # `require` rules ALSO ignore comments. Otherwise the comment explaining why
+    # a string must be present satisfies the requirement, and deleting the real
+    # thing goes unnoticed.
+    present=0
+    for target in "${targets[@]}"; do
+      if [ -n "$(matches_in_file "$kind" "$pattern" "$target")" ]; then
+        present=1
+        break
+      fi
+    done
+    if [ "$present" -eq 0 ]; then
+      fail "required pattern '$pattern' is MISSING from the effective content of scope '$scope'"
       printf '  why: %s\n' "$why" >&2
     fi
   fi

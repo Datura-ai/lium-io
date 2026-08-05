@@ -38,7 +38,16 @@ set -Eeuo pipefail
 DEFAULT_SEARCH_ROOTS="/home,/opt,/srv"
 DEFAULT_REPO_PATH="/opt/lium-io"
 DSTACKTEE_SUBPATH="neurons/executor/dstacktee"
-FIND_MAXDEPTH=8
+
+# 12, not 8. A checkout at /opt/lium-io puts hda.img at exactly depth 8 below
+# the search root, so 8 covered that one case and NOTHING deeper. The canonical
+# /home/<user>/lium-io is depth 9 — and /home is in the root list specifically
+# to catch a home-directory checkout, so the budget defeated the reason the root
+# was there. A host with its checkout on a data volume is on record.
+#
+# The cost of scanning deeper is a slower find; the cost of stopping short is a
+# CLEAN verdict on a host holding a renter's encrypted disk.
+FIND_MAXDEPTH=12
 
 SEARCH_ROOTS="${LIUM_HDA_SEARCH_ROOTS:-$DEFAULT_SEARCH_ROOTS}"
 REPO_PATH="${LIUM_REPO_PATH:-$DEFAULT_REPO_PATH}"
@@ -127,7 +136,18 @@ collect_hda_under() {
   fi
 }
 
+# Where this script actually lives, so a checkout in an unexpected place is
+# found without anyone having to pass --repo-path. bootstrap.sh runs from inside
+# the checkout, so its location is the one piece of information that is always
+# correct — and relying on the /opt/lium-io default instead is what let a
+# home-directory checkout read as CLEAN.
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_CHECKOUT="$(cd -- "${SELF_DIR}/../../../../../.." 2>/dev/null && pwd || printf '')"
+
 collect_hda_under "${REPO_PATH}/${DSTACKTEE_SUBPATH}"
+if [ -n "$LOCAL_CHECKOUT" ]; then
+  collect_hda_under "${LOCAL_CHECKOUT}/${DSTACKTEE_SUBPATH}"
+fi
 IFS=',' read -r -a _roots <<<"$SEARCH_ROOTS"
 for _root in "${_roots[@]}"; do
   [ -n "$_root" ] && collect_hda_under "$_root"

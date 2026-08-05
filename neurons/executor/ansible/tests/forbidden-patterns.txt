@@ -14,9 +14,13 @@
 #   sense   deny | require
 #   kind    fixed  — a literal string (grep -F)
 #           regex  — an extended regular expression (grep -E)
-#   scope   tree   — roles/*/{tasks,files,templates}/, group_vars/, bootstrap.sh, site.yml
-#           ci     — .github/workflows/test.yml and qemu-2604-compile.yml
-#           all    — both
+#   scope   tree      — roles/*/{tasks,files,templates}/, group_vars/, site.yml,
+#                       and bootstrap.sh
+#           bootstrap — bootstrap.sh alone
+#           commands  — group_vars/all/commands.yml alone
+#           groupvars — group_vars/**
+#           ci        — .github/workflows/test.yml and qemu-2604-compile.yml
+#           all       — tree plus ci
 #
 # Scope is per-pattern because the rules genuinely differ. `|| true` inside a
 # fact collector means "absent is a valid answer and I handle it below", which is
@@ -48,10 +52,14 @@ deny	regex	all	curl[^|]*-H[[:space:]]+["']	no_log hides a value from Ansible's o
 
 # --- assertions that are silently inert ----------------------------------------
 deny	fixed	ci	|| true	Discards the exit code of the very step that exists to check it. Two of these once kept a merge gate green while it proved nothing.
+deny	fixed	bootstrap	|| true	Same, in the entry point. bootstrap.sh's exit code is a contract: CI compares it against --print-expected-preflight-rc and a provider's automation gates on it. Swallowing a status here makes that constant meaningless. Deliberately scoped separately from the fact collectors under roles/*/files/, where `$(cmd || true)` means "absent is a valid answer and I handle it below".
 deny	regex	ci	^[[:space:]]*![[:space:]]+grep	INERT under bash -e: POSIX says set -e is ignored for a command preceded by `!`, and GitHub Actions' default shell is `bash -e {0}`. This is the `|| true` defect wearing a different hat, and it shipped once already. Write an explicit `if grep ...; then echo FAIL; exit 1; fi`.
 deny	regex	ci	^[[:space:]]*![[:space:]]+test	Same. The anchoring is deliberate: it targets the BARE command form, which is the inert one. `if ! command -v foo; then ...; else ...; fi` is safe, because an if condition is exempt from set -e by design and both branches are handled. Do not "improve" this into an unanchored pattern — that false-positives on the safe form, which is how someone ends up narrowing the search until it goes green.
 
 # --- things that MUST be present -----------------------------------------------
-require	fixed	tree	--setenv=HOME=	systemd-run starts with HOME UNSET. Without this the build script's `set -u` dies at line 3 while the unit goes inactive within seconds and looks finished with nothing built.
-require	fixed	tree	17950	The PLATFORM_MANIFEST body length Intel accepts. The raw efivar is 17954 bytes — a 4-byte version+size header plus this body — and POSTing the 17954-byte blob returns 400 InvalidPlatformManifest.
-require	fixed	tree	--gpu-bdf	A bare --query-cc-mode only LISTS devices and reports nothing about the one you asked about.
+# Scoped to where the value has to LIVE, not merely be mentioned. At tree scope
+# these were satisfied by a runtime error message that quotes the flag, so
+# deleting the real one went unnoticed.
+require	fixed	commands	--setenv=HOME=	systemd-run starts with HOME UNSET. Without this the build script's `set -u` dies at line 3 while the unit goes inactive within seconds and looks finished with nothing built.
+require	fixed	groupvars	17950	The PLATFORM_MANIFEST body length Intel accepts. The raw efivar is 17954 bytes — a 4-byte version+size header plus this body — and POSTing the 17954-byte blob returns 400 InvalidPlatformManifest.
+require	fixed	commands	--gpu-bdf	A bare --query-cc-mode only LISTS devices and reports nothing about the one you asked about.

@@ -31,7 +31,13 @@ LOCK_FILE="${LIUM_STATE_DIR}/bootstrap.lock"
 EXPECTED_PREFLIGHT_RC=2
 
 SUPPORTED_VERSIONS=("25.10" "26.04")
-MIN_ANSIBLE_CORE="2.16"
+# 2.18, not 2.16. `meta: end_role` is used by four roles and only exists from
+# 2.18; `systemd_service` needs 2.17. An older core already on PATH passes the
+# install step's early return, clears this gate, and then dies at the first
+# end_role — in play 4 or 5, AFTER the kernel play has written the GRUB drop-in
+# and possibly rebooted. A half-applied converge is exactly what this tool must
+# never produce.
+MIN_ANSIBLE_CORE="2.18"
 
 usage() {
   cat <<'USAGE'
@@ -197,7 +203,11 @@ if [ -z "$CORE_VERSION" ]; then
 fi
 CORE_OK="$(printf '%s\n%s\n' "$MIN_ANSIBLE_CORE" "$CORE_VERSION" | sort -V | head -1)"
 if [ "$CORE_OK" != "$MIN_ANSIBLE_CORE" ]; then
-  die "ansible-core ${CORE_VERSION} is older than the required ${MIN_ANSIBLE_CORE}"
+  die "ansible-core ${CORE_VERSION} is older than the required ${MIN_ANSIBLE_CORE}.
+    This playbook uses 'meta: end_role', which does not exist before 2.18. An older
+    core would run the first few plays and then fail partway through, leaving the
+    host half-converged. Upgrade ansible-core, or remove it so this script can
+    install a supported one."
 fi
 
 # --- 7. Guard, then choose the run profile. ----------------------------------

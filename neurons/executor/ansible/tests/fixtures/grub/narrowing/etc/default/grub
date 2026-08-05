@@ -1,0 +1,6 @@
+# Fixture: GRUB already carries an id that lspci no longer reports (10de:dead),
+# i.e. a hot-removed or wedged device. Writing the freshly discovered — shorter —
+# list would unbind it on the next boot, so the role must REFUSE.
+GRUB_DEFAULT=0
+GRUB_CMDLINE_LINUX="kvm_intel.tdx=on vfio-pci.ids=10de:2335,10de:22a3,10de:dead"
+GRUB_CMDLINE_LINUX_DEFAULT="intel_iommu=on iommu=pt nohibernate"
