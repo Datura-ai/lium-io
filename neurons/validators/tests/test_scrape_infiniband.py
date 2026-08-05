@@ -9,7 +9,11 @@ test_scrape_ncu_profiling.py).
 
 import ast
 import glob
+import json
 import os
+import subprocess
+import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -297,14 +301,17 @@ def test_infiniband_keys_are_wired_through_both_obfuscation_tables() -> None:
         assert key in all_keys
 
 
-def _obfuscated_infiniband_namespace() -> dict[str, Any]:
-    """The InfiniBand helpers as they ship: obfuscated, then key-substituted, then executed.
+@lru_cache(maxsize=1)
+def _source_text() -> str:
+    return (SRC / "miner_jobs" / "machine_scrape.py").read_text()
 
-    The unobfuscated source is not what runs on an executor, and the two disagree. obfuscator.py
-    renames `__init__` parameters while leaving keyword names at the call site, so a keyword
-    construction raises TypeError only in the packaged scrape — invisible to every test that
-    imports the source. That is what shipped in #1192 and returned an empty port list on all 373
-    prod executors, including hosts carrying 24 mlx5 devices.
+
+@lru_cache(maxsize=1)
+def _obfuscated_text() -> str:
+    """The scrape as it ships: obfuscated, then payload keys swapped for random names.
+
+    Cached because every call re-rolls the random names — two calls disagree on what anything is
+    called, which silently breaks any test that pairs a name with a body.
     """
     import contextlib
     import io
@@ -312,12 +319,16 @@ def _obfuscated_infiniband_namespace() -> dict[str, Any]:
     from miner_jobs.obfuscator import obfuscate_code
     from services.file_encrypt_service import FileEncryptService
 
-    source = (SRC / "miner_jobs" / "machine_scrape.py").read_text()
     with contextlib.redirect_stdout(io.StringIO()):  # the obfuscator narrates to stdout
-        obfuscated = obfuscate_code(source)
+        obfuscated = obfuscate_code(_source_text())
         key_mapping, _ = FileEncryptService.generate_key_mappings(FileEncryptService.__new__(FileEncryptService))
     for original_key, random_name in key_mapping.items():
         obfuscated = obfuscated.replace(original_key, random_name)
+    return obfuscated
+
+
+def _obfuscated_infiniband_source() -> str:
+    """Just the InfiniBand helpers of the obfuscated module, as runnable source."""
 
     def top_level_name(node: ast.AST) -> str:
         if isinstance(node, ast.FunctionDef | ast.ClassDef):
@@ -326,16 +337,35 @@ def _obfuscated_infiniband_namespace() -> dict[str, Any]:
             return getattr(node.targets[0], "id", "")
         return ""
 
-    source_tree, obfuscated_tree = ast.parse(source), ast.parse(obfuscated)
+    source_tree, obfuscated_tree = ast.parse(_source_text()), ast.parse(_obfuscated_text())
     kept = [
         obfuscated_tree.body[index]
         for index, node in enumerate(source_tree.body)
         if top_level_name(node) in INFINIBAND_HELPERS
     ]
     assert len(kept) == len(INFINIBAND_HELPERS), "machine_scrape.py no longer defines all of them at module level"
+    return ast.unparse(ast.Module(body=kept, type_ignores=[]))
 
+
+def _obfuscated_name_of(source_name: str) -> str:
+    """What `source_name` is called after obfuscation — node order is preserved, names are not."""
+    source_tree, obfuscated_tree = ast.parse(_source_text()), ast.parse(_obfuscated_text())
+    for index, node in enumerate(source_tree.body):
+        if isinstance(node, ast.FunctionDef | ast.ClassDef) and node.name == source_name:
+            return obfuscated_tree.body[index].name
+    raise AssertionError(f"{source_name} is no longer defined at module level")
+
+
+def _obfuscated_infiniband_namespace() -> dict[str, Any]:
+    """The InfiniBand helpers as they ship, executed.
+
+    The unobfuscated source is not what runs on an executor, and the two disagree: obfuscator.py
+    renames `__init__` parameters while leaving keyword names at the call site, so a keyword
+    construction raises TypeError only in the packaged scrape. That is what shipped in #1192 and
+    returned an empty port list on all 373 prod executors, hosts with 24 mlx5 devices included.
+    """
     namespace: dict[str, Any] = {"os": os, "glob": glob}
-    exec(compile(ast.Module(body=kept, type_ignores=[]), "obfuscated", "exec"), namespace)  # noqa: S102
+    exec(_obfuscated_infiniband_source(), namespace)  # noqa: S102
     return namespace
 
 
@@ -382,3 +412,44 @@ def test_no_locally_defined_name_in_the_scrape_is_called_with_keyword_arguments(
 
     # Assert
     assert keyword_calls == [], "call it positionally — the packaged scrape cannot take these keywords"
+
+
+def test_the_pyinstaller_binary_parses_a_port(tmp_path: Path) -> None:
+    """The last transformation before an executor runs it: obfuscate, substitute keys, freeze.
+
+    The AST-level test above catches renaming bugs, but the artifact that ships is a PyInstaller
+    one-file build, so this drives that. With the keyword construction that shipped in #1192 the
+    binary reproduces the production error verbatim — `__init__() got an unexpected keyword
+    argument 'device'` — and returns no ports.
+    """
+    # Arrange — build the same helpers the AST test executes, pointed at a fake sysfs tree
+    namespace_source = _obfuscated_infiniband_source()
+    sysfs_root = tmp_path / "sys"
+    write_port(sysfs_root, "mlx5_2", "1", IB_PORT_FILES)
+    probe_source = namespace_source.replace("'/sys/class/infiniband'", repr(str(sysfs_root)))
+    entry_point = _obfuscated_name_of("get_infiniband_ports")
+    probe_source += (
+        "\nimport json"
+        f"\n_observation = {entry_point}()"
+        "\nprint(json.dumps({'ports': len(_observation.ports), 'error': _observation.scrape_error}))\n"
+    )
+
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    probe_path = build_dir / "scrape_probe.py"
+    probe_path.write_text("import os, glob\n" + probe_source)
+
+    # Act — freeze it exactly like FileEncryptService.make_binary_file does, then run it
+    subprocess.run(
+        [sys.executable, "-m", "PyInstaller", str(probe_path), "--onefile", "--noconsole",
+         "--log-level=ERROR", "--distpath", str(build_dir), "--workpath", str(build_dir / "w"),
+         "--specpath", str(build_dir), "--name", "scrape_probe"],
+        check=True, capture_output=True,
+    )
+    result = subprocess.run([str(build_dir / "scrape_probe")], capture_output=True, text=True, timeout=180)
+
+    # Assert
+    assert result.stdout.strip(), f"the frozen binary printed nothing; rc={result.returncode} stderr={result.stderr[:300]}"
+    reported = json.loads(result.stdout.strip().splitlines()[-1])
+    assert reported["error"] == ""
+    assert reported["ports"] == 1
