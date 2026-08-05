@@ -1173,7 +1173,7 @@ def read_infiniband_port(
 class InfinibandObservation:
     # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
     # allowlist into the packaged scrape, so this file must not grow new ones.
-    def __init__(self, ports: list, scrape_error: str) -> None:
+    def __init__(self, ports: list[InfinibandPort], scrape_error: str) -> None:
         self.ports = ports
         self.scrape_error = scrape_error
 
