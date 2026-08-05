@@ -1,0 +1,115 @@
+---
+# The single output contract. Humans, bootstrap.sh's exit code, and (later)
+# cvmd's startup checks all read the same stable check ids.
+#
+# Every check is recomputed here from `lium.*`. There is NO cross-play handoff
+# of preflight's results, which is what makes the report correct whether
+# preflight ran, was skipped by a tag selection, or ran non-fatally in
+# maintenance mode.
+#
+# For the same reason there is no `preflight.*` id namespace: the six
+# preflight-derived checks use their EXISTING ids. Inventing parallel ones would
+# add ids that are in neither the schema enum nor README.md, and
+# tests/test_verify_schema.sh enforces that those two agree exactly.
+
+# The role creates its own output directory rather than depending on having been
+# reached through bootstrap.sh. `--tags verify` run by hand is a supported audit
+# path, and CI validates the file at a fixed location.
+- name: Ensure the state directory exists
+  ansible.builtin.file:
+    path: "{{ lium_state_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Analyse the kernel command line for the report
+  ansible.builtin.command:
+    cmd: >-
+      {{ role_path }}/../common/files/lium-cmdline.sh analyze
+      --required {{ lium_verify_required_tokens | join(' ') | quote }}
+      --grub-default {{ lium_grub_default_path | quote }}
+      --grub-dropin-dir {{ lium_grub_dropin_path | dirname | quote }}
+      --proc-cmdline {{ lium_proc_cmdline_path | quote }}
+  register: lium_verify_cmdline_raw
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  vars:
+    lium_verify_required_tokens: >-
+      {{ ['kvm_intel.tdx=on', 'intel_iommu=on', 'iommu=pt', 'nohibernate']
+         + (['vfio-pci.ids=' ~ (lium.present_pci_ids | join(','))]
+            if (lium.present_pci_ids | length) > 0 else [])
+         + ['vfio_iommu_type1.dma_entry_limit=' ~ lium_dma_entry_limit] }}
+
+- name: Publish the command-line analysis
+  ansible.builtin.set_fact:
+    lium_verify_cmdline: >-
+      {{ (lium_verify_cmdline_raw.stdout | from_json)
+         if (lium_verify_cmdline_raw.stdout | default('') | length) > 0
+         else {'drift_tokens': [], 'conflicting_keys': [], 'missing_tokens': []} }}
+
+- name: List local listeners
+  ansible.builtin.command:
+    cmd: ss -tlnp
+  register: lium_listeners
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Build the check list
+  ansible.builtin.set_fact:
+    lium_checks: "{{ lookup('template', 'checks.json.j2') | from_json }}"
+
+- name: Summarise
+  ansible.builtin.set_fact:
+    lium_summary:
+      ok: "{{ lium_checks | selectattr('status', 'equalto', 'OK') | list | length }}"
+      warn: "{{ lium_checks | selectattr('status', 'equalto', 'WARN') | list | length }}"
+      must_fix: "{{ lium_checks | selectattr('status', 'equalto', 'MUST_FIX') | list | length }}"
+      unknown: "{{ lium_checks | selectattr('status', 'equalto', 'UNKNOWN') | list | length }}"
+      skipped: "{{ lium_checks | selectattr('status', 'equalto', 'SKIPPED') | list | length }}"
+
+- name: Write the verify report
+  ansible.builtin.template:
+    src: verify-report.json.j2
+    dest: "{{ lium_state_dir }}/verify-report.json"
+    mode: "0644"
+
+# THE ONLY automatic reset of the reboot budget, and it belongs here on purpose.
+#
+# Reaching `verify` with a clean kernel command line is precisely the definition
+# of "the converge worked". A genuine reboot loop can never satisfy it: if
+# update-grub wrote nothing because /boot is full, or this host does not boot
+# GRUB at all, kernel.cmdline_tokens stays non-OK and the counter keeps climbing
+# to its cap exactly as intended.
+- name: Reset the reboot budget after a clean converge
+  ansible.builtin.copy:
+    dest: "{{ lium_state_dir }}/converge_reboots"
+    content: "0\n"
+    mode: "0644"
+  when:
+    - (lium_verify_cmdline.drift_tokens | default([]) | length) == 0
+    - (lium_verify_cmdline.missing_tokens | default([]) | length) == 0
+    - lium.proc_cmdline.readable | bool
+
+- name: Report the summary
+  ansible.builtin.debug:
+    msg: |
+      {{ lium_summary.ok }} OK   {{ lium_summary.warn }} WARN
+      {{ lium_summary.must_fix }} MUST_FIX   {{ lium_summary.unknown }} UNKNOWN
+      {{ lium_summary.skipped }} SKIPPED
+      Report: {{ lium_state_dir }}/verify-report.json
+      {% for check in lium_checks %}
+      {% if check.status in ['MUST_FIX', 'UNKNOWN'] %}
+        [{{ check.status }}] {{ check.id }}: {{ check.observed }}
+            fix: {{ check.remediation }}
+      {% endif %}
+      {% endfor %}
+
+# Non-zero exit on any MUST_FIX, so bootstrap.sh can gate on it and so a
+# scripted caller does not have to parse the human summary.
+- name: Fail when anything must be fixed
+  ansible.builtin.fail:
+    msg: >-
+      {{ lium_summary.must_fix }} check(s) are MUST_FIX. This host is not ready
+      to run a CVM. See {{ lium_state_dir }}/verify-report.json.
+  when: (lium_summary.must_fix | int) > 0
