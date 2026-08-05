@@ -97,6 +97,24 @@ def test_requested_path_must_stay_inside_volume() -> None:
         WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
 
 
+def test_helper_image_resolves_container_hostname_when_ssh_environment_omits_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("storage.workspace.socket.gethostname", lambda: "a" * 12)
+    monkeypatch.setattr(
+        "storage.workspace.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"sha256:{'b' * 64}\n",
+            stderr="",
+        ),
+    )
+
+    image = WorkspaceResolver(docker_binary="docker", environ={})._current_executor_image()
+
+    assert image == f"sha256:{'b' * 64}"
+
+
 def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments() -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload())
     workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)

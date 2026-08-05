@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -153,7 +154,7 @@ class WorkspaceResolver:
         return self._environ.get("LIUM_STORAGE_HELPER_IMAGE") or self._current_executor_image()
 
     def _current_executor_image(self) -> str:
-        container_id = self._environ.get("HOSTNAME")
+        container_id = self._environ.get("HOSTNAME") or socket.gethostname()
         if not container_id:
             raise WorkspaceResolutionError(
                 "storage helper requires LIUM_STORAGE_HELPER_IMAGE or the current executor image"
