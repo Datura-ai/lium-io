@@ -29,7 +29,6 @@ async def test_dind_verifier_sysbox_failure_sets_false(mocker):
         ]
     )
 
-    mocker.patch("services.executor_connectivity.dind_probe.asyncio.sleep", new=mocker.AsyncMock())
     mocker.patch(
         "services.executor_connectivity.dind_probe.asyncssh.import_private_key",
         return_value=mocker.Mock(),
@@ -38,9 +37,10 @@ async def test_dind_verifier_sysbox_failure_sets_false(mocker):
     ssh_session = mocker.AsyncMock()
     ssh_session.run = mocker.AsyncMock(return_value=_run_result(mocker, exit_status=1, stderr="fail"))
 
-    connect = mocker.patch("services.executor_connectivity.dind_probe.asyncssh.connect")
+    connect = mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect", new=mocker.AsyncMock()
+    )
     connect.return_value.__aenter__.return_value = ssh_session
-    connect.return_value.__aexit__.return_value = mocker.AsyncMock()
 
     verifier = DindVerifier(ssh_service)
 
@@ -73,7 +73,9 @@ async def test_dind_verifier_docker_run_fails(mocker):
         ]
     )
 
-    connect = mocker.patch("services.executor_connectivity.dind_probe.asyncssh.connect")
+    connect = mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect", new=mocker.AsyncMock()
+    )
 
     verifier = DindVerifier(ssh_service)
 
@@ -88,6 +90,63 @@ async def test_dind_verifier_docker_run_fails(mocker):
     assert result.success is False
     assert "check failed" in (result.log_text or "")
     connect.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dind_verifier_retries_connect_until_sshd_is_up(mocker):
+    """DAH-2588: sshd inside a fresh container is not listening immediately, so a refused
+    connection must be retried under the readiness deadline instead of failing the probe."""
+    port = PortPair(9000, 9000)
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair.return_value = ("priv", "pub")
+
+    ssh_client = mocker.AsyncMock()
+    ssh_client.run = mocker.AsyncMock(
+        side_effect=[
+            _run_result(mocker, exit_status=0, stdout="container_id"),
+            _run_result(mocker, exit_status=0, stdout=""),
+        ]
+    )
+
+    mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.import_private_key",
+        return_value=mocker.Mock(),
+    )
+
+    ssh_session = mocker.AsyncMock()
+    ssh_session.run = mocker.AsyncMock(return_value=_run_result(mocker, exit_status=0))
+    connection = mocker.MagicMock()
+    connection.__aenter__.return_value = ssh_session
+
+    connect = mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect",
+        new=mocker.AsyncMock(
+            side_effect=[
+                ConnectionRefusedError("[Errno 111] Connect call failed"),
+                ConnectionRefusedError("[Errno 111] Connect call failed"),
+                connection,
+            ]
+        ),
+    )
+    sleep = mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncio.sleep", new=mocker.AsyncMock()
+    )
+
+    verifier = DindVerifier(ssh_service)
+
+    result = await verifier.verify(
+        port,
+        ssh_client=ssh_client,
+        host="127.0.0.1",
+        container_name_prefix="container_miner",
+        sysbox=True,
+    )
+
+    assert result.success is True
+    assert result.sysbox_runtime is True
+    assert connect.await_count == 3
+    assert sleep.await_args_list == [mocker.call(1.5), mocker.call(1.5)]
 
 
 @pytest.mark.asyncio
@@ -107,7 +166,6 @@ async def test_dind_verifier_hung_connect_fails_within_timeout(mocker):
         ]
     )
 
-    mocker.patch("services.executor_connectivity.dind_probe.asyncio.sleep", new=mocker.AsyncMock())
     mocker.patch(
         "services.executor_connectivity.dind_probe.asyncssh.import_private_key",
         return_value=mocker.Mock(),
@@ -118,8 +176,10 @@ async def test_dind_verifier_hung_connect_fails_within_timeout(mocker):
     # login_timeout, which asyncssh surfaces as a TimeoutError).
     connect = mocker.patch(
         "services.executor_connectivity.dind_probe.asyncssh.connect",
-        side_effect=TimeoutError("connect timed out"),
+        new=mocker.AsyncMock(side_effect=TimeoutError("connect timed out")),
     )
+    # Deadline already spent, so the probe gives up on the first attempt instead of polling.
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_READY_TIMEOUT", 0)
 
     verifier = DindVerifier(ssh_service)
 
@@ -142,6 +202,51 @@ async def test_dind_verifier_hung_connect_fails_within_timeout(mocker):
 
 
 @pytest.mark.asyncio
+async def test_dind_verifier_gives_up_after_deadline(mocker):
+    """DAH-2588: a container that never comes up must still fail, and fail with the underlying
+    connection error rather than a generic timeout — the two have different diagnoses."""
+    port = PortPair(9000, 9000)
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair.return_value = ("priv", "pub")
+
+    ssh_client = mocker.AsyncMock()
+    ssh_client.run = mocker.AsyncMock(
+        side_effect=[
+            _run_result(mocker, exit_status=0, stdout="container_id"),
+            _run_result(mocker, exit_status=0, stdout=""),
+        ]
+    )
+
+    mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.import_private_key",
+        return_value=mocker.Mock(),
+    )
+
+    # Real (tiny) sleeps, so the loop's own clock advances and the deadline is what stops it.
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_READY_TIMEOUT", 0.05)
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_POLL_INTERVAL", 0.01)
+    connect = mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect",
+        new=mocker.AsyncMock(side_effect=ConnectionRefusedError("[Errno 111] Connect call failed")),
+    )
+
+    verifier = DindVerifier(ssh_service)
+
+    result = await verifier.verify(
+        port,
+        ssh_client=ssh_client,
+        host="127.0.0.1",
+        container_name_prefix="container_miner",
+        sysbox=True,
+    )
+
+    assert result.success is False
+    assert "check failed" in (result.log_text or "")
+    assert connect.await_count >= 2
+
+
+@pytest.mark.asyncio
 async def test_dind_verifier_hung_inner_docker_run_degrades_sysbox(mocker):
     """DAH-2272: a hung inner `docker run --rm hello-world` must degrade to
     sysbox_ok=False via asyncio.wait_for(timeout=30) instead of hanging the
@@ -159,7 +264,6 @@ async def test_dind_verifier_hung_inner_docker_run_degrades_sysbox(mocker):
         ]
     )
 
-    mocker.patch("services.executor_connectivity.dind_probe.asyncio.sleep", new=mocker.AsyncMock())
     mocker.patch(
         "services.executor_connectivity.dind_probe.asyncssh.import_private_key",
         return_value=mocker.Mock(),
@@ -176,9 +280,10 @@ async def test_dind_verifier_hung_inner_docker_run_degrades_sysbox(mocker):
     ssh_session = mocker.AsyncMock()
     ssh_session.run = mocker.Mock(return_value=_hangs_forever())
 
-    connect = mocker.patch("services.executor_connectivity.dind_probe.asyncssh.connect")
+    connect = mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect", new=mocker.AsyncMock()
+    )
     connect.return_value.__aenter__.return_value = ssh_session
-    connect.return_value.__aexit__.return_value = mocker.AsyncMock()
 
     seen_timeouts = []
 

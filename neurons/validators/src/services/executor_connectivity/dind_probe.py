@@ -11,6 +11,19 @@ from services.ssh_service import SSHService
 
 logger = logging.getLogger(__name__)
 
+# DAH-2588: how long sshd inside the DinD container may take to accept a login. Measured in
+# prod the container is ready in ~3s (p99 ~7s, max ~10s), so the fixed 5s wait this replaced
+# sat right on the median and refused roughly one probe in 130 — and a refused probe reads as
+# "no sysbox", which delists an unrented executor for the whole cycle. Polling is also cheaper
+# than a longer sleep: a ready container is caught at ~3s instead of always waiting.
+#
+# The per-attempt timeout stays at 12s and is deliberately not tightened to the poll interval:
+# asyncssh counts TCP connect, key exchange AND authentication against it, none of which carry
+# over to the next attempt, so a host slow enough to need 6s would fail every single try.
+DIND_SSH_READY_TIMEOUT = 30
+DIND_SSH_CONNECT_TIMEOUT = 12
+DIND_SSH_POLL_INTERVAL = 1.5
+
 
 class DindVerifier:
     """Verifies Docker-in-Docker capability."""
@@ -52,21 +65,10 @@ class DindVerifier:
                 )
 
             logger.info(_m("DinD container created", extra=get_extra_info(log_ctx)))
-            await asyncio.sleep(5)
 
             # Test SSH
             pkey = asyncssh.import_private_key(private_key)
-            async with asyncssh.connect(
-                host=host,
-                port=port.external,
-                username="root",
-                client_keys=[pkey],
-                known_hosts=None,
-                connect_timeout=12,
-                login_timeout=12,
-            ) as ssh:
-                logger.info(_m("DinD SSH connected", extra=get_extra_info(log_ctx)))
-
+            async with await self._wait_for_ssh(host, port, pkey, log_ctx) as ssh:
                 # Test sysbox
                 if sysbox:
                     # daturaai/dind:0.0.1 bundles the hello-world image into the inner dockerd
@@ -118,6 +120,69 @@ class DindVerifier:
                 sysbox_runtime=sysbox,
                 port=port,
             )
+
+    async def _wait_for_ssh(
+        self,
+        host: str,
+        port: PortPair,
+        pkey,
+        log_ctx: dict,
+    ) -> SSHClientConnection:
+        """Connect to the freshly started DinD container, retrying until sshd answers.
+
+        Bounded twice over: each attempt carries its own connect/login timeout, and no attempt
+        starts once the deadline is within one poll interval. The last failure is re-raised
+        rather than wrapped, so the caller still logs the underlying error (a refused
+        connection and an unreachable host are different diagnoses).
+        """
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        deadline = started_at + DIND_SSH_READY_TIMEOUT
+        attempts = 0
+
+        while True:
+            attempts += 1
+            try:
+                ssh = await asyncssh.connect(
+                    host=host,
+                    port=port.external,
+                    username="root",
+                    client_keys=[pkey],
+                    known_hosts=None,
+                    connect_timeout=DIND_SSH_CONNECT_TIMEOUT,
+                    login_timeout=DIND_SSH_CONNECT_TIMEOUT,
+                )
+            except Exception:
+                if loop.time() + DIND_SSH_POLL_INTERVAL >= deadline:
+                    logger.warning(
+                        _m(
+                            "DinD SSH not ready before deadline",
+                            extra=get_extra_info(
+                                {
+                                    **log_ctx,
+                                    "ssh_waited_sec": round(loop.time() - started_at, 2),
+                                    "ssh_attempts": attempts,
+                                }
+                            ),
+                        )
+                    )
+                    raise
+                await asyncio.sleep(DIND_SSH_POLL_INTERVAL)
+                continue
+
+            logger.info(
+                _m(
+                    "DinD SSH connected",
+                    extra=get_extra_info(
+                        {
+                            **log_ctx,
+                            "ssh_ready_sec": round(loop.time() - started_at, 2),
+                            "ssh_attempts": attempts,
+                        }
+                    ),
+                )
+            )
+            return ssh
 
 
 class DindProbe:
