@@ -1094,34 +1094,39 @@ def read_sysfs_value(path: str) -> str:
         return ""
 
 
-def get_infiniband_ports() -> list:
+def get_infiniband_ports() -> list[dict[str, str]]:
     """Every RDMA port the host exposes, as reported by the kernel (DAH-2571).
 
     Facts only - which ports are usable and which fabric each one sits on. Deciding whether two
     machines are on the same fabric is the backend's job: it needs both hosts, this sees one.
     """
-    ports = []
-    for device_path in sorted(glob.glob(f"{INFINIBAND_SYSFS_PATH}/*")):
-        device_name = os.path.basename(device_path)
-        node_guid = read_sysfs_value(f"{device_path}/node_guid")
-        for port_path in sorted(glob.glob(f"{device_path}/ports/*")):
-            # gids/0 is the port's default GID; its first four groups are the subnet prefix, the
-            # identifier every port on one fabric shares.
-            default_gid = read_sysfs_value(f"{port_path}/gids/0")
-            ports.append(
-                {
-                    "ib_device": device_name,
-                    "ib_port": os.path.basename(port_path),
-                    "ib_node_guid": node_guid,
-                    "ib_link_layer": read_sysfs_value(f"{port_path}/link_layer"),
-                    "ib_state": read_sysfs_value(f"{port_path}/state"),
-                    "ib_phys_state": read_sysfs_value(f"{port_path}/phys_state"),
-                    "ib_rate": read_sysfs_value(f"{port_path}/rate"),
-                    "ib_lid": read_sysfs_value(f"{port_path}/lid"),
-                    "ib_sm_lid": read_sysfs_value(f"{port_path}/sm_lid"),
-                    "ib_subnet_prefix": ":".join(default_gid.split(":")[:4]),
-                }
-            )
+    ports: list[dict[str, str]] = []
+    try:
+        for device_path in sorted(glob.glob(f"{INFINIBAND_SYSFS_PATH}/*")):
+            device_name = os.path.basename(device_path)
+            node_guid = read_sysfs_value(f"{device_path}/node_guid")
+            for port_path in sorted(glob.glob(f"{device_path}/ports/*")):
+                # gids/0 is the port's default GID; its first four groups are the subnet prefix,
+                # the identifier every port on one fabric shares.
+                default_gid = read_sysfs_value(f"{port_path}/gids/0")
+                ports.append(
+                    {
+                        "ib_device": device_name,
+                        "ib_port": os.path.basename(port_path),
+                        "ib_node_guid": node_guid,
+                        "ib_link_layer": read_sysfs_value(f"{port_path}/link_layer"),
+                        "ib_state": read_sysfs_value(f"{port_path}/state"),
+                        "ib_phys_state": read_sysfs_value(f"{port_path}/phys_state"),
+                        "ib_rate": read_sysfs_value(f"{port_path}/rate"),
+                        "ib_lid": read_sysfs_value(f"{port_path}/lid"),
+                        "ib_sm_lid": read_sysfs_value(f"{port_path}/sm_lid"),
+                        "ib_subnet_prefix": ":".join(default_gid.split(":")[:4]),
+                    }
+                )
+    except Exception:
+        # Every other probe in this file swallows its own failure - an interconnect reading is
+        # never worth failing the whole machine scrape over.
+        return []
     return ports
 
 
