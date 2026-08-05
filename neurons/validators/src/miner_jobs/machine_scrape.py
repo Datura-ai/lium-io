@@ -1039,6 +1039,12 @@ def check_storage_limit_ability() -> tuple[bool, str]:
 
 NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
+# Enough of the GID table to carry both the link-local entries and the IPv4-mapped one. Its index
+# is driver-specific - mlx5 puts it at 2-3, Intel irdma at 1 - so consumers must match on the
+# IPV4_MAPPED_GID_PREFIX below, never on a position.
+GID_TABLE_ENTRIES_READ = 4
+IPV4_MAPPED_GID_PREFIX = "0000:0000:0000:0000:0000:ffff:"
 
 
 class NcuProfilingObservation:
@@ -1083,6 +1089,107 @@ def get_host_boot_id() -> str:
             return boot_id_file.read().strip()
     except Exception:
         return ""
+
+
+def read_sysfs_value(path: str) -> str:
+    try:
+        with open(path) as sysfs_file:
+            return sysfs_file.read().strip()
+    except Exception:
+        return ""
+
+
+class InfinibandPort:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(
+        self,
+        device: str,
+        port: str,
+        node_guid: str,
+        sys_image_guid: str,
+        link_layer: str,
+        state: str,
+        phys_state: str,
+        rate: str,
+        lid: str,
+        sm_lid: str,
+        pkey: str,
+        gids: list[str],
+    ) -> None:
+        self.device = device
+        self.port = port
+        self.node_guid = node_guid
+        self.sys_image_guid = sys_image_guid
+        self.link_layer = link_layer
+        self.state = state
+        self.phys_state = phys_state
+        self.rate = rate
+        self.lid = lid
+        self.sm_lid = sm_lid
+        self.pkey = pkey
+        self.gids = gids
+
+    def as_payload(self) -> dict[str, str | list[str]]:
+        return {
+            "ib_device": self.device,
+            "ib_port": self.port,
+            "ib_node_guid": self.node_guid,
+            "ib_sys_image_guid": self.sys_image_guid,
+            "ib_link_layer": self.link_layer,
+            "ib_state": self.state,
+            "ib_phys_state": self.phys_state,
+            "ib_rate": self.rate,
+            "ib_lid": self.lid,
+            "ib_sm_lid": self.sm_lid,
+            "ib_pkey": self.pkey,
+            "ib_gids": self.gids,
+        }
+
+
+def read_infiniband_port(
+    device_path: str, node_guid: str, sys_image_guid: str, port_path: str
+) -> InfinibandPort:
+    # Whole GID table, not just gids/0: every prod port carries the default fe80:: prefix, so the
+    # prefix alone identifies nothing. The IPv4-mapped entry is the one that tells two Ethernet
+    # ports they share a segment - find it by IPV4_MAPPED_GID_PREFIX, its index moves by driver.
+    gids = [read_sysfs_value(f"{port_path}/gids/{index}") for index in range(GID_TABLE_ENTRIES_READ)]
+    return InfinibandPort(
+        device=os.path.basename(device_path),
+        port=os.path.basename(port_path),
+        node_guid=node_guid,
+        sys_image_guid=sys_image_guid,
+        link_layer=read_sysfs_value(f"{port_path}/link_layer"),
+        state=read_sysfs_value(f"{port_path}/state"),
+        phys_state=read_sysfs_value(f"{port_path}/phys_state"),
+        rate=read_sysfs_value(f"{port_path}/rate"),
+        lid=read_sysfs_value(f"{port_path}/lid"),
+        sm_lid=read_sysfs_value(f"{port_path}/sm_lid"),
+        pkey=read_sysfs_value(f"{port_path}/pkeys/0"),
+        gids=[gid for gid in gids if gid],
+    )
+
+
+def get_infiniband_ports() -> list[InfinibandPort]:
+    """Every RDMA port the host exposes, as reported by the kernel (DAH-2571).
+
+    Facts only - which ports are usable and which fabric each one sits on. Deciding whether two
+    machines are on the same fabric is the backend's job: it needs both hosts, this sees one.
+    """
+    ports: list[InfinibandPort] = []
+    try:
+        for device_path in sorted(glob.glob(f"{INFINIBAND_SYSFS_PATH}/*")):
+            node_guid = read_sysfs_value(f"{device_path}/node_guid")
+            sys_image_guid = read_sysfs_value(f"{device_path}/sys_image_guid")
+            for port_path in sorted(glob.glob(f"{device_path}/ports/*")):
+                ports.append(
+                    read_infiniband_port(device_path, node_guid, sys_image_guid, port_path)
+                )
+    except Exception:
+        # Every other probe in this file swallows its own failure - an interconnect reading is
+        # never worth failing the whole machine scrape over.
+        return []
+    return ports
 
 
 def get_machine_specs():
@@ -1205,6 +1312,7 @@ def get_machine_specs():
     if ncu_profiling.scrape_error:
         data["data_ncu_profiling_scrape_error"] = ncu_profiling.scrape_error
     data["data_boot_id"] = get_host_boot_id()
+    data["data_infiniband_ports"] = [port.as_payload() for port in get_infiniband_ports()]
 
     try:
         lscpu_output = run_cmd("lscpu")
