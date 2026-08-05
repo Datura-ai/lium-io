@@ -1198,23 +1198,29 @@ def get_infiniband_ports() -> InfinibandObservation:
 
     ports: list[InfinibandPort] = []
     try:
-        device_paths = sorted(glob.glob(f"{INFINIBAND_SYSFS_PATH}/*"))
-        for device_path in device_paths:
+        # os.listdir, not glob: glob swallows EACCES/EIO and returns [], which would be reported as
+        # "lists no devices" - the same kind of silent nothing this function exists to stop.
+        device_names = sorted(os.listdir(INFINIBAND_SYSFS_PATH))
+        for device_name in device_names:
+            device_path = f"{INFINIBAND_SYSFS_PATH}/{device_name}"
             node_guid = read_sysfs_value(f"{device_path}/node_guid")
             sys_image_guid = read_sysfs_value(f"{device_path}/sys_image_guid")
-            for port_path in sorted(glob.glob(f"{device_path}/ports/*")):
+            ports_path = f"{device_path}/ports"
+            if not os.path.isdir(ports_path):
+                continue
+            for port_name in sorted(os.listdir(ports_path)):
                 ports.append(
-                    read_infiniband_port(device_path, node_guid, sys_image_guid, port_path)
+                    read_infiniband_port(device_path, node_guid, sys_image_guid, f"{ports_path}/{port_name}")
                 )
     except Exception as e:
         # An interconnect reading is never worth failing the whole machine scrape over, but the
         # reason has to travel with the empty result.
         return InfinibandObservation(ports, f"Error walking {INFINIBAND_SYSFS_PATH}: {e}")
 
-    if not device_paths:
+    if not device_names:
         return InfinibandObservation([], f"{INFINIBAND_SYSFS_PATH} lists no devices")
     if not ports:
-        return InfinibandObservation([], f"{len(device_paths)} device(s) present, none exposing a port")
+        return InfinibandObservation([], f"{len(device_names)} device(s) present, none exposing a port")
     return InfinibandObservation(ports, "")
 
 

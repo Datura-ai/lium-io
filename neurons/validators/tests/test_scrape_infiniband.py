@@ -347,48 +347,6 @@ def _obfuscated_infiniband_source() -> str:
     return ast.unparse(ast.Module(body=kept, type_ignores=[]))
 
 
-def _obfuscated_name_of(source_name: str) -> str:
-    """What `source_name` is called after obfuscation — node order is preserved, names are not."""
-    source_tree, obfuscated_tree = ast.parse(_source_text()), ast.parse(_obfuscated_text())
-    for index, node in enumerate(source_tree.body):
-        if isinstance(node, ast.FunctionDef | ast.ClassDef) and node.name == source_name:
-            return obfuscated_tree.body[index].name
-    raise AssertionError(f"{source_name} is no longer defined at module level")
-
-
-def _obfuscated_infiniband_namespace() -> dict[str, Any]:
-    """The InfiniBand helpers as they ship, executed.
-
-    The unobfuscated source is not what runs on an executor, and the two disagree: obfuscator.py
-    renames `__init__` parameters while leaving keyword names at the call site, so a keyword
-    construction raises TypeError only in the packaged scrape. That is what shipped in #1192 and
-    returned an empty port list on all 373 prod executors, hosts with 24 mlx5 devices included.
-    """
-    namespace: dict[str, Any] = {"os": os, "glob": glob}
-    exec(_obfuscated_infiniband_source(), namespace)  # noqa: S102
-    return namespace
-
-
-def test_the_obfuscated_scrape_parses_a_port_and_does_not_just_return_empty(tmp_path: Path) -> None:
-    # Arrange
-    namespace = _obfuscated_infiniband_namespace()
-    sysfs_path_name = next(name for name, value in namespace.items() if value == "/sys/class/infiniband")
-    read_ports = next(
-        value for value in namespace.values() if callable(value) and "RDMA port" in (getattr(value, "__doc__", "") or "")
-    )
-    write_port(tmp_path, "mlx5_2", "1", IB_PORT_FILES)
-    namespace[sysfs_path_name] = str(tmp_path)
-
-    # Act
-    observation = read_ports()
-
-    # Assert — an empty list here means the packaged scrape is broken, whatever the source does
-    assert observation.scrape_error == ""
-    assert len(observation.ports) == 1
-    assert observation.ports[0].link_layer == "InfiniBand"
-    # payload keys are substituted with random names by then, so only their count is checkable
-    assert len(observation.ports[0].as_payload()) == 12
-
 
 def _obfuscated_name_of(source_name: str) -> str:
     """What `source_name` is called after obfuscation — node order is preserved, names are not."""
@@ -496,3 +454,25 @@ def test_the_pyinstaller_binary_parses_a_port(tmp_path: Path) -> None:
     reported = json.loads(result.stdout.strip().splitlines()[-1])
     assert reported["error"] == ""
     assert reported["ports"] == 1
+
+
+def test_an_unreadable_sysfs_tree_is_not_reported_as_no_devices(
+    scrape: dict[str, Any], tmp_path: Path
+) -> None:
+    """glob would swallow the EACCES and answer [], which reads as "this host has no RDMA" — the
+    exact silent-nothing this function exists to stop. os.listdir raises and the reason survives.
+    """
+    # Arrange
+    write_port(tmp_path, "mlx5_2", "1", IB_PORT_FILES)
+    tmp_path.chmod(0o000)
+    scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
+
+    try:
+        # Act
+        observation = scrape["get_infiniband_ports"]()
+    finally:
+        tmp_path.chmod(0o755)
+
+    # Assert
+    assert observation.ports == []
+    assert "Permission denied" in observation.scrape_error
