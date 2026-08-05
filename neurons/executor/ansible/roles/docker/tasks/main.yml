@@ -1,0 +1,70 @@
+---
+# Docker Engine from Docker's own repository.
+#
+# The suite comes from lium_os_matrix and is `noble` for both supported
+# releases: Ubuntu 25.10 has no Docker repo of its own, and 26.04's is
+# unverified. Using the release's own codename gets you a 404 and a failed apt
+# transaction.
+
+- name: Skip Docker when it is already installed
+  ansible.builtin.debug:
+    msg: "Docker {{ lium.docker_version }} is already installed."
+  when: lium.docker_version | length > 0
+
+- name: End the role when Docker is present
+  ansible.builtin.meta: end_role
+  when: lium.docker_version | length > 0
+
+- name: Install the packages needed to add an apt repository
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure the apt keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Install Docker's apt key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+
+- name: Add Docker's apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ lium_docker_arch }} signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/ubuntu
+      {{ lium_os_matrix[lium.os_version_id].docker_suite }} stable
+    filename: docker
+    state: present
+    update_cache: true
+
+- name: Install Docker Engine
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+
+- name: Enable and start Docker
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Add the invoking user to the docker group
+  ansible.builtin.user:
+    name: "{{ lium_docker_user }}"
+    groups: docker
+    append: true
+  when: lium_docker_user | length > 0

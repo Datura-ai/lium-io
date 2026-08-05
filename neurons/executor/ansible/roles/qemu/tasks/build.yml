@@ -1,0 +1,80 @@
+---
+# Source build, 10-40 minutes, under systemd-run.
+#
+# `nohup ... &` over ssh dies with the session. systemd-run does not — but it
+# starts with a minimal environment in which HOME is UNSET, which is why
+# lium_qemu_systemd_run_cmd carries --setenv=HOME=. Without it the build script
+# dies at line 3 and the unit goes inactive within seconds, looking "finished"
+# while nothing was built.
+
+- name: Install the QEMU build dependencies
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - git
+      - ninja-build
+      - pkg-config
+      - python3-pip
+      - python3-venv
+      - libglib2.0-dev
+      - libpixman-1-dev
+      - libslirp-dev
+      - flex
+      - bison
+      - acpica-tools
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure the build directory exists
+  ansible.builtin.file:
+    path: "{{ lium_qemu_build_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Render the build script
+  ansible.builtin.template:
+    src: build-qemu.sh.j2
+    dest: "{{ lium_qemu_build_dir }}/build-qemu.sh"
+    mode: "0755"
+
+# Both names are checked: fix-host.sh in the cvm-provision skill uses
+# qemu-dstack-build, and an earlier iteration of this playbook used
+# lium-qemu-build. Finding either means a build is already running and we must
+# wait for it rather than start a second one.
+- name: Look for a build that is already running
+  ansible.builtin.systemd_service:
+    name: "{{ item }}.service"
+  loop:
+    - "{{ lium_qemu_systemd_unit }}"
+    - "{{ lium_qemu_systemd_unit_legacy }}"
+  register: lium_qemu_unit_state
+  changed_when: false
+  failed_when: false
+
+- name: Start the build under systemd-run
+  ansible.builtin.command:
+    cmd: "{{ lium_qemu_systemd_run_cmd }}"
+  register: lium_qemu_build_start
+  changed_when: true
+  when: >-
+    lium_qemu_unit_state.results
+    | map(attribute='status.ActiveState', default='inactive')
+    | select('equalto', 'active')
+    | list | length == 0
+
+# The marker, not the unit's state. A unit that exited because HOME was unset is
+# "inactive" and looks finished; only QEMU_BUILD_DONE_OK means the build
+# actually completed.
+- name: Wait for the build to finish
+  ansible.builtin.wait_for:
+    path: "{{ lium_log_dir }}/qemu-build.log"
+    search_regex: QEMU_BUILD_DONE_OK
+    timeout: 3600
+
+- name: Record the installed binary's fingerprint
+  ansible.builtin.shell:
+    cmd: >-
+      sha256sum {{ lium_qemu_prefix }}/bin/qemu-system-x86_64
+      | cut -d' ' -f1 > {{ lium_state_dir }}/qemu.sha256
+  changed_when: true

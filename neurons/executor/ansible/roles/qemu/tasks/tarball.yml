@@ -1,0 +1,43 @@
+---
+# Install a prebuilt QEMU instead of spending 10-40 minutes compiling.
+#
+# No producer for this tarball exists yet — it is a follow-up, and an explicit
+# non-goal here. The variable interface ships now so that when the release
+# pipeline lands, this role needs no changes at all.
+
+- name: Require a checksum alongside the tarball URL
+  ansible.builtin.assert:
+    that:
+      - lium_qemu_tarball_sha256 | length > 0
+    fail_msg: >-
+      lium_qemu_tarball_url is set but lium_qemu_tarball_sha256 is not. QEMU is a
+      measured input: installing one whose contents were never verified would
+      change RTMR0 to a value nobody can attest to. Set both or neither.
+    quiet: true
+
+- name: Ensure the install prefix exists
+  ansible.builtin.file:
+    path: "{{ lium_qemu_prefix }}"
+    state: directory
+    mode: "0755"
+
+- name: Download the QEMU tarball
+  ansible.builtin.get_url:
+    url: "{{ lium_qemu_tarball_url }}"
+    dest: "{{ lium_qemu_build_dir }}/qemu-dstack.tar.gz"
+    checksum: "sha256:{{ lium_qemu_tarball_sha256 }}"
+    mode: "0644"
+
+- name: Unpack it into the install prefix
+  ansible.builtin.unarchive:
+    src: "{{ lium_qemu_build_dir }}/qemu-dstack.tar.gz"
+    dest: "{{ lium_qemu_prefix }}"
+    remote_src: true
+    extra_opts: ["--strip-components=1"]
+
+- name: Record the installed binary's fingerprint
+  ansible.builtin.shell:
+    cmd: >-
+      sha256sum {{ lium_qemu_prefix }}/bin/qemu-system-x86_64
+      | cut -d' ' -f1 > {{ lium_state_dir }}/qemu.sha256
+  changed_when: true

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# Build the dstack QEMU fork at a pinned commit.
+#
+# PLAIN BUILD. DUMP_ACPI_TABLES is deliberately absent: that variant is the
+# verifier's ORACLE binary and cannot run VMs. Building it here would produce a
+# QEMU that looks installed and fails every launch.
+#
+# Rendered from this template and shellchecked in CI (tests/render_scripts.yml),
+# because a templated script is otherwise the one shell file nobody can check.
+
+set -Eeuo pipefail
+
+LOG_DIR="{{ lium_log_dir }}"
+BUILD_ROOT="{{ lium_qemu_build_dir }}/qemu-src"
+PREFIX="{{ lium_qemu_prefix }}"
+BRANCH="{{ lium_qemu_branch }}"
+COMMIT="{{ lium_qemu_commit }}"
+REPO="{{ lium_qemu_repo }}"
+
+mkdir -p "$LOG_DIR" "$(dirname "$BUILD_ROOT")"
+
+# HOME is what makes this script worth its own file. systemd-run starts with a
+# minimal environment in which HOME is UNSET, so `set -u` plus any use of $HOME
+# dies instantly while the unit goes inactive within seconds and looks
+# "finished" with nothing built. The systemd-run line therefore passes
+# --setenv=HOME=, and this guard makes the failure legible if it ever does not.
+if [ -z "${HOME:-}" ]; then
+  printf 'build-qemu: HOME is unset. systemd-run needs --setenv=HOME=<path>.\n' >&2
+  exit 1
+fi
+
+printf 'build-qemu: starting at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [ ! -d "$BUILD_ROOT/.git" ]; then
+  printf 'build-qemu: cloning %s at %s\n' "$REPO" "$BRANCH"
+  rm -rf "$BUILD_ROOT"
+  git clone --depth 1 --branch "$BRANCH" --single-branch "$REPO" "$BUILD_ROOT"
+fi
+
+cd "$BUILD_ROOT"
+
+# The branch tip moves; the commit is what the attestation measurement is
+# pinned to. Fetch it explicitly rather than trusting the shallow clone to
+# contain it.
+printf 'build-qemu: fetching %s\n' "$COMMIT"
+git fetch --depth 1 origin "$COMMIT"
+git checkout "$COMMIT"
+
+mkdir -p build
+cd build
+
+printf 'build-qemu: configuring\n'
+{{ lium_qemu_configure_cmd }}
+
+printf 'build-qemu: compiling with %s jobs\n' "$(nproc)"
+make -j"$(nproc)"
+
+printf 'build-qemu: installing to %s\n' "$PREFIX"
+make install
+
+"$PREFIX/bin/qemu-system-x86_64" --version | head -1
+
+# The marker the role waits for. Anything short of this means the build did not
+# finish, no matter what the unit's state says.
+printf 'QEMU_BUILD_DONE_OK\n'
