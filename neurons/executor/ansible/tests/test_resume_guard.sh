@@ -94,6 +94,30 @@ expect "(4b) a budget at the cap still allows the arming it belongs to" allow
 rm -f "${STATE_DIR}/resume.state"
 expect "(5) a missing resume state is refused" refuse
 
+# Neither half of the unattended path may block forever.
+#
+# The guard runs from ExecStartPre of a Type=oneshot unit, which systemd gives
+# NO start timeout by default. A bare `sync` there flushes every mounted
+# filesystem, so one wedged mount parks it in uninterruptible sleep and the host
+# sits at boot with provisioning half finished and nothing to reap it. Both
+# halves are asserted because either alone still leaves an unbounded hang.
+UNIT=roles/kernel/templates/lium-cvm-resume.service.j2
+
+CASES=$((CASES + 1))
+if grep -qE '^[[:space:]]*sync[[:space:]]+-f[[:space:]]' "$GUARD" \
+   && ! grep -qE '^[[:space:]]*sync[[:space:]]*$' "$GUARD"; then
+  pass "(6) the guard syncs only its own state file, never every filesystem"
+else
+  fail "(6) $GUARD must use 'sync -f \$STATE_FILE'; a bare sync can block on an unrelated mount"
+fi
+
+CASES=$((CASES + 1))
+if grep -qE '^TimeoutStartSec=' "$UNIT"; then
+  pass "(7) the resume unit bounds its own start time"
+else
+  fail "(7) $UNIT has no TimeoutStartSec; Type=oneshot defaults to no timeout, so a blocked resume hangs the boot forever"
+fi
+
 printf '\n'
 if [ "$FAILURES" -gt 0 ]; then
   printf 'FAIL test_resume_guard.sh — %s of %s checks failed.\n' "$FAILURES" "$CASES" >&2

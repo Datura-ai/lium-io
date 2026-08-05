@@ -9,6 +9,14 @@ ConditionPathExists={{ lium_state_dir }}/resume.state
 [Service]
 Type=oneshot
 
+# systemd applies NO start timeout to Type=oneshot by default. This unit is the
+# whole unattended half of the converge: if anything inside it blocks — a wedged
+# filesystem, a hung package download, a network mount that never answers —
+# nothing reaps it, and the host sits at boot indefinitely, provisioning
+# unfinished and silent about why. A timeout turns that into a failed unit with
+# a reason in resume.log, which ExecStopPost then cleans up after.
+TimeoutStartSec={{ lium_resume_timeout_sec }}
+
 # The resume guard uses this to decide the host is looping. Without it the guard
 # falls back to its own built-in default and an operator's
 # lium_max_converge_reboots override never reaches the one code path that acts

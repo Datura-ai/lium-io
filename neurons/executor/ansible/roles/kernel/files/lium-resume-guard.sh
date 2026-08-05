@@ -79,7 +79,12 @@ sed "s/\"attempts\"[[:space:]]*:[[:space:]]*[0-9][0-9]*/\"attempts\": $((ATTEMPT
   "$STATE_FILE" >"$TMP"
 chmod 600 "$TMP"
 mv -f "$TMP" "$STATE_FILE"
-sync
+# `sync -f`, not bare `sync`. Only this file's durability matters here, and a
+# bare sync flushes EVERY mounted filesystem. This runs from ExecStartPre of a
+# Type=oneshot unit at boot, where a single wedged mount — an unreachable NFS
+# share, a failing disk — blocks it in uninterruptible sleep. Paired with
+# TimeoutStartSec in the unit, so neither half can hang the host on its own.
+sync -f "$STATE_FILE"
 
 printf 'lium-cvm-resume: resuming (boot %s, armed on %s, attempt %s)\n' \
   "$CURRENT_BOOT_ID" "$ARMED_BOOT_ID" "$((ATTEMPTS + 1))"
