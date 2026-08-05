@@ -14,6 +14,7 @@ from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
+from .checks.network_ema import resolve_display_speeds
 from .models import JobResult
 from .pipeline import Context
 
@@ -126,6 +127,17 @@ class ResultHandler:
             **(context.state.specs or {}),
             "tdx_attestation_passed": context.tdx_attestation_passed,
             "is_spot": is_spot,
+        }
+
+        # DAH-2572: the speeds every UI shows. Resolved here, at the only point where specs
+        # leave the validator, so the marketplace and the provider portal cannot disagree
+        # about which of the four measured numbers is the current one.
+        network: dict = specs.get("network") or {}
+        display_upload_speed, display_download_speed = resolve_display_speeds(network)
+        specs["network"] = {
+            **network,
+            "display_upload_speed": display_upload_speed,
+            "display_download_speed": display_download_speed,
         }
         # G1 — NVIDIA CC GPU attestation outcome. Only added when a verification
         # was actually performed (None → key omitted), mirroring gpu_metrics.
