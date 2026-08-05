@@ -96,6 +96,44 @@ expect_state "(c2) a checkout one level deeper than /opt still blocks" DORMANT \
   env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$DEEP" LIUM_REPO_PATH=/nonexistent
 rm -rf "$DEEP"
 
+# (c3) A checkout on a volume that is in NO search root — the /data0 shape.
+#
+#      The only thing that can find it is the guard locating its own checkout
+#      from its own path. So the guard is COPIED into a fake checkout at the
+#      real relative depth and run from there, with the search roots pointed at
+#      an empty directory: if the self-location is removed, nothing else can
+#      possibly see the hda.img and this case goes CLEAN.
+OFFROOT="$(mktemp -d)"
+mkdir -p "$OFFROOT/neurons/executor/ansible/roles/common/files"
+mkdir -p "$OFFROOT/neurons/executor/dstacktee/run/vms/demo"
+: >"$OFFROOT/neurons/executor/dstacktee/run/vms/demo/hda.img"
+cp "$GUARD" "$OFFROOT/neurons/executor/ansible/roles/common/files/lium-guard.sh"
+chmod +x "$OFFROOT/neurons/executor/ansible/roles/common/files/lium-guard.sh"
+EMPTY_ROOT="$(mktemp -d)"
+
+CASES=$((CASES + 1))
+got="$(env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$EMPTY_ROOT" \
+           LIUM_REPO_PATH=/nonexistent \
+           "$OFFROOT/neurons/executor/ansible/roles/common/files/lium-guard.sh" --state)"
+if [ "$got" = "DORMANT" ]; then
+  pass "(c3) a checkout outside every search root still blocks when run from inside it"
+else
+  fail "(c3) a checkout outside every search root -> expected DORMANT, got $got"
+fi
+
+# And the recovery must name that checkout's real VM directory, not a guess
+# based on the /opt default.
+CASES=$((CASES + 1))
+offrec="$(env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$EMPTY_ROOT" \
+              LIUM_REPO_PATH=/nonexistent \
+              "$OFFROOT/neurons/executor/ansible/roles/common/files/lium-guard.sh" --recovery)"
+if printf '%s' "$offrec" | grep -qF "$OFFROOT/neurons/executor/dstacktee/run/vms/demo"; then
+  pass "(c3) the recovery names that checkout's own VM directory"
+else
+  fail "(c3) the recovery did not name ${OFFROOT}/... — it is guessing a path"
+fi
+rm -rf "$OFFROOT" "$EMPTY_ROOT"
+
 # (d) Unreadable vs absent. An absent root is the NORMAL fresh-host shape before
 #     the clone and must never read as a permissions failure.
 expect_state "(d1) absent root is a benign skip" CLEAN \

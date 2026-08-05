@@ -143,6 +143,27 @@ asserts the two lists agree so the duplication cannot rot silently.
 ./files/lium-guard.sh --print-default-roots   # what the test compares against
 ```
 
+### What the guard can and cannot see
+
+It finds an `hda.img` in two ways, and the union of them is its reach:
+
+1. **The checkout it is run from.** The script locates itself and searches
+   `<checkout>/neurons/executor/dstacktee`. `bootstrap.sh` always runs the copy
+   inside the checkout the provider invoked, so this covers a checkout anywhere
+   on the filesystem — `/data0/lium-io` included.
+2. **The search roots**, to a depth of 12.
+
+The one shape it does **not** see: a CVM whose checkout is on a volume outside
+`/home`, `/opt` and `/srv`, converged from a *different* checkout. Pass
+`--repo-path` (or add the volume to `lium_hda_search_roots`) on such a host.
+
+The depth budget was 8 and is now 12 for a specific reason. A checkout at
+`/opt/lium-io` puts `hda.img` at exactly depth 8, so 8 covered that one shape and
+nothing deeper — while `/home/<user>/lium-io` is depth 9, and `/home` is in the
+root list *precisely* to catch a home-directory checkout. The budget defeated the
+reason the root was there, and the guard answered `CLEAN` on a host holding a
+renter's encrypted disk.
+
 ## Kernel command-line math
 
 `files/lium-cmdline.sh` owns all of it. See `roles/kernel/README.md` for the

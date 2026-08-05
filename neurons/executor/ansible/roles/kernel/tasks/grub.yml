@@ -46,17 +46,14 @@
 # discovered set gets shorter, and writing that shorter list unbinds a GPU on
 # the next boot. Refuse and name the missing ids instead.
 #
-# The comparison uses the analysis above, NOT the collected facts, because that
-# analysis reads /proc/cmdline as well as both GRUB variables. A host booted
-# with ids that were later cleaned out of the GRUB files would otherwise show an
-# empty "existing" set, the difference would be empty, and the shorter list
-# would be written — the exact outcome this rule exists to prevent.
+# The comparison unions TWO sources — see the vars below. Neither alone is
+# enough, and each covers the other's blind spot.
 - name: Refuse to narrow vfio-pci.ids
   ansible.builtin.fail:
     msg: |
       REFUSING: the vfio-pci id list would get SHORTER.
 
-      Already on the kernel command line or in GRUB : {{ lium_cmdline_before.existing_vfio_ids | join(', ') }}
+      Already on the kernel command line or in GRUB : {{ lium_vfio_ids_existing | join(', ') }}
       Discovered on this host right now             : {{ lium.present_pci_ids | join(', ') }}
       Would be dropped                              : {{ lium_vfio_ids_dropped | join(', ') }}
 
@@ -68,8 +65,22 @@
       then re-run. If the device is genuinely gone for good, remove its id from
       GRUB by hand so the two agree.
   vars:
+    # BOTH sources, unioned.
+    #
+    # lium_cmdline_before EXCLUDES our own drop-in (so the au2 shape stays
+    # reportable across re-runs) and INCLUDES /proc/cmdline. lium.* includes the
+    # drop-in but not /proc/cmdline. Either alone leaves a hole:
+    #   - without lium.*, ids that live only in a drop-in we wrote on a previous
+    #     run are invisible, so a run-2 with a wedged GPU quietly shortens the
+    #     list;
+    #   - without the analysis, ids the host BOOTED with but which were later
+    #     cleaned out of the GRUB files are invisible.
+    # Unioning cannot cause a false refusal: a legitimately added GPU only ever
+    # widens the discovered set, so the difference stays empty.
+    lium_vfio_ids_existing: >-
+      {{ lium_cmdline_before.existing_vfio_ids | union(lium.grub_existing_vfio_ids) }}
     lium_vfio_ids_dropped: >-
-      {{ lium_cmdline_before.existing_vfio_ids | difference(lium.present_pci_ids) }}
+      {{ lium_vfio_ids_existing | difference(lium.present_pci_ids) }}
   when: lium_vfio_ids_dropped | length > 0
 
 # Once, and never overwritten: the point of a backup is the state BEFORE the

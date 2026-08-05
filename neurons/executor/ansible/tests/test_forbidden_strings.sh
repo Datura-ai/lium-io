@@ -110,9 +110,15 @@ matches_in_file() {
   # grep exits 0 on a match, 1 on none, and >=2 on an ERROR — a malformed
   # pattern, say. Treating an error as "no match" would silently disable the
   # rule, which is the failure mode this whole file exists to prevent.
+  #
+  # The error is RETURNED, never reported from here. This function is always
+  # called inside a command substitution, which is a subshell — so calling
+  # fail() here would increment a copy of FAILURES that dies with the subshell,
+  # print its message to stderr, and still exit 0. That is a third variant of
+  # "looks like it is asserting and is not", in the one file whose entire job is
+  # to stop exactly that. Anything added here must return, not report.
   if [ "$rc" -ge 2 ]; then
-    fail "grep failed (rc=$rc) applying '$pattern' to $file — the rule is not being enforced"
-    return 0
+    return 2
   fi
   [ "$rc" -eq 0 ] || return 0
 
@@ -163,7 +169,12 @@ while IFS=$'\t' read -r sense kind scope pattern why; do
   if [ "$sense" = "deny" ]; then
     hits=""
     for target in "${targets[@]}"; do
-      found="$(matches_in_file "$kind" "$pattern" "$target")"
+      mrc=0
+      found="$(matches_in_file "$kind" "$pattern" "$target")" || mrc=$?
+      if [ "$mrc" -ge 2 ]; then
+        fail "grep failed (rc=$mrc) applying '$pattern' to $target — the rule is NOT being enforced"
+        continue
+      fi
       [ -n "$found" ] && hits="${hits}${found}"$'\n'
     done
     if [ -n "${hits// /}" ] && [ -n "$(printf '%s' "$hits" | tr -d '[:space:]')" ]; then
@@ -177,7 +188,13 @@ while IFS=$'\t' read -r sense kind scope pattern why; do
     # thing goes unnoticed.
     present=0
     for target in "${targets[@]}"; do
-      if [ -n "$(matches_in_file "$kind" "$pattern" "$target")" ]; then
+      mrc=0
+      found="$(matches_in_file "$kind" "$pattern" "$target")" || mrc=$?
+      if [ "$mrc" -ge 2 ]; then
+        fail "grep failed (rc=$mrc) applying '$pattern' to $target — the rule is NOT being enforced"
+        continue
+      fi
+      if [ -n "$found" ]; then
         present=1
         break
       fi

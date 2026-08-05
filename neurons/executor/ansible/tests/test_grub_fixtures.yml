@@ -109,6 +109,10 @@
         loop_var: narrow_case
         label: "{{ narrow_case.name }}"
 
+    # Pre-mortem #1 variant B: update-grub succeeds but writes nothing.
+    - name: An unreadable grub.cfg must refuse, not reboot
+      ansible.builtin.include_tasks: _grub_noreconfig_case.yml
+
     - name: All GRUB fixtures passed
       ansible.builtin.debug:
-        msg: "{{ grub_cases | length }} GRUB fixtures and 2 narrowing cases passed."
+        msg: "{{ grub_cases | length }} GRUB fixtures, 2 narrowing cases and the no-reconfigure case passed."

@@ -42,6 +42,20 @@ ansible-playbook -i inventory/localhost.yml tests/test_repo_app_pristine.yml
 ansible-playbook -i inventory/localhost.yml tests/test_maintenance_profile.yml
 ```
 
+## One suite at a time, per machine
+
+The fixture playbooks use fixed paths under `/tmp` (`/tmp/lium-grub-fixture`,
+`/tmp/lium-kernel-idem`, `/tmp/lium-maint`, `/tmp/lium-repo-fixture`), so **two
+runs of the suite on the same machine will delete each other's work trees**.
+GitHub-hosted runners are isolated, so this is not a merge-gate concern; it
+matters on a shared or self-hosted runner, and to anyone running the suite twice
+at once locally.
+
+Within a single run the cases are already isolated — each GRUB fixture owns its
+own subdirectory, and the root is cleared once at the start rather than between
+cases. That churn used to cause an intermittent "destination directory does not
+exist" at roughly one run in three on a clean `/tmp`.
+
 ## Test seams
 
 A seam redirects a decision away from the real host — a fake `/proc/cmdline`, a
