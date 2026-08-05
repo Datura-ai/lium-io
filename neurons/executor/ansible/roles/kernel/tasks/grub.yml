@@ -9,7 +9,7 @@
 # both sides of every comparison from here down: vfio-pci parses its ids with
 # %x, so `10DE:2335` is a working configuration, and an exact-string compare
 # would read a provider's upper-case list as five ids that all vanished.
-- name: Establish the managed PCI id universe
+- name: Establish the managed PCI id universe and the base tokens
   ansible.builtin.set_fact:
     lium_vfio_universe: "{{ (lium_cc_gpu_pci_ids + lium_nvswitch_pci_ids) | map('lower') | list }}"
     lium_vfio_present: "{{ lium.present_pci_ids | map('lower') | list }}"
@@ -41,9 +41,8 @@
 #
 # Carrying them is also the only honest answer. We never look for these ids in
 # lspci, so we cannot tell whether the device is present, which means we may
-# neither drop them nor refuse over them. Preserve the provider's stated intent
-# and say so. Keeping an id for a device that really did go away is harmless —
-# vfio-pci simply binds nothing.
+# neither drop them nor refuse over them. Keeping an id for a device that really
+# did go away is harmless — vfio-pci simply binds nothing.
 - name: Separate the managed ids from the ones we must carry forward
   ansible.builtin.set_fact:
     lium_vfio_unmanaged: >-
@@ -52,16 +51,17 @@
 
 - name: Build the required token set
   ansible.builtin.set_fact:
-    lium_vfio_ids_to_write: "{{ lium_vfio_present + lium_vfio_unmanaged }}"
     lium_required_tokens: >-
       {{
         lium_base_tokens
         + (
-            ['vfio-pci.ids=' ~ ((lium_vfio_present + lium_vfio_unmanaged) | join(','))]
-            if ((lium_vfio_present + lium_vfio_unmanaged) | length) > 0 else []
+            ['vfio-pci.ids=' ~ (lium_vfio_ids_to_write | join(','))]
+            if (lium_vfio_ids_to_write | length) > 0 else []
           )
         + ['vfio_iommu_type1.dma_entry_limit=' ~ lium_dma_entry_limit]
       }}
+  vars:
+    lium_vfio_ids_to_write: "{{ lium_vfio_present + lium_vfio_unmanaged }}"
 
 - name: Report the vfio-pci ids being carried forward
   ansible.builtin.debug:
