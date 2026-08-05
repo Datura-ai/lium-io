@@ -581,3 +581,50 @@ def test_reporter_full_completion_finishes_known_counters() -> None:
     assert isinstance(terminal_payload, dict)
     assert terminal_payload["processed_files"] == 7
     assert terminal_payload["processed_bytes"] == 100
+
+
+def test_reporter_uses_backup_summary_counters() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.BACKUP,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.BACKUP,
+        ),
+        session=session,
+    )
+
+    reporter.send(
+        {
+            "event": "restic",
+            "payload": {
+                "message_type": "status",
+                "total_files": 726,
+                "files_done": 16,
+                "total_bytes": 17_424,
+                "bytes_done": 408,
+            },
+        }
+    )
+    reporter.send(
+        {
+            "event": "restic",
+            "payload": {
+                "message_type": "summary",
+                "total_files_processed": 2_002,
+                "total_bytes_processed": 268_483_487,
+            },
+        }
+    )
+    reporter.send(
+        {"event": "result", "status": "COMPLETED", "result_quality": "FULL", "exit_code": 0}
+    )
+
+    terminal_payload = session.requests[-1]["json"]
+    assert isinstance(terminal_payload, dict)
+    assert terminal_payload["total_files"] == 2_002
+    assert terminal_payload["processed_files"] == 2_002
+    assert terminal_payload["total_bytes"] == 268_483_487
+    assert terminal_payload["processed_bytes"] == 268_483_487

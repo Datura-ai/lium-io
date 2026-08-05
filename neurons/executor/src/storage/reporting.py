@@ -88,14 +88,32 @@ class StorageEventReporter:
         if isinstance(percent_done, int | float) and not isinstance(percent_done, bool):
             self._state.progress = max(self._state.progress, min(float(percent_done) * 100.0, 99.9))
         self._state.total_files = _updated_integer(
-            event, self._state.total_files, "total_files", "total_file_count"
+            event,
+            self._state.total_files,
+            "total_files",
+            "total_file_count",
+            "total_files_processed",
         )
         self._state.processed_files = _updated_integer(
-            event, self._state.processed_files, "files_done", "files_restored"
+            event,
+            self._state.processed_files,
+            "files_done",
+            "files_restored",
+            "total_files_processed",
         )
-        self._state.total_bytes = _updated_integer(event, self._state.total_bytes, "total_bytes", "total_size")
+        self._state.total_bytes = _updated_integer(
+            event,
+            self._state.total_bytes,
+            "total_bytes",
+            "total_size",
+            "total_bytes_processed",
+        )
         self._state.processed_bytes = _updated_integer(
-            event, self._state.processed_bytes, "bytes_done", "bytes_restored"
+            event,
+            self._state.processed_bytes,
+            "bytes_done",
+            "bytes_restored",
+            "total_bytes_processed",
         )
 
     def _remember_restic_error(self, event: Mapping[str, object]) -> None:
