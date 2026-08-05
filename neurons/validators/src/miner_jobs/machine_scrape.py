@@ -1154,42 +1154,74 @@ def read_infiniband_port(
     # prefix alone identifies nothing. The IPv4-mapped entry is the one that tells two Ethernet
     # ports they share a segment - find it by IPV4_MAPPED_GID_PREFIX, its index moves by driver.
     gids = [read_sysfs_value(f"{port_path}/gids/{index}") for index in range(GID_TABLE_ENTRIES_READ)]
+    # POSITIONAL ON PURPOSE: obfuscator.py renames __init__ parameters but leaves keyword names at
+    # the call site, so a keyword call raises TypeError in the packaged scrape and nowhere else.
+    # That is what made the first prod rollout return an empty list on every host (DAH-2571).
     return InfinibandPort(
-        device=os.path.basename(device_path),
-        port=os.path.basename(port_path),
-        node_guid=node_guid,
-        sys_image_guid=sys_image_guid,
-        link_layer=read_sysfs_value(f"{port_path}/link_layer"),
-        state=read_sysfs_value(f"{port_path}/state"),
-        phys_state=read_sysfs_value(f"{port_path}/phys_state"),
-        rate=read_sysfs_value(f"{port_path}/rate"),
-        lid=read_sysfs_value(f"{port_path}/lid"),
-        sm_lid=read_sysfs_value(f"{port_path}/sm_lid"),
-        pkey=read_sysfs_value(f"{port_path}/pkeys/0"),
-        gids=[gid for gid in gids if gid],
+        os.path.basename(device_path),
+        os.path.basename(port_path),
+        node_guid,
+        sys_image_guid,
+        read_sysfs_value(f"{port_path}/link_layer"),
+        read_sysfs_value(f"{port_path}/state"),
+        read_sysfs_value(f"{port_path}/phys_state"),
+        read_sysfs_value(f"{port_path}/rate"),
+        read_sysfs_value(f"{port_path}/lid"),
+        read_sysfs_value(f"{port_path}/sm_lid"),
+        read_sysfs_value(f"{port_path}/pkeys/0"),
+        [gid for gid in gids if gid],
     )
 
 
-def get_infiniband_ports() -> list[InfinibandPort]:
+class InfinibandObservation:
+    # Plain class rather than a dataclass/NamedTuple: obfuscator.py only carries the imports on its
+    # allowlist into the packaged scrape, so this file must not grow new ones.
+    def __init__(self, ports: list[InfinibandPort], scrape_error: str) -> None:
+        self.ports = ports
+        self.scrape_error = scrape_error
+
+
+def get_infiniband_ports() -> InfinibandObservation:
     """Every RDMA port the host exposes, as reported by the kernel (DAH-2571).
 
     Facts only - which ports are usable and which fabric each one sits on. Deciding whether two
     machines are on the same fabric is the backend's job: it needs both hosts, this sees one.
+
+    An empty port list has three different causes and they must stay distinguishable: the host has
+    no RDMA hardware, the scrape cannot see the sysfs tree from where it runs, or the walk itself
+    failed. Reporting [] for all three is what made the first prod rollout unreadable - every
+    executor came back empty, including hosts known to carry 24 mlx5 devices, with no way to tell
+    which case it was.
     """
+    if not os.path.isdir(INFINIBAND_SYSFS_PATH):
+        return InfinibandObservation([], f"{INFINIBAND_SYSFS_PATH} does not exist")
+
     ports: list[InfinibandPort] = []
     try:
-        for device_path in sorted(glob.glob(f"{INFINIBAND_SYSFS_PATH}/*")):
+        # os.listdir, not glob: glob swallows EACCES/EIO and returns [], which would be reported as
+        # "lists no devices" - the same kind of silent nothing this function exists to stop.
+        device_names = sorted(os.listdir(INFINIBAND_SYSFS_PATH))
+        for device_name in device_names:
+            device_path = f"{INFINIBAND_SYSFS_PATH}/{device_name}"
             node_guid = read_sysfs_value(f"{device_path}/node_guid")
             sys_image_guid = read_sysfs_value(f"{device_path}/sys_image_guid")
-            for port_path in sorted(glob.glob(f"{device_path}/ports/*")):
+            ports_path = f"{device_path}/ports"
+            if not os.path.isdir(ports_path):
+                continue
+            for port_name in sorted(os.listdir(ports_path)):
                 ports.append(
-                    read_infiniband_port(device_path, node_guid, sys_image_guid, port_path)
+                    read_infiniband_port(device_path, node_guid, sys_image_guid, f"{ports_path}/{port_name}")
                 )
-    except Exception:
-        # Every other probe in this file swallows its own failure - an interconnect reading is
-        # never worth failing the whole machine scrape over.
-        return []
-    return ports
+    except Exception as e:
+        # An interconnect reading is never worth failing the whole machine scrape over, but the
+        # reason has to travel with the empty result.
+        return InfinibandObservation(ports, f"Error walking {INFINIBAND_SYSFS_PATH}: {e}")
+
+    if not device_names:
+        return InfinibandObservation([], f"{INFINIBAND_SYSFS_PATH} lists no devices")
+    if not ports:
+        return InfinibandObservation([], f"{len(device_names)} device(s) present, none exposing a port")
+    return InfinibandObservation(ports, "")
 
 
 def get_machine_specs():
@@ -1312,7 +1344,10 @@ def get_machine_specs():
     if ncu_profiling.scrape_error:
         data["data_ncu_profiling_scrape_error"] = ncu_profiling.scrape_error
     data["data_boot_id"] = get_host_boot_id()
-    data["data_infiniband_ports"] = [port.as_payload() for port in get_infiniband_ports()]
+    infiniband = get_infiniband_ports()
+    data["data_infiniband_ports"] = [port.as_payload() for port in infiniband.ports]
+    if infiniband.scrape_error:
+        data["data_infiniband_scrape_error"] = infiniband.scrape_error
 
     try:
         lscpu_output = run_cmd("lscpu")
