@@ -33,6 +33,7 @@ class StorageEventReporter:
         self._session = session or requests.Session()
         self._state = ProgressState(stage=action.value.upper())
         self._cancel_requested = False
+        self._failure_detail: str | None = None
 
     @property
     def cancel_requested(self) -> bool:
@@ -45,6 +46,7 @@ class StorageEventReporter:
             if not isinstance(payload, Mapping):
                 return
             self._apply_progress(payload)
+            self._remember_restic_error(payload)
             self._put(self._progress_payload(status="IN_PROGRESS"), terminal=False)
             return
         if event_type == "heartbeat":
@@ -53,6 +55,8 @@ class StorageEventReporter:
         if event_type == "diagnostic":
             message = event.get("message")
             if isinstance(message, str) and message:
+                if self._failure_detail is None:
+                    self._failure_detail = message[:2000]
                 self._put(
                     self._progress_payload(status="IN_PROGRESS", logs=[message[:2000]]),
                     terminal=False,
@@ -70,6 +74,7 @@ class StorageEventReporter:
                     result_quality=_optional_string(event.get("result_quality")),
                     snapshot_id=_optional_string(event.get("snapshot_id")),
                     exit_code=_optional_integer(event.get("exit_code")),
+                    error_message=self._failure_detail if status != "COMPLETED" else None,
                 ),
                 terminal=True,
             )
@@ -89,6 +94,22 @@ class StorageEventReporter:
             event, self._state.processed_bytes, "bytes_done", "bytes_restored"
         )
 
+    def _remember_restic_error(self, event: Mapping[str, object]) -> None:
+        if self._failure_detail is not None:
+            return
+        message_type = event.get("message_type")
+        if message_type not in ("error", "exit_error"):
+            return
+        error = event.get("error")
+        if isinstance(error, Mapping):
+            message = _optional_string(error.get("message"))
+            if message:
+                self._failure_detail = message[:2000]
+                return
+        message = _optional_string(event.get("message"))
+        if message:
+            self._failure_detail = message[:2000]
+
     def _progress_payload(
         self,
         *,
@@ -97,6 +118,7 @@ class StorageEventReporter:
         result_quality: str | None = None,
         snapshot_id: str | None = None,
         exit_code: int | None = None,
+        error_message: str | None = None,
     ) -> dict[str, object]:
         return {
             "operation_id": str(self._operation_id),
@@ -110,6 +132,7 @@ class StorageEventReporter:
             "result_quality": result_quality,
             "snapshot_id": snapshot_id,
             "exit_code": exit_code,
+            "error_message": error_message,
             "logs": logs,
         }
 

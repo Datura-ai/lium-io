@@ -126,6 +126,7 @@ def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments()
     assert "customer-volume:/workspace:ro" in command
     assert command[command.index("--workdir") + 1] == "/workspace/checkpoints"
     assert command[command.index("--log-driver") + 1] == "none"
+    assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=2281701376"
     assert "AWS_ACCESS_KEY_ID" in command
     assert "AWS_SESSION_TOKEN" in command
     assert "access-key" not in command
@@ -515,3 +516,35 @@ def test_reporter_preserves_zero_counters_and_receives_cancellation() -> None:
     assert payload["processed_files"] == 0
     assert payload["total_bytes"] == 0
     assert payload["processed_bytes"] == 0
+
+
+def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
+    session = _ReporterSession()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.BACKUP,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.BACKUP,
+        ),
+        session=session,
+    )
+
+    reporter.send(
+        {
+            "event": "restic",
+            "payload": {
+                "message_type": "error",
+                "error": {"message": "failed to save model.bin: no space left on device"},
+            },
+        }
+    )
+    reporter.send({"event": "diagnostic", "message": "restic backup failed with exit 1"})
+    reporter.send({"event": "result", "status": "FAILED", "exit_code": 1})
+
+    terminal_payload = session.requests[-1]["json"]
+    assert isinstance(terminal_payload, dict)
+    assert terminal_payload["error_message"] == (
+        "failed to save model.bin: no space left on device"
+    )
