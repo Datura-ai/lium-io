@@ -1,0 +1,54 @@
+---
+# One GPU, CC mode off -> on.
+#
+# Queries work while the device is bound to vfio-pci; MODE CHANGES DO NOT. So it
+# has to be unbound first, and its driver_override cleared, or the set commands
+# silently do nothing.
+
+- name: "Unbind from vfio-pci: {{ lium_gpu_bdf }}"
+  ansible.builtin.copy:
+    dest: /sys/bus/pci/drivers/vfio-pci/unbind
+    content: "{{ lium_gpu_bdf }}"
+    unsafe_writes: true
+    mode: "0200"
+  failed_when: false
+
+- name: "Clear the driver override: {{ lium_gpu_bdf }}"
+  ansible.builtin.copy:
+    dest: "/sys/bus/pci/devices/{{ lium_gpu_bdf }}/driver_override"
+    content: "\n"
+    unsafe_writes: true
+    mode: "0644"
+  failed_when: false
+
+- name: "Turn PPCIe mode off: {{ lium_gpu_bdf }}"
+  ansible.builtin.command:
+    cmd: "{{ lium_gpu_ppcie_off_cmd }}"
+  register: lium_ppcie_result
+  changed_when: true
+
+- name: "Turn confidential-compute mode on: {{ lium_gpu_bdf }}"
+  ansible.builtin.command:
+    cmd: "{{ lium_gpu_cc_on_cmd }}"
+  register: lium_cc_on_result
+  changed_when: true
+
+- name: "Read the mode back: {{ lium_gpu_bdf }}"
+  ansible.builtin.command:
+    cmd: "{{ lium_gpu_cc_query_cmd }}"
+  register: lium_cc_verify
+  changed_when: false
+
+# A wedged GPU (`_kgspEstablishSpdmSession: Timeout waiting for SPDM`) is
+# recovered by PCIe hot-remove plus rescan, and by nothing else.
+#
+# --reset-with-sbr made it WORSE on au1: it left the GPU [broken, cfg space
+# working] with the PCIe data link down (DLLLA:0). --recover-broken-gpu and
+# --reset-with-flr both failed to bring it back. All three flags are in
+# tests/forbidden-patterns.txt so they cannot reappear.
+- name: "Recover a wedged device by PCIe hot-remove and rescan: {{ lium_gpu_bdf }}"
+  ansible.builtin.command:
+    cmd: "{{ lium_gpu_rescan_cmd }}"
+  register: lium_rescan_result
+  changed_when: true
+  when: "'broken' in (lium_cc_verify.stdout | default('') | lower)"
