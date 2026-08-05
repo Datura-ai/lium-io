@@ -5,12 +5,18 @@ Run compute subnet executors inside Intel TDX confidential VMs with hardware att
 ## Prerequisites
 
 - Intel CPU with TDX and SGX support
-- Kernel with KVM TDX (Canonical intel kernel or mainline ≥ 6.16) and the boot parameters from [docs/host-setup.md](docs/host-setup.md)
+- Kernel with KVM TDX (Canonical intel kernel or mainline ≥ 6.16) and the boot parameters — applied for you by `ansible/bootstrap.sh`, see [docs/host-setup.md](docs/host-setup.md)
 - Docker and Docker Compose
-- The dstack QEMU 9.2.1 build — **required for attestation to pass**; one-time install, see [docs/host-setup.md](docs/host-setup.md)
+- The dstack QEMU 9.2.1 build — **required for attestation to pass**; built for you by `ansible/bootstrap.sh`, see [docs/host-setup.md](docs/host-setup.md)
 - SGX devices: `/dev/sgx_enclave` and `/dev/sgx_provision`
 
-First-time host? Follow [docs/host-setup.md](docs/host-setup.md) end to end — it covers BIOS, kernel parameters, the QEMU build, and the key provider; the steps below assume a prepared host.
+First-time host? Run the host bring-up first — one command, safe to re-run:
+
+```bash
+cd ../ansible && sudo ./bootstrap.sh
+```
+
+It covers kernel parameters, GPU confidential-compute mode, the QEMU build, Docker, SGX and the key provider, and it names any BIOS setting it cannot change itself. See [../ansible/README.md](../ansible/README.md) and [docs/host-setup.md](docs/host-setup.md). The steps below assume a prepared host.
 
 ## Quick Start
 
