@@ -1,8 +1,9 @@
 import asyncio
 import logging
+from typing import Any
 
 import asyncssh
-from asyncssh import SSHClientConnection
+from asyncssh import SSHClientConnection, SSHKey
 
 from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
@@ -17,12 +18,13 @@ logger = logging.getLogger(__name__)
 # "no sysbox", which delists an unrented executor for the whole cycle. Polling is also cheaper
 # than a longer sleep: a ready container is caught at ~3s instead of always waiting.
 #
-# The per-attempt timeout stays at 12s and is deliberately not tightened to the poll interval:
-# asyncssh counts TCP connect, key exchange AND authentication against it, none of which carry
-# over to the next attempt, so a host slow enough to need 6s would fail every single try.
-DIND_SSH_READY_TIMEOUT = 30
-DIND_SSH_CONNECT_TIMEOUT = 12
-DIND_SSH_POLL_INTERVAL = 1.5
+# The per-attempt timeout is deliberately not tightened to the poll interval: asyncssh counts TCP
+# connect, key exchange AND authentication against it, none of which carry over to the next
+# attempt, so a host slow enough to need 6s would fail every single try. An attempt is shortened
+# only when less than 12s of the deadline is left, which is time it could not have used anyway.
+DIND_SSH_READY_TIMEOUT_SECONDS = 30
+DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
+DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 
 
 class DindVerifier:
@@ -68,7 +70,9 @@ class DindVerifier:
 
             # Test SSH
             pkey = asyncssh.import_private_key(private_key)
-            async with await self._wait_for_ssh(host, port, pkey, log_ctx) as ssh:
+            async with await self._connect_retrying_until_sshd_answers(
+                host, port, pkey, log_ctx
+            ) as ssh:
                 # Test sysbox
                 if sysbox:
                     # daturaai/dind:0.0.1 bundles the hello-world image into the inner dockerd
@@ -121,39 +125,44 @@ class DindVerifier:
                 port=port,
             )
 
-    async def _wait_for_ssh(
+    async def _connect_retrying_until_sshd_answers(
         self,
         host: str,
         port: PortPair,
-        pkey,
-        log_ctx: dict,
+        pkey: SSHKey,
+        log_ctx: dict[str, Any],
     ) -> SSHClientConnection:
         """Connect to the freshly started DinD container, retrying until sshd answers.
 
-        Bounded twice over: each attempt carries its own connect/login timeout, and no attempt
-        starts once the deadline is within one poll interval. The last failure is re-raised
-        rather than wrapped, so the caller still logs the underlying error (a refused
-        connection and an unreachable host are different diagnoses).
+        The deadline caps the whole wait, not just the moment an attempt starts: a hanging
+        attempt gets whatever is left of the budget rather than a fresh 12s on top of it, so a
+        blackholed port cannot stretch the probe past DIND_SSH_READY_TIMEOUT_SECONDS (DAH-2272
+        exists because one such hang stalled the pipeline). The last failure is re-raised rather
+        than wrapped, so the caller still logs the underlying error (a refused connection and an
+        unreachable host are different diagnoses).
         """
         loop = asyncio.get_running_loop()
         started_at = loop.time()
-        deadline = started_at + DIND_SSH_READY_TIMEOUT
+        deadline = started_at + DIND_SSH_READY_TIMEOUT_SECONDS
         attempts = 0
 
         while True:
             attempts += 1
+            attempt_timeout_seconds = min(
+                DIND_SSH_CONNECT_TIMEOUT_SECONDS, deadline - loop.time()
+            )
             try:
-                ssh = await asyncssh.connect(
+                connection = await asyncssh.connect(
                     host=host,
                     port=port.external,
                     username="root",
                     client_keys=[pkey],
                     known_hosts=None,
-                    connect_timeout=DIND_SSH_CONNECT_TIMEOUT,
-                    login_timeout=DIND_SSH_CONNECT_TIMEOUT,
+                    connect_timeout=attempt_timeout_seconds,
+                    login_timeout=attempt_timeout_seconds,
                 )
             except Exception:
-                if loop.time() + DIND_SSH_POLL_INTERVAL >= deadline:
+                if loop.time() + DIND_SSH_POLL_INTERVAL_SECONDS >= deadline:
                     logger.warning(
                         _m(
                             "DinD SSH not ready before deadline",
@@ -167,7 +176,7 @@ class DindVerifier:
                         )
                     )
                     raise
-                await asyncio.sleep(DIND_SSH_POLL_INTERVAL)
+                await asyncio.sleep(DIND_SSH_POLL_INTERVAL_SECONDS)
                 continue
 
             logger.info(
@@ -182,7 +191,7 @@ class DindVerifier:
                     ),
                 )
             )
-            return ssh
+            return connection
 
 
 class DindProbe:
