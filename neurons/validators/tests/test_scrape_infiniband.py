@@ -295,3 +295,66 @@ def test_infiniband_keys_are_wired_through_both_obfuscation_tables() -> None:
         assert f'"{key}"' in scrape_text or f"'{key}'" in scrape_text
         assert key in original_keys
         assert key in all_keys
+
+
+def _obfuscated_infiniband_namespace() -> dict[str, Any]:
+    """The InfiniBand helpers as they ship: obfuscated, then key-substituted, then executed.
+
+    The unobfuscated source is not what runs on an executor, and the two disagree. obfuscator.py
+    renames `__init__` parameters while leaving keyword names at the call site, so a keyword
+    construction raises TypeError only in the packaged scrape — invisible to every test that
+    imports the source. That is what shipped in #1192 and returned an empty port list on all 373
+    prod executors, including hosts carrying 24 mlx5 devices.
+    """
+    import contextlib
+    import io
+
+    from miner_jobs.obfuscator import obfuscate_code
+    from services.file_encrypt_service import FileEncryptService
+
+    source = (SRC / "miner_jobs" / "machine_scrape.py").read_text()
+    with contextlib.redirect_stdout(io.StringIO()):  # the obfuscator narrates to stdout
+        obfuscated = obfuscate_code(source)
+        key_mapping, _ = FileEncryptService.generate_key_mappings(FileEncryptService.__new__(FileEncryptService))
+    for original_key, random_name in key_mapping.items():
+        obfuscated = obfuscated.replace(original_key, random_name)
+
+    def top_level_name(node: ast.AST) -> str:
+        if isinstance(node, ast.FunctionDef | ast.ClassDef):
+            return node.name
+        if isinstance(node, ast.Assign):
+            return getattr(node.targets[0], "id", "")
+        return ""
+
+    source_tree, obfuscated_tree = ast.parse(source), ast.parse(obfuscated)
+    kept = [
+        obfuscated_tree.body[index]
+        for index, node in enumerate(source_tree.body)
+        if top_level_name(node) in INFINIBAND_HELPERS
+    ]
+    assert len(kept) == len(INFINIBAND_HELPERS), "machine_scrape.py no longer defines all of them at module level"
+
+    namespace: dict[str, Any] = {"os": os, "glob": glob}
+    exec(compile(ast.Module(body=kept, type_ignores=[]), "obfuscated", "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+def test_the_obfuscated_scrape_parses_a_port_and_does_not_just_return_empty(tmp_path: Path) -> None:
+    # Arrange
+    namespace = _obfuscated_infiniband_namespace()
+    sysfs_path_name = next(name for name, value in namespace.items() if value == "/sys/class/infiniband")
+    read_ports = next(
+        value for value in namespace.values() if callable(value) and "RDMA port" in (getattr(value, "__doc__", "") or "")
+    )
+    write_port(tmp_path, "mlx5_2", "1", IB_PORT_FILES)
+    namespace[sysfs_path_name] = str(tmp_path)
+
+    # Act
+    observation = read_ports()
+
+    # Assert — an empty list here means the packaged scrape is broken, whatever the source does
+    assert observation.scrape_error == ""
+    assert len(observation.ports) == 1
+    assert observation.ports[0].link_layer == "InfiniBand"
+    # payload keys are substituted with random names by then, so only their count is checkable
+    assert len(observation.ports[0].as_payload()) == 12

@@ -1154,19 +1154,22 @@ def read_infiniband_port(
     # prefix alone identifies nothing. The IPv4-mapped entry is the one that tells two Ethernet
     # ports they share a segment - find it by IPV4_MAPPED_GID_PREFIX, its index moves by driver.
     gids = [read_sysfs_value(f"{port_path}/gids/{index}") for index in range(GID_TABLE_ENTRIES_READ)]
+    # POSITIONAL ON PURPOSE: obfuscator.py renames __init__ parameters but leaves keyword names at
+    # the call site, so a keyword call raises TypeError in the packaged scrape and nowhere else.
+    # That is what made the first prod rollout return an empty list on every host (DAH-2571).
     return InfinibandPort(
-        device=os.path.basename(device_path),
-        port=os.path.basename(port_path),
-        node_guid=node_guid,
-        sys_image_guid=sys_image_guid,
-        link_layer=read_sysfs_value(f"{port_path}/link_layer"),
-        state=read_sysfs_value(f"{port_path}/state"),
-        phys_state=read_sysfs_value(f"{port_path}/phys_state"),
-        rate=read_sysfs_value(f"{port_path}/rate"),
-        lid=read_sysfs_value(f"{port_path}/lid"),
-        sm_lid=read_sysfs_value(f"{port_path}/sm_lid"),
-        pkey=read_sysfs_value(f"{port_path}/pkeys/0"),
-        gids=[gid for gid in gids if gid],
+        os.path.basename(device_path),
+        os.path.basename(port_path),
+        node_guid,
+        sys_image_guid,
+        read_sysfs_value(f"{port_path}/link_layer"),
+        read_sysfs_value(f"{port_path}/state"),
+        read_sysfs_value(f"{port_path}/phys_state"),
+        read_sysfs_value(f"{port_path}/rate"),
+        read_sysfs_value(f"{port_path}/lid"),
+        read_sysfs_value(f"{port_path}/sm_lid"),
+        read_sysfs_value(f"{port_path}/pkeys/0"),
+        [gid for gid in gids if gid],
     )
 
 
