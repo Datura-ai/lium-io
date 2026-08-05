@@ -285,6 +285,52 @@ async def test_dind_verifier_hanging_attempts_stay_inside_the_deadline(mocker):
 
 
 @pytest.mark.asyncio
+async def test_dind_verifier_late_poll_wakeup_starts_no_further_attempt(mocker):
+    """DAH-2588: when the loop resumes the poll past the deadline there is no budget left, and an
+    attempt started anyway could only time out — reporting a timeout instead of the connection
+    error that actually kept sshd unreachable."""
+    port = PortPair(9000, 9000)
+    verifier, ssh_client = _build_started_dind(mocker)
+
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_READY_TIMEOUT_SECONDS", 0.05)
+    mocker.patch("services.executor_connectivity.dind_probe.DIND_SSH_POLL_INTERVAL_SECONDS", 0.01)
+
+    granted_timeouts = []
+
+    async def refuse_immediately(**kwargs):
+        granted_timeouts.append(kwargs["connect_timeout"])
+        raise ConnectionRefusedError("[Errno 111] Connect call failed")
+
+    connect = mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncssh.connect",
+        new=mocker.AsyncMock(side_effect=refuse_immediately),
+    )
+
+    # A poll that oversleeps its interval by more than the deadline had left.
+    real_sleep = asyncio.sleep
+
+    async def oversleep(_):
+        await real_sleep(0.2)
+
+    mocker.patch(
+        "services.executor_connectivity.dind_probe.asyncio.sleep",
+        new=mocker.AsyncMock(side_effect=oversleep),
+    )
+
+    result = await verifier.verify(
+        port,
+        ssh_client=ssh_client,
+        host="127.0.0.1",
+        container_name_prefix="container_miner",
+        sysbox=True,
+    )
+
+    assert result.success is False
+    assert connect.await_count == 1
+    assert all(timeout > 0 for timeout in granted_timeouts)
+
+
+@pytest.mark.asyncio
 async def test_dind_verifier_hung_inner_docker_run_degrades_sysbox(mocker):
     """DAH-2272: a hung inner `docker run --rm hello-world` must degrade to
     sysbox_ok=False via asyncio.wait_for(timeout=30) instead of hanging the

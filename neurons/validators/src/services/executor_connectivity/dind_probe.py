@@ -137,16 +137,19 @@ class DindVerifier:
         The deadline caps the whole wait, not just the moment an attempt starts: a hanging
         attempt gets whatever is left of the budget rather than a fresh 12s on top of it, so a
         blackholed port cannot stretch the probe past DIND_SSH_READY_TIMEOUT_SECONDS (DAH-2272
-        exists because one such hang stalled the pipeline). The last failure is re-raised rather
-        than wrapped, so the caller still logs the underlying error (a refused connection and an
-        unreachable host are different diagnoses).
+        exists because one such hang stalled the pipeline). No attempt starts once the deadline
+        has passed either — a poll that resumes late would otherwise get a negative budget and
+        report a timeout in place of the real connection error. The last failure is raised as is,
+        so the caller still logs that error (a refused connection and an unreachable host are
+        different diagnoses).
         """
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         deadline = started_at + DIND_SSH_READY_TIMEOUT_SECONDS
         attempts = 0
+        last_error: Exception | None = None
 
-        while True:
+        while loop.time() < deadline:
             attempts += 1
             attempt_timeout_seconds = min(
                 DIND_SSH_CONNECT_TIMEOUT_SECONDS, deadline - loop.time()
@@ -161,21 +164,10 @@ class DindVerifier:
                     connect_timeout=attempt_timeout_seconds,
                     login_timeout=attempt_timeout_seconds,
                 )
-            except Exception:
+            except Exception as error:
+                last_error = error
                 if loop.time() + DIND_SSH_POLL_INTERVAL_SECONDS >= deadline:
-                    logger.warning(
-                        _m(
-                            "DinD SSH not ready before deadline",
-                            extra=get_extra_info(
-                                {
-                                    **log_ctx,
-                                    "ssh_waited_sec": round(loop.time() - started_at, 2),
-                                    "ssh_attempts": attempts,
-                                }
-                            ),
-                        )
-                    )
-                    raise
+                    break
                 await asyncio.sleep(DIND_SSH_POLL_INTERVAL_SECONDS)
                 continue
 
@@ -192,6 +184,20 @@ class DindVerifier:
                 )
             )
             return connection
+
+        logger.warning(
+            _m(
+                "DinD SSH not ready before deadline",
+                extra=get_extra_info(
+                    {
+                        **log_ctx,
+                        "ssh_waited_sec": round(loop.time() - started_at, 2),
+                        "ssh_attempts": attempts,
+                    }
+                ),
+            )
+        )
+        raise last_error
 
 
 class DindProbe:
