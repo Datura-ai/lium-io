@@ -21,6 +21,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 INFINIBAND_HELPERS = {
     "INFINIBAND_SYSFS_PATH",
     "GID_TABLE_ENTRIES_READ",
+    "IPV4_MAPPED_GID_PREFIX",
     "read_sysfs_value",
     "InfinibandPort",
     "read_infiniband_port",
@@ -38,11 +39,14 @@ IB_PORT_FILES = {
     "sm_lid": "0x1",
     "pkeys/0": "0x7fff",
     "gids/0": "fe80:0000:0000:0000:9a03:9bff:fe1d:8a42",
+    "gids/1": "fe80:0000:0000:0000:9a03:9bff:fe1d:8a42",
+    "gids/2": "0000:0000:0000:0000:0000:ffff:0a7d:016b",
+    "gids/3": "0000:0000:0000:0000:0000:ffff:0a7d:016b",
 }
 
-# 38.255.28.18 (8xH200), mlx5_0 in Ethernet mode. GIDs 2-3 are the IPv4-mapped ones — the only
-# entries that say which segment the port is reachable on; 0-1 carry the default fe80:: prefix
-# every prod port shares.
+
+# 38.255.28.18 (8xH200), mlx5_0 in Ethernet mode. The IPv4-mapped GID says which segment the port
+# is reachable on; mlx5 puts it at indices 2-3, other drivers elsewhere, so it is found by prefix.
 ROCE_PORT_FILES = {
     "link_layer": "Ethernet",
     "state": "4: ACTIVE",
@@ -102,26 +106,51 @@ def test_infiniband_port_is_reported_with_its_fabric_identity(
             "ib_lid": "0x4",
             "ib_sm_lid": "0x1",
             "ib_pkey": "0x7fff",
-            "ib_gids": ["fe80:0000:0000:0000:9a03:9bff:fe1d:8a42"],
+            "ib_gids": [
+                "fe80:0000:0000:0000:9a03:9bff:fe1d:8a42",
+                "fe80:0000:0000:0000:9a03:9bff:fe1d:8a42",
+                "0000:0000:0000:0000:0000:ffff:0a7d:016b",
+                "0000:0000:0000:0000:0000:ffff:0a7d:016b",
+            ],
         }
     ]
 
 
-def test_roce_port_keeps_the_ipv4_mapped_gids(scrape: dict[str, Any], tmp_path: Path) -> None:
-    # Arrange
-    write_port(tmp_path, "mlx5_0", "1", ROCE_PORT_FILES)
+@pytest.mark.parametrize(
+    ("device", "files", "expected_ipv4_gid"),
+    [
+        # mlx5 puts the IPv4-mapped GID at 2-3 (38.255.28.18); Intel irdma puts it at 1 and leaves
+        # 2-3 zeroed (23.153.44.20). Matching on the index would find nothing on irdma.
+        ("mlx5_0", ROCE_PORT_FILES, "0000:0000:0000:0000:0000:ffff:26ff:1c12"),
+        (
+            "irdma0",
+            {
+                **ROCE_PORT_FILES,
+                "lid": "0x1",
+                "gids/1": "0000:0000:0000:0000:0000:ffff:ac10:6621",
+                "gids/2": "0000:0000:0000:0000:0000:0000:0000:0000",
+                "gids/3": "0000:0000:0000:0000:0000:0000:0000:0000",
+            },
+            "0000:0000:0000:0000:0000:ffff:ac10:6621",
+        ),
+    ],
+)
+def test_ipv4_mapped_gid_is_found_by_prefix_on_every_driver(
+    scrape: dict[str, Any], tmp_path: Path, device: str, files: dict[str, str], expected_ipv4_gid: str
+) -> None:
+    # Arrange — the IPv4-mapped GID is what tells two Ethernet ports they share a segment
+    write_port(tmp_path, device, "1", files)
     scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
 
     # Act
     ports = scrape["get_infiniband_ports"]()
 
-    # Assert — GIDs 2-3 encode the port's IPv4 address, which is how two RoCE ports are told they
-    # share a segment. Losing them would leave Ethernet ports unpairable.
+    # Assert
+    prefix = scrape["IPV4_MAPPED_GID_PREFIX"]
+    ipv4_gids = [gid for gid in ports[0].gids if gid.startswith(prefix)]
     assert ports[0].link_layer == "Ethernet"
-    assert ports[0].gids[2:] == [
-        "0000:0000:0000:0000:0000:ffff:26ff:1c12",
-        "0000:0000:0000:0000:0000:ffff:26ff:1c12",
-    ]
+    # mlx5 lists it twice (RoCE v1 and v2), irdma once — the value is what matters, not the count
+    assert set(ipv4_gids) == {expected_ipv4_gid}
 
 
 def test_link_layer_not_lid_separates_the_two_fabrics(scrape: dict[str, Any], tmp_path: Path) -> None:

@@ -1040,8 +1040,11 @@ def check_storage_limit_ability() -> tuple[bool, str]:
 NVIDIA_PARAMS_PATH = "/proc/driver/nvidia/params"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
-# 0-1 are the link-local GIDs, 2-3 the IPv4-mapped ones a RoCE port is reachable on.
+# Enough of the GID table to carry both the link-local entries and the IPv4-mapped one. Its index
+# is driver-specific - mlx5 puts it at 2-3, Intel irdma at 1 - so consumers must match on the
+# IPV4_MAPPED_GID_PREFIX below, never on a position.
 GID_TABLE_ENTRIES_READ = 4
+IPV4_MAPPED_GID_PREFIX = "0000:0000:0000:0000:0000:ffff:"
 
 
 class NcuProfilingObservation:
@@ -1144,16 +1147,18 @@ class InfinibandPort:
         }
 
 
-def read_infiniband_port(device_path: str, node_guid: str, port_path: str) -> InfinibandPort:
+def read_infiniband_port(
+    device_path: str, node_guid: str, sys_image_guid: str, port_path: str
+) -> InfinibandPort:
     # Whole GID table, not just gids/0: every prod port carries the default fe80:: prefix, so the
-    # prefix alone identifies nothing. The IPv4-mapped entries further down (indices 2-3 on RoCE)
-    # are what tells two Ethernet ports they share a segment.
+    # prefix alone identifies nothing. The IPv4-mapped entry is the one that tells two Ethernet
+    # ports they share a segment - find it by IPV4_MAPPED_GID_PREFIX, its index moves by driver.
     gids = [read_sysfs_value(f"{port_path}/gids/{index}") for index in range(GID_TABLE_ENTRIES_READ)]
     return InfinibandPort(
         device=os.path.basename(device_path),
         port=os.path.basename(port_path),
         node_guid=node_guid,
-        sys_image_guid=read_sysfs_value(f"{device_path}/sys_image_guid"),
+        sys_image_guid=sys_image_guid,
         link_layer=read_sysfs_value(f"{port_path}/link_layer"),
         state=read_sysfs_value(f"{port_path}/state"),
         phys_state=read_sysfs_value(f"{port_path}/phys_state"),
@@ -1175,8 +1180,11 @@ def get_infiniband_ports() -> list[InfinibandPort]:
     try:
         for device_path in sorted(glob.glob(f"{INFINIBAND_SYSFS_PATH}/*")):
             node_guid = read_sysfs_value(f"{device_path}/node_guid")
+            sys_image_guid = read_sysfs_value(f"{device_path}/sys_image_guid")
             for port_path in sorted(glob.glob(f"{device_path}/ports/*")):
-                ports.append(read_infiniband_port(device_path, node_guid, port_path))
+                ports.append(
+                    read_infiniband_port(device_path, node_guid, sys_image_guid, port_path)
+                )
     except Exception:
         # Every other probe in this file swallows its own failure - an interconnect reading is
         # never worth failing the whole machine scrape over.
