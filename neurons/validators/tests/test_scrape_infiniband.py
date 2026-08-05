@@ -358,3 +358,27 @@ def test_the_obfuscated_scrape_parses_a_port_and_does_not_just_return_empty(tmp_
     assert observation.ports[0].link_layer == "InfiniBand"
     # payload keys are substituted with random names by then, so only their count is checkable
     assert len(observation.ports[0].as_payload()) == 12
+
+
+def test_no_locally_defined_name_in_the_scrape_is_called_with_keyword_arguments() -> None:
+    """obfuscator.py renames parameters but not the keyword names at call sites, so any keyword
+    call to something this file defines raises TypeError once packaged — silently, because every
+    probe here swallows its own exception. `InfinibandPort(device=...)` did exactly that on all 373
+    prod executors. Builtins and imported callables are fine; only our own names break.
+    """
+    # Arrange
+    tree = ast.parse((SRC / "miner_jobs" / "machine_scrape.py").read_text())
+    locally_defined = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef | ast.ClassDef)}
+
+    # Act
+    keyword_calls = [
+        f"{node.func.id}(...) at line {node.lineno} passes {[keyword.arg for keyword in node.keywords]}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in locally_defined
+        and node.keywords
+    ]
+
+    # Assert
+    assert keyword_calls == [], "call it positionally — the packaged scrape cannot take these keywords"
