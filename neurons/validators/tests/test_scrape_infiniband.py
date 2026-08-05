@@ -20,6 +20,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 
 INFINIBAND_HELPERS = {
     "INFINIBAND_SYSFS_PATH",
+    "InfinibandObservation",
     "GID_TABLE_ENTRIES_READ",
     "IPV4_MAPPED_GID_PREFIX",
     "read_sysfs_value",
@@ -89,7 +90,7 @@ def test_infiniband_port_is_reported_with_its_fabric_identity(
     scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
 
     # Act
-    ports = scrape["get_infiniband_ports"]()
+    ports = scrape["get_infiniband_ports"]().ports
 
     # Assert — sm_lid plus the LID is what tells two hosts apart; every prod GID starts fe80::, so
     # the prefix on its own identifies nothing.
@@ -143,7 +144,7 @@ def test_ipv4_mapped_gid_is_found_by_prefix_on_every_driver(
     scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
 
     # Act
-    ports = scrape["get_infiniband_ports"]()
+    ports = scrape["get_infiniband_ports"]().ports
 
     # Assert
     prefix = scrape["IPV4_MAPPED_GID_PREFIX"]
@@ -160,7 +161,7 @@ def test_link_layer_not_lid_separates_the_two_fabrics(scrape: dict[str, Any], tm
     scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
 
     # Act
-    ports = scrape["get_infiniband_ports"]()
+    ports = scrape["get_infiniband_ports"]().ports
 
     # Assert
     assert ports[0].link_layer == "Ethernet"
@@ -176,7 +177,7 @@ def test_every_device_and_port_is_listed(scrape: dict[str, Any], tmp_path: Path)
     scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
 
     # Act
-    ports = scrape["get_infiniband_ports"]()
+    ports = scrape["get_infiniband_ports"]().ports
 
     # Assert
     assert [(port.device, port.port) for port in ports] == [
@@ -186,12 +187,56 @@ def test_every_device_and_port_is_listed(scrape: dict[str, Any], tmp_path: Path)
     ]
 
 
-def test_host_without_rdma_hardware_reports_no_ports(scrape: dict[str, Any], tmp_path: Path) -> None:
-    # Arrange — the usual case: no /sys/class/infiniband at all
-    scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path / "does-not-exist")
+def test_missing_sysfs_tree_says_so_instead_of_looking_like_no_hardware(
+    scrape: dict[str, Any], tmp_path: Path
+) -> None:
+    # Arrange — either the host has no RDMA at all, or the scrape cannot see the tree from where it
+    # runs. Both give an empty list, so the reason has to be reported.
+    missing = str(tmp_path / "does-not-exist")
+    scrape["INFINIBAND_SYSFS_PATH"] = missing
 
-    # Act / Assert — an empty list, not a scrape failure
-    assert scrape["get_infiniband_ports"]() == []
+    # Act
+    observation = scrape["get_infiniband_ports"]()
+
+    # Assert
+    assert observation.ports == []
+    assert observation.scrape_error == f"{missing} does not exist"
+
+
+def test_empty_sysfs_tree_is_distinguished_from_a_missing_one(
+    scrape: dict[str, Any], tmp_path: Path
+) -> None:
+    # Arrange — the tree exists but the kernel registered no RDMA device
+    scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
+
+    # Act
+    observation = scrape["get_infiniband_ports"]()
+
+    # Assert
+    assert observation.ports == []
+    assert observation.scrape_error == f"{tmp_path} lists no devices"
+
+
+def test_device_without_ports_is_reported_as_such(scrape: dict[str, Any], tmp_path: Path) -> None:
+    # Arrange — a device directory with no ports/ subtree
+    (tmp_path / "mlx5_0").mkdir(parents=True)
+    scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
+
+    # Act
+    observation = scrape["get_infiniband_ports"]()
+
+    # Assert
+    assert observation.ports == []
+    assert observation.scrape_error == "1 device(s) present, none exposing a port"
+
+
+def test_a_successful_walk_reports_no_error(scrape: dict[str, Any], tmp_path: Path) -> None:
+    # Arrange
+    write_port(tmp_path, "mlx5_2", "1", IB_PORT_FILES)
+    scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
+
+    # Act / Assert
+    assert scrape["get_infiniband_ports"]().scrape_error == ""
 
 
 def test_unreadable_attribute_leaves_an_empty_field(scrape: dict[str, Any], tmp_path: Path) -> None:
@@ -200,7 +245,7 @@ def test_unreadable_attribute_leaves_an_empty_field(scrape: dict[str, Any], tmp_
     scrape["INFINIBAND_SYSFS_PATH"] = str(tmp_path)
 
     # Act
-    ports = scrape["get_infiniband_ports"]()
+    ports = scrape["get_infiniband_ports"]().ports
 
     # Assert — the port still lands, only the missing attribute is empty
     assert ports[0].sm_lid == ""
@@ -226,6 +271,7 @@ def test_infiniband_keys_are_wired_through_both_obfuscation_tables() -> None:
     scrape_text = (SRC / "miner_jobs" / "machine_scrape.py").read_text()
     new_keys = [
         "data_infiniband_ports",
+        "data_infiniband_scrape_error",
         "ib_device",
         "ib_port",
         "ib_node_guid",
