@@ -1,0 +1,107 @@
+---
+# De-risk the largest unproven assumption in the CVM host playbook: that the
+# pinned dstack QEMU 9.2.1 tree still compiles on Ubuntu 26.04.
+#
+# All the field evidence for this build is Ubuntu 25.10 "questing". 26.04 LTS is
+# "resolute", the pinned fork's meson/ninja/glibc expectations are roughly two
+# years old against it, and 26.04's own archive ships QEMU 10.2.1.
+#
+# EXPLICITLY NOT A MERGE GATE. The build takes 10-40 minutes and would dominate
+# every pull request. Run it on demand, and paste the transcript into the PR
+# body of any change that touches the pinned commit or the supported releases.
+#
+# If it FAILS, there are three options and only one is available without a spec
+# change:
+#   a) gate 26.04 behind lium_qemu_tarball_url — but no producer for that
+#      tarball exists yet;
+#   b) drop 26.04 from the supported matrix — the matrix is user-locked, so this
+#      needs the spec owner's sign-off;
+#   c) patch the tree — out of scope here.
+# Whatever happens, record the outcome in the PR body before merging.
+
+name: QEMU 9.2.1 on Ubuntu 26.04
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so a toolchain change in 26.04 surfaces on its own rather than at
+    # the moment somebody needs the build to work.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: Compile the pinned QEMU fork on 26.04
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    timeout-minutes: 60
+
+    defaults:
+      run:
+        working-directory: neurons/executor/ansible
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq \
+            build-essential git ninja-build pkg-config python3 python3-pip \
+            python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev \
+            flex bison acpica-tools ca-certificates
+
+      - name: Install ansible-core so the template can be rendered
+        run: pip install --break-system-packages -r tests/requirements.txt
+
+      # Rendered from the SAME template the role uses, so this job tests the
+      # actual artifact rather than a copy of it that can drift.
+      - name: Render the build script from the role's own template
+        env:
+          ANSIBLE_LIUM_TEST: '1'
+        run: ansible-playbook -i inventory/localhost.yml tests/render_scripts.yml
+
+      # Run directly, not under systemd-run: there is no systemd in a container.
+      # HOME is exported explicitly here for the same reason the systemd-run line
+      # carries --setenv=HOME= — the script refuses to run without it, and that
+      # refusal is itself worth exercising.
+      - name: Compile
+        env:
+          HOME: /root
+        run: |
+          mkdir -p /var/log/lium-cvm
+          set -o pipefail
+          bash /tmp/lium-rendered/build-qemu.sh 2>&1 | tee /var/log/lium-cvm/qemu-build.log
+
+      # The marker, not the exit code. A build that died early can still leave a
+      # unit looking "finished".
+      - name: The build must report its completion marker
+        run: |
+          if grep -q 'QEMU_BUILD_DONE_OK' /var/log/lium-cvm/qemu-build.log; then
+            echo "build completed"
+          else
+            echo "FAIL: QEMU_BUILD_DONE_OK is missing from the build log"
+            exit 1
+          fi
+
+      - name: The installed binary reports the pinned version
+        run: |
+          version="$(/opt/qemu-dstack/bin/qemu-system-x86_64 --version | head -1)"
+          echo "$version"
+          if printf '%s' "$version" | grep -q '9\.2\.1'; then
+            echo "version matches the pinned 9.2.1"
+          else
+            echo "FAIL: expected QEMU 9.2.1, got: $version"
+            exit 1
+          fi
+
+      - name: Upload the build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-2604-build-log
+          path: /var/log/lium-cvm/qemu-build.log
+          if-no-files-found: warn
