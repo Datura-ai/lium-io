@@ -300,6 +300,24 @@ jobs:
           ANSIBLE_LIUM_TEST: '1'
         run: ansible-playbook -i inventory/localhost.yml tests/test_preflight_messages.yml
 
+      # Deliberately the same scripts the job above already runs, and NOT
+      # redundant: a bare container leaves LANG unset, so grep falls back to
+      # byte semantics. A `.` wildcard standing in for a multi-byte character
+      # then matches on every developer machine and on the runner, and fails
+      # only here — an assertion whose answer comes from the environment rather
+      # than from the file it checks. That shipped once and this step is what
+      # found it.
+      #
+      # Only the pure-shell tests. The fixture playbooks are left to the job
+      # above: ansible-core refuses to start without a UTF-8 locale, so running
+      # them here would prove nothing this step does not already prove.
+      - name: Shell units again, in the container's own locale
+        run: |
+          for t in test_forbidden_strings test_seam_gate test_guard \
+                   test_resume_guard test_verify_schema test_docs_pointer; do
+            bash "tests/$t.sh"
+          done
+
       # Reaches `common` (tags: always) plus `verify`, and nothing else — which
       # works precisely BECAUSE preflight is not `tags: always`. With `always`
       # it would hard-fail here by design and abort the play before verify ever
