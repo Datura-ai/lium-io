@@ -1,0 +1,28 @@
+---
+# `sgx-setup` is deliberately absent. It lives in Ubuntu universe, not Intel's
+# repository, and naming it aborts the WHOLE apt transaction — so every package
+# here silently fails to install and the host looks like it has no SGX support.
+lium_sgx_packages:
+  - libsgx-dcap-default-qpl
+  - libsgx-dcap-ql
+  - libsgx-dcap-quote-verify
+  - libsgx-enclave-common
+  - libsgx-urts
+  - sgx-pck-id-retrieval-tool
+  - sgx-ra-service
+  - sgx-dcap-pccs
+  - tdx-qgs
+
+lium_system_qcnl_path: /etc/sgx_default_qcnl.conf
+
+# Assertions that only make sense on real SGX hardware. The fixture tests set
+# these false so the templating and package-list logic can be exercised anywhere.
+# Installing Intel's packages needs root and network. The maintenance-profile
+# fixture test sets this false so the real site.yml can run end to end anywhere
+# and prove the TAG ROUTING, which is what that test is about. Role behaviour on
+# a real host is covered by the hardware acceptance run.
+lium_sgx_install: true
+
+lium_assert_vsock: true
+lium_assert_key_provider: true
+lium_start_key_provider: true

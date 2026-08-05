@@ -1,0 +1,96 @@
+---
+# Intel's DCAP packages, and the PCCS the wizard never finishes configuring.
+
+- name: Ensure the apt keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Install Intel's SGX apt key
+  ansible.builtin.get_url:
+    url: https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key
+    dest: /etc/apt/keyrings/intel-sgx.asc
+    mode: "0644"
+
+- name: Add Intel's SGX repository
+  ansible.builtin.template:
+    src: intel-sgx.sources.j2
+    dest: /etc/apt/sources.list.d/intel-sgx.sources
+    mode: "0644"
+  register: lium_sgx_repo
+
+- name: Refresh apt after adding the SGX repository
+  ansible.builtin.apt:
+    update_cache: true
+  when: lium_sgx_repo.changed
+
+# `sgx-setup` is NOT in this list, and must never be.
+#
+# It lives in Ubuntu universe, not Intel's repository. Naming it here aborts the
+# WHOLE apt transaction, so every package below silently fails to install and the
+# host looks like it simply has no SGX support. It is in
+# tests/forbidden-patterns.txt for exactly that reason.
+- name: Install the DCAP packages
+  ansible.builtin.apt:
+    name: "{{ lium_sgx_packages }}"
+    state: present
+
+# The sgx-dcap-pccs postinst runs an interactive wizard that fails under apt and
+# leaves the package half-configured. Running dpkg --configure non-interactively
+# takes the wizard's skip branch and clears that state.
+- name: Clear the half-configured PCCS package
+  ansible.builtin.command:
+    cmd: dpkg --configure sgx-dcap-pccs
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  register: lium_pccs_configure
+  changed_when: lium_pccs_configure.rc == 0
+  failed_when: false
+  when: lium_intel_api_key | length > 0
+
+# Everything below is what the SKIPPED wizard would have done. Without it PCCS
+# starts and dies immediately with ERR_MODULE_NOT_FOUND: config.
+- name: Configure PCCS
+  ansible.builtin.template:
+    src: pccs-default.json.j2
+    dest: /opt/intel/sgx-dcap-pccs/config/default.json
+    owner: pccs
+    group: pccs
+    mode: "0600"
+  no_log: true
+  when: lium_intel_api_key | length > 0
+  notify: Restart pccs
+
+- name: Install the PCCS node modules
+  ansible.builtin.command:
+    cmd: npm install --omit=dev
+    chdir: /opt/intel/sgx-dcap-pccs
+    creates: /opt/intel/sgx-dcap-pccs/node_modules
+  when: lium_intel_api_key | length > 0
+
+- name: Generate a self-signed certificate for the local PCCS
+  ansible.builtin.command:
+    cmd: >-
+      openssl req -x509 -newkey rsa:2048 -nodes
+      -keyout /opt/intel/sgx-dcap-pccs/ssl_key/private.pem
+      -out /opt/intel/sgx-dcap-pccs/ssl_key/file.crt
+      -days 3650 -subj "/CN=localhost"
+    creates: /opt/intel/sgx-dcap-pccs/ssl_key/file.crt
+  when: lium_intel_api_key | length > 0
+
+- name: Give PCCS ownership of its own tree
+  ansible.builtin.file:
+    path: /opt/intel/sgx-dcap-pccs
+    owner: pccs
+    group: pccs
+    recurse: true
+    state: directory
+  when: lium_intel_api_key | length > 0
+
+- name: Enable and start PCCS
+  ansible.builtin.systemd_service:
+    name: pccs
+    enabled: true
+    state: started
+  when: lium_intel_api_key | length > 0

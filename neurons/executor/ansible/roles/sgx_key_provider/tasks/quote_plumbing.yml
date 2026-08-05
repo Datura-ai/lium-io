@@ -1,0 +1,67 @@
+---
+# The two fresh-install defaults that each make a CVM reboot at ~160-190 seconds
+# instead of booting.
+#
+# The guest fetches its TD report via TSM, sends it over vhost-vsock to the host
+# to be turned into a quote, presents that to the key provider for the sealing
+# key, and unseals its data disk. Any failure in that chain fails
+# dstack-prepare, and the guest reboots. A GPU-clean boot that still reboots is
+# almost always one of these two.
+
+# 10a. qgsd ships with `#port = 4050` COMMENTED OUT, so it serves over a unix
+# socket, reports `active`, and never answers the guest.
+# Signature: `vsock failure: Connection reset by peer (os error 104)`.
+- name: Serve TD quotes over vsock
+  ansible.builtin.lineinfile:
+    path: /etc/qgs.conf
+    regexp: '^\s*#?\s*port\s*='
+    line: "port = 4050"
+    create: false
+    mode: "0644"
+  register: lium_qgs_conf
+  notify: Restart qgsd
+
+- name: Apply the qgsd change now
+  ansible.builtin.meta: flush_handlers
+
+- name: Confirm qgsd is listening on vsock 4050
+  ansible.builtin.command:
+    cmd: ss -a --vsock
+  register: lium_vsock
+  changed_when: false
+  failed_when: false
+
+- name: Assert the vsock listener exists
+  ansible.builtin.assert:
+    that:
+      - "'4050' in lium_vsock.stdout"
+    fail_msg: >-
+      qgsd is not listening on vsock port 4050, so the guest cannot get a TD
+      quote and will reboot at around 160 seconds with
+      "vsock failure: Connection reset by peer (os error 104)".
+      Check `systemctl status qgsd` and /etc/qgs.conf.
+    quiet: true
+  when: lium_assert_vsock | bool
+
+# 10b. The system QPL config ships "use_secure_cert": true, which verifies the
+# PCCS TLS certificate — and a local PCCS uses a self-signed one.
+# Signature: `[QCNL] CURL error: (60) SSL peer certificate ... was not OK`,
+# `[QPL] Failed to get quote config. Error code is 0xb033`, then
+# `vsock failure: failed to fill whole buffer`.
+- name: Accept the local PCCS certificate
+  ansible.builtin.lineinfile:
+    path: "{{ lium_system_qcnl_path }}"
+    regexp: '^\s*"use_secure_cert"\s*:'
+    line: '  "use_secure_cert": false,'
+    create: false
+    mode: "0644"
+  notify: Restart qgsd
+
+- name: Point the system QPL at the PCCS
+  ansible.builtin.lineinfile:
+    path: "{{ lium_system_qcnl_path }}"
+    regexp: '^\s*"pccs_url"\s*:'
+    line: '  "pccs_url": "{{ lium_pccs_url }}",'
+    create: false
+    mode: "0644"
+  notify: Restart qgsd
