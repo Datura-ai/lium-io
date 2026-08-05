@@ -16,7 +16,7 @@
     # the other half. A test that sets only one fails closed, which is correct
     # but confusing if you have not read tests/README.md.
     lium_test_mode: true
-    grub_work: /tmp/lium-grub-fixture
+    grub_root: /tmp/lium-grub-fixture
     lium_state_dir: /tmp/lium-grub-fixture/state
     lium_log_dir: /tmp/lium-grub-fixture/log
     lium_hda_search_roots: ["/tmp/lium-grub-fixture/no-such-root"]
@@ -58,6 +58,17 @@
         expect_only_in_linux: true
 
   pre_tasks:
+    # Cleared ONCE, here. Each fixture then gets its own untouched subdirectory
+    # rather than deleting and recreating one shared path between cases — that
+    # churn produced an intermittent "destination directory does not exist" at
+    # roughly one run in three, which on a merge gate is worse than a failure
+    # because it teaches people to re-run until green. It also leaves a failing
+    # case's tree behind for inspection.
+    - name: Clear the fixture root once
+      ansible.builtin.file:
+        path: "{{ grub_root }}"
+        state: absent
+
     - name: Provide an empty proc root so no real QEMU can confuse the guard
       ansible.builtin.file:
         path: "{{ playbook_dir }}/fixtures/emptyproc"
@@ -74,6 +85,8 @@
       loop_control:
         loop_var: grub_case
         label: "{{ grub_case.name }}"
+      vars:
+        grub_work: "{{ grub_root }}/{{ grub_case.name }}"
 
     - name: All GRUB fixtures passed
       ansible.builtin.debug:

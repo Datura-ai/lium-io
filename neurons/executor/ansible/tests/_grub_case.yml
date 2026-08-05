@@ -4,11 +4,8 @@
 #
 # Included once per fixture by test_grub_fixtures.yml.
 
-- name: "Start from a pristine copy of the fixture: {{ grub_case.name }}"
-  ansible.builtin.file:
-    path: "{{ grub_work }}"
-    state: absent
-
+# No deletion here: test_grub_fixtures.yml clears the root once, and each case
+# owns a directory nothing else touches.
 - name: "Create the work tree: {{ grub_case.name }}"
   ansible.builtin.file:
     path: "{{ grub_work }}/etc/default/grub.d"

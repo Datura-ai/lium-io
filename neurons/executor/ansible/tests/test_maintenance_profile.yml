@@ -57,6 +57,7 @@
           -e lium_state_dir={{ maint_state }}
           -e lium_log_dir={{ maint_work }}/log
           -e lium_repo_path={{ maint_work }}/no-such-repo
+          -e lium_repo_clone=false
           -e lium_sgx_install=false
           -e lium_start_key_provider=false
           -e '{"lium_hda_search_roots": ["{{ playbook_dir }}/fixtures/guard/dormant_hda"]}'
