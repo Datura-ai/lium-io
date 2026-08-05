@@ -57,7 +57,13 @@ assert_absent "host-setup.md section 3 heading removed" '^## 3\. ' "$HOST_SETUP"
 assert_absent "host-setup.md section 4 heading removed" '^## 4\. ' "$HOST_SETUP"
 
 # Replaced by a pointer that actually tells a provider what to run.
-assert_present "host-setup.md has the automated bring-up section" '^## 1.4\. Host bring-up . automated' "$HOST_SETUP"
+#
+# The dashes are written out rather than matched with `.`, which is a wildcard
+# for one CHARACTER in a UTF-8 locale and one BYTE otherwise. The heading uses an
+# en-dash and an em-dash, three bytes each, so the `.` form passed on any
+# developer machine and on the GitHub runner while failing in a bare container —
+# an assertion whose answer came from the environment rather than the file.
+assert_present "host-setup.md has the automated bring-up section" '^## 1–4\. Host bring-up — automated' "$HOST_SETUP"
 assert_present "host-setup.md has the bootstrap command" 'sudo \./bootstrap\.sh' "$HOST_SETUP"
 assert_present "host-setup.md points at the playbook README" 'ansible/README\.md' "$HOST_SETUP"
 
