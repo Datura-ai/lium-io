@@ -1,0 +1,161 @@
+---
+# render -> union -> write -> grub.cfg assertion -> drift.
+#
+# Every step here is driven through a seam so the whole chain runs end to end in
+# CI against a fixture root, without a real bootloader.
+
+# `vfio-pci.ids=` MAY ONLY WIDEN.
+#
+# If a device is hot-removed or wedged it disappears from lspci, the freshly
+# discovered set gets shorter, and writing that shorter list unbinds a GPU on the
+# next boot. Refuse and name the missing ids instead.
+- name: Refuse to narrow vfio-pci.ids
+  ansible.builtin.fail:
+    msg: |
+      REFUSING: the vfio-pci id list would get SHORTER.
+
+      Already on the kernel command line or in GRUB : {{ lium.grub_existing_vfio_ids | join(', ') }}
+      Discovered on this host right now             : {{ lium.present_pci_ids | join(', ') }}
+      Would be dropped                              : {{ lium_vfio_ids_dropped | join(', ') }}
+
+      A device that is hot-removed or wedged disappears from lspci. Writing the
+      shorter list would unbind it on the next boot. Bring it back first:
+
+          echo 1 | sudo tee /sys/bus/pci/rescan
+
+      then re-run. If the device is genuinely gone for good, remove its id from
+      GRUB by hand so the two agree.
+  vars:
+    lium_vfio_ids_dropped: "{{ lium.grub_existing_vfio_ids | difference(lium.present_pci_ids) }}"
+  when: lium_vfio_ids_dropped | length > 0
+
+- name: Build the required token set
+  ansible.builtin.set_fact:
+    lium_required_tokens: >-
+      {{
+        ['kvm_intel.tdx=on', 'intel_iommu=on', 'iommu=pt', 'nohibernate']
+        + (
+            ['vfio-pci.ids=' ~ (lium.present_pci_ids | join(','))]
+            if (lium.present_pci_ids | length) > 0 else []
+          )
+        + ['vfio_iommu_type1.dma_entry_limit=' ~ lium_dma_entry_limit]
+      }}
+
+# The PROVIDER's own shape, with our drop-in excluded.
+#
+# This has to be a separate analysis, and it has to exclude our own file.
+# Once the drop-in has appended the full required set to _DEFAULT, every token
+# is in both lines and the au2 shape — arguments in GRUB_CMDLINE_LINUX with
+# _DEFAULT empty — is masked by our own fix. Asking the post-write view would
+# report the shape on run 1 and silently stop reporting it on run 2.
+- name: Analyse the provider's own GRUB configuration
+  ansible.builtin.command:
+    cmd: >-
+      {{ lium_common_files }}/lium-cmdline.sh analyze
+      --required {{ lium_required_tokens | join(' ') | quote }}
+      --grub-default {{ lium_grub_default_path | quote }}
+      --grub-dropin-dir {{ lium_grub_dropin_path | dirname | quote }}
+      --exclude-dropin {{ lium_grub_dropin_path | quote }}
+  register: lium_cmdline_before_raw
+  changed_when: false
+  check_mode: false
+
+- name: Publish the provider's own configuration
+  ansible.builtin.set_fact:
+    lium_cmdline_before: "{{ lium_cmdline_before_raw.stdout | from_json }}"
+
+# Once, and never overwritten: the point of a backup is the state BEFORE the
+# first change, not before the most recent one.
+- name: Back up the provider's GRUB defaults
+  ansible.builtin.copy:
+    src: "{{ lium_grub_default_path }}"
+    dest: "{{ lium_grub_default_path }}.bak.pre-lium-cvm"
+    remote_src: true
+    force: false
+    mode: "0644"
+
+- name: Ensure the GRUB drop-in directory exists
+  ansible.builtin.file:
+    path: "{{ lium_grub_dropin_path | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Write the append-only GRUB drop-in
+  ansible.builtin.template:
+    src: 99-lium-cvm.cfg.j2
+    dest: "{{ lium_grub_dropin_path }}"
+    mode: "0644"
+  register: lium_grub_dropin
+
+- name: Regenerate the bootloader configuration
+  ansible.builtin.command:
+    cmd: "{{ lium_update_grub_cmd }}"
+  register: lium_update_grub_result
+  changed_when: lium_update_grub_result.rc == 0
+  when: lium_grub_dropin.changed
+
+# THE DECISIVE CHECK, and it runs before a reboot is even offered.
+#
+# A merge failure caught here is still trivially recoverable — restore
+# /etc/default/grub.bak.pre-lium-cvm; nothing has rebooted. Caught after the
+# reboot, the host comes back looking healthy while attestation silently fails.
+- name: Analyse the merged command line against the generated grub.cfg
+  ansible.builtin.command:
+    cmd: >-
+      {{ lium_common_files }}/lium-cmdline.sh analyze
+      --required {{ lium_required_tokens | join(' ') | quote }}
+      --grub-default {{ lium_grub_default_path | quote }}
+      --grub-dropin-dir {{ lium_grub_dropin_path | dirname | quote }}
+      --proc-cmdline {{ lium_proc_cmdline_path | quote }}
+      --grubcfg {{ lium_grubcfg_path | quote }}
+  register: lium_cmdline_raw
+  changed_when: false
+  check_mode: false
+
+- name: Publish the command-line analysis
+  ansible.builtin.set_fact:
+    lium_cmdline: "{{ lium_cmdline_raw.stdout | from_json }}"
+
+- name: Assert every required token wins in the generated grub.cfg
+  ansible.builtin.assert:
+    that:
+      - lium_cmdline.grubcfg_missing_tokens | length == 0
+    fail_msg: |
+      The generated bootloader configuration does NOT resolve every required token.
+      Refusing to reboot into it.
+
+      Missing or overridden : {{ lium_cmdline.grubcfg_missing_tokens | join(', ') }}
+      grub.cfg linux line   : {{ lium_cmdline.grubcfg_linux_line }}
+      GRUB_CMDLINE_LINUX    : {{ lium_cmdline.grub_cmdline_linux }}
+      ..._LINUX_DEFAULT     : {{ lium_cmdline.grub_cmdline_linux_default }}
+
+      Nothing has rebooted, so this is still easy to undo:
+          sudo cp {{ lium_grub_default_path }}.bak.pre-lium-cvm {{ lium_grub_default_path }}
+    success_msg: "Every required token resolves correctly in the generated grub.cfg."
+    quiet: true
+  when: lium_cmdline.grubcfg_present | bool
+
+- name: Record the running kernel's drift
+  ansible.builtin.set_fact:
+    lium_kernel_drift: "{{ lium_cmdline.drift_tokens }}"
+
+- name: Warn about stale conflicting tokens
+  ansible.builtin.debug:
+    msg: |
+      These keys appear more than once with DIFFERENT values across the GRUB
+      lines: {{ lium_cmdline.conflicting_keys | join(', ') }}
+
+      Our values win, because /etc/grub.d/10_linux emits GRUB_CMDLINE_LINUX before
+      GRUB_CMDLINE_LINUX_DEFAULT and the kernel takes the last occurrence. But
+      relying on that ordering forever is fragile — remove the stale copies from
+      {{ lium_grub_default_path }}.
+  when: lium_cmdline.conflicting_keys | length > 0
+
+- name: Report tokens the provider kept only in GRUB_CMDLINE_LINUX
+  ansible.builtin.debug:
+    msg: >-
+      Present only in GRUB_CMDLINE_LINUX, not in GRUB_CMDLINE_LINUX_DEFAULT:
+      {{ lium_cmdline_before.found_only_in_grub_cmdline_linux | join(', ') }}.
+      This is the au2 shape. It resolves correctly; it is recorded because a
+      naive edit of the wrong variable is what silently drops kvm_intel.tdx.
+  when: lium_cmdline_before.found_only_in_grub_cmdline_linux | length > 0

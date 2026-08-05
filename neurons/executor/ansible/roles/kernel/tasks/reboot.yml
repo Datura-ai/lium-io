@@ -1,0 +1,96 @@
+---
+# The reboot, and the budget that stops it looping.
+#
+# THE BUDGET IS SESSION-SCOPED, NOT LIFETIME-SCOPED.
+#
+# "Exactly once per arming" and "bounded across converges" are different
+# properties. The resume unit gives the first; this counter gives the second.
+# If /boot is full, update-grub writes nothing, /proc/cmdline never gains the
+# tokens, drift is detected on every converge, and the host reboots forever —
+# with "exactly once per arming" satisfied every single time.
+#
+# But it must reset on a clean converge, and `verify` owns that reset. A
+# lifetime counter would brick a HEALTHY host: this role's own superset rule
+# guarantees legitimate changes (add a GPU -> vfio-pci.ids= changes -> drift ->
+# reboot), so two legitimate GRUB changes would exhaust it and a third would be
+# refused forever behind an obscure escape variable.
+#
+# Loop protection is fully preserved, because a genuine loop never reaches a
+# clean verify.
+
+- name: Clear the reboot budget on request
+  ansible.builtin.copy:
+    dest: "{{ lium_state_dir }}/converge_reboots"
+    content: "0\n"
+    mode: "0644"
+  when: lium_reset_reboot_budget | bool
+
+- name: Read the reboot budget
+  ansible.builtin.slurp:
+    src: "{{ lium_state_dir }}/converge_reboots"
+  register: lium_budget_raw
+  failed_when: false
+  changed_when: false
+
+- name: Interpret the reboot budget
+  ansible.builtin.set_fact:
+    lium_converge_reboots: >-
+      {{ (lium_budget_raw.content | default('') | b64decode | trim | int)
+         if (lium_budget_raw.content is defined) else 0 }}
+
+# Warn and continue rather than hard-fail: reaching `verify` means the provider
+# gets a report naming the tokens that never took, instead of a stack trace and
+# no report. Loop protection is unaffected — verify's reset predicate is false
+# either way, so the counter stays at the cap.
+- name: Refuse to reboot again, and say what to do by hand
+  ansible.builtin.debug:
+    msg: |
+      REFUSING to reboot: this converge has already spent
+      {{ lium_converge_reboots }} of {{ lium_max_converge_reboots }} reboots and the
+      kernel command line still has not taken.
+
+      Still missing from the running kernel : {{ lium_kernel_drift | join(', ') }}
+      Generated grub.cfg linux line         : {{ lium_cmdline.grubcfg_linux_line }}
+
+      Rebooting again would loop. Check by hand, in this order:
+        1. Is /boot full?            df -h /boot
+        2. Does this host boot GRUB?  ls -l /boot/grub/grub.cfg
+        3. Run it manually:           sudo update-grub && sudo reboot
+      Then re-run. To clear the counter deliberately:
+           sudo ./bootstrap.sh -e lium_reset_reboot_budget=true
+
+      The run continues so that `verify` still produces a report.
+  when: (lium_converge_reboots | int) >= (lium_max_converge_reboots | int)
+
+- name: Stop here when the reboot budget is exhausted
+  ansible.builtin.meta: end_play
+  when: (lium_converge_reboots | int) >= (lium_max_converge_reboots | int)
+
+- name: Confirm the reboot with the operator
+  ansible.builtin.pause:
+    prompt: |
+      The kernel command line has changed and this host must reboot to pick it up.
+
+      Missing from the running kernel: {{ lium_kernel_drift | join(', ') }}
+
+      A one-shot systemd unit will continue the run automatically after the
+      reboot, exactly once, and then disable itself.
+
+      Press RETURN to reboot now, or Ctrl-C to stop.
+  when: not (lium_assume_yes | bool)
+
+# Incremented BEFORE arming, so a crash between here and the reboot still costs
+# a reboot from the budget. Under-counting is the dangerous direction.
+- name: Spend one reboot from the budget
+  ansible.builtin.copy:
+    dest: "{{ lium_state_dir }}/converge_reboots"
+    content: "{{ (lium_converge_reboots | int) + 1 }}\n"
+    mode: "0644"
+
+- name: Arm the post-reboot continuation
+  ansible.builtin.include_tasks: arm_resume.yml
+
+- name: Reboot
+  ansible.builtin.reboot:
+    msg: "Rebooting for the CVM host kernel command line (DAH-2544)"
+    reboot_timeout: 900
