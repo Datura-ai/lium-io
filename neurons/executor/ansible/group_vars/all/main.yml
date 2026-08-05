@@ -1,0 +1,146 @@
+---
+# Single place a new release or a new GPU is added.
+
+# Set as an ordinary variable, not via ansible.cfg's `ansible_managed` option:
+# that option is deprecated and is removed in ansible-core 2.23. Defining it here
+# also means it resolves under `gather_facts: false`, which the fixture tests use.
+ansible_managed: "Managed by the Lium CVM host playbook (DAH-2544). Local edits are overwritten on the next run."
+
+# Supported releases. Ubuntu 25.10 and 26.04 LTS only — 24.04 and older are
+# hard-rejected by preflight's os.supported gate. The apt suites are `noble` in
+# both cases: Ubuntu 25.10 has no Docker repo of its own and Intel's SGX repo
+# publishes no `questing`/`resolute` suite either (traps.md#7).
+lium_os_matrix:
+  "25.10": {codename: questing, sgx_suite: noble, docker_suite: noble}
+  "26.04": {codename: resolute, sgx_suite: noble, docker_suite: noble}
+
+# Field-verified on au1/au2/ar3 (8xH200 SXM + 4xNVSwitch), sourced from the
+# cvm-provision skill's preflight.sh:76 and fix-host.sh:164.
+# Blackwell (B200/B300) ids are NOT field-verified, so B200/B300 support is NOT
+# claimed anywhere in this tree — see the plan's section 6.2 and follow-up 8.
+lium_cc_gpu_pci_ids: ["10de:2335", "10de:2336", "10de:2330", "10de:233a"]
+lium_nvswitch_pci_ids: ["10de:22a3"]
+
+# QEMU — the dstack 9.2.1 fork. Source build at a pinned commit today; the
+# tarball pair is the interface a future release pipeline fills in (follow-up 3).
+lium_qemu_commit: dbcec07c0854bf873d346a09e87e4c993ccf2633
+lium_qemu_branch: dstack-qemu-9.2.1
+lium_qemu_repo: https://github.com/Dstack-TEE/qemu-tdx.git
+lium_qemu_prefix: /opt/qemu-dstack
+lium_qemu_version: "9.2.1"
+lium_qemu_systemd_unit: qemu-dstack-build
+lium_qemu_systemd_unit_legacy: lium-qemu-build
+lium_qemu_tarball_url: ""
+lium_qemu_tarball_sha256: ""
+lium_qemu_build_dir: /usr/local/lib/lium-cvm
+lium_build_home: /root
+
+# NVIDIA nvtrust — the CC-mode tool. /root/nvtrust is symlinked to this so the
+# cvm-provision skill's hardcoded paths keep working (plan section 6.5).
+lium_nvtrust_tag: "2025.4.11.001"
+lium_nvtrust_repo: https://github.com/NVIDIA/nvtrust
+lium_nvtrust_dir: /opt/nvtrust
+lium_nvtrust_tool: "{{ lium_nvtrust_dir }}/host_tools/python/nvidia_gpu_tools.py"
+
+# vfio. 65535 is the shipped default and it kills a TDX guest mid-boot with
+# `VFIO_MAP_DMA failed: No space left on device` (traps.md#7).
+lium_dma_entry_limit: 16777216
+
+# Reboot budget. Session-scoped: `verify` resets it to 0 on a clean converge, so
+# a healthy host that legitimately changes GRUB twice is not bricked. A genuine
+# reboot loop never reaches a clean verify, so loop protection is preserved.
+lium_max_converge_reboots: 2
+lium_reset_reboot_budget: false
+
+lium_state_dir: /var/lib/lium-cvm
+lium_log_dir: /var/log/lium-cvm
+
+# Mirrors lium-guard.sh's BUILT-IN defaults. The script is the single source of
+# truth because bootstrap.sh runs it BEFORE Ansible starts, so it can never read
+# group_vars. tests/test_guard.sh asserts the two lists agree, so this
+# duplication cannot rot silently.
+lium_hda_search_roots: ["/home", "/opt", "/srv"]
+
+# Repo checkout the playbook converges.
+lium_repo_url: https://github.com/Datura-ai/lium-io.git
+lium_repo_path: /opt/lium-io
+lium_repo_ref: main
+lium_repo_clone: true
+
+# Set by bootstrap.sh --yes. The kernel role pauses for confirmation before a
+# reboot unless this is true.
+lium_assume_yes: false
+
+# SGX / DCAP. An unset lium_intel_api_key selects the DEGRADED path: no local
+# PCCS, no in-band registration, both qcnl files pointed at lium_pccs_url (which
+# may name a remote PCCS). See the plan's section 6.9.
+lium_pccs_url: "https://localhost:8081/sgx/certification/v4/"
+lium_intel_api_key: ""
+lium_pccs_user_token: ""
+lium_intel_registration_url: "https://api.trustedservices.intel.com/sgx/registration/v1/platform"
+lium_intel_api_host: api.trustedservices.intel.com
+lium_intel_api_port: 443
+
+# The PLATFORM_MANIFEST body length Intel accepts. The raw efivar is 17954 bytes
+# (a 4-byte version+size header plus this body); POSTing the 17954-byte blob
+# returns 400 InvalidPlatformManifest. This cost ar3 one 400 (traps.md#1).
+lium_platform_manifest_len: 17950
+
+# Disk headroom, in GB.
+lium_min_build_space_gb: 10
+lium_min_image_space_gb: 30
+
+# Per-action destructive overrides. Each names exactly the damage it accepts.
+# --force-converge only restores the destructive-tagged ROLES to the play; it
+# does not authorise the damage. These are the second lock.
+lium_force_qemu_rebuild: false   # accepts that any existing hda.img becomes undecryptable
+lium_force_gpu_cc: false         # accepts resetting every GPU
+lium_force_reboot: false         # accepts an unattended reboot
+
+# Preflight is fatal on a day-zero run. bootstrap.sh sets this false in
+# maintenance mode so a flipped BIOS knob is REPORTED in the verify report
+# instead of aborting the run before the report exists.
+lium_preflight_fatal: true
+
+# Set per device by the gpu role; also set by tests/test_command_vars.yml.
+# Declared here so --syntax-check and ansible-lint resolve the command strings.
+lium_gpu_bdf: ""
+
+# Production paths. A test replaces these through the seam gate below.
+lium_proc_cmdline_path: /proc/cmdline
+lium_grub_default_path: /etc/default/grub
+lium_grub_dropin_path: /etc/default/grub.d/99-lium-cvm.cfg
+lium_grubcfg_path: /boot/grub/grub.cfg
+lium_boot_id_path: /proc/sys/kernel/random/boot_id
+lium_proc_root: /proc
+lium_lspci_output: ""
+
+# Test seams. Every variable below is refused unless BOTH lium_test_mode is true
+# AND the environment variable ANSIBLE_LIUM_TEST is 1. Documented in
+# tests/README.md only — never in the provider-facing README.
+#
+# The gate compares each variable against its PRODUCTION value rather than
+# asking whether it is defined, because several of these are ordinary settings
+# that always have a value (lium_state_dir, lium_hda_search_roots). Comparing to
+# the production value is the only rule that covers both kinds uniformly and
+# gives "non-default" a precise meaning.
+lium_test_mode: false
+lium_seam_defaults:
+  lium_proc_cmdline_path: /proc/cmdline
+  lium_grub_default_path: /etc/default/grub
+  lium_grub_dropin_path: /etc/default/grub.d/99-lium-cvm.cfg
+  lium_grubcfg_path: /boot/grub/grub.cfg
+  lium_update_grub_cmd: update-grub
+  lium_lspci_output: ""
+  lium_proc_root: /proc
+  lium_boot_id_path: /proc/sys/kernel/random/boot_id
+  lium_hda_search_roots: ["/home", "/opt", "/srv"]
+  lium_state_dir: /var/lib/lium-cvm
+
+# cvmd / catalog variable interfaces. Unset => the stub says what it is waiting
+# on. Set => the stub asserts its companions then fails "not implemented".
+lium_cvmd_package_url: ""
+lium_cvmd_package_sha256: ""
+lium_cvmd_authorized_client_keys: []
+lium_catalog_manifest_url: ""
+lium_catalog_manifest_sha256: ""
