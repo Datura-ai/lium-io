@@ -1,0 +1,40 @@
+---
+# cvmd ships as a VARIABLE INTERFACE, not an implementation.
+#
+# The point is that day-zero does not wait on the cvmd build. The interface is
+# fixed here so the roles that will consume it can be written against something
+# real, and so a host provisioned today needs no re-plumbing later.
+#
+# It must be LOUD IN BOTH DIRECTIONS. A stub that silently does nothing when set
+# is worse than no stub: it makes a half-configured host look finished.
+
+- name: Report that cvmd is not installed
+  ansible.builtin.debug:
+    msg: >-
+      cvmd not installed — waiting on the cvmd build (DAH-2575).
+      Set lium_cvmd_package_url, lium_cvmd_package_sha256 and
+      lium_cvmd_authorized_client_keys to enable it.
+  when: lium_cvmd_package_url | length == 0
+
+- name: End the role while cvmd is unset
+  ansible.builtin.meta: end_role
+  when: lium_cvmd_package_url | length == 0
+
+- name: Require the companion variables
+  ansible.builtin.assert:
+    that:
+      - lium_cvmd_package_sha256 | length > 0
+      - lium_cvmd_authorized_client_keys | length > 0
+    fail_msg: >-
+      lium_cvmd_package_url is set, but lium_cvmd_package_sha256 and
+      lium_cvmd_authorized_client_keys are both required with it. A package
+      installed without a checksum, or a daemon with no authorised clients, is
+      not a working configuration.
+    quiet: true
+
+- name: Stop, because cvmd installation is not implemented here
+  ansible.builtin.fail:
+    msg: >-
+      cvmd installation is not implemented in DAH-2544. The variable interface is
+      defined here; the implementation lands in DAH-2575. Unset
+      lium_cvmd_package_url to continue without it.
