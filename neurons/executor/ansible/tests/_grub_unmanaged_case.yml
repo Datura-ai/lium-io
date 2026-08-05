@@ -1,0 +1,123 @@
+---
+# The other side of the superset rule, and the one that bites a real provider.
+#
+# The host passes an SR-IOV NIC (15b3:1017) through vfio-pci alongside its GPUs.
+# Normal on a virtualization host. That id is not in lium_cc_gpu_pci_ids or
+# lium_nvswitch_pci_ids, so it is never looked for in lspci and can never appear
+# in present_pci_ids — which means a rule comparing the whole existing list
+# against present_pci_ids finds it "dropped" on every run, forever.
+#
+# Two things must hold, and they pull in opposite directions:
+#   1. The role must NOT refuse. Nothing is wrong with this host, and the
+#      refusal's advice (rescan the PCI bus) can never help, because the id is
+#      not one the playbook enumerates.
+#   2. The role must not silently unbind the NIC either. `vfio-pci.ids=` is a
+#      module parameter whose last occurrence wins, and our drop-in lands last,
+#      so writing only the discovered ids would replace the provider's list.
+#
+# Ignoring the id satisfies (1) and breaks (2). Carrying it forward satisfies
+# both, so that is what the role does.
+
+- name: Create the unmanaged-id work tree
+  ansible.builtin.file:
+    path: "{{ grub_root }}/unmanaged_id/etc/default/grub.d"
+    state: directory
+    mode: "0755"
+
+- name: Copy the unmanaged-id fixture in
+  ansible.builtin.copy:
+    src: fixtures/grub/unmanaged_id/etc/default/grub
+    dest: "{{ grub_root }}/unmanaged_id/etc/default/grub"
+    mode: "0644"
+
+- name: Converge twice against it
+  block:
+    - name: "Converge: unmanaged_id (pass {{ item }})"
+      ansible.builtin.include_role:
+        name: kernel
+      vars:
+        lium_kernel_fixture_mode: true
+        lium_kernel_reboot_enabled: false
+        lium_grub_default_path: "{{ grub_root }}/unmanaged_id/etc/default/grub"
+        lium_grub_dropin_path: "{{ grub_root }}/unmanaged_id/etc/default/grub.d/99-lium-cvm.cfg"
+        lium_grubcfg_path: "{{ grub_root }}/unmanaged_id/boot/grub/grub.cfg"
+        lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/cmdline_complete"
+        lium_modprobe_conf_path: "{{ grub_root }}/unmanaged_id/etc/modprobe.d/vfio-dma.conf"
+        lium_modules_load_path: "{{ grub_root }}/unmanaged_id/etc/modules-load.d/vfio.conf"
+        lium_update_grub_cmd: >-
+          {{ playbook_dir }}/fake-update-grub.sh
+          {{ grub_root }}/unmanaged_id/etc/default/grub
+          {{ grub_root }}/unmanaged_id/etc/default/grub.d
+          {{ grub_root }}/unmanaged_id/boot/grub/grub.cfg
+      loop: [1, 2]
+
+    - name: Record that the role converged
+      ansible.builtin.set_fact:
+        unmanaged_refused: false
+        unmanaged_msg: ""
+  rescue:
+    - name: Record the refusal
+      ansible.builtin.set_fact:
+        unmanaged_refused: true
+        unmanaged_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+- name: An unmanaged id is not a narrowing
+  ansible.builtin.assert:
+    that:
+      - not (unmanaged_refused | bool)
+    fail_msg: >-
+      The role refused to converge on a healthy host whose only unusual feature
+      is a non-GPU device passed through vfio-pci. 15b3:1017 is outside the
+      managed id universe, so its absence from lspci proves nothing.
+      msg={{ unmanaged_msg }}
+    quiet: true
+
+- name: Read back what was written
+  ansible.builtin.slurp:
+    src: "{{ grub_root }}/unmanaged_id/etc/default/grub.d/99-lium-cvm.cfg"
+  register: unmanaged_dropin
+
+- name: Read back the id list the generated grub.cfg resolves to
+  ansible.builtin.command:
+    cmd: >-
+      {{ playbook_dir }}/../roles/common/files/lium-cmdline.sh vfio-ids
+      --line {{ lookup('file', grub_root ~ '/unmanaged_id/boot/grub/grub.cfg')
+                | regex_search('^\s*linux\s+.*$', multiline=True) | quote }}
+  register: unmanaged_resolved
+  changed_when: false
+
+- name: The NIC survived into the written list and into grub.cfg
+  ansible.builtin.assert:
+    that:
+      # In the file we write...
+      - "'15b3:1017' in (unmanaged_dropin.content | b64decode)"
+      # ...and, decisively, in the value the kernel would actually see. The
+      # drop-in wins last, so this is the assertion that proves we did not
+      # unbind the device rather than merely mentioning it somewhere.
+      - "'15b3:1017' in unmanaged_resolved.stdout"
+      - "'10de:2335' in unmanaged_resolved.stdout"
+      - "'10de:22a3' in unmanaged_resolved.stdout"
+    fail_msg: >-
+      The unmanaged id did not survive. Our drop-in replaces the whole
+      vfio-pci.ids value, so an id we do not carry forward is unbound on the
+      next boot.
+      written={{ unmanaged_dropin.content | b64decode }}
+      resolved={{ unmanaged_resolved.stdout }}
+    quiet: true
+
+- name: Carrying forward is idempotent
+  ansible.builtin.assert:
+    that:
+      - (unmanaged_resolved.stdout.split(',') | length)
+        == (unmanaged_resolved.stdout.split(',') | unique | length)
+    fail_msg: >-
+      The id list has duplicates after two passes, so each run appends to it.
+      Pass N would keep growing the kernel command line.
+      resolved={{ unmanaged_resolved.stdout }}
+    quiet: true
+
+- name: PASS unmanaged id
+  ansible.builtin.debug:
+    msg: >-
+      PASS unmanaged_id — converged instead of refusing, and carried 15b3:1017
+      through to {{ unmanaged_resolved.stdout }}

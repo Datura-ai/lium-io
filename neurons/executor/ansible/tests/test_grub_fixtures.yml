@@ -24,6 +24,18 @@
     lium_lspci_output: "{{ playbook_dir }}/fixtures/lspci/h200_8gpu_4nvswitch.txt"
     lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
 
+    # The play-level `common` role collects facts BEFORE any case runs, and each
+    # case overrides these per fixture. Left unset they default to /etc/default/grub
+    # — so `common` would read the REAL host's bootloader configuration and feed it
+    # into lium.grub_existing_vfio_ids, which the kernel role unions into a
+    # REFUSAL. On a GitHub runner that is harmless; on the machines most likely to
+    # run this suite by hand — TDX hosts with GPU passthrough — it fails the run
+    # pointing at a bug that is not there. Pinned at a path that does not exist so
+    # the fixture cases are the only source of GRUB state.
+    lium_grub_default_path: "{{ grub_root }}/host-grub-must-not-be-read/grub"
+    lium_grub_dropin_path: "{{ grub_root }}/host-grub-must-not-be-read/grub.d/99-lium-cvm.cfg"
+    lium_grubcfg_path: "{{ grub_root }}/host-grub-must-not-be-read/grub.cfg"
+
     grub_cases:
       - name: default_only
         proc: cmdline_complete
@@ -75,6 +87,22 @@
         state: directory
         mode: "0755"
 
+    # Structural, and checkable on any machine — including the ones whose own
+    # bootloader configuration is empty, where simply running the suite would
+    # never reveal that the pin had been dropped.
+    - name: No GRUB path may point outside the fixture root
+      ansible.builtin.assert:
+        that:
+          - lium_grub_default_path is match(grub_root)
+          - lium_grub_dropin_path is match(grub_root)
+          - lium_grubcfg_path is match(grub_root)
+        fail_msg: >-
+          A GRUB path escapes {{ grub_root }}, so the play-level `common` role
+          reads this machine's real bootloader configuration and feeds it into
+          the kernel role's narrowing check. On a host that genuinely passes
+          GPUs through, that fails the suite over a healthy configuration.
+        quiet: true
+
   roles:
     - common
 
@@ -100,14 +128,23 @@
         - name: grub_has_extra_id
           fixture: narrowing
           proc: cmdline_complete
-          dropped: "10de:dead"
+          dropped: "10de:2330"
         - name: proc_has_extra_id
           fixture: narrowing_proc_only
           proc: cmdline_booted_extra_vfio_id
-          dropped: "10de:beef"
+          dropped: "10de:233a"
       loop_control:
         loop_var: narrow_case
         label: "{{ narrow_case.name }}"
+
+    # ...and the other direction, which is the one a real provider hits: an id
+    # the playbook does not manage must neither trigger a refusal nor get
+    # silently unbound.
+    - name: An unmanaged vfio-pci id must be carried, not refused over
+      ansible.builtin.include_tasks: _grub_unmanaged_case.yml
+
+    - name: An absent grub.cfg must be regenerated even when nothing changed
+      ansible.builtin.include_tasks: _grub_regenerate_case.yml
 
     # Pre-mortem #1 variant B: update-grub succeeds but writes nothing.
     - name: An unreadable grub.cfg must refuse, not reboot
@@ -115,4 +152,7 @@
 
     - name: All GRUB fixtures passed
       ansible.builtin.debug:
-        msg: "{{ grub_cases | length }} GRUB fixtures, 2 narrowing cases and the no-reconfigure case passed."
+        msg: >-
+          {{ grub_cases | length }} GRUB fixtures, 2 narrowing cases, the
+          unmanaged-id case, the regeneration case and the no-reconfigure case
+          passed.

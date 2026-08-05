@@ -22,6 +22,15 @@
     lium_lspci_output: "{{ playbook_dir }}/fixtures/lspci/h200_8gpu_4nvswitch.txt"
     lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
 
+    # Pinned inside the work tree for the same reason as test_grub_fixtures.yml:
+    # unset, the play-level `common` role reads the real host's /etc/default/grub
+    # and the kernel role unions that into its narrowing check. A host that
+    # genuinely passes GPUs through would fail this test over its own healthy
+    # configuration.
+    lium_grub_default_path: "{{ kern_work }}/etc/default/grub"
+    lium_grub_dropin_path: "{{ kern_work }}/etc/default/grub.d/99-lium-cvm.cfg"
+    lium_grubcfg_path: "{{ kern_work }}/boot/grub/grub.cfg"
+
 
   pre_tasks:
     - name: Provide an empty proc root
@@ -29,6 +38,17 @@
         path: "{{ playbook_dir }}/fixtures/emptyproc"
         state: directory
         mode: "0755"
+
+    - name: No GRUB path may point outside the work tree
+      ansible.builtin.assert:
+        that:
+          - lium_grub_default_path is match(kern_work)
+          - lium_grub_dropin_path is match(kern_work)
+          - lium_grubcfg_path is match(kern_work)
+        fail_msg: >-
+          A GRUB path escapes {{ kern_work }}, so this test reads the real host's
+          bootloader configuration instead of its own fixture.
+        quiet: true
 
     - name: Start from a clean work tree
       ansible.builtin.file:

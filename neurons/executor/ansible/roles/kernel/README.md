@@ -62,6 +62,36 @@ names the ids that would be dropped, and hints:
 echo 1 | sudo tee /sys/bus/pci/rescan
 ```
 
+### …but only over ids this playbook manages
+
+The comparison runs against the **managed universe** —
+`lium_cc_gpu_pci_ids ∪ lium_nvswitch_pci_ids` — lower-cased on both sides,
+because `vfio-pci` parses its ids with `%x` and `10DE:2335` is a configuration a
+provider can and does type.
+
+Everything else in a provider's `vfio-pci.ids=` is **carried forward unchanged**:
+an SR-IOV NIC, an NVMe, a GPU generation whose ids are not field-verified yet
+(§6.2). Both halves of that are load-bearing.
+
+- **It may not refuse over them.** Those ids are never looked for in `lspci`, so
+  they can never appear in `present_pci_ids` and would read as "dropped" on every
+  run forever. A host passing a NIC through `vfio-pci` — ordinary on a
+  virtualization host — could never converge, and the refusal would tell its owner
+  to rescan a bus that has nothing to find.
+- **It may not drop them either.** `vfio-pci.ids=` is a module parameter and the
+  last occurrence wins. Our drop-in lands last by construction, so it replaces the
+  whole value; writing only the ids we discovered would unbind every unmanaged
+  device on the next boot.
+
+Ignoring an unmanaged id satisfies the first and breaks the second. Carrying it
+forward satisfies both, and is the only honest answer available: we cannot verify
+a device we never look for. Keeping an id whose device really did go away costs
+nothing — `vfio-pci` simply binds nothing.
+
+Only the GRUB files feed the carry-forward, never `/proc/cmdline`. An id that is
+only in `/proc/cmdline` has already been removed from the boot configuration, and
+restoring it would resurrect a setting the provider deleted.
+
 ## The decisive check runs before the reboot is offered
 
 After `update-grub`, the role parses the **generated** `grub.cfg` default `linux`

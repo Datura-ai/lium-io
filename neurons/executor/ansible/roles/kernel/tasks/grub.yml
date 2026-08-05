@@ -4,17 +4,73 @@
 # Every step here is driven through a seam so the whole chain runs end to end in
 # CI against a fixture root, without a real bootloader.
 
+# The ids this playbook MANAGES — the only vendor:device pairs it looks for in
+# lspci, and therefore the only ones it can make any claim about. Lower-cased on
+# both sides of every comparison from here down: vfio-pci parses its ids with
+# %x, so `10DE:2335` is a working configuration, and an exact-string compare
+# would read a provider's upper-case list as five ids that all vanished.
+- name: Establish the managed PCI id universe
+  ansible.builtin.set_fact:
+    lium_vfio_universe: "{{ (lium_cc_gpu_pci_ids + lium_nvswitch_pci_ids) | map('lower') | list }}"
+    lium_vfio_present: "{{ lium.present_pci_ids | map('lower') | list }}"
+    lium_base_tokens: ['kvm_intel.tdx=on', 'intel_iommu=on', 'iommu=pt', 'nohibernate']
+
+# What is configured today, before we touch anything. Runs BEFORE the token set
+# is built because the token set depends on it — see the carry-forward below.
+- name: Discover the vfio-pci ids already configured
+  ansible.builtin.command:
+    cmd: >-
+      {{ lium_common_files }}/lium-cmdline.sh analyze
+      --required {{ lium_base_tokens | join(' ') | quote }}
+      --grub-default {{ lium_grub_default_path | quote }}
+      --grub-dropin-dir {{ lium_grub_dropin_path | dirname | quote }}
+      --exclude-dropin {{ lium_grub_dropin_path | quote }}
+      --proc-cmdline {{ lium_proc_cmdline_path | quote }}
+  register: lium_vfio_scan_raw
+  changed_when: false
+  check_mode: false
+
+# Ids in the provider's GRUB files that this playbook does NOT manage: an SR-IOV
+# NIC, an NVMe, a GPU generation whose ids are not field-verified yet (§6.2).
+#
+# They must be CARRIED INTO the list we write. `vfio-pci.ids=` is a module
+# parameter and the last occurrence wins, so our drop-in — which lands last by
+# construction — replaces the value outright. A drop-in listing only the ids we
+# discovered would unbind every unmanaged device on the next boot: the exact
+# catastrophe the superset rule exists to prevent, one device class over.
+#
+# Carrying them is also the only honest answer. We never look for these ids in
+# lspci, so we cannot tell whether the device is present, which means we may
+# neither drop them nor refuse over them. Preserve the provider's stated intent
+# and say so. Keeping an id for a device that really did go away is harmless —
+# vfio-pci simply binds nothing.
+- name: Separate the managed ids from the ones we must carry forward
+  ansible.builtin.set_fact:
+    lium_vfio_unmanaged: >-
+      {{ (lium_vfio_scan_raw.stdout | from_json).grub_existing_vfio_ids
+         | map('lower') | difference(lium_vfio_universe) | sort }}
+
 - name: Build the required token set
   ansible.builtin.set_fact:
+    lium_vfio_ids_to_write: "{{ lium_vfio_present + lium_vfio_unmanaged }}"
     lium_required_tokens: >-
       {{
-        ['kvm_intel.tdx=on', 'intel_iommu=on', 'iommu=pt', 'nohibernate']
+        lium_base_tokens
         + (
-            ['vfio-pci.ids=' ~ (lium.present_pci_ids | join(','))]
-            if (lium.present_pci_ids | length) > 0 else []
+            ['vfio-pci.ids=' ~ ((lium_vfio_present + lium_vfio_unmanaged) | join(','))]
+            if ((lium_vfio_present + lium_vfio_unmanaged) | length) > 0 else []
           )
         + ['vfio_iommu_type1.dma_entry_limit=' ~ lium_dma_entry_limit]
       }}
+
+- name: Report the vfio-pci ids being carried forward
+  ansible.builtin.debug:
+    msg: >-
+      Carrying {{ lium_vfio_unmanaged | join(', ') }} into vfio-pci.ids unchanged.
+      These are not GPU or NVSwitch ids this playbook knows about, so their
+      presence cannot be verified — but the drop-in's value replaces the whole
+      list, so dropping them would unbind those devices on the next boot.
+  when: lium_vfio_unmanaged | length > 0
 
 # The PROVIDER's own shape, with our drop-in excluded.
 #
@@ -53,9 +109,9 @@
     msg: |
       REFUSING: the vfio-pci id list would get SHORTER.
 
-      Already on the kernel command line or in GRUB : {{ lium_vfio_ids_existing | join(', ') }}
-      Discovered on this host right now             : {{ lium.present_pci_ids | join(', ') }}
-      Would be dropped                              : {{ lium_vfio_ids_dropped | join(', ') }}
+      Configured previously, and this playbook manages it : {{ lium_vfio_ids_existing | join(', ') }}
+      Discovered on this host right now                   : {{ lium_vfio_present | join(', ') }}
+      Would be dropped                                    : {{ lium_vfio_ids_dropped | join(', ') }}
 
       A device that is hot-removed or wedged disappears from lspci. Writing the
       shorter list would unbind it on the next boot. Bring it back first:
@@ -65,7 +121,7 @@
       then re-run. If the device is genuinely gone for good, remove its id from
       GRUB by hand so the two agree.
   vars:
-    # BOTH sources, unioned.
+    # BOTH sources, unioned, then narrowed to the ids we manage.
     #
     # lium_cmdline_before EXCLUDES our own drop-in (so the au2 shape stays
     # reportable across re-runs) and INCLUDES /proc/cmdline. lium.* includes the
@@ -75,12 +131,19 @@
     #     list;
     #   - without the analysis, ids the host BOOTED with but which were later
     #     cleaned out of the GRUB files are invisible.
-    # Unioning cannot cause a false refusal: a legitimately added GPU only ever
-    # widens the discovered set, so the difference stays empty.
+    #
+    # The intersection with the managed universe is what keeps this a claim we
+    # can actually support. Anything outside it is never looked for in lspci, so
+    # it can never appear in present_pci_ids and would be "dropped" on every run
+    # forever — refusing on a healthy host over a passed-through NIC, and telling
+    # its owner to rescan a bus that has nothing to find. Those ids are handled
+    # by carrying them forward instead; see above.
     lium_vfio_ids_existing: >-
-      {{ lium_cmdline_before.existing_vfio_ids | union(lium.grub_existing_vfio_ids) }}
+      {{ (lium_cmdline_before.existing_vfio_ids | map('lower') | list)
+         | union(lium.grub_existing_vfio_ids | map('lower') | list)
+         | intersect(lium_vfio_universe) | sort }}
     lium_vfio_ids_dropped: >-
-      {{ lium_vfio_ids_existing | difference(lium.present_pci_ids) }}
+      {{ lium_vfio_ids_existing | difference(lium_vfio_present) }}
   when: lium_vfio_ids_dropped | length > 0
 
 # Once, and never overwritten: the point of a backup is the state BEFORE the

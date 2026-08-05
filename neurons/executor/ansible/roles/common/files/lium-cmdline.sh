@@ -238,19 +238,36 @@ cmd_analyze() {
   # Pre-existing vfio-pci.ids= from every source. The role asserts the freshly
   # discovered set is a SUPERSET of this union: narrowing the list unbinds a GPU
   # on the next boot, which is how a hot-removed device silently costs you a GPU.
-  local existing_ids=() src
-  for src in "$linux_line" "$default_line" "$proc_line"; do
+  #
+  # The GRUB-file subset is reported separately because the two answer different
+  # questions. The union answers "was this id ever configured?" — the right basis
+  # for a refusal. The GRUB-file subset answers "what will the NEXT boot get if we
+  # write our drop-in now?" — the right basis for deciding which ids we must carry
+  # forward so our own append does not shorten the list. An id that is only in
+  # /proc/cmdline is already gone from the boot configuration; restoring it would
+  # resurrect a setting the provider removed.
+  # Iterated by ORIGIN, not by value: a host whose /proc/cmdline happens to be
+  # byte-identical to GRUB_CMDLINE_LINUX is ordinary, and comparing the strings
+  # to decide which source a line came from would misfile its ids.
+  local existing_ids=() grub_existing_ids=() origin src
+  for origin in grub:"$linux_line" grub:"$default_line" proc:"$proc_line"; do
+    src="${origin#*:}"
     [ -n "$src" ] || continue
     local ids
     ids="$(vfio_ids_of_line "$src")"
     [ -n "$ids" ] || continue
     local IFS=','
     for id in $ids; do
-      [ -n "$id" ] && existing_ids+=("$id")
+      [ -n "$id" ] || continue
+      existing_ids+=("$id")
+      [ "${origin%%:*}" = proc ] || grub_existing_ids+=("$id")
     done
   done
   if [ "${#existing_ids[@]}" -gt 0 ]; then
     mapfile -t existing_ids < <(printf '%s\n' "${existing_ids[@]}" | sort -u)
+  fi
+  if [ "${#grub_existing_ids[@]}" -gt 0 ]; then
+    mapfile -t grub_existing_ids < <(printf '%s\n' "${grub_existing_ids[@]}" | sort -u)
   fi
   if [ "${#conflicting[@]}" -gt 0 ]; then
     mapfile -t conflicting < <(printf '%s\n' "${conflicting[@]}" | sort -u)
@@ -269,7 +286,8 @@ cmd_analyze() {
   "drift_tokens": $(json_array_of_strings ${drift[@]+"${drift[@]}"}),
   "found_only_in_grub_cmdline_linux": $(json_array_of_strings ${only_in_linux[@]+"${only_in_linux[@]}"}),
   "conflicting_keys": $(json_array_of_strings ${conflicting[@]+"${conflicting[@]}"}),
-  "existing_vfio_ids": $(json_array_of_strings ${existing_ids[@]+"${existing_ids[@]}"})
+  "existing_vfio_ids": $(json_array_of_strings ${existing_ids[@]+"${existing_ids[@]}"}),
+  "grub_existing_vfio_ids": $(json_array_of_strings ${grub_existing_ids[@]+"${grub_existing_ids[@]}"})
 }
 JSON
 }
