@@ -242,7 +242,9 @@ COMM_PREFIX="qemu-system"
 PROC_PIDS=()
 PROC_COMMS=()
 PROC_STATES=()
+PROC_PPIDS=()
 PROC_OURS=()
+PROC_ARGV_READABLE=()
 PROC_CMDHEADS=()
 
 for _procdir in "$PROC_ROOT"/[0-9]*; do
@@ -260,14 +262,33 @@ for _procdir in "$PROC_ROOT"/[0-9]*; do
   # Process state is field 3 of /proc/<pid>/stat, after the parenthesised comm.
   # A `Z` (zombie) QEMU still holds guest RAM and is not reaped until its parent
   # dies — polling it stalls forever (traps #8).
+  # Everything after the parenthesised comm is "state ppid pgrp ...", so both
+  # fields come from one read. The ppid matters for a zombie: the recovery turns
+  # on whether there is still a parent left to kill.
   _state="?"
+  _ppid="0"
   if [ -r "$_procdir/stat" ]; then
-    _state="$(sed -e 's/^.*) //' -e 's/ .*$//' "$_procdir/stat" 2>/dev/null || printf '?')"
+    _rest="$(sed -e 's/^.*) //' "$_procdir/stat" 2>/dev/null || printf '')"
+    if [ -n "$_rest" ]; then
+      _state="${_rest%% *}"
+      _rest="${_rest#* }"
+      _ppid="${_rest%% *}"
+    fi
   fi
+  case "$_ppid" in ''|*[!0-9]*) _ppid="0" ;; esac
 
+  # A ZOMBIE'S ARGV IS ALWAYS EMPTY. The kernel frees it when the process exits,
+  # so /proc/<pid>/cmdline reads as 0 bytes while the entry still exists. Reading
+  # that emptiness as "does not point at run/vms/, therefore not ours" is how a
+  # host with our own dead CVM was described to the operator as somebody's
+  # active bare-metal rental — "expected revenue, not an outage". Observed on a
+  # production host. Absence of evidence is tracked separately from evidence of
+  # absence, and only the latter may claim a process belongs to a tenant.
   _cmdline=""
+  _argv_readable="false"
   if [ -r "$_procdir/cmdline" ]; then
     _cmdline="$(tr '\0' ' ' <"$_procdir/cmdline" 2>/dev/null || true)"
+    [ -n "$_cmdline" ] && _argv_readable="true"
   fi
 
   _ours="false"
@@ -278,7 +299,9 @@ for _procdir in "$PROC_ROOT"/[0-9]*; do
   PROC_PIDS+=("$_pid")
   PROC_COMMS+=("$_comm")
   PROC_STATES+=("${_state:-?}")
+  PROC_PPIDS+=("$_ppid")
   PROC_OURS+=("$_ours")
+  PROC_ARGV_READABLE+=("$_argv_readable")
   PROC_CMDHEADS+=("$(printf '%.160s' "$_cmdline")")
 done
 
@@ -309,9 +332,20 @@ fi
 # with processes was already claimed above it — and harmlessly so.
 ANY_ZOMBIE="false"
 ANY_OURS="false"
+ANY_ZOMBIE_ORPHANED="false"
+ANY_FOREIGN_WITH_ARGV="false"
+ANY_ARGV_UNREADABLE="false"
 for _i in "${!PROC_PIDS[@]}"; do
   [ "${PROC_STATES[$_i]}" = "Z" ] && ANY_ZOMBIE="true"
   [ "${PROC_OURS[$_i]}" = "true" ] && ANY_OURS="true"
+  if [ "${PROC_STATES[$_i]}" = "Z" ] && [ "${PROC_PPIDS[$_i]}" = "1" ]; then
+    ANY_ZOMBIE_ORPHANED="true"
+  fi
+  if [ "${PROC_ARGV_READABLE[$_i]}" = "true" ]; then
+    [ "${PROC_OURS[$_i]}" = "false" ] && ANY_FOREIGN_WITH_ARGV="true"
+  else
+    ANY_ARGV_UNREADABLE="true"
+  fi
 done
 
 if [ "${#ROOTS_UNREADABLE[@]}" -gt 0 ]; then
@@ -358,9 +392,28 @@ if [ "${#HDA_IMAGES[@]}" -gt 0 ]; then
 fi
 
 if [ "$ANY_ZOMBIE" = "true" ]; then
-  RECOVERY_LINES+=("A zombie qemu-system process still holds guest memory. It is not reaped until its")
-  RECOVERY_LINES+=("parent dies, so polling for it never returns. Kill the parent:")
-  RECOVERY_LINES+=("  sudo tmux kill-session -t lium-cvm")
+  RECOVERY_LINES+=("A zombie qemu-system process still holds guest memory. It is not reaped while")
+  RECOVERY_LINES+=("any of its threads are alive, so polling for it never returns.")
+  for _i in "${!PROC_PIDS[@]}"; do
+    [ "${PROC_STATES[$_i]}" = "Z" ] || continue
+    RECOVERY_LINES+=("  pid ${PROC_PIDS[$_i]}, parent pid ${PROC_PPIDS[$_i]}")
+  done
+  # Which instruction is correct depends on facts already collected, so it is
+  # chosen from them. The unconditional `tmux kill-session -t lium-cvm` named a
+  # session this host did not have and a parent that was already init.
+  if [ "$TMUX_LIUM_CVM" = "true" ]; then
+    RECOVERY_LINES+=("The lium-cvm tmux session is its parent. Killing that reaps it:")
+    RECOVERY_LINES+=("  sudo tmux kill-session -t lium-cvm")
+  elif [ "$ANY_ZOMBIE_ORPHANED" = "true" ]; then
+    RECOVERY_LINES+=("Its parent is already init (pid 1), so there is no parent left to kill, and")
+    RECOVERY_LINES+=("kill -9 does nothing to a process that has already exited. The guest memory")
+    RECOVERY_LINES+=("stays reserved until its last thread exits. See what is still running:")
+    RECOVERY_LINES+=("  ls /proc/<pid>/task")
+    RECOVERY_LINES+=("If those threads do not exit, a host reboot is the only thing that frees it.")
+  else
+    RECOVERY_LINES+=("Kill the parent pid shown above: a zombie is reaped when its parent exits or")
+    RECOVERY_LINES+=("reaps it, and not before.")
+  fi
 fi
 
 if [ "$ANY_OURS" = "true" ]; then
@@ -368,10 +421,18 @@ if [ "$ANY_OURS" = "true" ]; then
   RECOVERY_LINES+=("  sudo ./lium-cvm.sh stop <name>")
 fi
 
-if [ "$ANY_OURS" = "false" ] && [ "${#PROC_PIDS[@]}" -gt 0 ]; then
+# Gated on argv having actually been READ. "Its command line does not mention
+# run/vms/" only means "someone else's" when there was a command line to look at.
+if [ "$ANY_FOREIGN_WITH_ARGV" = "true" ]; then
   RECOVERY_LINES+=("A qemu-system process is running that does not point at our run/vms/ tree.")
   RECOVERY_LINES+=("This is what an active bare-metal rental looks like — expected revenue, not an")
   RECOVERY_LINES+=("outage. Confirm against rental_history before doing anything to this host.")
+fi
+
+if [ "$ANY_ARGV_UNREADABLE" = "true" ]; then
+  RECOVERY_LINES+=("A qemu-system process has no readable command line — a zombie's is always")
+  RECOVERY_LINES+=("empty — so whether it was ours or a tenant's cannot be told from it. Do not")
+  RECOVERY_LINES+=("read that silence as 'not ours': check run/vms/ and rental_history instead.")
 fi
 
 if [ "${#RECOVERY_LINES[@]}" -eq 0 ]; then
@@ -399,7 +460,9 @@ for _i in "${!PROC_PIDS[@]}"; do
   procs_json="${procs_json}{\"pid\": ${PROC_PIDS[$_i]}"
   procs_json="${procs_json}, \"comm\": \"$(json_escape "${PROC_COMMS[$_i]}")\""
   procs_json="${procs_json}, \"proc_state\": \"$(json_escape "${PROC_STATES[$_i]}")\""
+  procs_json="${procs_json}, \"ppid\": ${PROC_PPIDS[$_i]}"
   procs_json="${procs_json}, \"ours\": ${PROC_OURS[$_i]}"
+  procs_json="${procs_json}, \"argv_readable\": ${PROC_ARGV_READABLE[$_i]}"
   procs_json="${procs_json}, \"cmdline_head\": \"$(json_escape "${PROC_CMDHEADS[$_i]}")\"}"
 done
 procs_json="${procs_json}]"

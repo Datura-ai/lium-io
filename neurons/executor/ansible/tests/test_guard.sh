@@ -260,14 +260,74 @@ make_proc "$PROC" 1005 "qemu-system-x86" Z "/opt/lium-io/neurons/executor/dstack
 expect_state "(ladder) ZOMBIE outranks LIVE" ZOMBIE \
   env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent LIUM_REPO_PATH=/nonexistent
 
+# A REAL zombie has an EMPTY argv — the kernel frees it on exit — and once it is
+# orphaned its parent is init. Modelled exactly, because both facts were being
+# misread on a production host: the empty argv made `ours` false, so our own dead
+# CVM was reported as somebody's active bare-metal rental ("expected revenue,
+# not an outage"), and the recovery told the operator to kill a tmux session
+# named lium-cvm that did not exist, for a parent that was already pid 1.
+rm -rf "${PROC:?}"/*
+make_proc "$PROC" 1007 "qemu-system-x86" Z ""
+CASES=$((CASES + 1))
+zorphan="$(env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent \
+               LIUM_REPO_PATH=/nonexistent "$GUARD" --recovery)"
+case "$zorphan" in *"expected revenue"*) _rev=1 ;; *) _rev=0 ;; esac
+if [ "$_rev" -eq 0 ]; then
+  pass "(zombie) an empty argv is not reported as a tenant's paying rental"
+else
+  fail "(zombie) a zombie with no argv was described as an active bare-metal rental"
+fi
+
+CASES=$((CASES + 1))
+case "$zorphan" in *"tmux kill-session"*) _tm=1 ;; *) _tm=0 ;; esac
+case "$zorphan" in *"parent is already init"*) _init=1 ;; *) _init=0 ;; esac
+if [ "$_tm" -eq 0 ] && [ "$_init" -eq 1 ]; then
+  pass "(zombie) an orphaned zombie gets the init advice, not a tmux session that does not exist"
+else
+  fail "(zombie) orphan recovery wrong: tmux_advice=$_tm init_advice=$_init"
+fi
+
+CASES=$((CASES + 1))
+case "$zorphan" in *"cannot be told from it"*) _amb=1 ;; *) _amb=0 ;; esac
+if [ "$_amb" -eq 1 ]; then
+  pass "(zombie) the unreadable command line is declared rather than assumed"
+else
+  fail "(zombie) an unreadable argv was passed over in silence"
+fi
+
+rm -rf "${PROC:?}"/*
+make_proc "$PROC" 1005 "qemu-system-x86" Z "/opt/lium-io/neurons/executor/dstacktee/run/vms/demo/x"
 CASES=$((CASES + 1))
 zrecovery="$(env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent \
                  LIUM_REPO_PATH=/nonexistent "$GUARD" --recovery)"
-case "$zrecovery" in *"tmux kill-session"*) _hit=1 ;; *) _hit=0 ;; esac
+case "$zrecovery" in *"pid 1005, parent pid 1"*) _hit=1 ;; *) _hit=0 ;; esac
 if [ "$_hit" -eq 1 ]; then
-  pass "(ladder) a zombie contributes the tmux reaping step"
+  pass "(ladder) a zombie contributes a reaping step naming its own pid and parent"
 else
-  fail "(ladder) a zombie did not contribute the tmux reaping step"
+  fail "(ladder) the zombie recovery does not name the pid and parent it is about"
+fi
+
+# The tmux branch is still the right advice when that session really is the
+# parent, so it keeps its own case rather than being deleted along with the
+# unconditional version.
+CASES=$((CASES + 1))
+if command -v tmux >/dev/null 2>&1; then
+  tmux new-session -d -s lium-cvm 'sleep 30' 2>/dev/null || true
+  if tmux has-session -t lium-cvm 2>/dev/null; then
+    tmuxrec="$(env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent \
+                   LIUM_REPO_PATH=/nonexistent "$GUARD" --recovery)"
+    tmux kill-session -t lium-cvm 2>/dev/null || true
+    case "$tmuxrec" in *"tmux kill-session -t lium-cvm"*) _hit=1 ;; *) _hit=0 ;; esac
+    if [ "$_hit" -eq 1 ]; then
+      pass "(zombie) with a real lium-cvm session present, the tmux step is offered"
+    else
+      fail "(zombie) a live lium-cvm session did not produce the tmux reaping step"
+    fi
+  else
+    printf '  SKIP (zombie) tmux present but a session could not be started here\n'
+  fi
+else
+  printf '  SKIP (zombie) tmux is not installed, so the tmux branch cannot be exercised\n'
 fi
 
 # The search roots are duplicated on purpose — the script owns them because it
