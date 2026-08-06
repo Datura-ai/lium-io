@@ -190,7 +190,7 @@
 {% set _ = checks.append({
   'id': 'kernel.cmdline_tokens',
   'title': 'The running kernel has every required parameter',
-  'status': 'UNKNOWN' if not (lium.proc_cmdline.readable | bool) else ('OK' if (lium_verify_cmdline.drift_tokens | default([]) | length) == 0 else 'MUST_FIX'),
+  'status': 'UNKNOWN' if (not (lium.proc_cmdline.readable | bool) or not (lium_verify_cmdline_ok | bool)) else ('OK' if (lium_verify_cmdline.drift_tokens | default([]) | length) == 0 else 'MUST_FIX'),
   'observed': ((lium_verify_cmdline.drift_tokens | default([]) | length) ~ ' token(s) missing from the running kernel') ~ (((': ' ~ (lium_verify_cmdline.drift_tokens | join(', '))) if (lium_verify_cmdline.drift_tokens | default([]) | length) > 0 else '')),
   'expected': 'every required token resolves on /proc/cmdline',
   'remediation': 'Re-run bootstrap.sh and allow the reboot. If it has already rebooted twice without effect, check whether /boot is full and whether update-grub actually rewrote grub.cfg.',
@@ -200,7 +200,7 @@
 {% set _ = checks.append({
   'id': 'kernel.grub_persisted',
   'title': 'The kernel parameters are persisted in GRUB',
-  'status': 'OK' if (lium_verify_cmdline.missing_tokens | default([]) | length) == 0 else 'MUST_FIX',
+  'status': 'UNKNOWN' if not (lium_verify_cmdline_ok | bool) else ('OK' if (lium_verify_cmdline.missing_tokens | default([]) | length) == 0 else 'MUST_FIX'),
   'observed': (lium_verify_cmdline.missing_tokens | default([]) | length) ~ ' token(s) not resolving in the merged GRUB configuration',
   'expected': 'every required token wins in GRUB_CMDLINE_LINUX plus GRUB_CMDLINE_LINUX_DEFAULT',
   'remediation': 'Re-run the kernel role. The drop-in appends to GRUB_CMDLINE_LINUX_DEFAULT and never assigns GRUB_CMDLINE_LINUX, so a provider value is never clobbered.',
@@ -210,7 +210,7 @@
 {% set _ = checks.append({
   'id': 'kernel.grub_conflicting_tokens',
   'title': 'No stale duplicate kernel parameters',
-  'status': 'OK' if (lium_verify_cmdline.conflicting_keys | default([]) | length) == 0 else 'WARN',
+  'status': 'UNKNOWN' if not (lium_verify_cmdline_ok | bool) else ('OK' if (lium_verify_cmdline.conflicting_keys | default([]) | length) == 0 else 'WARN'),
   'observed': ((lium_verify_cmdline.conflicting_keys | default([]) | join(', ')) if (lium_verify_cmdline.conflicting_keys | default([]) | length) > 0 else 'none'),
   'expected': 'each parameter appears once',
   'remediation': 'These keys appear more than once with different values. Ours win, because 10_linux emits GRUB_CMDLINE_LINUX before GRUB_CMDLINE_LINUX_DEFAULT and the kernel takes the last occurrence — but relying on that ordering forever is fragile. Remove the stale copies from /etc/default/grub.',

@@ -5,7 +5,7 @@ galaxy_info:
   description: DAH-2544 CVM day-zero host provisioning — verify
   company: Datura
   license: MIT
-  min_ansible_version: "2.16"
+  min_ansible_version: "2.18"
   platforms:
     - name: Ubuntu
       versions:

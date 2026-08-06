@@ -9,11 +9,10 @@
 # both sides of every comparison from here down: vfio-pci parses its ids with
 # %x, so `10DE:2335` is a working configuration, and an exact-string compare
 # would read a provider's upper-case list as five ids that all vanished.
-- name: Establish the managed PCI id universe and the base tokens
+- name: Establish the managed PCI id universe
   ansible.builtin.set_fact:
     lium_vfio_universe: "{{ (lium_cc_gpu_pci_ids + lium_nvswitch_pci_ids) | map('lower') | list }}"
     lium_vfio_present: "{{ lium.present_pci_ids | map('lower') | list }}"
-    lium_base_tokens: ['kvm_intel.tdx=on', 'intel_iommu=on', 'iommu=pt', 'nohibernate']
 
 # What is configured today, before we touch anything. Runs BEFORE the token set
 # is built because the token set depends on it — see the carry-forward below.
@@ -21,7 +20,7 @@
   ansible.builtin.command:
     cmd: >-
       {{ lium_common_files }}/lium-cmdline.sh analyze
-      --required {{ lium_base_tokens | join(' ') | quote }}
+      --required {{ lium_base_kernel_tokens | join(' ') | quote }}
       --grub-default {{ lium_grub_default_path | quote }}
       --grub-dropin-dir {{ lium_grub_dropin_path | dirname | quote }}
       --exclude-dropin {{ lium_grub_dropin_path | quote }}
@@ -53,7 +52,7 @@
   ansible.builtin.set_fact:
     lium_required_tokens: >-
       {{
-        lium_base_tokens
+        lium_base_kernel_tokens
         + (
             ['vfio-pci.ids=' ~ (lium_vfio_ids_to_write | join(','))]
             if (lium_vfio_ids_to_write | length) > 0 else []

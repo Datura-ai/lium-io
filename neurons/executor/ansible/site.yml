@@ -27,9 +27,21 @@
 # Ordering: kernel before gpu (GPUs must be vfio-pci bound, which the GRUB
 # vfio-pci.ids= provides after the reboot); qemu after docker (a 10-40 minute
 # build should not precede anything cheap that can fail).
+#
+# `gather_facts: false` on every play but two. This tree reads exactly two
+# ansible facts — ansible_date_time in kernel/tasks/arm_resume.yml, and
+# date_time plus hostname in the verify report — and everything else it needs
+# comes from the `lium` bundle, collected by a script. The default `implicit`
+# gathering ran a full `setup` ten times per run, enumerating every PCI device,
+# interface and mount on an 8-GPU host, to supply two values. Those two plays
+# still gather, deliberately: `gathering = smart` in ansible.cfg would have
+# collapsed the ten to one, but it also freezes date_time at the first play, so
+# a report written after a 40-minute QEMU build would be stamped with the time
+# the run started.
 
 - name: Collect host facts and derive the guard state
   hosts: localhost
+  gather_facts: false
   become: true
   tags: [always]
   roles:
@@ -37,6 +49,7 @@
 
 - name: Preflight hard gates
   hosts: localhost
+  gather_facts: false
   become: true
   tags: [preflight, converge]
   roles:
@@ -59,6 +72,7 @@
 
 - name: GPU confidential-compute mode and vfio binding
   hosts: localhost
+  gather_facts: false
   become: true
   tags: [gpu, converge, destructive]
   pre_tasks:
@@ -74,6 +88,7 @@
 
 - name: Docker engine
   hosts: localhost
+  gather_facts: false
   become: true
   tags: [docker, converge]
   roles:
@@ -81,6 +96,7 @@
 
 - name: QEMU — the dstack 9.2.1 build
   hosts: localhost
+  gather_facts: false
   become: true
   tags: [qemu, converge, destructive]
   pre_tasks:
@@ -96,6 +112,7 @@
 
 - name: Repo — lium-io checkout and CVM OS image
   hosts: localhost
+  gather_facts: false
   become: true
   tags: [repo, converge]
   roles:
@@ -103,6 +120,7 @@
 
 - name: SGX DCAP stack, quote plumbing and the sealing-key provider
   hosts: localhost
+  gather_facts: false
   become: true
   tags: [sgx, converge]
   roles:
@@ -110,15 +128,30 @@
 
 - name: Stubs — cvmd and catalog variable interfaces
   hosts: localhost
+  gather_facts: false
   become: true
   tags: [stubs, converge]
   roles:
     - cvmd
     - catalog
 
+# `common` runs AGAIN here, and that is the point.
+#
+# `lium` is a set_fact taken once in the first play, before any role ran. Every
+# converge role then changes the very things the report describes — docker
+# installed, QEMU built, the checkout cloned, CC mode flipped, the key provider
+# up. Rendering the report from the opening snapshot means the run that does the
+# work reports it as undone: ~8 MUST_FIX checks and a non-zero exit on a host
+# that just converged correctly, with a third run needed before it ever reads
+# green.
+#
+# Re-collecting is also what makes the report honest as a standalone audit:
+# `--tags verify` describes the host now, not whenever facts were last taken.
+# The cost is one extra fact collection and guard sweep per run.
 - name: Verify — emit the machine-readable report
   hosts: localhost
   become: true
   tags: [verify]
   roles:
+    - common
     - verify

@@ -42,6 +42,22 @@ lium_nvtrust_repo: https://github.com/NVIDIA/nvtrust
 lium_nvtrust_dir: /opt/nvtrust
 lium_nvtrust_tool: "{{ lium_nvtrust_dir }}/host_tools/python/nvidia_gpu_tools.py"
 
+# The kernel parameters that do not depend on what is plugged into this host.
+#
+# Shared rather than repeated, because TWO roles have to agree on the required
+# token set exactly: `kernel` writes it into the GRUB drop-in, and `verify`
+# rebuilds it to decide whether the running host matches. Restated as a literal
+# in both, they drifted — the report contradicted the converge that had just
+# succeeded, on hosts where nothing was wrong.
+#
+# The vfio-pci.ids= and dma_entry_limit tokens are NOT here: both are derived
+# per host and both roles derive them the same way from this list.
+lium_base_kernel_tokens:
+  - kvm_intel.tdx=on
+  - intel_iommu=on
+  - iommu=pt
+  - nohibernate
+
 # vfio. 65535 is the shipped default and it kills a TDX guest mid-boot with
 # `VFIO_MAP_DMA failed: No space left on device` (traps.md#7).
 lium_dma_entry_limit: 16777216
@@ -72,6 +88,19 @@ lium_repo_url: https://github.com/Datura-ai/lium-io.git
 lium_repo_path: /opt/lium-io
 lium_repo_ref: main
 lium_repo_clone: true
+
+# The ONE tracked file this playbook edits inside the checkout, named in one
+# place because two roles have to agree about it: `sgx_key_provider` repoints its
+# pccs_url, and `repo` has to restore it before moving the ref.
+#
+# Ansible's git module treats any tracked modification as fatal when force is no
+# — `has_local_mods` filters only untracked entries out of `git status
+# --porcelain` — so without the restore the SECOND converge aborts in `repo`,
+# over an edit `sgx` made on the first one.
+#
+# It is NOT part of the measured surface: everything hashed into the compose the
+# validator whitelists lives under dstacktee/app/, and this does not.
+lium_kp_qcnl_relpath: neurons/executor/dstacktee/key-provider/sgx_default_qcnl.conf
 
 # Set by bootstrap.sh --yes. The kernel role pauses for confirmation before a
 # reboot unless this is true.

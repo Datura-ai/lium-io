@@ -21,6 +21,38 @@
     state: directory
     mode: "0755"
 
+# The expected token set must be derived the SAME way the kernel role derives
+# what it writes, or the report contradicts the converge that just succeeded.
+#
+# `--exclude-dropin` skips our own file, so this reads what the PROVIDER'S GRUB
+# configuration would give the next boot. Ids outside the managed universe are
+# carried forward by the kernel role rather than dropped (an SR-IOV NIC, an NVMe,
+# a GPU generation whose ids are not field-verified yet), so they belong in the
+# expected value too. Expecting `present_pci_ids` alone makes every such host
+# report two blocker checks forever on a command line that is exactly right.
+- name: Discover the vfio-pci ids the next boot would keep
+  ansible.builtin.command:
+    cmd: >-
+      {{ role_path }}/../common/files/lium-cmdline.sh analyze
+      --required {{ lium_base_kernel_tokens | join(' ') | quote }}
+      --grub-default {{ lium_grub_default_path | quote }}
+      --grub-dropin-dir {{ lium_grub_dropin_path | dirname | quote }}
+      --exclude-dropin {{ lium_grub_dropin_path | quote }}
+      --proc-cmdline {{ lium_proc_cmdline_path | quote }}
+  register: lium_verify_vfio_scan
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Separate the ids this playbook does not manage
+  ansible.builtin.set_fact:
+    lium_verify_vfio_unmanaged: >-
+      {{ ((lium_verify_vfio_scan.stdout | from_json).grub_existing_vfio_ids
+          | map('lower')
+          | difference((lium_cc_gpu_pci_ids + lium_nvswitch_pci_ids) | map('lower') | list)
+          | sort)
+         if (lium_verify_vfio_scan.stdout | default('') | length) > 0 else [] }}
+
 - name: Analyse the kernel command line for the report
   ansible.builtin.command:
     cmd: >-
@@ -34,18 +66,27 @@
   check_mode: false
   failed_when: false
   vars:
+    lium_verify_vfio_ids: >-
+      {{ (lium.present_pci_ids | map('lower') | list) + lium_verify_vfio_unmanaged }}
     lium_verify_required_tokens: >-
-      {{ ['kvm_intel.tdx=on', 'intel_iommu=on', 'iommu=pt', 'nohibernate']
-         + (['vfio-pci.ids=' ~ (lium.present_pci_ids | join(','))]
-            if (lium.present_pci_ids | length) > 0 else [])
+      {{ lium_base_kernel_tokens
+         + (['vfio-pci.ids=' ~ (lium_verify_vfio_ids | join(','))]
+            if (lium_verify_vfio_ids | length) > 0 else [])
          + ['vfio_iommu_type1.dma_entry_limit=' ~ lium_dma_entry_limit] }}
 
+# A crashed analyser is UNKNOWN, never a pass. The previous fallback substituted
+# three empty lists, which reads as "no drift, nothing missing, no conflicts" —
+# so an analysis that never ran rendered kernel.grub_persisted as OK and reset
+# the reboot budget, disabling the loop protection. The report's own doctrine is
+# that UNKNOWN means "could not be read at all", and this is that case.
 - name: Publish the command-line analysis
   ansible.builtin.set_fact:
+    lium_verify_cmdline_ok: "{{ (lium_verify_cmdline_raw.stdout | default('') | length) > 0 }}"
     lium_verify_cmdline: >-
       {{ (lium_verify_cmdline_raw.stdout | from_json)
          if (lium_verify_cmdline_raw.stdout | default('') | length) > 0
-         else {'drift_tokens': [], 'conflicting_keys': [], 'missing_tokens': []} }}
+         else {'drift_tokens': [], 'conflicting_keys': [], 'missing_tokens': [],
+               'grubcfg_missing_tokens': []} }}
 
 - name: List local listeners
   ansible.builtin.command:
@@ -87,6 +128,9 @@
     content: "0\n"
     mode: "0644"
   when:
+    # A POSITIVE analysis, not merely the absence of a negative one: with the
+    # analyser crashed, the two length checks below are trivially satisfied.
+    - lium_verify_cmdline_ok | bool
     - (lium_verify_cmdline.drift_tokens | default([]) | length) == 0
     - (lium_verify_cmdline.missing_tokens | default([]) | length) == 0
     - lium.proc_cmdline.readable | bool
