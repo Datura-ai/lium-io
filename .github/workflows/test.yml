@@ -159,6 +159,9 @@ jobs:
       - name: Test seams are unreachable in production
         run: bash tests/test_seam_gate.sh
 
+      - name: Kernel command-line resolution
+        run: bash tests/test_cmdline_resolution.sh
+
       - name: Destructive-action guard
         run: bash tests/test_guard.sh
 
@@ -314,7 +317,8 @@ jobs:
       - name: Shell units again, in the container's own locale
         run: |
           for t in test_forbidden_strings test_seam_gate test_guard \
-                   test_resume_guard test_verify_schema test_docs_pointer; do
+                   test_resume_guard test_verify_schema test_docs_pointer \
+                   test_cmdline_resolution; do
             bash "tests/$t.sh"
           done
 

@@ -240,29 +240,51 @@ cmd_analyze() {
   # on the next boot, which is how a hot-removed device silently costs you a GPU.
   #
   # The GRUB-file subset is reported separately because the two answer different
-  # questions. The union answers "was this id ever configured?" — the right basis
-  # for a refusal. The GRUB-file subset answers "what will the NEXT boot get if we
-  # write our drop-in now?" — the right basis for deciding which ids we must carry
-  # forward so our own append does not shorten the list. An id that is only in
-  # /proc/cmdline is already gone from the boot configuration; restoring it would
-  # resurrect a setting the provider removed.
-  # Iterated by ORIGIN, not by value: a host whose /proc/cmdline happens to be
-  # byte-identical to GRUB_CMDLINE_LINUX is ordinary, and comparing the strings
-  # to decide which source a line came from would misfile its ids.
-  local existing_ids=() grub_existing_ids=() origin src
-  for origin in grub:"$linux_line" grub:"$default_line" proc:"$proc_line"; do
-    src="${origin#*:}"
+  # questions, and they need DIFFERENT resolutions — not the same scan labelled
+  # two ways.
+  #
+  #   existing_ids       union over every source: "was this id ever configured?"
+  #                      The right basis for the narrowing refusal.
+  #
+  #   grub_existing_ids  "what does the NEXT boot get if we write our drop-in
+  #                      now?" The right basis for the carry-forward. That is a
+  #                      last-occurrence-wins resolution over the line 10_linux
+  #                      actually emits — `${GRUB_CMDLINE_LINUX}
+  #                      ${GRUB_CMDLINE_LINUX_DEFAULT}` — and NOT a union of the
+  #                      two variables. A host with vfio-pci.ids= in both boots
+  #                      with the _DEFAULT value alone, so unioning them would
+  #                      carry forward, and re-bind, a device the provider had
+  #                      already stopped passing through. Binding the host's own
+  #                      NVMe to vfio-pci is not a smaller mistake than unbinding
+  #                      a NIC.
+  #
+  # An id that is only in /proc/cmdline is already gone from the boot
+  # configuration, so it appears in the union and never in the carry-forward;
+  # restoring it would resurrect a setting the provider removed.
+  #
+  # Both splits go through `read`, NOT through `IFS=,` plus an unquoted
+  # expansion. `local IFS=,` has FUNCTION scope, so it would still be set on the
+  # next trip round the loop, and `resolve_key` splits its line with an unquoted
+  # `for tok in $line` — with IFS=, that stops splitting on whitespace and every
+  # source after the first one carrying ids resolves to nothing.
+  local existing_ids=() grub_existing_ids=() src id ids
+  for src in "$linux_line" "$default_line" "$proc_line"; do
     [ -n "$src" ] || continue
-    local ids
     ids="$(vfio_ids_of_line "$src")"
     [ -n "$ids" ] || continue
-    local IFS=','
-    for id in $ids; do
+    while IFS= read -r id; do
       [ -n "$id" ] || continue
       existing_ids+=("$id")
-      [ "${origin%%:*}" = proc ] || grub_existing_ids+=("$id")
-    done
+    done < <(printf '%s\n' "${ids//,/$'\n'}")
   done
+
+  ids="$(vfio_ids_of_line "$linux_line $default_line")"
+  if [ -n "$ids" ]; then
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      grub_existing_ids+=("$id")
+    done < <(printf '%s\n' "${ids//,/$'\n'}")
+  fi
   if [ "${#existing_ids[@]}" -gt 0 ]; then
     mapfile -t existing_ids < <(printf '%s\n' "${existing_ids[@]}" | sort -u)
   fi
