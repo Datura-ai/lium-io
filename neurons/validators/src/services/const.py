@@ -41,7 +41,8 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     # Export-compliant A100: same GA100 and 80 GB, NVLink cut to 400 GB/s.
-    "NVIDIA A800 80GB PCIe": 0.01,
+    # Supported operationally, but excluded from the unrented pool.
+    "NVIDIA A800 80GB PCIe": 0.0,
     "NVIDIA A100-SXM4-80GB": 0.05,
     "NVIDIA A10 Tensor Core GPU": 0.0,
     "NVIDIA RTX A6000": 0.009,
