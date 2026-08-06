@@ -6,8 +6,6 @@ prod B300 on 2026-08-06 — under `sysbox-runc` with the devices and `memlock=-1
 enumerates all 24 devices and the four ACTIVE ports, with the same LIDs the host reports.
 """
 
-import inspect
-
 import pytest
 
 from services.nvidia_devices import (
@@ -16,35 +14,46 @@ from services.nvidia_devices import (
     build_gpu_docker_config_for_executor,
 )
 from services.rental_docker_sdk import ContainerRunSpec, ContainerUlimit, _build_host_config_kwargs
+from core.config import settings
 from services.docker_service import DockerService
 from services.rental_docker_sdk import DeviceMount
 from tests.test_nvidia_devices import FakeRun, fake_ssh
 
 
-def test_only_the_verbs_nodes_are_forwarded_never_the_whole_directory() -> None:
-    """`/dev/infiniband` as a directory also hands over `issm*` (the subnet-manager interface) and
-    `umad*` (raw MAD). A renter holding issm can interfere with the fabric everyone else shares."""
-    # Arrange / Act
-    probe_source = inspect.getsource(_query_shared_nodes)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passthrough_enabled", [True, False])
+async def test_rdma_is_forwarded_only_when_the_flag_is_on(monkeypatch, passthrough_enabled: bool) -> None:
+    """Off by default: RDMA skips the host network stack, so on a shared RoCE segment it reaches a
+    neighbour with no iptables, conntrack or rate limit in the way. Enabling it later is free."""
+    # Arrange
+    monkeypatch.setattr(settings, "ENABLE_RDMA_DEVICE_PASSTHROUGH", passthrough_enabled)
+    ssh = fake_ssh(FakeRun(""))
+
+    # Act
+    await _query_shared_nodes(ssh, is_whole_host_rental=True)
 
     # Assert
-    assert "/dev/infiniband/uverbs[0-9]*" in probe_source
-    assert "/dev/infiniband/rdma_cm" in probe_source
-    assert "/dev/infiniband/issm" not in probe_source
-    assert "/dev/infiniband/umad" not in probe_source
-    assert '"/dev/infiniband"' not in probe_source
+    probe_command = ssh.run.call_args.args[0]
+    assert ("/dev/infiniband/uverbs[0-9]*" in probe_command) is passthrough_enabled
+    assert ("/dev/infiniband/rdma_cm" in probe_command) is passthrough_enabled
 
 
-def test_rdma_devices_are_skipped_on_a_partial_host_rental() -> None:
-    """The cards belong to the whole host. On a split node forwarding all of them would hand one
-    tenant the verbs devices of a card the other tenant is renting."""
-    # Arrange / Act
-    probe_source = inspect.getsource(_query_shared_nodes)
-    rdma_block_offset = probe_source.index("/dev/infiniband/uverbs[0-9]*")
-    whole_host_guard_offset = probe_source.index("if is_whole_host_rental:")
+@pytest.mark.asyncio
+async def test_the_directory_form_is_never_used(monkeypatch) -> None:
+    """`/dev/infiniband` as a directory also hands over `issm*` (the subnet-manager interface) and
+    `umad*` (raw MAD). A renter holding issm can interfere with the fabric everyone else shares."""
+    # Arrange
+    monkeypatch.setattr(settings, "ENABLE_RDMA_DEVICE_PASSTHROUGH", True)
+    ssh = fake_ssh(FakeRun(""))
 
-    # Assert — the RDMA listing sits inside the whole-host branch, not before it
-    assert whole_host_guard_offset < rdma_block_offset
+    # Act
+    await _query_shared_nodes(ssh, is_whole_host_rental=True)
+
+    # Assert
+    probe_command = ssh.run.call_args.args[0]
+    assert "/dev/infiniband/issm" not in probe_command
+    assert "/dev/infiniband/umad" not in probe_command
+    assert " /dev/infiniband " not in probe_command
 
 
 def test_memlock_is_raised_only_for_a_container_that_got_rdma_devices() -> None:
@@ -108,7 +117,7 @@ async def test_a_repeated_uuid_does_not_pass_a_single_gpu_rental_off_as_whole_ho
 
 
 @pytest.mark.asyncio
-async def test_a_whole_host_rental_carries_the_card_all_the_way_into_the_host_config() -> None:
+async def test_a_whole_host_rental_carries_the_card_all_the_way_into_the_host_config(monkeypatch) -> None:
     """The seam this feature lives or dies on: what the probe finds on the executor has to survive
     into the Docker host config, or the renter still cannot see the card.
 
@@ -116,6 +125,7 @@ async def test_a_whole_host_rental_carries_the_card_all_the_way_into_the_host_co
     the host-config mapping — and each was verified separately until now.
     """
     # Arrange — an executor with one GPU and one RDMA card, rented whole
+    monkeypatch.setattr(settings, "ENABLE_RDMA_DEVICE_PASSTHROUGH", True)
     ssh = fake_ssh(
         FakeRun("/dev/nvidia0\n"),
         FakeRun("/dev/nvidiactl\n/dev/infiniband/uverbs0\n/dev/infiniband/rdma_cm\n"),

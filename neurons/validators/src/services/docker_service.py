@@ -941,10 +941,12 @@ class DockerService:
         RDMA pins the memory it registers and the default 64 KB is far below one queue pair, so the
         forwarded verbs devices are unusable without this (DAH-2571).
 
-        Both conditions matter. Locked pages are charged to the container's memory cgroup, so with a
-        limit in place a tenant can only pin their own allocation. Without one — `mem_limit` is
-        skipped for a falsy `memory_gb`, and a pod's `ram_total` defaults to 0 — unlimited memlock
-        would let them pin the host's RAM in non-reclaimable pages instead.
+        Both conditions matter, though the limit is a bound, not safety. Locked pages are charged to
+        the container's memory cgroup, so the tenant can pin at most `memory_gb` — but on a
+        whole-host rental that is the machine: `ram_total` is host RAM less ~2 GiB. What the cgroup
+        buys is a ceiling the kernel enforces and the OOM killer can act on. Without one —
+        `mem_limit` is skipped for a falsy `memory_gb`, and a pod's `ram_total` defaults to 0 —
+        there is no ceiling at all, and mlocked pages never reclaim.
         """
         forwards_rdma = any(
             device.path_on_host.startswith("/dev/infiniband/") for device in devices

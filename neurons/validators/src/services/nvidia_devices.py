@@ -42,6 +42,7 @@ from collections.abc import Sequence
 
 import asyncssh
 
+from core.config import settings
 from services.rental_docker_sdk import GpuDockerConfig, build_gpu_docker_config
 
 logger = logging.getLogger(__name__)
@@ -213,7 +214,10 @@ async def _query_shared_nodes(
     device — all three belong to the host as a whole, and forwarding them would hand a tenant
     control nodes of a GPU or a card another tenant is renting on the same box.
 
-    Only the `uverbs*` nodes and `rdma_cm` are forwarded, never the /dev/infiniband directory:
+    RDMA is additionally behind ENABLE_RDMA_DEVICE_PASSTHROUGH, off by default: the path skips the
+    host network stack, so on a shared RoCE segment it reaches a neighbour with no iptables,
+    conntrack or rate limit in the way. Only the `uverbs*` nodes and `rdma_cm` are ever forwarded,
+    never the /dev/infiniband directory:
     that also carries `issm*`, the subnet-manager interface, and `umad*`, raw MAD access. A renter
     holding `issm` can interfere with the fabric every other tenant on it depends on (DAH-2571).
     """
@@ -222,7 +226,7 @@ async def _query_shared_nodes(
         "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
         "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
     )
-    if is_whole_host_rental:
+    if is_whole_host_rental and settings.ENABLE_RDMA_DEVICE_PASSTHROUGH:
         globs += " /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
     cmd = (
         f"for p in {globs}; do "
