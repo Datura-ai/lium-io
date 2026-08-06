@@ -563,6 +563,11 @@ def build_startup_command_args(startup_commands: str | None) -> str:
     return " ".join(shlex.quote(token) for token in tokens)
 
 
+def _forwards_rdma_devices(devices: tuple[DeviceMount, ...]) -> bool:
+    """Whether this rental was handed the RDMA verbs devices (DAH-2571)."""
+    return any(device.path_on_host.startswith("/dev/infiniband/") for device in devices)
+
+
 class DockerService:
     def __init__(
         self,
@@ -933,8 +938,8 @@ class DockerService:
             entrypoint=custom_options.entrypoint,
         )
 
+    @staticmethod
     async def _attach_rdma_fabric_if_available(
-        self,
         *,
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
@@ -951,10 +956,7 @@ class DockerService:
         host is the normal case, not an error, and the pod is still exactly what today's
         passthrough delivers.
         """
-        forwards_rdma = any(
-            device.path_on_host.startswith("/dev/infiniband/") for device in forwarded_devices
-        )
-        if not forwards_rdma:
+        if not _forwards_rdma_devices(forwarded_devices):
             return
         try:
             attachment = await attach_container_to_rdma_fabric(ssh_client, container_name)
@@ -998,10 +1000,7 @@ class DockerService:
         `mem_limit` is skipped for a falsy `memory_gb`, and a pod's `ram_total` defaults to 0 —
         there is no ceiling at all, and mlocked pages never reclaim.
         """
-        forwards_rdma = any(
-            device.path_on_host.startswith("/dev/infiniband/") for device in devices
-        )
-        if not forwards_rdma or not memory_gb:
+        if not _forwards_rdma_devices(devices) or not memory_gb:
             return ()
         return (ContainerUlimit(name="memlock", soft=-1, hard=-1),)
 

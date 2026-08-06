@@ -21,6 +21,12 @@ NET_ADMIN, so nothing enforced by the container's own kernel namespace counts:
 Neither is configured by us at rental time: exclusive mode is host-wide and disruptive to flip
 while RDMA is in use, and only whoever owns the fabric knows which addresses on it are free. Both
 are read as preconditions, and the attachment is skipped when they are absent.
+
+KNOWN LIMITATION: the attachment is made once, when the container is created. Rental containers run
+under `restart-unless-stopped`, and a restart destroys the network namespace — the kernel returns
+the function to the host and the restarted container comes back with its bridge address only, no
+`fabric0` and no RDMA device, without saying so. Re-attaching on restart needs a watcher on the
+executor and is not built here; until it is, a pod that restarts has silently lost the fabric.
 """
 from __future__ import annotations
 
@@ -111,6 +117,14 @@ async def read_host_fabric_config(
         )
         return None
     vlan_id: int | None = document.get("vlan_id")
+    # The file is written on the host and its values reach `ip link set`; a non-integer tag would
+    # cross into that command as text.
+    if vlan_id is not None and not isinstance(vlan_id, int):
+        logger.warning(
+            "rdma_fabric: vlan_id in the host fabric config is not an integer, ignoring the config",
+            extra={"path": HOST_FABRIC_CONFIG_PATH, "vlan_id": repr(vlan_id)},
+        )
+        return None
     return HostFabricConfig(container_ip_range=container_ip_range, vlan_id=vlan_id)
 
 
@@ -154,23 +168,27 @@ def build_attachment(
     the range belongs to that host alone, and a derived address needs no state to survive a
     validator restart or a second container starting concurrently.
     """
-    addresses = list(ipaddress.ip_network(host_config.container_ip_range).hosts())
-    if virtual_function.index >= len(addresses):
+    container_ip_network = ipaddress.ip_network(host_config.container_ip_range)
+    # Indexed, not enumerated: the range comes from a file on the host, and materialising the
+    # addresses of a /8 someone typed there would cost the validator a gigabyte per pod.
+    usable_address_count = container_ip_network.num_addresses - 2
+    if virtual_function.index >= usable_address_count:
         logger.warning(
             "rdma_fabric: host range is smaller than the card's function count, "
             "leaving the container on the NAT bridge",
             extra={
                 "container_ip_range": host_config.container_ip_range,
                 "virtual_function_index": virtual_function.index,
-                "usable_addresses": len(addresses),
+                "usable_addresses": max(usable_address_count, 0),
             },
         )
         return None
-    prefix_length = ipaddress.ip_network(host_config.container_ip_range).prefixlen
+    # +1 skips the network address, matching what `.hosts()` would have yielded.
+    container_address = container_ip_network[virtual_function.index + 1]
     return RdmaFabricAttachment(
         virtual_function=virtual_function,
         mac_address=_locally_administered_mac_for(container_name),
-        ipv4_cidr=f"{addresses[virtual_function.index]}/{prefix_length}",
+        ipv4_cidr=f"{container_address}/{container_ip_network.prefixlen}",
         vlan_id=host_config.vlan_id,
     )
 
@@ -236,18 +254,18 @@ async def move_into_container_namespace(
     virtual_function = attachment.virtual_function
     host_netdev = shlex.quote(virtual_function.netdev)
     fabric_netdev = CONTAINER_FABRIC_NETDEV_NAME
-    steps = (
+    attach_commands = (
         f"ip link set {host_netdev} netns {container_pid}",
         f"nsenter -t {container_pid} -n ip link set {host_netdev} name {fabric_netdev}",
         f"nsenter -t {container_pid} -n ip addr add {attachment.ipv4_cidr} dev {fabric_netdev}",
         f"nsenter -t {container_pid} -n ip link set {fabric_netdev} up",
         f"rdma dev set {shlex.quote(virtual_function.rdma_device)} netns {container_pid}",
     )
-    for step in steps:
-        result = await ssh_client.run(step)
+    for command in attach_commands:
+        result = await ssh_client.run(command)
         if result.exit_status != 0:
             raise RuntimeError(
-                f"failed to attach the RDMA fabric function: {step!r} "
+                f"failed to attach the RDMA fabric function: {command!r} "
                 f"exited {result.exit_status}, stderr={result.stderr!r}"
             )
 
