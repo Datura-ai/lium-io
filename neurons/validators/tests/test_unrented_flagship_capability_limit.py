@@ -1,9 +1,9 @@
-"""DAH-2546 — unrented incentive flagship capability gate.
+"""DAH-2546 / DAH-2594 — unrented incentive flagship capability gate.
 
-An unrented 8x H200/B200/B300 executor that neither has NCU profiling counters
-open on the host (ncu_profiling_access == "unrestricted") nor real GPU
-splitting enabled (min_gpu_count below the full node size) forfeits the
-unrented rental incentive while staying active. Enforcement is gated by
+An unrented 8x H200/B200/B300 executor that has none of NCU profiling counters
+open on the host (ncu_profiling_access == "unrestricted"), real GPU splitting
+enabled (min_gpu_count below the full node size), or a passed TDX attestation
+forfeits the unrented rental incentive while staying active. Enforcement is gated by
 ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT; while the flag is off the breach is
 only logged (shadow mode) and the payout is unchanged.
 """

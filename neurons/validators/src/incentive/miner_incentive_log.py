@@ -9,7 +9,7 @@ WHERE A NODE EARNS (two "pools" of subnet emission; the rest is burned):
 HOW A NODE PICKS A POOL:
   rented?                                              -> mining pool (always earns)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
-       AND (not flagship-8x OR NCU/split offered)
+       AND (not flagship-8x OR NCU/split/attested-CVM offered)
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
 
@@ -24,7 +24,8 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
      total disk below 1.5x total GPU VRAM (add disk to earn),
-     8x H200/B200/B300 with neither NCU profiling nor GPU splitting (offer either to earn),
+     8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
+       attestation (offer any of the three to earn),
      no unrented capacity for that GPU-count tier this cycle,
      NVIDIA driver below the minimum, sysbox runtime not enabled
 
