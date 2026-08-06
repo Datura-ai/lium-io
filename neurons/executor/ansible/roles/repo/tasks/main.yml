@@ -22,9 +22,31 @@
     dest: "{{ lium_repo_path }}"
     version: "{{ lium_repo_ref }}"
     update: false
+  register: lium_repo_cloned
   when:
     - lium_repo_clone | bool
     - not (lium.repo_present | bool)
+
+# Narrowly, and only the file we own. The sgx role rewrites its two lines later
+# in this same run, so nothing is lost — but leaving the edit in place makes the
+# git task below fail outright on every converge after the first, in a role that
+# has nothing to do with the cause. Any OTHER tracked modification still stops
+# the update, which is the property worth keeping.
+#
+# `command` rather than the git module on purpose: ansible.builtin.git operates
+# on the whole checkout, and its only lever here is force, which would discard
+# every local modification instead of the one file we own.
+- name: Restore the QPL config this playbook manages  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: git checkout -- {{ lium_kp_qcnl_relpath | quote }}
+    chdir: "{{ lium_repo_path }}"
+  register: lium_repo_qcnl_restore
+  changed_when: lium_repo_qcnl_restore.rc == 0
+  failed_when: false
+  when:
+    - lium_repo_clone | bool
+    - lium.repo_present | bool
+    - lium.guard.state == 'CLEAN'
 
 # Only on a CLEAN host.
 - name: Move the checkout to the requested ref
@@ -79,14 +101,19 @@
       Do not work around this by copying another host's files.
   when: lium.app_dirty_files | length > 0
 
+# `lium.repo_present` is a SNAPSHOT taken in the common play, before this role
+# ran, so on a fresh host it is false even after the clone above succeeded. On
+# its own it would skip the download on the one run that most needs it, and the
+# provider would have to notice and run the playbook a second time. The clone's
+# own result is the only thing that knows the checkout exists now.
 - name: Download the CVM OS image
   ansible.builtin.command:
-    cmd: ./lium-cvm.sh download
+    cmd: "{{ lium_os_image_download_cmd }}"
     chdir: "{{ lium_repo_path }}/neurons/executor/dstacktee"
   register: lium_image_download
   changed_when: true
   when:
-    - lium.repo_present | bool
+    - lium.repo_present | bool or (lium_repo_cloned.changed | default(false))
     - lium.os_image_digest | length == 0
 
 - name: Report the recorded image and runner digests

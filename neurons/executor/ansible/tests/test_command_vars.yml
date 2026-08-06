@@ -50,6 +50,8 @@
 
       lium_update_grub_cmd: update-grub
 
+      lium_os_image_download_cmd: ./lium-cvm.sh download
+
   tasks:
     - name: Every command matches its golden string
       ansible.builtin.assert:

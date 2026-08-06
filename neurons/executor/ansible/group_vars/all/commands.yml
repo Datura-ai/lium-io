@@ -56,6 +56,13 @@ lium_modprobe_cmds:
 
 lium_update_grub_cmd: update-grub
 
+# --- repo --------------------------------------------------------------------
+# Run with chdir into the dstacktee checkout. A variable rather than a literal
+# for the usual reason — check mode never sees a command task — and so the
+# fixture test can point the clone-path case at a stub instead of pulling a
+# multi-gigabyte OS image.
+lium_os_image_download_cmd: ./lium-cvm.sh download
+
 # --- QEMU --------------------------------------------------------------------
 # Plain build. DUMP_ACPI_TABLES is deliberately absent: that variant is the
 # verifier's oracle binary and cannot run VMs (host-setup.md section 3).

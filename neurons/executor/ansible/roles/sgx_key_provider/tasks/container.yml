@@ -14,7 +14,7 @@
 # pccs_url repoint.
 - name: Point the key provider's QPL at the PCCS
   ansible.builtin.lineinfile:
-    path: "{{ lium_repo_path }}/neurons/executor/dstacktee/key-provider/sgx_default_qcnl.conf"
+    path: "{{ lium_repo_path }}/{{ lium_kp_qcnl_relpath }}"
     regexp: '^\s*"pccs_url"\s*:'
     line: '  "pccs_url": "{{ lium_pccs_url }}",'
     create: false
@@ -22,7 +22,7 @@
 
 - name: Ensure the key provider's QPL accepts the local certificate
   ansible.builtin.lineinfile:
-    path: "{{ lium_repo_path }}/neurons/executor/dstacktee/key-provider/sgx_default_qcnl.conf"
+    path: "{{ lium_repo_path }}/{{ lium_kp_qcnl_relpath }}"
     regexp: '^\s*"use_secure_cert"\s*:'
     line: '  "use_secure_cert": false,'
     create: false

@@ -162,3 +162,246 @@
         msg: >-
           PASS repo accepts a pristine measured surface and refuses a modified
           one, naming the file and the restore command.
+
+# The first converge on a FRESH host: nothing is checked out yet.
+#
+# Every `lium.*` fact is a snapshot taken in the common play, before this role
+# runs, so `lium.repo_present` is false here even after the clone succeeds.
+# A download gated on that fact alone silently does nothing on the one run that
+# has to do it, and the provider is left with a checkout and no OS image — with
+# no error to tell them, because a skipped task is not a failure.
+- name: Repo role downloads the OS image on the run that clones the checkout
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    clone_work: /tmp/lium-repo-clone-fixture
+    lium_state_dir: /tmp/lium-repo-clone-fixture/state
+    lium_log_dir: /tmp/lium-repo-clone-fixture/log
+    lium_hda_search_roots: ["/tmp/lium-repo-clone-fixture/no-such-root"]
+    lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    lium_repo_path: /tmp/lium-repo-clone-fixture/repo
+    lium_repo_clone: true
+    lium_repo_url: /tmp/lium-repo-clone-fixture/origin
+    lium_repo_ref: main
+    # A stub, so the case exercises the CONDITION rather than pulling a
+    # multi-gigabyte image. Absolute, because the real task chdirs into the
+    # checkout.
+    lium_os_image_download_cmd: /tmp/lium-repo-clone-fixture/fake-download.sh
+
+  pre_tasks:
+    - name: Start from a clean work tree
+      ansible.builtin.file:
+        path: "{{ clone_work }}"
+        state: absent
+
+    - name: The checkout must not exist yet
+      ansible.builtin.file:
+        path: "{{ clone_work }}/origin/neurons/executor/dstacktee/app"
+        state: directory
+        mode: "0755"
+
+    - name: Build an origin to clone from
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          cd {{ clone_work }}/origin
+          git init -q -b main
+          git config user.email fixture@example.invalid
+          git config user.name Fixture
+          cp {{ playbook_dir }}/fixtures/repo_dirty_app/neurons/executor/dstacktee/app/docker-compose.yml \
+             neurons/executor/dstacktee/app/docker-compose.yml
+          git add -A
+          git commit -q -m "fixture: origin"
+        executable: /bin/bash
+      changed_when: true
+
+    # Records that it ran, and creates the digest the real download would, so a
+    # second converge has nothing left to do.
+    - name: Install the download stub
+      ansible.builtin.copy:
+        dest: "{{ clone_work }}/fake-download.sh"
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          mkdir -p "{{ clone_work }}/repo/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11"
+          printf 'sha256:%064d\n' 0 \
+            > "{{ clone_work }}/repo/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11/digest.txt"
+          printf 'downloaded\n' > "{{ clone_work }}/download-ran"
+
+  tasks:
+    - name: Collect facts while the checkout is still absent
+      ansible.builtin.include_role:
+        name: common
+
+    - name: The fixture really is a fresh host
+      ansible.builtin.assert:
+        that:
+          - not (lium.repo_present | bool)
+          - lium.os_image_digest | length == 0
+        fail_msg: >-
+          The checkout or the image digest already exists, so this case would
+          pass without proving anything about the first converge.
+        quiet: true
+
+    - name: Converge repo
+      ansible.builtin.include_role:
+        name: repo
+
+    - name: The image download ran on the same run as the clone
+      ansible.builtin.stat:
+        path: "{{ clone_work }}/download-ran"
+      register: clone_download_marker
+
+    - name: The clone and the download must happen together
+      ansible.builtin.assert:
+        that:
+          - clone_download_marker.stat.exists
+        fail_msg: >-
+          The checkout was cloned but the OS image was not downloaded. The
+          download is gated on lium.repo_present, which is a snapshot from
+          before this role ran and is still false — so the first converge leaves
+          the host without an image and says nothing about it.
+        quiet: true
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: PASS repo downloads the OS image on the run that clones the checkout.
+
+# The SECOND converge on a CLEAN host.
+#
+# The sgx role repoints pccs_url in a TRACKED file inside the checkout. Ansible's
+# git module treats any tracked modification as fatal when force is no, so the
+# next converge aborts in `repo` — a role with nothing to do with the cause —
+# and the run never reaches sgx, qemu or verify again.
+- name: Repo role survives the edit the SGX role leaves in the checkout
+  hosts: localhost
+  gather_facts: false
+  vars:
+    lium_test_mode: true
+    reconv_work: /tmp/lium-repo-reconverge-fixture
+    lium_state_dir: /tmp/lium-repo-reconverge-fixture/state
+    lium_log_dir: /tmp/lium-repo-reconverge-fixture/log
+    lium_hda_search_roots: ["/tmp/lium-repo-reconverge-fixture/no-such-root"]
+    lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    lium_repo_path: /tmp/lium-repo-reconverge-fixture/repo
+    lium_repo_clone: true
+    lium_repo_url: /tmp/lium-repo-reconverge-fixture/origin
+    lium_repo_ref: main
+
+  pre_tasks:
+    - name: Start from a clean work tree
+      ansible.builtin.file:
+        path: "{{ reconv_work }}"
+        state: absent
+
+    - name: Lay out the origin
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ reconv_work }}/origin/neurons/executor/dstacktee/app"
+        - "{{ reconv_work }}/origin/neurons/executor/dstacktee/key-provider"
+
+    # The real file's shape, not a placeholder: the sgx role edits it by line
+    # with an anchored regex that includes the trailing comma.
+    - name: Commit an origin that carries the QPL config
+      ansible.builtin.shell:
+        cmd: |
+          set -Eeuo pipefail
+          cd {{ reconv_work }}/origin
+          git init -q -b main
+          git config user.email fixture@example.invalid
+          git config user.name Fixture
+          cp {{ playbook_dir }}/fixtures/repo_dirty_app/neurons/executor/dstacktee/app/docker-compose.yml \
+             neurons/executor/dstacktee/app/docker-compose.yml
+          cat > {{ lium_kp_qcnl_relpath }} <<'JSON'
+          {
+            "pccs_url": "https://pccs.phala.network/tdx/certification/v4/",
+            "use_secure_cert": false,
+            "retry_times": 6
+          }
+          JSON
+          git add -A
+          git commit -q -m "fixture: origin with a QPL config"
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Clone it, as the first converge would have
+      ansible.builtin.git:
+        repo: "{{ lium_repo_url }}"
+        dest: "{{ lium_repo_path }}"
+        version: main
+        update: false
+
+    - name: Make room for the image digest
+      ansible.builtin.file:
+        path: "{{ lium_repo_path }}/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11"
+        state: directory
+        mode: "0755"
+
+    - name: Give it an image digest so the download is not in play
+      ansible.builtin.copy:
+        dest: "{{ lium_repo_path }}/neurons/executor/dstacktee/run/images/dstack-nvidia-0.5.11/digest.txt"
+        content: "sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+        mode: "0644"
+
+    # Exactly what roles/sgx_key_provider/tasks/container.yml does.
+    - name: Leave the edit the SGX role leaves
+      ansible.builtin.lineinfile:
+        path: "{{ lium_repo_path }}/{{ lium_kp_qcnl_relpath }}"
+        regexp: '^\s*"pccs_url"\s*:'
+        line: '  "pccs_url": "https://localhost:8081/sgx/certification/v4/",'
+        create: false
+        mode: "0644"
+
+  tasks:
+    - name: Collect facts against the edited checkout
+      ansible.builtin.include_role:
+        name: common
+
+    - name: The fixture really is the second-converge state
+      ansible.builtin.assert:
+        that:
+          - lium.repo_present | bool
+          - lium.guard.state == 'CLEAN'
+          - lium.app_dirty_files | length == 0
+        fail_msg: >-
+          The fixture is not a CLEAN host with a present checkout and a pristine
+          measured surface, so the git update below would be skipped and this
+          case would prove nothing. guard={{ lium.guard.state }}
+          present={{ lium.repo_present }} dirty={{ lium.app_dirty_files }}
+        quiet: true
+
+    - name: Converge repo a second time
+      block:
+        - name: Run repo over the edited checkout
+          ansible.builtin.include_role:
+            name: repo
+
+        - name: Record that repo survived
+          ansible.builtin.set_fact:
+            reconv_failed: false
+            reconv_msg: ""
+      rescue:
+        - name: Record the abort
+          ansible.builtin.set_fact:
+            reconv_failed: true
+            reconv_msg: "{{ ansible_failed_result.msg | default('') }}"
+
+    - name: The second converge must not abort over our own edit
+      ansible.builtin.assert:
+        that:
+          - not (reconv_failed | bool)
+        fail_msg: >-
+          repo aborted on the second converge. The sgx role edits a TRACKED file
+          in the checkout, and the git module fails on any tracked modification
+          when force is no — so every run after the first dies here, before sgx,
+          qemu or verify are reached again. msg={{ reconv_msg }}
+        quiet: true
+
+    - name: PASS
+      ansible.builtin.debug:
+        msg: PASS repo restores the QPL config it manages and re-converges cleanly.
