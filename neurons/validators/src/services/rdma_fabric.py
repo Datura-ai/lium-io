@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 # free. A validator-wide setting cannot know that — the segment is shared between hosts.
 HOST_FABRIC_CONFIG_PATH = "/etc/lium/rdma-fabric.json"
 
+# What the fabric interface is called inside every container. VF netdev names vary per host and
+# driver (enp1s0f0v3, eth4, ...), and NCCL/gloo do not pick a second interface on their own —
+# customers point them at it with NCCL_SOCKET_IFNAME/GLOO_SOCKET_IFNAME, so the name has to be
+# one documented constant, not something to discover per pod.
+CONTAINER_FABRIC_NETDEV_NAME = "fabric0"
+
 
 @dataclass(frozen=True, slots=True)
 class HostFabricConfig:
@@ -210,11 +216,12 @@ async def move_into_container_namespace(
     attachment: RdmaFabricAttachment,
     container_name: str,
 ) -> None:
-    """Hand the function to the container: netdev, address, then the RDMA device.
+    """Hand the function to the container: netdev, stable name, address, then the RDMA device.
 
-    Order matters. The RDMA device moves last, because its GID table is built from the addresses
-    present in the namespace it lands in — move it before the address exists and the GIDs it
-    publishes are empty.
+    Order matters twice. The rename happens inside the namespace, where the name cannot collide
+    with another rental's function. The RDMA device moves last, because its GID table is built
+    from the addresses present in the namespace it lands in — move it before the address exists
+    and the GIDs it publishes are empty.
     """
     quoted_container_name = shlex.quote(container_name)
     pid_result = await ssh_client.run(
@@ -227,11 +234,13 @@ async def move_into_container_namespace(
         )
 
     virtual_function = attachment.virtual_function
-    netdev = shlex.quote(virtual_function.netdev)
+    host_netdev = shlex.quote(virtual_function.netdev)
+    fabric_netdev = CONTAINER_FABRIC_NETDEV_NAME
     steps = (
-        f"ip link set {netdev} netns {container_pid}",
-        f"nsenter -t {container_pid} -n ip addr add {attachment.ipv4_cidr} dev {netdev}",
-        f"nsenter -t {container_pid} -n ip link set {netdev} up",
+        f"ip link set {host_netdev} netns {container_pid}",
+        f"nsenter -t {container_pid} -n ip link set {host_netdev} name {fabric_netdev}",
+        f"nsenter -t {container_pid} -n ip addr add {attachment.ipv4_cidr} dev {fabric_netdev}",
+        f"nsenter -t {container_pid} -n ip link set {fabric_netdev} up",
         f"rdma dev set {shlex.quote(virtual_function.rdma_device)} netns {container_pid}",
     )
     for step in steps:

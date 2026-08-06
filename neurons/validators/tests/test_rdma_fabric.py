@@ -107,7 +107,21 @@ async def test_the_function_lands_in_the_containers_namespace() -> None:
     await attach_container_to_rdma_fabric(ssh, "pod_test")
 
     assert "ip link set enp1s0f0v3 netns 48211" in ssh.commands
-    assert "nsenter -t 48211 -n ip addr add 38.255.28.196/27 dev enp1s0f0v3" in ssh.commands
+    assert "nsenter -t 48211 -n ip addr add 38.255.28.196/27 dev fabric0" in ssh.commands
+
+
+@pytest.mark.asyncio
+async def test_the_interface_is_renamed_to_the_documented_constant_before_it_is_addressed() -> None:
+    ssh = _ready_host()
+
+    await attach_container_to_rdma_fabric(ssh, "pod_test")
+
+    rename = "nsenter -t 48211 -n ip link set enp1s0f0v3 name fabric0"
+    assert rename in ssh.commands
+    # Customers reach it as NCCL_SOCKET_IFNAME=fabric0; the host-side driver name never leaks out.
+    assert ssh.commands.index(rename) < next(
+        i for i, c in enumerate(ssh.commands) if "ip addr add" in c
+    )
 
 
 @pytest.mark.asyncio
