@@ -4,6 +4,8 @@ from __future__ import annotations
 import pytest
 
 from services import rdma_fabric
+from services.docker_service import DockerService
+from services.rental_docker_sdk import DeviceMount
 from services.rdma_fabric import (
     HostFabricConfig,
     VirtualFunction,
@@ -186,3 +188,64 @@ async def test_unparsable_host_config_is_treated_as_unconfigured() -> None:
     )
 
     assert await attach_container_to_rdma_fabric(ssh, "pod_test") is None
+
+
+# --- The guard: an ordinary rental must not notice this feature exists at all ---
+
+
+def _device(path_on_host: str) -> DeviceMount:
+    return DeviceMount(path_on_host=path_on_host, path_in_container=path_on_host)
+
+
+_ORDINARY_RENTAL_DEVICES = (
+    _device("/dev/net/tun"),
+    _device("/dev/nvidia0"),
+    _device("/dev/nvidiactl"),
+    _device("/dev/nvidia-uvm"),
+)
+
+
+@pytest.mark.asyncio
+async def test_a_rental_without_rdma_devices_never_touches_the_host() -> None:
+    ssh = _ready_host()
+
+    await DockerService._attach_rdma_fabric_if_available(
+        DockerService.__new__(DockerService),
+        ssh_client=ssh,
+        container_name="pod_ordinary",
+        forwarded_devices=_ORDINARY_RENTAL_DEVICES,
+        default_extra={},
+    )
+
+    # Not "did nothing harmful" — did nothing at all, on the box of every rental that has no card.
+    assert ssh.commands == []
+
+
+@pytest.mark.asyncio
+async def test_an_unprepared_host_with_rdma_devices_is_left_exactly_as_it_was() -> None:
+    ssh = _ready_host(**{rdma_fabric.HOST_FABRIC_CONFIG_PATH: _StubSshResult("")})
+
+    await DockerService._attach_rdma_fabric_if_available(
+        DockerService.__new__(DockerService),
+        ssh_client=ssh,
+        container_name="pod_rdma",
+        forwarded_devices=(*_ORDINARY_RENTAL_DEVICES, _device("/dev/infiniband/uverbs0")),
+        default_extra={},
+    )
+
+    assert not any("ip link set" in command for command in ssh.commands)
+
+
+@pytest.mark.asyncio
+async def test_an_attach_failure_does_not_fail_the_rental() -> None:
+    ssh = _ready_host(**{"rdma dev set": _StubSshResult("", exit_status=1)})
+
+    # The pod is already created and running by this point; a fabric it cannot reach is a
+    # degraded rental, not a failed one.
+    await DockerService._attach_rdma_fabric_if_available(
+        DockerService.__new__(DockerService),
+        ssh_client=ssh,
+        container_name="pod_rdma",
+        forwarded_devices=(*_ORDINARY_RENTAL_DEVICES, _device("/dev/infiniband/uverbs0")),
+        default_extra={},
+    )
