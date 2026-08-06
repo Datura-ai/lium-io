@@ -32,6 +32,7 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
     "NVIDIA RTX PRO 4000 Blackwell": 0.0,
     "NVIDIA RTX PRO 5000 Blackwell": 0.0,
+    "NVIDIA RTX 4500 Ada Generation": 0.0,
     "NVIDIA RTX 5000 Ada Generation": 0.0,
     "NVIDIA RTX 5880 Ada Generation": 0.0,
     "NVIDIA RTX 6000 Ada Generation": 0.01,

@@ -261,6 +261,7 @@ _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA RTX PRO 5000 Blackwell": [(44237, 51610), (66355, 77414)],
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": [(88474, 103219)],
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": [(88474, 103219)],
+    "NVIDIA RTX 4500 Ada Generation": [(22118, 25805)],
     "NVIDIA RTX 5000 Ada Generation": [(29491, 34406)],
     "NVIDIA RTX 5880 Ada Generation": [(44237, 51610)],
     "NVIDIA RTX 6000 Ada Generation": [(44237, 51610)],

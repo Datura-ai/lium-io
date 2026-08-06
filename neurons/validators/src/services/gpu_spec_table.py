@@ -96,6 +96,7 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     "NVIDIA RTX PRO 5000 Blackwell":                      [49152, 73728],  # 48/72 GB multi-variant
     "NVIDIA RTX PRO 6000 Blackwell Server Edition":       [98304],         # 96 GB; observed: 97887
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition":  [98304],         # 96 GB; observed: 97887
+    "NVIDIA RTX 4500 Ada Generation":                     [24576],         # 24 GB; Vast offer reports 23034
     "NVIDIA RTX 5000 Ada Generation":                     [32768],         # 32 GB
     "NVIDIA RTX 5880 Ada Generation":                     [49152],         # 48 GB
     "NVIDIA RTX 6000 Ada Generation":                     [49152],         # 48 GB; observed: 49140 (92%), 46068 (8%)
