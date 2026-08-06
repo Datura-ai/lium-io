@@ -83,6 +83,43 @@ def test_normalize_gpu_details_canonicalizes_a10_alias():
     ]
 
 
+@pytest.mark.asyncio
+async def test_machine_spec_scrape_preserves_raw_a10_name_for_native_challenge(
+    context_factory,
+):
+    raw_specs = {
+        "gpu": {
+            "count": 1,
+            "details": [{"name": "NVIDIA A10", "uuid": "GPU-abc123"}],
+        },
+    }
+    runner = DummySSHCommandRunner(
+        result=make_command_result(success=True, stdout="encrypted_payload_here")
+    )
+    services = build_services(ssh=DummySSHService(decrypted_data=raw_specs))
+    config = build_context_config(
+        machine_scrape_filename="scrape.sh",
+        machine_scrape_timeout=300,
+        obfuscation_keys={},
+    )
+    ctx = context_factory(
+        services=services,
+        config=config,
+        state=build_state(remote_dir="/remote/path"),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    result = await MachineSpecScrapeCheck().run(ctx)
+
+    assert result.passed is True
+    updated_state = result.updates["state"]
+    assert updated_state.specs["gpu"]["details"][0]["name"] == "NVIDIA A10"
+    assert updated_state.gpu_details[0]["name"] == "NVIDIA A10 Tensor Core GPU"
+    assert updated_state.gpu_model == "NVIDIA A10 Tensor Core GPU"
+    assert updated_state.gpu_model_count == "NVIDIA A10 Tensor Core GPU:1"
+
+
 @pytest.mark.parametrize(
     "has_remote_dir,has_script_filename,scrape_success,stdout,has_encrypt_key,expected_pass,expected_reason",
     [

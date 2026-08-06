@@ -112,10 +112,9 @@ class MachineSpecScrapeCheck:
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
             raw_gpu_details = gpu_info.get("details", []) or []
+            # The native capability challenge derives its key from the raw NVML name in
+            # specs. Policy and scoring use the canonicalized state fields below.
             gpu_details = _normalize_gpu_details(raw_gpu_details)
-            if gpu_details != raw_gpu_details:
-                gpu_info = {**gpu_info, "details": gpu_details}
-                specs = {**specs, "gpu": gpu_info}
             gpu_model = None
             if gpu_count > 0 and gpu_details:
                 gpu_model = gpu_details[0].get("name")
