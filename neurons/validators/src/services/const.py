@@ -45,6 +45,10 @@ GPU_MODEL_RATES = {
     "NVIDIA RTX A6000": 0.009,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.025, # 2.5x 6000 ada
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.027, # 2.7x 6000 ada
+    # China SKU of the PRO 6000: 84 GB on a 448-bit bus, 19968 cores. Supported
+    # operationally, but excluded from the unrented pool until we have supply data.
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": 0.0,
+    "NVIDIA RTX 6000D": 0.0,
     "NVIDIA RTX A5000": 0.002,
     "NVIDIA RTX A4500": 0.002,
     "NVIDIA RTX A4000": 0.002,
