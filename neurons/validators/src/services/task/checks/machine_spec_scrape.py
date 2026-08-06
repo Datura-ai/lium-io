@@ -8,6 +8,7 @@ from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
 from services.file_encrypt_service import ORIGINAL_KEYS
+from services.gpu_spec_table import normalize_gpu_model
 from .network_ema import compute_ema
 
 
@@ -98,7 +99,19 @@ class MachineSpecScrapeCheck:
 
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
-            gpu_details = gpu_info.get("details", []) or []
+            raw_gpu_details = gpu_info.get("details", []) or []
+            gpu_details = [
+                {
+                    **detail,
+                    "name": normalize_gpu_model(detail.get("name")),
+                }
+                if detail.get("name")
+                else detail
+                for detail in raw_gpu_details
+            ]
+            if gpu_details != raw_gpu_details:
+                gpu_info = {**gpu_info, "details": gpu_details}
+                specs = {**specs, "gpu": gpu_info}
             gpu_model = None
             if gpu_count > 0 and gpu_details:
                 gpu_model = gpu_details[0].get("name")

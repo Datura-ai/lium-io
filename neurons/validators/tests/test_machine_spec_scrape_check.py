@@ -105,8 +105,8 @@ async def test_machine_spec_scrape_check(
         "gpu": {
             "count": 2,
             "details": [
-                {"name": "NVIDIA RTX 3090", "uuid": "GPU-abc123"},
-                {"name": "NVIDIA RTX 3090", "uuid": "GPU-def456"},
+                {"name": "NVIDIA A10", "uuid": "GPU-abc123"},
+                {"name": "NVIDIA A10", "uuid": "GPU-def456"},
             ],
         },
         "cpu": {"cores": 8},
@@ -171,7 +171,13 @@ async def test_machine_spec_scrape_check(
         assert "state" in result.updates
         updated_state = result.updates["state"]
         # Check that specs were parsed and stored correctly
-        assert updated_state.specs.get("gpu") == mock_specs["gpu"]
+        assert updated_state.specs.get("gpu") == {
+            "count": 2,
+            "details": [
+                {"name": "NVIDIA A10 Tensor Core GPU", "uuid": "GPU-abc123"},
+                {"name": "NVIDIA A10 Tensor Core GPU", "uuid": "GPU-def456"},
+            ],
+        }
         assert updated_state.specs.get("cpu") == mock_specs["cpu"]
         assert updated_state.specs.get("gpu_processes") == mock_specs["gpu_processes"]
         assert updated_state.specs.get("sysbox_runtime") == mock_specs["sysbox_runtime"]
@@ -179,8 +185,8 @@ async def test_machine_spec_scrape_check(
         assert updated_state.specs.get("network", {}).get("ema_download_speed") is None
         assert updated_state.specs.get("network", {}).get("ema_upload_speed") is None
         assert updated_state.gpu_count == 2
-        assert updated_state.gpu_model == "NVIDIA RTX 3090"
-        assert updated_state.gpu_model_count == "NVIDIA RTX 3090:2"
+        assert updated_state.gpu_model == "NVIDIA A10 Tensor Core GPU"
+        assert updated_state.gpu_model_count == "NVIDIA A10 Tensor Core GPU:2"
         assert updated_state.gpu_uuids == "GPU-abc123,GPU-def456"
         assert updated_state.sysbox_runtime is True
         assert len(updated_state.gpu_details) == 2
