@@ -8,8 +8,11 @@ enumerates all 24 devices and the four ACTIVE ports, with the same LIDs the host
 
 import inspect
 
-from services.nvidia_devices import _query_shared_nodes
-from services.rental_docker_sdk import ContainerUlimit, _build_host_config_kwargs, ContainerRunSpec
+import pytest
+
+from services.nvidia_devices import _query_gpu_nodes_for_uuids, _query_shared_nodes
+from services.rental_docker_sdk import ContainerRunSpec, ContainerUlimit, _build_host_config_kwargs
+from tests.test_nvidia_devices import FakeRun, fake_ssh
 
 
 def test_only_the_verbs_nodes_are_forwarded_never_the_whole_directory() -> None:
@@ -62,3 +65,21 @@ def test_a_spec_without_ulimits_sends_none() -> None:
 
     # Assert
     assert "ulimits" not in host_config
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_uuid_does_not_pass_a_single_gpu_rental_off_as_whole_host() -> None:
+    """The whole-host decision compares the resolved node count against the host GPU count. Without
+    dedup, one UUID sent eight times on an eight-GPU host counts as eight and the tenant gets every
+    host-wide device — caps and RDMA both."""
+    # Arrange — one GPU requested, repeated, on a host that has four
+    ssh = fake_ssh(
+        FakeRun("GPU-aaa,0\nGPU-bbb,1\nGPU-ccc,2\nGPU-ddd,3\n"),
+    )
+
+    # Act
+    per_gpu, host_total = await _query_gpu_nodes_for_uuids(ssh, ["GPU-aaa"] * 4)
+
+    # Assert
+    assert per_gpu == ("/dev/nvidia0",)
+    assert len(per_gpu) < host_total

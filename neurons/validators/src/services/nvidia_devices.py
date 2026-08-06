@@ -95,11 +95,11 @@ async def build_gpu_docker_config_for_executor(
             per_gpu = await _query_all_gpu_nodes(ssh_client)
             is_partial_rental = False
 
-        # On partial rentals (some-but-not-all GPUs on the host), skip /dev/nvidia-caps/*.
-        # Caps are per-GPU/per-MIG control nodes; forwarding all of them lets a tenant
-        # peek at or manipulate MIG state of another tenant's GPU on the same host.
-        # We don't sell MIG slices today, but stripping caps under partial rental
-        # closes the leak before that ever ships.
+        # On partial rentals (some-but-not-all GPUs on the host), withhold every host-wide node:
+        # /dev/nvidia-caps/* are per-GPU/per-MIG control nodes that would let a tenant peek at or
+        # manipulate another tenant's GPU, and the RDMA verbs devices belong to cards the other
+        # tenant may be renting (DAH-2571). We don't sell MIG slices today, but stripping both
+        # under partial rental closes the leak before either ever ships.
         shared = await _query_shared_nodes(ssh_client, is_whole_host_rental=not is_partial_rental)
         return build_gpu_docker_config(gpu_uuids, device_nodes=(*per_gpu, *shared))
     except Exception:
@@ -164,7 +164,10 @@ async def _query_gpu_nodes_for_uuids(
             f"visible: {sorted(uuid_to_minor)}"
         )
 
-    per_gpu = tuple(f"/dev/nvidia{uuid_to_minor[uuid]}" for uuid in gpu_uuids)
+    # Deduplicated, request order kept: the caller compares this length against the host GPU count
+    # to decide whether the rental covers the whole host, so a UUID repeated N times would pass a
+    # single-GPU rental off as whole-host and hand it every host-wide device.
+    per_gpu = tuple(dict.fromkeys(f"/dev/nvidia{uuid_to_minor[uuid]}" for uuid in gpu_uuids))
     return per_gpu, len(uuid_to_minor)
 
 
