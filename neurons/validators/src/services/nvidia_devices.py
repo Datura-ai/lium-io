@@ -1,4 +1,7 @@
-"""NVIDIA device-node discovery for `docker run --device` flags.
+"""Host device-node discovery for `docker run --device` flags.
+
+Named for NVIDIA because that is why it was written; it now also resolves the RDMA verbs nodes a
+rental container needs to use an InfiniBand or RoCE card (DAH-2571).
 
 Why this module exists
 ----------------------

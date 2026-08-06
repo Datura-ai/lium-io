@@ -922,10 +922,7 @@ class DockerService:
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=("NET_ADMIN",),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
-            # RDMA pins the memory it registers, and the default 64 KB memlock is far below what a
-            # single queue pair needs — without this the verbs devices forwarded above are present
-            # but unusable (DAH-2571). Harmless on hosts with no RDMA hardware.
-            ulimits=(ContainerUlimit(name="memlock", soft=-1, hard=-1),),
+            ulimits=self._memlock_ulimit_for(devices),
             devices=devices,
             device_requests=gpu_devices.device_requests,
             cpu_count=cpu_count,
@@ -934,6 +931,22 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
         )
+
+    @staticmethod
+    def _memlock_ulimit_for(devices: tuple[DeviceMount, ...]) -> tuple[ContainerUlimit, ...]:
+        """Unlimited memlock, but only for a container that actually got RDMA devices.
+
+        RDMA pins the memory it registers and the default 64 KB is far below one queue pair, so the
+        forwarded verbs devices are unusable without this (DAH-2571). It is NOT set globally: a pod
+        whose `ram_total` is 0 carries no memory cgroup limit either (`mem_limit` is skipped for a
+        falsy value), and unlimited memlock on top of that would let a tenant pin the host's RAM.
+        """
+        forwards_rdma = any(
+            device.path_on_host.startswith("/dev/infiniband/") for device in devices
+        )
+        if not forwards_rdma:
+            return ()
+        return (ContainerUlimit(name="memlock", soft=-1, hard=-1),)
 
     async def _remove_failed_container_for_retry(
         self,

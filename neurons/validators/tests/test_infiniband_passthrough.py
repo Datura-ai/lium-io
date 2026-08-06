@@ -12,6 +12,8 @@ import pytest
 
 from services.nvidia_devices import _query_gpu_nodes_for_uuids, _query_shared_nodes
 from services.rental_docker_sdk import ContainerRunSpec, ContainerUlimit, _build_host_config_kwargs
+from services.docker_service import DockerService
+from services.rental_docker_sdk import DeviceMount
 from tests.test_nvidia_devices import FakeRun, fake_ssh
 
 
@@ -41,7 +43,20 @@ def test_rdma_devices_are_skipped_on_a_partial_host_rental() -> None:
     assert whole_host_guard_offset < rdma_block_offset
 
 
-def test_memlock_is_unlimited_on_the_rental_container() -> None:
+def test_memlock_is_raised_only_for_a_container_that_got_rdma_devices() -> None:
+    """A pod whose ram_total is 0 carries no memory cgroup limit either, and unlimited memlock on
+    top of that would let a tenant pin the host's RAM. Raise it only where it buys something."""
+    # Arrange
+    rdma = (DeviceMount(path_on_host="/dev/infiniband/uverbs0", path_in_container="/dev/infiniband/uverbs0"),)
+    gpu_only = (DeviceMount(path_on_host="/dev/nvidia0", path_in_container="/dev/nvidia0"),)
+
+    # Act / Assert
+    assert DockerService._memlock_ulimit_for(rdma) == (ContainerUlimit(name="memlock", soft=-1, hard=-1),)
+    assert DockerService._memlock_ulimit_for(gpu_only) == ()
+    assert DockerService._memlock_ulimit_for(()) == ()
+
+
+def test_memlock_reaches_the_host_config() -> None:
     """The default 64 KB memlock is far below one queue pair; without this the forwarded devices
     are present but unusable."""
     # Arrange
