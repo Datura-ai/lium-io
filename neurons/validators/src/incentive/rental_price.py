@@ -44,8 +44,8 @@ SOFT_LIMIT_PRICE_RATE = 1.1
 MIN_DISK_TO_VRAM_RATE = 1.5
 
 # DAH-2546 — flagship capability gate. An unrented 8x machine of these base models must
-# have NCU profiling counters open on the host, real GPU splitting enabled, or a passed TDX
-# attestation (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
+# have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
+# quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
 # the incentive but stays active.
 FLAGSHIP_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300"})
 FLAGSHIP_CAPABILITY_GPU_COUNT = 8
@@ -336,11 +336,16 @@ class RentalPriceIncentive(DefaultIncentive):
             and result.gpu_splitting_min_count < result.gpu_count
         )
         # DAH-2594 — a CVM provider has no access to the host GPU drivers, so NCU counters are
-        # unreachable by construction; a passed attestation is that machine's capability path
+        # unreachable by construction; a verified TDX quote is that machine's capability path.
+        # The quote alone, not JobResult.tdx_attestation_passed: that flag also drops on a failed
+        # GPU-CC verdict, which is observe-only today, so a CVM submitting failing GPU evidence
+        # would earn less than one submitting none. Bad GPU evidence is the GPU-attestation
+        # enforcement flag's job; once it is on, evidence is mandatory and no digest reaches here.
+        attested_cvm: bool = result.attestation_digest is not None
         if (
             ncu_profiling_access == NCU_PROFILING_UNRESTRICTED
             or has_real_splitting
-            or result.tdx_attestation_passed
+            or attested_cvm
         ):
             return None
         return MissingFlagshipCapability(
@@ -367,8 +372,8 @@ class RentalPriceIncentive(DefaultIncentive):
                     "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
                     "supports_gpu_splitting": result.supports_gpu_splitting,
                     "gpu_splitting_min_count": result.gpu_splitting_min_count,
-                    # separates a self-declared CVM whose attestation did not pass from an
-                    # ordinary host; tdx_attestation_passed is False on every line emitted here
+                    # separates a self-declared CVM whose TDX quote did not verify from an
+                    # ordinary host; attestation_digest is None on every line emitted here
                     "tdx_quote_present": bool(result.executor_info.tdx_quote),
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,

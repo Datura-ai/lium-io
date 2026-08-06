@@ -2,7 +2,7 @@
 
 An unrented 8x H200/B200/B300 executor that has none of NCU profiling counters
 open on the host (ncu_profiling_access == "unrestricted"), real GPU splitting
-enabled (min_gpu_count below the full node size), or a passed TDX attestation
+enabled (min_gpu_count below the full node size), or a verified TDX quote
 forfeits the unrented rental incentive while staying active. Enforcement is gated by
 ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT; while the flag is off the breach is
 only logged (shadow mode) and the payout is unchanged.
@@ -27,6 +27,9 @@ H100 = "NVIDIA H100 80GB HBM3"
 # a scrape carrying no NCU observation at all: a machine not re-scraped since DAH-2182 shipped
 SCRAPE_WITHOUT_NCU: dict[str, str] = {}
 
+# what prepare_host_policy returns for a verified TDX quote: os_image_hash + compose_hash
+ATTESTATION_DIGEST = "0f1e2d:9a8b7c"
+
 
 def _build_incentive() -> RentalPriceIncentive:
     return RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
@@ -41,7 +44,8 @@ def _make_job(
     supports_gpu_splitting: bool = False,
     gpu_splitting_min_count: int | None = None,
     is_rented: bool = False,
-    tdx_attestation_passed: bool = False,
+    attestation_digest: str | None = None,
+    gpu_attestation_passed: bool | None = None,
     tdx_quote: str | None = None,
 ) -> JobResult:
     return JobResult(
@@ -66,7 +70,8 @@ def _make_job(
         gpu_count=gpu_count,
         is_rented=is_rented,
         supports_gpu_splitting=supports_gpu_splitting,
-        tdx_attestation_passed=tdx_attestation_passed,
+        attestation_digest=attestation_digest,
+        gpu_attestation_passed=gpu_attestation_passed,
         gpu_splitting_min_count=gpu_splitting_min_count,
         collateral_deposited=True,
         sysbox_runtime=True,
@@ -91,8 +96,11 @@ def _make_job(
         ({"gpu_model": B300, "supports_gpu_splitting": True, "gpu_splitting_min_count": 1}, False),
         ({"gpu_model": H100}, False),  # not a flagship model
         ({"gpu_count": 4}, False),  # only full 8x nodes are gated
-        ({"tdx_attestation_passed": True}, False),
-        ({"gpu_model": B200, "tdx_attestation_passed": True}, False),
+        ({"attestation_digest": ATTESTATION_DIGEST}, False),
+        ({"gpu_model": B200, "attestation_digest": ATTESTATION_DIGEST}, False),
+        # a CVM whose GPU-CC evidence verified bad still counts: GPU attestation is a separate
+        # (observe-only) lever, and withholding evidence must never pay more than submitting it
+        ({"attestation_digest": ATTESTATION_DIGEST, "gpu_attestation_passed": False}, False),
     ],
 )
 def test_missing_flagship_capability(job_kwargs, is_missing):
@@ -164,15 +172,15 @@ async def test_shadow_mode_emits_the_capability_log(monkeypatch, caplog):
 
 @pytest.mark.asyncio
 async def test_self_declared_cvm_is_still_excluded(monkeypatch, caplog):
-    # A machine that submitted a quote but whose attestation did not pass still fails the
-    # gate; the log has to separate it from an ordinary host, since tdx_attestation_passed
-    # is False on every line this gate emits.
+    # A machine that submitted a quote the validator did not verify still fails the gate; the
+    # log has to separate it from an ordinary host, since attestation_digest is None on every
+    # line this gate emits.
     monkeypatch.setattr(settings, "ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", True)
     incentive = _build_incentive()
 
     with caplog.at_level(logging.INFO):
         result = await incentive.calculate_executor_score(
-            _make_job(tdx_quote='{"quote": "..."}', tdx_attestation_passed=False)
+            _make_job(tdx_quote='{"quote": "..."}', attestation_digest=None)
         )
 
     breach = next(
@@ -227,7 +235,7 @@ async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
         # path every cycle; the gate must fail open on those (DAH-2520 precedent)
         ({"spec": None}, True),
         # DAH-2594 — an attested CVM cannot open host NCU counters, attestation is its path
-        ({"tdx_attestation_passed": True}, True),
+        ({"attestation_digest": ATTESTATION_DIGEST}, True),
     ],
 )
 @pytest.mark.asyncio
