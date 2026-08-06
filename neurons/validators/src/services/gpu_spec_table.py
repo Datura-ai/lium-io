@@ -106,6 +106,7 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     # Ampere data-center
     "NVIDIA A100 80GB PCIe":                              [81920],         # 80 GB; observed: 81920
     "NVIDIA A100-SXM4-80GB":                              [81920],         # 80 GB; observed: 81920
+    "NVIDIA A800 80GB PCIe":                              [81920],         # 80 GB; Vast offers report 81920
     "NVIDIA A10 Tensor Core GPU":                         [24576],         # 24 GB
     # Ampere pro
     "NVIDIA RTX A6000":                                   [49152],         # 48 GB; observed: 49140

@@ -269,6 +269,7 @@ _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA L40": [(44237, 51610)],
     "NVIDIA A100 80GB PCIe": [(73728, 86016)],
     "NVIDIA A100-SXM4-80GB": [(73728, 86016)],
+    "NVIDIA A800 80GB PCIe": [(73728, 86016)],
     "NVIDIA A10 Tensor Core GPU": [(22118, 25805)],
     "NVIDIA RTX A6000": [(44237, 51610)],
     "NVIDIA RTX A5000": [(22118, 25805)],
