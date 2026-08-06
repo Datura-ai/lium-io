@@ -112,7 +112,7 @@ class ContainerRunSpec:
     runtime: str | None = None
     cap_add: tuple[str, ...] = ()
     sysctls: dict[str, str] = field(default_factory=dict)
-    ulimits: tuple["ContainerUlimit", ...] = ()
+    ulimits: tuple[ContainerUlimit, ...] = ()
     devices: tuple[DeviceMount, ...] = ()
     device_requests: tuple[GpuDeviceRequest, ...] = ()
     cpu_count: int | None = None

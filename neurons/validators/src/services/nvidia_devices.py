@@ -211,10 +211,15 @@ async def _query_shared_nodes(
     that also carries `issm*`, the subnet-manager interface, and `umad*`, raw MAD access. A renter
     holding `issm` can interfere with the fabric every other tenant on it depends on (DAH-2571).
     """
-    cmd = (
-        "for p in /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
+    globs = (
+        "/dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
         "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
-        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*; do "
+        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
+    )
+    if is_whole_host_rental:
+        globs += " /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
+    cmd = (
+        f"for p in {globs}; do "
         '[ -e "$p" ] && printf "%s\\n" "$p"; '
         "done"
     )
@@ -222,11 +227,6 @@ async def _query_shared_nodes(
         cmd += (
             "; find /dev/nvidia-caps /dev/nvidia-caps-imex-channels "
             "-mindepth 1 -maxdepth 1 -print 2>/dev/null || true"
-        )
-        cmd += (
-            "; for p in /dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm; do "
-            '[ -e "$p" ] && printf "%s\\n" "$p"; '
-            "done"
         )
     res = await ssh.run(cmd)
     return _stdout_lines(res.stdout)
