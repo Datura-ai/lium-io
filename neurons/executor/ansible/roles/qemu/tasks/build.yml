@@ -52,29 +52,43 @@
   changed_when: false
   failed_when: false
 
+- name: Decide whether a build has to be started
+  ansible.builtin.set_fact:
+    lium_qemu_start_build: >-
+      {{
+        lium_qemu_unit_state.results
+        | map(attribute='status.ActiveState', default='inactive')
+        | select('equalto', 'active')
+        | list | length == 0
+      }}
+
+# Before the unit starts, and only when we are the ones starting it. The wait
+# below matches a regex in this file, so a QEMU_BUILD_DONE_OK left by an earlier
+# build would satisfy it the instant it opened — reporting success for a build
+# that has not begun. A build already running keeps its log.
+- name: Clear the previous build log
+  ansible.builtin.file:
+    path: "{{ lium_log_dir }}/qemu-build.log"
+    state: absent
+  when: lium_qemu_start_build | bool
+
 - name: Start the build under systemd-run
   ansible.builtin.command:
     cmd: "{{ lium_qemu_systemd_run_cmd }}"
   register: lium_qemu_build_start
   changed_when: true
-  when: >-
-    lium_qemu_unit_state.results
-    | map(attribute='status.ActiveState', default='inactive')
-    | select('equalto', 'active')
-    | list | length == 0
+  when: lium_qemu_start_build | bool
 
 # The marker, not the unit's state. A unit that exited because HOME was unset is
 # "inactive" and looks finished; only QEMU_BUILD_DONE_OK means the build
 # actually completed.
+#
+# The script redirects its own output into this file — see build-qemu.sh.j2.
+# systemd-run does not, and neither does the command in commands.yml, so
+# without that redirect there is no file here and this waits out the full
+# timeout after a build that succeeded.
 - name: Wait for the build to finish
   ansible.builtin.wait_for:
     path: "{{ lium_log_dir }}/qemu-build.log"
     search_regex: QEMU_BUILD_DONE_OK
     timeout: 3600
-
-- name: Record the installed binary's fingerprint
-  ansible.builtin.shell:
-    cmd: >-
-      sha256sum {{ lium_qemu_prefix }}/bin/qemu-system-x86_64
-      | cut -d' ' -f1 > {{ lium_state_dir }}/qemu.sha256
-  changed_when: true

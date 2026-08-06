@@ -20,6 +20,23 @@ REPO="{{ lium_qemu_repo }}"
 
 mkdir -p "$LOG_DIR" "$(dirname "$BUILD_ROOT")"
 
+# The script owns its own log, because the role waits for QEMU_BUILD_DONE_OK to
+# appear in this exact file. Under systemd-run there is no shell to redirect for
+# us and the unit line carries no redirection, so without this the file is never
+# created and the role waits out its full 3600 s timeout AFTER a build that
+# succeeded.
+#
+# A plain redirect, not `tee` through a process substitution: the marker is a
+# contract, and output written through a background tee can still be in flight
+# when the script exits. The journal loses the build output as a result, which
+# is the right trade — the log file is what the role, the CI job and the
+# provider all read.
+#
+# Keeping the redirect here rather than in the caller is also what lets the CI
+# compile job run this script unmodified, so it exercises the real artifact
+# instead of a copy with the missing piece supplied by hand.
+exec >"$LOG_DIR/qemu-build.log" 2>&1
+
 # HOME is what makes this script worth its own file. systemd-run starts with a
 # minimal environment in which HOME is UNSET, so `set -u` plus any use of $HOME
 # dies instantly while the unit goes inactive within seconds and looks

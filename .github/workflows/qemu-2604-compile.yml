@@ -68,13 +68,20 @@ jobs:
       # HOME is exported explicitly here for the same reason the systemd-run line
       # carries --setenv=HOME= — the script refuses to run without it, and that
       # refusal is itself worth exercising.
+      #
+      # No `tee` and no redirection here, deliberately. The script writes
+      # /var/log/lium-cvm/qemu-build.log itself, and the role waits on that
+      # file — supplying it from the caller is what let a missing redirect go
+      # unnoticed while this job stayed green. The log is printed by the step
+      # below so a failure is still readable.
       - name: Compile
         env:
           HOME: /root
-        run: |
-          mkdir -p /var/log/lium-cvm
-          set -o pipefail
-          bash /tmp/lium-rendered/build-qemu.sh 2>&1 | tee /var/log/lium-cvm/qemu-build.log
+        run: bash /tmp/lium-rendered/build-qemu.sh
+
+      - name: Show the build log
+        if: always()
+        run: cat /var/log/lium-cvm/qemu-build.log
 
       # The marker, not the exit code. A build that died early can still leave a
       # unit looking "finished".
