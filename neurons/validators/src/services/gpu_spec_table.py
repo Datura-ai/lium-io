@@ -92,7 +92,10 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     "NVIDIA GeForce RTX 4060 Ti":                         [8192, 16384],   # 8/16 GB multi-variant
     "NVIDIA GeForce RTX 4060":                            [8192],          # 8 GB
     # Blackwell pro / Ada pro / Quadro-class
+    "NVIDIA RTX PRO 2000 Blackwell":                      [16384],         # 16 GB; observed: 16311
     "NVIDIA RTX PRO 4000 Blackwell":                      [24576],         # 24 GB
+    "NVIDIA RTX PRO 4500 Blackwell":                      [32768],         # 32 GB
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition":       [32768],         # 32 GB
     "NVIDIA RTX PRO 5000 Blackwell":                      [49152, 73728],  # 48/72 GB multi-variant
     "NVIDIA RTX PRO 6000 Blackwell Server Edition":       [98304],         # 96 GB; observed: 97887
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition":  [98304],         # 96 GB; observed: 97887
@@ -107,6 +110,9 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     "NVIDIA A100 80GB PCIe":                              [81920],         # 80 GB; observed: 81920
     "NVIDIA A100-SXM4-80GB":                              [81920],         # 80 GB; observed: 81920
     "NVIDIA A10 Tensor Core GPU":                         [24576],         # 24 GB
+    # Factory size only. The community unlock exposes 40/64 GB; those readings must
+    # fail precheck, so no size is listed for them.
+    "NVIDIA CMP 170HX":                                   [8192],          # 8 GB
     # Ampere pro
     "NVIDIA RTX A6000":                                   [49152],         # 48 GB; observed: 49140
     "NVIDIA RTX A5000":                                   [24576],         # 24 GB; observed: 24564

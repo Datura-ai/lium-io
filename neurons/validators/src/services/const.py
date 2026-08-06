@@ -30,7 +30,10 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
+    "NVIDIA RTX PRO 2000 Blackwell": 0.0,
     "NVIDIA RTX PRO 4000 Blackwell": 0.0,
+    "NVIDIA RTX PRO 4500 Blackwell": 0.0,
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": 0.0,
     "NVIDIA RTX PRO 5000 Blackwell": 0.0,
     "NVIDIA RTX 5000 Ada Generation": 0.0,
     "NVIDIA RTX 5880 Ada Generation": 0.0,
@@ -41,6 +44,9 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     "NVIDIA A100-SXM4-80GB": 0.05,
+    # GA100 mining SKU, factory configuration only: 8 GB HBM2e. Cards running the
+    # community VRAM unlock report 40/64 GB and are rejected by the VRAM precheck.
+    "NVIDIA CMP 170HX": 0.0,
     "NVIDIA A10 Tensor Core GPU": 0.0,
     "NVIDIA RTX A6000": 0.009,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.025, # 2.5x 6000 ada
