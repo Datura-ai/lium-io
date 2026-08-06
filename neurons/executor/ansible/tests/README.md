@@ -166,6 +166,11 @@ real host that already has a CVM.
 | `lspci/empty.txt` | no CC-capable device |
 | _built at run time_ | an `hda.img` with **no processes** — the case a process-only guard waves through |
 | _built at run time_ | an `hda.img` **and** someone else's QEMU — the case that is not a partition |
+| `guard/unreadable_root` | exists but cannot be read → `UNKNOWN` |
+| `guard/clean_root` | nothing at all |
+| `manifest/field6_17950.bin` | the body Intel accepts |
+| `manifest/field6_17954.bin` | the version-prefixed blob Intel answers with a 400 |
+| `verify-report.example.json` | a healthy reference host — doubles as documentation |
 
 The two `hda.img` fixtures are created by the tests, never committed. A tracked
 file matching `*/run/vms/*/hda.img` is indistinguishable from a renter's
@@ -174,11 +179,6 @@ search root: a host that had never created a CVM then read as `DORMANT`, every
 destructive role refused, and the recovery text told the operator to `rm -rf`
 this repository's own test data. `tests/test_guard.sh` asserts that nothing
 tracked matches that glob.
-| `guard/unreadable_root` | exists but cannot be read → `UNKNOWN` |
-| `guard/clean_root` | nothing at all |
-| `manifest/field6_17950.bin` | the body Intel accepts |
-| `manifest/field6_17954.bin` | the version-prefixed blob Intel answers with a 400 |
-| `verify-report.example.json` | a healthy reference host — doubles as documentation |
 
 `guard/unreadable_root` is chmod-ed to 000 by the test and restored in a trap.
 **Running as root skips that one case**, because root bypasses file permissions
