@@ -44,8 +44,8 @@ GPU_MODEL_RATES = {
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
     "NVIDIA A100-SXM4-80GB": 0.05,
-    # GA100 mining SKU, factory configuration only: 8 GB HBM2e. Cards running the
-    # community VRAM unlock report 40/64 GB and are rejected by the VRAM precheck.
+    # GA100 mining SKU: 8 GB HBM2e from the factory, 40/64 GB with the community
+    # driver unlock. All three sizes accepted; no unrented-pool weight.
     "NVIDIA CMP 170HX": 0.0,
     "NVIDIA A10 Tensor Core GPU": 0.0,
     "NVIDIA RTX A6000": 0.009,
