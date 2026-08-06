@@ -19,7 +19,7 @@ STATE_FILE="${STATE_DIR}/resume.state"
 [ -r "$STATE_FILE" ] || { printf 'lium-cvm-resume: no state file, nothing to do\n'; exit 0; }
 
 json_str() {
-  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$STATE_FILE" | head -1
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p;T;q" "$STATE_FILE"
 }
 
 BOOTSTRAP="$(json_str bootstrap_path)"

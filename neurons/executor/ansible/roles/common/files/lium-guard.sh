@@ -49,9 +49,21 @@ DSTACKTEE_SUBPATH="neurons/executor/dstacktee"
 # CLEAN verdict on a host holding a renter's encrypted disk.
 FIND_MAXDEPTH=12
 
+# Per-root ceiling. An unbounded find under a failing disk hangs the guard, and
+# a guard that never answers is a guard that never blocks. A root that times out
+# is recorded UNREADABLE, which the ladder below turns into UNKNOWN.
+FIND_TIMEOUT_SEC="${LIUM_FIND_TIMEOUT_SEC:-120}"
+
 SEARCH_ROOTS="${LIUM_HDA_SEARCH_ROOTS:-$DEFAULT_SEARCH_ROOTS}"
 REPO_PATH="${LIUM_REPO_PATH:-$DEFAULT_REPO_PATH}"
 PROC_ROOT="${LIUM_PROC_ROOT:-/proc}"
+
+# Test seam, exactly like LIUM_PROC_ROOT. Point it at a hand-written mounts file
+# to drive the per-filesystem sweep below over fixtures, or at /dev/null to
+# switch the sweep off and sandbox a case to its declared roots. The playbook
+# never sets it.
+MOUNTS_PATH="${LIUM_MOUNTS_PATH:-/proc/mounts}"
+
 MODE="json"
 
 usage() {
@@ -115,16 +127,23 @@ collect_hda_under() {
   # A root that does NOT exist is omitted, not recorded. A fresh host before the
   # clone has no repo path at all, and that must never read as a permissions
   # failure — it is the normal first-run shape.
-  local root="$1" stderr_file found
+  #
+  # Any arguments after the root are passed straight to find, which is how the
+  # per-filesystem sweep below adds -xdev.
+  local root="$1"; shift
+  local stderr_file found rc=0
   [ -e "$root" ] || return 0
 
   stderr_file="$(mktemp)"
-  found="$(find "$root" -maxdepth "$FIND_MAXDEPTH" -path '*/run/vms/*/hda.img' \
-             -type f -print 2>"$stderr_file" || true)"
+  found="$(timeout "$FIND_TIMEOUT_SEC" \
+             find "$root" -maxdepth "$FIND_MAXDEPTH" "$@" \
+             -path '*/run/vms/*/hda.img' -type f -print 2>"$stderr_file")" || rc=$?
 
-  # Anything on find's stderr means part of the tree could not be traversed.
+  # Anything on find's stderr means part of the tree could not be traversed, and
+  # a non-zero exit covers the case stderr does not: timeout's 124, where find
+  # was killed mid-walk and its silence means nothing.
   # Fail closed: an unreadable root becomes UNKNOWN, which blocks.
-  if [ -s "$stderr_file" ]; then
+  if [ "$rc" -ne 0 ] || [ -s "$stderr_file" ]; then
     ROOTS_UNREADABLE+=("$root")
   fi
   rm -f "$stderr_file"
@@ -152,6 +171,52 @@ IFS=',' read -r -a _roots <<<"$SEARCH_ROOTS"
 for _root in "${_roots[@]}"; do
   [ -n "$_root" ] && collect_hda_under "$_root"
 done
+
+# --- fact 1b: every locally mounted filesystem --------------------------------
+# The static roots are the CONVENTIONAL locations, and conventions are not where
+# hosts actually are. A production host with its checkout on a data volume put a
+# 388 GB renter disk at /data0/lium-io/…/hda.img — outside all three roots, and
+# outside REPO_PATH and LOCAL_CHECKOUT too on the day-zero shape, where the
+# operator bootstraps a FRESH clone at /opt/lium-io. Stop the CVM and there is no
+# process to fall back on either, so all five sources miss and the answer is
+# CLEAN. CLEAN is precisely the verdict that authorises rebuilding QEMU, and
+# rebuilding QEMU makes that disk permanently undecryptable.
+#
+# Raising FIND_MAXDEPTH fixed how DEEP the search goes. This fixes WHERE it
+# starts. Each filesystem is swept once with -xdev, so the union is complete and
+# nothing is walked twice — measured at 2.2 s for / plus 0.03 s for a 14 TB data
+# volume, once per bootstrap.
+#
+# The type list is a DENY list. An unrecognised filesystem gets searched,
+# because failing to find a disk yields CLEAN and destroys data, while searching
+# something exotic only costs time and is bounded by FIND_TIMEOUT_SEC. The three
+# categories denied are ones where searching is never right: kernel pseudo
+# filesystems hold no files; overlay and squashfs are container image layers,
+# never a QEMU data disk; and network mounts hang on `[ -e ]` itself when the
+# server is gone — before any timeout can bound them — while a multi-hundred-GB
+# raw image that QEMU does direct I/O against is never on one.
+DENY_FS_TYPES="proc sysfs devtmpfs devpts tmpfs ramfs cgroup cgroup2 securityfs
+pstore efivarfs bpf tracefs debugfs configfs fusectl mqueue hugetlbfs
+binfmt_misc autofs nsfs rpc_pipefs selinuxfs overlay squashfs vfat
+nfs nfs4 cifs smb3 smbfs ceph glusterfs afs 9p fuse.sshfs fuse.s3fs"
+
+MOUNT_ROOTS=()
+if [ -r "$MOUNTS_PATH" ]; then
+  while read -r _dev _mnt _fstype _rest; do
+    [ -n "${_mnt:-}" ] || continue
+    case " $DENY_FS_TYPES " in *" $_fstype "*) continue ;; esac
+    # /proc/mounts octal-escapes spaces and tabs in mount points.
+    _mnt="$(printf '%b' "$_mnt")"
+    MOUNT_ROOTS+=("$_mnt")
+  done < "$MOUNTS_PATH"
+fi
+
+if [ "${#MOUNT_ROOTS[@]}" -gt 0 ]; then
+  mapfile -t MOUNT_ROOTS < <(printf '%s\n' "${MOUNT_ROOTS[@]}" | sort -u)
+  for _mroot in "${MOUNT_ROOTS[@]}"; do
+    collect_hda_under "$_mroot" -xdev
+  done
+fi
 
 # De-duplicate: the repo path may itself sit under one of the search roots.
 if [ "${#HDA_IMAGES[@]}" -gt 0 ]; then
@@ -342,6 +407,7 @@ procs_json="${procs_json}]"
 hda_json="$(json_array_of_strings ${HDA_IMAGES[@]+"${HDA_IMAGES[@]}"})"
 unreadable_json="$(json_array_of_strings ${ROOTS_UNREADABLE[@]+"${ROOTS_UNREADABLE[@]}"})"
 roots_json="$(json_array_of_strings ${_roots[@]+"${_roots[@]}"})"
+mount_roots_json="$(json_array_of_strings ${MOUNT_ROOTS[@]+"${MOUNT_ROOTS[@]}"})"
 
 cat <<JSON
 {
@@ -352,6 +418,7 @@ cat <<JSON
   "procs": ${procs_json},
   "roots_unreadable": ${unreadable_json},
   "search_roots": ${roots_json},
+  "mount_roots": ${mount_roots_json},
   "repo_path": "$(json_escape "$REPO_PATH")",
   "tmux_lium_cvm": ${TMUX_LIUM_CVM},
   "mem_used_gb": ${MEM_USED_GB},

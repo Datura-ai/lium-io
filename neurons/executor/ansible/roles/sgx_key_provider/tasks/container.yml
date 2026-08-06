@@ -44,6 +44,12 @@
   retries: 30
   delay: 5
   failed_when: false
+  # Check mode skips the `docker compose up` above, so there is nothing to wait
+  # for — and a skipped command returns no stdout, so `until` can never be
+  # satisfied. `failed_when: false` does not rescue it: retry exhaustion is
+  # reported as a task failure in its own right. Observed as 30 attempts, 150
+  # seconds of delay, and then a dead run that never reached verify.
+  when: not ansible_check_mode
 
 # All three conditions together, because any one alone can look healthy:
 # a container can be running while its enclave crash-loops, and a restart count
@@ -62,4 +68,8 @@
       the MPA registration log, which reports success on broken hosts too.
     success_msg: "Key provider running in PRODUCTION mode with no enclave errors."
     quiet: true
-  when: lium_assert_key_provider | bool
+  when:
+    - lium_assert_key_provider | bool
+    # Check mode never started the container, so lium_kp_logs carries no stdout
+    # and this would fail every check run on every host, healthy or not.
+    - not ansible_check_mode

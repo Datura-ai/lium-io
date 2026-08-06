@@ -21,6 +21,8 @@
     lium_repo_path: /tmp/lium-kernel-idem/no-such-repo
     lium_lspci_output: "{{ playbook_dir }}/fixtures/lspci/h200_8gpu_4nvswitch.txt"
     lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    # No sweep: this case declares its own search surface.
+    lium_mounts_path: /dev/null
 
     # Pinned inside the work tree for the same reason as test_grub_fixtures.yml:
     # unset, the play-level `common` role reads the real host's /etc/default/grub

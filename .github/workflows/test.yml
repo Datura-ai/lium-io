@@ -165,6 +165,12 @@ jobs:
       - name: Destructive-action guard
         run: bash tests/test_guard.sh
 
+      # Repeated deliberately. The defect it guards is a race, so a single run
+      # of the collector passed while roughly a quarter of runs on real hardware
+      # derived the wrong vfio-pci.ids= value.
+      - name: Fact collector is deterministic
+        run: bash tests/test_facts_determinism.sh
+
       - name: Reboot resume guard
         run: bash tests/test_resume_guard.sh
 

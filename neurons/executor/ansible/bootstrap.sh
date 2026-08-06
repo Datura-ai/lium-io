@@ -22,7 +22,19 @@ GUARD="${SCRIPT_DIR}/roles/common/files/lium-guard.sh"
 
 LIUM_STATE_DIR=/var/lib/lium-cvm
 LIUM_LOG_DIR=/var/log/lium-cvm
-LOCK_FILE="${LIUM_STATE_DIR}/bootstrap.lock"
+# The lock is taken on the state DIRECTORY, not on a file inside it.
+#
+# Section 4 creates that directory root-owned 0755 — but `exec 9>` is performed
+# by the shell itself, with the CALLER's privileges, never sudo's. A lock FILE
+# inside a root-owned directory is therefore unopenable for write by exactly the
+# non-root provider this script exists to support, and the run dies at the
+# redirection, before section 6, with a bare "Permission denied".
+#
+# Opening a DIRECTORY read-only succeeds for anyone who can traverse it, and
+# flock(2) places its lock on the inode regardless of the fd's access mode. So
+# `exec 9<` on the state dir locks identically for root and for a sudo-capable
+# user, with no file to create, chown, or leave behind.
+LOCK_DIR="$LIUM_STATE_DIR"
 
 # The exit code a preflight aggregate failure produces. CI reads this through
 # --print-expected-preflight-rc rather than hardcoding it, so a change here moves
@@ -155,14 +167,14 @@ fi
 #
 # The `attempts` increment stays in lium-resume-guard.sh, before ExecStart. That
 # placement is what makes exactly-once crash-safe; do not move it here.
-exec 9>"$LOCK_FILE"
+exec 9<"$LOCK_DIR"
 if [ "$RESUME" -eq 1 ]; then
   if ! flock -w 120 9; then
     die "another bootstrap held the lock for over 120s; this host is already being converged"
   fi
 else
   if ! flock -n 9; then
-    die "another bootstrap is already running (lock: ${LOCK_FILE})"
+    die "another bootstrap is already running (lock: ${LOCK_DIR})"
   fi
 fi
 
@@ -175,7 +187,9 @@ APT=("${SUDO[@]}" apt-get -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Opt
 
 install_ansible() {
   if command -v ansible-playbook >/dev/null 2>&1; then
-    ok "ansible-core present: $(ansible-playbook --version | head -1)"
+    local banner
+    banner="$(ansible-playbook --version)"
+    ok "ansible-core present: ${banner%%$'\n'*}"
     return 0
   fi
   log "Installing ansible-core, git, curl, ca-certificates"
@@ -197,11 +211,23 @@ command -v ansible-playbook >/dev/null 2>&1 \
 # Collections are deliberately NOT installed: this tree needs none. If that ever
 # changes it needs a collections/requirements.yml installed with
 # `ansible-galaxy collection install -r` HERE and in CI — pip cannot install them.
-CORE_VERSION="$(ansible-playbook --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+#
+# Parsed with bash's own regex rather than `... | head -1 | grep -oE ... | head -1`.
+# `head` exits after one line, the producer takes SIGPIPE, and `set -o pipefail`
+# reports that 141 — which under `set -e` aborts the script at an ASSIGNMENT,
+# before the emptiness check below ever runs. `|| true` is not available here:
+# swallowing a status in the entry point is exactly what the forbidden-pattern
+# list bans, because this script's exit code is a contract.
+CORE_VERSION=""
+if [[ "$(ansible-playbook --version)" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+  CORE_VERSION="${BASH_REMATCH[1]}"
+fi
 if [ -z "$CORE_VERSION" ]; then
   die "cannot determine the installed ansible-core version"
 fi
-CORE_OK="$(printf '%s\n%s\n' "$MIN_ANSIBLE_CORE" "$CORE_VERSION" | sort -V | head -1)"
+# sort -V with no early-exiting reader, then the first line by expansion.
+CORE_OK="$(printf '%s\n%s\n' "$MIN_ANSIBLE_CORE" "$CORE_VERSION" | sort -V)"
+CORE_OK="${CORE_OK%%$'\n'*}"
 if [ "$CORE_OK" != "$MIN_ANSIBLE_CORE" ]; then
   die "ansible-core ${CORE_VERSION} is older than the required ${MIN_ANSIBLE_CORE}.
     This playbook uses 'meta: end_role', which does not exist before 2.18. An older
@@ -352,6 +378,14 @@ for check in report.get("checks", []):
         print("      fix: {remediation}".format(**check))
 PYSUM
   fi
+elif [ "$CHECK_MODE" -eq 1 ]; then
+  # Check mode writes no files, so the absence of the report says nothing about
+  # whether verify ran. It usually did — the summary is in the output above,
+  # and the report content appears there as a diff. Claiming the run "did not
+  # reach the verify role" here is simply false, and it sends an operator
+  # hunting for a failure that did not happen.
+  warn "No verify report written: --check makes no changes, including to ${REPORT}."
+  warn "The verify summary above is still the real reading of this host."
 else
   warn "No verify report at ${REPORT} — the run did not reach the verify role."
 fi

@@ -149,6 +149,11 @@ lium_grubcfg_path: /boot/grub/grub.cfg
 lium_boot_id_path: /proc/sys/kernel/random/boot_id
 lium_proc_root: /proc
 lium_lspci_output: ""
+# The guard sweeps every locally mounted filesystem for a CVM data disk, because
+# the static roots above are conventions and a real host kept its checkout — and
+# a renter's 388 GB disk — on a data volume outside all of them. A fixture points
+# this at a hand-written mounts file, or at /dev/null to switch the sweep off.
+lium_mounts_path: /proc/mounts
 
 # Test seams. Every variable below is refused unless BOTH lium_test_mode is true
 # AND the environment variable ANSIBLE_LIUM_TEST is 1. Documented in
@@ -171,6 +176,7 @@ lium_seam_defaults:
   lium_boot_id_path: /proc/sys/kernel/random/boot_id
   lium_hda_search_roots: ["/home", "/opt", "/srv"]
   lium_state_dir: /var/lib/lium-cvm
+  lium_mounts_path: /proc/mounts
 
 # cvmd / catalog variable interfaces. Unset => the stub says what it is waiting
 # on. Set => the stub asserts its companions then fails "not implemented".

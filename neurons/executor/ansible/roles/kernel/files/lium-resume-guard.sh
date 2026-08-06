@@ -40,10 +40,10 @@ refuse() {
 # so these extractions need no JSON parser and therefore no dependency on a
 # host that has not finished being provisioned.
 json_str() {
-  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$STATE_FILE" | head -1
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p;T;q" "$STATE_FILE"
 }
 json_num() {
-  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$STATE_FILE" | head -1
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p;T;q" "$STATE_FILE"
 }
 
 ARMED_BOOT_ID="$(json_str armed_boot_id)"

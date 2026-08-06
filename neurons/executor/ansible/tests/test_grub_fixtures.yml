@@ -23,6 +23,8 @@
     lium_repo_path: /tmp/lium-grub-fixture/no-such-repo
     lium_lspci_output: "{{ playbook_dir }}/fixtures/lspci/h200_8gpu_4nvswitch.txt"
     lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    # No sweep: this case declares its own search surface.
+    lium_mounts_path: /dev/null
 
     # The play-level `common` role collects facts BEFORE any case runs, and each
     # case overrides these per fixture. Left unset they default to /etc/default/grub

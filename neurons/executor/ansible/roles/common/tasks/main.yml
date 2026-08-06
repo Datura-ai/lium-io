@@ -63,6 +63,7 @@
     LIUM_HDA_SEARCH_ROOTS: "{{ lium_hda_search_roots | join(',') }}"
     LIUM_REPO_PATH: "{{ lium_repo_path }}"
     LIUM_PROC_ROOT: "{{ lium_proc_root }}"
+    LIUM_MOUNTS_PATH: "{{ lium_mounts_path }}"
   register: lium_guard_raw
   changed_when: false
   check_mode: false

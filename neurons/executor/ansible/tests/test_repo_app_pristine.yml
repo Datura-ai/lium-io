@@ -19,6 +19,8 @@
     lium_log_dir: /tmp/lium-repo-fixture/log
     lium_hda_search_roots: ["/tmp/lium-repo-fixture/no-such-root"]
     lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    # No sweep: this case declares its own search surface.
+    lium_mounts_path: /dev/null
     lium_repo_path: /tmp/lium-repo-fixture/repo
     lium_repo_clone: false
 
@@ -180,6 +182,8 @@
     lium_log_dir: /tmp/lium-repo-clone-fixture/log
     lium_hda_search_roots: ["/tmp/lium-repo-clone-fixture/no-such-root"]
     lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    # No sweep: this case declares its own search surface.
+    lium_mounts_path: /dev/null
     lium_repo_path: /tmp/lium-repo-clone-fixture/repo
     lium_repo_clone: true
     lium_repo_url: /tmp/lium-repo-clone-fixture/origin
@@ -285,6 +289,8 @@
     lium_log_dir: /tmp/lium-repo-reconverge-fixture/log
     lium_hda_search_roots: ["/tmp/lium-repo-reconverge-fixture/no-such-root"]
     lium_proc_root: "{{ playbook_dir }}/fixtures/emptyproc"
+    # No sweep: this case declares its own search surface.
+    lium_mounts_path: /dev/null
     lium_repo_path: /tmp/lium-repo-reconverge-fixture/repo
     lium_repo_clone: true
     lium_repo_url: /tmp/lium-repo-reconverge-fixture/origin

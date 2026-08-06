@@ -100,6 +100,9 @@
       not {{ lium_platform_manifest_len }}. 17954 means the version+size header was
       not stripped and Intel will answer 400 InvalidPlatformManifest. Do not POST it.
     quiet: true
+  # Check mode skipped both the extract and the decode, so there is no byte
+  # count to compare against.
+  when: not ansible_check_mode
 
 - name: Read the manifest bytes
   ansible.builtin.slurp:
@@ -171,3 +174,5 @@
     success_msg: >-
       pckcache.db now holds {{ lium_pck_after.stdout | trim }} PCK certificate(s).
     quiet: true
+  # Check mode never ran the registration this is meant to confirm.
+  when: not ansible_check_mode

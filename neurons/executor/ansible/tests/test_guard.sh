@@ -18,6 +18,18 @@ FIX="$PWD/tests/fixtures/guard"
 FAILURES=0
 CASES=0
 
+# Every case below declares its own search surface and must see nothing else.
+# The guard also sweeps each locally mounted filesystem, which on a real machine
+# means the runner's own disks — so without this, every fixture case inherits
+# whatever the CI host happens to be holding and the sandbox is not a sandbox.
+# /dev/null is a mounts file with no entries. Case (c4) overrides it with a real
+# one, which is where the sweep itself is tested.
+export LIUM_MOUNTS_PATH=/dev/null
+
+# Substring tests use `case`, not `printf ... | grep -q`: grep -q exits on the
+# first match, printf takes SIGPIPE, and pipefail reports that as failure — so
+# a passing assertion intermittently reads as a FAIL. Same defect the collector
+# had, and a merge gate that fails at random is worse than one that does not run.
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n' "$1" >&2; FAILURES=$((FAILURES + 1)); }
 
@@ -44,7 +56,25 @@ make_proc() {
 
 PROC="$(mktemp -d)"
 EMPTY_PROC="$(mktemp -d)"
-trap 'rm -rf "$PROC" "$EMPTY_PROC"; chmod 755 "$FIX/unreadable_root" 2>/dev/null || printf ""' EXIT
+
+# The two "a disk exists" fixtures are BUILT HERE rather than committed.
+#
+# To the guard, a checked-in file at */run/vms/*/hda.img is indistinguishable
+# from a renter's encrypted data disk — and the playbook clones this very repo
+# to /opt/lium-io, which is inside the search roots at a depth the find reaches.
+# So a host that had never created a CVM read as DORMANT the moment the clone
+# landed: kernel, gpu and qemu blocked on every run afterwards, with recovery
+# text telling the operator to rm -rf the repo's own test data. Reproduced on a
+# production host. Nothing this tree ships may match that glob — asserted below.
+FIXTMP="$(mktemp -d)"
+DORMANT_ROOT="$FIXTMP/dormant_hda"
+FOREIGN_ROOT="$FIXTMP/hda_plus_foreign"
+for _r in "$DORMANT_ROOT" "$FOREIGN_ROOT"; do
+  mkdir -p "$_r/run/vms/demo"
+  printf 'placeholder standing in for a CVM encrypted data disk\n' >"$_r/run/vms/demo/hda.img"
+done
+
+trap 'rm -rf "$PROC" "$EMPTY_PROC" "$FIXTMP"; chmod 755 "$FIX/unreadable_root" 2>/dev/null || printf ""' EXIT
 
 printf 'test_guard.sh\n'
 
@@ -80,7 +110,7 @@ expect_state "(b2) a build whose argv mentions qemu-system does not block" CLEAN
 #     A stopped CVM: hda.img on disk, zero processes. stop_cvm() never removes
 #     the VM directory, so this is a normal, reachable, common state.
 expect_state "(c) hda.img with no processes blocks as DORMANT" DORMANT \
-  env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$FIX/dormant_hda" LIUM_REPO_PATH=/nonexistent
+  env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$DORMANT_ROOT" LIUM_REPO_PATH=/nonexistent
 
 # (c2) A checkout deeper than /opt/lium-io.
 #
@@ -127,12 +157,46 @@ CASES=$((CASES + 1))
 offrec="$(env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$EMPTY_ROOT" \
               LIUM_REPO_PATH=/nonexistent \
               "$OFFROOT/neurons/executor/ansible/roles/common/files/lium-guard.sh" --recovery)"
-if printf '%s' "$offrec" | grep -qF "$OFFROOT/neurons/executor/dstacktee/run/vms/demo"; then
+case "$offrec" in *"$OFFROOT/neurons/executor/dstacktee/run/vms/demo"*) _hit=1 ;; *) _hit=0 ;; esac
+if [ "$_hit" -eq 1 ]; then
   pass "(c3) the recovery names that checkout's own VM directory"
 else
   fail "(c3) the recovery did not name ${OFFROOT}/... — it is guessing a path"
 fi
 rm -rf "$OFFROOT" "$EMPTY_ROOT"
+
+# (c4) THE SAME /data0 SHAPE, MINUS THE SELF-LOCATION FALLBACK — which is the
+#      combination that actually happens on day zero.
+#
+#      Case (c3) survives only because the guard was run from inside the offside
+#      checkout. A provider onboarding a host does the opposite: they bootstrap a
+#      FRESH clone at /opt/lium-io while the stopped CVM's disk still sits on a
+#      data volume. Now REPO_PATH is the new clone, LOCAL_CHECKOUT is the new
+#      clone, the static roots are /home /opt /srv, and a stopped CVM leaves no
+#      process. All five sources miss, and the answer was CLEAN over a 388 GB
+#      encrypted disk — reproduced on a production host.
+#
+#      Only the per-filesystem sweep can see this. Driven through a fixture
+#      mounts file so the case is hermetic.
+VOL="$(mktemp -d)"
+mkdir -p "$VOL/lium-io/neurons/executor/dstacktee/run/vms/demo"
+: >"$VOL/lium-io/neurons/executor/dstacktee/run/vms/demo/hda.img"
+FAKE_MOUNTS="$(mktemp)"
+printf '/dev/sdb1 %s ext4 rw,relatime 0 0\n' "$VOL" >"$FAKE_MOUNTS"
+expect_state "(c4) a disk on a volume in no search root blocks via the filesystem sweep" DORMANT \
+  env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$FIX/clean_root" \
+      LIUM_REPO_PATH=/nonexistent LIUM_MOUNTS_PATH="$FAKE_MOUNTS"
+
+# (c5) The deny list is consulted, not decorative. The SAME volume, described as
+#      an overlay mount, must not be swept: container image layers never hold a
+#      QEMU data disk, and sweeping every overlay on a busy Docker host walks
+#      each image layer separately. If the type check is dropped, this case goes
+#      DORMANT and reveals it.
+printf 'overlay %s overlay rw,relatime 0 0\n' "$VOL" >"$FAKE_MOUNTS"
+expect_state "(c5) a denied filesystem type is not swept" CLEAN \
+  env LIUM_PROC_ROOT="$EMPTY_PROC" LIUM_HDA_SEARCH_ROOTS="$FIX/clean_root" \
+      LIUM_REPO_PATH=/nonexistent LIUM_MOUNTS_PATH="$FAKE_MOUNTS"
+rm -rf "$VOL" "$FAKE_MOUNTS"
 
 # (d) Unreadable vs absent. An absent root is the NORMAL fresh-host shape before
 #     the clone and must never read as a permissions failure.
@@ -166,13 +230,15 @@ fi
 rm -rf "${PROC:?}"/*
 make_proc "$PROC" 1003 "qemu-system-x86" S "/opt/dstack/dstack-v05x/run/foreign.img"
 expect_state "(e) hda + foreign QEMU classifies per the ladder" FOREIGN \
-  env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS="$FIX/hda_plus_foreign" LIUM_REPO_PATH=/nonexistent
+  env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS="$FOREIGN_ROOT" LIUM_REPO_PATH=/nonexistent
 
 CASES=$((CASES + 1))
-recovery="$(env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS="$FIX/hda_plus_foreign" \
+recovery="$(env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS="$FOREIGN_ROOT" \
                 LIUM_REPO_PATH=/nonexistent "$GUARD" --recovery)"
-if printf '%s' "$recovery" | grep -qF 'rm -rf'; then
-  if printf '%s' "$recovery" | grep -qF 'run/vms/'; then
+case "$recovery" in *"rm -rf"*) _hit_rm=1 ;; *) _hit_rm=0 ;; esac
+case "$recovery" in *"run/vms/"*) _hit_vms=1 ;; *) _hit_vms=0 ;; esac
+if [ "$_hit_rm" -eq 1 ]; then
+  if [ "$_hit_vms" -eq 1 ]; then
     pass "(e) recovery still contains the rm -rf run/vms/ step"
   else
     fail "(e) recovery has rm -rf but not run/vms/"
@@ -197,7 +263,8 @@ expect_state "(ladder) ZOMBIE outranks LIVE" ZOMBIE \
 CASES=$((CASES + 1))
 zrecovery="$(env LIUM_PROC_ROOT="$PROC" LIUM_HDA_SEARCH_ROOTS=/nonexistent \
                  LIUM_REPO_PATH=/nonexistent "$GUARD" --recovery)"
-if printf '%s' "$zrecovery" | grep -qF 'tmux kill-session'; then
+case "$zrecovery" in *"tmux kill-session"*) _hit=1 ;; *) _hit=0 ;; esac
+if [ "$_hit" -eq 1 ]; then
   pass "(ladder) a zombie contributes the tmux reaping step"
 else
   fail "(ladder) a zombie did not contribute the tmux reaping step"
@@ -214,6 +281,29 @@ if [ "$script_roots" = "$gv_roots" ]; then
   pass "search roots agree between lium-guard.sh and group_vars ($script_roots)"
 else
   fail "search roots DIVERGED: script='$script_roots' group_vars='$gv_roots'"
+fi
+
+# NOTHING THIS REPOSITORY SHIPS MAY LOOK LIKE A CVM DATA DISK.
+#
+# The playbook clones lium-io to /opt/lium-io, and /opt is a search root. A
+# tracked file at */run/vms/*/hda.img is therefore indistinguishable from a
+# renter's encrypted disk the moment the clone lands: a host that has never
+# created a CVM reads DORMANT, every destructive role refuses for good, and the
+# recovery text instructs the operator to rm -rf the repo's own test data. Two
+# such fixtures were committed and did exactly this on a production host, so
+# this is asserted against the whole repository, not just this directory.
+CASES=$((CASES + 1))
+repo_top="$(git rev-parse --show-toplevel 2>/dev/null || printf '')"
+if [ -n "$repo_top" ]; then
+  shipped="$(git -C "$repo_top" ls-files -- '*/run/vms/*/hda.img' 'run/vms/*/hda.img')"
+  if [ -z "$shipped" ]; then
+    pass "no tracked file matches the guard's data-disk glob"
+  else
+    fail "tracked files match */run/vms/*/hda.img — a fresh clone will read as DORMANT:
+$shipped"
+  fi
+else
+  printf '  SKIP no git checkout here, so the shipped-fixture invariant cannot be read\n'
 fi
 
 # A clean host, with nothing anywhere.

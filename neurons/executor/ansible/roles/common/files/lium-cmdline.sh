@@ -139,7 +139,12 @@ read_grub_vars() {
 grubcfg_linux_line() {
   local file="$1"
   [ -r "$file" ] || return 1
-  sed -n -E 's/^[[:space:]]*linux(16|efi)?[[:space:]]+//p' "$file" | head -n 1
+  # `q` inside sed, never `| head -n 1`. head exits after the first line, sed
+  # takes SIGPIPE on its next write, and `set -o pipefail` turns that 141 into
+  # the pipeline's status — so a grub.cfg with several menu entries can report
+  # failure having read the line perfectly well. Letting sed stop by itself
+  # removes the second process, and with it the race.
+  sed -n -E -e 's/^[[:space:]]*linux(16|efi)?[[:space:]]+//' -e 'T' -e 'p;q' "$file"
 }
 
 cmd_analyze() {

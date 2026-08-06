@@ -164,8 +164,16 @@ real host that already has a CVM.
 | `proc/cmdline_narrower_vfio_ids` | a device disappeared from the id list |
 | `lspci/h200_8gpu_4nvswitch.txt` | 8 GPUs, 4 NVSwitches, plus one unrelated device |
 | `lspci/empty.txt` | no CC-capable device |
-| `guard/dormant_hda` | an `hda.img` with **no processes** — the case a process-only guard waves through |
-| `guard/hda_plus_foreign` | an `hda.img` **and** someone else's QEMU — the case that is not a partition |
+| _built at run time_ | an `hda.img` with **no processes** — the case a process-only guard waves through |
+| _built at run time_ | an `hda.img` **and** someone else's QEMU — the case that is not a partition |
+
+The two `hda.img` fixtures are created by the tests, never committed. A tracked
+file matching `*/run/vms/*/hda.img` is indistinguishable from a renter's
+encrypted disk once the playbook clones this repo to `/opt/lium-io`, which is a
+search root: a host that had never created a CVM then read as `DORMANT`, every
+destructive role refused, and the recovery text told the operator to `rm -rf`
+this repository's own test data. `tests/test_guard.sh` asserts that nothing
+tracked matches that glob.
 | `guard/unreadable_root` | exists but cannot be read → `UNKNOWN` |
 | `guard/clean_root` | nothing at all |
 | `manifest/field6_17950.bin` | the body Intel accepts |

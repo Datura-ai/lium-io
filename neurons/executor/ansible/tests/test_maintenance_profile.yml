@@ -29,6 +29,7 @@
     maint_work: /tmp/lium-maint
     maint_state: /tmp/lium-maint/state
     maint_report: /tmp/lium-maint/state/verify-report.json
+    maint_dormant: /tmp/lium-maint/dormant
 
   tasks:
     - name: Start from a clean state directory
@@ -41,6 +42,22 @@
         path: "{{ playbook_dir }}/fixtures/emptyproc"
         state: directory
         mode: "0755"
+
+    # Built here, not committed. A tracked file at */run/vms/*/hda.img is
+    # indistinguishable from a renter's encrypted disk once this repo is cloned
+    # to /opt/lium-io — which is a search root — so a host that had never made a
+    # CVM read as DORMANT for good, and every destructive role refused.
+    - name: Build a DORMANT fixture — a stopped CVM's data disk on disk
+      ansible.builtin.file:
+        path: "{{ maint_dormant }}/run/vms/demo"
+        state: directory
+        mode: "0755"
+
+    - name: Place the encrypted data disk inside it
+      ansible.builtin.copy:
+        dest: "{{ maint_dormant }}/run/vms/demo/hda.img"
+        content: "placeholder standing in for a CVM encrypted data disk\n"
+        mode: "0644"
 
     # Run the REAL site.yml as a child process, exactly as bootstrap.sh would in
     # maintenance mode. Anything less would test a copy of the tag design rather
@@ -60,8 +77,9 @@
           -e lium_repo_clone=false
           -e lium_sgx_install=false
           -e lium_start_key_provider=false
-          -e '{"lium_hda_search_roots": ["{{ playbook_dir }}/fixtures/guard/dormant_hda"]}'
+          -e '{"lium_hda_search_roots": ["{{ maint_dormant }}"]}'
           -e lium_proc_root={{ playbook_dir }}/fixtures/emptyproc
+          -e lium_mounts_path=/dev/null
         chdir: "{{ playbook_dir }}/.."
       environment:
         ANSIBLE_LIUM_TEST: "1"

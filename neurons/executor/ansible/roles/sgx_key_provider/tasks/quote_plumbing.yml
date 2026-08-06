@@ -30,6 +30,9 @@
   register: lium_vsock
   changed_when: false
   failed_when: false
+  # Reading a listener list changes nothing, and check mode skips command tasks
+  # unconditionally — which would leave this register with no stdout at all.
+  check_mode: false
 
 - name: Assert the vsock listener exists
   ansible.builtin.assert:
@@ -41,7 +44,14 @@
       "vsock failure: Connection reset by peer (os error 104)".
       Check `systemctl status qgsd` and /etc/qgs.conf.
     quiet: true
-  when: lium_assert_vsock | bool
+  when:
+    - lium_assert_vsock | bool
+    # A check run never applied the `port = 4050` line above and never fired the
+    # qgsd restart, so a failure here would only describe the host as it was
+    # BEFORE the fix this very run is proposing. On a healthy host it aborted
+    # `--check` outright — killing the run before the verify report exists,
+    # which is the one artefact a report-only run is for.
+    - not ansible_check_mode
 
 # 10b. The system QPL config ships "use_secure_cert": true, which verifies the
 # PCCS TLS certificate — and a local PCCS uses a self-signed one.

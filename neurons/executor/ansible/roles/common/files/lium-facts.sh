@@ -197,19 +197,43 @@ else
   LSPCI_REASON="cannot enumerate PCI devices: lspci not found (install pciutils)"
 fi
 
+# Substring test done in the shell, NEVER as `printf ... | grep -q`.
+#
+# `grep -q` exits the instant it matches, so printf loses the rest of its write
+# to SIGPIPE and returns 141. Under `set -o pipefail` — which this script sets —
+# the PIPELINE then reports 141, so a SUCCESSFUL match reads as "not found". It
+# is a race with the scheduler, not a constant: over 30 runs on one unchanged
+# 8xH200 host this dropped an id 8 times and returned an empty list twice, while
+# `lspci -n` listed all 12 devices every time.
+#
+# That matters more here than anywhere else in this tree: present_pci_ids is what
+# `vfio-pci.ids=` is built from. A run that silently loses 10de:2335 writes a
+# GRUB line binding only the NVSwitches, and after the reboot not one of the
+# eight GPUs is available to any CVM.
+str_contains_any() {
+  local haystack="$1" _needle
+  local IFS=','
+  for _needle in $2; do
+    [ -n "$_needle" ] || continue
+    case "$haystack" in *"$_needle"*) return 0 ;; esac
+  done
+  return 1
+}
+
 if [ "$LSPCI_READABLE" = "true" ]; then
-  _gpu_re="$(printf '%s' "$CC_GPU_IDS" | tr ',' '|')"
-  _sw_re="$(printf '%s' "$NVSWITCH_IDS" | tr ',' '|')"
   while IFS= read -r _line; do
     [ -n "$_line" ] || continue
-    _bdf="$(printf '%s' "$_line" | cut -d' ' -f1)"
+    # Parameter expansion, not `| cut -f1`: this runs once per PCI device, and
+    # two forked processes per line is the whole cost of the collector on a
+    # machine with a long device list.
+    _bdf="${_line%% *}"
     case "$_bdf" in
       *:*:*) ;;                       # already domain-qualified
       *) _bdf="0000:${_bdf}" ;;       # lspci -n omits the domain
     esac
-    if printf '%s' "$_line" | grep -qE "($_sw_re)"; then
+    if str_contains_any "$_line" "$NVSWITCH_IDS"; then
       NVSWITCH_BDFS+=("$_bdf")
-    elif printf '%s' "$_line" | grep -qE "($_gpu_re)"; then
+    elif str_contains_any "$_line" "$CC_GPU_IDS"; then
       GPU_BDFS+=("$_bdf")
     else
       continue
@@ -229,7 +253,7 @@ PRESENT_IDS=()
 if [ "$LSPCI_READABLE" = "true" ]; then
   for _id in $(printf '%s,%s' "$CC_GPU_IDS" "$NVSWITCH_IDS" | tr ',' ' '); do
     [ -n "$_id" ] || continue
-    if printf '%s' "$LSPCI_TEXT" | grep -qF "$_id"; then
+    if str_contains_any "$LSPCI_TEXT" "$_id"; then
       PRESENT_IDS+=("$_id")
     fi
   done
