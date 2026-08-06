@@ -78,6 +78,7 @@ from services.gpu_power_limit import (
 )
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.nvidia_devices import build_gpu_docker_config_for_executor
+from services.rdma_fabric import attach_container_to_rdma_fabric
 from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
@@ -931,6 +932,55 @@ class DockerService:
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
         )
+
+    async def _attach_rdma_fabric_if_available(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        forwarded_devices: tuple[DeviceMount, ...],
+        default_extra: dict,
+    ) -> None:
+        """Give the container its own function on the RDMA fabric, when the host supports it.
+
+        Without this the container reaches its own cards but nothing across the wire: its only
+        address is the NAT bridge's, while the card's GID carries the host's (DAH-2602).
+
+        A failure here never fails the rental. Every precondition lives on the host — exclusive
+        RDMA namespace mode, a declared address range, a free virtual function — so an unprepared
+        host is the normal case, not an error, and the pod is still exactly what today's
+        passthrough delivers.
+        """
+        forwards_rdma = any(
+            device.path_on_host.startswith("/dev/infiniband/") for device in forwarded_devices
+        )
+        if not forwards_rdma:
+            return
+        try:
+            attachment = await attach_container_to_rdma_fabric(ssh_client, container_name)
+        except Exception:
+            logger.warning(
+                _m(
+                    "RDMA_FABRIC_ATTACH_FAILED",
+                    extra=get_extra_info({**default_extra, "container_name": container_name}),
+                ),
+                exc_info=True,
+            )
+            return
+        if attachment:
+            logger.info(
+                _m(
+                    "RDMA_FABRIC_ATTACHED",
+                    extra=get_extra_info({
+                        **default_extra,
+                        "container_name": container_name,
+                        "virtual_function_netdev": attachment.virtual_function.netdev,
+                        "virtual_function_rdma_device": attachment.virtual_function.rdma_device,
+                        "ipv4_cidr": attachment.ipv4_cidr,
+                        "vlan_id": attachment.vlan_id,
+                    }),
+                )
+            )
 
     @staticmethod
     def _memlock_ulimit_for(
@@ -4473,6 +4523,13 @@ class DockerService:
                     )
 
                     logger.info("Container creation step finished")
+
+                    await self._attach_rdma_fabric_if_available(
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        forwarded_devices=run_spec.devices,
+                        default_extra=default_extra,
+                    )
 
                     # DAH-1524: isolate the bare `docker run` (dominated by the NVIDIA
                     # --gpus prestart hook, +sysbox/storage-opt) from the post-run
