@@ -25,6 +25,7 @@ class StorageOperationFiles:
     log: PurePosixPath
     pid: PurePosixPath
     status: PurePosixPath
+    cancel: PurePosixPath
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -34,6 +35,7 @@ class StorageOperationFiles:
             log=REMOTE_OPERATION_DIRECTORY / f"{stem}.log",
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
+            cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
         )
 
 
@@ -54,6 +56,8 @@ async def start_storage_operation(
     python_path: str,
     operation_id: UUID,
     spec: Mapping[str, object],
+    *,
+    retain_terminal_artifacts: bool,
 ) -> StorageOperationFiles:
     files = StorageOperationFiles.for_operation(operation_id)
     try:
@@ -75,16 +79,31 @@ async def start_storage_operation(
 
         runner = " ".join(
             shlex.quote(item)
-            for item in [python_path, REMOTE_RUNNER_PATH, "--spec", str(files.spec)]
+            for item in [
+                python_path,
+                REMOTE_RUNNER_PATH,
+                "--spec",
+                str(files.spec),
+                "--cancel-file",
+                str(files.cancel),
+            ]
         )
+        terminal_cleanup = (
+            ""
+            if retain_terminal_artifacts
+            else f"; rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.log))}"
+        )
+        # Bootstrap callers consume the terminal files; detached online jobs
+        # remove them themselves after the runner has finished reporting.
         wrapper = (
-            f"rm -f {shlex.quote(str(files.status))}; "
+            f"rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.cancel))}; "
             f"{runner} & child=$!; "
             f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
             'wait "$child"; result=$?; '
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
-            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))}"
+            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
+            f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
         )
         launch_command = (
             f"nohup /bin/sh -c {shlex.quote(wrapper)} "
@@ -166,18 +185,56 @@ async def cancel_storage_operation(
     operation_id: UUID,
 ) -> None:
     files = StorageOperationFiles.for_operation(operation_id)
+    spec = await _read_operation_spec(ssh_client, files.spec)
     helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    cancel_path = shlex.quote(str(files.cancel))
+    pid_path = shlex.quote(str(files.pid))
+    # Let the runner terminate its Restic process and helper first. Direct
+    # process termination is only a bounded fallback for an unresponsive runner.
     command = (
-        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        f"if test -f {shlex.quote(str(files.pid))}; then "
-        f"pid=$(cat {shlex.quote(str(files.pid))}); "
+        f"touch {cancel_path}; "
+        f"if test -s {pid_path}; then "
+        f"pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
-        'kill -TERM "$pid" 2>/dev/null || true; '
+        'attempt=0; while kill -0 "$pid" 2>/dev/null && test "$attempt" -lt 100; do '
+        "sleep 0.25; attempt=$((attempt + 1)); done; "
+        'if kill -0 "$pid" 2>/dev/null; then '
+        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
+        'kill -TERM "$pid" 2>/dev/null || true; sleep 2; '
+        'if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; '
+        'attempt=0; while kill -0 "$pid" 2>/dev/null && test "$attempt" -lt 20; do '
+        "sleep 0.1; attempt=$((attempt + 1)); done; fi; "
+        "fi; "
+        'kill -0 "$pid" 2>/dev/null && exit 3 || true; '
+        "else "
+        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         "fi"
     )
     result = await ssh_client.run(command, check=False)
-    if result.exit_status not in (0, 2):
+    if result.exit_status == 2:
+        raise StorageOperationLaunchError("storage operation had an invalid process ID")
+    if result.exit_status != 0:
         raise StorageOperationLaunchError("failed to cancel storage operation")
+    if spec:
+        await _report_cancelled(operation_id, spec)
+    await _remove_operation_artifacts(ssh_client, files)
+
+
+async def _read_operation_spec(
+    ssh_client: asyncssh.SSHClientConnection,
+    spec_path: PurePosixPath,
+) -> Mapping[str, object] | None:
+    result = await ssh_client.run(
+        f"cat {shlex.quote(str(spec_path))}",
+        check=False,
+    )
+    if result.exit_status != 0:
+        return None
+    try:
+        value = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, Mapping) else None
 
 
 async def _tail_operation_log(
@@ -199,7 +256,8 @@ async def _remove_operation_artifacts(
     await ssh_client.run(
         "rm -f "
         + " ".join(
-            shlex.quote(str(path)) for path in (files.status, files.log, files.pid, files.spec)
+            shlex.quote(str(path))
+            for path in (files.status, files.log, files.pid, files.spec, files.cancel)
         ),
         check=False,
     )
@@ -210,36 +268,73 @@ async def _report_launch_failure(
     spec: Mapping[str, object],
     error: Exception,
 ) -> None:
+    await _report_operation_status(
+        operation_id,
+        spec,
+        status="FAILED",
+        stage="LAUNCH",
+        message=f"Storage runner launch failed: {type(error).__name__}: {error}",
+    )
+
+
+async def _report_cancelled(
+    operation_id: UUID,
+    spec: Mapping[str, object],
+) -> bool:
+    return await _report_operation_status(
+        operation_id,
+        spec,
+        status="CANCELLED",
+        stage="CANCELLED",
+        message="Storage operation cancelled by user",
+        attempts=3,
+    )
+
+
+async def _report_operation_status(
+    operation_id: UUID,
+    spec: Mapping[str, object],
+    *,
+    status: str,
+    stage: str,
+    message: str,
+    attempts: int = 1,
+) -> bool:
     reporter = spec.get("reporter")
     if not isinstance(reporter, Mapping):
-        return
+        return False
     api_url = reporter.get("api_url")
     auth_token = reporter.get("auth_token")
     resource = reporter.get("resource")
     if not isinstance(api_url, str) or not isinstance(auth_token, str):
-        return
+        return False
     if resource not in ("backup", "restore"):
-        return
+        return False
 
     resource_path = "backup-logs" if resource == "backup" else "restore-logs"
     url = f"{api_url.rstrip('/')}/{resource_path}/{operation_id}/progress"
-    message = f"Storage runner launch failed: {type(error).__name__}: {error}"
     payload = {
         "operation_id": str(operation_id),
         "progress": 0,
-        "status": "FAILED",
-        "stage": "LAUNCH",
+        "status": status,
+        "stage": stage,
         "error_message": message[:2000],
         "logs": [message[:2000]],
     }
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.put(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {auth_token}"},
-            ) as response:
-                await response.read()
-    except Exception:
-        return
+    for attempt in range(attempts):
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.put(
+                    url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {auth_token}"},
+                ) as response:
+                    await response.read()
+                    if getattr(response, "status", 200) < 400:
+                        return True
+        except Exception:
+            pass
+        if attempt + 1 < attempts:
+            await asyncio.sleep(2**attempt)
+    return False

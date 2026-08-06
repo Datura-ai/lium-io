@@ -87,6 +87,7 @@ class JsonEventWriter:
         output: IO[str] = sys.stdout,
         clock: Callable[[], float] = time.monotonic,
         reporter: StorageEventReporter | None = None,
+        cancellation_probe: Callable[[], bool] | None = None,
     ) -> None:
         self._operation_id = operation_id
         self._progress_interval_seconds = progress_interval_seconds
@@ -96,6 +97,7 @@ class JsonEventWriter:
         self._last_progress_at: float | None = None
         self._last_heartbeat_at = self._clock()
         self._reporter = reporter
+        self._cancellation_probe = cancellation_probe
 
     def restic_event(self, payload: Mapping[str, object]) -> None:
         message_type = payload.get("message_type")
@@ -121,7 +123,10 @@ class JsonEventWriter:
 
     @property
     def cancellation_requested(self) -> bool:
-        return bool(self._reporter and self._reporter.cancel_requested)
+        return bool(
+            (self._reporter and self._reporter.cancel_requested)
+            or (self._cancellation_probe and self._cancellation_probe())
+        )
 
     def result(self, result: ResticResult) -> None:
         self._write(
@@ -362,7 +367,9 @@ class ResticStorageRunner:
         try:
             while True:
                 try:
-                    raw_line = output_lines.get(timeout=self._events.heartbeat_interval_seconds)
+                    raw_line = output_lines.get(
+                        timeout=min(self._events.heartbeat_interval_seconds, 1.0)
+                    )
                 except queue.Empty:
                     self._events.heartbeat_if_due()
                     self._cancel_if_requested(process)
@@ -484,7 +491,9 @@ class ResticStorageRunner:
             "--sparse",
         ]
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
-            arguments.extend(["--exclude-xattr", "*"])
+            # User xattrs belong to customer data; only host-managed namespaces
+            # that cannot be written from the rental user namespace are skipped.
+            arguments.extend(["--exclude-xattr", "security.*", "--exclude-xattr", "trusted.*"])
         arguments.append(snapshot_id)
         return self._execution_command(arguments, working_directory=False)
 

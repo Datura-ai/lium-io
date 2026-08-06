@@ -431,7 +431,7 @@ def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
     assert "s3.connections=64" in command
 
 
-def test_encrypted_restore_uses_namespace_path_without_xattrs() -> None:
+def test_encrypted_restore_preserves_user_xattrs() -> None:
     operation = StorageOperationSpec.from_mapping(
         _operation_payload(action="restore", mode="encrypted_running")
     )
@@ -453,7 +453,23 @@ def test_encrypted_restore_uses_namespace_path_without_xattrs() -> None:
     assert "/proc/4321/root/root/restored" in command
     assert "restore" in command
     assert "--json" in command
-    assert command[command.index("--exclude-xattr") + 1] == "*"
+    excluded_xattrs = [
+        command[index + 1]
+        for index, argument in enumerate(command)
+        if argument == "--exclude-xattr"
+    ]
+    assert excluded_xattrs == ["security.*", "trusted.*"]
+    assert "user.*" not in excluded_xattrs
+
+
+def test_local_cancellation_marker_is_observed() -> None:
+    events = JsonEventWriter(
+        str(OPERATION_ID),
+        0,
+        cancellation_probe=lambda: True,
+    )
+
+    assert events.cancellation_requested is True
 
 
 class _FakeRestorePopen:

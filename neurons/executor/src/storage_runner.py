@@ -35,6 +35,9 @@ def main() -> int:
             operation.progress_interval_seconds,
             operation.heartbeat_interval_seconds,
             reporter=reporter,
+            cancellation_probe=(
+                lambda: Path(arguments.cancel_file).exists() if arguments.cancel_file else False
+            ),
         )
         workspace = WorkspaceResolver().resolve(operation)
         ResticStorageRunner(operation, workspace, event_writer=event_writer).run()
@@ -77,6 +80,10 @@ def _parse_arguments() -> argparse.Namespace:
         "--spec",
         default="-",
         help="operation JSON file with mode 0600, or '-' to read JSON from stdin",
+    )
+    parser.add_argument(
+        "--cancel-file",
+        help="local marker created by the validator when cancellation is requested",
     )
     return parser.parse_args()
 

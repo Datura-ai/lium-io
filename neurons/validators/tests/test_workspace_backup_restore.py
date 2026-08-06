@@ -526,6 +526,7 @@ def test_restic_backup_empty_path_targets_the_whole_volume():
     spec = MinerService._restic_backup_operation_spec(payload)
 
     assert spec["workspace"]["requested_path"] == payload.source_volume_path
+    assert spec["reporter"]["failure_timeout_seconds"] == 600
 
 
 def test_restic_online_restore_empty_path_targets_the_whole_volume():
@@ -538,6 +539,7 @@ def test_restic_online_restore_empty_path_targets_the_whole_volume():
     spec = MinerService._restic_restore_operation_spec(payload)
 
     assert spec["workspace"]["requested_path"] == payload.target_volume_path
+    assert spec["reporter"]["failure_timeout_seconds"] == 600
 
 
 @pytest.mark.asyncio

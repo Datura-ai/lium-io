@@ -1475,6 +1475,7 @@ class MinerService:
                     executor_info.python_path,
                     operation_id,
                     self._restic_backup_operation_spec(payload),
+                    retain_terminal_artifacts=False,
                 )
                 return
 
@@ -1531,6 +1532,7 @@ class MinerService:
                     executor_info.python_path,
                     operation_id,
                     self._restic_restore_operation_spec(payload),
+                    retain_terminal_artifacts=False,
                 )
                 return
 
@@ -1609,6 +1611,7 @@ class MinerService:
                 "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "auth_token": payload.auth_token,
                 "resource": "backup",
+                "failure_timeout_seconds": payload.failure_timeout_seconds,
             },
         }
 
@@ -1637,6 +1640,7 @@ class MinerService:
                 "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "auth_token": payload.auth_token,
                 "resource": "restore",
+                "failure_timeout_seconds": payload.failure_timeout_seconds,
             },
         }
 

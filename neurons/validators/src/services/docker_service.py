@@ -4899,6 +4899,7 @@ class DockerService:
                 "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "auth_token": restore.auth_token,
                 "resource": "restore",
+                "failure_timeout_seconds": restore.failure_timeout_seconds,
             },
         }
         files = await start_storage_operation(
@@ -4906,6 +4907,7 @@ class DockerService:
             executor_info.python_path,
             operation_id,
             spec,
+            retain_terminal_artifacts=True,
         )
         await wait_for_storage_operation(ssh_client, files)
 

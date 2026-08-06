@@ -233,6 +233,7 @@ class BootstrapRestoreSpec(BaseModel):
     auth_token: str = Field(repr=False)
     restore_path: str
     s3_connections: int = Field(default=64, ge=1, le=128)
+    failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
 class PayloadPortMapping(BaseModel):
@@ -408,7 +409,7 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_path: str
     source_volume_path: str
     backup_target_path: str
-    auth_token: str  # JWT for progress updates
+    auth_token: str = Field(repr=False)  # JWT for progress updates
     backup_log_id: str
     volume_encrypted: bool = False
     container_name: str | None = None
@@ -416,6 +417,7 @@ class BackupContainerRequest(ContainerBaseRequest):
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
     s3_connections: int = Field(default=64, ge=1, le=128)
+    failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -424,7 +426,7 @@ class RestoreContainerRequest(ContainerBaseRequest):
     backup_volume_info: ExternalVolumeInfo  # S3 backup volume with credentials
     backup_source_path: str  # path in backup S3 volume
     target_volume_path: str  # local volume mounted path
-    auth_token: str  # JWT for progress updates
+    auth_token: str = Field(repr=False)  # JWT for progress updates
     restore_log_id: str
     restore_path: str
     volume_encrypted: bool = False
@@ -435,6 +437,7 @@ class RestoreContainerRequest(ContainerBaseRequest):
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
     s3_connections: int = Field(default=64, ge=1, le=128)
+    failure_timeout_seconds: int = Field(default=600, gt=0)
 
 
 class CancelStorageOperationRequest(ContainerBaseRequest):
