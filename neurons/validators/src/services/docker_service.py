@@ -922,7 +922,7 @@ class DockerService:
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=("NET_ADMIN",),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
-            ulimits=self._memlock_ulimit_for(devices),
+            ulimits=self._memlock_ulimit_for(devices, payload.memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
             cpu_count=cpu_count,
@@ -933,18 +933,23 @@ class DockerService:
         )
 
     @staticmethod
-    def _memlock_ulimit_for(devices: tuple[DeviceMount, ...]) -> tuple[ContainerUlimit, ...]:
-        """Unlimited memlock, but only for a container that actually got RDMA devices.
+    def _memlock_ulimit_for(
+        devices: tuple[DeviceMount, ...], memory_gb: int | None
+    ) -> tuple[ContainerUlimit, ...]:
+        """Unlimited memlock, for a container that got RDMA devices AND a memory limit.
 
         RDMA pins the memory it registers and the default 64 KB is far below one queue pair, so the
-        forwarded verbs devices are unusable without this (DAH-2571). It is NOT set globally: a pod
-        whose `ram_total` is 0 carries no memory cgroup limit either (`mem_limit` is skipped for a
-        falsy value), and unlimited memlock on top of that would let a tenant pin the host's RAM.
+        forwarded verbs devices are unusable without this (DAH-2571).
+
+        Both conditions matter. Locked pages are charged to the container's memory cgroup, so with a
+        limit in place a tenant can only pin their own allocation. Without one — `mem_limit` is
+        skipped for a falsy `memory_gb`, and a pod's `ram_total` defaults to 0 — unlimited memlock
+        would let them pin the host's RAM in non-reclaimable pages instead.
         """
         forwards_rdma = any(
             device.path_on_host.startswith("/dev/infiniband/") for device in devices
         )
-        if not forwards_rdma:
+        if not forwards_rdma or not memory_gb:
             return ()
         return (ContainerUlimit(name="memlock", soft=-1, hard=-1),)
 

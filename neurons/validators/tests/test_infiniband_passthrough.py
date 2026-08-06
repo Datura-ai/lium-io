@@ -51,9 +51,12 @@ def test_memlock_is_raised_only_for_a_container_that_got_rdma_devices() -> None:
     gpu_only = (DeviceMount(path_on_host="/dev/nvidia0", path_in_container="/dev/nvidia0"),)
 
     # Act / Assert
-    assert DockerService._memlock_ulimit_for(rdma) == (ContainerUlimit(name="memlock", soft=-1, hard=-1),)
-    assert DockerService._memlock_ulimit_for(gpu_only) == ()
-    assert DockerService._memlock_ulimit_for(()) == ()
+    assert DockerService._memlock_ulimit_for(rdma, 64) == (ContainerUlimit(name="memlock", soft=-1, hard=-1),)
+    assert DockerService._memlock_ulimit_for(gpu_only, 64) == ()
+    assert DockerService._memlock_ulimit_for((), 64) == ()
+    # no memory cgroup limit -> pinning would come out of the host, not the tenant's own allocation
+    assert DockerService._memlock_ulimit_for(rdma, 0) == ()
+    assert DockerService._memlock_ulimit_for(rdma, None) == ()
 
 
 def test_memlock_reaches_the_host_config() -> None:
