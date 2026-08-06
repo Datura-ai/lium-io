@@ -91,6 +91,7 @@ from services.rental_docker_sdk import (
     DEFAULT_DOCKER_PULL_TIMEOUT_SECONDS,
     ContainerExecSpec,
     ContainerRunSpec,
+    ContainerUlimit,
     DeviceMount,
     PortBinding,
     RentalDockerConnectionError,
@@ -921,6 +922,10 @@ class DockerService:
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=("NET_ADMIN",),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
+            # RDMA pins the memory it registers, and the default 64 KB memlock is far below what a
+            # single queue pair needs — without this the verbs devices forwarded above are present
+            # but unusable (DAH-2571). Harmless on hosts with no RDMA hardware.
+            ulimits=(ContainerUlimit(name="memlock", soft=-1, hard=-1),),
             devices=devices,
             device_requests=gpu_devices.device_requests,
             cpu_count=cpu_count,
