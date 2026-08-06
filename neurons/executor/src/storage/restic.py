@@ -35,7 +35,7 @@ RESTIC_OPEN_PACKER_COUNT = 4
 RESTIC_TEMP_PACK_HEADROOM = 2
 RESTIC_MINIMUM_TMPFS_BYTES = 256 * MEBIBYTE
 ENCRYPTED_BACKUP_SCRIPT = 'cd "$1"; shift; exec "$@"'
-ENCRYPTED_BOOTSTRAP_SCRIPT = r'''
+ENCRYPTED_BOOTSTRAP_SCRIPT = r"""
 set -eu
 passfile=/tmp/.lium-volume-passphrase
 umask 077
@@ -50,10 +50,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 "$@"
-'''
+"""
+
 
 class ResticOperationError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class StorageOperationCancelled(RuntimeError):
@@ -66,6 +69,7 @@ class ResticResult:
     result_quality: OperationResultQuality | None
     snapshot_id: str | None
     exit_code: int
+    error_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,7 +101,9 @@ class JsonEventWriter:
         message_type = payload.get("message_type")
         if message_type == "status" and not self._progress_due():
             return
-        self._write({"event": "restic", "operation_id": self._operation_id, "payload": dict(payload)})
+        self._write(
+            {"event": "restic", "operation_id": self._operation_id, "payload": dict(payload)}
+        )
 
     def diagnostic(self, message: str) -> None:
         self._write({"event": "diagnostic", "operation_id": self._operation_id, "message": message})
@@ -126,12 +132,16 @@ class JsonEventWriter:
                 "result_quality": result.result_quality.value if result.result_quality else None,
                 "snapshot_id": result.snapshot_id,
                 "exit_code": result.exit_code,
+                "error_code": result.error_code,
             }
         )
 
     def _progress_due(self) -> bool:
         now = self._clock()
-        if self._last_progress_at is None or now - self._last_progress_at >= self._progress_interval_seconds:
+        if (
+            self._last_progress_at is None
+            or now - self._last_progress_at >= self._progress_interval_seconds
+        ):
             self._last_progress_at = now
             return True
         return False
@@ -165,7 +175,10 @@ class ResticStorageRunner:
 
     def run(self) -> ResticResult:
         if self._operation.engine is StorageEngine.RESTIC:
-            self._ensure_repository()
+            if self._operation.action is StorageAction.BACKUP:
+                self._ensure_repository_for_backup()
+            else:
+                self._require_repository_for_restore()
         if self._operation.action is StorageAction.BACKUP:
             result = self._backup()
         else:
@@ -173,7 +186,7 @@ class ResticStorageRunner:
         self._events.result(result)
         return result
 
-    def _ensure_repository(self) -> None:
+    def _ensure_repository_for_backup(self) -> None:
         probe = subprocess.run(
             self._restic_command(["snapshots", "--json"]),
             env=self._environment,
@@ -184,7 +197,9 @@ class ResticStorageRunner:
             return
         if probe.returncode != 10:
             detail = _redact(probe.stderr or probe.stdout, self._secret_values())
-            raise ResticOperationError(f"restic repository probe failed with exit {probe.returncode}: {detail}")
+            raise ResticOperationError(
+                f"restic repository probe failed with exit {probe.returncode}: {detail}"
+            )
 
         initialized = subprocess.run(
             self._restic_command(["init", "--json"]),
@@ -204,6 +219,43 @@ class ResticStorageRunner:
         if retry_probe.returncode != 0:
             detail = _redact(initialized.stderr or initialized.stdout, self._secret_values())
             raise ResticOperationError(f"restic repository initialization failed: {detail}")
+
+    def _require_repository_for_restore(self) -> None:
+        # Restore is read-only: a missing source must fail instead of creating an
+        # empty repository at the requested prefix.
+        snapshot_id = self._operation.snapshot_id
+        if not snapshot_id:
+            raise ResticOperationError("restore requires a snapshot ID")
+        probe = subprocess.run(
+            self._restic_command(["snapshots", "--json", snapshot_id]),
+            env=self._environment,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 10:
+            raise ResticOperationError(
+                "backup repository does not exist",
+                error_code="RESTIC_REPOSITORY_MISSING",
+            )
+        if probe.returncode != 0:
+            detail = _redact(probe.stderr or probe.stdout, self._secret_values())
+            raise ResticOperationError(
+                f"backup repository probe failed with exit {probe.returncode}: {detail}"
+            )
+        try:
+            snapshots = json.loads(probe.stdout)
+        except json.JSONDecodeError as error:
+            raise ResticOperationError("backup repository probe returned invalid JSON") from error
+        if not isinstance(snapshots, list) or not any(
+            isinstance(snapshot, dict)
+            and isinstance(snapshot.get("id"), str)
+            and snapshot["id"].startswith(snapshot_id)
+            for snapshot in snapshots
+        ):
+            raise ResticOperationError(
+                f"backup snapshot {snapshot_id} does not exist",
+                error_code="RESTIC_SNAPSHOT_MISSING",
+            )
 
     def _backup(self) -> ResticResult:
         if self._operation.engine is not StorageEngine.RESTIC:
@@ -307,47 +359,58 @@ class ResticStorageRunner:
         output_reader = threading.Thread(target=read_output, name="restic-output", daemon=True)
         output_reader.start()
 
-        while True:
-            try:
-                raw_line = output_lines.get(timeout=self._events.heartbeat_interval_seconds)
-            except queue.Empty:
+        try:
+            while True:
+                try:
+                    raw_line = output_lines.get(timeout=self._events.heartbeat_interval_seconds)
+                except queue.Empty:
+                    self._events.heartbeat_if_due()
+                    self._cancel_if_requested(process)
+                    continue
+                if raw_line is None:
+                    break
+                line = raw_line.strip()
+                if not line:
+                    continue
+                checkpoint = _restore_checkpoint(line)
+                if checkpoint is not None and restore_stats is not None:
+                    self._events.restic_event(
+                        _restore_progress(checkpoint, restore_stats, time.monotonic() - started_at)
+                    )
+                    self._events.heartbeat_if_due()
+                    self._cancel_if_requested(process)
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    self._events.diagnostic(_redact(line, self._secret_values()))
+                    continue
+                if not isinstance(payload, dict):
+                    self._events.diagnostic("restic emitted a non-object JSON message")
+                    continue
+                self._events.restic_event(payload)
                 self._events.heartbeat_if_due()
                 self._cancel_if_requested(process)
-                continue
-            if raw_line is None:
-                break
-            line = raw_line.strip()
-            if not line:
-                continue
-            checkpoint = _restore_checkpoint(line)
-            if checkpoint is not None and restore_stats is not None:
-                self._events.restic_event(
-                    _restore_progress(checkpoint, restore_stats, time.monotonic() - started_at)
-                )
-                self._events.heartbeat_if_due()
-                self._cancel_if_requested(process)
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                self._events.diagnostic(_redact(line, self._secret_values()))
-                continue
-            if not isinstance(payload, dict):
-                self._events.diagnostic("restic emitted a non-object JSON message")
-                continue
-            self._events.restic_event(payload)
-            self._events.heartbeat_if_due()
-            self._cancel_if_requested(process)
-            if payload.get("message_type") == "summary":
-                summary = payload
+                if payload.get("message_type") == "summary":
+                    summary = payload
 
-        exit_code = process.wait()
-        output_reader.join(timeout=1)
-        return exit_code, summary
+            exit_code = process.wait()
+            return exit_code, summary
+        except StorageOperationCancelled:
+            raise
+        except Exception:
+            self._terminate_process(process)
+            raise
+        finally:
+            output_reader.join(timeout=1)
 
     def _cancel_if_requested(self, process: subprocess.Popen[str]) -> None:
         if not self._events.cancellation_requested:
             return
+        self._terminate_process(process)
+        raise StorageOperationCancelled("storage operation cancellation requested")
+
+    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
         self._stop_helper_container()
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -357,7 +420,6 @@ class ResticStorageRunner:
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
-        raise StorageOperationCancelled("storage operation cancellation requested")
 
     def _stop_helper_container(self) -> None:
         subprocess.run(
@@ -431,9 +493,9 @@ class ResticStorageRunner:
             'mkdir -p -- "$4"; '
             '"$1" s3 cp "s3://$2/$3" - --no-progress | '
             'tar --extract --gzip --file - --directory "$4" --strip-components=1 '
-            '--preserve-permissions --same-owner --numeric-owner '
-            f'--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} '
-            f'--checkpoint-action=echo={RESTORE_CHECKPOINT_PREFIX}%u'
+            "--preserve-permissions --same-owner --numeric-owner --xattrs --acls "
+            f"--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} "
+            f"--checkpoint-action=echo={RESTORE_CHECKPOINT_PREFIX}%u"
         )
         pipeline_command = [
             "/bin/bash",
@@ -491,7 +553,9 @@ class ResticStorageRunner:
         working_directory: bool,
     ) -> list[str]:
         if not isinstance(self._workspace, DockerEncryptedVolumeWorkspace):
-            raise ResticOperationError("encrypted volume helper requested for a different workspace")
+            raise ResticOperationError(
+                "encrypted volume helper requested for a different workspace"
+            )
         wrapped_command = command
         if working_directory:
             wrapped_command = [
@@ -525,9 +589,7 @@ class ResticStorageRunner:
     def _docker_helper_base(self) -> list[str]:
         tmpfs_size_bytes = max(
             RESTIC_MINIMUM_TMPFS_BYTES,
-            (
-                self._operation.repository.s3_connections + RESTIC_OPEN_PACKER_COUNT
-            )
+            (self._operation.repository.s3_connections + RESTIC_OPEN_PACKER_COUNT)
             * RESTIC_PACK_SIZE_BYTES
             * RESTIC_TEMP_PACK_HEADROOM,
         )
@@ -555,8 +617,6 @@ class ResticStorageRunner:
             "-e",
             "RESTIC_PASSWORD",
             "-e",
-            "RESTIC_HOST",
-            "-e",
             "LIUM_VOLUME_PASSPHRASE",
         ]
 
@@ -576,8 +636,6 @@ class ResticStorageRunner:
         return f"s3.connections={self._operation.repository.s3_connections}"
 
     def _workspace_path(self) -> str:
-        if isinstance(self._workspace, LocalWorkspace):
-            return str(self._workspace.path)
         return str(self._workspace.path)
 
     def _build_environment(self) -> dict[str, str]:
@@ -589,7 +647,6 @@ class ResticStorageRunner:
                 "AWS_SECRET_ACCESS_KEY": repository.secret_access_key,
                 "AWS_DEFAULT_REGION": repository.region,
                 "RESTIC_REPOSITORY": repository.url_for_pod(self._operation.repository_pod_id),
-                "RESTIC_HOST": f"lium-pod-{self._operation.pod_id}",
             }
         )
         if repository.password:

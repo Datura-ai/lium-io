@@ -106,7 +106,11 @@ from services.rental_docker_sdk import (
     require_rental_docker_ssh_host_key,
 )
 from services.ssh_connect_timing import connect_with_phase_timing
-from services.storage_operations import start_storage_operation, wait_for_storage_operation
+from services.storage_operations import (
+    start_storage_operation,
+    supports_storage_operation,
+    wait_for_storage_operation,
+)
 from services.task.runner import SSHCommandRunner
 from tenacity import RetryError
 
@@ -4845,6 +4849,21 @@ class DockerService:
         local_volume_path: str,
         encrypted: bool,
     ) -> None:
+        if not await supports_storage_operation(ssh_client, restore.backup_engine):
+            # Legacy archives must remain restorable while executor-image adoption
+            # is gradual. Restic has no safe fallback without its pinned binary.
+            if restore.backup_engine == "tar_aws_cli" and not encrypted:
+                await self._run_legacy_bootstrap_restore(
+                    ssh_client=ssh_client,
+                    executor_info=executor_info,
+                    restore=restore,
+                    local_volume=local_volume,
+                    local_volume_path=local_volume_path,
+                )
+                return
+            raise RuntimeError(
+                f"executor does not support bootstrap restore engine {restore.backup_engine}"
+            )
         operation_id = UUID(restore.restore_log_id)
         workspace: dict[str, object] = {
             "mode": "encrypted_bootstrap" if encrypted else "plain_volume",
@@ -4863,6 +4882,7 @@ class DockerService:
             "secret_access_key": restore.backup_volume_info.iam_user_secret_key,
             "session_token": restore.backup_volume_info.session_token,
             "password": restore.repository_password,
+            "s3_connections": restore.s3_connections,
         }
         spec: dict[str, object] = {
             "operation_id": restore.restore_log_id,
@@ -4888,6 +4908,47 @@ class DockerService:
             spec,
         )
         await wait_for_storage_operation(ssh_client, files)
+
+    async def _run_legacy_bootstrap_restore(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        restore: BootstrapRestoreSpec,
+        local_volume: str,
+        local_volume_path: str,
+    ) -> None:
+        local_jobs = Path(__file__).resolve().parent.parent / "miner_jobs"
+        remote_script = "/root/app/restore_storage.py"
+        remote_helper = "/root/app/workspace_mount.py"
+        async with ssh_client.start_sftp_client() as sftp:
+            await sftp.put(str(local_jobs / "restore_storage.py"), remote_script)
+            await sftp.put(str(local_jobs / "workspace_mount.py"), remote_helper)
+        command = [
+            executor_info.python_path,
+            remote_script,
+            "--api-url",
+            settings.COMPUTE_REST_API_URL_EXTERNAL,
+            "--target-volume",
+            local_volume,
+            "--restore-path",
+            restore.restore_path or local_volume_path,
+            "--backup-source-path",
+            restore.legacy_object_key or "",
+            "--auth-token",
+            restore.auth_token,
+            "--restore-log-id",
+            restore.restore_log_id,
+            "--backup-volume-name",
+            restore.backup_volume_info.name,
+            "--backup-volume-iam_user_access_key",
+            restore.backup_volume_info.iam_user_access_key,
+            "--backup-volume-iam_user_secret_key",
+            restore.backup_volume_info.iam_user_secret_key,
+            "--target-volume-path",
+            local_volume_path,
+        ]
+        await ssh_client.run(shlex.join(command), check=True)
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
         async with self.lock:

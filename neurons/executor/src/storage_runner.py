@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from storage.models import OperationSpecError, StorageOperationSpec
-from storage.reporting import StorageEventReporter
+from storage.reporting import ReportingLeaseExpired, StorageEventReporter
 from storage.restic import (
     JsonEventWriter,
     ResticOperationError,
@@ -44,7 +44,25 @@ def main() -> int:
             event_writer.diagnostic(str(error))
             event_writer.result(ResticResult("CANCELLED", None, None, 130))
         return 130
-    except (OperationSpecError, WorkspaceResolutionError, ResticOperationError, OSError) as error:
+    except ReportingLeaseExpired as error:
+        print(
+            json.dumps(
+                {
+                    "event": "result",
+                    "status": "FAILED",
+                    "message": str(error),
+                }
+            )
+        )
+        return 1
+    except ResticOperationError as error:
+        if event_writer:
+            event_writer.diagnostic(str(error))
+            event_writer.result(ResticResult("FAILED", None, None, 1, error_code=error.error_code))
+        else:
+            print(json.dumps({"event": "result", "status": "FAILED", "message": str(error)}))
+        return 1
+    except (OperationSpecError, WorkspaceResolutionError, OSError) as error:
         if event_writer:
             event_writer.diagnostic(str(error))
             event_writer.result(ResticResult("FAILED", None, None, 1))

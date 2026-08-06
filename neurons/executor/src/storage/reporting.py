@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
 import requests
 
 from storage.models import ReporterResource, ReporterSpec, StorageAction
+
+
+class ReportingLeaseExpired(RuntimeError):
+    pass
 
 
 @dataclass
@@ -27,13 +31,19 @@ class StorageEventReporter:
         action: StorageAction,
         spec: ReporterSpec,
         session: requests.Session | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self._operation_id = operation_id
         self._spec = spec
         self._session = session or requests.Session()
+        self._clock = clock
+        self._sleeper = sleeper
+        self._last_success_at = self._clock()
         self._state = ProgressState(stage=action.value.upper())
         self._cancel_requested = False
-        self._failure_detail: str | None = None
+        self._restic_failure_detail: str | None = None
+        self._diagnostic_detail: str | None = None
 
     @property
     def cancel_requested(self) -> bool:
@@ -55,8 +65,8 @@ class StorageEventReporter:
         if event_type == "diagnostic":
             message = event.get("message")
             if isinstance(message, str) and message:
-                if self._failure_detail is None:
-                    self._failure_detail = message[:2000]
+                if self._diagnostic_detail is None:
+                    self._diagnostic_detail = message[:2000]
                 self._put(
                     self._progress_payload(status="IN_PROGRESS", logs=[message[:2000]]),
                     terminal=False,
@@ -78,7 +88,10 @@ class StorageEventReporter:
                     result_quality=result_quality,
                     snapshot_id=_optional_string(event.get("snapshot_id")),
                     exit_code=_optional_integer(event.get("exit_code")),
-                    error_message=self._failure_detail if status != "COMPLETED" else None,
+                    error_code=_optional_string(event.get("error_code")),
+                    error_message=(self._restic_failure_detail or self._diagnostic_detail)
+                    if status != "COMPLETED"
+                    else None,
                 ),
                 terminal=True,
             )
@@ -117,7 +130,7 @@ class StorageEventReporter:
         )
 
     def _remember_restic_error(self, event: Mapping[str, object]) -> None:
-        if self._failure_detail is not None:
+        if self._restic_failure_detail is not None:
             return
         message_type = event.get("message_type")
         if message_type not in ("error", "exit_error"):
@@ -126,11 +139,11 @@ class StorageEventReporter:
         if isinstance(error, Mapping):
             message = _optional_string(error.get("message"))
             if message:
-                self._failure_detail = message[:2000]
+                self._restic_failure_detail = message[:2000]
                 return
         message = _optional_string(event.get("message"))
         if message:
-            self._failure_detail = message[:2000]
+            self._restic_failure_detail = message[:2000]
 
     def _progress_payload(
         self,
@@ -140,6 +153,7 @@ class StorageEventReporter:
         result_quality: str | None = None,
         snapshot_id: str | None = None,
         exit_code: int | None = None,
+        error_code: str | None = None,
         error_message: str | None = None,
     ) -> dict[str, object]:
         return {
@@ -154,13 +168,14 @@ class StorageEventReporter:
             "result_quality": result_quality,
             "snapshot_id": snapshot_id,
             "exit_code": exit_code,
+            "error_code": error_code,
             "error_message": error_message,
             "logs": logs,
         }
 
     def _put(self, payload: Mapping[str, object], *, terminal: bool) -> None:
-        attempts = 3 if terminal else 1
-        for attempt in range(attempts):
+        retry_delay_seconds = 1.0
+        while True:
             try:
                 response = self._session.put(
                     self._url(),
@@ -170,15 +185,29 @@ class StorageEventReporter:
                 )
                 response.raise_for_status()
                 body = response.json()
+                self._last_success_at = self._clock()
                 if isinstance(body, Mapping) and body.get("cancel_requested") is True:
                     self._cancel_requested = True
                 return
-            except (requests.RequestException, ValueError):
-                if attempt + 1 < attempts:
-                    time.sleep(1 + attempt)
+            except (requests.RequestException, ValueError) as error:
+                # This lease expires before the backend's stale-operation sweep so
+                # the runner stops owning the repository before it can be released.
+                remaining_seconds = self._spec.failure_timeout_seconds - (
+                    self._clock() - self._last_success_at
+                )
+                if remaining_seconds <= 0:
+                    raise ReportingLeaseExpired(
+                        "storage operation stopped because progress reporting was unavailable"
+                    ) from error
+                if not terminal:
+                    return
+                self._sleeper(min(retry_delay_seconds, remaining_seconds))
+                retry_delay_seconds = min(retry_delay_seconds * 2, 30.0)
 
     def _url(self) -> str:
-        resource_path = "backup-logs" if self._spec.resource is ReporterResource.BACKUP else "restore-logs"
+        resource_path = (
+            "backup-logs" if self._spec.resource is ReporterResource.BACKUP else "restore-logs"
+        )
         return f"{self._spec.api_url}/{resource_path}/{self._operation_id}/progress"
 
 

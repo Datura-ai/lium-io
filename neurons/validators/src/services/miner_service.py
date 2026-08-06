@@ -90,13 +90,18 @@ def _get_error_details(error: Exception) -> str:
     return f"{type(error).__name__}: {str(error)}"
 
 
-def _storage_repository_spec(volume_info, password: str | None) -> dict[str, object]:
+def _storage_repository_spec(
+    volume_info,
+    password: str | None,
+    s3_connections: int,
+) -> dict[str, object]:
     return {
         "bucket": volume_info.name,
         "access_key_id": volume_info.iam_user_access_key,
         "secret_access_key": volume_info.iam_user_secret_key,
         "session_token": volume_info.session_token,
         "password": password,
+        "s3_connections": s3_connections,
     }
 
 
@@ -1588,7 +1593,11 @@ class MinerService:
             "repository_pod_id": payload.repository_pod_id or payload.pod_id,
             "action": "backup",
             "engine": "restic",
-            "repository": _storage_repository_spec(payload.backup_volume_info, payload.repository_password),
+            "repository": _storage_repository_spec(
+                payload.backup_volume_info,
+                payload.repository_password,
+                payload.s3_connections,
+            ),
             "workspace": {
                 "mode": "encrypted_running" if payload.volume_encrypted else "plain_volume",
                 "volume_name": payload.source_volume,
@@ -1612,7 +1621,11 @@ class MinerService:
             "action": "restore",
             "engine": "restic",
             "snapshot_id": payload.snapshot_id,
-            "repository": _storage_repository_spec(payload.backup_volume_info, payload.repository_password),
+            "repository": _storage_repository_spec(
+                payload.backup_volume_info,
+                payload.repository_password,
+                payload.s3_connections,
+            ),
             "workspace": {
                 "mode": "encrypted_running" if payload.volume_encrypted else "plain_volume",
                 "volume_name": payload.target_volume,

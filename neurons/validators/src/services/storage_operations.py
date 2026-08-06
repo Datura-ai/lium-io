@@ -37,6 +37,18 @@ class StorageOperationFiles:
         )
 
 
+async def supports_storage_operation(
+    ssh_client: asyncssh.SSHClientConnection,
+    engine: object,
+) -> bool:
+    required_binary = "/usr/local/bin/restic" if engine == "restic" else "/usr/bin/aws"
+    result = await ssh_client.run(
+        f"test -r {shlex.quote(REMOTE_RUNNER_PATH)} && test -x {shlex.quote(required_binary)}",
+        check=False,
+    )
+    return result.exit_status == 0
+
+
 async def start_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
     python_path: str,
@@ -45,14 +57,20 @@ async def start_storage_operation(
 ) -> StorageOperationFiles:
     files = StorageOperationFiles.for_operation(operation_id)
     try:
+        engine = spec.get("engine")
+        if not await supports_storage_operation(ssh_client, engine):
+            raise StorageOperationLaunchError(
+                f"executor does not support the requested {engine or 'storage'} operation"
+            )
         await ssh_client.run(
-            f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}; "
-            f"find {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} -type f -mtime +1 -delete",
+            f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
             check=True,
         )
         async with ssh_client.start_sftp_client() as sftp:
             async with sftp.open(str(files.spec), "w") as remote_spec:
-                await remote_spec.write(json.dumps(dict(spec), separators=(",", ":"), sort_keys=True))
+                await remote_spec.write(
+                    json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
+                )
             await sftp.chmod(str(files.spec), 0o600)
 
         runner = " ".join(
@@ -64,7 +82,7 @@ async def start_storage_operation(
             f"{runner} & child=$!; "
             f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
-            "wait \"$child\"; result=$?; "
+            'wait "$child"; result=$?; '
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))}"
         )
@@ -83,25 +101,64 @@ async def wait_for_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
     poll_interval_seconds: float = 5.0,
+    launch_grace_polls: int = 6,
 ) -> None:
+    runner_seen = False
+    starting_polls = 0
     while True:
-        result = await ssh_client.run(
-            f"test -f {shlex.quote(str(files.status))} && cat {shlex.quote(str(files.status))}",
-            check=False,
-        )
-        if result.exit_status == 0 and (result.stdout or "").strip():
+        # Healthy large operations have no wall-clock deadline; only terminal
+        # status or loss of the supervised runner ends this wait.
+        state = await _operation_state(ssh_client, files)
+        if state.startswith("STATUS:"):
             try:
-                exit_code = int(result.stdout.strip())
+                exit_code = int(state.removeprefix("STATUS:").strip())
             except ValueError as error:
-                raise StorageOperationLaunchError("storage operation returned an invalid status") from error
+                await _remove_operation_artifacts(ssh_client, files)
+                raise StorageOperationLaunchError(
+                    "storage operation returned an invalid status"
+                ) from error
             if exit_code != 0:
                 detail = await _tail_operation_log(ssh_client, files.log)
+                await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
                     f"storage operation failed with exit {exit_code}: {detail}"
                 )
-            await _remove_operation_status(ssh_client, files)
+            await _remove_operation_artifacts(ssh_client, files)
             return
+        if state == "RUNNING":
+            runner_seen = True
+        elif state in {"EXITED", "INVALID"} or runner_seen:
+            detail = await _tail_operation_log(ssh_client, files.log)
+            await _remove_operation_artifacts(ssh_client, files)
+            raise StorageOperationLaunchError(
+                f"storage operation runner disappeared without a terminal status: {detail}"
+            )
+        else:
+            starting_polls += 1
+            if starting_polls >= launch_grace_polls:
+                detail = await _tail_operation_log(ssh_client, files.log)
+                await _remove_operation_artifacts(ssh_client, files)
+                raise StorageOperationLaunchError(
+                    f"storage operation runner did not start: {detail}"
+                )
         await asyncio.sleep(poll_interval_seconds)
+
+
+async def _operation_state(
+    ssh_client: asyncssh.SSHClientConnection,
+    files: StorageOperationFiles,
+) -> str:
+    status_path = shlex.quote(str(files.status))
+    pid_path = shlex.quote(str(files.pid))
+    command = (
+        f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
+        f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
+        "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
+        '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
+        "else echo STARTING; fi"
+    )
+    result = await ssh_client.run(command, check=False)
+    return (result.stdout or "").strip()
 
 
 async def cancel_storage_operation(
@@ -115,7 +172,7 @@ async def cancel_storage_operation(
         f"if test -f {shlex.quote(str(files.pid))}; then "
         f"pid=$(cat {shlex.quote(str(files.pid))}); "
         "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
-        "kill -TERM \"$pid\" 2>/dev/null || true; "
+        'kill -TERM "$pid" 2>/dev/null || true; '
         "fi"
     )
     result = await ssh_client.run(command, check=False)
@@ -135,12 +192,15 @@ async def _tail_operation_log(
     return compact[-2000:]
 
 
-async def _remove_operation_status(
+async def _remove_operation_artifacts(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
 ) -> None:
     await ssh_client.run(
-        "rm -f " + " ".join(shlex.quote(str(path)) for path in (files.status, files.log)),
+        "rm -f "
+        + " ".join(
+            shlex.quote(str(path)) for path in (files.status, files.log, files.pid, files.spec)
+        ),
         check=False,
     )
 

@@ -4,9 +4,11 @@ import io
 import json
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
+import requests
 from storage.models import (
     OperationResultQuality,
     OperationSpecError,
@@ -15,8 +17,8 @@ from storage.models import (
     StorageAction,
     StorageOperationSpec,
 )
-from storage.reporting import StorageEventReporter
-from storage.restic import JsonEventWriter, ResticStorageRunner, RestoreStats
+from storage.reporting import ReportingLeaseExpired, StorageEventReporter
+from storage.restic import JsonEventWriter, ResticOperationError, ResticStorageRunner, RestoreStats
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
     DockerVolumeWorkspace,
@@ -79,6 +81,27 @@ def test_restore_requires_snapshot_id() -> None:
         StorageOperationSpec.from_mapping(payload)
 
 
+def test_restore_missing_repository_never_initializes_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        commands.append(command)
+        return SimpleNamespace(returncode=10, stdout="", stderr="repository does not exist")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", run)
+
+    with pytest.raises(ResticOperationError, match="repository does not exist") as raised:
+        ResticStorageRunner(operation, LocalWorkspace(tmp_path)).run()
+
+    assert raised.value.error_code == "RESTIC_REPOSITORY_MISSING"
+    assert commands
+    assert all("init" not in command for command in commands)
+
+
 @pytest.mark.parametrize("value", [0, 129, 1.5, True])
 def test_s3_connections_must_be_a_bounded_integer(value: object) -> None:
     payload = _operation_payload()
@@ -117,7 +140,9 @@ def test_helper_image_resolves_container_hostname_when_ssh_environment_omits_hos
 
 def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments() -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload())
-    workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(operation)
+    workspace = WorkspaceResolver(environ={"LIUM_STORAGE_HELPER_IMAGE": "executor:test"}).resolve(
+        operation
+    )
     runner = ResticStorageRunner(operation, workspace)
 
     command, cwd = runner._execution_command(["backup", "--json", "."], working_directory=True)
@@ -442,7 +467,34 @@ class _FakeRestorePopen:
         return None
 
 
-def test_restore_checkpoint_emits_bounded_progress(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+class _SingleEventPopen:
+    def __init__(self, command: list[str], *args: object, **kwargs: object) -> None:
+        self.stdout = iter(['{"message_type":"status","percent_done":0.1}\n'])
+
+
+def test_reporting_lease_loss_terminates_the_owned_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = StorageOperationSpec.from_mapping(_operation_payload())
+    events = SimpleNamespace(
+        heartbeat_interval_seconds=1,
+        restic_event=MagicMock(side_effect=ReportingLeaseExpired("lease expired")),
+    )
+    runner = ResticStorageRunner(operation, LocalWorkspace(tmp_path), event_writer=events)
+    terminate = MagicMock()
+    monkeypatch.setattr("storage.restic.subprocess.Popen", _SingleEventPopen)
+    monkeypatch.setattr(runner, "_terminate_process", terminate)
+
+    with pytest.raises(ReportingLeaseExpired, match="lease expired"):
+        runner._stream_command(["backup-test"], None)
+
+    terminate.assert_called_once()
+
+
+def test_restore_checkpoint_emits_bounded_progress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     operation = StorageOperationSpec.from_mapping(_operation_payload(action="restore"))
     output = io.StringIO()
     events = JsonEventWriter(str(OPERATION_ID), 0, output=output)
@@ -529,6 +581,7 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
         session=session,
     )
 
+    reporter.send({"event": "diagnostic", "message": "docker emitted an unrelated warning"})
     reporter.send(
         {
             "event": "restic",
@@ -538,7 +591,6 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
             },
         }
     )
-    reporter.send({"event": "diagnostic", "message": "restic backup failed with exit 1"})
     reporter.send({"event": "result", "status": "FAILED", "exit_code": 1})
 
     terminal_payload = session.requests[-1]["json"]
@@ -546,6 +598,44 @@ def test_reporter_includes_specific_restic_error_in_failed_result() -> None:
     assert terminal_payload["error_message"] == (
         "failed to save model.bin: no space left on device"
     )
+
+
+class _FailingReporterSession:
+    def put(self, *args: object, **kwargs: object) -> None:
+        raise requests.ConnectionError("backend unavailable")
+
+
+class _ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_terminal_reporting_retries_until_the_reporting_lease_expires() -> None:
+    clock = _ManualClock()
+    reporter = StorageEventReporter(
+        OPERATION_ID,
+        StorageAction.BACKUP,
+        ReporterSpec(
+            api_url="https://api.example",
+            auth_token="token",
+            resource=ReporterResource.BACKUP,
+            failure_timeout_seconds=3,
+        ),
+        session=_FailingReporterSession(),
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+
+    with pytest.raises(ReportingLeaseExpired, match="reporting was unavailable"):
+        reporter.send({"event": "result", "status": "COMPLETED", "result_quality": "FULL"})
+
+    assert clock.now == 3
 
 
 def test_reporter_full_completion_finishes_known_counters() -> None:

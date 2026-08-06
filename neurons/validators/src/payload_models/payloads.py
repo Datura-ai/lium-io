@@ -232,6 +232,7 @@ class BootstrapRestoreSpec(BaseModel):
     legacy_object_size_bytes: int | None = None
     auth_token: str = Field(repr=False)
     restore_path: str
+    s3_connections: int = Field(default=64, ge=1, le=128)
 
 
 class PayloadPortMapping(BaseModel):
@@ -414,6 +415,7 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_engine: str = "tar_aws_cli"
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
+    s3_connections: int = Field(default=64, ge=1, le=128)
 
 
 class RestoreContainerRequest(ContainerBaseRequest):
@@ -432,6 +434,7 @@ class RestoreContainerRequest(ContainerBaseRequest):
     repository_password: str | None = Field(default=None, repr=False)
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
+    s3_connections: int = Field(default=64, ge=1, le=128)
 
 
 class CancelStorageOperationRequest(ContainerBaseRequest):

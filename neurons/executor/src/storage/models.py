@@ -113,6 +113,7 @@ class ReporterSpec:
     api_url: str
     auth_token: str = field(repr=False)
     resource: ReporterResource
+    failure_timeout_seconds: float = 600.0
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> ReporterSpec:
@@ -127,6 +128,11 @@ class ReporterSpec:
             api_url=api_url,
             auth_token=_required_string(value, "auth_token"),
             resource=resource,
+            failure_timeout_seconds=_optional_positive_number(
+                value,
+                "failure_timeout_seconds",
+                default=600.0,
+            ),
         )
 
 
@@ -271,6 +277,13 @@ def _optional_nullable_nonnegative_integer(value: Mapping[str, object], key: str
     if not isinstance(item, int) or isinstance(item, bool) or item < 0:
         raise OperationSpecError(f"{key} must be a non-negative integer when provided")
     return item
+
+
+def _optional_positive_number(value: Mapping[str, object], key: str, *, default: float) -> float:
+    item = value.get(key, default)
+    if not isinstance(item, int | float) or isinstance(item, bool) or item <= 0:
+        raise OperationSpecError(f"{key} must be a positive number")
+    return float(item)
 
 
 def _safe_identifier(value: str, key: str) -> str:
