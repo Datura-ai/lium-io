@@ -34,10 +34,3 @@
     dest: "{{ lium_qemu_prefix }}"
     remote_src: true
     extra_opts: ["--strip-components=1"]
-
-- name: Record the installed binary's fingerprint
-  ansible.builtin.shell:
-    cmd: >-
-      sha256sum {{ lium_qemu_prefix }}/bin/qemu-system-x86_64
-      | cut -d' ' -f1 > {{ lium_state_dir }}/qemu.sha256
-  changed_when: true

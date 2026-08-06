@@ -80,31 +80,17 @@ tri_unknown() {  # name, reason
 }
 
 # --- OS / hardware identity (trivially readable, so plain) --------------------
-OS_ID=""; OS_VERSION_ID=""; OS_CODENAME=""
+OS_ID=""; OS_VERSION_ID=""
 if [ -r /etc/os-release ]; then
   # shellcheck disable=SC1091
   . /etc/os-release
   OS_ID="${ID:-}"
   OS_VERSION_ID="${VERSION_ID:-}"
-  OS_CODENAME="${VERSION_CODENAME:-}"
 fi
 plain_str os_id "$OS_ID"
 plain_str os_version_id "$OS_VERSION_ID"
-plain_str codename "$OS_CODENAME"
 plain_str kernel "$(uname -r 2>/dev/null || printf '')"
 plain_str arch "$(uname -m 2>/dev/null || printf '')"
-
-RAM_TOTAL_GB=0; RAM_USED_GB=0
-if [ -r /proc/meminfo ]; then
-  _kt="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
-  _ka="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
-  RAM_TOTAL_GB=$(( _kt / 1024 / 1024 ))
-  RAM_USED_GB=$(( (_kt - _ka) / 1024 / 1024 ))
-fi
-# Reported for context only. The ~31 GB "no-CVM baseline" in known-good.md is
-# specific to a 2011 GB 8xH200 host and does not port to other hardware.
-plain ram_total_gb "$RAM_TOTAL_GB"
-plain ram_used_gb "$RAM_USED_GB"
 
 if [ -r /proc/sys/kernel/random/boot_id ]; then
   tri_str_ok boot_id "$(cat /proc/sys/kernel/random/boot_id)"
@@ -162,7 +148,6 @@ except Exception:
 fi
 
 plain_str pccs_active "$(systemctl is-active pccs 2>/dev/null || printf 'unknown')"
-plain_str qgsd_active "$(systemctl is-active qgsd 2>/dev/null || printf 'unknown')"
 
 if command -v ss >/dev/null 2>&1; then
   _v="$(ss -a --vsock 2>/dev/null | grep -c ':4050' || true)"
@@ -291,6 +276,18 @@ else
   tri_unknown proc_cmdline "cannot read $PROC_CMDLINE_PATH; refusing to reboot on unknown drift"
 fi
 
+# This reads the GRUB files a SECOND time — lium-cmdline.sh in the same
+# directory also parses them — and the difference is deliberate, not drift.
+#
+# lium-cmdline.sh answers "what does the next boot get?": last occurrence wins,
+# and the caller can exclude our own drop-in. That is the right question for
+# deciding what to WRITE.
+#
+# The scan below answers "was this id ever configured?": every occurrence in
+# both variables, our drop-in INCLUDED. That is the right question for the
+# narrowing refusal, which must see ids a previous run of this playbook wrote.
+# Substituting either answer for the other reintroduces a defect: refusing over
+# a healthy host, or shortening the list on a wedged GPU.
 _grub_linux=""; _grub_default=""
 if [ -r "$GRUB_DEFAULT_PATH" ]; then
   while IFS=$'\t' read -r _k _v; do
@@ -314,8 +311,6 @@ if [ -r "$GRUB_DEFAULT_PATH" ]; then
     printf 'DEFAULT\t%s\n' "$GRUB_CMDLINE_LINUX_DEFAULT"
   )
 fi
-plain_str grub_cmdline_linux "$_grub_linux"
-plain_str grub_cmdline_linux_default "$_grub_default"
 
 _existing_ids=()
 for _src in "$_grub_linux" "$_grub_default"; do
@@ -426,14 +421,6 @@ if [ -n "$_bs" ]; then tri_ok build_space_gb "$_bs"; else tri_unknown build_spac
 
 _is="$(free_gb_for "$REPO_PATH")"
 if [ -n "$_is" ]; then tri_ok image_space_gb "$_is"; else tri_unknown image_space_gb "df could not report free space for $REPO_PATH"; fi
-
-# --- converge budget ---------------------------------------------------------
-_budget=0
-if [ -r "${STATE_DIR}/converge_reboots" ]; then
-  _budget="$(tr -cd '0-9' <"${STATE_DIR}/converge_reboots")"
-  [ -n "$_budget" ] || _budget=0
-fi
-plain converge_reboots "$_budget"
 
 # --- emit --------------------------------------------------------------------
 printf '{\n'

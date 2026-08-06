@@ -30,7 +30,8 @@
     lium_grub_default_path: "{{ kern_work }}/etc/default/grub"
     lium_grub_dropin_path: "{{ kern_work }}/etc/default/grub.d/99-lium-cvm.cfg"
     lium_grubcfg_path: "{{ kern_work }}/boot/grub/grub.cfg"
-
+    lium_modprobe_conf_path: "{{ kern_work }}/etc/modprobe.d/vfio-dma.conf"
+    lium_modules_load_path: "{{ kern_work }}/etc/modules-load.d/vfio.conf"
 
   pre_tasks:
     - name: Provide an empty proc root
@@ -39,15 +40,21 @@
         state: directory
         mode: "0755"
 
-    - name: No GRUB path may point outside the work tree
+    # Every redirected path is declared HERE, at play level, and nowhere else.
+    # The include_role calls below deliberately do not restate them: a path
+    # passed as an include var is invisible to this assertion, so a copy that
+    # drifted would write to the real /etc while the check below still passed.
+    - name: No managed path may point outside the work tree
       ansible.builtin.assert:
         that:
           - lium_grub_default_path is match(kern_work)
           - lium_grub_dropin_path is match(kern_work)
           - lium_grubcfg_path is match(kern_work)
+          - lium_modprobe_conf_path is match(kern_work)
+          - lium_modules_load_path is match(kern_work)
         fail_msg: >-
-          A GRUB path escapes {{ kern_work }}, so this test reads the real host's
-          bootloader configuration instead of its own fixture.
+          A managed path escapes {{ kern_work }}, so this test reads or writes
+          the real host's configuration instead of its own fixture.
         quiet: true
 
     - name: Start from a clean work tree
@@ -81,11 +88,6 @@
       vars:
         lium_kernel_fixture_mode: true
         lium_kernel_reboot_enabled: false
-        lium_grub_default_path: /tmp/lium-kernel-idem/etc/default/grub
-        lium_grub_dropin_path: /tmp/lium-kernel-idem/etc/default/grub.d/99-lium-cvm.cfg
-        lium_grubcfg_path: /tmp/lium-kernel-idem/boot/grub/grub.cfg
-        lium_modprobe_conf_path: /tmp/lium-kernel-idem/etc/modprobe.d/vfio-dma.conf
-        lium_modules_load_path: /tmp/lium-kernel-idem/etc/modules-load.d/vfio.conf
         lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/cmdline_missing_tdx"
         lium_update_grub_cmd: >-
           {{ playbook_dir }}/fake-update-grub.sh
@@ -122,11 +124,6 @@
       vars:
         lium_kernel_fixture_mode: true
         lium_kernel_reboot_enabled: false
-        lium_grub_default_path: /tmp/lium-kernel-idem/etc/default/grub
-        lium_grub_dropin_path: /tmp/lium-kernel-idem/etc/default/grub.d/99-lium-cvm.cfg
-        lium_grubcfg_path: /tmp/lium-kernel-idem/boot/grub/grub.cfg
-        lium_modprobe_conf_path: /tmp/lium-kernel-idem/etc/modprobe.d/vfio-dma.conf
-        lium_modules_load_path: /tmp/lium-kernel-idem/etc/modules-load.d/vfio.conf
         lium_proc_cmdline_path: "{{ playbook_dir }}/fixtures/proc/cmdline_missing_tdx"
         lium_update_grub_cmd: >-
           {{ playbook_dir }}/fake-update-grub.sh

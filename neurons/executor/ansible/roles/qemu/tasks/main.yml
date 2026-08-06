@@ -38,6 +38,27 @@
     - lium_qemu_tarball_url | length == 0
     - lium.qemu_version.value != lium_qemu_version
 
+# One copy, after both arms. The two install paths are mutually exclusive and
+# each used to end with its own byte-identical copy of this, so the
+# lium_state_dir/qemu.sha256 contract — which checks.json.j2 reads — lived in
+# two places and a path change in one arm would have silently degraded
+# qemu.fingerprint to SKIPPED.
+#
+# `stat` + `copy` rather than a shell redirect, so the fingerprint is still
+# recorded under --check, where command and shell tasks are skipped entirely.
+- name: Fingerprint the installed binary
+  ansible.builtin.stat:
+    path: "{{ lium_qemu_prefix }}/bin/qemu-system-x86_64"
+    checksum_algorithm: sha256
+  register: lium_qemu_binary
+
+- name: Record the installed binary's fingerprint
+  ansible.builtin.copy:
+    dest: "{{ lium_state_dir }}/qemu.sha256"
+    content: "{{ lium_qemu_binary.stat.checksum }}\n"
+    mode: "0644"
+  when: lium_qemu_binary.stat.exists
+
 - name: Report that QEMU is already at the pinned version
   ansible.builtin.debug:
     msg: "QEMU {{ lium.qemu_version.value }} is already installed; nothing to build."

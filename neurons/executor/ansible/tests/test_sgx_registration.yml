@@ -47,14 +47,10 @@
           between a 201 and a 400.
         quiet: true
 
-    # The assertion the role makes, reproduced here against both inputs so its
-    # behaviour is pinned rather than assumed.
-    - name: The role's length rule accepts the body
-      ansible.builtin.assert:
-        that:
-          - sgx_manifests.results[0].stat.size == (lium_platform_manifest_len | int)
-        quiet: true
-
+    # The accepting half of the role's length rule is already asserted above,
+    # against the same expression and the same fixture; restating it here only
+    # duplicated it without its fail_msg. What is NOT covered above is the
+    # rejecting half.
     - name: The role's length rule rejects the version-prefixed blob
       ansible.builtin.assert:
         that:
