@@ -99,10 +99,8 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     "NVIDIA RTX PRO 5000 Blackwell":                      [49152, 73728],  # 48/72 GB multi-variant
     "NVIDIA RTX PRO 6000 Blackwell Server Edition":       [98304],         # 96 GB; observed: 97887
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition":  [98304],         # 96 GB; observed: 97887
-    # China SKU: 28 x 3 GB GDDR7 on a 448-bit bus per teardown, not the 96 GB of the
-    # global card. Both driver names of the D family are listed.
-    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": [86016],         # 84 GB
-    "NVIDIA RTX 6000D":                                   [86016],         # 84 GB
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": [86016],         # 84 GB; China SKU, 448-bit bus
+    "NVIDIA RTX 6000D":                                   [86016],         # 84 GB; China SKU, 448-bit bus
     "NVIDIA RTX 4500 Ada Generation":                     [24576],         # 24 GB; observed: 23034
     "NVIDIA RTX 5000 Ada Generation":                     [32768],         # 32 GB
     "NVIDIA RTX 5880 Ada Generation":                     [49152],         # 48 GB
@@ -114,12 +112,10 @@ GPU_VRAM_SIZES_MB: Dict[str, List[int]] = {
     # Ampere data-center
     "NVIDIA A100 80GB PCIe":                              [81920],         # 80 GB; observed: 81920
     "NVIDIA A100-SXM4-80GB":                              [81920],         # 80 GB; observed: 81920
-    "NVIDIA A800 80GB PCIe":                              [81920],         # 80 GB; Vast offers report 81920
+    "NVIDIA A800 80GB PCIe":                              [81920],         # 80 GB
     "NVIDIA A10 Tensor Core GPU":                         [24576],         # 24 GB
-    # 8 GB is the factory size; 40/64 GB come from the community driver unlock and are
-    # both observed in live marketplace offers. Windows stay discrete, so the unlisted
-    # 80 GB profile still fails.
-    "NVIDIA CMP 170HX":                                   [8192, 40960, 65536],  # 8/40/64 GB multi-variant
+    # Only 8 GB is a factory SKU; 40/64 GB come from the community driver unlock.
+    "NVIDIA CMP 170HX":                                   [8192, 40960, 65536], # 8/40/64 GB multi-variant
     # Ampere pro
     "NVIDIA RTX A6000":                                   [49152],         # 48 GB; observed: 49140
     "NVIDIA RTX A5000":                                   [24576],         # 24 GB; observed: 24564

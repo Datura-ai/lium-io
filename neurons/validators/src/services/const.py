@@ -44,17 +44,13 @@ GPU_MODEL_RATES = {
     "NVIDIA L40": 0.01,
     # "NVIDIA RTX 2000 Ada Generation": 0.001,
     "NVIDIA A100 80GB PCIe": 0.01,
-    # Export-compliant A100: same GA100 and 80 GB, NVLink cut to 400 GB/s.
-    "NVIDIA A800 80GB PCIe": 0.0,
     "NVIDIA A100-SXM4-80GB": 0.05,
-    # GA100 mining SKU: 8 GB HBM2e from the factory, 40/64 GB with the community
-    # driver unlock. All three sizes accepted; no unrented-pool weight.
+    "NVIDIA A800 80GB PCIe": 0.0,
     "NVIDIA CMP 170HX": 0.0,
     "NVIDIA A10 Tensor Core GPU": 0.0,
     "NVIDIA RTX A6000": 0.009,
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": 0.025, # 2.5x 6000 ada
     "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": 0.027, # 2.7x 6000 ada
-    # China SKU of the PRO 6000: 84 GB on a 448-bit bus, 19968 cores.
     "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": 0.0,
     "NVIDIA RTX 6000D": 0.0,
     "NVIDIA RTX A5000": 0.002,

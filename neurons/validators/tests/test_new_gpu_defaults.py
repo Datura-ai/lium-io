@@ -55,6 +55,14 @@ NEW_GPU_MODELS = {
     "NVIDIA RTX 5880 Ada Generation": "RTX 5880 Ada Generation",
     "NVIDIA RTX PRO 4000 Blackwell": "RTX PRO 4000",
     "NVIDIA RTX PRO 5000 Blackwell": "RTX PRO 5000",
+    "NVIDIA RTX PRO 2000 Blackwell": "RTX PRO 2000",
+    "NVIDIA RTX PRO 4500 Blackwell": "RTX PRO 4500",
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": "RTX PRO 4500",
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": "RTX PRO 6000D",
+    "NVIDIA RTX 6000D": "RTX PRO 6000D",
+    "NVIDIA RTX 4500 Ada Generation": "RTX 4500 Ada Generation",
+    "NVIDIA A800 80GB PCIe": "A800",
+    "NVIDIA CMP 170HX": "CMP 170HX",
 }
 
 
