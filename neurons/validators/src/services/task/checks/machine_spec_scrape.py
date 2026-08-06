@@ -32,6 +32,18 @@ def _deobfuscate(spec: dict[str, Any], obfuscation_keys: dict[str, str] | None) 
     return _update_keys(first_pass, ORIGINAL_KEYS)
 
 
+def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            **detail,
+            "name": normalize_gpu_model(detail.get("name")),
+        }
+        if detail.get("name")
+        else detail
+        for detail in gpu_details
+    ]
+
+
 class MachineSpecScrapeCheck:
     """Run the obfuscated scrape script and unpack the executor's hardware profile.
 
@@ -100,15 +112,7 @@ class MachineSpecScrapeCheck:
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
             raw_gpu_details = gpu_info.get("details", []) or []
-            gpu_details = [
-                {
-                    **detail,
-                    "name": normalize_gpu_model(detail.get("name")),
-                }
-                if detail.get("name")
-                else detail
-                for detail in raw_gpu_details
-            ]
+            gpu_details = _normalize_gpu_details(raw_gpu_details)
             if gpu_details != raw_gpu_details:
                 gpu_info = {**gpu_info, "details": gpu_details}
                 specs = {**specs, "gpu": gpu_info}
