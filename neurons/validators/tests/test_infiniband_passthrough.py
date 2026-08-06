@@ -10,7 +10,11 @@ import inspect
 
 import pytest
 
-from services.nvidia_devices import _query_gpu_nodes_for_uuids, _query_shared_nodes
+from services.nvidia_devices import (
+    _query_gpu_nodes_for_uuids,
+    _query_shared_nodes,
+    build_gpu_docker_config_for_executor,
+)
 from services.rental_docker_sdk import ContainerRunSpec, ContainerUlimit, _build_host_config_kwargs
 from services.docker_service import DockerService
 from services.rental_docker_sdk import DeviceMount
@@ -101,3 +105,38 @@ async def test_a_repeated_uuid_does_not_pass_a_single_gpu_rental_off_as_whole_ho
     # Assert
     assert per_gpu == ("/dev/nvidia0",)
     assert len(per_gpu) < host_total
+
+
+@pytest.mark.asyncio
+async def test_a_whole_host_rental_carries_the_card_all_the_way_into_the_host_config() -> None:
+    """The seam this feature lives or dies on: what the probe finds on the executor has to survive
+    into the Docker host config, or the renter still cannot see the card.
+
+    Everything between is plain plumbing, but it spans three modules — the probe, the run spec and
+    the host-config mapping — and each was verified separately until now.
+    """
+    # Arrange — an executor with one GPU and one RDMA card, rented whole
+    ssh = fake_ssh(
+        FakeRun("/dev/nvidia0\n"),
+        FakeRun("/dev/nvidiactl\n/dev/infiniband/uverbs0\n/dev/infiniband/rdma_cm\n"),
+    )
+
+    # Act
+    gpu_config = await build_gpu_docker_config_for_executor(ssh, gpu_uuids=None)
+    devices = tuple(gpu_config.device_mounts)
+    host_config = _build_host_config_kwargs(
+        ContainerRunSpec(
+            image="ubuntu:24.04",
+            name="pod_test",
+            devices=devices,
+            ulimits=DockerService._memlock_ulimit_for(devices, memory_gb=64),
+            memory_gb=64,
+        )
+    )
+
+    # Assert — the card reaches the container, and it can pin the memory RDMA needs
+    forwarded = [entry.split(":")[0] for entry in host_config["devices"]]
+    assert "/dev/infiniband/uverbs0" in forwarded
+    assert "/dev/infiniband/rdma_cm" in forwarded
+    assert [(u["Name"], u["Soft"]) for u in host_config["ulimits"]] == [("memlock", -1)]
+    assert host_config["mem_limit"] == "64g"
