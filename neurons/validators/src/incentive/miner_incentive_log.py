@@ -346,11 +346,12 @@ class MinerLogLine(BaseModel):
             reason=ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
             message=(
                 f"No unrented incentive: an idle {result.gpu_count}x {result.gpu_model} must offer "
-                "NCU profiling or GPU splitting. Either open the host profiling counters "
-                "(NVreg_RestrictProfilingToAdminUsers=0, then reboot), which also makes the node "
-                "rentable only as a whole host, or set a minimum GPU count below the full node in "
-                "the Miner Portal on a host that supports docker storage limits, "
-                "or rent it out to earn."
+                "NCU profiling, GPU splitting or confidential computing. Either open the host "
+                "profiling counters (NVreg_RestrictProfilingToAdminUsers=0, then reboot), which "
+                "also makes the node rentable only as a whole host, or set a minimum GPU count "
+                "below the full node in the Miner Portal on a host that supports docker storage "
+                "limits, or run the executor inside a confidential VM whose TDX attestation "
+                "passes, or rent it out to earn."
             ),
             extra_fields={
                 "ncu_profiling_access": missing.ncu_profiling_access,
