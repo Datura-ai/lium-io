@@ -1,9 +1,9 @@
-"""DAH-2546 — unrented incentive flagship capability gate.
+"""DAH-2546 / DAH-2594 — unrented incentive flagship capability gate.
 
-An unrented 8x H200/B200/B300 executor that neither has NCU profiling counters
-open on the host (ncu_profiling_access == "unrestricted") nor real GPU
-splitting enabled (min_gpu_count below the full node size) forfeits the
-unrented rental incentive while staying active. Enforcement is gated by
+An unrented 8x H200/B200/B300 executor that has none of NCU profiling counters
+open on the host (ncu_profiling_access == "unrestricted"), real GPU splitting
+enabled (min_gpu_count below the full node size), or a verified TDX quote
+forfeits the unrented rental incentive while staying active. Enforcement is gated by
 ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT; while the flag is off the breach is
 only logged (shadow mode) and the payout is unchanged.
 """
@@ -27,6 +27,9 @@ H100 = "NVIDIA H100 80GB HBM3"
 # a scrape carrying no NCU observation at all: a machine not re-scraped since DAH-2182 shipped
 SCRAPE_WITHOUT_NCU: dict[str, str] = {}
 
+# what prepare_host_policy returns for a verified TDX quote: os_image_hash + compose_hash
+ATTESTATION_DIGEST = "0f1e2d:9a8b7c"
+
 
 def _build_incentive() -> RentalPriceIncentive:
     return RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {}, {})
@@ -41,6 +44,9 @@ def _make_job(
     supports_gpu_splitting: bool = False,
     gpu_splitting_min_count: int | None = None,
     is_rented: bool = False,
+    attestation_digest: str | None = None,
+    gpu_attestation_passed: bool | None = None,
+    tdx_quote: str | None = None,
 ) -> JobResult:
     return JobResult(
         executor_info=ExecutorSSHInfo(
@@ -52,6 +58,7 @@ def _make_job(
             python_path="/usr/bin/python3",
             root_dir="/tmp",
             price_per_gpu=1.0,
+            tdx_quote=tdx_quote,
         ),
         spec=spec,
         score=1.0,
@@ -63,6 +70,8 @@ def _make_job(
         gpu_count=gpu_count,
         is_rented=is_rented,
         supports_gpu_splitting=supports_gpu_splitting,
+        attestation_digest=attestation_digest,
+        gpu_attestation_passed=gpu_attestation_passed,
         gpu_splitting_min_count=gpu_splitting_min_count,
         collateral_deposited=True,
         sysbox_runtime=True,
@@ -87,6 +96,11 @@ def _make_job(
         ({"gpu_model": B300, "supports_gpu_splitting": True, "gpu_splitting_min_count": 1}, False),
         ({"gpu_model": H100}, False),  # not a flagship model
         ({"gpu_count": 4}, False),  # only full 8x nodes are gated
+        ({"attestation_digest": ATTESTATION_DIGEST}, False),
+        ({"gpu_model": B200, "attestation_digest": ATTESTATION_DIGEST}, False),
+        # a CVM whose GPU-CC evidence verified bad still counts: GPU attestation is a separate
+        # (observe-only) lever, and withholding evidence must never pay more than submitting it
+        ({"attestation_digest": ATTESTATION_DIGEST, "gpu_attestation_passed": False}, False),
     ],
 )
 def test_missing_flagship_capability(job_kwargs, is_missing):
@@ -153,6 +167,29 @@ async def test_shadow_mode_emits_the_capability_log(monkeypatch, caplog):
     assert breach.extra["ncu_profiling_scrape_error"] == "Cannot read /proc/driver/nvidia/params"
     assert breach.extra["enforced"] is False
     assert breach.extra["pool"] == "rental_kept_shadow"
+    assert breach.extra["tdx_quote_present"] is False
+
+
+@pytest.mark.asyncio
+async def test_self_declared_cvm_is_still_excluded(monkeypatch, caplog):
+    # A machine that submitted a quote the validator did not verify still fails the gate; the
+    # log has to separate it from an ordinary host, since attestation_digest is None on every
+    # line this gate emits.
+    monkeypatch.setattr(settings, "ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT", True)
+    incentive = _build_incentive()
+
+    with caplog.at_level(logging.INFO):
+        result = await incentive.calculate_executor_score(
+            _make_job(tdx_quote='{"quote": "..."}', attestation_digest=None)
+        )
+
+    breach = next(
+        record.msg
+        for record in caplog.records
+        if record.msg.extra.get("reason") == "flagship_without_ncu_or_split"
+    )
+    assert result.eligible_for_rental_share is False
+    assert breach.extra["tdx_quote_present"] is True
 
 
 @pytest.mark.asyncio
@@ -182,6 +219,7 @@ async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
     assert "flagship_without_ncu_or_split" in log
     assert "NCU profiling" in log
     assert "GPU splitting" in log
+    assert "confidential computing" in log
     assert [reason.reason for reason in result.zero_incentive_reasons] == [
         "flagship_without_ncu_or_split"
     ]
@@ -196,6 +234,8 @@ async def test_enforced_appends_customer_facing_incentive_log(monkeypatch):
         # estimate_executor feeds spec-less synthetic results through the same scoring
         # path every cycle; the gate must fail open on those (DAH-2520 precedent)
         ({"spec": None}, True),
+        # DAH-2594 — an attested CVM cannot open host NCU counters, attestation is its path
+        ({"attestation_digest": ATTESTATION_DIGEST}, True),
     ],
 )
 @pytest.mark.asyncio

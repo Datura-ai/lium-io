@@ -44,8 +44,9 @@ SOFT_LIMIT_PRICE_RATE = 1.1
 MIN_DISK_TO_VRAM_RATE = 1.5
 
 # DAH-2546 — flagship capability gate. An unrented 8x machine of these base models must
-# have NCU profiling counters open on the host or real GPU splitting enabled to earn the
-# unrented incentive; with neither it forfeits the incentive but stays active.
+# have NCU profiling counters open on the host, real GPU splitting enabled, or a verified TDX
+# quote (DAH-2594) to earn the unrented incentive; with none of the three it forfeits
+# the incentive but stays active.
 FLAGSHIP_CAPABILITY_BASE_MODELS = frozenset({"H200", "B200", "B300"})
 FLAGSHIP_CAPABILITY_GPU_COUNT = 8
 # Value the machine scrape reports when RmProfilingAdminOnly is 0 on the host (DAH-2182).
@@ -63,8 +64,8 @@ class InsufficientDisk(BaseModel):
 
 
 class MissingFlagshipCapability(BaseModel):
-    """What the scrape reported about NCU profiling on a flagship machine that offers neither
-    open profiling counters nor real GPU splitting. Sole owner of these scrape keys."""
+    """What the scrape reported about NCU profiling on a flagship machine that offers no open
+    profiling counters, real GPU splitting or attested CVM. Sole owner of these scrape keys."""
 
     ncu_profiling_access: str | None  # None = the scrape carries no observation at all
     ncu_profiling_scrape_error: str | None  # set when the probe could not read the driver params
@@ -334,7 +335,18 @@ class RentalPriceIncentive(DefaultIncentive):
             and result.gpu_splitting_min_count
             and result.gpu_splitting_min_count < result.gpu_count
         )
-        if ncu_profiling_access == NCU_PROFILING_UNRESTRICTED or has_real_splitting:
+        # DAH-2594 — a CVM provider has no access to the host GPU drivers, so NCU counters are
+        # unreachable by construction; a verified TDX quote is that machine's capability path.
+        # The quote alone, not JobResult.tdx_attestation_passed: that flag also drops on a failed
+        # GPU-CC verdict, which is observe-only today, so a CVM submitting failing GPU evidence
+        # would earn less than one submitting none. Bad GPU evidence is the GPU-attestation
+        # enforcement flag's job; once it is on, evidence is mandatory and no digest reaches here.
+        attested_cvm: bool = result.attestation_digest is not None
+        if (
+            ncu_profiling_access == NCU_PROFILING_UNRESTRICTED
+            or has_real_splitting
+            or attested_cvm
+        ):
             return None
         return MissingFlagshipCapability(
             ncu_profiling_access=ncu_profiling_access,
@@ -344,11 +356,12 @@ class RentalPriceIncentive(DefaultIncentive):
     def _log_flagship_capability_limit(
         self, result: JobResult, missing: MissingFlagshipCapability
     ) -> None:
-        # structured log for every rental-eligible 8x flagship executor lacking both capabilities
+        # structured log for every rental-eligible 8x flagship executor lacking all capabilities
         enforced = settings.ENABLE_UNRENTED_FLAGSHIP_CAPABILITY_LIMIT
         logger.info(
             _m(
-                "Unrented flagship executor has neither NCU profiling nor GPU splitting"
+                "Unrented flagship executor has no NCU profiling, GPU splitting "
+                "or confidential computing"
                 + ("" if enforced else " (shadow only - flag off)"),
                 extra={
                     "executor_id": str(result.executor_info.uuid),
@@ -359,6 +372,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     "ncu_profiling_scrape_error": missing.ncu_profiling_scrape_error,
                     "supports_gpu_splitting": result.supports_gpu_splitting,
                     "gpu_splitting_min_count": result.gpu_splitting_min_count,
+                    # separates a self-declared CVM whose TDX quote did not verify from an
+                    # ordinary host; attestation_digest is None on every line emitted here
+                    "tdx_quote_present": bool(result.executor_info.tdx_quote),
                     "enforced": enforced,
                     "reason": ZeroIncentiveReason.FLAGSHIP_WITHOUT_NCU_OR_SPLIT,
                     "pool": "rental_excluded" if enforced else "rental_kept_shadow",
