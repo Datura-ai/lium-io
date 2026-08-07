@@ -8,6 +8,7 @@ from ..messages import MachineSpecMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandRunner
 from services.file_encrypt_service import ORIGINAL_KEYS
+from services.gpu_spec_table import normalize_gpu_model
 from .network_ema import compute_ema
 
 
@@ -29,6 +30,18 @@ def _deobfuscate(spec: dict[str, Any], obfuscation_keys: dict[str, str] | None) 
     reverse = {v: k for k, v in obfuscation_keys.items()}
     first_pass = _update_keys(spec, reverse)
     return _update_keys(first_pass, ORIGINAL_KEYS)
+
+
+def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            **detail,
+            "name": normalize_gpu_model(detail.get("name")),
+        }
+        if detail.get("name")
+        else detail
+        for detail in gpu_details
+    ]
 
 
 class MachineSpecScrapeCheck:
@@ -98,7 +111,10 @@ class MachineSpecScrapeCheck:
 
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
-            gpu_details = gpu_info.get("details", []) or []
+            raw_gpu_details = gpu_info.get("details", []) or []
+            # The native capability challenge derives its key from the raw NVML name in
+            # specs. Policy and scoring use the canonicalized state fields below.
+            gpu_details = _normalize_gpu_details(raw_gpu_details)
             gpu_model = None
             if gpu_count > 0 and gpu_details:
                 gpu_model = gpu_details[0].get("name")

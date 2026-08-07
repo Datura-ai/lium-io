@@ -66,6 +66,40 @@ async def test_handle_result_omits_gpu_metrics_when_absent(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_handle_result_publishes_canonical_gpu_name_without_mutating_challenge_specs(
+    context_factory,
+):
+    raw_gpu_detail = {"name": "NVIDIA A10", "uuid": "GPU-abc123"}
+    state = build_state(
+        specs={"gpu": {"count": 1, "details": [raw_gpu_detail]}},
+        gpu_model_count="NVIDIA A10 Tensor Core GPU:1",
+    )
+    ctx = context_factory(
+        state=state,
+        tdx_attestation_passed=False,
+        score=1.0,
+        job_score=1.0,
+        collateral_deposited=False,
+        ssh_pub_keys=[],
+        rented=False,
+    )
+
+    result = await ResultHandler(redis_service=None, dry_run=True).handle_result(
+        context=ctx,
+        miner_info=_miner_info(),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="ok",
+        success=True,
+    )
+
+    assert ctx.state.specs["gpu"]["details"] == [raw_gpu_detail]
+    assert result.spec["gpu"]["details"] == [
+        {"name": "NVIDIA A10 Tensor Core GPU", "uuid": "GPU-abc123"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_handle_result_defaults_inspector_outcome_to_skipped(context_factory):
     ctx = context_factory(
         score=1.0,
