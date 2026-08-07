@@ -13,8 +13,6 @@ lium_sgx_packages:
   - sgx-dcap-pccs
   - tdx-qgs
 
-lium_system_qcnl_path: /etc/sgx_default_qcnl.conf
-
 # The system QPL configuration is written whole from a template rather than
 # line-edited, so its values are named here. Intel's own defaults, except
 # use_secure_cert: a local PCCS serves a self-signed certificate, and leaving

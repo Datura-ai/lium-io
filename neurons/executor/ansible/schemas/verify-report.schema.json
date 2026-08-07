@@ -5,7 +5,13 @@
   "description": "The machine-readable output contract of the CVM host provisioning playbook. Humans, bootstrap.sh's exit code, and cvmd's startup checks all read this same document. Check ids are stable: every id in the enum below has a documented meaning under a matching '### <id>' heading in roles/verify/README.md, and tests/test_verify_schema.sh asserts the two sets are exactly equal.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "generated_at", "host", "summary", "checks"],
+  "required": [
+    "schema_version",
+    "generated_at",
+    "host",
+    "summary",
+    "checks"
+  ],
   "properties": {
     "schema_version": {
       "type": "string",
@@ -19,24 +25,58 @@
     "host": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["hostname", "os", "kernel", "boot_id"],
+      "required": [
+        "hostname",
+        "os",
+        "kernel",
+        "boot_id"
+      ],
       "properties": {
-        "hostname": {"type": "string"},
-        "os": {"type": "string"},
-        "kernel": {"type": "string"},
-        "boot_id": {"type": "string"}
+        "hostname": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string"
+        },
+        "kernel": {
+          "type": "string"
+        },
+        "boot_id": {
+          "type": "string"
+        }
       }
     },
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["ok", "warn", "must_fix", "unknown", "skipped"],
+      "required": [
+        "ok",
+        "warn",
+        "must_fix",
+        "unknown",
+        "skipped"
+      ],
       "properties": {
-        "ok": {"type": "integer", "minimum": 0},
-        "warn": {"type": "integer", "minimum": 0},
-        "must_fix": {"type": "integer", "minimum": 0},
-        "unknown": {"type": "integer", "minimum": 0},
-        "skipped": {"type": "integer", "minimum": 0}
+        "ok": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "warn": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "must_fix": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unknown": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "checks": {
@@ -45,7 +85,16 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "title", "status", "observed", "expected", "remediation", "evidence_source", "severity"],
+        "required": [
+          "id",
+          "title",
+          "status",
+          "observed",
+          "expected",
+          "remediation",
+          "evidence_source",
+          "severity"
+        ],
         "properties": {
           "id": {
             "description": "Stable identifier. Consumers match on this, never on the title or the human summary.",
@@ -60,6 +109,7 @@
               "sgx.pccs_active",
               "sgx.qgsd_vsock_4050",
               "sgx.qpl_secure_cert_false",
+              "sgx.qpl_config_parses",
               "sgx.keyprovider_production",
               "net.intel_api_reachable",
               "gpu.cc_mode_all_on",
@@ -86,21 +136,41 @@
               "catalog.stub_status"
             ]
           },
-          "title": {"type": "string", "minLength": 1},
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
           "status": {
             "description": "UNKNOWN means the check could not be read at all. It is never silently collapsed into a pass or a failure.",
-            "enum": ["OK", "WARN", "MUST_FIX", "UNKNOWN", "SKIPPED"]
+            "enum": [
+              "OK",
+              "WARN",
+              "MUST_FIX",
+              "UNKNOWN",
+              "SKIPPED"
+            ]
           },
-          "observed": {"type": "string"},
-          "expected": {"type": "string"},
+          "observed": {
+            "type": "string"
+          },
+          "expected": {
+            "type": "string"
+          },
           "remediation": {
             "type": "string",
             "minLength": 1,
             "description": "What to do about it. Never empty: providers run this unattended with no Lium access to their host, so this text is the support channel."
           },
-          "evidence_source": {"type": "string", "minLength": 1},
+          "evidence_source": {
+            "type": "string",
+            "minLength": 1
+          },
           "severity": {
-            "enum": ["blocker", "degraded", "info"]
+            "enum": [
+              "blocker",
+              "degraded",
+              "info"
+            ]
           }
         }
       }

@@ -116,6 +116,16 @@
   'severity': 'blocker'}) %}
 
 {% set _ = checks.append({
+  'id': 'sgx.qpl_config_parses',
+  'title': 'The QPL configuration is readable JSON',
+  'status': 'UNKNOWN' if not (lium.qcnl_parses.readable | bool) else ('OK' if (lium.qcnl_parses.value | bool) else 'MUST_FIX'),
+  'observed': (lium.qcnl_parses.reason if not (lium.qcnl_parses.readable | bool) else ('parses' if (lium.qcnl_parses.value | bool) else 'does not parse as JSON')),
+  'expected': 'the file parses once whole-line // comments are stripped',
+  'remediation': 'Re-run the sgx role: it writes this file whole from a template with a json.load validate, so it cannot install an unparseable one. The pristine platform copy is kept at ' ~ lium_system_qcnl_path ~ '.pre-lium-cvm. This is checked separately from sgx.qpl_secure_cert_false because that check GREPS for a key, and a grep is satisfied by a line appended after the closing brace — which is exactly how a corrupted file passed while the QPL could not read a word of it. Symptom: every CVM reboots at ~160s, "cpus are not resettable, terminating", and docker logs dstack-key-provider shows "DCAP error".',
+  'evidence_source': lium_system_qcnl_path,
+  'severity': 'blocker'}) %}
+
+{% set _ = checks.append({
   'id': 'sgx.keyprovider_production',
   'title': 'The sealing-key provider runs in production mode',
   'status': 'OK' if ((lium.kp_production | int) > 0 and (lium.kp_aesm_error | int) == 0) else ('MUST_FIX' if lium.kp_running == 'true' else 'SKIPPED'),

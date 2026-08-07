@@ -169,6 +169,34 @@ else
   tri_unknown qcnl_use_secure_cert "$QCNL is not readable"
 fi
 
+# Does the file PARSE — not just "does a grep find the key in it".
+#
+# The grep above returned `false` quite happily from a file that had stopped
+# being JSON: a lineinfile whose regexp matched nothing had appended
+# `"use_secure_cert": false,` AFTER the closing brace. The key was present, the
+# check said OK, and the QPL could not read a word of the file. Every CVM then
+# rebooted at ~160 s with a DCAP error while the report said 0 MUST_FIX.
+#
+# `//` comments are stripped first because Intel's own shipped file uses them
+# and their parser accepts them — a pristine platform file is CORRECT and would
+# otherwise be reported broken. Only whole-line comments are stripped: guessing
+# where a `//` is quoted inside a string is how a stripper starts corrupting the
+# thing it is checking.
+if [ -r "$QCNL" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    if sed -e 's|^[[:space:]]*//.*$||' "$QCNL" 2>/dev/null \
+       | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
+      tri_ok qcnl_parses true
+    else
+      tri_ok qcnl_parses false
+    fi
+  else
+    tri_unknown qcnl_parses "python3 is not available to parse $QCNL"
+  fi
+else
+  tri_unknown qcnl_parses "$QCNL is not readable"
+fi
+
 # Bounded reachability probe. An egress filter in front of Intel's API turns
 # in-band registration into an opaque hang, so it is worth knowing up front.
 if timeout 6 bash -c "exec 3<>/dev/tcp/${INTEL_API_HOST}/${INTEL_API_PORT}" 2>/dev/null; then

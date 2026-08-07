@@ -122,6 +122,18 @@ lium_repo_clone: true
 # validator whitelists lives under dstacktee/app/, and this does not.
 lium_kp_qcnl_relpath: neurons/executor/dstacktee/key-provider/sgx_default_qcnl.conf
 
+# The SYSTEM QPL config, here rather than in sgx_key_provider/defaults because
+# two roles have to agree about it: `sgx_key_provider` writes it, and `verify`
+# reports on it. A role default is only in scope for its own role, so the verify
+# template referencing it there failed with "'lium_system_qcnl_path' is
+# undefined" — and only in the one fixture test that renders the whole report.
+#
+# ⚠ roles/common/files/lium-facts.sh hardcodes this same path. It runs before
+# Ansible does and cannot read group_vars, and it is deliberately NOT given an
+# environment override: pointing the collector at another file would redirect a
+# real decision about the real host, which is what the seam gate exists to stop.
+lium_system_qcnl_path: /etc/sgx_default_qcnl.conf
+
 # Set by bootstrap.sh --yes. The kernel role pauses for confirmation before a
 # reboot unless this is true.
 lium_assume_yes: false

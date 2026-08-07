@@ -105,6 +105,16 @@ ships it `true`, which rejects a local self-signed PCCS certificate:
 `[QCNL] CURL error: (60)`, `[QPL] ... 0xb033`, then the guest reboots. It must
 be false in **both** QPL configs — the system one and the key provider's.
 
+### sgx.qpl_config_parses
+`/etc/sgx_default_qcnl.conf` still parses as JSON once whole-line `//` comments
+are stripped. Blocker. Separate from `sgx.qpl_secure_cert_false` because that
+check GREPS for a key, and a grep is satisfied by a line appended *after* the
+closing brace — which is how a `lineinfile` whose regexp matched nothing left the
+file unparseable while the value check read `false` and said OK. The QPL then
+could not read a word of it: every CVM rebooted at ~160s with
+`cpus are not resettable, terminating`, and `docker logs dstack-key-provider`
+showed `DCAP error`, while the report said 0 MUST_FIX.
+
 ### sgx.keyprovider_production
 The container logs `Running in PRODUCTION mode` with no `error 44` and no failed
 `load_enclave`. **This is the end-to-end proof that the whole SGX chain works** —

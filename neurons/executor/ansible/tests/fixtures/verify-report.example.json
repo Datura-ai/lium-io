@@ -101,6 +101,16 @@
       "title": "The QPL accepts the PCCS certificate"
     },
     {
+      "evidence_source": "/etc/sgx_default_qcnl.conf",
+      "expected": "the file parses once whole-line // comments are stripped",
+      "id": "sgx.qpl_config_parses",
+      "observed": "parses",
+      "remediation": "Re-run the sgx role: it writes this file whole from a template with a json.load validate, so it cannot install an unparseable one. The pristine platform copy is kept at /etc/sgx_default_qcnl.conf.pre-lium-cvm. This is checked separately from sgx.qpl_secure_cert_false because that check GREPS for a key, and a grep is satisfied by a line appended after the closing brace \u2014 which is exactly how a corrupted file passed while the QPL could not read a word of it. Symptom: every CVM reboots at ~160s, \"cpus are not resettable, terminating\", and docker logs dstack-key-provider shows \"DCAP error\".",
+      "severity": "blocker",
+      "status": "OK",
+      "title": "The QPL configuration is readable JSON"
+    },
+    {
       "evidence_source": "docker logs dstack-key-provider",
       "expected": "PRODUCTION mode, RestartCount 0, no enclave errors",
       "id": "sgx.keyprovider_production",
@@ -350,7 +360,7 @@
   },
   "schema_version": "1.0.0",
   "summary": {
-    "ok": 31,
+    "ok": 32,
     "warn": 1,
     "must_fix": 0,
     "unknown": 0,
