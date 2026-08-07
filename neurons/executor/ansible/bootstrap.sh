@@ -59,6 +59,10 @@ Usage: sudo ./bootstrap.sh [options]
   --repo-url <url>       where to clone the repo from
   --repo-path <path>     where the checkout lives (default /opt/lium-io)
   --vars-file <path>     extra variables, e.g. secrets (see group_vars/all/secrets.example.yml)
+  -e <name=value>        one extra variable, passed through to ansible-playbook.
+                         Repeatable. NEVER put a secret here — argv is world
+                         readable through ps and /proc/<pid>/cmdline. Use
+                         --vars-file for anything sensitive.
   --check                Ansible check mode: report, change nothing
   --tags <list>          passed through to ansible-playbook
   --skip-tags <list>     passed through to ansible-playbook
@@ -78,6 +82,7 @@ USAGE
 # --- 1. Argument parsing. Pure: touches nothing. -----------------------------
 REPO_REF=""; REPO_URL=""; REPO_PATH=""; VARS_FILE=""
 CHECK_MODE=0; TAGS=""; SKIP_TAGS=""; NO_CLONE=0; ASSUME_YES=0
+EXTRA_VARS=()
 FORCE_CONVERGE=0; RESUME=0; PRINT_RC=0
 
 while [ $# -gt 0 ]; do
@@ -86,6 +91,11 @@ while [ $# -gt 0 ]; do
     --repo-url) REPO_URL="${2:?--repo-url needs a value}"; shift ;;
     --repo-path) REPO_PATH="${2:?--repo-path needs a value}"; shift ;;
     --vars-file) VARS_FILE="${2:?--vars-file needs a value}"; shift ;;
+    # Passed through to ansible-playbook. Several remediation messages in this
+    # tree instruct the operator to run `bootstrap.sh -e <var>=<value>`, and
+    # without this they were told to run a command the entry point rejected
+    # with exit 64 and a usage dump.
+    -e|--extra-vars) EXTRA_VARS+=("${2:?-e needs a name=value}"); shift ;;
     --check) CHECK_MODE=1 ;;
     --tags) TAGS="${2:?--tags needs a value}"; shift ;;
     --skip-tags) SKIP_TAGS="${2:?--skip-tags needs a value}"; shift ;;
@@ -321,6 +331,17 @@ fi
 if [ -n "$VARS_FILE" ]; then
   [ -r "$VARS_FILE" ] || die "--vars-file is not readable: ${VARS_FILE}"
   PLAY_ARGS+=(-e "@${VARS_FILE}")
+fi
+
+# LAST, so an explicit -e beats the values bootstrap.sh derived from its own
+# flags: with repeated --extra-vars, ansible takes the later one. That ordering
+# is the point of the flag — an operator reaching for -e is overriding a default
+# on purpose, and silently losing to a flag they did not pass would be worse
+# than not having the option at all.
+if [ "${#EXTRA_VARS[@]}" -gt 0 ]; then
+  for _ev in "${EXTRA_VARS[@]}"; do
+    PLAY_ARGS+=(-e "$_ev")
+  done
 fi
 
 log "Running the playbook. Full output also goes to ${BOOTSTRAP_LOG}"
