@@ -12,12 +12,34 @@ from core.utils import _m, get_extra_info
 from payload_models.payloads import MinerJobRequestPayload
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from datura.requests.miner_requests import ExecutorSSHInfo
+from services.gpu_spec_table import normalize_gpu_model
 from services.redis_service import INSPECTOR_EVENT_CHANNEL, RedisService
 
 from .models import JobResult
 from .pipeline import Context
 
 logger = logging.getLogger(__name__)
+
+
+def _canonicalize_published_gpu_names(specs: dict) -> dict:
+    gpu = specs.get("gpu")
+    if not isinstance(gpu, dict):
+        return specs
+
+    details = gpu.get("details")
+    if not isinstance(details, list):
+        return specs
+
+    canonical_details = [
+        {**detail, "name": normalize_gpu_model(detail.get("name"))}
+        if isinstance(detail, dict) and detail.get("name")
+        else detail
+        for detail in details
+    ]
+    if canonical_details == details:
+        return specs
+
+    return {**specs, "gpu": {**gpu, "details": canonical_details}}
 
 
 class ResultHandler:
@@ -122,11 +144,13 @@ class ResultHandler:
 
         # add TDX attestation and spot tier to specs (propagated to compute-app
         # via MACHINE_SPEC_CHANNEL → executor.specs)
-        specs = {
-            **(context.state.specs or {}),
-            "tdx_attestation_passed": context.tdx_attestation_passed,
-            "is_spot": is_spot,
-        }
+        specs = _canonicalize_published_gpu_names(
+            {
+                **(context.state.specs or {}),
+                "tdx_attestation_passed": context.tdx_attestation_passed,
+                "is_spot": is_spot,
+            }
+        )
         # G1 — NVIDIA CC GPU attestation outcome. Only added when a verification
         # was actually performed (None → key omitted), mirroring gpu_metrics.
         # Rides executor.specs to the backend like tdx_attestation_passed.
